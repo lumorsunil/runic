@@ -1,0 +1,19 @@
+# Zig cache and build output
+.zig-cache/
+zig-out/
+
+# Generated binaries and logs
+*.exe
+*.log
+*.out
+
+# Editor and OS cruft
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Temporary coverage and test artifacts
+coverage/
+tmp/
