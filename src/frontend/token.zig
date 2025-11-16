@@ -32,31 +32,58 @@ pub const Tag = enum {
     eof,
     newline,
 
+    /// Bare words that double as both command segments and expression
+    /// identifiers depending on context.
     identifier,
+
+    // Literal tokens
     int_literal,
     float_literal,
     string_literal,
 
-    // Keywords
+    // Declaration keywords
+    /// Immutable variable declarations and destructuring.
     kw_let,
+    /// Explicitly mutable variable declarations.
     kw_mut,
+    /// Function declarations/expressions.
     kw_fn,
+
+    // Error/type keywords
+    /// Starts error set declarations.
     kw_error,
+    /// Plain error enum variant blocks.
     kw_enum,
+    /// Tagged union error variant blocks.
     kw_union,
+
+    // Async/promise keywords
+    /// Async blocks/functions returning ^T.
     kw_async,
+    /// Await expression keyword used with ^T.
     kw_await,
+
+    // Flow control keywords
     kw_if,
     kw_else,
     kw_for,
     kw_while,
     kw_match,
     kw_return,
+
+    // Module/interop keywords
+    /// Module import keyword.
     kw_import,
+    /// Module import source specifier.
     kw_from,
+    /// Starts legacy bash { ... } blocks.
     kw_bash,
+
+    // Error-handling keywords
     kw_try,
     kw_catch,
+
+    // Literal keywords
     kw_true,
     kw_false,
     kw_null,
@@ -67,12 +94,15 @@ pub const Tag = enum {
     star,
     slash,
     percent,
+    /// Promise prefix "^".
     caret,
     amp,
     amp_amp,
+    /// Stage separator for pipelines.
     pipe,
     pipe_pipe,
     bang,
+    /// Optional prefix "?".
     question,
     colon,
     semicolon,
@@ -91,9 +121,13 @@ pub const Tag = enum {
     fat_arrow, // "=>"
     l_paren,
     r_paren,
+    /// Scope/map literal opener.
     l_brace,
+    /// Scope/map literal closer.
     r_brace,
+    /// Array literal opener.
     l_bracket,
+    /// Array literal closer.
     r_bracket,
 
     pub fn toKeyword(tag: Tag) ?[]const u8 {
@@ -137,7 +171,7 @@ pub fn identifierTag(name: []const u8) Tag {
     return .identifier;
 }
 
-const keyword_map = std.ComptimeStringMap(Tag, .{
+const keyword_map = std.StaticStringMap(Tag).initComptime(.{
     .{ "let", .kw_let },
     .{ "mut", .kw_mut },
     .{ "fn", .kw_fn },
