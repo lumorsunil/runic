@@ -700,7 +700,8 @@ test "command runner emits tracing logs" {
     var buffer = std.ArrayList(u8).init(std.testing.allocator);
     defer buffer.deinit();
     var writer = buffer.writer(std.testing.allocator);
-    var tracer = Tracer.init(&.{ "pipeline", "process" }, writer.any());
+    var writer_adapter = writer.adaptToNewApi(&.{});
+    var tracer = Tracer.init(&.{ "pipeline", "process" }, &writer_adapter.new_interface);
 
     var runner = CommandRunner.initWithTracer(std.testing.allocator, &tracer);
     var handle = try runner.runSync(.{ .argv = &.{ "sh", "-c", "printf 'trace me'" } });

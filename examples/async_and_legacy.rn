@@ -1,0 +1,42 @@
+// Run with: zig build run -- examples/async_and_legacy.rn --trace async --trace process
+// Demonstrates async promises, background process handles, module imports, and bash blocks.
+
+import http from "net/http"
+
+error ReleaseError = enum { Timeout, Offline }
+
+fn fetch_release(tag: Str) ^ReleaseError!http.Response {
+  async {
+    let resp = try http.get("https://api.example.com/releases/${tag}")
+    if resp.code >= 500 {
+      return error.ReleaseError.Offline
+    }
+    return resp
+  }
+}
+
+let latest = fetch_release("stable")
+await (latest) |release| {
+  echo "Latest release => ${release.code}"
+} catch |err| {
+  match err {
+    error.ReleaseError.Timeout => echo "Release lookup timed out"
+    error.ReleaseError.Offline => echo "API is offline"
+  }
+}
+
+let server_handle = python -m http.server 9000 &
+let finished = await server_handle
+if finished.status.ok {
+  echo "Preview server ready"
+}
+
+if server_handle |stdout, stderr, status| {
+  echo "Background server STDOUT:"
+  echo stdout
+}
+
+bash {
+  echo "Cleaning temporary files with legacy bash"
+  rm -f zig-out/tmp/*.log || true
+}

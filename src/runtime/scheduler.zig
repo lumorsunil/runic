@@ -374,7 +374,8 @@ test "scheduler traces async lifecycle" {
     var buffer = std.ArrayList(u8).init(std.testing.allocator);
     defer buffer.deinit();
     var writer = buffer.writer(std.testing.allocator);
-    var tracer = Tracer.init(&.{ "async", "process", "pipeline" }, writer.any());
+    var writer_adapter = writer.adaptToNewApi(&.{});
+    var tracer = Tracer.init(&.{ "async", "process", "pipeline" }, &writer_adapter.new_interface);
 
     var scheduler = Scheduler.initWithTracer(std.testing.allocator, &tracer);
     defer scheduler.deinit();

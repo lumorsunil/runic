@@ -101,3 +101,22 @@ Tracing is the fastest way to inspect how Runic pipelines, async tasks, and proc
 - `async` — follows the scheduler lifecycle. Every background task logs its spawn, completion/error, promise wait events, and the resolved handle summary so you can see exactly when async work finishes.
 
 The REPL inherits these switches, so you can run `zig build run -- --repl --trace pipeline --trace async` to watch commands execute in real time while experimenting interactively.
+
+## Examples
+
+Sample Runic scripts now live under `examples/` so you can get a feel for the CLI ergonomics before wiring your own programs. Execute them with `zig build run -- examples/<script>.rn` and pass extra flags to the script after `--`.
+
+- `examples/pipelines_and_handles.rn` — demonstrates pipelines, tee capture, and process-handle destructuring with `--trace pipeline --trace process`.
+- `examples/data_and_flow.rn` — highlights typed bindings, array/map literals, optional-aware flow control, and loops.
+- `examples/errors_and_match.rn` — exercises error declarations, `try`/`catch`, and pattern matching for recovery.
+- `examples/async_and_legacy.rn` — covers async promises, background processes, module imports, and the `bash { ... }` escape hatch.
+
+## Neovim syntax plugin
+
+Syntax highlighting for Runic lives under `editor/neovim/`. Run
+`./scripts/neovim_plugin.sh install` to symlink the plugin into your local
+`nvim/site/pack` tree (customize the destination via `--pack-root`, `--slot`, or
+`--target`). Call `./scripts/neovim_plugin.sh open-example` to launch Neovim
+with the plugin preloaded and one of the sample programs from `examples/*.rn`.
+See `editor/neovim/README.md` for additional commands, a `lazy.nvim` spec
+snippet, and troubleshooting tips.

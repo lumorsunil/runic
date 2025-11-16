@@ -1,7 +1,7 @@
 const std = @import("std");
 
 const ascii = std.ascii;
-const AnyWriter = std.io.AnyWriter;
+const IoWriter = std.Io.Writer;
 
 /// Logical tracing categories that can be toggled independently via
 /// command-line `--trace <topic>` switches.
@@ -57,17 +57,17 @@ pub const TopicSet = struct {
 /// writes pre-formatted log lines to the provided sink under a mutex so callers
 /// can safely emit events from background threads.
 pub const Tracer = struct {
-    sink: ?AnyWriter = null,
+    sink: ?*IoWriter = null,
     topics: TopicSet = .{},
     mutex: std.Thread.Mutex = .{},
 
-    pub fn init(names: [][]const u8, sink: ?AnyWriter) Tracer {
+    pub fn init(names: [][]const u8, sink: ?*IoWriter) Tracer {
         var tracer = Tracer{ .sink = sink };
         tracer.topics.enableNames(names);
         return tracer;
     }
 
-    pub fn setSink(self: *Tracer, sink: AnyWriter) void {
+    pub fn setSink(self: *Tracer, sink: *IoWriter) void {
         self.sink = sink;
     }
 
@@ -91,6 +91,7 @@ pub const Tracer = struct {
         try sink.print("[trace {s}] ", .{topic.label()});
         try sink.print(fmt, args);
         try sink.print("\n", .{});
+        try sink.flush();
     }
 };
 
@@ -112,9 +113,8 @@ test "tracer logs only enabled topics" {
     var buffer = std.ArrayList(u8).init(std.testing.allocator);
     defer buffer.deinit();
     var writer = buffer.writer(std.testing.allocator);
-    const sink = writer.any();
-
-    var tracer = Tracer.init(&.{ "PIPELINE", "process" }, sink);
+    var writer_adapter = writer.adaptToNewApi(&.{});
+    var tracer = Tracer.init(&.{ "PIPELINE", "process" }, &writer_adapter.new_interface);
     try tracer.log(.pipeline, "start {d} stages", .{2});
     try tracer.log(.async, "should skip", .{});
     try tracer.log(.process, "pid={d}", .{42});
