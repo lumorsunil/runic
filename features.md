@@ -119,10 +119,12 @@ if (maybe_port) |port| {
 Promises are first-class types that use the dedicated `^T` syntax, mirroring the shorthand used for optionals (`?T`) and error unions (`!T`). Any function or expression marked `async` returns a `^T`, and `await` unwraps the eventual value while preserving the same capture ergonomics used elsewhere in the language.
 
 ```rn
-fn fetch_release(tag: Str) ^Release {
+error ReleaseError = enum { Timeout, Offline }
+
+fn fetch_release(tag: Str) ^ReleaseError!Release {
   async {
-    let resp = http.get("https://api.example.com/releases/${tag}")
-    return parse_release(resp.body)
+    let resp = try http.get("https://api.example.com/releases/${tag}")
+    return try parse_release(resp.body)
   }
 }
 
@@ -135,7 +137,7 @@ await (latest) |release| {
 }
 ```
 
-**Result:** `^Release` advertises that `fetch_release` completes in the future. `await (latest) |release| { ... }` uses the same capture clause syntax as optional-aware `if` statements, and `catch |err| { ... }` mirrors error handling so scripts can branch on successful resolutions or failures without bespoke glue code.
+**Result:** `^ReleaseError!Release` advertises that `fetch_release` completes in the future and may fail with a typed error set. `await (latest) |release| { ... }` uses the same capture clause syntax as optional-aware `if` statements to bind the resolved value, and `catch |err| { ... }` mirrors error handling so scripts can branch on successful resolutions or failures without bespoke glue code.
 
 ## Structured flow control
 

@@ -3,24 +3,19 @@ const std = @import("std");
 
 pub const token = @import("frontend/token.zig");
 pub const lexer = @import("frontend/lexer.zig");
+pub const ast = @import("frontend/ast.zig");
+pub const diagnostics = @import("frontend/diagnostics.zig");
+pub const types = @import("semantic/types.zig");
+pub const symbols = @import("semantic/symbols.zig");
+pub const type_checker = @import("semantic/type_checker.zig");
+pub const command_runner = @import("runtime/command_runner.zig");
+pub const bash_executor = @import("runtime/bash_executor.zig");
+pub const scheduler = @import("runtime/scheduler.zig");
+pub const match_executor = @import("runtime/match_executor.zig");
+pub const module_loader = @import("runtime/module_loader.zig");
+pub const stack_trace = @import("runtime/stack_trace.zig");
+pub const tracing = @import("runtime/tracing.zig");
 
-pub fn bufferedPrint() !void {
-    // Stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-    const stdout = &stdout_writer.interface;
-
-    try stdout.print("Run `zig build test` to run the tests.\n", .{});
-
-    try stdout.flush(); // Don't forget to flush!
-}
-
-pub fn add(a: i32, b: i32) i32 {
-    return a + b;
-}
-
-test "basic add functionality" {
-    try std.testing.expect(add(3, 7) == 10);
+comptime {
+    _ = @import("frontend/parser_tests.zig");
 }
