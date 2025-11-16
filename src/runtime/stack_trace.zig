@@ -58,6 +58,7 @@ pub const StackTrace = struct {
         const total = self.frames.items.len;
         if (total == 0) {
             try writer.print("Runtime stack trace (empty)\n", .{});
+            try writer.flush();
             return;
         }
 
@@ -81,6 +82,7 @@ pub const StackTrace = struct {
 
             display += 1;
         }
+        try writer.flush();
     }
 
     fn freeFrame(self: *StackTrace, frame: Frame) void {
@@ -131,7 +133,9 @@ test "stack trace renders newest frame first" {
 
     var buffer = std.ArrayList(u8).init(std.testing.allocator);
     defer buffer.deinit();
-    try trace.render(buffer.writer());
+    var writer = buffer.writer();
+    var writer_adapter = writer.adaptToNewApi(&.{});
+    try trace.render(&writer_adapter.new_interface);
 
     const expected =
         \\Runtime stack trace (2 frames):

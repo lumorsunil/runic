@@ -8,6 +8,8 @@ const CommandDisplay = runic.command_runner.CommandDisplay;
 const StackTrace = runic.stack_trace.StackTrace;
 const Tracer = runic.tracing.Tracer;
 
+const writer_buffer_len: usize = 1024;
+
 pub const Options = struct {
     prompt: []const u8 = "runic> ",
     continuation_prompt: []const u8 = "...> ",
@@ -18,6 +20,7 @@ pub const Options = struct {
 
 pub fn run(allocator: std.mem.Allocator, options: Options) !void {
     var session = try Session.init(allocator, options);
+    session.tracer.setSink(&session.stderr.interface);
     defer session.deinit();
     try session.loop();
 }
@@ -26,6 +29,8 @@ const Session = struct {
     allocator: std.mem.Allocator,
     options: Options,
     editor: LineEditor,
+    stdout_buffer: []u8,
+    stderr_buffer: []u8,
     stdout: std.fs.File.Writer,
     stderr: std.fs.File.Writer,
     tracer: Tracer,
@@ -34,21 +39,31 @@ const Session = struct {
         const stdout_file = std.fs.File.stdout();
         const stderr_file = std.fs.File.stderr();
 
-        var session = Session{
+        const stdout_buffer = try allocator.alloc(u8, writer_buffer_len);
+        errdefer allocator.free(stdout_buffer);
+        const stderr_buffer = try allocator.alloc(u8, writer_buffer_len);
+        errdefer allocator.free(stderr_buffer);
+
+        var editor = try LineEditor.init(allocator, options.history_limit);
+        errdefer editor.deinit();
+
+        return Session{
             .allocator = allocator,
             .options = options,
-            .editor = try LineEditor.init(allocator, options.history_limit),
-            .stdout = stdout_file.writer(&.{}),
-            .stderr = stderr_file.writer(&.{}),
+            .editor = editor,
+            .stdout_buffer = stdout_buffer,
+            .stderr_buffer = stderr_buffer,
+            .stdout = stdout_file.writer(stdout_buffer),
+            .stderr = stderr_file.writer(stderr_buffer),
             .tracer = Tracer.init(options.trace_topics, null),
         };
-        session.tracer.setSink(session.stderr.any());
-        return session;
     }
 
     fn deinit(self: *Session) void {
         self.tracer.clearSink();
         self.editor.deinit();
+        self.allocator.free(self.stdout_buffer);
+        self.allocator.free(self.stderr_buffer);
         self.* = undefined;
     }
 
@@ -65,6 +80,7 @@ const Session = struct {
             const line_opt = try self.editor.readLine(prompt);
             if (line_opt == null) {
                 try self.stdout.interface.writeAll("\n");
+                try self.stdout.interface.flush();
                 break;
             }
 
@@ -109,6 +125,7 @@ const Session = struct {
                 "Meta commands: :help, :history, :quit\n",
             .{},
         );
+        try self.stdout.interface.flush();
     }
 
     fn handleCommand(self: *Session, command: []const u8) !bool {
@@ -121,6 +138,8 @@ const Session = struct {
 
     fn handleMeta(self: *Session, command: []const u8) !bool {
         const trimmed = std.mem.trim(u8, command, " \t");
+        defer self.stdout.interface.flush() catch {};
+        defer self.stderr.interface.flush() catch {};
         if (trimmed.len == 0) {
             try self.stdout.interface.print(":help, :history, :quit\n", .{});
             return false;
@@ -146,6 +165,7 @@ const Session = struct {
     }
 
     fn executePipeline(self: *Session, command: []const u8) !bool {
+        defer self.stderr.interface.flush() catch {};
         var tokens = TokenList.init(self.allocator);
         defer tokens.deinit();
 
@@ -181,6 +201,7 @@ const Session = struct {
 
     fn showHistory(self: *Session) !void {
         const entries = self.editor.historyEntries();
+        defer self.stdout.interface.flush() catch {};
         if (entries.len == 0) {
             try self.stdout.interface.print("(history empty)\n", .{});
             return;
@@ -191,6 +212,10 @@ const Session = struct {
     }
 
     fn displayHandle(self: *Session, handle: ProcessHandle) !void {
+        defer {
+            self.stdout.interface.flush() catch {};
+            self.stderr.interface.flush() catch {};
+        }
         const stdout_bytes = handle.stdoutBytes();
         if (stdout_bytes.len > 0) try self.stdout.interface.writeAll(stdout_bytes);
 
@@ -258,6 +283,7 @@ const LineEditor = struct {
     allocator: std.mem.Allocator,
     stdin_file: std.fs.File,
     stdout_file: std.fs.File,
+    writer_buffer: []u8,
     writer: std.fs.File.Writer,
     buffer: std.ArrayList(u8),
     saved_current: std.ArrayList(u8),
@@ -271,11 +297,14 @@ const LineEditor = struct {
     fn init(allocator: std.mem.Allocator, history_limit: usize) !LineEditor {
         const stdin_file = std.fs.File.stdin();
         const stdout_file = std.fs.File.stdout();
+        const writer_buffer = try allocator.alloc(u8, writer_buffer_len);
+        errdefer allocator.free(writer_buffer);
         var editor = LineEditor{
             .allocator = allocator,
             .stdin_file = stdin_file,
             .stdout_file = stdout_file,
-            .writer = stdout_file.writer(&.{}),
+            .writer_buffer = writer_buffer,
+            .writer = stdout_file.writer(writer_buffer),
             .buffer = .empty,
             .saved_current = .empty,
             .history = .init(allocator, history_limit),
@@ -295,6 +324,7 @@ const LineEditor = struct {
         self.buffer.deinit(self.allocator);
         self.saved_current.deinit(self.allocator);
         self.history.deinit();
+        self.allocator.free(self.writer_buffer);
     }
 
     fn readLine(self: *LineEditor, prompt: []const u8) !?[]u8 {
@@ -360,6 +390,7 @@ const LineEditor = struct {
                 },
                 .enter => {
                     try self.writer.interface.writeAll("\r\n");
+                    try self.writer.interface.flush();
                     const owned = try self.buffer.toOwnedSlice(self.allocator);
                     if (owned.len != 0) {
                         try self.history.append(owned);
@@ -451,12 +482,12 @@ const LineEditor = struct {
     }
 
     fn readKey(self: *LineEditor) !Key {
-        var byte_buf: [1]u8 = undefined;
-        var buffer: [1024 * 4]u8 = undefined;
+        var buffer: [512]u8 = undefined;
         var reader = self.stdin_file.reader(&buffer);
-        const read = try reader.read(&byte_buf);
-        if (read == 0) return Key.eof;
-        const byte = byte_buf[0];
+        const byte = reader.interface.takeByte() catch |err| switch (err) {
+            error.EndOfStream => return Key.eof,
+            else => return err,
+        };
         return switch (byte) {
             '\r', '\n' => Key.enter,
             0x7f => Key.backspace,
@@ -503,12 +534,12 @@ const LineEditor = struct {
     }
 
     fn readRawByte(self: *LineEditor) !?u8 {
-        var byte_buf: [1]u8 = undefined;
-        var buffer: [1024 * 4]u8 = undefined;
+        var buffer: [512]u8 = undefined;
         var reader = self.stdin_file.reader(&buffer);
-        const read = try reader.read(&byte_buf);
-        if (read == 0) return null;
-        return byte_buf[0];
+        return reader.interface.takeByte() catch |err| switch (err) {
+            error.EndOfStream => null,
+            else => err,
+        };
     }
 
     fn enableRawMode(self: *LineEditor) !void {
@@ -720,18 +751,17 @@ fn describeStage(
 ) ![]u8 {
     var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(allocator);
-    var writer = buffer.writer(allocator);
 
-    try writer.print("{any}", .{CommandDisplay{ .argv = argv }});
+    try buffer.print(allocator, "{any}", .{CommandDisplay{ .argv = argv }});
 
     if (status.signal) |sig| {
-        try writer.print(" (signal {d})", .{sig});
+        try buffer.print(allocator, " (signal {d})", .{sig});
     } else if (status.exit_code) |code| {
         if (!status.ok or code != 0) {
-            try writer.print(" (exit code {d})", .{code});
+            try buffer.print(allocator, " (exit code {d})", .{code});
         }
     } else if (!status.ok) {
-        try writer.writeAll(" (failed)");
+        try buffer.print(allocator, " (failed)", .{});
     }
 
     return try buffer.toOwnedSlice(allocator);

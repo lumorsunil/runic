@@ -1,0 +1,32 @@
+// Run with: zig build run -- examples/data_and_flow.rn -- --port 8080
+// Demonstrates typed bindings, arrays/maps, optional-aware flow, and idiomatic loops.
+
+let greeting: Str = "hello"
+mut retries: Int = 2
+let services = ["api", "jobs", "web"]
+let thresholds = { api: 200, jobs: 350, web: 150 }
+
+if (env.get("PORT")) |port| {
+  echo "Using env PORT=${port}"
+} else {
+  echo "Falling back to default port ${thresholds.api}"
+}
+
+for (services, 0..) |service, idx| {
+  echo "${idx}: checking ${service}"
+  let probe = echo "ping ${service}" | upper
+  if probe.status.ok {
+    echo "  ${service} responded"
+  } else {
+    echo "  ${service} failed"
+  }
+}
+
+let reader = file.open("README.md")
+while reader.lines() |line| {
+  if line.starts_with("# ") {
+    echo "Heading => ${line}"
+  }
+}
+
+echo "Retries allowed: ${retries}"

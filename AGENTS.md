@@ -5,6 +5,7 @@ Keep top-level folders predictable: place interpreter sources and shared utiliti
 
 ## Build, Test, and Development Commands
 Use the native toolchain of the implementation language for formatting, linting, building, and testing. Document the canonical commands in the README (e.g., formatter → linter → build → test) so contributors can follow the same workflow. When working on experimental Runic programs inside `examples/`, prefer invoking the emerging CLI or REPL (`cmd/` binaries) the same way users eventually will, e.g., `path/to/repl -- path/to/script.rn`, so behavior mirrors production expectations.
+When working in Zig (currently version 0.15.1), reference the official documentation at www.ziglang.org so guidance stays aligned with the upstream tooling.
 
 ## Coding Style & Naming Conventions
 Follow the idioms of the chosen language (folder structure, naming, indentation) and keep functions short and domain-specific. Extract parser or runtime helpers into submodules inside `src/` to avoid monolithic files. Always run the language-appropriate formatter before opening a PR, treat lint warnings as errors, name Runic files with the `.rn` extension, and keep command invocations column-aligned for readability.

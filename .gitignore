@@ -20,3 +20,7 @@ www.ziglang.org/
 # Temporary coverage and test artifacts
 coverage/
 tmp/
+
+# Nvim
+.cache/
+.nvimlog

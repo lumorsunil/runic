@@ -1,0 +1,44 @@
+// Run with: zig build run -- examples/errors_and_match.rn -- --feature FEATURE_FLAG
+// Exercises error declarations, typed returns, try/catch flows, and match-based recovery.
+
+error ConfigError = union {
+  MissingEnv: { name: Str },
+  InvalidValue: { name: Str, value: Str },
+}
+
+fn require_env(name: Str) ConfigError!Str {
+  let value = env.get(name)
+  if (value) |val| {
+    return val
+  }
+  return error.ConfigError.MissingEnv { name }
+}
+
+fn parse_bool(name: Str, raw: Str) ConfigError!Bool {
+  if raw == "true" {
+    return true
+  }
+  if raw == "false" {
+    return false
+  }
+  return error.ConfigError.InvalidValue { name, value: raw }
+}
+
+fn resolve_flag(name: Str) ConfigError!Bool {
+  let raw = try require_env(name)
+  return try parse_bool(name, raw)
+}
+
+let feature = resolve_flag("FEATURE_FLAG") catch |err| {
+  match err {
+    error.ConfigError.MissingEnv => |info| {
+      echo "${info.name} not set; enabling safe defaults"
+    }
+    error.ConfigError.InvalidValue => |info| {
+      echo "${info.name}='${info.value}' is invalid; forcing off"
+    }
+  }
+  return false
+}
+
+echo "Feature flag active? ${feature}"

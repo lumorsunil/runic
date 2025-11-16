@@ -29,6 +29,9 @@ pub fn renderSyntaxError(writer: anytype, options: RenderOptions) !void {
     try writeRepeated(writer, ' ', pointer.offset);
     try writeRepeated(writer, '^', pointer.width);
     try writer.writeAll("\n");
+    if (@hasDecl(@TypeOf(writer), "flush")) {
+        try writer.flush();
+    }
 }
 
 const CaretInfo = struct {

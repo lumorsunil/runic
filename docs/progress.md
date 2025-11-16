@@ -164,3 +164,8 @@
   - Expanded `scheduler.zig` tests with non-zero background exits and duplicate `wait` calls, exercising both the success path (handle resolution) and failure path (`PromiseError.AlreadyAwaited`) for async promise handling.
 
 32. Create regression tests for both success and failure flows—especially error propagation, optional handling, and async promise resolution. (completed 2025-11-16T14:57:31+01:00)
+- **Task 33:** Add `examples/` Runic scripts showcasing the documented features and verifying CLI ergonomics. (completed 2025-11-16T15:34:37+01:00)
+  - Created `examples/` with four runnable Runic scripts that each highlight a slice of the language surface: pipelines/process handles, data/loops, errors/matches, and async/modules/legacy bash.
+  - Documented how to invoke each script (and the useful `--trace` flags) directly from the CLI so contributors can validate ergonomics, and linked the new directory plus summaries from `README.md`.
+
+33. Add `examples/` Runic scripts showcasing the documented features and verifying CLI ergonomics. (completed 2025-11-16T15:32:07+01:00)
