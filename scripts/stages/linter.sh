@@ -6,18 +6,20 @@ lang="${RUNIC_LANG:-unknown}"
 repo_root="${RUNIC_REPO_ROOT:?RUNIC_REPO_ROOT must be set}"
 
 run_zig_fmt_check() {
-  local -a zig_files
-  mapfile -t zig_files < <(
-    cd "$repo_root"
-    find src cmd tests -type f \( -name '*.zig' -o -name '*.rnzig' \) 2>/dev/null || true
-  )
+  local -a zig_dirs=()
 
-  if [[ ${#zig_files[@]} -eq 0 ]]; then
-    echo "No Zig sources found to lint; skipping."
+  for dir in src cmd tests; do
+    if [[ -d "$repo_root/$dir" ]]; then
+      zig_dirs+=("$dir")
+    fi
+  done
+
+  if [[ ${#zig_dirs[@]} -eq 0 ]]; then
+    echo "No Zig source directories found to lint; skipping."
     return 0
   fi
 
-  (cd "$repo_root" && zig fmt --check "${zig_files[@]}")
+  (cd "$repo_root" && zig fmt --check "${zig_dirs[@]}")
 }
 
 case "$lang" in

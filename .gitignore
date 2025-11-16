@@ -2,6 +2,9 @@
 .zig-cache/
 zig-out/
 
+# Zig documentation AI helper
+www.ziglang.org/
+
 # Generated binaries and logs
 *.exe
 *.log
