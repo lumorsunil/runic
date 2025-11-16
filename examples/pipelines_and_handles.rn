@@ -1,0 +1,39 @@
+// Run with: zig build run -- examples/pipelines_and_handles.rn --trace pipeline --trace process
+// Exercises pipelines, tee capture, destructuring process handles, and CLI ergonomic flags.
+
+let listing = ls ./src
+if listing.status.ok {
+  echo "Interpreter sources:"
+  echo listing.stdout
+} else {
+  echo "ls ./src failed with exit ${listing.status.exit_code}"
+  echo listing.stderr
+}
+
+let fmt_check = (zig fmt --check src cmd tests | tee fmt-check.log)
+if !fmt_check.status.ok {
+  echo "Formatter failed at stage ${fmt_check.status.failed_stage}"
+  echo fmt_check.stderr
+}
+
+let { stdout: git_summary, stderr: git_errors, exit_code } = git status --short
+if git_summary != "" {
+  echo "git status (short):"
+  echo git_summary
+}
+if git_errors != "" {
+  echo "git errors:"
+  echo git_errors
+}
+echo "git exited with code ${exit_code}"
+
+let build = zig build
+if build.status.ok {
+  echo "zig build completed successfully"
+} else {
+  echo "zig build failed with exit ${build.status.exit_code}"
+  echo build.stderr
+}
+
+echo "Build output:"
+echo build.stdout

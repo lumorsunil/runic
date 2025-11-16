@@ -54,11 +54,14 @@ pub fn main() !void {
     }
 
     const allocator = gpa.allocator();
+
+    var stdout_buffer: [1024]u8 = undefined;
+    var stderr_buffer: [1024]u8 = undefined;
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
 
-    var stdoutWriter = std.fs.File.stdout().writer(&.{});
-    var stderrWriter = std.fs.File.stderr().writer(&.{});
+    var stdoutWriter = std.fs.File.stdout().writer(&stdout_buffer);
+    var stderrWriter = std.fs.File.stderr().writer(&stderr_buffer);
     const stdout = &stdoutWriter.interface;
     const stderr = &stderrWriter.interface;
 
@@ -72,6 +75,7 @@ pub fn main() !void {
             defer allocator.free(message);
             try stderr.print("error: {s}\n\n", .{message});
             try printUsage(stderr);
+            try stderr.flush();
             std.process.exit(2);
         },
         .ready => |config| {
@@ -101,6 +105,7 @@ fn dispatch(allocator: std.mem.Allocator, config: CliConfig, writer: *std.Io.Wri
                 "Pass --help for usage details while runtime execution remains under construction.\n",
                 .{},
             );
+            try writer.flush();
         },
         .repl => {
             try repl.run(allocator, .{
@@ -273,6 +278,7 @@ fn printUsage(writer: *std.Io.Writer) !void {
         \\Script execution remains stubbed while the interpreter matures.
         \\
     , .{});
+    try writer.flush();
 }
 
 fn argEqual(a: []const u8, b: []const u8) bool {
@@ -313,6 +319,7 @@ fn finalizeList(comptime T: type, list: *ManagedArrayList(T), cleanup_flag: *boo
 fn printStringList(writer: *std.Io.Writer, label: []const u8, values: [][]const u8) !void {
     if (values.len == 0) {
         try writer.print("{s}: (none)\n", .{label});
+        try writer.flush();
         return;
     }
     try writer.print("{s}: ", .{label});
@@ -321,17 +328,20 @@ fn printStringList(writer: *std.Io.Writer, label: []const u8, values: [][]const 
         try writer.print("{s}", .{value});
     }
     try writer.writeByte('\n');
+    try writer.flush();
 }
 
 fn printEnvOverrides(writer: *std.Io.Writer, overrides: []const CliConfig.EnvOverride) !void {
     if (overrides.len == 0) {
         try writer.print("Env overrides: (none)\n", .{});
+        try writer.flush();
         return;
     }
     try writer.print("Env overrides:\n", .{});
     for (overrides) |override| {
         try writer.print("  {s}={s}\n", .{ override.key, override.value });
     }
+    try writer.flush();
 }
 
 fn freeStringList(allocator: std.mem.Allocator, values: [][]const u8) void {
