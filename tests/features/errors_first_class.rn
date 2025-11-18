@@ -1,0 +1,58 @@
+// Tests custom error unions, returning typed failures, and pattern matching.
+
+import ensure from "test_support/ensure"
+let ensure = ensure.ensure
+
+error ParserError = union {
+  MissingValue: { name: Str },
+  InvalidBool: { name: Str, provided: Str },
+}
+
+fn parse_flag(name: Str, raw: Str) ParserError!Bool {
+  if raw == "" {
+    return error.ParserError.MissingValue { name }
+  }
+  if raw == "true" {
+    return true
+  }
+  if raw == "false" {
+    return false
+  }
+  return error.ParserError.InvalidBool { name, provided: raw }
+}
+
+let enabled = parse_flag("FEATURE", "true") catch |err| {
+  echo "Unexpected error parsing true: ${err}"
+  return false
+}
+ensure(enabled, "happy path returns Bool")
+
+let missing = parse_flag("FEATURE", "") catch |err| {
+  match err {
+    error.ParserError.MissingValue => |info| {
+      ensure(info.name == "FEATURE", "MissingValue surfaces context")
+    }
+    else => {
+      echo "Wrong error variant: ${err}"
+      exit 1
+    }
+  }
+  return false
+}
+ensure(!missing, "missing input falls back to default")
+
+let invalid = parse_flag("FEATURE", "maybe") catch |err| {
+  match err {
+    error.ParserError.InvalidBool => |info| {
+      ensure(info.provided == "maybe", "InvalidBool exposes provided value")
+    }
+    else => {
+      echo "Wrong error variant: ${err}"
+      exit 1
+    }
+  }
+  return false
+}
+ensure(!invalid, "invalid input handled via match")
+
+echo "errors as first-class types test passed"

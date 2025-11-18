@@ -132,12 +132,13 @@
 - **Task 27:** Build the `cmd/runic` binary that accepts script paths, REPL mode, and options for tracing, module paths, and environment overrides. (completed 2025-11-16T10:24:00+01:00)
   - Replaced the stub `main` with a structured CLI parser that validates mutually exclusive script/REPL modes, handles repeated `--trace`, `--module-path`, and `--env KEY=VALUE` switches, and forwards script arguments (with `--` sentinels) verbatim to the yet-to-be-wired interpreter.
   - Added regression tests for both script and REPL invocations plus fresh README documentation so contributors know how to drive the new binary while the runtime remains under construction.
+  - Enabled the script runner so `runic <script>.rn` now reads the file, resolves modules, applies `let` bindings, and forwards pipelines to `CommandRunner`, surfacing diagnostics and exit codes just like the REPL.
 
 27. Build the `cmd/runic` binary that accepts script paths, REPL mode, and options for tracing, module paths, and environment overrides. (completed 2025-11-16T12:52:59+01:00)
 
 - **Task 28:** Wire REPL support for quick experiments, including syntax highlighting or at least multiline editing with history. (completed 2025-11-16T13:32:07+01:00)
   - Added `cmd/runic/repl.zig`, a raw-terminal REPL loop with multiline editing (continuations via `\`), arrow-key editing, persistent history, and meta commands such as `:help`, `:history`, and `:quit`, plus a lightweight tokenizer/pipeline builder backed by new tests.
-  - Hooked `runic --repl` to the new session, reused `CommandRunner` to execute entered pipelines, and refreshed the top-level README plus `cmd/runic/README.md` to document the workflow while keeping script execution in stub mode.
+  - Hooked `runic --repl` to the new session, reused `CommandRunner` to execute entered pipelines, and refreshed the top-level README plus `cmd/runic/README.md` to document the workflow alongside the script runner.
 
 28. Wire REPL support for quick experiments, including syntax highlighting or at least multiline editing with history. (completed 2025-11-16T13:17:01+01:00)
 
@@ -169,3 +170,9 @@
   - Documented how to invoke each script (and the useful `--trace` flags) directly from the CLI so contributors can validate ergonomics, and linked the new directory plus summaries from `README.md`.
 
 33. Add `examples/` Runic scripts showcasing the documented features and verifying CLI ergonomics. (completed 2025-11-16T15:32:07+01:00)
+
+- **Task 34:** Expand `README.md` (and potentially `docs/`) with instructions on building, running tests, authoring modules, and migrating from bash. (completed 2025-11-16T16:05:00+01:00)
+  - Reworked `README.md` with explicit toolchain requirements, a richer build section (covering debug/release flags and cache expectations), dedicated testing instructions, and new sections that teach module authorship plus bash migration workflows.
+  - Added `docs/module_authoring.md` and `docs/migrating-from-bash.md`, then linked them from both the README and `docs/README.md` so contributors can dive deeper into manifest schemas and incremental porting guidance.
+
+34. Expand `README.md` (and potentially `docs/`) with instructions on building, running tests, authoring modules, and migrating from bash. (completed 2025-11-16T23:24:20+01:00)

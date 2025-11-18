@@ -1,0 +1,3 @@
+fn greet(greeting: Str) Void {
+  return echo ${greeting}
+}

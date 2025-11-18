@@ -1,0 +1,26 @@
+{
+  "exports": [
+    {
+      "kind": "function",
+      "name": "add",
+      "params": [
+        { "name": "lhs", "type": { "kind": "primitive", "name": "int" } },
+        { "name": "rhs", "type": { "kind": "primitive", "name": "int" } }
+      ],
+      "return_type": { "kind": "primitive", "name": "int" }
+    },
+    {
+      "kind": "function",
+      "name": "square",
+      "params": [
+        { "name": "value", "type": { "kind": "primitive", "name": "int" } }
+      ],
+      "return_type": { "kind": "primitive", "name": "int" }
+    },
+    {
+      "kind": "value",
+      "name": "tau",
+      "type": { "kind": "primitive", "name": "float" }
+    }
+  ]
+}

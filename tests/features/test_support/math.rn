@@ -1,0 +1,10 @@
+fn add(x: Float, y: Float) Float {
+  return x + y
+}
+
+fn square(x: Float) Float {
+  return x * x
+}
+
+let pi = 3.14159
+let tau = pi * 2

@@ -220,6 +220,11 @@ local definitions = {
                 pattern = [[/\%(:\|->\)\s*\zs\%([?^!]*\h\w*\%(\.\h\w*\)*\)/]],
                 clauses = { "contains=RunicSigil" },
             },
+            {
+                type = "match",
+                pattern = [[/\%(^\|\W\)\zs[?^!]*\u\w*\%(\.\u\w*\)*/]],
+                clauses = { "contains=RunicSigil" },
+            },
         },
     },
     {
@@ -405,7 +410,7 @@ local definitions = {
         syntax = {
             {
                 type = "match",
-                pattern = [[/\%(^\|\%(|\|&\|;\|\%(||\|&&\)\)\)\s*\zs\%([./]\|\h\)\%([\w.\-\/]*\)/]],
+                pattern = [[/\%(^\|\%(|\|&\|;\|\%(||\|&&\)\)\)\s*\zs\%([./]\|\h\)\%(\k\|[./-]\)*/]],
                 clauses = { "contains=RunicBuiltinCmd" },
             },
         },

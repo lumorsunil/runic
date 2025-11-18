@@ -1,5 +1,6 @@
 # Zig cache and build output
 .zig-cache/
+zig-cache/
 zig-out/
 
 # Zig documentation AI helper

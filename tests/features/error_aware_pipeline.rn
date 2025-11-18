@@ -1,0 +1,19 @@
+// Tests pipeline status objects that capture per-stage failures.
+
+import ensure from "test_support/ensure"
+let ensure = ensure.ensure
+
+let healthy = (true | true)
+ensure(healthy.status.ok, "all stages succeed")
+
+let first_failure = (false | true)
+let first_status = first_failure.status
+ensure(!first_status.ok, "pipeline flagged failure")
+ensure(first_status.failed_stage == 0, "records first stage failure index")
+
+let second_failure = (true | false)
+let second_status = second_failure.status
+ensure(!second_status.ok, "second pipeline flagged failure")
+ensure(second_status.failed_stage == 1, "records downstream failure index")
+
+echo "error-aware pipeline test passed"

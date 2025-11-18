@@ -1,0 +1,18 @@
+// Tests embedding raw bash blocks for legacy snippets.
+
+import ensure from "test_support/ensure"
+let ensure = ensure.ensure
+
+bash {
+  echo "legacy-mode"
+  printf "still works\n"
+}
+
+let capture = bash {
+  printf "hello from bash\n" >&1
+}
+
+ensure(capture.stdout == "hello from bash\n", "bash block returns stdout")
+ensure(capture.status.ok, "bash block exit code captured")
+
+echo "legacy compatibility test passed"

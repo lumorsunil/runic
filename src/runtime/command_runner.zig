@@ -129,7 +129,10 @@ pub const CommandRunner = struct {
 
         if (args.stdin_data) |input| {
             var stdin_file = child.stdin orelse unreachable;
-            defer stdin_file.close();
+            defer {
+                stdin_file.close();
+                child.stdin = null;
+            }
             try stdin_file.writeAll(input);
         }
 
@@ -521,7 +524,7 @@ fn cloneBytes(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
         return allocator.alloc(u8, 0);
     }
     const copy = try allocator.alloc(u8, bytes.len);
-    std.mem.copy(u8, copy, bytes);
+    std.mem.copyForwards(u8, copy, bytes);
     return copy;
 }
 
@@ -536,7 +539,7 @@ fn needsQuotes(arg: []const u8) bool {
 fn copyOwnedSlice(allocator: std.mem.Allocator, bytes: []const u8, include: bool) !?[]u8 {
     if (!include) return null;
     const copy = try allocator.alloc(u8, bytes.len);
-    std.mem.copy(u8, copy, bytes);
+    std.mem.copyForwards(u8, copy, bytes);
     return copy;
 }
 

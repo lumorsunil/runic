@@ -1,0 +1,24 @@
+// Tests keyword-driven if/else blocks returning values.
+
+import ensure from "test_support/ensure"
+let ensure = ensure.ensure
+
+fn classify(count: Int) Str {
+  if count > 1 {
+    return "plural"
+  } else if count == 1 {
+    return "singular"
+  } else {
+    return "empty"
+  }
+}
+
+let plural = classify(3)
+let singular = classify(1)
+let zero = classify(0)
+
+ensure(plural == "plural", "if branch returns happy path")
+ensure(singular == "singular", "else-if branch honored")
+ensure(zero == "empty", "final else runs when previous checks fail")
+
+echo "structured flow control test passed"

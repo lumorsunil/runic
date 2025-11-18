@@ -1,0 +1,55 @@
+// Tests restricting functions to specific error sets so callers know exact failures.
+
+import ensure from "test_support/ensure"
+let ensure = ensure.ensure
+
+error FileError = union {
+  NotFound: { path: Str },
+  Unreadable: { path: Str },
+}
+
+fn read_config(path: Str) FileError!Str {
+  if path == "./tests/features/does-not-exist.conf" {
+    return error.FileError.NotFound { path }
+  }
+  if path == "./tests/features/protected.conf" {
+    return error.FileError.Unreadable { path }
+  }
+  return "key=value"
+}
+
+let missing = read_config("./tests/features/does-not-exist.conf") catch |err| {
+  match err {
+    error.FileError.NotFound => |info| {
+      ensure(info.path == "./tests/features/does-not-exist.conf", "NotFound path surfaced")
+    }
+    error.FileError.Unreadable => {
+      echo "Expected NotFound"
+      exit 1
+    }
+  }
+  return ""
+}
+ensure(missing == "", "missing config handled")
+
+let unreadable = read_config("./tests/features/protected.conf") catch |err| {
+  match err {
+    error.FileError.Unreadable => |info| {
+      ensure(info.path == "./tests/features/protected.conf", "Unreadable path surfaced")
+    }
+    else => {
+      echo "Expected Unreadable"
+      exit 1
+    }
+  }
+  return ""
+}
+ensure(unreadable == "", "unreadable config handled")
+
+let loaded = read_config("./tests/features/existing.conf") catch |err| {
+  echo "Unexpected error: ${err}"
+  return ""
+}
+ensure(loaded == "key=value", "valid config returned when no errors occur")
+
+echo "restricted error set test passed"

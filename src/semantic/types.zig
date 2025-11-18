@@ -15,6 +15,7 @@ pub const Type = union(enum) {
     function: FunctionType,
     error_set: ErrorSet,
     error_union: ErrorUnion,
+    structure: StructType,
     process_handle: ProcessHandleType,
 
     pub const Primitive = enum {
@@ -77,6 +78,15 @@ pub const Type = union(enum) {
         payload: TypeRef,
     };
 
+    pub const StructType = struct {
+        fields: []const Field,
+
+        pub const Field = struct {
+            name: []const u8,
+            ty: TypeRef,
+        };
+    };
+
     pub const ProcessHandleType = struct {
         mode: Mode,
         stdout: StreamShape,
@@ -124,6 +134,15 @@ pub const ProcessHandleDesc = struct {
     stdout: Type.ProcessHandleType.StreamShape,
     stderr: Type.ProcessHandleType.StreamShape,
     status: TypeRef,
+};
+
+pub const StructFieldDesc = struct {
+    name: []const u8,
+    ty: TypeRef,
+};
+
+pub const StructDesc = struct {
+    fields: []const StructFieldDesc = &.{},
 };
 
 /// TypeStore owns every instantiated `Type` node and guarantees the underlying
@@ -184,6 +203,18 @@ pub const TypeStore = struct {
         return copy;
     }
 
+    fn copyStructFields(self: *TypeStore, fields: []const StructFieldDesc) ![]const Type.StructType.Field {
+        const alloc = self.allocator();
+        const copy = try alloc.alloc(Type.StructType.Field, fields.len);
+        for (fields, 0..) |field, idx| {
+            copy[idx] = .{
+                .name = try self.dupeBytes(field.name),
+                .ty = field.ty,
+            };
+        }
+        return copy;
+    }
+
     pub fn primitive(self: *TypeStore, tag: Type.Primitive) !TypeRef {
         return self.create(.{ .primitive = tag });
     }
@@ -236,6 +267,12 @@ pub const TypeStore = struct {
         });
 
         return self.create(.{ .error_union = .{ .set = set, .payload = payload } });
+    }
+
+    pub fn structure(self: *TypeStore, desc: StructDesc) !TypeRef {
+        return self.create(.{
+            .structure = .{ .fields = try self.copyStructFields(desc.fields) },
+        });
     }
 
     pub fn processHandle(self: *TypeStore, desc: ProcessHandleDesc) !TypeRef {
@@ -355,6 +392,31 @@ test "process handles track stream configuration" {
             try std.testing.expectEqual(Type.ProcessHandleType.StreamDelivery.streaming, proc.stderr.delivery);
             try std.testing.expectEqual(bytes, proc.stderr.payload);
             try std.testing.expectEqual(status, proc.status);
+        },
+        else => return TestError.UnexpectedType,
+    }
+}
+
+test "struct types capture ordered field metadata" {
+    var store = TypeStore.init(std.testing.allocator);
+    defer store.deinit();
+
+    const str = try store.primitive(.string);
+    const float = try store.primitive(.float);
+    const result = try store.structure(.{
+        .fields = &.{
+            .{ .name = "value", .ty = float },
+            .{ .name = "ok", .ty = str },
+        },
+    });
+
+    switch (result.*) {
+        .structure => |info| {
+            try std.testing.expectEqual(@as(usize, 2), info.fields.len);
+            try std.testing.expectEqualStrings("value", info.fields[0].name);
+            try std.testing.expectEqual(float, info.fields[0].ty);
+            try std.testing.expectEqualStrings("ok", info.fields[1].name);
+            try std.testing.expectEqual(str, info.fields[1].ty);
         },
         else => return TestError.UnexpectedType,
     }

@@ -66,7 +66,7 @@ let config = load_config() catch |err| {
 Every emitted error must be handled explicitly—either propagated with `try` or resolved locally with `catch`—so the compiler guarantees nothing is silently dropped. The syntax mirrors Zig exactly, preserving muscle memory for developers already familiar with its error discipline.
 
 ```rn
-fn init() !void {
+fn init() !Void {
   try bootstrap_network(); // bubbles failures to the caller
 
   read_config("/etc/runic.conf") catch |err| {
@@ -253,7 +253,7 @@ if !status.ok {
 
 ## Module system and reuse
 
-Libraries live under `src/` and can be imported with clear syntax, enabling teams to package shared utilities across scripts.
+Libraries live alongside your scripts (or inside shared module directories) and can be imported with clear syntax, enabling teams to package shared utilities across scripts.
 
 ```rn
 import http from "net/http"
@@ -263,6 +263,43 @@ echo response.code
 ```
 
 **Result:** Modules encapsulate functionality, provide typed APIs, and return predictable structures such as HTTP response objects.
+
+To define your own module, add a `.rn` file relative to the script that will import it. A spec of `util/math` resolves to `<script_dir>/util/math.rn`:
+
+```rn
+// <script_dir>/util/math.rn
+fn add(lhs: Int, rhs: Int) Int {
+  return lhs + rhs
+}
+
+let pi = 3.14159
+```
+
+Each module also carries a manifest named `<file>.module.json` that documents which functions or values are exported and their types. The module loader reads this metadata to surface strongly-typed APIs to consumers:
+
+```json
+// <script_dir>/util/math.rn.module.json
+{
+  "exports": [
+    {
+      "kind": "function",
+      "name": "add",
+      "params": [
+        { "name": "lhs", "type": { "kind": "primitive", "name": "int" } },
+        { "name": "rhs", "type": { "kind": "primitive", "name": "int" } }
+      ],
+      "return_type": { "kind": "primitive", "name": "int" }
+    },
+    {
+      "kind": "value",
+      "name": "pi",
+      "type": { "kind": "primitive", "name": "float" }
+    }
+  ]
+}
+```
+
+The manifest uses a concise schema (`primitive`, `array`, `map`, `optional`, `promise`, etc.) so downstream scripts know what they are importing before the runtime executes the module. See `docs/module_authoring.md` for the full list of descriptors and publishing conventions.
 
 ## Legacy compatibility escape hatch
 
@@ -277,3 +314,16 @@ bash {
 ```
 
 **Result:** The block executes verbatim in bash, allowing existing snippets to run untouched while the surrounding script benefits from Runic’s safer semantics.
+
+## Structs
+
+Structs are a collection of fields, each with their own type.
+
+```rn
+let Result = struct {
+    value: ?Float,
+    ok: bool,
+}
+```
+
+**Result:** This binds an identifier Result to a type which is a struct. This way you can also alias types using let bindings and also create struct types on the fly as type expressions.

@@ -785,6 +785,16 @@ fn slicesEqual(a: []const types.TypeRef, b: []const types.TypeRef) bool {
     return true;
 }
 
+fn structFieldsEqual(a: []const types.Type.StructType.Field, b: []const types.Type.StructType.Field) bool {
+    if (a.len != b.len) return false;
+    for (a, 0..) |field_a, idx| {
+        const field_b = b[idx];
+        if (!std.mem.eql(u8, field_a.name, field_b.name)) return false;
+        if (!typesEqual(field_a.ty, field_b.ty)) return false;
+    }
+    return true;
+}
+
 fn typesEqual(a: types.TypeRef, b: types.TypeRef) bool {
     if (a == b) return true;
     const lhs = a.*;
@@ -823,6 +833,10 @@ fn typesEqual(a: types.TypeRef, b: types.TypeRef) bool {
         .error_set => |_| errorSetsEqual(a, b),
         .error_union => |left| switch (rhs) {
             .error_union => |right| typesEqual(left.set, right.set) and typesEqual(left.payload, right.payload),
+            else => false,
+        },
+        .structure => |left| switch (rhs) {
+            .structure => |right| structFieldsEqual(left.fields, right.fields),
             else => false,
         },
         .process_handle => |left| switch (rhs) {
@@ -895,6 +909,51 @@ test "inferBinding suggests try/catch when assigning error unions to plain bindi
             try std.testing.expectEqual(union_str, hint.actual);
             try std.testing.expectEqual(str, hint.payload);
             try std.testing.expectEqual(@as(usize, 6), hint.span.start.offset);
+        },
+        else => return TestViolationError.UnexpectedViolation,
+    }
+}
+
+test "struct annotations compare shape and ordering" {
+    var store = types.TypeStore.init(std.testing.allocator);
+    defer store.deinit();
+
+    const str = try store.primitive(.string);
+    const bool_ty = try store.primitive(.bool);
+
+    const result_alias = try store.structure(.{
+        .fields = &.{
+            .{ .name = "value", .ty = str },
+            .{ .name = "ok", .ty = bool_ty },
+        },
+    });
+
+    const result_copy = try store.structure(.{
+        .fields = &.{
+            .{ .name = "value", .ty = str },
+            .{ .name = "ok", .ty = bool_ty },
+        },
+    });
+
+    const reordered = try store.structure(.{
+        .fields = &.{
+            .{ .name = "ok", .ty = bool_ty },
+            .{ .name = "value", .ty = str },
+        },
+    });
+
+    var checker = TypeChecker.init(&store);
+    const inferred = try checker.inferBinding(result_alias, result_copy, fakeSpan(10));
+    try std.testing.expectEqual(result_alias, inferred);
+
+    try std.testing.expectError(
+        TypeError.AnnotationMismatch,
+        checker.inferBinding(result_alias, reordered, fakeSpan(12)),
+    );
+    switch (checker.violation().?) {
+        .annotation_mismatch => |info| {
+            try std.testing.expectEqual(result_alias, info.expected);
+            try std.testing.expectEqual(reordered, info.actual);
         },
         else => return TestViolationError.UnexpectedViolation,
     }

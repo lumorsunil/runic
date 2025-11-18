@@ -1,0 +1,22 @@
+// Tests typed bindings and annotated function signatures.
+
+import ensure from "test_support/ensure"
+let ensure = ensure.ensure
+
+fn add(lhs: Int, rhs: Int) Int {
+  return lhs + rhs
+}
+
+let typed_port: Int = 8080
+mut retries: Int = 1
+let config: Map(Str, Int) = { port: typed_port, retries: retries }
+let sum: Int = add(2, 3)
+
+retries = retries + 1
+
+ensure(typed_port == 8080, "annotated immutable binding stays constant")
+ensure(retries == 2, "annotated mutable binding updates")
+ensure(config.port == 8080, "map literal honors annotated values")
+ensure(sum == 5, "function annotations propagate correctly")
+
+echo "type annotations test passed"

@@ -1,0 +1,15 @@
+// Tests importing Runic modules via src/ manifests.
+
+import math from "test_support/math"
+import ensure from "test_support/ensure"
+let ensure = ensure.ensure
+
+let added = math.add(2, 3)
+let squared = math.square(4)
+let tau_value = math.tau
+
+ensure(added == 5, "imported function executed")
+ensure(squared == 16, "second function exported correctly")
+ensure(tau_value > 6.28, "value exports hydrate into caller scope")
+
+echo "module system test passed"

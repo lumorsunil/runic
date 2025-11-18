@@ -1,0 +1,34 @@
+// Tests async promises, ^T types, await capture blocks, and typed errors.
+
+import ensure from "test_support/ensure"
+let ensure = ensure.ensure
+
+error PromiseError = enum { Timeout }
+
+fn async_sum(lhs: Int, rhs: Int) ^Int {
+  async {
+    let total = lhs + rhs
+    return total
+  }
+}
+
+fn async_fail() ^PromiseError!Int {
+  async {
+    return error.PromiseError.Timeout
+  }
+}
+
+let pending = async_sum(2, 3)
+await (pending) |value| {
+  ensure(value == 5, "await unwraps resolved value")
+}
+
+let failing = async_fail()
+await (failing) |value| {
+  echo "Unexpected success ${value}"
+  exit 1
+} catch |err| {
+  ensure(err == error.PromiseError.Timeout, "await surfaces typed errors")
+}
+
+echo "promises test passed"
