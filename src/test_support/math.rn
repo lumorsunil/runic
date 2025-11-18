@@ -1,0 +1,11 @@
+// Simple math helpers used by module system tests.
+
+fn add(lhs: Int, rhs: Int) Int {
+  return lhs + rhs
+}
+
+fn square(value: Int) Int {
+  return value * value
+}
+
+let tau = 6.28318

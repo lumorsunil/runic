@@ -1,0 +1,30 @@
+// Tests optional bindings and Zig-style if-unwrapping.
+
+import ensure from "test_support/ensure"
+let ensure = ensure.ensure
+
+fn maybe_lookup(flag: Bool) ?Int {
+  if flag {
+    return 8080
+  }
+  return null
+}
+
+let has_port = maybe_lookup(true)
+let missing_port = maybe_lookup(false)
+
+if (has_port) |port| {
+  ensure(port == 8080, "optional unwrap exposes value")
+} else {
+  echo "Expected a port for has_port"
+  exit 1
+}
+
+if (missing_port) |port| {
+  echo "Unexpected port: ${port}"
+  exit 1
+} else {
+  ensure(true, "else branch runs when optional is null")
+}
+
+echo "optional data test passed"

@@ -24,7 +24,7 @@ Runic keeps the "just type commands" workflow but layers in contemporary program
 ## Core ideas
 
 1. **Modern syntax surface**: indentation-aware blocks or braces with required keywords, eliminating the mix of `then`, `fi`, `do`, and `done`.
-2. **Data primitives**: strings, numbers, booleans, arrays, and maps with predictable coercion rules and convenient literals.
+2. **Data primitives**: strings, numbers, booleans, arrays, and maps with predictable coercion rules and convenient literals. Type names must always begin with a capital letter (`Str`, `ProcessHandle`) so they stand out from value identifiers.
 3. **Command vs. expression separation**: explicit operators differentiate when you're invoking a program versus evaluating a language expression, reducing quoting headaches.
 4. **Error-aware pipelines**: pipeline execution surfaces per-stage exit codes, allowing guarded chaining without `set -e` footguns.
 5. **Module system**: reusable libraries and standard tooling for testing, formatting, and packaging scripts.
@@ -42,18 +42,31 @@ Runic aims to be familiar enough that a bash user can start using it immediately
 
 The interpreter and CLI are implemented in Zig (tested with Zig 0.15.1). Zig's build system drives the project layout: `src/` hosts the reusable interpreter modules, while `cmd/runic/` exposes the CLI entry point that imports those modules.
 
-### Build commands
+### Toolchain requirements
 
-- `zig build` — compiles the Runic CLI and installs it under `zig-out/bin/runic`.
-- `zig build run -- --help` — builds (if needed) and runs the CLI with any arguments passed after `--`.
-- `zig build test` — runs all Zig `test` blocks across the interpreter and CLI modules. Use the `ZIG_GLOBAL_CACHE_DIR` that is already configured in your shell (by Zig or the CI scripts) rather than overriding it for this command.
+- Install Zig 0.15.1 (matching the `build.zig` defaults). Confirm with `zig version`.
+- Ensure `zig` and `zig fmt` are on your `PATH`; every script in `scripts/` expects the CLI to be invocable directly.
+- Optional environment variables `RUNIC_LANG=zig` and `RUNIC_REPO_ROOT=/path/to/runic` are exported automatically by `scripts/run_ci.sh`, but you can set them manually when calling the stage scripts yourself.
+
+### Building from source
+
+1. From the repository root, run `zig build`. This produces `zig-out/bin/runic`.
+2. Use `zig build run -- --help` (or `zig-out/bin/runic --help` after building once) to confirm the CLI wiring.
+3. When experimenting with scripts, prefer `zig build run -- path/to/script.rn -- <args>` so Zig automatically rebuilds if any sources changed.
+4. For optimized binaries, pass `-Doptimize=ReleaseSafe` (or `ReleaseFast`) to `zig build`. Cross-compilation follows standard Zig flags (`-Dtarget=x86_64-linux-gnu`).
+5. Keep `ZIG_GLOBAL_CACHE_DIR` untouched so repeated builds share the same cache location (the CI scripts configure it for you).
+
+### Running tests
+
+- `zig build test` — executes every Zig `test` block, covering lexer/parser/runtime modules along with module-loader fixtures. Run this command before sending any PR.
+- `./scripts/run_ci.sh` — enforces formatter → linter → `zig build test` → CLI smoke suites (`tests/cli_*.sh`). Use this script for a full pre-push verification.
+- Stage-specific reruns: `./scripts/stages/unit_tests.sh`, `./scripts/stages/cli_smoke.sh`, etc., respect the same `RUNIC_REPO_ROOT`/`RUNIC_LANG` environment variables.
+- Add new CLI regression tests by dropping shell scripts under `tests/cli_*.sh`. They run inside `run_ci.sh` and should invoke `zig build run -- ...` to interact with the current binary.
 
 ### Formatting and linting
 
 - `zig fmt src cmd tests` formats every Zig source file and is enforced in CI before code review.
 - `zig fmt --check src cmd tests` runs the same formatter in check mode and doubles as our lint step (scripts treat any diff as a failure).
-
-All contributor tooling assumes Zig is installed and on the `PATH`. Optional environment variables `RUNIC_LANG=zig` and `RUNIC_REPO_ROOT=/path/to/runic` are set automatically by `scripts/run_ci.sh`, but they can be exported manually when invoking stage scripts directly.
 
 ## Development workflow
 
@@ -62,15 +75,39 @@ Run `./scripts/run_ci.sh` before pushing changes. The script enforces the format
 1. **Formatter** — runs `zig fmt` across `src/`, `cmd/`, and `tests/`.
 2. **Linter** — runs `zig fmt --check` on the same set of Zig sources so misformatted files fail the build.
 3. **Unit tests** — executes `zig build test` (without changing whatever `ZIG_GLOBAL_CACHE_DIR` is already exported), which compiles the interpreter as a module alongside the CLI and runs all `test` blocks.
-4. **CLI smoke tests** — executes every shell script that matches `tests/cli_*.sh` (a placeholder lives at `tests/cli_smoke.sh`). Replace the stub with real CLI invocations as soon as the interpreter is runnable.
+4. **CLI smoke tests** — executes every shell script that matches `tests/cli_*.sh` (a starter harness lives at `tests/cli_smoke.sh`). Extend these scripts with real CLI invocations as new scenarios land.
 
 Each stage stops the pipeline on failure so contributors get immediate feedback. Extend the stage scripts under `scripts/stages/` if a different toolchain or extra checks are required.
 
 Each stage script expects `RUNIC_REPO_ROOT` to point at the repository root and `RUNIC_LANG` to describe the toolchain; `scripts/run_ci.sh` exports both before invoking a stage. You can rerun an individual phase by calling, for example, `RUNIC_LANG=zig RUNIC_REPO_ROOT=$PWD ./scripts/stages/unit_tests.sh` when iterating on a specific failure.
 
+## Authoring modules
+
+Runic modules are regular `.rn` files paired with JSON manifests so the loader can expose typed exports to consumers:
+
+1. Place the implementation at `<script_dir>/<spec>.rn` (e.g. `scripts/net/http.rn`) and keep the spec lowercase with `/` separators.
+2. Create `<script_dir>/<spec>.rn.module.json` to declare the module's public surface. Each entry in the `exports` array is either a function (with `params`, `return_type`, and optional `is_async`) or a value with a `type` descriptor.
+3. Supported type descriptors include `primitive`, `array`, `map`, `optional`, and `promise`, matching the Zig-side parser in `src/runtime/module_loader.zig`.
+4. Import the module from scripts using `import http from "net/http"`. Supplement search paths with `--module-path <dir>` when iterating on modules stored outside the importing script's directory.
+5. Validate manifests by running `zig build test` (the module loader has dedicated fixtures) and by invoking a small script via `zig build run -- examples/<script>.rn`.
+
+See `docs/module_authoring.md` for the full manifest schema, type descriptor explanations, and a sample manifest.
+
+## Migrating from bash
+
+Runic keeps the familiar pipeline mindset while removing bash-specific hazards. To migrate existing scripts:
+
+- Port declarations/functions to typed Runic syntax (`let`, `mut`, `fn`) before touching command pipelines so behavior stays verifiable.
+- Replace `source`-style helper files with modules plus manifests (described above) to surface typed APIs.
+- Handle failures with `try`/`catch` and typed status objects rather than `set -e` and `$?`.
+- Embed unported fragments inside `bash { ... }` blocks so you can gradually shrink the compatibility surface without blocking the rest of the script.
+- Exercise the in-progress interpreter via `zig build run -- path/to/script.rn --trace pipeline` and add CLI smoke tests to `tests/` as soon as a migration lands.
+
+`docs/migrating-from-bash.md` includes a checklist that walks through the recommended workflow, highlights common traps, and links back to `features.md` entries that replace legacy bash behaviors.
+
 ## CLI usage
 
-The `cmd/runic` binary accepts either a script path or `--repl` and exposes switches for tracing, module lookup paths, and environment overrides. Script execution still prints a structured summary while the interpreter lands, but `--repl` now launches an interactive shell so quick experiments feel closer to a finished experience.
+The `cmd/runic` binary accepts either a script path or `--repl` and exposes switches for tracing, module lookup paths, and environment overrides. Script execution now parses `.rn` files directly, honors import/module lookups, `let` bindings, and pipelines, and forwards diagnostics/command output just like the REPL, which still provides a friendlier surface for quick experiments.
 
 A typical invocation looks like:
 
@@ -78,7 +115,7 @@ A typical invocation looks like:
 # run a script with inline args, capturing CLI options for the interpreter
 zig build run -- path/to/script.rn --trace parser --module-path ./lib -- --flag value
 
-# request the REPL stub (syntax-aware history lands in plan task 28)
+# request the REPL (syntax-aware history lands in plan task 28)
 zig build run -- --repl
 ```
 
@@ -88,7 +125,7 @@ Key flags:
 - `--repl` — enter REPL mode instead of executing a script. The REPL provides history, multiline editing (continue a command with a trailing `\`), and meta commands such as `:history`, `:help`, and `:quit`.
 - `--trace <topic>` — enable structured tracing for the given interpreter subsystem. Current topics are `pipeline` (per-stage spawn/exit), `process` (handle summaries, stage outcomes, and captured IO sizes), and `async` (scheduler + promise lifecycle). Repeat the flag to collect multiple targets (e.g. `--trace pipeline --trace process`).
 - `--module-path <dir>` — prepend an additional directory to the module loader search roots. This mirrors `import foo from "custom/foo"` scenarios from `features.md`.
-- `--env KEY=VALUE` — override environment bindings that will eventually be forwarded to script executions and background commands.
+- `--env KEY=VALUE` — override environment bindings that will be forwarded to script executions and background commands.
 
 After the script path, `runic` forwards every argument verbatim. Insert `--` between the script and its arguments when you need to pass values that look like CLI flags.
 

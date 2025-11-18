@@ -2,6 +2,24 @@
 
 This plan decomposes the work required to build an interpreter that satisfies the behavior described in `features.md`. Each phase lists the concrete tasks and their expected outputs so progress can be tracked in order.
 
+## Interpreter Gap Assessment
+- `cmd/runic/main.zig` now executes `.rn` scripts through the command runner, yet the full interpreter pipeline (parser, analyzer, evaluator) still needs to be wired so declarations, functions, and control flow behave exactly as documented in `features.md`.
+- The REPL implemented in `cmd/runic/repl.zig` bypasses the actual language pipeline by tokenizing input into bare command pipelines and forwarding them directly to `CommandRunner`, which means declarations, functions, and structured flow control cannot be tested interactively.
+- `src/frontend/` currently ships `token.zig`, `lexer.zig`, `ast.zig`, and regression tests, but there is no parser module that turns tokens into AST nodes, leaving the rest of the interpreter without an entry point.
+- There is no execution engine that walks AST nodes—`src/runtime/` provides building blocks (`command_runner.zig`, `scheduler.zig`, `match_executor.zig`, `module_loader.zig`, etc.), yet nothing wires them together to evaluate statements, manage scopes, or surface diagnostics.
+
+## Interpreter Bring-Up Backlog
+- **IB1 — Parser & program builder:** Add `src/frontend/parser.zig` (plus helpers) that consumes the streaming lexer, produces the AST structures defined in `ast.zig`, and records diagnostics with precise spans. The parser should cover every construct documented in `features.md`, provide partial-recovery so multiple errors can be reported, and expose an API the CLI can call to parse entire files or REPL snippets.
+- **IB2 — Semantic binder & type checking pipeline:** Introduce an analyzer that walks parsed ASTs, populates `semantic/symbols.zig` tables, resolves identifiers, and invokes the existing `TypeChecker` APIs to enforce annotations, optional/promise captures, match exhaustiveness, and control-flow requirements. This pass needs to surface violation metadata through `frontend/diagnostics.zig` and prepare a typed program IR (or annotate the AST) that the interpreter can execute.
+- **IB3 — Interpreter core & evaluation state:** Create a runtime package (e.g., `src/interpreter/`) that owns evaluation contexts, environments, module instances, and value representations. This layer should:
+  - Evaluate statements/expressions, emit/propagate typed values, and enforce immutability at runtime.
+  - Invoke `runtime/command_runner.zig` for pipelines, coordinate background jobs through `runtime/scheduler.zig`, and surface process handles that obey the `features.md` contract.
+  - Integrate `runtime/match_executor.zig`, `runtime/module_loader.zig`, `runtime/bash_executor.zig`, and `runtime/stack_trace.zig` so control flow, imports, and diagnostics behave consistently.
+  - Provide tracing hooks via `runtime/tracing.zig` so `--trace` topics mirror REPL logging.
+- **IB4 — Script runner integration:** Ensure `cmd/runic/main.zig` wires script mode into the parser/analyzer/interpreter pipeline so `runic <script> [args]` loads the file, executes it, and applies CLI flags (module paths, env overrides, tracing topics). Script mode must manage exit codes (non-zero on diagnostics or runtime errors) and forward stdout/stderr from both commands and interpreter diagnostics deterministically.
+- **IB5 — REPL integration:** Reuse the new interpreter pipeline inside `cmd/runic/repl.zig` so interactive commands parse and evaluate using the same semantics as scripts. This entails feeding multi-line input to the parser, maintaining persistent scopes between submissions, surfacing diagnostics inline, and keeping support for the existing meta-commands (`:help`, `:history`, `:quit`).
+- **IB6 — Tests & documentation for the interpreter:** Add end-to-end tests under `tests/` that compile small `.rn` fixtures, assert interpreter outputs/exit codes, and cover both success/failure flows (pipelines, errors, async await, modules). Update `README.md`, `docs/progress.md`, and `docs/plan.md` with the new workflow so contributors know how to run scripts, REPL sessions, and regression suites once the interpreter is live.
+
 ## Phase 1 — Repository & Tooling Scaffolding
 1. Establish the canonical directory layout: `src/` for interpreter modules, `cmd/runic/` for the CLI entry point, `tests/` for integration suites, and `docs/` for reference material.
 2. Select the implementation language (e.g., Rust, Zig, or Go) and create the initial build configuration, formatter targets, and lint commands; document them in `README.md`.

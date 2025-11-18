@@ -1,0 +1,14 @@
+// Tests command-first execution and pipeline semantics.
+
+import ensure from "test_support/ensure"
+let ensure = ensure.ensure
+
+let pipeline = echo "command-first" | upper
+ensure(pipeline.status.ok, "pipeline executed successfully")
+ensure(pipeline.stdout == "COMMAND-FIRST\n", "pipeline transformed input")
+
+let chained = echo "pipeline" | upper | tr "A-Z" "a-z"
+ensure(chained.status.ok, "chained pipeline executed successfully")
+ensure(chained.stdout == "pipeline\n", "chained pipeline preserved flow")
+
+echo "command-first execution test passed"

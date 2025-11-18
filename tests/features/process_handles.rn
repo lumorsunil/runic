@@ -1,0 +1,22 @@
+// Tests process handles, destructuring stdout/stderr/exit_code, and background handles.
+
+import ensure from "test_support/ensure"
+let ensure = ensure.ensure
+
+let { stdout: src_listing, stderr: src_errors, exit_code } = ls ./src
+ensure(exit_code == 0, "ls exited cleanly")
+ensure(src_errors == "", "stderr is empty for successful sync command")
+ensure(src_listing != "", "stdout captured interpreter files")
+
+let background = echo "background-complete" &
+let finished = await background
+ensure(finished.status.ok, "background process resolved successfully")
+ensure(finished.stdout == "background-complete\n", "await returned buffered stdout")
+
+if background |stdout, stderr, status| {
+  ensure(status.ok, "if-capture awaited background process implicitly")
+  ensure(stderr == "", "captured stderr remains empty")
+  ensure(stdout == "background-complete\n", "captured stdout matches awaited value")
+}
+
+echo "process handles test passed"

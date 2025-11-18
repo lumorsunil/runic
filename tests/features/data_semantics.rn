@@ -1,0 +1,20 @@
+// Tests immutable vs mutable bindings plus literal arrays and maps.
+
+import ensure from "test_support/ensure"
+let ensure = ensure.ensure
+
+let greeting = "hello"
+mut retries = 2
+let services = ["api", "jobs", "web"]
+let thresholds = { api: 200, jobs: 350, web: 150 }
+
+retries = retries + 1
+let first_service = services[0]
+let job_threshold = thresholds.jobs
+
+ensure(greeting == "hello", "immutable binding preserved")
+ensure(retries == 3, "mutable binding updated explicitly")
+ensure(first_service == "api", "arrays preserve order")
+ensure(job_threshold == 350, "maps retain structured access")
+
+echo "data semantics test passed"

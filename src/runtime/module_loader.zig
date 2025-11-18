@@ -2,8 +2,8 @@ const std = @import("std");
 const types = @import("../semantic/types.zig");
 
 /// ModuleLoader resolves `import http from "net/http"` style specs into source
-/// files rooted under `src/` (configurable) and surfaces the typed export
-/// signatures declared in each manifest.
+/// files relative to the importing script's directory (or additional search
+/// paths) and surfaces the typed export signatures declared in each manifest.
 pub const ModuleLoader = struct {
     allocator: std.mem.Allocator,
     store: *types.TypeStore,
@@ -24,7 +24,6 @@ pub const ModuleLoader = struct {
         };
 
     pub const Config = struct {
-        root_dir: []const u8 = "src",
         source_extension: []const u8 = ".rn",
         manifest_suffix: []const u8 = ".module.json",
         manifest_max_bytes: usize = 1 << 20,
@@ -35,7 +34,6 @@ pub const ModuleLoader = struct {
             .allocator = allocator,
             .store = store,
             .config = .{
-                .root_dir = try dupe(allocator, config.root_dir),
                 .source_extension = try dupe(allocator, config.source_extension),
                 .manifest_suffix = try dupe(allocator, config.manifest_suffix),
                 .manifest_max_bytes = config.manifest_max_bytes,
@@ -52,24 +50,23 @@ pub const ModuleLoader = struct {
             self.allocator.destroy(module);
         }
         self.modules.deinit(self.allocator);
-        self.allocator.free(self.config.root_dir);
         self.allocator.free(self.config.source_extension);
         self.allocator.free(self.config.manifest_suffix);
         self.* = undefined;
     }
 
-    pub fn load(self: *ModuleLoader, spec_literal: []const u8) Error!*Module {
+    pub fn load(self: *ModuleLoader, importer_dir: []const u8, spec_literal: []const u8) Error!*Module {
         const spec = try self.normalizeSpec(spec_literal);
         var spec_cleanup = true;
         defer if (spec_cleanup) self.allocator.free(spec);
 
-        if (self.modules.get(spec)) |module| {
-            return module;
-        }
-
-        const source_path = try self.buildPath(spec, self.config.source_extension);
+        const source_path = try self.buildPath(importer_dir, spec, self.config.source_extension);
         var source_cleanup = true;
         defer if (source_cleanup) self.allocator.free(source_path);
+
+        if (self.modules.get(source_path)) |module| {
+            return module;
+        }
 
         try self.ensureFileExists(source_path);
 
@@ -102,7 +99,7 @@ pub const ModuleLoader = struct {
 
         try self.populateExports(module, parsed.value);
 
-        try self.modules.put(self.allocator, module.spec, module);
+        try self.modules.put(self.allocator, module.source_path, module);
         return module;
     }
 
@@ -233,6 +230,28 @@ pub const ModuleLoader = struct {
             const payload_value = try expectField(obj, "payload");
             const payload = try self.parseType(payload_value);
             return self.store.promise(payload);
+        } else if (std.mem.eql(u8, kind, "struct")) {
+            const fields_value = try expectField(obj, "fields");
+            const fields_array = try expectArray(fields_value, "fields");
+            if (fields_array.items.len == 0) {
+                return self.store.structure(.{});
+            }
+
+            var field_descs = try self.allocator.alloc(types.StructFieldDesc, fields_array.items.len);
+            defer self.allocator.free(field_descs);
+
+            for (fields_array.items, 0..) |field_entry, idx| {
+                const field_obj = try expectObject(field_entry, "struct field");
+                const field_name = try expectStringField(field_obj, "name");
+                const field_type_value = try expectField(field_obj, "type");
+                const field_type = try self.parseType(field_type_value);
+                field_descs[idx] = .{
+                    .name = field_name,
+                    .ty = field_type,
+                };
+            }
+
+            return self.store.structure(.{ .fields = field_descs[0..fields_array.items.len] });
         }
 
         return Error.ManifestInvalid;
@@ -255,12 +274,17 @@ pub const ModuleLoader = struct {
         return builder.toOwnedSlice();
     }
 
-    fn buildPath(self: *ModuleLoader, spec: []const u8, extension: []const u8) ![]u8 {
+    fn buildPath(
+        self: *ModuleLoader,
+        importer_dir: []const u8,
+        spec: []const u8,
+        extension: []const u8,
+    ) ![]u8 {
         var builder = std.ArrayList(u8).init(self.allocator);
         errdefer builder.deinit();
 
-        if (self.config.root_dir.len > 0) {
-            try builder.appendSlice(self.config.root_dir);
+        if (importer_dir.len > 0) {
+            try builder.appendSlice(importer_dir);
         }
 
         if (spec.len > 0) {
@@ -463,6 +487,17 @@ test "module loader resolves typed APIs from manifest" {
             \\        "kind": "array",
             \\        "element": { "kind": "primitive", "name": "string" }
             \\      }
+            \\    },
+            \\    {
+            \\      "kind": "value",
+            \\      "name": "result_type",
+            \\      "type": {
+            \\        "kind": "struct",
+            \\        "fields": [
+            \\          { "name": "value", "type": { "kind": "primitive", "name": "float" } },
+            \\          { "name": "ok", "type": { "kind": "primitive", "name": "bool" } }
+            \\        ]
+            \\      }
             \\    }
             \\  ]
             \\}
@@ -475,10 +510,10 @@ test "module loader resolves typed APIs from manifest" {
     const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, "src");
     defer std.testing.allocator.free(root_path);
 
-    var loader = try ModuleLoader.init(std.testing.allocator, &store, .{ .root_dir = root_path });
+    var loader = try ModuleLoader.init(std.testing.allocator, &store, .{});
     defer loader.deinit();
 
-    const module = try loader.load("net/http");
+    const module = try loader.load(root_path, "net/http");
     try std.testing.expectEqualStrings("net/http", module.spec);
 
     const expected_source = try std.fmt.allocPrint(
@@ -497,7 +532,7 @@ test "module loader resolves typed APIs from manifest" {
     defer std.testing.allocator.free(expected_manifest);
     try std.testing.expectEqualStrings(expected_manifest, module.manifest_path);
 
-    try std.testing.expectEqual(@as(usize, 2), module.exports.len);
+    try std.testing.expectEqual(@as(usize, 3), module.exports.len);
 
     const export_get = module.exports[0];
     try std.testing.expect(std.meta.activeTag(export_get) == .function);
@@ -527,8 +562,23 @@ test "module loader resolves typed APIs from manifest" {
     try std.testing.expectEqualStrings("default_headers", default_headers.name);
     try std.testing.expect(std.meta.activeTag(default_headers.ty.*) == .array);
     try std.testing.expect(std.meta.activeTag(default_headers.ty.*.array.element.*) == .primitive);
+    try std.testing.expect(default_headers.ty.*.array.element.*.primitive == types.Type.Primitive.string);
 
-    const module_again = try loader.load("net/http");
+    const export_struct = module.exports[2];
+    try std.testing.expect(std.meta.activeTag(export_struct) == .value);
+    const result_value = export_struct.value;
+    try std.testing.expectEqualStrings("result_type", result_value.name);
+    try std.testing.expect(std.meta.activeTag(result_value.ty.*) == .structure);
+    const struct_info = result_value.ty.*.structure;
+    try std.testing.expectEqual(@as(usize, 2), struct_info.fields.len);
+    try std.testing.expectEqualStrings("value", struct_info.fields[0].name);
+    try std.testing.expect(std.meta.activeTag(struct_info.fields[0].ty.*) == .primitive);
+    try std.testing.expect(struct_info.fields[0].ty.*.primitive == types.Type.Primitive.float);
+    try std.testing.expectEqualStrings("ok", struct_info.fields[1].name);
+    try std.testing.expect(std.meta.activeTag(struct_info.fields[1].ty.*) == .primitive);
+    try std.testing.expect(struct_info.fields[1].ty.*.primitive == types.Type.Primitive.bool);
+
+    const module_again = try loader.load(root_path, "net/http");
     try std.testing.expectEqual(module, module_again);
 }
 
@@ -539,12 +589,12 @@ test "module loader rejects invalid specs and missing manifests" {
     const root = try std.fs.cwd().realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(root);
 
-    var loader = try ModuleLoader.init(std.testing.allocator, &store, .{ .root_dir = root });
+    var loader = try ModuleLoader.init(std.testing.allocator, &store, .{});
     defer loader.deinit();
 
-    try std.testing.expectError(ModuleLoader.Error.InvalidSpec, loader.load(""));
-    try std.testing.expectError(ModuleLoader.Error.InvalidSpec, loader.load("../net/http"));
-    try std.testing.expectError(ModuleLoader.Error.InvalidSpec, loader.load("net//http"));
+    try std.testing.expectError(ModuleLoader.Error.InvalidSpec, loader.load(root, ""));
+    try std.testing.expectError(ModuleLoader.Error.InvalidSpec, loader.load(root, "../net/http"));
+    try std.testing.expectError(ModuleLoader.Error.InvalidSpec, loader.load(root, "net//http"));
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -557,7 +607,59 @@ test "module loader rejects invalid specs and missing manifests" {
     const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, "src");
     defer std.testing.allocator.free(root_path);
 
-    var isolated_loader = try ModuleLoader.init(std.testing.allocator, &store, .{ .root_dir = root_path });
+    var isolated_loader = try ModuleLoader.init(std.testing.allocator, &store, .{});
     defer isolated_loader.deinit();
-    try std.testing.expectError(ModuleLoader.Error.ManifestNotFound, isolated_loader.load("fs/temp"));
+    try std.testing.expectError(ModuleLoader.Error.ManifestNotFound, isolated_loader.load(root_path, "fs/temp"));
+}
+
+test "module loader resolves relative to importer directory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("alpha/util");
+    try tmp.dir.makePath("beta/util");
+
+    {
+        var file = try tmp.dir.createFile("alpha/util/math.rn", .{});
+        defer file.close();
+        try file.writeAll("// alpha\n");
+    }
+    {
+        var manifest = try tmp.dir.createFile("alpha/util/math.rn.module.json", .{});
+        defer manifest.close();
+        try manifest.writeAll(
+            \\{ "exports": [{ "kind": "value", "name": "alpha", "type": { "kind": "primitive", "name": "int" } }] }
+        );
+    }
+    {
+        var file = try tmp.dir.createFile("beta/util/math.rn", .{});
+        defer file.close();
+        try file.writeAll("// beta\n");
+    }
+    {
+        var manifest = try tmp.dir.createFile("beta/util/math.rn.module.json", .{});
+        defer manifest.close();
+        try manifest.writeAll(
+            \\{ "exports": [{ "kind": "value", "name": "beta", "type": { "kind": "primitive", "name": "int" } }] }
+        );
+    }
+
+    var store = types.TypeStore.init(std.testing.allocator);
+    defer store.deinit();
+
+    var loader = try ModuleLoader.init(std.testing.allocator, &store, .{});
+    defer loader.deinit();
+
+    const alpha_dir = try tmp.dir.realpathAlloc(std.testing.allocator, "alpha");
+    defer std.testing.allocator.free(alpha_dir);
+    const beta_dir = try tmp.dir.realpathAlloc(std.testing.allocator, "beta");
+    defer std.testing.allocator.free(beta_dir);
+
+    const alpha_module = try loader.load(alpha_dir, "util/math");
+    const beta_module = try loader.load(beta_dir, "util/math");
+
+    try std.testing.expect(alpha_module != beta_module);
+    try std.testing.expect(!std.mem.eql(u8, alpha_module.source_path, beta_module.source_path));
+    try std.testing.expect(std.mem.indexOf(u8, alpha_module.source_path, "alpha") != null);
+    try std.testing.expect(std.mem.indexOf(u8, beta_module.source_path, "beta") != null);
 }

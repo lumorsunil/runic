@@ -1,0 +1,32 @@
+// Tests for/while iterator syntax with capture clauses.
+
+import ensure from "test_support/ensure"
+let ensure = ensure.ensure
+
+let fruits = ["apple", "banana", "pear"]
+mut order_checks = 0
+
+for (fruits, 0..) |fruit, idx| {
+  if fruit == "apple" {
+    ensure(idx == 0, "first item index captured")
+    order_checks = order_checks + 1
+  }
+  if fruit == "pear" {
+    ensure(idx == 2, "last item index captured")
+    order_checks = order_checks + 1
+  }
+}
+
+ensure(order_checks == 2, "for loop visited expected entries")
+
+let reader = file.open("README.md")
+mut heading_lines = 0
+while reader.lines() |line| {
+  if line.starts_with("#") {
+    heading_lines = heading_lines + 1
+  }
+}
+
+ensure(heading_lines >= 1, "while loop consumed iterator until condition met")
+
+echo "native iteration test passed"

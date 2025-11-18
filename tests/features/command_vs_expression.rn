@@ -1,0 +1,15 @@
+// Tests deliberate separation between shell commands and pure expressions.
+
+import ensure from "test_support/ensure"
+let ensure = ensure.ensure
+
+let command_handle = ls ./tests
+ensure(command_handle.status.ok, "command executed using process semantics")
+
+let expression_value = (2 + 3) * 2
+ensure(expression_value == 10, "pure expression evaluated without invoking a process")
+
+let combined_summary = "command_ok=${command_handle.status.ok} expr=${expression_value}"
+ensure(combined_summary == "command_ok=true expr=10", "outputs from both sides can be composed explicitly")
+
+echo "command vs expression separation test passed"

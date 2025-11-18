@@ -1,0 +1,8 @@
+let abc = ["abc", "def", "ghi"]
+
+let Position = struct {
+  x: Float,
+  y: Float,
+}
+
+echo ${abc}

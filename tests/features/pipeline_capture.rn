@@ -1,0 +1,15 @@
+// Tests capturing stdout/stderr from pipelines and redirecting into variables.
+
+import ensure from "test_support/ensure"
+let ensure = ensure.ensure
+
+let tee_run = (echo "capture" | tee /dev/null)
+ensure(tee_run.status.ok, "tee pipeline succeeds")
+ensure(tee_run.stdout == "capture\n", "tee preserved stdout for inspection")
+
+let captured = echo "caps" | upper 1>$upper_stdout 2>$upper_stderr
+ensure(captured.status.ok, "redirect pipeline succeeded")
+ensure(upper_stdout.stdout == "CAPS\n", "stdout redirection filled variable")
+ensure(upper_stderr.stdout == "", "stderr redirection stays empty")
+
+echo "pipeline capture test passed"
