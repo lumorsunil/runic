@@ -83,13 +83,12 @@ Promises use the dedicated `^T` shorthand and lean on `async`/`await` keywords:
 
 ## Modules and Imports
 
-Modules load through `import`/`from` statements and member access uses the
-existing `dot` token:
+Modules load through the special `import()` call inside `let` bindings, and
+member access uses the existing `dot` token:
 
 | Tag | Lexeme | Purpose |
 | --- | --- | --- |
-| `kw_import` | `import` | Starts an import declaration |
-| `kw_from` | `from` | Provides the module path |
+| `kw_import` | `import` | Starts an import binding |
 | `dot` | `.` | Member access within imported modules |
 
 ## `bash { ... }` Compatibility Blocks

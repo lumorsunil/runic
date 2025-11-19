@@ -256,7 +256,7 @@ if !status.ok {
 Libraries live alongside your scripts (or inside shared module directories) and can be imported with clear syntax, enabling teams to package shared utilities across scripts.
 
 ```rn
-import http from "net/http"
+let http = import("net/http")
 
 let response = http.get("https://example.com/status")
 echo response.code
@@ -327,3 +327,25 @@ let Result = struct {
 ```
 
 **Result:** This binds an identifier Result to a type which is a struct. This way you can also alias types using let bindings and also create struct types on the fly as type expressions.
+
+## Files are structs
+
+Just like in zig, all files in runic are implicitly structs. All functions or declarations in a file will exist on the struct type of the file.
+
+```rn
+// lib.rn
+
+fn add(x: Float, y: Float) Float {
+  return x + y
+}
+```
+
+```rn
+// main.rn
+
+let lib = import("lib")
+
+echo lib.add(3, 5)
+```
+
+**Result:** `lib.rn` will become a struct type with a function `add` declared on it. `main.rn` is importing `lib.rn` and binding it to the identifier `lib`. `lib` is of the type `struct { fn add(x: Float, y: Float) }`.

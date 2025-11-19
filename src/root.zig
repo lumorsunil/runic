@@ -4,6 +4,7 @@ const std = @import("std");
 pub const token = @import("frontend/token.zig");
 pub const lexer = @import("frontend/lexer.zig");
 pub const ast = @import("frontend/ast.zig");
+pub const parser = @import("frontend/parser.zig");
 pub const diagnostics = @import("frontend/diagnostics.zig");
 pub const types = @import("semantic/types.zig");
 pub const symbols = @import("semantic/symbols.zig");
@@ -15,6 +16,7 @@ pub const match_executor = @import("runtime/match_executor.zig");
 pub const module_loader = @import("runtime/module_loader.zig");
 pub const stack_trace = @import("runtime/stack_trace.zig");
 pub const tracing = @import("runtime/tracing.zig");
+pub const interpreter = @import("interpreter/root.zig");
 
 comptime {
     _ = @import("frontend/parser_tests.zig");

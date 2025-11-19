@@ -1,7 +1,6 @@
 // Tests command-first execution and pipeline semantics.
 
-import ensure from "test_support/ensure"
-let ensure = ensure.ensure
+let ensure = import("test_support/ensure").ensure
 
 let pipeline = echo "command-first" | upper
 ensure(pipeline.status.ok, "pipeline executed successfully")

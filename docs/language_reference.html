@@ -328,7 +328,7 @@ if is_plural {
           <p>Opaque byte buffers for binary payloads such as HTTP bodies or archive blobs. Keep text/bytes conversions explicit.</p>
           <div>
             <div class="example-label">Example</div>
-            <pre><code class="language-rn">import http from "net/http"
+            <pre><code class="language-rn">let http = import("net/http")
 
 let resp = http.get("https://example.com/status")
 let payload: Bytes = resp.body</code></pre>
@@ -648,7 +648,7 @@ if !status.ok {
           <p>Import reusable helpers from <code>src/</code> via manifest-backed modules so scripts depend on typed APIs.</p>
           <div>
             <div class="example-label">Example</div>
-            <pre><code class="language-rn">import http from "net/http"
+            <pre><code class="language-rn">let http = import("net/http")
 
 let response = http.get("https://example.com/status")
 echo response.code</code></pre>

@@ -1,7 +1,7 @@
 const std = @import("std");
 const types = @import("../semantic/types.zig");
 
-/// ModuleLoader resolves `import http from "net/http"` style specs into source
+/// ModuleLoader resolves `let http = import("net/http")` style specs into source
 /// files relative to the importing script's directory (or additional search
 /// paths) and surfaces the typed export signatures declared in each manifest.
 pub const ModuleLoader = struct {
@@ -91,6 +91,7 @@ pub const ModuleLoader = struct {
             .source_path = source_path,
             .manifest_path = manifest_path,
             .exports = &[_]Module.Export{},
+            .struct_type = undefined,
         };
         spec_cleanup = false;
         source_cleanup = false;
@@ -98,6 +99,7 @@ pub const ModuleLoader = struct {
         errdefer module.deinit(self.allocator);
 
         try self.populateExports(module, parsed.value);
+        module.struct_type = try self.buildStructType(module.exports);
 
         try self.modules.put(self.allocator, module.source_path, module);
         return module;
@@ -333,6 +335,40 @@ pub const ModuleLoader = struct {
 
         return builder.toOwnedSlice();
     }
+
+    fn buildStructType(self: *ModuleLoader, exports: []const Module.Export) Error!types.TypeRef {
+        if (exports.len == 0) {
+            return try self.store.structure(.{});
+        }
+
+        var fields = try self.allocator.alloc(types.StructFieldDesc, exports.len);
+        defer self.allocator.free(fields);
+
+        for (exports, 0..) |entry, idx| {
+            fields[idx] = .{
+                .name = exportName(entry),
+                .ty = try self.fieldTypeForExport(entry),
+            };
+        }
+
+        return self.store.structure(.{ .fields = fields });
+    }
+
+    fn fieldTypeForExport(self: *ModuleLoader, desc: Module.Export) Error!types.TypeRef {
+        return switch (desc) {
+            .function => |fn_export| blk: {
+                const param_types = try self.allocator.alloc(types.TypeRef, fn_export.params.len);
+                defer self.allocator.free(param_types);
+
+                for (fn_export.params, 0..) |param, idx| {
+                    param_types[idx] = param.ty;
+                }
+
+                break :blk try self.store.function(param_types, fn_export.return_type, fn_export.is_async);
+            },
+            .value => |value_export| value_export.ty,
+        };
+    }
 };
 
 pub const Module = struct {
@@ -340,6 +376,7 @@ pub const Module = struct {
     source_path: []const u8,
     manifest_path: []const u8,
     exports: []Module.Export,
+    struct_type: types.TypeRef,
 
     pub const Export = union(enum) {
         function: FunctionExport,
@@ -424,6 +461,13 @@ fn expectStringField(obj: std.json.ObjectMap, field: []const u8) ModuleLoader.Er
 
 fn expectField(obj: std.json.ObjectMap, field: []const u8) ModuleLoader.Error!std.json.Value {
     return obj.get(field) orelse ModuleLoader.Error.ManifestInvalid;
+}
+
+fn exportName(desc: Module.Export) []const u8 {
+    return switch (desc) {
+        .function => |fn_export| fn_export.name,
+        .value => |value_export| value_export.name,
+    };
 }
 
 fn segmentAllowed(segment: []const u8) bool {
@@ -578,6 +622,24 @@ test "module loader resolves typed APIs from manifest" {
     try std.testing.expect(std.meta.activeTag(struct_info.fields[1].ty.*) == .primitive);
     try std.testing.expect(struct_info.fields[1].ty.*.primitive == types.Type.Primitive.bool);
 
+    const module_struct = module.struct_type;
+    try std.testing.expect(std.meta.activeTag(module_struct.*) == .structure);
+    const module_fields = module_struct.*.structure.fields;
+    try std.testing.expectEqual(@as(usize, 3), module_fields.len);
+    try std.testing.expectEqualStrings("get", module_fields[0].name);
+    try std.testing.expect(std.meta.activeTag(module_fields[0].ty.*) == .function);
+    const struct_fn = module_fields[0].ty.*.function;
+    try std.testing.expectEqual(@as(usize, 2), struct_fn.params.len);
+    try std.testing.expectEqual(struct_fn.params[0], url_param.ty);
+    try std.testing.expectEqual(struct_fn.params[1], headers_param.ty);
+    try std.testing.expectEqual(struct_fn.return_type, fn_get.return_type);
+    try std.testing.expectEqual(struct_fn.is_async, fn_get.is_async);
+    try std.testing.expectEqualStrings("default_headers", module_fields[1].name);
+    try std.testing.expect(std.meta.activeTag(module_fields[1].ty.*) == .array);
+    try std.testing.expect(module_fields[1].ty == default_headers.ty);
+    try std.testing.expectEqualStrings("result_type", module_fields[2].name);
+    try std.testing.expect(module_fields[2].ty == result_value.ty);
+
     const module_again = try loader.load(root_path, "net/http");
     try std.testing.expectEqual(module, module_again);
 }
@@ -662,4 +724,37 @@ test "module loader resolves relative to importer directory" {
     try std.testing.expect(!std.mem.eql(u8, alpha_module.source_path, beta_module.source_path));
     try std.testing.expect(std.mem.indexOf(u8, alpha_module.source_path, "alpha") != null);
     try std.testing.expect(std.mem.indexOf(u8, beta_module.source_path, "beta") != null);
+}
+
+test "module loader synthesizes empty struct for modules without exports" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("pkg");
+    {
+        var file = try tmp.dir.createFile("pkg/utils.rn", .{});
+        defer file.close();
+        try file.writeAll("// no exports\n");
+    }
+    {
+        var manifest = try tmp.dir.createFile("pkg/utils.rn.module.json", .{});
+        defer manifest.close();
+        try manifest.writeAll(
+            \\{ "exports": [] }
+        );
+    }
+
+    var store = types.TypeStore.init(std.testing.allocator);
+    defer store.deinit();
+
+    var loader = try ModuleLoader.init(std.testing.allocator, &store, .{});
+    defer loader.deinit();
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, "pkg");
+    defer std.testing.allocator.free(root);
+
+    const module = try loader.load(root, "utils");
+    try std.testing.expectEqual(@as(usize, 0), module.exports.len);
+    try std.testing.expect(std.meta.activeTag(module.struct_type.*) == .structure);
+    try std.testing.expectEqual(@as(usize, 0), module.struct_type.*.structure.fields.len);
 }

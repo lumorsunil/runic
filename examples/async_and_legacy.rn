@@ -1,7 +1,7 @@
 // Run with: zig build run -- examples/async_and_legacy.rn --trace async --trace process
 // Demonstrates async promises, background process handles, module imports, and bash blocks.
 
-import http from "net/http"
+let http = import("net/http")
 
 error ReleaseError = enum { Timeout, Offline }
 

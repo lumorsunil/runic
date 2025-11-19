@@ -577,13 +577,13 @@ test "lexer fixtures cover feature surfaces" {
         .{
             .name = "modules_and_access",
             .source =
-            \\import http from "net/http"
+            \\let http = import("net/http")
             \\let resp = http.client.get
             ,
             .tokens = &[_]token.Tag{
-                .kw_import,  .identifier, .kw_from,    .string_literal, .newline,
-                .kw_let,     .identifier, .assign,     .identifier,     .dot,
-                .identifier, .dot,        .identifier, .newline,        .eof,
+                .kw_let,    .identifier, .assign,     .kw_import,   .l_paren, .string_literal, .r_paren, .newline,
+                .kw_let,    .identifier, .assign,     .identifier,  .dot,
+                .identifier, .dot,        .identifier, .newline,     .eof,
             },
         },
         .{

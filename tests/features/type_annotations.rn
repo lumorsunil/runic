@@ -1,7 +1,7 @@
 // Tests typed bindings and annotated function signatures.
 
-import ensure from "test_support/ensure"
-let ensure = ensure.ensure
+let ensure_module = import("test_support/ensure")
+let ensure = ensure_module.ensure
 
 fn add(lhs: Int, rhs: Int) Int {
   return lhs + rhs
@@ -9,7 +9,7 @@ fn add(lhs: Int, rhs: Int) Int {
 
 let typed_port: Int = 8080
 mut retries: Int = 1
-let config: Map(Str, Int) = { port: typed_port, retries: retries }
+let config: Map(Str, Int) = .{ .port = typed_port, .retries = retries }
 let sum: Int = add(2, 3)
 
 retries = retries + 1

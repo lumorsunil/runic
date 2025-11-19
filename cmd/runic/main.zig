@@ -13,20 +13,17 @@ const Tracer = runic.tracing.Tracer;
 const TokenList = pipeline.TokenList;
 const Pipeline = pipeline.Pipeline;
 const describeStage = pipeline.describeStage;
-
-const ModuleParseError = error{
-    MissingFunctionName,
-    MissingParameterList,
-    UnterminatedParameterList,
-    MissingFunctionBody,
-    UnterminatedFunctionBody,
-    InvalidParameterName,
-    MissingReturnStatement,
-    MissingReturnCommand,
-    MissingValueName,
-    MissingValueInitializer,
-    InvalidValueExpression,
-};
+const parser_pkg = runic.parser;
+const Parser = parser_pkg.Parser;
+const ParserError = parser_pkg.ParseError;
+const lexer_pkg = runic.lexer;
+const LexerError = lexer_pkg.Error;
+const ast = runic.ast;
+const interpreter_pkg = runic.interpreter;
+const Evaluator = interpreter_pkg.Evaluator;
+const ScopeStack = interpreter_pkg.ScopeStack;
+const RuntimeValue = interpreter_pkg.Value;
+const ModuleParseError = parser_pkg.ModuleParseError;
 
 const BindingProvider = struct {
     context: ?*const ScriptContext = null,
@@ -45,6 +42,13 @@ const BindingProvider = struct {
             if (ctx.getStringBinding(name)) |value| {
                 return value;
             }
+            if (parseInterpolatedObjectField(name)) |field| {
+                if (ctx.getObjectBinding(field.object_name)) |object_binding| {
+                    if (object_binding.getField(field.field_name)) |value| {
+                        return value;
+                    }
+                }
+            }
         }
         return null;
     }
@@ -56,6 +60,120 @@ const BindingProvider = struct {
         return false;
     }
 };
+
+const ObjectFieldSpecifier = struct {
+    object_name: []const u8,
+    field_name: []const u8,
+};
+
+const AstSnippet = struct {
+    source: []u8,
+    parser: *Parser,
+    root: *ast.Expression,
+    script_path: []const u8,
+    line_number: usize,
+
+    fn deinit(self: *AstSnippet, allocator: Allocator) void {
+        self.parser.deinit();
+        allocator.destroy(self.parser);
+        allocator.free(self.source);
+        self.* = undefined;
+    }
+};
+
+const InterpreterState = struct {
+    evaluator: Evaluator,
+    scopes: ScopeStack,
+
+    fn init(allocator: Allocator, runner: *CommandRunner) !InterpreterState {
+        var scopes = ScopeStack.init(allocator);
+        errdefer scopes.deinit();
+        try scopes.pushFrame();
+
+        return .{
+            .evaluator = Evaluator.initWithRunner(allocator, runner),
+            .scopes = scopes,
+        };
+    }
+
+    fn deinit(self: *InterpreterState) void {
+        self.scopes.deinit();
+        self.* = undefined;
+    }
+
+    fn executeSnippet(
+        self: *InterpreterState,
+        context: *const ScriptContext,
+        snippet: *const AstSnippet,
+    ) Evaluator.Error!void {
+        try reseedInterpreterScopeWithContext(self.evaluator.allocator, &self.scopes, context);
+
+        const expr_span = snippet.root.span();
+        var stmt = ast.Statement{
+            .expression = .{
+                .expression = snippet.root,
+                .span = expr_span,
+            },
+        };
+        const statements = [_]*ast.Statement{&stmt};
+        const block = ast.Block{
+            .statements = &statements,
+            .span = expr_span,
+        };
+        try self.evaluator.runBlock(&self.scopes, block);
+    }
+};
+
+fn reseedInterpreterScopeWithContext(
+    allocator: Allocator,
+    scopes: *ScopeStack,
+    context: *const ScriptContext,
+) (Allocator.Error || ScopeStack.Error)!void {
+    var fresh = ScopeStack.init(allocator);
+    errdefer fresh.deinit();
+
+    try fresh.pushFrame();
+
+    for (context.bindings.items) |binding| {
+        switch (binding.value) {
+            .string => |literal| {
+                var runtime_value = RuntimeValue{ .string = try allocator.dupe(u8, literal) };
+                errdefer runtime_value.deinit(allocator);
+                try fresh.declare(binding.name, &runtime_value, binding.is_mutable);
+            },
+            else => {},
+        }
+    }
+
+    var previous = scopes.*;
+    scopes.* = fresh;
+    previous.deinit();
+}
+
+fn parseInterpolatedObjectField(name: []const u8) ?ObjectFieldSpecifier {
+    if (name.len == 0) return null;
+    const dot_index = std.mem.indexOfScalar(u8, name, '.') orelse return null;
+    if (dot_index == 0 or dot_index + 1 >= name.len) return null;
+    if (std.mem.indexOfScalar(u8, name[dot_index + 1 ..], '.')) |_| return null;
+
+    const object_name = name[0..dot_index];
+    const field_name = name[dot_index + 1 ..];
+    if (!isValidIdentifier(object_name) or !isValidIdentifier(field_name)) return null;
+
+    return .{
+        .object_name = object_name,
+        .field_name = field_name,
+    };
+}
+
+fn isValidIdentifier(text: []const u8) bool {
+    if (text.len == 0) return false;
+    if (!isIdentifierStart(text[0])) return false;
+    for (text[1..]) |ch| {
+        if (!isIdentifierChar(ch)) return false;
+    }
+    return true;
+}
 
 const ModuleRegistry = struct {
     allocator: Allocator,
@@ -122,17 +240,18 @@ const ModuleRegistry = struct {
         self: *ModuleRegistry,
         script_dir: []const u8,
         module_paths: [][]const u8,
-        import_stmt: ParsedImport,
+        alias: []const u8,
+        spec: []const u8,
     ) !void {
-        if (self.findModule(import_stmt.alias)) |_| {
+        if (self.findModule(alias)) |_| {
             return;
         }
 
-        const alias_owned = try self.allocator.dupe(u8, import_stmt.alias);
+        const alias_owned = try self.allocator.dupe(u8, alias);
         var alias_cleanup = true;
         defer if (alias_cleanup) self.allocator.free(alias_owned);
 
-        const spec_owned = try self.allocator.dupe(u8, import_stmt.spec);
+        const spec_owned = try self.allocator.dupe(u8, spec);
         var spec_cleanup = true;
         defer if (spec_cleanup) self.allocator.free(spec_owned);
 
@@ -236,6 +355,15 @@ const ModuleRegistry = struct {
         _ = self;
         const trimmed = std.mem.trim(u8, function.command, " \t\r\n");
         if (trimmed.len == 0) return null;
+        if (trimmed[0] == '"') {
+            const literal = parseStringLiteral(allocator, trimmed) catch return null;
+            var consumed = literal.consumed;
+            skipWhitespaceAll(trimmed, &consumed);
+            if (consumed == trimmed.len) {
+                return literal.value;
+            }
+            allocator.free(literal.value);
+        }
         const numeric = evaluateNumericExpression(module, trimmed, params) catch |err| switch (err) {
             ModuleExpressionError.InvalidToken, ModuleExpressionError.MissingOperand, ModuleExpressionError.UnknownIdentifier => return null,
             ModuleExpressionError.DivisionByZero => return null,
@@ -289,86 +417,46 @@ const ModuleRegistry = struct {
     }
 
     fn parseModuleFunctions(self: *ModuleRegistry, module: *Module, source: []const u8) !void {
-        var idx: usize = 0;
-        while (idx < source.len) {
-            skipWhitespaceAndComments(source, &idx);
-            if (idx >= source.len) break;
-            if (!std.mem.startsWith(u8, source[idx..], "fn")) {
-                idx += 1;
-                continue;
-            }
-            const keyword_end = idx + 2;
-            if (keyword_end < source.len and isIdentifierChar(source[keyword_end])) {
-                idx = keyword_end;
-                continue;
-            }
-            idx = keyword_end;
-            skipWhitespaceAll(source, &idx);
-            if (idx >= source.len or !isIdentifierStart(source[idx])) {
-                return ModuleParseError.MissingFunctionName;
-            }
-            const name_start = idx;
-            idx += 1;
-            while (idx < source.len and isIdentifierChar(source[idx])) : (idx += 1) {}
-            const name_slice = source[name_start..idx];
-            const name_owned = try self.allocator.dupe(u8, name_slice);
-            var name_cleanup = true;
-            defer if (name_cleanup) self.allocator.free(name_owned);
+        var pr = Parser.init(self.allocator, source);
+        defer pr.deinit();
 
-            skipWhitespaceAll(source, &idx);
-            if (idx >= source.len or source[idx] != '(') {
-                return ModuleParseError.MissingParameterList;
-            }
-            idx += 1;
-            const params_start = idx;
-            var depth: usize = 1;
-            while (idx < source.len and depth > 0) : (idx += 1) {
-                if (source[idx] == '(') {
-                    depth += 1;
-                } else if (source[idx] == ')') {
-                    depth -= 1;
-                }
-            }
-            if (depth != 0) return ModuleParseError.UnterminatedParameterList;
-            const params_slice = source[params_start .. idx - 1];
-            const params = try parseModuleParamNames(self.allocator, params_slice);
-            var params_cleanup = true;
-            defer if (params_cleanup) freeStringList(self.allocator, params);
+        const document = try pr.parseModuleDocument();
+        for (document.declarations) |decl| {
+            switch (decl) {
+                .function => |func| {
+                    const name_owned = try self.allocator.dupe(u8, func.name);
+                    var name_cleanup = true;
+                    defer if (name_cleanup) self.allocator.free(name_owned);
 
-            skipWhitespaceAndComments(source, &idx);
-            const return_type_start = idx;
-            const brace_index =
-                std.mem.indexOfScalarPos(u8, source, idx, '{') orelse return ModuleParseError.MissingFunctionBody;
-            const return_type_slice = source[return_type_start..brace_index];
-            const has_void_return = functionReturnTypeIsVoid(return_type_slice);
-            idx = brace_index + 1;
+                    var params_owned = try self.allocator.alloc([]const u8, func.params.len);
+                    var params_cleanup = true;
+                    defer if (params_cleanup) freeStringList(self.allocator, params_owned);
+                    for (func.params, 0..) |param, i| {
+                        params_owned[i] = try self.allocator.dupe(u8, param.name);
+                    }
 
-            const body_start = idx;
-            var brace_depth: usize = 1;
-            while (idx < source.len and brace_depth > 0) : (idx += 1) {
-                const ch = source[idx];
-                if (ch == '{') {
-                    brace_depth += 1;
-                    continue;
-                }
-                if (ch == '}') {
-                    brace_depth -= 1;
-                }
+                    const return_slice = if (func.return_type_span) |span|
+                        pr.sliceForSpan(span)
+                    else
+                        source[0..0];
+                    const has_void_return = functionReturnTypeIsVoid(return_slice);
+
+                    const body_slice = pr.sliceForRange(func.body_range);
+                    const command_text = try extractReturnCommand(self.allocator, body_slice, .{
+                        .require_return = !has_void_return,
+                        .allow_empty_command = has_void_return,
+                    });
+
+                    try module.functions.append(self.allocator, Function{
+                        .name = name_owned,
+                        .params = params_owned,
+                        .command = command_text,
+                    });
+                    name_cleanup = false;
+                    params_cleanup = false;
+                },
+                else => {},
             }
-            if (brace_depth != 0 or idx == 0) return ModuleParseError.UnterminatedFunctionBody;
-            const body_slice = source[body_start .. idx - 1];
-            const command_text = try extractReturnCommand(self.allocator, body_slice, .{
-                .require_return = !has_void_return,
-                .allow_empty_command = has_void_return,
-            });
-
-            try module.functions.append(self.allocator, Function{
-                .name = name_owned,
-                .params = params,
-                .command = command_text,
-            });
-            name_cleanup = false;
-            params_cleanup = false;
         }
     }
 
@@ -637,6 +725,7 @@ const ModuleInvocationError = error{
     MissingArgumentList,
     MissingClosingParen,
     TrailingCharacters,
+    UnsupportedCatchClause,
 };
 
 const ModuleInvocation = struct {
@@ -855,6 +944,15 @@ fn runScript(
     var aggregated = std.ArrayList(u8).empty;
     defer aggregated.deinit(allocator);
 
+    var interpreter_state = InterpreterState.init(allocator, &runner) catch |err| {
+        try stderr.print(
+            "error: failed to initialize interpreter: {s}\n",
+            .{@errorName(err)},
+        );
+        return 1;
+    };
+    defer interpreter_state.deinit();
+
     var continuing = false;
     var command_start_line: usize = 0;
     var exit_code: ?u8 = null;
@@ -891,11 +989,18 @@ fn runScript(
         }
 
         try aggregated.appendSlice(allocator, trimmed);
-        continuing = wants_continuation;
+
+        const command_slice = std.mem.trim(u8, aggregated.items, " \t\r\n");
+        const needs_let_continuation = !wants_continuation and letCommandNeedsMoreLines(command_slice);
+        const needs_error_continuation =
+            !wants_continuation and errorDeclarationNeedsMoreLines(command_slice);
+        const needs_control_flow_continuation =
+            !wants_continuation and controlFlowNeedsMoreLines(command_slice);
+        continuing = wants_continuation or needs_let_continuation or needs_error_continuation or
+            needs_control_flow_continuation;
 
         if (continuing) continue;
 
-        const command_slice = std.mem.trim(u8, aggregated.items, " \t\r\n");
         if (command_slice.len == 0) continue;
 
         if (isFunctionDeclaration(command_slice)) {
@@ -910,6 +1015,7 @@ fn runScript(
             &env_map,
             &context,
             &modules,
+            &interpreter_state,
             script_dir,
             config.module_paths,
             command_slice,
@@ -950,8 +1056,102 @@ fn moduleParseErrorMessage(err: anyerror) []const u8 {
         ModuleParseError.MissingValueName => "expected value name after 'let'",
         ModuleParseError.MissingValueInitializer => "expected '=' after value name",
         ModuleParseError.InvalidValueExpression => "value initializer must be an arithmetic expression",
+        ModuleParseError.MissingManifestBody => "expected '{' to start manifest body",
+        ModuleParseError.UnterminatedManifestBody => "unterminated manifest body",
+        ModuleParseError.InvalidSyntax => "invalid module syntax",
         else => "unknown module parse error",
     };
+}
+
+const AstRecordResult = union(enum) {
+    recorded: AstSnippet,
+    skipped,
+    syntax_error,
+};
+
+fn recordAstSnippet(
+    allocator: Allocator,
+    command: []const u8,
+    script_path: []const u8,
+    line_number: usize,
+    stderr: *std.Io.Writer,
+) !AstRecordResult {
+    const trimmed = std.mem.trim(u8, command, " \t\r\n");
+    if (trimmed.len == 0) return .skipped;
+
+    const is_control_flow = commandStartsWithIf(trimmed);
+
+    const owned = if (is_control_flow)
+        try sanitizeControlFlowSnippet(allocator, command)
+    else
+        try allocator.dupe(u8, command);
+    var cleanup_source = true;
+    defer if (cleanup_source) allocator.free(owned);
+
+    var parser_ptr = try allocator.create(Parser);
+    parser_ptr.* = Parser.init(allocator, owned);
+    var cleanup_parser = true;
+    defer if (cleanup_parser) {
+        parser_ptr.deinit();
+        allocator.destroy(parser_ptr);
+    };
+
+    const expression = parser_ptr.parseExpression() catch |err| {
+        return try handleAstParseIssue(err, is_control_flow, script_path, line_number, stderr);
+    };
+
+    parser_ptr.expectEnd() catch |err| {
+        return try handleAstParseIssue(err, is_control_flow, script_path, line_number, stderr);
+    };
+
+    cleanup_source = false;
+    cleanup_parser = false;
+    return .{ .recorded = .{
+        .source = owned,
+        .parser = parser_ptr,
+        .root = expression,
+        .script_path = script_path,
+        .line_number = line_number,
+    } };
+}
+
+fn handleAstParseIssue(
+    err: anyerror,
+    is_control_flow: bool,
+    script_path: []const u8,
+    line_number: usize,
+    stderr: *std.Io.Writer,
+) !AstRecordResult {
+    return switch (err) {
+        ParserError.UnexpectedToken,
+        ParserError.UnexpectedEOF,
+        LexerError.UnexpectedCharacter,
+        LexerError.UnterminatedString,
+        LexerError.UnterminatedBlockComment,
+        LexerError.TokenConsumptionDepthExceeded,
+        => blk: {
+            if (is_control_flow) {
+                try stderr.print(
+                    "{s}:{d}: unable to parse statement ({s})\n",
+                    .{ script_path, line_number, @errorName(err) },
+                );
+                break :blk .syntax_error;
+            }
+            break :blk .skipped;
+        },
+        else => err,
+    };
+}
+
+fn renderInterpreterError(
+    stderr: *std.Io.Writer,
+    snippet: *const AstSnippet,
+    err: anyerror,
+) !void {
+    try stderr.print(
+        "{s}:{d}: interpreter error: {s}\n",
+        .{ snippet.script_path, snippet.line_number, @errorName(err) },
+    );
 }
 
 fn executeScriptCommand(
@@ -960,6 +1160,7 @@ fn executeScriptCommand(
     env_map: *std.process.EnvMap,
     context: *ScriptContext,
     modules: *ModuleRegistry,
+    interpreter: *InterpreterState,
     script_dir: []const u8,
     module_paths: [][]const u8,
     command: []const u8,
@@ -969,47 +1170,50 @@ fn executeScriptCommand(
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
 ) !?u8 {
-    const import_result = parseImportStatement(allocator, command) catch |err| {
+    const error_decl = parseErrorDeclaration(command) catch |err| {
         try stderr.print(
-            "{s}:{d}: invalid import statement ({s})\n",
+            "{s}:{d}: invalid error declaration ({s})\n",
             .{ script_path, line_number, @errorName(err) },
         );
         return 1;
     };
-    if (import_result) |parsed| {
-        var import_stmt = parsed;
-        defer import_stmt.deinit(allocator);
-
-        modules.ensureImport(script_dir, module_paths, import_stmt) catch |err| {
-            switch (err) {
-                error.ModuleNotFound => try stderr.print(
-                    "{s}:{d}: module '{s}' not found\n",
-                    .{ script_path, line_number, import_stmt.spec },
-                ),
-                ModuleParseError.MissingFunctionName, ModuleParseError.MissingParameterList, ModuleParseError.UnterminatedParameterList, ModuleParseError.MissingFunctionBody, ModuleParseError.UnterminatedFunctionBody, ModuleParseError.InvalidParameterName, ModuleParseError.MissingReturnStatement, ModuleParseError.MissingReturnCommand => try stderr.print(
-                    "{s}:{d}: module '{s}' is invalid: {s}\n",
-                    .{ script_path, line_number, import_stmt.spec, moduleParseErrorMessage(err) },
-                ),
-                else => try stderr.print(
-                    "{s}:{d}: failed to load module '{s}': {s}\n",
-                    .{ script_path, line_number, import_stmt.spec, @errorName(err) },
-                ),
-            }
+    if (error_decl) |decl| {
+        context.declareTypeBinding(decl.name, decl.definition, false) catch |err| {
+            try renderBindingError(stderr, script_path, line_number, decl.name, err);
             return 1;
         };
-
         return null;
     }
 
     const maybe_binding = parseLetBindingWithOptions(allocator, command, .{
         .context = context,
         .modules = modules,
-    }) catch |err| {
-        try stderr.print(
-            "{s}:{d}: invalid let binding ({s})\n",
-            .{ script_path, line_number, @errorName(err) },
-        );
-        return 1;
+    }) catch |err| switch (err) {
+        error.UnknownFunctionBinding => {
+            if (functionCallNameFromLet(command)) |fn_name| {
+                try stderr.print(
+                    "{s}:{d}: unknown function binding '{s}'\n",
+                    .{ script_path, line_number, fn_name },
+                );
+            } else {
+                try stderr.print("{s}:{d}: unknown function binding\n", .{ script_path, line_number });
+            }
+            return 1;
+        },
+        ModuleInvocationError.UnsupportedCatchClause => {
+            try stderr.print(
+                "{s}:{d}: module invocations cannot include 'catch' clauses yet\n",
+                .{ script_path, line_number },
+            );
+            return 1;
+        },
+        else => {
+            try stderr.print(
+                "{s}:{d}: invalid let binding ({s})\n",
+                .{ script_path, line_number, @errorName(err) },
+            );
+            return 1;
+        },
     };
 
     if (maybe_binding) |binding| {
@@ -1085,6 +1289,74 @@ fn executeScriptCommand(
                     stdout,
                     stderr,
                 )) |code| return code;
+            },
+            .module_import => |import_binding| {
+                defer allocator.free(import_binding.spec);
+                modules.ensureImport(script_dir, module_paths, binding.name, import_binding.spec) catch |err| {
+                    switch (err) {
+                        error.ModuleNotFound => try stderr.print(
+                            "{s}:{d}: module '{s}' not found\n",
+                            .{ script_path, line_number, import_binding.spec },
+                        ),
+                        ModuleParseError.MissingFunctionName, ModuleParseError.MissingParameterList, ModuleParseError.UnterminatedParameterList, ModuleParseError.MissingFunctionBody, ModuleParseError.UnterminatedFunctionBody, ModuleParseError.InvalidParameterName, ModuleParseError.MissingReturnStatement, ModuleParseError.MissingReturnCommand => try stderr.print(
+                            "{s}:{d}: module '{s}' is invalid: {s}\n",
+                            .{ script_path, line_number, import_binding.spec, moduleParseErrorMessage(err) },
+                        ),
+                        else => try stderr.print(
+                            "{s}:{d}: failed to load module '{s}': {s}\n",
+                            .{ script_path, line_number, import_binding.spec, @errorName(err) },
+                        ),
+                    }
+                    return 1;
+                };
+            },
+            .module_import_member => |member_binding| {
+                defer allocator.free(member_binding.spec);
+                defer allocator.free(member_binding.member_name);
+                modules.ensureImport(script_dir, module_paths, binding.name, member_binding.spec) catch |err| {
+                    switch (err) {
+                        error.ModuleNotFound => try stderr.print(
+                            "{s}:{d}: module '{s}' not found\n",
+                            .{ script_path, line_number, member_binding.spec },
+                        ),
+                        ModuleParseError.MissingFunctionName, ModuleParseError.MissingParameterList, ModuleParseError.UnterminatedParameterList, ModuleParseError.MissingFunctionBody, ModuleParseError.UnterminatedFunctionBody, ModuleParseError.InvalidParameterName, ModuleParseError.MissingReturnStatement, ModuleParseError.MissingReturnCommand => try stderr.print(
+                            "{s}:{d}: module '{s}' is invalid: {s}\n",
+                            .{ script_path, line_number, member_binding.spec, moduleParseErrorMessage(err) },
+                        ),
+                        else => try stderr.print(
+                            "{s}:{d}: failed to load module '{s}': {s}\n",
+                            .{ script_path, line_number, member_binding.spec, @errorName(err) },
+                        ),
+                    }
+                    return 1;
+                };
+
+                if (modules.lookupFunction(binding.name, member_binding.member_name)) |_| {
+                    context.declareFunctionBinding(
+                        binding.name,
+                        binding.name,
+                        member_binding.member_name,
+                        binding.is_mutable,
+                    ) catch |err| {
+                        try renderBindingError(stderr, script_path, line_number, binding.name, err);
+                        return 1;
+                    };
+                } else if (modules.lookupValue(binding.name, member_binding.member_name)) |module_value| {
+                    context.declareStringBinding(
+                        binding.name,
+                        module_value.literal,
+                        binding.is_mutable,
+                    ) catch |err| {
+                        try renderBindingError(stderr, script_path, line_number, binding.name, err);
+                        return 1;
+                    };
+                } else {
+                    try stderr.print(
+                        "{s}:{d}: module '{s}' has no member '{s}'\n",
+                        .{ script_path, line_number, member_binding.spec, member_binding.member_name },
+                    );
+                    return 1;
+                }
             },
             .module_value => |value_ref| {
                 defer {
@@ -1228,12 +1500,21 @@ fn executeScriptCommand(
         return null;
     }
 
-    var invocation_result = parseModuleInvocation(allocator, command, context) catch |err| {
-        try stderr.print(
-            "{s}:{d}: invalid module invocation ({s})\n",
-            .{ script_path, line_number, @errorName(err) },
-        );
-        return 1;
+    var invocation_result = parseModuleInvocation(allocator, command, context) catch |err| switch (err) {
+        ModuleInvocationError.UnsupportedCatchClause => {
+            try stderr.print(
+                "{s}:{d}: module invocations cannot include 'catch' clauses yet\n",
+                .{ script_path, line_number },
+            );
+            return 1;
+        },
+        else => {
+            try stderr.print(
+                "{s}:{d}: invalid module invocation ({s})\n",
+                .{ script_path, line_number, @errorName(err) },
+            );
+            return 1;
+        },
     };
 
     if (invocation_result) |*invocation| {
@@ -1251,6 +1532,12 @@ fn executeScriptCommand(
             stdout,
             stderr,
         );
+    } else if (unknownFunctionBindingNameFromExpression(command, context)) |fn_name| {
+        try stderr.print(
+            "{s}:{d}: unknown function binding '{s}'\n",
+            .{ script_path, line_number, fn_name },
+        );
+        return 1;
     }
 
     const ensure_candidate = parseEnsureCall(command) catch |err| {
@@ -1271,6 +1558,21 @@ fn executeScriptCommand(
             stdout,
             stderr,
         );
+    }
+
+    switch (try recordAstSnippet(allocator, command, script_path, line_number, stderr)) {
+        .recorded => |snippet| {
+            var owned = snippet;
+            defer owned.deinit(allocator);
+            if (interpreter.executeSnippet(context, &owned)) {
+                return null;
+            } else |err| {
+                try renderInterpreterError(stderr, &owned, err);
+                return 1;
+            }
+        },
+        .skipped => {},
+        .syntax_error => return 1,
     }
 
     const bindings = BindingProvider{ .context = context };
@@ -1396,7 +1698,6 @@ fn runModuleInvocationInternal(
         );
         return .{ .exit_code = 1 };
     }
-
     var overrides: []BindingProvider.Binding = &[_]BindingProvider.Binding{};
     if (function.params.len > 0) {
         overrides = try allocator.alloc(BindingProvider.Binding, function.params.len);
@@ -1561,9 +1862,11 @@ fn runPipelineInternal(
     capture_handle: bool,
     render_failures: bool,
 ) !PipelineOutcome {
+    const normalized_command = trimCommandExpression(command_to_run);
+
     var tokens = TokenList.init(allocator);
     defer tokens.deinit();
-    tokens.populate(command_to_run) catch |err| {
+    tokens.populate(normalized_command) catch |err| {
         try stderr.print(
             "{s}:{d}: invalid pipeline syntax ({s})\n",
             .{ script_path, line_number, @errorName(err) },
@@ -1631,6 +1934,60 @@ fn runPipelineInternal(
     }
 
     return .{};
+}
+
+fn trimCommandExpression(command: []const u8) []const u8 {
+    var trimmed = std.mem.trim(u8, command, " \t\r\n");
+    while (hasWrappingParentheses(trimmed)) {
+        const inner = std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t\r\n");
+        if (inner.len == 0) break;
+        trimmed = inner;
+    }
+    return trimmed;
+}
+
+fn hasWrappingParentheses(command: []const u8) bool {
+    if (command.len < 2) return false;
+    if (command[0] != '(' or command[command.len - 1] != ')') return false;
+
+    var depth: usize = 0;
+    var in_single = false;
+    var in_double = false;
+    var escape = false;
+
+    for (command, 0..) |byte, idx| {
+        if (escape) {
+            escape = false;
+            continue;
+        }
+        if (!in_single and byte == '\\') {
+            escape = true;
+            continue;
+        }
+        if (!in_double and byte == '\'') {
+            in_single = !in_single;
+            continue;
+        }
+        if (!in_single and byte == '"') {
+            in_double = !in_double;
+            continue;
+        }
+        if (in_single or in_double) continue;
+
+        switch (byte) {
+            '(' => depth += 1,
+            ')' => {
+                if (depth == 0) return false;
+                depth -= 1;
+                if (depth == 0 and idx != command.len - 1) {
+                    return false;
+                }
+            },
+            else => {},
+        }
+    }
+
+    return depth == 0;
 }
 
 fn forwardHandleOutput(handle: *const ProcessHandle, stdout: *std.Io.Writer, stderr: *std.Io.Writer) !void {
@@ -1975,6 +2332,397 @@ fn braceBalanceDelta(line: []const u8) isize {
         }
     }
     return delta;
+}
+
+const QuoteMode = enum {
+    none,
+    single,
+    double,
+};
+
+fn letCommandNeedsMoreLines(command: []const u8) bool {
+    if (!commandStartsWithLetOrMut(command)) return false;
+
+    const eq_index = findAssignmentEquals(command) orelse return false;
+    if (eq_index + 1 >= command.len) return true;
+
+    var value_slice = command[eq_index + 1 ..];
+    value_slice = std.mem.trimLeft(u8, value_slice, " \t\r\n");
+    if (value_slice.len == 0) return true;
+
+    var braces: isize = 0;
+    var parens: isize = 0;
+    var mode: QuoteMode = .none;
+    var escape = false;
+    var idx: usize = 0;
+    while (idx < value_slice.len) : (idx += 1) {
+        const ch = value_slice[idx];
+        switch (mode) {
+            .double => {
+                if (escape) {
+                    escape = false;
+                    continue;
+                }
+                if (ch == '\\') {
+                    escape = true;
+                    continue;
+                }
+                if (ch == '"') mode = .none;
+                continue;
+            },
+            .single => {
+                if (escape) {
+                    escape = false;
+                    continue;
+                }
+                if (ch == '\\') {
+                    escape = true;
+                    continue;
+                }
+                if (ch == '\'') mode = .none;
+                continue;
+            },
+            .none => {
+                if (ch == '"') {
+                    mode = .double;
+                    continue;
+                }
+                if (ch == '\'') {
+                    mode = .single;
+                    continue;
+                }
+                if (ch == '#') break;
+                if (ch == '/' and idx + 1 < value_slice.len and value_slice[idx + 1] == '/') break;
+                switch (ch) {
+                    '{' => braces += 1,
+                    '}' => braces -= 1,
+                    '(' => parens += 1,
+                    ')' => parens -= 1,
+                    else => {},
+                }
+            },
+        }
+    }
+
+    return braces > 0 or parens > 0;
+}
+
+fn controlFlowNeedsMoreLines(command: []const u8) bool {
+    if (!commandStartsWithIf(command)) return false;
+
+    var braces: isize = 0;
+    var mode: QuoteMode = .none;
+    var escape = false;
+    var idx: usize = 0;
+
+    while (idx < command.len) {
+        const ch = command[idx];
+        switch (mode) {
+            .double => {
+                if (escape) {
+                    escape = false;
+                } else if (ch == '\\') {
+                    escape = true;
+                } else if (ch == '"') {
+                    mode = .none;
+                }
+                idx += 1;
+                continue;
+            },
+            .single => {
+                if (escape) {
+                    escape = false;
+                } else if (ch == '\\') {
+                    escape = true;
+                } else if (ch == '\'') {
+                    mode = .none;
+                }
+                idx += 1;
+                continue;
+            },
+            .none => {
+                if (ch == '"') {
+                    mode = .double;
+                    idx += 1;
+                    continue;
+                }
+                if (ch == '\'') {
+                    mode = .single;
+                    idx += 1;
+                    continue;
+                }
+                if (ch == '#') {
+                    idx += 1;
+                    while (idx < command.len and command[idx] != '\n') {
+                        idx += 1;
+                    }
+                    continue;
+                }
+                if (ch == '/' and idx + 1 < command.len and command[idx + 1] == '/') {
+                    idx += 2;
+                    while (idx < command.len and command[idx] != '\n') {
+                        idx += 1;
+                    }
+                    continue;
+                }
+                if (ch == '{') {
+                    braces += 1;
+                } else if (ch == '}' and braces > 0) {
+                    braces -= 1;
+                }
+                idx += 1;
+            },
+        }
+    }
+
+    return braces > 0;
+}
+
+fn sanitizeControlFlowSnippet(allocator: Allocator, command: []const u8) ![]u8 {
+    var builder = std.ArrayList(u8).empty;
+    defer builder.deinit(allocator);
+
+    var idx: usize = 0;
+    while (idx < command.len) {
+        const ch = command[idx];
+        if (ch == '{') {
+            try builder.append(allocator, '{');
+            try builder.appendSlice(allocator, " value ");
+            idx = skipControlFlowBlock(command, idx + 1);
+            if (idx < command.len and command[idx] == '}') {
+                try builder.append(allocator, '}');
+                idx += 1;
+            }
+            continue;
+        }
+        try builder.append(allocator, ch);
+        idx += 1;
+    }
+
+    return builder.toOwnedSlice(allocator);
+}
+
+fn skipControlFlowBlock(command: []const u8, start_idx: usize) usize {
+    var idx = start_idx;
+    var depth: isize = 1;
+    var mode: QuoteMode = .none;
+    var escape = false;
+
+    while (idx < command.len) {
+        const ch = command[idx];
+        switch (mode) {
+            .double => {
+                if (escape) {
+                    escape = false;
+                } else if (ch == '\\') {
+                    escape = true;
+                } else if (ch == '"') {
+                    mode = .none;
+                }
+                idx += 1;
+                continue;
+            },
+            .single => {
+                if (escape) {
+                    escape = false;
+                } else if (ch == '\\') {
+                    escape = true;
+                } else if (ch == '\'') {
+                    mode = .none;
+                }
+                idx += 1;
+                continue;
+            },
+            .none => {
+                if (ch == '"') {
+                    mode = .double;
+                    idx += 1;
+                    continue;
+                }
+                if (ch == '\'') {
+                    mode = .single;
+                    idx += 1;
+                    continue;
+                }
+                if (ch == '#') {
+                    idx += 1;
+                    while (idx < command.len and command[idx] != '\n') {
+                        idx += 1;
+                    }
+                    continue;
+                }
+                if (ch == '/' and idx + 1 < command.len and command[idx + 1] == '/') {
+                    idx += 2;
+                    while (idx < command.len and command[idx] != '\n') {
+                        idx += 1;
+                    }
+                    continue;
+                }
+                if (ch == '{') {
+                    depth += 1;
+                    idx += 1;
+                    continue;
+                }
+                if (ch == '}') {
+                    depth -= 1;
+                    break;
+                }
+                idx += 1;
+            },
+        }
+    }
+
+    return idx;
+}
+
+fn errorDeclarationNeedsMoreLines(command: []const u8) bool {
+    var trimmed = std.mem.trimLeft(u8, command, " \t");
+    if (!std.mem.startsWith(u8, trimmed, "error")) return false;
+    if (trimmed.len == "error".len) return true;
+    if (!std.ascii.isWhitespace(trimmed["error".len])) return false;
+
+    const eq_index = findAssignmentEquals(trimmed) orelse return true;
+    if (eq_index + 1 >= trimmed.len) return true;
+
+    var body_slice = trimmed[eq_index + 1 ..];
+    body_slice = std.mem.trimLeft(u8, body_slice, " \t\r\n");
+    if (body_slice.len == 0) return true;
+
+    var braces: isize = 0;
+    var mode: QuoteMode = .none;
+    var escape = false;
+    var saw_open = false;
+    var idx: usize = 0;
+
+    while (idx < body_slice.len) : (idx += 1) {
+        const ch = body_slice[idx];
+        switch (mode) {
+            .double => {
+                if (escape) {
+                    escape = false;
+                    continue;
+                }
+                if (ch == '\\') {
+                    escape = true;
+                    continue;
+                }
+                if (ch == '"') mode = .none;
+                continue;
+            },
+            .single => {
+                if (escape) {
+                    escape = false;
+                    continue;
+                }
+                if (ch == '\\') {
+                    escape = true;
+                    continue;
+                }
+                if (ch == '\'') mode = .none;
+                continue;
+            },
+            .none => {
+                if (ch == '"') {
+                    mode = .double;
+                    continue;
+                }
+                if (ch == '\'') {
+                    mode = .single;
+                    continue;
+                }
+                if (ch == '#') break;
+                if (ch == '/' and idx + 1 < body_slice.len and body_slice[idx + 1] == '/') break;
+                switch (ch) {
+                    '{' => {
+                        braces += 1;
+                        saw_open = true;
+                    },
+                    '}' => braces -= 1,
+                    else => {},
+                }
+            },
+        }
+    }
+
+    if (!saw_open) return true;
+    return braces > 0;
+}
+
+fn commandStartsWithIf(command: []const u8) bool {
+    var idx: usize = 0;
+    while (idx < command.len and (command[idx] == ' ' or command[idx] == '\t')) {
+        idx += 1;
+    }
+    if (idx + 1 >= command.len) return false;
+    if (!std.mem.startsWith(u8, command[idx..], "if")) return false;
+    const suffix_index = idx + 2;
+    if (suffix_index >= command.len) return true;
+    const suffix = command[suffix_index];
+    if (isIdentifierChar(suffix)) return false;
+    if (suffix == '(') return true;
+    return std.ascii.isWhitespace(suffix);
+}
+
+fn commandStartsWithLetOrMut(command: []const u8) bool {
+    if (command.len < 3) return false;
+    if (std.mem.startsWith(u8, command, "let")) {
+        if (command.len == 3) return true;
+        const suffix = command[3];
+        return std.ascii.isWhitespace(suffix);
+    }
+    if (std.mem.startsWith(u8, command, "mut")) {
+        if (command.len == 3) return true;
+        const suffix = command[3];
+        return std.ascii.isWhitespace(suffix);
+    }
+    return false;
+}
+
+fn findAssignmentEquals(command: []const u8) ?usize {
+    var mode: QuoteMode = .none;
+    var escape = false;
+    var idx: usize = 0;
+    while (idx < command.len) : (idx += 1) {
+        const ch = command[idx];
+        switch (mode) {
+            .double => {
+                if (escape) {
+                    escape = false;
+                    continue;
+                }
+                if (ch == '\\') {
+                    escape = true;
+                    continue;
+                }
+                if (ch == '"') mode = .none;
+                continue;
+            },
+            .single => {
+                if (escape) {
+                    escape = false;
+                    continue;
+                }
+                if (ch == '\\') {
+                    escape = true;
+                    continue;
+                }
+                if (ch == '\'') mode = .none;
+                continue;
+            },
+            .none => {
+                if (ch == '"') {
+                    mode = .double;
+                    continue;
+                }
+                if (ch == '\'') {
+                    mode = .single;
+                    continue;
+                }
+                if (ch == '=') return idx;
+            },
+        }
+    }
+    return null;
 }
 
 fn isFunctionDeclaration(command: []const u8) bool {
@@ -2382,12 +3130,23 @@ const ModuleValueBinding = struct {
     value_name: []u8,
 };
 
+const ModuleImportBinding = struct {
+    spec: []u8,
+};
+
+const ModuleImportMemberBinding = struct {
+    spec: []u8,
+    member_name: []u8,
+};
+
 const LetValue = union(enum) {
     literal: []u8,
     command: []u8,
     module_function: ModuleFunctionAlias,
     module_invocation: ModuleInvocationBinding,
     module_value: ModuleValueBinding,
+    module_import: ModuleImportBinding,
+    module_import_member: ModuleImportMemberBinding,
     array_literal: [][]u8,
     object_literal: ObjectLiteral,
     binding_expression: BindingExpression,
@@ -2476,6 +3235,7 @@ const LetParseError = error{
     InvalidExpression,
     InvalidTypeExpression,
     MissingClosingParen,
+    UnknownFunctionBinding,
 };
 
 const ParseStringError = error{
@@ -2484,72 +3244,24 @@ const ParseStringError = error{
     InvalidEscapeSequence,
 };
 
-const ImportParseError = ParseStringError || error{
-    MissingAlias,
-    InvalidAlias,
-    MissingFromClause,
-    MissingModuleSpec,
-    TrailingCharacters,
-};
-
-const ParsedImport = struct {
-    alias: []u8,
-    spec: []u8,
-
-    fn deinit(self: *ParsedImport, allocator: Allocator) void {
-        allocator.free(self.alias);
-        allocator.free(self.spec);
-        self.* = undefined;
-    }
-};
-
-fn parseImportStatement(allocator: Allocator, command: []const u8) (ImportParseError || Allocator.Error)!?ParsedImport {
-    var trimmed = std.mem.trim(u8, command, " \t\r\n");
-    if (!std.mem.startsWith(u8, trimmed, "import")) return null;
-    if (trimmed.len > 6) {
-        const suffix = trimmed[6];
-        if (!std.ascii.isWhitespace(suffix)) return null;
-    } else {
-        return error.MissingAlias;
-    }
-
-    var idx: usize = 6;
-    skipInlineWhitespace(trimmed, &idx);
-    if (idx >= trimmed.len) return error.MissingAlias;
-
-    if (!isIdentifierStart(trimmed[idx])) return error.InvalidAlias;
-    const alias_start = idx;
-    idx += 1;
-    while (idx < trimmed.len and isIdentifierChar(trimmed[idx])) : (idx += 1) {}
-    const alias_slice = trimmed[alias_start..idx];
-    const alias_owned = try allocator.dupe(u8, alias_slice);
-    errdefer allocator.free(alias_owned);
-
-    skipInlineWhitespace(trimmed, &idx);
-
-    if (idx + 4 > trimmed.len or !std.mem.eql(u8, trimmed[idx .. idx + 4], "from")) {
-        return error.MissingFromClause;
-    }
-    idx += 4;
-
-    skipInlineWhitespace(trimmed, &idx);
-    if (idx >= trimmed.len) return error.MissingModuleSpec;
-    if (trimmed[idx] != '"') return error.MissingStringLiteral;
-
-    const literal = try parseStringLiteral(allocator, trimmed[idx..]);
-    idx += literal.consumed;
-
-    skipInlineWhitespace(trimmed, &idx);
-    if (idx != trimmed.len) return error.TrailingCharacters;
-
-    return ParsedImport{ .alias = alias_owned, .spec = literal.value };
-}
-
 const BindingInfo = struct { len: usize, is_mutable: bool };
 
 const ParseLetBindingOptions = struct {
     context: ?*const ScriptContext = null,
     modules: ?*const ModuleRegistry = null,
+};
+
+const ErrorDeclarationParseError = error{
+    MissingName,
+    InvalidName,
+    MissingEquals,
+    MissingDefinition,
+    MissingBodyKind,
+};
+
+const ParsedErrorDeclaration = struct {
+    name: []const u8,
+    definition: []const u8,
 };
 
 const ParseLetBindingError = LetParseError || ModuleInvocationError || ParseStringError || Allocator.Error;
@@ -2710,8 +3422,13 @@ fn shouldParseAsTypeExpression(text: []const u8) bool {
         if (suffix == '.' or std.ascii.isWhitespace(suffix)) return true;
     }
     if (std.ascii.isUpper(first)) return true;
-    if (std.mem.indexOfScalar(u8, remaining, '.')) |dot_idx| {
-        if (dot_idx + 1 < remaining.len and std.ascii.isUpper(remaining[dot_idx + 1])) {
+    var first_token_end: usize = 0;
+    while (first_token_end < remaining.len and !std.ascii.isWhitespace(remaining[first_token_end])) {
+        first_token_end += 1;
+    }
+    const first_token = remaining[0..first_token_end];
+    if (std.mem.indexOfScalar(u8, first_token, '.')) |dot_idx| {
+        if (dot_idx + 1 < first_token.len and std.ascii.isUpper(first_token[dot_idx + 1])) {
             return true;
         }
     }
@@ -2781,7 +3498,7 @@ fn parseLetBindingWithOptions(
     if (idx >= trimmed.len or trimmed[idx] != '=') return error.MissingEquals;
     idx += 1;
 
-    skipInlineWhitespace(trimmed, &idx);
+    skipWhitespaceAll(trimmed, &idx);
     if (idx >= trimmed.len) return error.MissingValue;
 
     if (trimmed[idx] == '"') {
@@ -2814,10 +3531,23 @@ fn parseLetBindingWithOptions(
         };
     }
 
-    if (trimmed[idx] == '{') {
-        var object_literal = try parseObjectLiteral(allocator, trimmed[idx..]);
+    var object_start: ?usize = null;
+    if (idx < trimmed.len) {
+        if (trimmed[idx] == '{') {
+            object_start = idx;
+        } else if (trimmed[idx] == '.') {
+            var after_dot = idx + 1;
+            skipWhitespaceAll(trimmed, &after_dot);
+            if (after_dot < trimmed.len and trimmed[after_dot] == '{') {
+                object_start = after_dot;
+            }
+        }
+    }
+
+    if (object_start) |start_idx| {
+        var object_literal = try parseObjectLiteral(allocator, trimmed[start_idx..]);
         errdefer object_literal.literal.deinit(allocator);
-        idx += object_literal.consumed;
+        idx = start_idx + object_literal.consumed;
 
         skipInlineWhitespace(trimmed, &idx);
         if (idx != trimmed.len) return error.TrailingCharacters;
@@ -2864,6 +3594,23 @@ fn parseLetBindingWithOptions(
     const command_text = std.mem.trim(u8, trimmed[literal_start..], " \t");
     if (command_text.len == 0) return error.MissingValue;
 
+    if (options.modules != null) {
+        if (try parseModuleImportMemberExpression(allocator, command_text)) |member_spec| {
+            return LetBinding{
+                .name = name,
+                .value = .{ .module_import_member = member_spec },
+                .is_mutable = is_mutable,
+            };
+        }
+        if (try parseModuleImportExpression(allocator, command_text)) |import_spec| {
+            return LetBinding{
+                .name = name,
+                .value = .{ .module_import = .{ .spec = import_spec } },
+                .is_mutable = is_mutable,
+            };
+        }
+    }
+
     const type_candidate = std.mem.trim(u8, command_text, " \t\r\n");
     if (type_candidate.len > 0 and shouldParseAsTypeExpression(type_candidate)) {
         parseTypeExpressionLiteral(type_candidate) catch |err| switch (err) {
@@ -2900,6 +3647,9 @@ fn parseLetBindingWithOptions(
             };
         }
     }
+    if (unknownFunctionBindingNameFromExpression(command_text, options.context)) |_| {
+        return error.UnknownFunctionBinding;
+    }
     if (try parseBindingExpression(allocator, command_text)) |expr| {
         return LetBinding{
             .name = name,
@@ -2923,6 +3673,50 @@ fn parseLetBindingWithOptions(
         .value = .{ .command = command_owned },
         .is_mutable = is_mutable,
     };
+}
+
+fn parseErrorDeclaration(command: []const u8) ErrorDeclarationParseError!?ParsedErrorDeclaration {
+    var trimmed = std.mem.trim(u8, command, " \t\r\n");
+    if (trimmed.len < "error".len) return null;
+    if (!std.mem.startsWith(u8, trimmed, "error")) return null;
+    if (trimmed.len == "error".len) return error.MissingName;
+    if (!std.ascii.isWhitespace(trimmed["error".len])) return null;
+
+    var idx: usize = "error".len;
+    skipWhitespaceAll(trimmed, &idx);
+    if (idx >= trimmed.len) return error.MissingName;
+    if (!isIdentifierStart(trimmed[idx])) return error.InvalidName;
+    const name_start = idx;
+    idx += 1;
+    while (idx < trimmed.len and isIdentifierChar(trimmed[idx])) : (idx += 1) {}
+    const name = trimmed[name_start..idx];
+
+    skipWhitespaceAll(trimmed, &idx);
+    if (idx >= trimmed.len or trimmed[idx] != '=') return error.MissingEquals;
+    idx += 1;
+
+    skipWhitespaceAll(trimmed, &idx);
+    if (idx >= trimmed.len) return error.MissingDefinition;
+    const definition = std.mem.trim(u8, trimmed[idx..], " \t\r\n");
+    if (definition.len == 0) return error.MissingDefinition;
+
+    const starts_with_union = startsWithErrorBody(definition, "union");
+    const starts_with_enum = startsWithErrorBody(definition, "enum");
+    if (!starts_with_union and !starts_with_enum) return error.MissingBodyKind;
+
+    return ParsedErrorDeclaration{
+        .name = name,
+        .definition = definition,
+    };
+}
+
+fn startsWithErrorBody(definition: []const u8, keyword: []const u8) bool {
+    if (definition.len < keyword.len) return false;
+    if (!std.mem.startsWith(u8, definition, keyword)) return false;
+    if (definition.len == keyword.len) return true;
+    const suffix = definition[keyword.len];
+    if (suffix == '{') return true;
+    return std.ascii.isWhitespace(suffix);
 }
 
 fn shouldParseAsModuleFunction(
@@ -3060,6 +3854,103 @@ fn parseModuleValueReference(
     return ModuleValueBinding{
         .module_alias = alias_owned,
         .value_name = value_owned,
+    };
+}
+
+const ModuleImportParseResult = struct {
+    spec: []u8,
+    next_index: usize,
+};
+
+fn parseModuleImportPrefix(
+    allocator: Allocator,
+    trimmed: []const u8,
+) (ParseLetBindingError)!?ModuleImportParseResult {
+    if (!std.mem.startsWith(u8, trimmed, "import")) return null;
+    if (trimmed.len > 6) {
+        const suffix = trimmed[6];
+        if (!std.ascii.isWhitespace(suffix) and suffix != '(') return null;
+    } else {
+        return error.MissingValue;
+    }
+
+    var idx: usize = 6;
+    skipWhitespaceAll(trimmed, &idx);
+    if (idx >= trimmed.len or trimmed[idx] != '(') return error.InvalidExpression;
+    idx += 1;
+
+    skipWhitespaceAll(trimmed, &idx);
+    if (idx >= trimmed.len) return error.MissingValue;
+    if (trimmed[idx] != '"') return error.MissingStringLiteral;
+
+    const literal = try parseStringLiteral(allocator, trimmed[idx..]);
+    idx += literal.consumed;
+
+    skipWhitespaceAll(trimmed, &idx);
+    if (idx >= trimmed.len or trimmed[idx] != ')') {
+        allocator.free(literal.value);
+        return error.MissingClosingParen;
+    }
+    idx += 1;
+
+    return ModuleImportParseResult{
+        .spec = literal.value,
+        .next_index = idx,
+    };
+}
+
+fn parseModuleImportExpression(
+    allocator: Allocator,
+    value: []const u8,
+) (ParseLetBindingError)!?[]u8 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    const prefix = try parseModuleImportPrefix(allocator, trimmed) orelse return null;
+    var idx = prefix.next_index;
+
+    skipWhitespaceAll(trimmed, &idx);
+    if (idx != trimmed.len) {
+        allocator.free(prefix.spec);
+        return error.TrailingCharacters;
+    }
+
+    return prefix.spec;
+}
+
+fn parseModuleImportMemberExpression(
+    allocator: Allocator,
+    value: []const u8,
+) (ParseLetBindingError)!?ModuleImportMemberBinding {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    const prefix = try parseModuleImportPrefix(allocator, trimmed) orelse return null;
+    var idx = prefix.next_index;
+
+    skipWhitespaceAll(trimmed, &idx);
+    if (idx >= trimmed.len or trimmed[idx] != '.') {
+        allocator.free(prefix.spec);
+        return null;
+    }
+    idx += 1;
+
+    skipWhitespaceAll(trimmed, &idx);
+    if (idx >= trimmed.len or !isIdentifierStart(trimmed[idx])) {
+        allocator.free(prefix.spec);
+        return error.InvalidExpression;
+    }
+    const member_start = idx;
+    idx += 1;
+    while (idx < trimmed.len and isIdentifierChar(trimmed[idx])) : (idx += 1) {}
+    const member_slice = trimmed[member_start..idx];
+
+    skipWhitespaceAll(trimmed, &idx);
+    if (idx != trimmed.len) {
+        allocator.free(prefix.spec);
+        return error.TrailingCharacters;
+    }
+
+    const member_owned = try allocator.dupe(u8, member_slice);
+    return ModuleImportMemberBinding{
+        .spec = prefix.spec,
+        .member_name = member_owned,
     };
 }
 
@@ -3309,21 +4200,64 @@ fn parseArithmeticDelta(text: []const u8) LetParseError!i64 {
 
 const ParseModuleInvocationError = ModuleInvocationError || ParseStringError || Allocator.Error;
 
+fn catchClauseStartsHere(text: []const u8) bool {
+    if (text.len < "catch".len) return false;
+    if (!std.mem.startsWith(u8, text, "catch")) return false;
+    if (text.len == "catch".len) return true;
+    const next = text["catch".len];
+    return std.ascii.isWhitespace(next) or next == '|' or next == '{';
+}
+
+fn ReturnType(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .@"fn" => |f| f.return_type orelse void,
+        .pointer => |p| ReturnType(p.child),
+        else => @compileError(@typeName(T) ++ " is not a function"),
+    };
+}
+
+fn JoinOptional(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .optional => |o| switch (@typeInfo(o.child)) {
+            .optional => |o2| ?o2.child,
+            else => T,
+        },
+        else => @compileError(@typeName(T) ++ " is not an optional type"),
+    };
+}
+
+fn parseExact(
+    parser: anytype,
+    command: []const u8,
+    idx: *usize,
+) JoinOptional(?ReturnType(@TypeOf(parser))) {
+    const start = idx.*;
+    const result = parser(command, idx);
+    if (idx.* + start == command.len) return result;
+    idx.* = start;
+    return null;
+}
+
+fn parseIdentifier(
+    command: []const u8,
+    idx: *usize,
+) ?[]const u8 {
+    skipWhitespaceAll(command, idx);
+    if (idx.* >= command.len) return null;
+    if (!isIdentifierStart(command[idx.*])) return null;
+    const alias_start = idx.*;
+    idx.* += 1;
+    while (idx.* < command.len and isIdentifierChar(command[idx.*])) : (idx.* += 1) {}
+    return command[alias_start..idx.*];
+}
+
 fn parseModuleInvocation(
     allocator: Allocator,
     command: []const u8,
     context: ?*const ScriptContext,
 ) ParseModuleInvocationError!?ModuleInvocation {
     var idx: usize = 0;
-    skipWhitespaceAll(command, &idx);
-    if (idx >= command.len) return null;
-    if (!isIdentifierStart(command[idx])) return null;
-
-    const alias_start = idx;
-    idx += 1;
-    while (idx < command.len and isIdentifierChar(command[idx])) : (idx += 1) {}
-    const identifier = command[alias_start..idx];
-
+    const identifier = parseIdentifier(command, &idx) orelse return null;
     const alias_end = idx;
     skipWhitespaceAll(command, &idx);
     const consumed_after_alias = idx - alias_end;
@@ -3331,22 +4265,22 @@ fn parseModuleInvocation(
 
     if (command[idx] == '.' and consumed_after_alias == 0) {
         idx += 1;
-        skipWhitespaceAll(command, &idx);
-        if (idx >= command.len) return error.MissingFunctionName;
-        if (!isIdentifierStart(command[idx])) return error.MissingFunctionName;
-        const func_start = idx;
-        idx += 1;
-        while (idx < command.len and isIdentifierChar(command[idx])) : (idx += 1) {}
-        const function_name = command[func_start..idx];
+        const function_name = parseIdentifier(command, &idx) orelse return error.MissingFunctionName;
 
         skipWhitespaceAll(command, &idx);
-        if (idx >= command.len or command[idx] != '(') return null;
+        const nextChar = peekChar(command, idx) orelse return null;
+        if (nextChar != '(') return null;
 
         const args = try parseInvocationArguments(allocator, command, &idx);
         errdefer freeStringList(allocator, args);
 
         skipWhitespaceAll(command, &idx);
-        if (idx != command.len) return null;
+        if (idx != command.len) {
+            if (catchClauseStartsHere(command[idx..])) {
+                return ModuleInvocationError.UnsupportedCatchClause;
+            }
+            return null;
+        }
 
         return ModuleInvocation{
             .alias = identifier,
@@ -3363,7 +4297,12 @@ fn parseModuleInvocation(
         errdefer freeStringList(allocator, args);
 
         skipWhitespaceAll(command, &idx);
-        if (idx != command.len) return null;
+        if (idx != command.len) {
+            if (catchClauseStartsHere(command[idx..])) {
+                return ModuleInvocationError.UnsupportedCatchClause;
+            }
+            return null;
+        }
 
         return ModuleInvocation{
             .alias = binding.module_alias,
@@ -3381,8 +4320,7 @@ fn parseInvocationArguments(
     idx_ptr: *usize,
 ) (ModuleInvocationError || ParseStringError || Allocator.Error)![][]const u8 {
     var idx = idx_ptr.*;
-    if (idx >= command.len or command[idx] != '(') return error.MissingArgumentList;
-    idx += 1;
+    parseChar('(', command, &idx) orelse return error.MissingArgumentList;
 
     var args = ManagedArrayList([]const u8).init(allocator);
     errdefer {
@@ -3429,36 +4367,61 @@ fn parseInvocationArguments(
     return owned;
 }
 
-fn parseBindingExpression(allocator: Allocator, input: []const u8) !?BindingExpression {
-    const trimmed = std.mem.trim(u8, input, " \t");
-    if (trimmed.len == 0) return null;
+fn parseChar(char: u8, command: []const u8, idx: *usize) ?void {
+    if (idx.* >= command.len) return null;
+    if (command[idx.* + 1] == char) {
+        idx.* += 1;
+        return;
+    }
+    return null;
+}
 
+fn peekChar(command: []const u8, idx: usize) ?u8 {
+    if (idx >= command.len) return null;
+    return command[idx + 1];
+}
+
+fn parseFunctionCallName(command: []const u8) ?[]const u8 {
     var idx: usize = 0;
-    if (!isIdentifierStart(trimmed[idx])) return null;
-    const base_start = idx;
-    idx += 1;
-    while (idx < trimmed.len and isIdentifierChar(trimmed[idx])) : (idx += 1) {}
-    const base_name = trimmed[base_start..idx];
+    const function_name = parseIdentifier(command, &idx) orelse return null;
+    const nextChar = peekChar(command, idx) orelse return null;
+    if (nextChar != '(') return null;
+    return function_name;
+}
 
-    var cursor = idx;
-    skipInlineWhitespace(trimmed, &cursor);
-    if (cursor == trimmed.len) {
+fn unknownFunctionBindingNameFromExpression(
+    expression: []const u8,
+    context: ?*const ScriptContext,
+) ?[]const u8 {
+    const ctx = context orelse return null;
+    const name = parseFunctionCallName(expression) orelse return null;
+    if (ctx.getFunctionBinding(name)) |_| return null;
+    return name;
+}
+
+fn functionCallNameFromLet(command: []const u8) ?[]const u8 {
+    const eq_idx = findAssignmentEquals(command) orelse return null;
+    var idx = eq_idx + 1;
+    skipWhitespaceAll(command, &idx);
+    if (idx >= command.len) return null;
+    return parseFunctionCallName(command[idx..]);
+}
+
+fn parseBindingExpression(allocator: Allocator, input: []const u8) !?BindingExpression {
+    var idx: usize = 0;
+    const base_name = parseIdentifier(input, &idx) orelse return null;
+    skipInlineWhitespace(input, &idx);
+    if (idx == input.len) {
         const owned = try allocator.dupe(u8, base_name);
         return BindingExpression{ .identifier = owned };
     }
 
-    if (trimmed[cursor] == '.') {
-        cursor += 1;
+    if (input[idx] == '.') {
+        idx += 1;
 
-        skipInlineWhitespace(trimmed, &cursor);
-        if (cursor >= trimmed.len or !isIdentifierStart(trimmed[cursor])) return null;
-        const field_start = cursor;
-        cursor += 1;
-        while (cursor < trimmed.len and isIdentifierChar(trimmed[cursor])) : (cursor += 1) {}
-        const field_name = trimmed[field_start..cursor];
-
-        skipInlineWhitespace(trimmed, &cursor);
-        if (cursor != trimmed.len) return null;
+        const field_name = parseIdentifier(input, &idx) orelse return null;
+        skipInlineWhitespace(input, &idx);
+        if (idx != input.len) return null;
 
         const object_owned = try allocator.dupe(u8, base_name);
         errdefer allocator.free(object_owned);
@@ -3472,26 +4435,26 @@ fn parseBindingExpression(allocator: Allocator, input: []const u8) !?BindingExpr
         };
     }
 
-    if (trimmed[cursor] == '[') {
-        cursor += 1;
-        skipInlineWhitespace(trimmed, &cursor);
-        if (cursor >= trimmed.len) return null;
+    if (input[idx] == '[') {
+        idx += 1;
+        skipInlineWhitespace(input, &idx);
+        if (idx >= input.len) return null;
 
-        const index_start = cursor;
-        while (cursor < trimmed.len and std.ascii.isDigit(trimmed[cursor])) : (cursor += 1) {}
-        if (index_start == cursor) return null;
+        const index_start = idx;
+        while (idx < input.len and std.ascii.isDigit(input[idx])) : (idx += 1) {}
+        if (index_start == idx) return null;
 
-        const index_slice = trimmed[index_start..cursor];
+        const index_slice = input[index_start..idx];
         const element_index = std.fmt.parseUnsigned(usize, index_slice, 10) catch {
             return null;
         };
 
-        skipInlineWhitespace(trimmed, &cursor);
-        if (cursor >= trimmed.len or trimmed[cursor] != ']') return null;
-        cursor += 1;
+        skipInlineWhitespace(input, &idx);
+        if (idx >= input.len or input[idx] != ']') return null;
+        idx += 1;
 
-        skipInlineWhitespace(trimmed, &cursor);
-        if (cursor != trimmed.len) return null;
+        skipInlineWhitespace(input, &idx);
+        if (idx != input.len) return null;
 
         const array_owned = try allocator.dupe(u8, base_name);
         return BindingExpression{
@@ -3589,14 +4552,25 @@ fn parseObjectLiteral(allocator: Allocator, input: []const u8) ParseObjectError!
     while (idx < input.len) {
         skipWhitespaceAll(input, &idx);
         if (idx >= input.len) return error.MissingClosingBrace;
-        if (!isIdentifierStart(input[idx])) return error.InvalidObjectLiteral;
+        if (input[idx] == '}') {
+            idx += 1;
+            break;
+        }
+        if (input[idx] == '.') {
+            idx += 1;
+            skipWhitespaceAll(input, &idx);
+        }
+
+        if (idx >= input.len or !isIdentifierStart(input[idx])) return error.InvalidObjectLiteral;
         const key_start = idx;
         idx += 1;
         while (idx < input.len and isIdentifierChar(input[idx])) : (idx += 1) {}
         const key_slice = input[key_start..idx];
 
         skipWhitespaceAll(input, &idx);
-        if (idx >= input.len or input[idx] != ':') return error.InvalidObjectLiteral;
+        if (idx >= input.len) return error.MissingClosingBrace;
+        const separator = input[idx];
+        if (separator != ':' and separator != '=') return error.InvalidObjectLiteral;
         idx += 1;
 
         skipWhitespaceAll(input, &idx);
@@ -3617,10 +4591,7 @@ fn parseObjectLiteral(allocator: Allocator, input: []const u8) ParseObjectError!
                 entry_value = .{ .literal = try allocator.dupe(u8, value_slice) };
             } else {
                 var name_idx: usize = 0;
-                if (!isIdentifierStart(value_slice[name_idx])) return error.InvalidObjectLiteral;
-                name_idx += 1;
-                while (name_idx < value_slice.len and isIdentifierChar(value_slice[name_idx])) : (name_idx += 1) {}
-                if (name_idx != value_slice.len) return error.InvalidObjectLiteral;
+                _ = parseExact(parseIdentifier, value_slice, &name_idx) orelse return error.InvalidObjectLiteral;
                 entry_value = .{ .identifier = try allocator.dupe(u8, value_slice) };
             }
         }
@@ -3781,34 +4752,6 @@ fn fileExists(path: []const u8) bool {
     return true;
 }
 
-fn parseModuleParamNames(allocator: Allocator, params: []const u8) ![][]const u8 {
-    const trimmed = std.mem.trim(u8, params, " \t\r\n");
-    if (trimmed.len == 0) return &[_][]const u8{};
-
-    var list = std.ArrayList([]const u8).empty;
-    errdefer {
-        for (list.items) |param| allocator.free(param);
-        list.deinit(allocator);
-    }
-
-    var iter = std.mem.splitScalar(u8, trimmed, ',');
-    while (iter.next()) |entry| {
-        const cleaned = std.mem.trim(u8, entry, " \t\r\n");
-        if (cleaned.len == 0) continue;
-        const colon = std.mem.indexOfScalar(u8, cleaned, ':') orelse cleaned.len;
-        const name_slice = std.mem.trim(u8, cleaned[0..colon], " \t\r\n");
-        if (name_slice.len == 0) return ModuleParseError.InvalidParameterName;
-        if (!isIdentifierStart(name_slice[0])) return ModuleParseError.InvalidParameterName;
-        for (name_slice[1..]) |ch| {
-            if (!isIdentifierChar(ch)) return ModuleParseError.InvalidParameterName;
-        }
-        const name_owned = try allocator.dupe(u8, name_slice);
-        try list.append(allocator, name_owned);
-    }
-
-    return try list.toOwnedSlice(allocator);
-}
-
 const ReturnCommandOptions = struct {
     require_return: bool = true,
     allow_empty_command: bool = false,
@@ -3873,7 +4816,62 @@ fn extractReturnCommand(allocator: Allocator, body: []const u8, options: ReturnC
         return ModuleParseError.MissingReturnCommand;
     }
 
-    var command_slice = std.mem.trim(u8, trimmed[idx..], " \t\r\n");
+    var command_region = trimmed[idx..];
+    var region_end = command_region.len;
+    var scan_idx: usize = 0;
+    var mode: QuoteMode = .none;
+    var escape = false;
+    while (scan_idx < command_region.len) : (scan_idx += 1) {
+        const ch = command_region[scan_idx];
+        switch (mode) {
+            .double => {
+                if (escape) {
+                    escape = false;
+                    continue;
+                }
+                if (ch == '\\') {
+                    escape = true;
+                    continue;
+                }
+                if (ch == '"') mode = .none;
+                continue;
+            },
+            .single => {
+                if (escape) {
+                    escape = false;
+                    continue;
+                }
+                if (ch == '\\') {
+                    escape = true;
+                    continue;
+                }
+                if (ch == '\'') mode = .none;
+                continue;
+            },
+            .none => {},
+        }
+
+        if (mode == .none) {
+            if (ch == '\n' or ch == '\r') {
+                region_end = scan_idx;
+                break;
+            }
+            if (ch == '#') {
+                region_end = scan_idx;
+                break;
+            }
+            if (ch == '/' and scan_idx + 1 < command_region.len and command_region[scan_idx + 1] == '/') {
+                region_end = scan_idx;
+                break;
+            }
+            if (ch == '}') {
+                region_end = scan_idx;
+                break;
+            }
+        }
+    }
+    command_region = command_region[0..region_end];
+    var command_slice = std.mem.trim(u8, command_region, " \t\r\n");
     if (command_slice.len == 0) {
         if (options.allow_empty_command) {
             return try allocator.dupe(u8, &[_]u8{});
@@ -4022,6 +5020,25 @@ test "extractReturnCommand allows bare return without command" {
     try std.testing.expectEqual(@as(usize, 0), command.len);
 }
 
+test "extractReturnCommand stops at return line" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    const source =
+        \\  if count > 1 {
+        \\    return "plural"
+        \\  } else if count == 1 {
+        \\    return "singular"
+        \\  } else {
+        \\    return "empty"
+        \\  }
+    ;
+
+    const command = try extractReturnCommand(gpa.allocator(), source, .{});
+    defer gpa.allocator().free(command);
+    try std.testing.expectEqualStrings("\"plural\"", command);
+}
+
 fn isAbsolutePath(path: []const u8) bool {
     if (path.len == 0) return false;
     if (path[0] == '/' or path[0] == '\\') return true;
@@ -4137,6 +5154,103 @@ test "parse let binding rejects invalid struct type expression" {
     );
 }
 
+test "parse error declaration captures union body" {
+    const command =
+        \\error FileError = union {
+        \\  NotFound: { path: Str },
+        \\  Unreadable: { path: Str },
+        \\}
+    ;
+    const parsed = try parseErrorDeclaration(command);
+    try std.testing.expect(parsed != null);
+    const decl = parsed.?;
+    try std.testing.expectEqualStrings("FileError", decl.name);
+    try std.testing.expect(std.mem.startsWith(u8, decl.definition, "union"));
+    try std.testing.expect(std.mem.indexOf(u8, decl.definition, "Unreadable") != null);
+}
+
+test "parse error declaration rejects missing body kind" {
+    try std.testing.expectError(
+        ErrorDeclarationParseError.MissingBodyKind,
+        parseErrorDeclaration("error Something = struct { value: Int }"),
+    );
+}
+
+test "let continuation detection tracks struct type expressions" {
+    try std.testing.expect(letCommandNeedsMoreLines("let Result = struct {"));
+    try std.testing.expect(letCommandNeedsMoreLines("let Result = struct {\n  value: ?Float,"));
+    try std.testing.expect(!letCommandNeedsMoreLines("let Result = struct {\n  value: ?Float,\n}"));
+    try std.testing.expect(!letCommandNeedsMoreLines(
+        "let Result = struct { value: ?Float, } // trailing comment {",
+    ));
+}
+
+test "let continuation detection counts parentheses and empty values" {
+    try std.testing.expect(letCommandNeedsMoreLines("let MaybePair = Result("));
+    try std.testing.expect(letCommandNeedsMoreLines("let MaybePair = Result(Float,\n  Float,"));
+    try std.testing.expect(!letCommandNeedsMoreLines("let MaybePair = Result(Float, Float)"));
+    try std.testing.expect(!letCommandNeedsMoreLines("let pattern = \"{value}\""));
+    try std.testing.expect(letCommandNeedsMoreLines("let Something ="));
+}
+
+test "error declaration continuation detection tracks braces" {
+    try std.testing.expect(errorDeclarationNeedsMoreLines("error ParserError = union {"));
+    try std.testing.expect(
+        errorDeclarationNeedsMoreLines(
+            "error ParserError = union {\n  Missing: { path: Str },\n  Invalid: { value: Str },",
+        ),
+    );
+    try std.testing.expect(
+        !errorDeclarationNeedsMoreLines(
+            "error ParserError = union {\n  Missing: { path: Str },\n  Invalid: { value: Str },\n}",
+        ),
+    );
+    try std.testing.expect(errorDeclarationNeedsMoreLines("error ParserError = union"));
+}
+
+test "control flow continuation detection tracks if expressions" {
+    try std.testing.expect(controlFlowNeedsMoreLines("if (value) {"));
+    try std.testing.expect(controlFlowNeedsMoreLines("if (value) {\n  echo \"hi\"\n} else {"));
+    try std.testing.expect(!controlFlowNeedsMoreLines("if (value) {\n  echo \"{ ok }\"\n}"));
+    try std.testing.expect(
+        !controlFlowNeedsMoreLines("if (value) {\n  echo \"hi\"\n} else {\n  echo \"bye\"\n}"),
+    );
+    try std.testing.expect(controlFlowNeedsMoreLines("if (value) {\n  // brace in comment }\n"));
+}
+
+test "control flow sanitizer replaces block bodies" {
+    const allocator = std.testing.allocator;
+    const sanitized = try sanitizeControlFlowSnippet(
+        allocator,
+        "if (value) |port| {\n  ensure(port == 8080, \"msg\")\n} else {\n  echo \"{value}\"\n}\n",
+    );
+    defer allocator.free(sanitized);
+    try std.testing.expectEqualStrings("if (value) |port| { value } else { value }\n", sanitized);
+}
+
+test "script context bindings seed interpreter scopes" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var context = ScriptContext.init(gpa.allocator());
+    defer context.deinit();
+    try context.declareStringBinding("greeting", "hello", false);
+    try context.declareStringBinding("mutable_value", "42", true);
+
+    var scopes = ScopeStack.init(gpa.allocator());
+    defer scopes.deinit();
+
+    try reseedInterpreterScopeWithContext(gpa.allocator(), &scopes, &context);
+
+    const greeting = scopes.lookup("greeting");
+    try std.testing.expect(greeting != null);
+    try std.testing.expectEqualStrings("hello", greeting.?.value.string);
+
+    const mutable_binding = scopes.lookup("mutable_value");
+    try std.testing.expect(mutable_binding != null);
+    try std.testing.expect(mutable_binding.?.is_mutable);
+}
+
 test "parse mut binding marks binding mutable" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -4174,6 +5288,21 @@ test "parse let binding captures pipeline commands" {
     try std.testing.expectEqualStrings("echo \"hi\" | upper", result.value.command);
 }
 
+test "trimCommandExpression unwraps parenthesized pipelines" {
+    const command = "  (true | true)  ";
+    try std.testing.expectEqualStrings("true | true", trimCommandExpression(command));
+}
+
+test "trimCommandExpression respects unmatched parentheses" {
+    const command = "(echo hi) | upper";
+    try std.testing.expectEqualStrings(command, trimCommandExpression(command));
+}
+
+test "trimCommandExpression ignores quoted parentheses" {
+    const command = "(echo \"(\")";
+    try std.testing.expectEqualStrings("echo \"(\"", trimCommandExpression(command));
+}
+
 test "parse let binding supports command arguments with leading dot" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -4208,9 +5337,9 @@ test "parse let binding captures object literals" {
 
     const binding = try parseLetBinding(gpa.allocator(), "let thresholds = { api: 200, jobs: typed_port }");
     try std.testing.expect(binding != null);
-    var result = binding.?;
+    const result = binding.?;
     defer switch (result.value) {
-        .object_literal => |*literal| literal.deinit(gpa.allocator()),
+        .object_literal => |*literal| @constCast(literal).deinit(gpa.allocator()),
         else => {},
     };
     try std.testing.expectEqualStrings("thresholds", result.name);
@@ -4219,6 +5348,80 @@ test "parse let binding captures object literals" {
     try std.testing.expectEqualStrings("api", result.value.object_literal.entries[0].key);
     try std.testing.expect(result.value.object_literal.entries[0].value == .literal);
     try std.testing.expect(result.value.object_literal.entries[1].value == .identifier);
+}
+
+test "parse let binding allows trailing commas in object literals" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    const binding = try parseLetBinding(
+        gpa.allocator(),
+        "let thresholds = { api: 200, jobs: typed_port, }",
+    );
+    try std.testing.expect(binding != null);
+    const result = binding.?;
+    defer switch (result.value) {
+        .object_literal => |*literal| @constCast(literal).deinit(gpa.allocator()),
+        else => {},
+    };
+    try std.testing.expectEqualStrings("thresholds", result.name);
+    try std.testing.expect(result.value == .object_literal);
+    try std.testing.expectEqual(@as(usize, 2), result.value.object_literal.entries.len);
+    try std.testing.expectEqualStrings("api", result.value.object_literal.entries[0].key);
+    try std.testing.expect(result.value.object_literal.entries[0].value == .literal);
+    try std.testing.expect(result.value.object_literal.entries[1].value == .identifier);
+}
+
+test "parse let binding captures zig-style object literals" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    const binding = try parseLetBinding(
+        gpa.allocator(),
+        "let thresholds = .{ .api = 200, .jobs = typed_port }",
+    );
+    try std.testing.expect(binding != null);
+    const result = binding.?;
+    defer switch (result.value) {
+        .object_literal => |*literal| @constCast(literal).deinit(gpa.allocator()),
+        else => {},
+    };
+
+    try std.testing.expectEqualStrings("thresholds", result.name);
+    try std.testing.expect(result.value == .object_literal);
+    try std.testing.expectEqual(@as(usize, 2), result.value.object_literal.entries.len);
+    try std.testing.expectEqualStrings("api", result.value.object_literal.entries[0].key);
+    try std.testing.expectEqualStrings("jobs", result.value.object_literal.entries[1].key);
+    try std.testing.expect(result.value.object_literal.entries[0].value == .literal);
+    try std.testing.expect(result.value.object_literal.entries[1].value == .identifier);
+}
+
+test "parse let binding captures multiline zig-style object literals" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    const source =
+        \\let result: Result = .{
+        \\  .value = 1,
+        \\  .ok = false,
+        \\}
+    ;
+
+    const binding = try parseLetBinding(gpa.allocator(), source);
+    try std.testing.expect(binding != null);
+    var result = binding.?;
+    defer switch (result.value) {
+        .object_literal => |*literal| @constCast(literal).deinit(gpa.allocator()),
+        else => {},
+    };
+
+    try std.testing.expectEqualStrings("result", result.name);
+    try std.testing.expect(result.value == .object_literal);
+    try std.testing.expectEqual(@as(usize, 2), result.value.object_literal.entries.len);
+    try std.testing.expectEqualStrings("value", result.value.object_literal.entries[0].key);
+    try std.testing.expectEqualStrings("ok", result.value.object_literal.entries[1].key);
+    try std.testing.expect(result.value.object_literal.entries[0].value == .literal);
+    try std.testing.expect(result.value.object_literal.entries[1].value == .literal);
 }
 
 test "parse let binding captures object field expressions" {
@@ -4289,6 +5492,50 @@ test "parse let binding recognizes module function references" {
     try std.testing.expectEqualStrings("ensure", result.value.module_function.function_name);
 }
 
+test "parse let binding recognizes module imports" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var modules = ModuleRegistry.init(gpa.allocator());
+    defer modules.deinit();
+
+    const binding = try parseLetBindingWithOptions(
+        gpa.allocator(),
+        "let helpers = import(\"lib/helpers\")",
+        .{ .modules = &modules },
+    );
+    try std.testing.expect(binding != null);
+    const result = binding.?;
+    defer gpa.allocator().free(result.value.module_import.spec);
+    try std.testing.expectEqualStrings("helpers", result.name);
+    try std.testing.expect(result.value == .module_import);
+    try std.testing.expectEqualStrings("lib/helpers", result.value.module_import.spec);
+}
+
+test "parse let binding recognizes inline module import members" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var modules = ModuleRegistry.init(gpa.allocator());
+    defer modules.deinit();
+
+    const binding = try parseLetBindingWithOptions(
+        gpa.allocator(),
+        "let ensure = import(\"lib/helpers\").ensure",
+        .{ .modules = &modules },
+    );
+    try std.testing.expect(binding != null);
+    const result = binding.?;
+    defer {
+        gpa.allocator().free(result.value.module_import_member.spec);
+        gpa.allocator().free(result.value.module_import_member.member_name);
+    }
+    try std.testing.expectEqualStrings("ensure", result.name);
+    try std.testing.expect(result.value == .module_import_member);
+    try std.testing.expectEqualStrings("lib/helpers", result.value.module_import_member.spec);
+    try std.testing.expectEqualStrings("ensure", result.value.module_import_member.member_name);
+}
+
 test "parse let binding recognizes module invocations" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -4303,10 +5550,10 @@ test "parse let binding recognizes module invocations" {
     );
     try std.testing.expect(binding != null);
     var result = binding.?;
-    defer {
+    defer if (result.value == .module_invocation) {
         result.value.module_invocation.invocation.deinit(gpa.allocator());
         gpa.allocator().free(result.value.module_invocation.display_command);
-    }
+    };
     try std.testing.expectEqualStrings("sum", result.name);
     try std.testing.expect(result.value == .module_invocation);
     try std.testing.expectEqualStrings("math.add(1, 2)", result.value.module_invocation.display_command);
@@ -4315,6 +5562,28 @@ test "parse let binding recognizes module invocations" {
     try std.testing.expectEqual(@as(usize, 2), result.value.module_invocation.invocation.args.len);
     try std.testing.expectEqualStrings("1", result.value.module_invocation.invocation.args[0]);
     try std.testing.expectEqualStrings("2", result.value.module_invocation.invocation.args[1]);
+}
+
+test "parse let binding rejects module invocation catch clauses" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var context = ScriptContext.init(gpa.allocator());
+    defer context.deinit();
+
+    try context.declareFunctionBinding("bootstrap", "script", "bootstrap", false);
+
+    try std.testing.expectError(
+        ModuleInvocationError.UnsupportedCatchClause,
+        parseLetBindingWithOptions(
+            gpa.allocator(),
+            \\let recovered = bootstrap() catch |err| {
+            \\  echo err
+            \\}
+        ,
+            .{ .context = &context },
+        ),
+    );
 }
 
 test "parse let binding prefers object field references when modules are available" {
@@ -4381,6 +5650,23 @@ test "parse let binding rejects invalid arithmetic expressions" {
     );
 }
 
+test "parse let binding rejects unknown function bindings" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var context = ScriptContext.init(gpa.allocator());
+    defer context.deinit();
+
+    try std.testing.expectError(
+        LetParseError.UnknownFunctionBinding,
+        parseLetBindingWithOptions(
+            gpa.allocator(),
+            "let has_port = maybe_lookup(true)",
+            .{ .context = &context },
+        ),
+    );
+}
+
 test "parse identifier assignment captures numeric literal" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -4433,36 +5719,6 @@ test "parse identifier assignment handles compound addition" {
     try std.testing.expectEqual(@as(i64, 5), result.value.arithmetic.delta);
 }
 
-test "parse import statement recognizes valid form" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-
-    const handled = try parseImportStatement(gpa.allocator(), "import greet from \"lib\"");
-    try std.testing.expect(handled != null);
-    var parsed = handled.?;
-    defer parsed.deinit(gpa.allocator());
-    try std.testing.expectEqualStrings("greet", parsed.alias);
-    try std.testing.expectEqualStrings("lib", parsed.spec);
-}
-
-test "parse import statement ignores commands" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-
-    const handled = try parseImportStatement(gpa.allocator(), "important output");
-    try std.testing.expect(handled == null);
-}
-
-test "parse import statement errors on missing literal" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-
-    try std.testing.expectError(
-        ImportParseError.MissingStringLiteral,
-        parseImportStatement(gpa.allocator(), "import greet from greet"),
-    );
-}
-
 test "token interpolation applies context bindings" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -4483,6 +5739,50 @@ test "token interpolation applies context bindings" {
     try std.testing.expectEqual(@as(usize, 2), tokens.items.len);
     try std.testing.expectEqualStrings("echo", tokens.items[0]);
     try std.testing.expectEqualStrings("hello, world", tokens.items[1]);
+}
+
+test "token interpolation resolves object fields" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var context = ScriptContext.init(gpa.allocator());
+    defer context.deinit();
+
+    const entries = try gpa.allocator().alloc(ScriptContext.ObjectValue.ObjectEntry, 1);
+    var entries_owned = true;
+    defer if (entries_owned) gpa.allocator().free(entries);
+
+    entries[0].key = try gpa.allocator().dupe(u8, "value");
+    var key_owned = true;
+    defer if (key_owned) gpa.allocator().free(entries[0].key);
+
+    entries[0].value = try gpa.allocator().dupe(u8, "1");
+    var value_owned = true;
+    defer if (value_owned) gpa.allocator().free(entries[0].value);
+
+    var object_value = ScriptContext.ObjectValue{ .entries = entries };
+    var object_owned = false;
+    defer if (object_owned) object_value.deinit(gpa.allocator());
+
+    object_owned = true;
+    entries_owned = false;
+    key_owned = false;
+    value_owned = false;
+
+    try context.declareObjectBinding("result", &object_value, false);
+    object_owned = false;
+
+    var tokens = TokenList.init(gpa.allocator());
+    defer tokens.deinit();
+    try tokens.populate("echo ${result.value}");
+
+    const bindings = BindingProvider{ .context = &context };
+    var issue: ?[]const u8 = null;
+    try interpolateTokensWithBindings(&tokens, bindings, &issue);
+    try std.testing.expect(issue == null);
+    try std.testing.expectEqual(@as(usize, 2), tokens.items.len);
+    try std.testing.expectEqualStrings("echo", tokens.items[0]);
+    try std.testing.expectEqualStrings("1", tokens.items[1]);
 }
 
 test "token interpolation preserves unknown bindings" {
@@ -4568,6 +5868,34 @@ test "parse module invocation ignores plain commands" {
 
     const parsed = try parseModuleInvocation(gpa.allocator(), "echo hi", null);
     try std.testing.expect(parsed == null);
+}
+
+test "module registry parses module functions via parser" {
+    var modules = ModuleRegistry.init(std.testing.allocator);
+    defer modules.deinit();
+
+    var module = ModuleRegistry.Module{
+        .alias = try std.testing.allocator.dupe(u8, "inline"),
+        .spec = try std.testing.allocator.dupe(u8, "inline"),
+        .path = try std.testing.allocator.dupe(u8, "inline.rn"),
+        .functions = .empty,
+        .values = .empty,
+    };
+    defer module.deinit(std.testing.allocator);
+
+    const source =
+        \\fn greet(name: Str) Void {
+        \\  return echo name
+        \\}
+    ;
+
+    try modules.parseModuleFunctions(&module, source);
+    try std.testing.expectEqual(@as(usize, 1), module.functions.items.len);
+    const fn_entry = module.functions.items[0];
+    try std.testing.expectEqualStrings("greet", fn_entry.name);
+    try std.testing.expectEqual(@as(usize, 1), fn_entry.params.len);
+    try std.testing.expectEqualStrings("name", fn_entry.params[0]);
+    try std.testing.expectEqualStrings("echo name", fn_entry.command);
 }
 
 fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseResult {

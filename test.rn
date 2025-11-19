@@ -1,8 +1,11 @@
-let abc = ["abc", "def", "ghi"]
-
-let Position = struct {
-  x: Float,
-  y: Float,
+let Result = struct {
+  value: Float,
+  ok: bool,
 }
 
-echo ${abc}
+let result: Result = .{
+  .value = 1,
+  .ok = false,
+}
+
+echo ${result.value}

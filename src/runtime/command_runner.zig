@@ -320,7 +320,7 @@ pub const ProcessHandle = struct {
     pub fn clone(self: ProcessHandle, allocator: std.mem.Allocator) !ProcessHandle {
         const statuses_copy = try allocator.alloc(StageStatus, self.stage_statuses.len);
         errdefer allocator.free(statuses_copy);
-        std.mem.copy(StageStatus, statuses_copy, self.stage_statuses);
+        @memcpy(statuses_copy, self.stage_statuses);
 
         const captures_copy = try allocator.alloc(StageCapture, self.stage_captures.len);
         var initialized: usize = 0;

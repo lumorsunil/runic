@@ -1,7 +1,7 @@
 // Tests restricting functions to specific error sets so callers know exact failures.
 
-import ensure from "test_support/ensure"
-let ensure = ensure.ensure
+let ensure_module = import("test_support/ensure")
+let ensure = ensure_module.ensure
 
 error FileError = union {
   NotFound: { path: Str },
@@ -10,10 +10,10 @@ error FileError = union {
 
 fn read_config(path: Str) FileError!Str {
   if path == "./tests/features/does-not-exist.conf" {
-    return error.FileError.NotFound { path }
+    return error.FileError.NotFound{ .path = path }
   }
   if path == "./tests/features/protected.conf" {
-    return error.FileError.Unreadable { path }
+    return error.FileError.Unreadable{ .path = path }
   }
   return "key=value"
 }

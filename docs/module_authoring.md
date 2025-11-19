@@ -79,7 +79,7 @@ Nest these descriptors freely to model shapes such as `?Map(Str, Int)` or `^!Pro
 2. Run `zig build run -- path/to/script.rn` from the repository root with a small script that imports your module:
 
    ```rn
-   import http from "net/http"
+   let http = import("net/http")
 
    let ping = http.get("https://example.com")
    await(ping) |resp| {

@@ -1,7 +1,6 @@
 // Tests pipeline status objects that capture per-stage failures.
 
-import ensure from "test_support/ensure"
-let ensure = ensure.ensure
+let ensure = import("test_support/ensure").ensure
 
 let healthy = (true | true)
 ensure(healthy.status.ok, "all stages succeed")

@@ -1,7 +1,7 @@
 // Tests for/while iterator syntax with capture clauses.
 
-import ensure from "test_support/ensure"
-let ensure = ensure.ensure
+let ensure_module = import("test_support/ensure")
+let ensure = ensure_module.ensure
 
 let fruits = ["apple", "banana", "pear"]
 mut order_checks = 0

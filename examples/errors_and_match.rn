@@ -11,7 +11,7 @@ fn require_env(name: Str) ConfigError!Str {
   if (value) |val| {
     return val
   }
-  return error.ConfigError.MissingEnv { name }
+  return error.ConfigError.MissingEnv{ .name = name }
 }
 
 fn parse_bool(name: Str, raw: Str) ConfigError!Bool {
@@ -21,7 +21,7 @@ fn parse_bool(name: Str, raw: Str) ConfigError!Bool {
   if raw == "false" {
     return false
   }
-  return error.ConfigError.InvalidValue { name, value: raw }
+  return error.ConfigError.InvalidValue{ .name = name, .value = raw }
 }
 
 fn resolve_flag(name: Str) ConfigError!Bool {

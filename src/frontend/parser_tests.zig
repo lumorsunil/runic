@@ -1,5 +1,7 @@
 const std = @import("std");
 const lexer = @import("lexer.zig");
+const parser = @import("parser.zig");
+const ast = @import("ast.zig");
 const token = @import("token.zig");
 
 const ParseError = error{
@@ -62,13 +64,13 @@ test "parser fixtures exercise stream-driven parsing success and failure" {
             .expected_error = ParseError.UnexpectedEOF,
         },
         .{
-            .name = "import_statement",
-            .source = "import http from \"net/http\"\n",
+            .name = "import_binding",
+            .source = "let http = import(\"net/http\")\n",
             .parser = parseImport,
         },
         .{
             .name = "import_missing_path",
-            .source = "import http from \n",
+            .source = "let http = import(\n",
             .parser = parseImport,
             .expect_error = true,
             .expected_error = ParseError.UnexpectedToken,
@@ -120,6 +122,113 @@ test "parser fixtures exercise stream-driven parsing success and failure" {
             try fixture.parser(&stream);
         }
     }
+}
+
+test "parser builds AST for optional-aware if expression" {
+    const source =
+        \\if (maybe_value) |value| {
+        \\  value
+        \\} else {
+        \\  null
+        \\}
+    ;
+
+    var pr = parser.Parser.init(std.testing.allocator, source);
+    defer pr.deinit();
+
+    const expr = try pr.parseExpression();
+    try pr.expectEnd();
+
+    try std.testing.expect(expr.* == .if_expr);
+    const if_expr = expr.if_expr;
+    const condition = switch (if_expr.condition.*) {
+        .identifier => |id| id,
+        else => return error.UnexpectedConditionShape,
+    };
+    try std.testing.expectEqualStrings("maybe_value", condition.name);
+
+    try std.testing.expect(if_expr.capture != null);
+    const capture = if_expr.capture.?;
+    try std.testing.expectEqual(@as(usize, 1), capture.bindings.len);
+    const binding = capture.bindings[0];
+    switch (binding.*) {
+        .identifier => |id| try std.testing.expectEqualStrings("value", id.name),
+        else => return error.UnexpectedBindingPattern,
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), if_expr.then_block.statements.len);
+    const then_stmt = if_expr.then_block.statements[0];
+    try std.testing.expect(then_stmt.* == .expression);
+    try std.testing.expect(then_stmt.expression.expression.* == .identifier);
+
+    const else_branch = if_expr.else_branch orelse return error.MissingElseBranch;
+    switch (else_branch) {
+        .block => |block| {
+            try std.testing.expectEqual(@as(usize, 1), block.statements.len);
+            const stmt = block.statements[0];
+            try std.testing.expect(stmt.* == .expression);
+            try std.testing.expect(stmt.expression.expression.* == .literal);
+            try std.testing.expect(stmt.expression.expression.literal == .null);
+        },
+        else => return error.UnexpectedElseShape,
+    }
+}
+
+test "module parser captures functions values and manifests" {
+    const source =
+        \\fn add(lhs: Int, rhs: Int) Int {
+        \\  return echo hi
+        \\}
+        \\let tau = 6.28318
+        \\manifest {
+        \\  "exports": []
+        \\}
+    ;
+
+    var pr = parser.Parser.init(std.testing.allocator, source);
+    defer pr.deinit();
+
+    const document = try pr.parseModuleDocument();
+    try std.testing.expectEqual(@as(usize, 3), document.declarations.len);
+
+    const decl0 = document.declarations[0];
+    switch (decl0) {
+        .function => |func| {
+            try std.testing.expectEqualStrings("add", func.name);
+            try std.testing.expectEqual(@as(usize, 2), func.params.len);
+            try std.testing.expectEqualStrings("lhs", func.params[0].name);
+            try std.testing.expectEqualStrings("rhs", func.params[1].name);
+            const body_slice = pr.sliceForRange(func.body_range);
+            try std.testing.expect(std.mem.indexOfScalar(u8, body_slice, 'e') != null);
+        },
+        else => return error.ExpectedFunctionDecl,
+    }
+
+    const decl1 = document.declarations[1];
+    switch (decl1) {
+        .value => |value| {
+            try std.testing.expectEqualStrings("tau", value.name);
+            const literal = pr.sliceForRange(value.initializer_range);
+            try std.testing.expectEqualStrings("6.28318", std.mem.trim(u8, literal, " \t\r\n"));
+        },
+        else => return error.ExpectedValueDecl,
+    }
+
+    const decl2 = document.declarations[2];
+    switch (decl2) {
+        .manifest => |manifest| {
+            const manifest_slice = pr.sliceForRange(manifest.body_range);
+            try std.testing.expect(std.mem.indexOfScalar(u8, manifest_slice, '[') != null);
+        },
+        else => return error.ExpectedManifestDecl,
+    }
+}
+
+test "module parser reports missing function name" {
+    const source = "fn (value: Int) Int { return value }";
+    var pr = parser.Parser.init(std.testing.allocator, source);
+    defer pr.deinit();
+    try std.testing.expectError(parser.ModuleParseError.MissingFunctionName, pr.parseModuleDocument());
 }
 
 fn parseLetOrMut(stream: *lexer.Stream) ParserError!void {
@@ -212,12 +321,19 @@ fn parseOptionalStageArgument(stream: *lexer.Stream) ParserError!void {
 
 fn parseImport(stream: *lexer.Stream) ParserError!void {
     try skipNewlines(stream);
-    _ = try expectToken(stream, .kw_import);
+    _ = try expectToken(stream, .kw_let);
     try expectIdentifier(stream);
-    _ = try expectToken(stream, .kw_from);
+    try skipNewlines(stream);
+    _ = try expectToken(stream, .assign);
+    try skipNewlines(stream);
+    _ = try expectToken(stream, .kw_import);
+    try skipNewlines(stream);
+    _ = try expectToken(stream, .l_paren);
     try skipNewlines(stream);
     const path = try stream.next();
     if (path.tag != .string_literal) return ParseError.UnexpectedToken;
+    try skipNewlines(stream);
+    _ = try expectToken(stream, .r_paren);
     try consumeStatementTerminator(stream);
 }
 

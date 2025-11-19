@@ -54,7 +54,7 @@ This plan decomposes the work required to build an interpreter that satisfies th
 23. Introduce async promise blocks (`async { ... }`) and the `await (promise) |value| { ... } catch |err| { ... }` syntax, integrating with the process handle promises.
 24. Implement pattern matching for errors and general `match` expressions, allowing capture clauses (`=> |info| ...`) as described in the spec.
 25. Add looping constructs: `for (iterable, range) |value, idx| { ... }` and `while iterator |val| { ... }`, ensuring iterators can come from arrays, generators, or IO streams.
-26. Provide module imports (`import http from "net/http"`) with a loader that maps spec paths to files under `src/` and exposes typed APIs.
+26. Provide module imports (`let http = import("net/http")`) with a loader that maps spec paths to files under `src/` and exposes typed APIs.
 
 ## Phase 6 — CLI & User-Facing Experience
 27. Build the `cmd/runic` binary that accepts script paths, REPL mode, and options for tracing, module paths, and environment overrides.

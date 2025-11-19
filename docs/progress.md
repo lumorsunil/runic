@@ -56,7 +56,7 @@
 - **Task 23:** Introduce async promise blocks (`async { ... }`) and the `await (promise) |value| { ... } catch |err| { ... }` syntax, integrating with the process handle promises. (completed 2025-11-16T00:26:00+01:00)
   - Added `analyzeAsyncBlock`/`analyzeAwait` helpers to `src/semantic/type_checker.zig`, taught `captureTypeForPromise` how to unwrap promise-backed process handles, and threaded error-union validation so `await` blocks can safely branch between success and `catch` handlers while surfacing the inferred payload/error-set types for capture scopes.
   - Expanded the unit suite with async-block and await-focused coverage plus process-handle promise unwrapping, and refreshed the promises section in `features.md` to spell out that `await ... catch` requires typed error unions—while background processes launched with `&` now await into immediate handles using the shared semantics.
-- **Task 26:** Provide module imports (`import http from "net/http"`) with a loader that maps spec paths to files under `src/` and exposes typed APIs. (completed 2025-11-16T01:32:00+01:00)
+- **Task 26:** Provide module imports (`let http = import("net/http")`) with a loader that maps spec paths to files under `src/` and exposes typed APIs. (completed 2025-11-16T01:32:00+01:00)
   - Added `src/runtime/module_loader.zig`, a resolver that normalizes import specs, verifies the corresponding `src/<path>.rn` file exists, and hydrates module manifests into `types.TypeStore` references so the rest of the interpreter can inspect exported functions/values with concrete type information.
   - Introduced loader-focused Zig tests that generate temporary module trees to cover caching behavior, manifest parsing for primitive/map/optional types, invalid-spec rejection, and detection of missing metadata files; `src/root.zig` now re-exports the loader for downstream consumers.
 - **Task 10:** Implement symbol tables, scope management, and immutability enforcement (reject reassignment to `let` bindings unless declared `mut`). (completed 2025-11-15T20:07:00+01:00)
@@ -126,7 +126,7 @@
 
 24. Implement pattern matching for errors and general `match` expressions, allowing capture clauses (`=> |info| ...`) as described in the spec. (completed 2025-11-16T00:55:15+01:00)
 
-26. Provide module imports (`import http from "net/http"`) with a loader that maps spec paths to files under `src/` and exposes typed APIs. (completed 2025-11-16T09:35:14+01:00)
+26. Provide module imports (`let http = import("net/http")`) with a loader that maps spec paths to files under `src/` and exposes typed APIs. (completed 2025-11-16T09:35:14+01:00)
 
 ### Phase 6 — CLI & User-Facing Experience
 - **Task 27:** Build the `cmd/runic` binary that accepts script paths, REPL mode, and options for tracing, module paths, and environment overrides. (completed 2025-11-16T10:24:00+01:00)

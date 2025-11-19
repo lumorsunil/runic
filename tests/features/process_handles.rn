@@ -1,7 +1,7 @@
 // Tests process handles, destructuring stdout/stderr/exit_code, and background handles.
 
-import ensure from "test_support/ensure"
-let ensure = ensure.ensure
+let ensure_module = import("test_support/ensure")
+let ensure = ensure_module.ensure
 
 let { stdout: src_listing, stderr: src_errors, exit_code } = ls ./src
 ensure(exit_code == 0, "ls exited cleanly")

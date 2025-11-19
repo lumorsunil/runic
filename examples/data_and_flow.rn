@@ -4,7 +4,7 @@
 let greeting: Str = "hello"
 mut retries: Int = 2
 let services = ["api", "jobs", "web"]
-let thresholds = { api: 200, jobs: 350, web: 150 }
+let thresholds = .{ .api = 200, .jobs = 350, .web = 150 }
 
 if (env.get("PORT")) |port| {
   echo "Using env PORT=${port}"

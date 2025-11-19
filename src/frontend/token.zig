@@ -74,8 +74,6 @@ pub const Tag = enum {
     // Module/interop keywords
     /// Module import keyword.
     kw_import,
-    /// Module import source specifier.
-    kw_from,
     /// Starts legacy bash { ... } blocks.
     kw_bash,
 
@@ -147,7 +145,6 @@ pub const Tag = enum {
             .kw_match => "match",
             .kw_return => "return",
             .kw_import => "import",
-            .kw_from => "from",
             .kw_bash => "bash",
             .kw_try => "try",
             .kw_catch => "catch",
@@ -187,7 +184,6 @@ const keyword_map = std.StaticStringMap(Tag).initComptime(.{
     .{ "match", .kw_match },
     .{ "return", .kw_return },
     .{ "import", .kw_import },
-    .{ "from", .kw_from },
     .{ "bash", .kw_bash },
     .{ "try", .kw_try },
     .{ "catch", .kw_catch },

@@ -1,7 +1,7 @@
 // Tests optional bindings and Zig-style if-unwrapping.
 
-import ensure from "test_support/ensure"
-let ensure = ensure.ensure
+let ensure_module = import("test_support/ensure")
+let ensure = ensure_module.ensure
 
 fn maybe_lookup(flag: Bool) ?Int {
   if flag {

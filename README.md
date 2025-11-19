@@ -54,7 +54,8 @@ The interpreter and CLI are implemented in Zig (tested with Zig 0.15.1). Zig's b
 2. Use `zig build run -- --help` (or `zig-out/bin/runic --help` after building once) to confirm the CLI wiring.
 3. When experimenting with scripts, prefer `zig build run -- path/to/script.rn -- <args>` so Zig automatically rebuilds if any sources changed.
 4. For optimized binaries, pass `-Doptimize=ReleaseSafe` (or `ReleaseFast`) to `zig build`. Cross-compilation follows standard Zig flags (`-Dtarget=x86_64-linux-gnu`).
-5. Keep `ZIG_GLOBAL_CACHE_DIR` untouched so repeated builds share the same cache location (the CI scripts configure it for you).
+5. Build the language server with `zig build runic-lsp`. The resulting `zig-out/bin/runic-lsp` binary speaks LSP over stdio and is ready to be registered with editors.
+6. Keep `ZIG_GLOBAL_CACHE_DIR` untouched so repeated builds share the same cache location (the CI scripts configure it for you).
 
 ### Running tests
 
@@ -67,6 +68,12 @@ The interpreter and CLI are implemented in Zig (tested with Zig 0.15.1). Zig's b
 
 - `zig fmt src cmd tests` formats every Zig source file and is enforced in CI before code review.
 - `zig fmt --check src cmd tests` runs the same formatter in check mode and doubles as our lint step (scripts treat any diff as a failure).
+
+### Language server
+
+- Build with `zig build runic-lsp` to produce `zig-out/bin/runic-lsp`. Editors should launch it with the default `--stdio` transport.
+- Set `RUNIC_LSP_LOG=1` when debugging conversations; logs go to stderr so protocol responses on stdout remain untouched.
+- A placeholder `--tcp <port>` flag exists for upcoming transport introspection. Until then, prefer stdio and invoke `zig-out/bin/runic-lsp --stdio` directly when iterating locally.
 
 ## Development workflow
 
@@ -88,7 +95,7 @@ Runic modules are regular `.rn` files paired with JSON manifests so the loader c
 1. Place the implementation at `<script_dir>/<spec>.rn` (e.g. `scripts/net/http.rn`) and keep the spec lowercase with `/` separators.
 2. Create `<script_dir>/<spec>.rn.module.json` to declare the module's public surface. Each entry in the `exports` array is either a function (with `params`, `return_type`, and optional `is_async`) or a value with a `type` descriptor.
 3. Supported type descriptors include `primitive`, `array`, `map`, `optional`, and `promise`, matching the Zig-side parser in `src/runtime/module_loader.zig`.
-4. Import the module from scripts using `import http from "net/http"`. Supplement search paths with `--module-path <dir>` when iterating on modules stored outside the importing script's directory.
+4. Import the module from scripts using `let http = import("net/http")`. Supplement search paths with `--module-path <dir>` when iterating on modules stored outside the importing script's directory.
 5. Validate manifests by running `zig build test` (the module loader has dedicated fixtures) and by invoking a small script via `zig build run -- examples/<script>.rn`.
 
 See `docs/module_authoring.md` for the full manifest schema, type descriptor explanations, and a sample manifest.
@@ -124,7 +131,7 @@ Key flags:
 - `--help`, `-h` — show the usage summary (also the default when no arguments are provided).
 - `--repl` — enter REPL mode instead of executing a script. The REPL provides history, multiline editing (continue a command with a trailing `\`), and meta commands such as `:history`, `:help`, and `:quit`.
 - `--trace <topic>` — enable structured tracing for the given interpreter subsystem. Current topics are `pipeline` (per-stage spawn/exit), `process` (handle summaries, stage outcomes, and captured IO sizes), and `async` (scheduler + promise lifecycle). Repeat the flag to collect multiple targets (e.g. `--trace pipeline --trace process`).
-- `--module-path <dir>` — prepend an additional directory to the module loader search roots. This mirrors `import foo from "custom/foo"` scenarios from `features.md`.
+- `--module-path <dir>` — prepend an additional directory to the module loader search roots. This mirrors `let foo = import("custom/foo")` scenarios from `features.md`.
 - `--env KEY=VALUE` — override environment bindings that will be forwarded to script executions and background commands.
 
 After the script path, `runic` forwards every argument verbatim. Insert `--` between the script and its arguments when you need to pass values that look like CLI flags.

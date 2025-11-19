@@ -37,7 +37,7 @@ default colors in Neovim.
 | `RunicAsyncKeyword` / `@keyword.coroutine.runic` | `kw_async`, `kw_await` | `Keyword` | Tree-sitter capture chosen to stay compatible with `@keyword.coroutine`. |
 | `RunicControlKeyword` / `@keyword.control.runic` | `kw_if`, `kw_else`, `kw_match`, `kw_return` | `Conditional` | `return` sticks with the control keyword palette; loops live in the next row. |
 | `RunicLoopKeyword` / `@keyword.repeat.runic` | `kw_for`, `kw_while` | `Repeat` | Split from the control keywords so themes can color loops distinctly. |
-| `RunicImportKeyword` / `@keyword.import.runic` | `kw_import`, `kw_from` | `Include` | Maps to built-in import/include colors. |
+| `RunicImportKeyword` / `@keyword.import.runic` | `kw_import` | `Include` | Maps to built-in import/include colors. |
 | `RunicInteropKeyword` / `@keyword.special.runic` | `kw_bash` | `Keyword` | Signals Bash compatibility blocks; kept separate in case we dim it later. |
 | `RunicErrorKeyword` / `@keyword.exception.runic` | `kw_try`, `kw_catch` | `Exception` | Aligns with exception-style palettes in Neovim themes. |
 | `RunicBooleanLiteral` / `@constant.builtin.boolean.runic` | `kw_true`, `kw_false` | `Boolean` | Emits the built-in boolean colors regardless of context. |

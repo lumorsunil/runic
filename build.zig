@@ -10,6 +10,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const lsp = b.addModule("runic_lsp", .{
+        .root_source_file = b.path("src/lsp/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const cli = b.addExecutable(.{
         .name = "runic",
         .root_module = b.createModule(.{
@@ -36,4 +42,22 @@ pub fn build(b: *std.Build) void {
     const cli_tests = b.addTest(.{ .root_module = cli.root_module });
     const cli_runner = b.addRunArtifact(cli_tests);
     test_step.dependOn(&cli_runner.step);
+
+    const lsp_cli = b.addExecutable(.{
+        .name = "runic-lsp",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cmd/runic-lsp/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    lsp_cli.root_module.addImport("runic_lsp", lsp);
+    b.installArtifact(lsp_cli);
+
+    const lsp_build = b.step("runic-lsp", "Build the Runic language server");
+    lsp_build.dependOn(&lsp_cli.step);
+
+    const lsp_tests = b.addTest(.{ .root_module = lsp });
+    const lsp_runner = b.addRunArtifact(lsp_tests);
+    test_step.dependOn(&lsp_runner.step);
 }
