@@ -4,6 +4,12 @@ const token = @import("../frontend/token.zig");
 const command_runner = @import("../runtime/command_runner.zig");
 const Value = @import("value.zig").Value;
 const ScopeStack = @import("scope.zig").ScopeStack;
+const Parser = @import("../frontend/document_store.zig").Parser;
+const DocumentStore = @import("../frontend/document_store.zig").DocumentStore;
+const Document = @import("../frontend/document_store.zig").Document;
+const resolveModulePath = @import("../frontend/document_store.zig").resolveModulePath;
+const ScriptExecutor = @import("script_executor.zig").ScriptExecutor;
+const ScriptContext = @import("script_context.zig").ScriptContext;
 
 const CommandRunner = command_runner.CommandRunner;
 const ProcessHandle = command_runner.ProcessHandle;
@@ -18,12 +24,18 @@ fn ArrayListManaged(comptime T: type) type {
 pub const Evaluator = struct {
     allocator: std.mem.Allocator,
     executor: CommandExecutor,
+    documentStore: *DocumentStore,
 
     pub const Error = std.mem.Allocator.Error ||
         ScopeStack.Error ||
         CommandExecutor.Error ||
+        ScriptContext.BindingError ||
         std.fmt.ParseIntError ||
         std.fmt.ParseFloatError ||
+        std.fs.Dir.RealPathAllocError ||
+        std.fs.File.OpenError ||
+        std.Io.Reader.ShortError ||
+        std.Io.Writer.Error ||
         error{
             UnsupportedStatement,
             UnsupportedExpression,
@@ -33,6 +45,7 @@ pub const Evaluator = struct {
             UnknownIdentifier,
             EmptyPipeline,
             InvalidStringCoercion,
+            DocumentNotParsed,
         };
 
     pub const BlockOptions = struct {
@@ -57,12 +70,24 @@ pub const Evaluator = struct {
         }
     };
 
-    pub fn init(allocator: std.mem.Allocator, executor: CommandExecutor) Evaluator {
-        return .{ .allocator = allocator, .executor = executor };
+    pub fn init(
+        allocator: std.mem.Allocator,
+        executor: CommandExecutor,
+        documentStore: *DocumentStore,
+    ) Evaluator {
+        return .{
+            .allocator = allocator,
+            .executor = executor,
+            .documentStore = documentStore,
+        };
     }
 
-    pub fn initWithRunner(allocator: std.mem.Allocator, runner: *CommandRunner) Evaluator {
-        return init(allocator, CommandExecutor.fromRunner(runner));
+    pub fn initWithRunner(
+        allocator: std.mem.Allocator,
+        runner: *CommandRunner,
+        documentStore: *DocumentStore,
+    ) Evaluator {
+        return init(allocator, CommandExecutor.fromRunner(runner), documentStore);
     }
 
     /// Executes the provided block in the existing scope (callers should ensure
@@ -72,6 +97,16 @@ pub const Evaluator = struct {
         var result = try self.executeBlock(scopes, block, .{ .push_scope = false, .capture_result = false });
         defer result.deinit(self.allocator);
         _ = result.take();
+    }
+
+    /// Executes a single statement in the current scope and returns its result
+    /// if the statement produces a value (expression statements).
+    pub fn runStatement(
+        self: *Evaluator,
+        scopes: *ScopeStack,
+        statement: *const ast.Statement,
+    ) Error!?Value {
+        return self.executeStatement(scopes, statement);
     }
 
     fn executeBlock(
@@ -90,7 +125,17 @@ pub const Evaluator = struct {
         errdefer if (scope_active) scopes.popFrame() catch {};
 
         for (block.statements) |stmt_ptr| {
-            try self.executeStatement(scopes, stmt_ptr, options.capture_result, &result);
+            const maybe_value = try self.executeStatement(scopes, stmt_ptr);
+            if (maybe_value) |value| {
+                var owned = value;
+                var consumed = false;
+                defer if (!consumed) owned.deinit(self.allocator);
+
+                if (options.capture_result) {
+                    self.storeLastValue(&result, &owned);
+                    consumed = true;
+                }
+            }
         }
 
         if (scope_active) {
@@ -105,17 +150,26 @@ pub const Evaluator = struct {
         self: *Evaluator,
         scopes: *ScopeStack,
         statement: *const ast.Statement,
-        capture_result: bool,
-        result: *BlockResult,
-    ) Error!void {
-        switch (statement.*) {
-            .let_decl => |decl| try self.executeLet(scopes, &decl),
-            .expression => |expr_stmt| try self.executeExpressionStatement(scopes, expr_stmt.expression, capture_result, result),
-            else => return Error.UnsupportedStatement,
-        }
+    ) Error!?Value {
+        return switch (statement.*) {
+            .binding_decl => |decl| blk: {
+                try self.executeLet(scopes, &decl);
+                break :blk null;
+            },
+            .expression => |expr_stmt| try self.executeExpression(scopes, expr_stmt.expression),
+            else => Error.UnsupportedStatement,
+        };
     }
 
-    fn executeLet(self: *Evaluator, scopes: *ScopeStack, decl: *const ast.LetDecl) Error!void {
+    fn executeExpression(
+        self: *Evaluator,
+        scopes: *ScopeStack,
+        expression: *ast.Expression,
+    ) Error!?Value {
+        return try self.evaluateExpression(scopes, expression);
+    }
+
+    fn executeLet(self: *Evaluator, scopes: *ScopeStack, decl: *const ast.BindingDecl) Error!void {
         var value = try self.evaluateExpression(scopes, decl.initializer);
         var consumed = false;
         defer if (!consumed) value.deinit(self.allocator);
@@ -124,29 +178,13 @@ pub const Evaluator = struct {
         consumed = true;
     }
 
-    fn executeExpressionStatement(
-        self: *Evaluator,
-        scopes: *ScopeStack,
-        expr: *const ast.Expression,
-        capture_result: bool,
-        result: *BlockResult,
-    ) Error!void {
-        var value = try self.evaluateExpression(scopes, expr);
-        var consumed = false;
-        defer if (!consumed) value.deinit(self.allocator);
-
-        if (capture_result) {
-            self.storeLastValue(result, &value);
-            consumed = true;
-        }
-    }
-
     fn evaluateExpression(self: *Evaluator, scopes: *ScopeStack, expr: *const ast.Expression) Error!Value {
         return switch (expr.*) {
             .literal => |literal| try self.evaluateLiteral(scopes, literal),
             .identifier => |identifier| try self.evaluateIdentifier(scopes, identifier),
             .pipeline => |pipeline| try self.evaluatePipeline(scopes, pipeline),
             .block => |block_expr| try self.evaluateBlockExpression(scopes, block_expr),
+            .import_expr => |import_expr| try self.evaluateImportExpression(import_expr),
             else => Error.UnsupportedExpression,
         };
     }
@@ -182,6 +220,57 @@ pub const Evaluator = struct {
             return value;
         }
         return Value{ .void = {} };
+    }
+
+    fn evaluateImportExpression(
+        self: *Evaluator,
+        import: ast.ImportExpr,
+    ) Error!Value {
+        const document = try self.getCachedDocument(import.importer, import.module_name);
+
+        if (document.script_executor) |*script_executor| {
+            return .{ .scope = &script_executor.scopes };
+        }
+
+        const script_ast = document.ast orelse return Error.DocumentNotParsed;
+
+        const currentDocument = try self.documentStore.requestDocument(import.importer);
+        const currentExecutor = currentDocument.script_executor;
+
+        document.script_executor = try ScriptExecutor.initWithRunner(
+            self.allocator,
+            currentExecutor.?.command_bridge.?.runner,
+            currentExecutor.?.command_bridge.?.env_map,
+            self.documentStore,
+        );
+
+        const executor = &document.script_executor.?;
+
+        try executor.scopes.pushFrame();
+
+        var stdout = std.fs.File.stdout().writer(&.{});
+        var stderr = std.fs.File.stderr().writer(&.{});
+
+        const context = try self.allocator.create(ScriptContext);
+        context.* = ScriptContext.init(self.allocator);
+        defer self.allocator.destroy(context);
+
+        const exitCode = try executor.execute(script_ast, .{
+            .script_path = document.path,
+            .stdout = &stdout.interface,
+            .stderr = &stderr.interface,
+            .context = context,
+        });
+
+        document.exitCode = exitCode;
+
+        return .{ .scope = &executor.scopes };
+    }
+
+    fn getCachedDocument(self: *Evaluator, importer: []const u8, moduleName: []const u8) Error!*Document {
+        const path = try resolveModulePath(self.allocator, importer, moduleName);
+        defer self.allocator.free(path);
+        return try self.documentStore.requestDocument(path);
     }
 
     fn evaluatePipeline(self: *Evaluator, scopes: *ScopeStack, pipeline: ast.Pipeline) Error!Value {
@@ -261,7 +350,7 @@ pub const Evaluator = struct {
 
         for (literal.segments) |segment| {
             switch (segment) {
-                .text => |slice| try buffer.appendSlice(slice),
+                .text => |t| try buffer.appendSlice(t.payload),
                 .interpolation => |expr_ptr| {
                     var value = try self.evaluateExpression(scopes, expr_ptr);
                     defer value.deinit(self.allocator);
@@ -282,10 +371,11 @@ pub const Evaluator = struct {
                 value.* = .{ .void = {} };
                 break :blk slice;
             },
-            .boolean => |flag| try self.allocator.dupe(u8, if (flag) "true" else "false"),
+            .boolean => |flag| try self.allocator.dupe(u8, if (flag) "1" else "0"),
             .integer => |int| try std.fmt.allocPrint(self.allocator, "{d}", .{int}),
             .float => |flt| try std.fmt.allocPrint(self.allocator, "{d}", .{flt}),
-            .void, .process_handle => Error.InvalidStringCoercion,
+            .process_handle => |p| try self.allocator.dupe(u8, p.stdoutBytes()),
+            .void, .scope => Error.InvalidStringCoercion,
         };
     }
 
@@ -519,7 +609,7 @@ fn buildLetAndPipelineBlock(
 
     const let_stmt_ptr = try allocator.create(ast.Statement);
     let_stmt_ptr.* = .{
-        .let_decl = .{
+        .binding_decl = .{
             .is_mutable = false,
             .pattern = pattern_ptr,
             .annotation = null,

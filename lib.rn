@@ -1,3 +1,4 @@
-fn greet(greeting: Str) Void {
-  return echo ${greeting}
-}
+# lib.rn
+
+const name = echo "lib"
+echo "hello from ${name}"

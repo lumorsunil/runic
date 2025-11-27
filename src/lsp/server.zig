@@ -2,15 +2,28 @@ const std = @import("std");
 const workspace_mod = @import("workspace.zig");
 const symbols = @import("symbols.zig");
 const completion = @import("completion.zig");
+const diag = @import("diagnostics.zig");
+const runic = @import("runic");
+const token = runic.token;
+const parseFile = @import("parser.zig").parseFile;
+const Parser = @import("parser.zig").Parser;
 
 const Allocator = std.mem.Allocator;
+
+const MAX_LINE = 16 * 1024;
+const MAX_FILE = 4 * 1024 * 1024;
+const MAX_OUT_CONTENT = 4 * 1024 * 1024;
 
 pub const Server = struct {
     allocator: Allocator,
     stdin_file: std.fs.File,
     stdout_file: std.fs.File,
     stderr_file: std.fs.File,
+    stdin_reader: std.fs.File.Reader,
+    reader: *std.Io.Reader,
     reader_buffer: [4096]u8 = undefined,
+    stdout_writer: std.fs.File.Writer,
+    writer: *std.Io.Writer,
     workspace: workspace_mod.Workspace,
     documents: DocumentStore,
     initialized: bool = false,
@@ -22,7 +35,7 @@ pub const Server = struct {
         stdin_file: std.fs.File,
         stdout_file: std.fs.File,
         stderr_file: std.fs.File,
-    ) !Server {
+    ) Server {
         var log_enabled = false;
         if (std.process.getEnvVarOwned(allocator, "RUNIC_LSP_LOG")) |value| {
             defer allocator.free(value);
@@ -36,7 +49,11 @@ pub const Server = struct {
             .stdin_file = stdin_file,
             .stdout_file = stdout_file,
             .stderr_file = stderr_file,
-            .workspace = workspace_mod.Workspace.init(allocator),
+            .stdin_reader = undefined,
+            .reader = undefined,
+            .stdout_writer = undefined,
+            .writer = undefined,
+            .workspace = workspace_mod.Workspace.init(allocator, undefined),
             .documents = DocumentStore.init(allocator),
             .log_enabled = log_enabled,
         };
@@ -47,20 +64,31 @@ pub const Server = struct {
         self.documents.deinit();
     }
 
-    fn getReader(self: *Server) *std.Io.Reader {
-        return &self.stdin_file.reader(&self.reader_buffer).interface;
+    pub fn initInterface(self: *Server) void {
+        self.workspace.documents = &self.documents;
+        self.stdin_reader = self.stdin_file.readerStreaming(&self.reader_buffer);
+        self.reader = &self.stdin_reader.interface;
+        self.stdout_writer = self.stdout_file.writerStreaming(&.{});
+        self.writer = &self.stdout_writer.interface;
     }
 
     pub fn run(self: *Server) !void {
+        try self.log("runic-lsp server started", .{});
         while (true) {
             const payload = self.readMessage() catch |err| switch (err) {
                 error.EndOfStream => break,
-                else => return err,
+                else => {
+                    try self.log("runic-lsp encountered an error: {}", .{err});
+                    return err;
+                },
             };
             defer self.allocator.free(payload);
+            try self.log("Recieved message: {s}", .{payload});
             const continue_loop = try self.handleEnvelope(payload);
             if (!continue_loop) break;
+            try self.flushDiagnostics();
         }
+        try self.log("stdin ended", .{});
     }
 
     fn handleEnvelope(self: *Server, payload: []u8) !bool {
@@ -114,7 +142,11 @@ pub const Server = struct {
         }
         if (std.mem.eql(u8, method, "textDocument/completion")) {
             if (!id.present()) return true;
-            try self.handleCompletion(id, params);
+            // try self.handleCompletion(id, params);
+            self.handleCompletion(id, params) catch |err| {
+                std.log.err("Could not handleCompletion: {}, writer error: {?}", .{ err, self.stdout_writer.err });
+                return err;
+            };
             return true;
         }
         if (std.mem.eql(u8, method, "workspace/didChangeConfiguration") or
@@ -134,6 +166,78 @@ pub const Server = struct {
             try self.log("dropping notification for unknown method: {s}", .{method});
         }
         return true;
+    }
+
+    const DiagnosticPacket = struct {
+        version: ?i64 = null,
+        diagnostics: std.ArrayList(diag.Diagnostic) = .empty,
+
+        pub fn deinit(self: *DiagnosticPacket, allocator: Allocator) void {
+            self.diagnostics.deinit(allocator);
+        }
+    };
+
+    fn groupWorkspaceDiagnostics(
+        self: *Server,
+        groups: *std.StringArrayHashMap(DiagnosticPacket),
+    ) !void {
+        for (self.workspace.diagnostics.items) |d| {
+            const entry = try groups.getOrPut(d.uri);
+
+            if (!entry.found_existing) {
+                entry.value_ptr.* = .{};
+            }
+
+            try entry.value_ptr.diagnostics.append(self.allocator, d);
+        }
+    }
+
+    fn groupDocumentsDiagnostics(
+        self: *Server,
+        groups: *std.StringArrayHashMap(DiagnosticPacket),
+    ) !void {
+        var docIt = self.documents.map.iterator();
+        while (docIt.next()) |docEntry| {
+            if (!docEntry.value_ptr.shouldSendDiagnostics) continue;
+            docEntry.value_ptr.shouldSendDiagnostics = false;
+
+            const diagnostics = docEntry.value_ptr.diagnostics.items;
+            const uri = try docEntry.value_ptr.uri(self.allocator);
+            const entry = try groups.getOrPut(uri);
+
+            if (!entry.found_existing) {
+                entry.value_ptr.* = .{};
+            }
+
+            try entry.value_ptr.diagnostics.appendSlice(self.allocator, diagnostics);
+            entry.value_ptr.version = docEntry.value_ptr.version;
+        }
+    }
+
+    fn flushDiagnostics(self: *Server) !void {
+        var groups: std.StringArrayHashMap(DiagnosticPacket) = .init(self.allocator);
+        defer {
+            var gIt = groups.iterator();
+            while (gIt.next()) |entry| {
+                entry.value_ptr.deinit(self.allocator);
+                self.allocator.free(entry.key_ptr.*);
+            }
+            groups.deinit();
+            self.workspace.clearDiagnostics();
+            var docIt = self.documents.map.iterator();
+            while (docIt.next()) |entry| entry.value_ptr.clearDiagnostics(self.allocator);
+        }
+
+        // try self.groupWorkspaceDiagnostics(&groups);
+        try self.groupDocumentsDiagnostics(&groups);
+
+        var it = groups.iterator();
+        while (it.next()) |entry| {
+            const uri = entry.key_ptr.*;
+            const version = entry.value_ptr.version;
+            const diagnostics = entry.value_ptr.diagnostics.items;
+            try self.sendDiagnostics(uri, version, diagnostics);
+        }
     }
 
     fn handleInitialize(self: *Server, id: RequestId, params_value: ?std.json.Value) !void {
@@ -203,14 +307,26 @@ pub const Server = struct {
         const version = parseOptionalInt(text_doc.get("version")) orelse 0;
         const changes = try expectArrayField(params, "contentChanges");
         if (changes.items.len == 0) return;
-        const change_value = changes.items[changes.items.len - 1];
-        const change = try expectObject(change_value, "content change");
-        if (change.get("range")) |_| {
-            try self.log("skipping incremental update for {s}; send full text", .{uri});
-            return;
+        var textUpdates = try std.ArrayList(DocumentStore.TextUpdate).initCapacity(self.allocator, changes.items.len);
+        defer textUpdates.deinit(self.allocator);
+
+        for (changes.items) |change_value| {
+            const change = try expectObject(change_value, "content change");
+            if (change.get("range")) |range| {
+                // {"range":{"start":{"character":0,"line":7},"end":{"character":0,"line":11}},"text":"","rangeLength":55}
+                textUpdates.appendAssumeCapacity(.{
+                    .range = .{
+                        .start = try expectLocationField(range.object, "start"),
+                        .end = try expectLocationField(range.object, "end"),
+                        .replacementText = try expectStringField(change, "text"),
+                        .rangeLength = @intCast(try expectIntegerField(change, "rangeLength")),
+                    },
+                });
+            } else {
+                textUpdates.appendAssumeCapacity(.{ .text = try expectStringField(change, "text") });
+            }
         }
-        const text = try expectStringField(change, "text");
-        _ = try self.documents.update(uri, text, version, &self.workspace);
+        _ = try self.documents.update(uri, textUpdates.items, version, &self.workspace);
     }
 
     fn handleDidClose(self: *Server, params_value: ?std.json.Value) !void {
@@ -254,21 +370,21 @@ pub const Server = struct {
     }
 
     fn sendInitializeResult(self: *Server, id: RequestId) !void {
-        var body = std.ArrayList(u8){};
-        defer body.deinit(self.allocator);
-        var writer = body.writer(self.allocator);
+        const buffer = try self.allocator.alloc(u8, MAX_OUT_CONTENT);
+        defer self.allocator.free(buffer);
+        var writer = std.Io.Writer.fixed(buffer);
         try writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
         try id.writeJson(&writer);
         try writer.writeAll(",\"result\":{\"capabilities\":{\"textDocumentSync\":{\"openClose\":true,\"change\":2}," ++
             "\"completionProvider\":{\"triggerCharacters\":[\".\",\":\"],\"resolveProvider\":false}}," ++
             "\"serverInfo\":{\"name\":\"runic-lsp\",\"version\":\"0.1\"}}}");
-        try self.sendBody(body.items);
+        try self.sendBody(writer.buffered());
     }
 
     fn sendCompletionResult(self: *Server, id: RequestId, items: []const completion.Match) !void {
-        var body = std.ArrayList(u8){};
-        defer body.deinit(self.allocator);
-        var writer = body.writer(self.allocator);
+        const buffer = try self.allocator.alloc(u8, MAX_OUT_CONTENT);
+        defer self.allocator.free(buffer);
+        var writer = std.Io.Writer.fixed(buffer);
         try writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
         try id.writeJson(&writer);
         try writer.writeAll(",\"result\":{\"isIncomplete\":false,\"items\":[");
@@ -279,23 +395,60 @@ pub const Server = struct {
             try writeCompletionItem(&writer, entry.symbol);
         }
         try writer.writeAll("]}}");
-        try self.sendBody(body.items);
+        try self.sendBody(writer.buffered());
+    }
+
+    fn sendDiagnostics(
+        self: *Server,
+        uri: []const u8,
+        version: ?i64,
+        diagnostics: []const diag.Diagnostic,
+    ) !void {
+        std.log.err("sending diagnostics: {} version: {?} uri: {s}", .{ diagnostics.len, version, uri });
+        if (diagnostics.len == 1) {
+            std.log.err("{f}", .{std.json.fmt(diagnostics[0], .{})});
+        }
+
+        const buffer = try self.allocator.alloc(u8, MAX_OUT_CONTENT);
+        defer self.allocator.free(buffer);
+        var writer = std.Io.Writer.fixed(buffer);
+
+        try writer.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{");
+        try writer.writeAll("\"uri\":");
+        try writeJsonString(&writer, uri);
+        try writer.print(",\"version\":{f},\"diagnostics\":[", .{std.json.fmt(version, .{})});
+
+        var first = true;
+        for (diagnostics) |d| {
+            if (!first) try writer.writeByte(',');
+            first = false;
+
+            try writer.writeAll("{\"range\":");
+            try writeLspRange(&writer, d.span);
+            try writer.print(",\"severity\":{f}", .{d.severity});
+            try writer.writeAll(",\"source\":\"runic\",\"message\":");
+            try writeJsonString(&writer, d.message);
+            try writer.writeByte('}');
+        }
+
+        try writer.writeAll("]}}");
+        try self.sendBody(writer.buffered());
     }
 
     fn sendNullResult(self: *Server, id: RequestId) !void {
-        var body = std.ArrayList(u8){};
-        defer body.deinit(self.allocator);
-        var writer = body.writer(self.allocator);
+        const buffer = try self.allocator.alloc(u8, MAX_OUT_CONTENT);
+        defer self.allocator.free(buffer);
+        var writer = std.Io.Writer.fixed(buffer);
         try writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
         try id.writeJson(&writer);
         try writer.writeAll(",\"result\":null}");
-        try self.sendBody(body.items);
+        try self.sendBody(writer.buffered());
     }
 
     fn sendError(self: *Server, id: RequestId, code: i64, message: []const u8) !void {
-        var body = std.ArrayList(u8){};
-        defer body.deinit(self.allocator);
-        var writer = body.writer(self.allocator);
+        const buffer = try self.allocator.alloc(u8, MAX_OUT_CONTENT);
+        defer self.allocator.free(buffer);
+        var writer = std.Io.Writer.fixed(buffer);
         try writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
         try id.writeJson(&writer);
         try writer.writeAll(",\"error\":{\"code\":");
@@ -303,14 +456,15 @@ pub const Server = struct {
         try writer.writeAll(",\"message\":");
         try writeJsonString(&writer, message);
         try writer.writeAll("}}");
-        try self.sendBody(body.items);
+        try self.sendBody(writer.buffered());
     }
 
-    fn writeCompletionItem(writer: anytype, symbol: *const symbols.Symbol) !void {
+    fn writeCompletionItem(writer: *std.Io.Writer, symbol: *const symbols.Symbol) !void {
         try writer.writeAll("{\"label\":");
         try writeJsonString(writer, symbol.name);
         try writer.writeAll(",\"kind\":");
         try writer.print("{d}", .{completionKind(symbol.kind)});
+        try writer.flush();
         if (symbol.detail.len != 0) {
             try writer.writeAll(",\"detail\":");
             try writeJsonString(writer, symbol.detail);
@@ -332,7 +486,7 @@ pub const Server = struct {
         };
     }
 
-    fn writeSortKey(writer: anytype, label: []const u8) !void {
+    fn writeSortKey(writer: *std.Io.Writer, label: []const u8) !void {
         try writer.writeByte('"');
         for (label) |ch| {
             const lower = std.ascii.toLower(ch);
@@ -342,22 +496,21 @@ pub const Server = struct {
     }
 
     fn readMessage(self: *Server) ![]u8 {
-        var reader = self.stdin_file.reader(&self.reader_buffer);
-        const content_length = try self.readHeaders(&reader.interface);
+        const content_length = try self.readHeaders();
         var buffer = try self.allocator.alloc(u8, content_length);
+        errdefer self.allocator.free(buffer);
         var filled: usize = 0;
         while (filled < buffer.len) {
-            const read_bytes = try reader.read(buffer[filled..]);
-            if (read_bytes == 0) return error.EndOfStream;
-            filled += read_bytes;
+            const bytes_read = try self.reader.readSliceShort(buffer[filled..]);
+            filled += bytes_read;
         }
         return buffer;
     }
 
-    fn readHeaders(self: *Server, reader: *std.Io.Reader) !usize {
+    fn readHeaders(self: *Server) !usize {
         var content_length: ?usize = null;
         while (true) {
-            const line = try readLine(self.allocator, reader);
+            const line = try readLine(self.allocator, self.reader);
             defer self.allocator.free(line);
             const trimmed = std.mem.trimRight(u8, line, "\r");
             if (trimmed.len == 0) break;
@@ -371,17 +524,18 @@ pub const Server = struct {
     }
 
     fn sendBody(self: *Server, body: []const u8) !void {
-        var writer = self.stdout_file.writer(&.{});
-        try writer.interface.print("Content-Length: {d}\r\n\r\n", .{body.len});
-        try writer.interface.writeAll(body);
+        try self.writer.print("Content-Length: {d}\r\n\r\n", .{body.len});
+        try self.writer.writeAll(body);
+        try self.writer.flush();
     }
 
     fn log(self: *Server, comptime fmt: []const u8, args: anytype) !void {
         if (!self.log_enabled) return;
-        var writer = self.stderr_file.writer(&.{});
-        try writer.interface.print("[runic-lsp] ", .{});
-        try writer.interface.print(fmt, args);
-        try writer.interface.writeByte('\n');
+        var stderr = self.stderr_file.writer(&.{});
+        try stderr.interface.print("[runic-lsp] ", .{});
+        try stderr.interface.print(fmt, args);
+        try stderr.interface.writeByte('\n');
+        try stderr.interface.flush();
     }
 
     fn resolveUriPath(self: *Server, uri: []const u8) ![]u8 {
@@ -401,7 +555,7 @@ pub const Server = struct {
     }
 };
 
-const DocumentStore = struct {
+pub const DocumentStore = struct {
     allocator: Allocator,
     map: std.StringHashMap(Document),
 
@@ -435,20 +589,142 @@ const DocumentStore = struct {
         errdefer self.allocator.free(key);
         var document = try Document.init(self.allocator, path, text, version);
         errdefer document.deinit(self.allocator);
-        try document.rebuildSymbols(self.allocator, workspace.describePath(document.path));
-        try self.map.put(key, document);
+        const entry = try self.map.getOrPut(key);
+        entry.value_ptr.* = document;
+        try document.rebuildSymbols(
+            self.allocator,
+            workspace,
+            workspace.describePath(document.path),
+        );
+    }
+
+    pub const TextUpdate = union(enum) {
+        text: []const u8,
+        range: Range,
+
+        pub const Range = struct {
+            start: Location,
+            end: Location,
+            replacementText: []const u8,
+            rangeLength: usize,
+
+            pub const Location = struct {
+                character: usize,
+                line: usize,
+
+                pub fn findIndex(self: Location, source: []const u8) ?usize {
+                    var column: usize = 0;
+                    var line: usize = 0;
+                    var i: usize = 0;
+
+                    while (column != self.character or line != self.line) : (i += 1) {
+                        switch (source[i]) {
+                            '\\' => {
+                                if (i < source.len - 1) {
+                                    const next = source[i + 1];
+
+                                    switch (next) {
+                                        'n' => {
+                                            line += 1;
+                                            column = 0;
+                                        },
+                                        else => column += 1,
+                                    }
+                                } else {
+                                    column += 1;
+                                }
+                            },
+                            '\r' => {
+                                if (i < source.len - 1 and source[i + 1] == '\n') {
+                                    i += 1;
+                                }
+
+                                line += 1;
+                                column = 0;
+                            },
+                            '\n' => {
+                                if (i < source.len - 1 and source[i + 1] == '\r') {
+                                    i += 1;
+                                }
+
+                                line += 1;
+                                column = 0;
+                            },
+                            else => column += 1,
+                        }
+
+                        if (column > self.character and line > self.line) return null;
+                    }
+
+                    if (column == self.character and line == self.line) {
+                        return i;
+                    }
+
+                    return null;
+                }
+            };
+        };
+    };
+
+    fn getLine(line: usize, source: []const u8) ?[]const u8 {
+        const index = TextUpdate.Range.Location.findIndex(.{
+            .character = 0,
+            .line = line,
+        }, source) orelse return null;
+
+        const end = std.mem.indexOfScalarPos(u8, source, index, '\n');
+
+        return if (end) |e| source[index..e] else source[index..];
     }
 
     fn update(
         self: *DocumentStore,
         uri: []const u8,
-        text: []const u8,
+        textUpdates: []const TextUpdate,
         version: i64,
         workspace: *workspace_mod.Workspace,
     ) !bool {
         if (self.map.getPtr(uri)) |doc| {
+            var text: []const u8 = try self.allocator.dupe(u8, doc.text);
+
+            for (textUpdates) |textUpdate| switch (textUpdate) {
+                .text => |t| {
+                    self.allocator.free(text);
+                    text = try self.allocator.dupe(u8, t);
+                },
+                .range => |range| {
+                    const startIndex = range.start.findIndex(text) orelse {
+                        std.log.err("range not found: {},{} len: {}", .{ range.start.character, range.start.line, text.len });
+                        const startLineN = range.start.line -| 2;
+                        const endLineN = range.start.line +| 2;
+                        const linesLen = endLineN - startLineN;
+                        for (0..linesLen) |i| {
+                            const lineN = startLineN + i;
+                            const line = getLine(lineN, text) orelse "<not found>";
+                            std.log.err("{}: {s}", .{ lineN, line });
+                        }
+                        return error.RangeNotFound;
+                    };
+                    const endIndex = startIndex + range.rangeLength;
+                    const first = text[0..startIndex];
+                    const second = range.replacementText;
+                    const third = if (endIndex < text.len) text[endIndex..] else "";
+
+                    const oldText = text;
+                    text = try std.fmt.allocPrint(self.allocator, "{s}{s}{s}", .{ first, second, third });
+                    self.allocator.free(oldText);
+                },
+            };
+
+            std.log.err("new document text: \n\n{s}", .{text});
+
             try doc.setText(self.allocator, text, version);
-            try doc.rebuildSymbols(self.allocator, workspace.describePath(doc.path));
+            self.allocator.free(text);
+            try doc.rebuildSymbols(
+                self.allocator,
+                workspace,
+                workspace.describePath(doc.path),
+            );
             return true;
         }
         return false;
@@ -462,7 +738,16 @@ const DocumentStore = struct {
         }
     }
 
-    fn get(self: *DocumentStore, uri: []const u8) ?*Document {
+    pub fn resolveUri(self: DocumentStore, path: []const u8) ![]const u8 {
+        const absolutePath = if (std.fs.path.isAbsolute(path))
+            try self.allocator.dupe(u8, path)
+        else
+            try std.fs.cwd().realpathAlloc(self.allocator, path);
+        defer self.allocator.free(absolutePath);
+        return std.fmt.allocPrint(self.allocator, "file://{s}", .{absolutePath});
+    }
+
+    pub fn get(self: *DocumentStore, uri: []const u8) ?*Document {
         return self.map.getPtr(uri);
     }
 };
@@ -471,14 +756,17 @@ const Document = struct {
     path: []u8,
     text: []u8,
     version: i64,
-    symbols: std.ArrayList(symbols.Symbol),
+    symbols: std.ArrayList(symbols.Symbol) = .empty,
+    diagnostics: std.ArrayList(diag.Diagnostic) = .empty,
+    ast: ?runic.ast.Script = null,
+    parser: ?Parser = null,
+    shouldSendDiagnostics: bool = false,
 
     fn init(allocator: Allocator, path: []u8, text: []const u8, version: i64) !Document {
         return .{
             .path = path,
             .text = try allocator.dupe(u8, text),
             .version = version,
-            .symbols = .{},
         };
     }
 
@@ -490,16 +778,40 @@ const Document = struct {
         self.* = undefined;
     }
 
+    pub fn uri(self: Document, allocator: Allocator) ![]const u8 {
+        return std.fmt.allocPrint(allocator, "file://{s}", .{self.path});
+    }
+
+    fn clearDiagnostics(self: *Document, allocator: Allocator) void {
+        for (self.diagnostics.items) |*entry| entry.deinit(allocator);
+        self.diagnostics.clearRetainingCapacity();
+    }
+
     fn setText(self: *Document, allocator: Allocator, text: []const u8, version: i64) !void {
         allocator.free(self.text);
         self.text = try allocator.dupe(u8, text);
         self.version = version;
     }
 
-    fn rebuildSymbols(self: *Document, allocator: Allocator, detail: []const u8) !void {
+    fn rebuildSymbols(
+        self: *Document,
+        allocator: Allocator,
+        workspace: *workspace_mod.Workspace,
+        detail: []const u8,
+    ) !void {
+        self.shouldSendDiagnostics = true;
+
         for (self.symbols.items) |*entry| entry.deinit(allocator);
         self.symbols.clearRetainingCapacity();
-        try symbols.collectSymbols(allocator, detail, self.text, &self.symbols);
+        self.clearDiagnostics(allocator);
+
+        if (self.parser) |*p| p.deinit();
+
+        // var parser = runic.parser.Parser.init(allocator, self.text);
+        self.parser = Parser.init(allocator, workspace.documents);
+        // defer parser.deinit();
+        const script = try parseFile(allocator, &self.diagnostics, &self.parser.?, self.path) orelse return;
+        try symbols.collectSymbols(allocator, detail, script, &self.symbols);
     }
 };
 
@@ -528,7 +840,7 @@ const RequestId = union(enum) {
         self.* = .none;
     }
 
-    fn writeJson(self: RequestId, writer: anytype) !void {
+    fn writeJson(self: RequestId, writer: *std.Io.Writer) !void {
         switch (self) {
             .none => try writer.writeAll("null"),
             .integer => |value| try writer.print("{d}", .{value}),
@@ -558,6 +870,24 @@ fn expectArrayField(obj: std.json.ObjectMap, name: []const u8) !std.json.Array {
     };
 }
 
+fn expectLocation(value: std.json.Value) !DocumentStore.TextUpdate.Range.Location {
+    return switch (value) {
+        .object => |obj| .{
+            .character = @intCast(try expectIntegerField(obj, "character")),
+            .line = @intCast(try expectIntegerField(obj, "line")),
+        },
+        else => error.InvalidRequest,
+    };
+}
+
+fn expectLocationField(
+    obj: std.json.ObjectMap,
+    name: []const u8,
+) !DocumentStore.TextUpdate.Range.Location {
+    const value = obj.get(name) orelse return error.InvalidRequest;
+    return try expectLocation(value);
+}
+
 fn expectString(value: std.json.Value, _: []const u8) ![]const u8 {
     return switch (value) {
         .string => |slice| slice,
@@ -568,6 +898,18 @@ fn expectString(value: std.json.Value, _: []const u8) ![]const u8 {
 fn expectStringField(obj: std.json.ObjectMap, name: []const u8) ![]const u8 {
     const value = obj.get(name) orelse return error.InvalidRequest;
     return try expectString(value, name);
+}
+
+fn expectInteger(value: std.json.Value, _: []const u8) !i64 {
+    return switch (value) {
+        .integer => |n| n,
+        else => error.InvalidRequest,
+    };
+}
+
+fn expectIntegerField(obj: std.json.ObjectMap, name: []const u8) !i64 {
+    const value = obj.get(name) orelse return error.InvalidRequest;
+    return try expectInteger(value, name);
 }
 
 fn parseOptionalInt(value_opt: ?std.json.Value) ?i64 {
@@ -613,7 +955,7 @@ fn extractPrefix(text: []const u8, line: usize, character: usize) []const u8 {
     return text[start..cursor];
 }
 
-fn writeJsonString(writer: anytype, text: []const u8) !void {
+fn writeJsonString(writer: *std.Io.Writer, text: []const u8) !void {
     try writer.writeByte('"');
     for (text) |ch| switch (ch) {
         '"' => try writer.writeAll("\\\""),
@@ -627,9 +969,21 @@ fn writeJsonString(writer: anytype, text: []const u8) !void {
     try writer.writeByte('"');
 }
 
+fn writeLspRange(writer: *std.Io.Writer, span: token.Span) !void {
+    try writer.print(
+        "{{\"start\":{{\"line\":{d},\"character\":{d}}},\"end\":{{\"line\":{d},\"character\":  {d}}}}}",
+        .{
+            span.start.line - 1,
+            span.start.column - 1,
+            span.end.line - 1,
+            span.end.column - 1,
+        },
+    );
+}
+
 fn readLine(allocator: Allocator, reader: *std.Io.Reader) ![]u8 {
     const line = try reader.takeDelimiterExclusive('\n');
-    if (line.len > 16 * 1024) return error.ProtocolError;
+    if (line.len > MAX_LINE) return error.ProtocolError;
     return try allocator.dupe(u8, line);
 }
 
@@ -663,5 +1017,5 @@ fn parseHexDigit(ch: u8) ?u8 {
 fn readWholeFile(allocator: Allocator, path: []const u8) ![]u8 {
     const file = try std.fs.openFileAbsolute(path, .{});
     defer file.close();
-    return try file.readToEndAlloc(allocator, 4 * 1024 * 1024);
+    return try file.readToEndAlloc(allocator, MAX_FILE);
 }

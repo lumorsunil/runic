@@ -8,4 +8,4 @@ fn square(value: Int) Int {
   return value * value
 }
 
-let tau = 6.28318
+const tau = 6.28318

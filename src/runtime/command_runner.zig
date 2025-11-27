@@ -156,9 +156,9 @@ pub const CommandRunner = struct {
 
     fn tracePipelineStart(self: CommandRunner, specs: []const CommandSpec) void {
         const tracer = self.tracer orelse return;
-        tracer.log(.pipeline, "starting pipeline (stages={d})", .{specs.len}) catch {};
+        tracer.log(.pipeline, "starting pipeline (stages={})", .{specs.len}) catch {};
         for (specs, 0..) |spec, idx| {
-            tracer.log(.pipeline, "stage {d}: {any}", .{
+            tracer.log(.pipeline, "stage {}: {any}", .{
                 idx + 1,
                 CommandDisplay{ .argv = spec.argv },
             }) catch {};
@@ -174,7 +174,7 @@ pub const CommandRunner = struct {
         if (stage.status.signal) |sig| {
             tracer.log(
                 .pipeline,
-                "stage {d} pid={d} signal={d} stdout={d}B stderr={d}B duration_ns={d}",
+                "stage {} pid={} signal={} stdout={}B stderr={}B duration_ns={}",
                 .{ stage.status.index + 1, stage.pid, sig, stdout_len, stderr_len, duration },
             ) catch {};
             return;
@@ -183,7 +183,7 @@ pub const CommandRunner = struct {
         if (stage.status.exit_code) |code| {
             tracer.log(
                 .pipeline,
-                "stage {d} pid={d} exit={d} ok={} stdout={d}B stderr={d}B duration_ns={d}",
+                "stage {} pid={} exit={} ok={} stdout={}B stderr={}B duration_ns={}",
                 .{ stage.status.index + 1, stage.pid, code, stage.status.ok, stdout_len, stderr_len, duration },
             ) catch {};
             return;
@@ -191,7 +191,7 @@ pub const CommandRunner = struct {
 
         tracer.log(
             .pipeline,
-            "stage {d} pid={d} ok={} stdout={d}B stderr={d}B duration_ns={d}",
+            "stage {} pid={} ok={} stdout={}B stderr={}B duration_ns={}",
             .{ stage.status.index + 1, stage.pid, stage.status.ok, stdout_len, stderr_len, duration },
         ) catch {};
     }
@@ -245,35 +245,35 @@ pub const ProcessHandle = struct {
     pub fn traceSummary(self: ProcessHandle, tracer: *Tracer, label: []const u8) !void {
         try tracer.log(
             .process,
-            "{s}: pid={d} stages={d} ok={} duration_ns={d}",
+            "{s}: pid={} stages={} ok={} duration_ns={}",
             .{ label, self.pid, self.stage_statuses.len, self.status.ok, self.durationNs() },
         );
         if (self.status.exit_code) |code| {
-            try tracer.log(.process, "{s}: exit code {d}", .{ label, code });
+            try tracer.log(.process, "{s}: exit code {}", .{ label, code });
         } else {
             try tracer.log(.process, "{s}: exit code unknown", .{label});
         }
         if (self.status.signal) |sig| {
-            try tracer.log(.process, "{s}: signal {d}", .{ label, sig });
+            try tracer.log(.process, "{s}: signal {}", .{ label, sig });
         }
         if (self.status.failed_stage) |idx| {
-            try tracer.log(.process, "{s}: failed stage {d}", .{ label, idx + 1 });
+            try tracer.log(.process, "{s}: failed stage {}", .{ label, idx + 1 });
         }
         const statuses = self.stageStatuses();
         for (statuses) |status| {
             if (status.signal) |sig| {
-                try tracer.log(.process, "{s}: stage {d} signal {d}", .{ label, status.index + 1, sig });
+                try tracer.log(.process, "{s}: stage {} signal {}", .{ label, status.index + 1, sig });
                 continue;
             }
             if (status.exit_code) |code| {
                 try tracer.log(
                     .process,
-                    "{s}: stage {d} exit {d} (ok={})",
+                    "{s}: stage {} exit {} (ok={})",
                     .{ label, status.index + 1, code, status.ok },
                 );
                 continue;
             }
-            try tracer.log(.process, "{s}: stage {d} ok={}", .{ label, status.index + 1, status.ok });
+            try tracer.log(.process, "{s}: stage {} ok={}", .{ label, status.index + 1, status.ok });
         }
     }
 

@@ -3,11 +3,13 @@ const token = @import("token.zig");
 
 const max_token_consumption_depth: usize = 1024;
 
-pub const Error = error{
+pub const Error = std.mem.Allocator.Error || std.Io.Writer.Error || error{
     UnexpectedCharacter,
     UnterminatedString,
     UnterminatedBlockComment,
     TokenConsumptionDepthExceeded,
+    ContextStackUnderflow,
+    IndexDidNotIncrease,
 };
 
 pub const Lexer = struct {
@@ -18,35 +20,148 @@ pub const Lexer = struct {
     needs_trailing_newline: bool,
     emitted_trailing_newline: bool = false,
     active_next_depth: usize = 0,
+    last_index: ?usize = null,
+    last_context_len: ?usize = null,
+    context_stack: std.ArrayList(Context) = .empty,
+    arena: std.heap.ArenaAllocator,
+    logging_enabled: bool = false,
 
-    pub fn init(source: []const u8) Lexer {
+    const Context = union(enum) {
+        root,
+        string,
+        string_interp: StringInterp,
+
+        pub const StringInterp = struct {
+            paren_counter: usize = 0,
+            bracket_counter: usize = 0,
+            brace_counter: usize = 0,
+
+            pub const CounterType = enum {
+                paren,
+                bracket,
+                brace,
+            };
+
+            pub fn field(self: *@This(), comptime ctType: CounterType) *usize {
+                return &@field(self, @tagName(ctType) ++ "_counter");
+            }
+
+            pub fn inc(self: *@This(), comptime ctType: CounterType) void {
+                self.field(ctType).* += 1;
+            }
+
+            pub fn dec(self: *@This(), comptime ctType: CounterType) void {
+                self.field(ctType).* -= 1;
+            }
+
+            pub fn canEnd(self: @This()) bool {
+                return self.paren_counter | self.brace_counter | self.brace_counter == 0;
+            }
+        };
+
+        pub fn interp() Context {
+            return .{ .string_interp = .{} };
+        }
+    };
+
+    pub fn init(allocator_: std.mem.Allocator, source: []const u8) Lexer {
         return .{
+            .arena = .init(allocator_),
             .source = source,
             .needs_trailing_newline = source.len > 0 and !endsWithNewline(source),
         };
     }
 
-    pub fn next(self: *Lexer) Error!token.Token {
-        if (self.active_next_depth >= max_token_consumption_depth) {
-            return Error.TokenConsumptionDepthExceeded;
+    pub fn deinit(self: Lexer) void {
+        self.arena.deinit();
+    }
+
+    pub fn allocator(self: *Lexer) std.mem.Allocator {
+        return self.arena.allocator();
+    }
+
+    pub fn currentContext(self: Lexer) Context {
+        return self.context_stack.getLastOrNull() orelse .root;
+    }
+
+    pub fn currentContextPtr(self: Lexer) ?*Context {
+        if (self.context_stack.items.len == 0) return null;
+        return &self.context_stack.items[self.context_stack.items.len - 1];
+    }
+
+    pub fn pushContext(self: *Lexer, context: Context) !void {
+        try self.context_stack.append(self.allocator(), context);
+    }
+
+    pub fn popContext(self: *Lexer) !void {
+        _ = self.context_stack.pop() orelse return Error.ContextStackUnderflow;
+    }
+
+    pub fn incCounter(self: *Lexer, comptime ctType: Context.StringInterp.CounterType) void {
+        if (self.currentContextPtr()) |ctx| {
+            switch (ctx.*) {
+                .string_interp => |*interp| interp.inc(ctType),
+                else => {},
+            }
         }
-        self.active_next_depth += 1;
-        defer self.active_next_depth -= 1;
+    }
+
+    pub fn decCounter(self: *Lexer, comptime ctType: Context.StringInterp.CounterType) void {
+        if (self.currentContextPtr()) |ctx| {
+            switch (ctx.*) {
+                .string_interp => |*interp| interp.dec(ctType),
+                else => {},
+            }
+        }
+    }
+
+    pub fn snapshot(self: Lexer) Lexer {
+        return self;
+    }
+
+    pub fn restore(self: *Lexer, s: Lexer) void {
+        self.* = s;
+    }
+
+    pub fn log(self: Lexer, comptime fmt: []const u8, args: anytype) !void {
+        if (!self.logging_enabled) return;
+        var stdout = std.fs.File.stderr().writer(&.{});
+        try stdout.interface.print("[lexer:{}:{}:{}]: ", .{ self.index, self.line, self.column });
+        try stdout.interface.print(fmt ++ "\n", args);
+    }
+
+    fn nextInner(self: *Lexer) Error!token.Token {
+        if (self.currentContext() == .string) return self.lexStringText();
+
+        if (self.lexStartInterp()) |start_interp_token| return start_interp_token;
+
         try self.skipWhitespaceAndComments();
 
         if (self.isAtEnd()) {
             if (self.needs_trailing_newline and !self.emitted_trailing_newline) {
-                return self.synthesizeTrailingNewline();
+                return try self.synthesizeTrailingNewline();
             }
             const loc = self.location();
+            defer self.index += 1;
             return .{
                 .tag = .eof,
-                .lexeme = self.source[self.index..self.index],
+                .lexeme = "",
                 .span = .{ .start = loc, .end = loc },
             };
         }
 
         const ch = self.peek().?;
+
+        if (ch == '}') switch (self.currentContext()) {
+            .string_interp => |ctx| if (ctx.canEnd()) {
+                const start = self.mark();
+                _ = self.advance();
+                try self.popContext();
+                return self.finish(.startAt(start), .string_interp_end);
+            },
+            else => {},
+        };
+
         if (ch == '\n' or ch == '\r') {
             return self.lexNewline();
         }
@@ -61,12 +176,30 @@ pub const Lexer = struct {
 
         return switch (ch) {
             '"' => self.lexString(),
-            '(' => self.singleCharToken(.l_paren),
-            ')' => self.singleCharToken(.r_paren),
-            '{' => self.singleCharToken(.l_brace),
-            '}' => self.singleCharToken(.r_brace),
-            '[' => self.singleCharToken(.l_bracket),
-            ']' => self.singleCharToken(.r_bracket),
+            '(' => brk: {
+                self.incCounter(.paren);
+                break :brk self.singleCharToken(.l_paren);
+            },
+            ')' => brk: {
+                self.decCounter(.paren);
+                break :brk self.singleCharToken(.r_paren);
+            },
+            '{' => brk: {
+                self.incCounter(.brace);
+                break :brk self.singleCharToken(.l_brace);
+            },
+            '}' => brk: {
+                self.decCounter(.brace);
+                break :brk self.singleCharToken(.r_brace);
+            },
+            '[' => brk: {
+                self.incCounter(.bracket);
+                break :brk self.singleCharToken(.l_bracket);
+            },
+            ']' => brk: {
+                self.decCounter(.bracket);
+                break :brk self.singleCharToken(.r_bracket);
+            },
             ',' => self.singleCharToken(.comma),
             ':' => self.singleCharToken(.colon),
             ';' => self.singleCharToken(.semicolon),
@@ -83,9 +216,31 @@ pub const Lexer = struct {
             '.' => self.lexDotLike(),
             '|' => self.lexPipe(),
             '&' => self.lexAmp(),
+            '$' => self.singleCharToken(.dollar),
             '/' => self.singleCharToken(.slash),
             else => Error.UnexpectedCharacter,
         };
+    }
+
+    pub fn next(self: *Lexer) Error!token.Token {
+        try self.log("next", .{});
+
+        if (self.active_next_depth >= max_token_consumption_depth) {
+            return Error.TokenConsumptionDepthExceeded;
+        }
+        self.active_next_depth += 1;
+        defer self.active_next_depth -= 1;
+
+        const next_token = try self.nextInner();
+
+        const didIndexIncrease = self.last_index == self.index;
+        const didContextChange = self.last_context_len == self.context_stack.items.len;
+        if (didIndexIncrease and didContextChange) return Error.IndexDidNotIncrease;
+
+        self.last_index = self.index;
+        self.last_context_len = self.context_stack.items.len;
+
+        return next_token;
     }
 
     fn lexIdentifier(self: *Lexer) token.Token {
@@ -104,6 +259,24 @@ pub const Lexer = struct {
             .lexeme = lexeme,
             .span = .{ .start = start, .end = self.location() },
         };
+    }
+
+    fn lexStartInterp(self: *Lexer) ?token.Token {
+        if (self.currentContextPtr()) |ctx| {
+            switch (ctx.*) {
+                .string_interp => {
+                    if (self.peekSliceIs("${")) {
+                        const start = self.mark();
+                        _ = self.advance();
+                        _ = self.advance();
+                        return self.finish(.startAt(start), .string_interp_start);
+                    }
+                },
+                else => {},
+            }
+        }
+
+        return null;
     }
 
     fn lexNumber(self: *Lexer) token.Token {
@@ -138,23 +311,50 @@ pub const Lexer = struct {
 
     fn lexString(self: *Lexer) Error!token.Token {
         const start = self.mark();
+        try self.pushContext(.string);
         _ = self.advance(); // consume opening quote
-        while (!self.isAtEnd()) {
-            const ch = self.advance().?;
+        return self.finish(.startAt(start), .string_start);
+    }
+
+    fn lexStringText(self: *Lexer) Error!token.Token {
+        const start = self.mark();
+
+        {
+            const ch = self.peek().?;
             if (ch == '"') {
-                return self.finish(start, .string_literal);
+                try self.popContext();
+                _ = self.advance();
+                return self.finish(.startAt(start), .string_end);
+            }
+        }
+
+        while (!self.isAtEnd()) {
+            const ch = self.peek().?;
+            if (ch == '"') {
+                return self.finish(.startAt(start), .string_text);
             }
             if (ch == '\\') {
+                _ = self.advance();
                 if (self.isAtEnd()) break;
                 _ = self.advance();
                 continue;
             }
+            if (ch == '$') {
+                if (self.peekSliceIs("${")) {
+                    try self.pushContext(.interp());
+                    return self.finish(.startAt(start), .string_text);
+                }
+                continue;
+            }
             if (ch == '\n' or ch == '\r') break;
+            _ = self.advance();
         }
         return Error.UnterminatedString;
     }
 
-    fn lexNewline(self: *Lexer) token.Token {
+    fn lexNewline(self: *Lexer) Error!token.Token {
+        try self.log("newline", .{});
+
         const start = self.mark();
         const consumed = self.advance().?;
         if (consumed == '\r') {
@@ -169,12 +369,14 @@ pub const Lexer = struct {
         } else {
             // Should be unreachable, but we fall back to emitting newline anyway.
         }
-        return self.finish(start, .newline);
+        return self.finish(.startAt(start), .newline);
     }
 
-    fn synthesizeTrailingNewline(self: *Lexer) token.Token {
+    fn synthesizeTrailingNewline(self: *Lexer) Error!token.Token {
+        try self.log("synthesizeTrailingNewline", .{});
         const start = self.location();
         self.emitted_trailing_newline = true;
+        defer self.index += 1;
         self.line += 1;
         self.column = 1;
         const end = self.location();
@@ -189,48 +391,48 @@ pub const Lexer = struct {
         const start = self.mark();
         _ = self.advance();
         if (self.match('>')) {
-            return self.finish(start, .arrow);
+            return self.finish(.startAt(start), .arrow);
         }
-        return self.finish(start, .minus);
+        return self.finish(.startAt(start), .minus);
     }
 
     fn lexBang(self: *Lexer) token.Token {
         const start = self.mark();
         _ = self.advance();
         if (self.match('=')) {
-            return self.finish(start, .bang_equal);
+            return self.finish(.startAt(start), .bang_equal);
         }
-        return self.finish(start, .bang);
+        return self.finish(.startAt(start), .bang);
     }
 
     fn lexEquals(self: *Lexer) token.Token {
         const start = self.mark();
         _ = self.advance();
         if (self.match('>')) {
-            return self.finish(start, .fat_arrow);
+            return self.finish(.startAt(start), .fat_arrow);
         }
         if (self.match('=')) {
-            return self.finish(start, .equal_equal);
+            return self.finish(.startAt(start), .equal_equal);
         }
-        return self.finish(start, .assign);
+        return self.finish(.startAt(start), .assign);
     }
 
     fn lexGreater(self: *Lexer) token.Token {
         const start = self.mark();
         _ = self.advance();
         if (self.match('=')) {
-            return self.finish(start, .greater_equal);
+            return self.finish(.startAt(start), .greater_equal);
         }
-        return self.finish(start, .greater);
+        return self.finish(.startAt(start), .greater);
     }
 
     fn lexLess(self: *Lexer) token.Token {
         const start = self.mark();
         _ = self.advance();
         if (self.match('=')) {
-            return self.finish(start, .less_equal);
+            return self.finish(.startAt(start), .less_equal);
         }
-        return self.finish(start, .less);
+        return self.finish(.startAt(start), .less);
     }
 
     fn lexDotLike(self: *Lexer) token.Token {
@@ -238,38 +440,39 @@ pub const Lexer = struct {
         _ = self.advance();
         if (self.match('.')) {
             if (self.match('.')) {
-                return self.finish(start, .ellipsis);
+                return self.finish(.startAt(start), .ellipsis);
             }
-            return self.finish(start, .range);
+            return self.finish(.startAt(start), .range);
         }
-        return self.finish(start, .dot);
+        return self.finish(.startAt(start), .dot);
     }
 
     fn lexPipe(self: *Lexer) token.Token {
         const start = self.mark();
         _ = self.advance();
         if (self.match('|')) {
-            return self.finish(start, .pipe_pipe);
+            return self.finish(.startAt(start), .pipe_pipe);
         }
-        return self.finish(start, .pipe);
+        return self.finish(.startAt(start), .pipe);
     }
 
     fn lexAmp(self: *Lexer) token.Token {
         const start = self.mark();
         _ = self.advance();
         if (self.match('&')) {
-            return self.finish(start, .amp_amp);
+            return self.finish(.startAt(start), .amp_amp);
         }
-        return self.finish(start, .amp);
+        return self.finish(.startAt(start), .amp);
     }
 
     fn singleCharToken(self: *Lexer, tag: token.Tag) token.Token {
         const start = self.mark();
         _ = self.advance();
-        return self.finish(start, tag);
+        return self.finish(.startAt(start), tag);
     }
 
     fn skipWhitespaceAndComments(self: *Lexer) Error!void {
+        try self.log("Skipping whitespace", .{});
         while (!self.isAtEnd()) {
             const ch = self.peek().?;
             switch (ch) {
@@ -337,6 +540,17 @@ pub const Lexer = struct {
         return self.source[self.index];
     }
 
+    fn peekSlice(self: *Lexer, len: usize) ?[]const u8 {
+        if (self.index + len - 1 >= self.source.len) return null;
+        return self.source[self.index .. self.index + len];
+    }
+
+    fn peekSliceIs(self: *Lexer, comptime s: []const u8) bool {
+        if (self.index + s.len - 1 >= self.source.len) return false;
+        const src = self.source[self.index .. self.index + s.len];
+        return std.mem.eql(u8, src, s);
+    }
+
     fn peekIs(self: *Lexer, needle: u8) bool {
         if (self.isAtEnd()) return false;
         return self.source[self.index] == needle;
@@ -380,23 +594,42 @@ pub const Lexer = struct {
         };
     }
 
-    const TokenStart = struct {
+    const TokenMark = struct {
         loc: token.Location,
         index: usize,
     };
 
-    fn mark(self: *Lexer) TokenStart {
+    fn mark(self: *Lexer) TokenMark {
         return .{ .loc = self.location(), .index = self.index };
     }
 
-    fn finish(self: *Lexer, start: TokenStart, tag: token.Tag) token.Token {
+    const TokenFinishType = union(enum) {
+        start: TokenMark,
+        start_end: struct { TokenMark, TokenMark },
+
+        pub fn startAt(marker: TokenMark) TokenFinishType {
+            return .{ .start = marker };
+        }
+
+        pub fn startEnd(start: TokenMark, end: TokenMark) TokenFinishType {
+            return .{ .start_end = .{ start, end } };
+        }
+    };
+
+    fn finish(
+        self: *Lexer,
+        finishType: TokenFinishType,
+        tag: token.Tag,
+    ) token.Token {
+        const span: token.Span = switch (finishType) {
+            .start => |marker| .fromLocs(marker.loc, self.location()),
+            .start_end => |markers| .fromLocs(markers.@"0".loc, markers.@"1".loc),
+        };
+
         return .{
             .tag = tag,
-            .lexeme = self.source[start.index..self.index],
-            .span = .{
-                .start = start.loc,
-                .end = self.location(),
-            },
+            .lexeme = span.sliceFrom(self.source),
+            .span = span,
         };
     }
 };
@@ -405,18 +638,32 @@ pub const Lexer = struct {
 /// parser can peek ahead without materializing the entire token list.
 pub const Stream = struct {
     lexer: Lexer,
+    current: ?token.Token = null,
     peeked: ?token.Token = null,
     active_next_depth: usize = 0,
 
     pub const max_guard_depth: usize = max_token_consumption_depth;
 
-    pub fn init(source: []const u8) Stream {
-        return .{ .lexer = Lexer.init(source) };
+    pub fn init(allocator: std.mem.Allocator, source: []const u8) Stream {
+        return .{ .lexer = Lexer.init(allocator, source) };
+    }
+
+    pub fn deinit(self: Stream) void {
+        self.lexer.deinit();
+    }
+
+    pub fn snapshot(self: Stream) Stream {
+        return self;
+    }
+
+    pub fn restore(self: *Stream, s: Stream) void {
+        self.* = s;
     }
 
     pub fn next(self: *Stream) Error!token.Token {
         if (self.peeked) |tok| {
             self.peeked = null;
+            self.current = tok;
             return tok;
         }
         return self.guardedNext();
@@ -444,7 +691,10 @@ pub const Stream = struct {
         }
         self.active_next_depth += 1;
         defer self.active_next_depth -= 1;
-        return self.lexer.next();
+        const next_token = try self.lexer.next();
+        try self.lexer.log("next token: {}", .{next_token.tag});
+        self.current = next_token;
+        return next_token;
     }
 };
 
@@ -522,8 +772,8 @@ test "lexer fixtures cover feature surfaces" {
             \\}
             ,
             .tokens = &[_]token.Tag{
-                .kw_let,     .identifier, .colon,      .identifier,  .assign,  .string_literal, .newline,
-                .kw_mut,     .identifier, .assign,     .int_literal, .newline, .kw_fn,          .identifier,
+                .kw_const,   .identifier, .colon,      .identifier,  .assign,  .string_literal, .newline,
+                .kw_var,     .identifier, .assign,     .int_literal, .newline, .kw_fn,          .identifier,
                 .l_paren,    .identifier, .colon,      .identifier,  .comma,   .identifier,     .colon,
                 .identifier, .r_paren,    .arrow,      .identifier,  .l_brace, .newline,        .kw_return,
                 .identifier, .plus,       .identifier, .newline,     .r_brace, .newline,        .eof,
@@ -536,9 +786,9 @@ test "lexer fixtures cover feature surfaces" {
             \\let mapping = { key: null, nested: [false] }
             ,
             .tokens = &[_]token.Tag{
-                .kw_let,    .identifier, .assign, .l_bracket,  .int_literal, .comma,     .float_literal, .comma,   .kw_true,
-                .r_bracket, .newline,    .kw_let, .identifier, .assign,      .l_brace,   .identifier,    .colon,   .kw_null,
-                .comma,     .identifier, .colon,  .l_bracket,  .kw_false,    .r_bracket, .r_brace,       .newline, .eof,
+                .kw_const,  .identifier, .assign,   .l_bracket,  .int_literal, .comma,     .float_literal, .comma,   .kw_true,
+                .r_bracket, .newline,    .kw_const, .identifier, .assign,      .l_brace,   .identifier,    .colon,   .kw_null,
+                .comma,     .identifier, .colon,    .l_bracket,  .kw_false,    .r_bracket, .r_brace,       .newline, .eof,
             },
         },
         .{
@@ -566,7 +816,7 @@ test "lexer fixtures cover feature surfaces" {
             ,
             .tokens = &[_]token.Tag{
                 .kw_async,   .kw_fn,      .identifier,  .l_paren,    .r_paren,        .colon,   .caret,      .identifier, .l_brace,     .newline,
-                .kw_let,     .identifier, .colon,       .question,   .identifier,     .assign,  .kw_await,   .identifier, .kw_catch,    .pipe,
+                .kw_const,   .identifier, .colon,       .question,   .identifier,     .assign,  .kw_await,   .identifier, .kw_catch,    .pipe,
                 .identifier, .pipe,       .l_brace,     .kw_return,  .identifier,     .r_brace, .newline,    .kw_for,     .l_paren,     .identifier,
                 .comma,      .identifier, .r_paren,     .pipe,       .identifier,     .comma,   .identifier, .pipe,       .l_brace,     .kw_while,
                 .identifier, .less,       .int_literal, .l_brace,    .kw_if,          .l_paren, .identifier, .greater,    .int_literal, .r_paren,
@@ -581,9 +831,9 @@ test "lexer fixtures cover feature surfaces" {
             \\let resp = http.client.get
             ,
             .tokens = &[_]token.Tag{
-                .kw_let,    .identifier, .assign,     .kw_import,   .l_paren, .string_literal, .r_paren, .newline,
-                .kw_let,    .identifier, .assign,     .identifier,  .dot,
-                .identifier, .dot,        .identifier, .newline,     .eof,
+                .kw_const, .identifier, .assign, .kw_import,  .l_paren, .string_literal, .r_paren, .newline,
+                .kw_const, .identifier, .assign, .identifier, .dot,     .identifier,     .dot,     .identifier,
+                .newline,  .eof,
             },
         },
         .{
@@ -599,8 +849,8 @@ test "lexer fixtures cover feature surfaces" {
                 .kw_if,       .l_paren,     .identifier,  .greater_equal, .int_literal, .r_paren,    .l_brace,
                 .identifier,  .assign,      .identifier,  .star,          .int_literal, .minus,      .int_literal,
                 .r_brace,     .kw_else,     .l_brace,     .identifier,    .assign,      .identifier, .slash,
-                .int_literal, .r_brace,     .newline,     .kw_let,        .identifier,  .assign,     .identifier,
-                .l_bracket,   .int_literal, .range,       .int_literal,   .r_bracket,   .newline,    .kw_let,
+                .int_literal, .r_brace,     .newline,     .kw_const,      .identifier,  .assign,     .identifier,
+                .l_bracket,   .int_literal, .range,       .int_literal,   .r_bracket,   .newline,    .kw_const,
                 .identifier,  .assign,      .int_literal, .ellipsis,      .int_literal, .newline,    .kw_while,
                 .l_paren,     .identifier,  .bang_equal,  .int_literal,   .amp_amp,     .bang,       .identifier,
                 .r_paren,     .l_brace,     .identifier,  .assign,        .identifier,  .percent,    .int_literal,
@@ -645,8 +895,8 @@ test "lexer emits tokens with spans" {
 
     var lx = Lexer.init(src);
     const expected_tags = [_]token.Tag{
-        .kw_let,     .identifier, .assign, .string_literal, .newline,
-        .kw_mut,     .identifier, .assign, .int_literal,    .newline,
+        .kw_const,   .identifier, .assign, .string_literal, .newline,
+        .kw_var,     .identifier, .assign, .int_literal,    .newline,
         .identifier, .identifier, .pipe,   .identifier,     .newline,
         .eof,
     };
@@ -695,10 +945,10 @@ test "lexer stream supports peeking and conditional consumption" {
     var stream = Stream.init(src);
 
     const peek_let = try stream.peek();
-    try std.testing.expectEqual(token.Tag.kw_let, peek_let.tag);
+    try std.testing.expectEqual(token.Tag.kw_const, peek_let.tag);
 
     const let_tok = try stream.next();
-    try std.testing.expectEqual(token.Tag.kw_let, let_tok.tag);
+    try std.testing.expectEqual(token.Tag.kw_const, let_tok.tag);
 
     const ident_tok = try stream.peek();
     try std.testing.expectEqualSlices(u8, "name", ident_tok.lexeme);

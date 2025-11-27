@@ -1,7 +1,7 @@
 // Run with: zig build run -- examples/async_and_legacy.rn --trace async --trace process
 // Demonstrates async promises, background process handles, module imports, and bash blocks.
 
-let http = import("net/http")
+const http = import("net/http")
 
 error ReleaseError = enum { Timeout, Offline }
 
@@ -15,7 +15,7 @@ fn fetch_release(tag: Str) ^ReleaseError!http.Response {
   }
 }
 
-let latest = fetch_release("stable")
+const latest = fetch_release("stable")
 await (latest) |release| {
   echo "Latest release => ${release.code}"
 } catch |err| {
@@ -25,8 +25,8 @@ await (latest) |release| {
   }
 }
 
-let server_handle = python -m http.server 9000 &
-let finished = await server_handle
+const server_handle = python -m http.server 9000 &
+const finished = await server_handle
 if finished.status.ok {
   echo "Preview server ready"
 }

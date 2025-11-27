@@ -1,0 +1,36 @@
+// source --lexer-> tokens --parser-> ast
+//
+# // compile: ast --compiler-> target_code
+// interpret: ast --interpreter-> execute
+// lsp: ast --lsp-> lsp
+// types: ast --type-checker-> diagnostics
+
+// fn parseInt(@stdin: String) !Int {
+//    ...
+// }
+//
+// fn formatInt(@stdin: Int, radix: Int) Void {
+//    ...
+// }
+//
+// echo "15" | parseInt | formatInt 16
+
+const lib = import "lib.rn"
+
+const hello = "hello"
+const value = "${hello}, world!"
+const b = true
+const p = printf "hello, world!\nno\nyes" | grep "yes"
+
+echo "${"${"${"${"asdf"}"}"}"}"
+echo "${b}"
+echo "${p}"
+echo "\n"
+
+# echo "hello" | cat "-" "test-2.rn"
+
+# Expected output:
+# asdf
+# 1
+# yes
+# \n

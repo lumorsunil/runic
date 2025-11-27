@@ -1,413 +1,525 @@
 <!DOCTYPE html>
 <html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>Runic Language Reference</title>
-  <style>
-    * {
-      box-sizing: border-box;
-    }
-
-    body {
-      font-family: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      margin: 0;
-      background: #0f172a;
-      color: #e2e8f0;
-      line-height: 1.6;
-      padding: 2rem;
-    }
-
-    header {
-      max-width: 900px;
-      margin: 0 auto 2rem;
-      text-align: center;
-    }
-
-    h1 {
-      margin: 0 0 0.5rem;
-      font-size: 2.75rem;
-      letter-spacing: -0.04em;
-    }
-
-    header p {
-      margin: 0 auto 1rem;
-      max-width: 720px;
-      color: #94a3b8;
-    }
-
-    .search {
-      margin-top: 1.5rem;
-      display: flex;
-      flex-direction: column;
-      gap: 0.4rem;
-      text-align: left;
-    }
-
-    .search label {
-      font-weight: 600;
-    }
-
-    .search input {
-      padding: 0.8rem 1rem;
-      border-radius: 0.75rem;
-      border: 1px solid rgba(148, 163, 184, 0.3);
-      background: rgba(15, 23, 42, 0.6);
-      color: inherit;
-      font-size: 1rem;
-      transition: border 0.2s ease, box-shadow 0.2s ease;
-    }
-
-    .search input:focus {
-      outline: none;
-      border-color: #38bdf8;
-      box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.25);
-    }
-
-    .content {
-      max-width: 1400px;
-      margin: 0 auto;
-      display: flex;
-      gap: 2rem;
-      align-items: flex-start;
-    }
-
-    nav.sidebar {
-      position: sticky;
-      top: 2rem;
-      width: 260px;
-      flex-shrink: 0;
-      background: rgba(15, 23, 42, 0.85);
-      border: 1px solid rgba(59, 130, 246, 0.3);
-      border-radius: 1rem;
-      padding: 1.25rem;
-      box-shadow: 0 10px 35px rgba(2, 6, 23, 0.5);
-      max-height: calc(100vh - 4rem);
-      overflow-y: auto;
-    }
-
-    .sidebar-title {
-      margin: 0 0 1rem;
-      font-size: 1.2rem;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      color: #94a3b8;
-    }
-
-    .sidebar-group + .sidebar-group {
-      margin-top: 1.5rem;
-    }
-
-    .sidebar-group h3 {
-      margin: 0 0 0.5rem;
-      font-size: 1rem;
-      color: #e0e7ff;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-    }
-
-    .sidebar-list {
-      list-style: none;
-      margin: 0;
-      padding: 0;
-      display: flex;
-      flex-direction: column;
-      gap: 0.35rem;
-    }
-
-    .sidebar-list a {
-      color: #cbd5f5;
-      text-decoration: none;
-      font-size: 0.95rem;
-      padding: 0.3rem 0.4rem;
-      border-radius: 0.5rem;
-      display: block;
-      transition: background 0.2s ease, color 0.2s ease;
-    }
-
-    .sidebar-list a:hover,
-    .sidebar-list a:focus {
-      background: rgba(59, 130, 246, 0.2);
-      color: #e2e8f0;
-      outline: none;
-    }
-
-    main {
-      flex: 1;
-      max-width: none;
-      display: flex;
-      flex-direction: column;
-      gap: 3rem;
-    }
-
-    section h2 {
-      margin: 0 0 0.6rem;
-      font-size: 1.8rem;
-    }
-
-    section > p {
-      margin: 0 0 1rem;
-      color: #a5b4fc;
-    }
-
-    .entry-list {
-      display: flex;
-      flex-direction: column;
-      gap: 2rem;
-    }
-
-    article.entry {
-      padding: 1.5rem 1.5rem 1.5rem 1.75rem;
-      background: rgba(15, 23, 42, 0.75);
-      border-left: 4px solid rgba(59, 130, 246, 0.5);
-      border-radius: 0.85rem;
-      box-shadow: 0 6px 18px rgba(2, 6, 23, 0.55);
-      display: flex;
-      flex-direction: column;
-      gap: 0.85rem;
-    }
-
-    article.entry h3 {
-      margin: 0;
-      font-size: 1.3rem;
-    }
-
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      padding: 0.15rem 0.45rem;
-      border-radius: 999px;
-      font-size: 0.75rem;
-      text-transform: uppercase;
-      font-weight: 700;
-      letter-spacing: 0.05em;
-    }
-
-    .badge-type {
-      background: rgba(16, 185, 129, 0.15);
-      color: #34d399;
-    }
-
-    .badge-feature {
-      background: rgba(248, 113, 113, 0.15);
-      color: #f87171;
-    }
-
-    pre {
-      margin: 0;
-      padding: 0.75rem;
-      border-radius: 0.75rem;
-      background: #0b1121;
-      overflow-x: auto;
-      font-size: 0.9rem;
-    }
-
-    code {
-      font-family: "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace;
-    }
-
-    .example-label {
-      text-transform: uppercase;
-      font-size: 0.7rem;
-      letter-spacing: 0.08em;
-      color: #cbd5f5;
-      margin-bottom: 0.25rem;
-    }
-
-    .empty-state {
-      text-align: center;
-      color: #fca5a5;
-      font-weight: 600;
-    }
-
-    .is-hidden {
-      display: none !important;
-    }
-
-    @media (max-width: 900px) {
-      .content {
-        flex-direction: column;
+  <head>
+    <meta charset="UTF-8" />
+    <title>Runic Language Reference</title>
+    <style>
+      * {
+        box-sizing: border-box;
       }
 
-      nav.sidebar {
-        position: static;
-        width: 100%;
-      }
-    }
-
-    @media (max-width: 600px) {
       body {
-        padding: 1.5rem 1rem;
+        font-family:
+          "Inter",
+          system-ui,
+          -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          sans-serif;
+        margin: 0;
+        background: #0f172a;
+        color: #e2e8f0;
+        line-height: 1.6;
+        padding: 2rem;
+      }
+
+      header {
+        max-width: 900px;
+        margin: 0 auto 2rem;
+        text-align: center;
       }
 
       h1 {
-        font-size: 2.2rem;
+        margin: 0 0 0.5rem;
+        font-size: 2.75rem;
+        letter-spacing: -0.04em;
       }
-    }
-  </style>
-</head>
-<body>
-  <header>
-    <h1>Runic Language Reference</h1>
-    <p>
-      A quick reference to Runic&rsquo;s built-in types and language features.
-      Every entry includes a one-line summary plus an executable snippet pulled from the
-      current design docs so you can mirror the same behavior in your scripts.
-    </p>
-    <div class="search">
-      <label for="search">Search by name, keyword, or capability</label>
-      <input id="search" type="search" placeholder="e.g. promise, pipeline, map, async" autocomplete="off">
-    </div>
-  </header>
 
-  <div class="content">
-    <nav class="sidebar" aria-label="Reference navigation">
-      <p class="sidebar-title">Jump to</p>
-      <div class="sidebar-group">
-        <h3>Types</h3>
-        <ul id="sidebar-types" class="sidebar-list"></ul>
-      </div>
-      <div class="sidebar-group">
-        <h3>Features</h3>
-        <ul id="sidebar-features" class="sidebar-list"></ul>
-      </div>
-    </nav>
+      header p {
+        margin: 0 auto 1rem;
+        max-width: 720px;
+        color: #94a3b8;
+      }
 
-    <main>
-    <section id="types">
-      <h2>Built-in Types</h2>
-      <p>Runic values default to predictable semantics: immutable bindings, explicit mutation, and Zig-inspired wrappers like <code>?T</code>, <code>!T</code>, and <code>^T</code>.</p>
-      <div class="entry-list">
-        <article class="entry" data-searchable data-keywords="str string text primitive">
-          <h3><span class="badge badge-type">Type</span> Str</h3>
-          <p>Immutable UTF-8 strings. Use <code>Str</code> for command arguments, logging, and any textual data.</p>
-          <div>
-            <div class="example-label">Example</div>
-            <pre><code class="language-rn">let greeting: Str = "hello world"
+      .search {
+        margin-top: 1.5rem;
+        display: flex;
+        flex-direction: column;
+        gap: 0.4rem;
+        text-align: left;
+      }
+
+      .search label {
+        font-weight: 600;
+      }
+
+      .search input {
+        padding: 0.8rem 1rem;
+        border-radius: 0.75rem;
+        border: 1px solid rgba(148, 163, 184, 0.3);
+        background: rgba(15, 23, 42, 0.6);
+        color: inherit;
+        font-size: 1rem;
+        transition:
+          border 0.2s ease,
+          box-shadow 0.2s ease;
+      }
+
+      .search input:focus {
+        outline: none;
+        border-color: #38bdf8;
+        box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.25);
+      }
+
+      .content {
+        max-width: 1400px;
+        margin: 0 auto;
+        display: flex;
+        gap: 2rem;
+        align-items: flex-start;
+      }
+
+      nav.sidebar {
+        position: sticky;
+        top: 2rem;
+        width: 260px;
+        flex-shrink: 0;
+        background: rgba(15, 23, 42, 0.85);
+        border: 1px solid rgba(59, 130, 246, 0.3);
+        border-radius: 1rem;
+        padding: 1.25rem;
+        box-shadow: 0 10px 35px rgba(2, 6, 23, 0.5);
+        max-height: calc(100vh - 4rem);
+        overflow-y: auto;
+      }
+
+      .sidebar-title {
+        margin: 0 0 1rem;
+        font-size: 1.2rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: #94a3b8;
+      }
+
+      .sidebar-group + .sidebar-group {
+        margin-top: 1.5rem;
+      }
+
+      .sidebar-group h3 {
+        margin: 0 0 0.5rem;
+        font-size: 1rem;
+        color: #e0e7ff;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+      }
+
+      .sidebar-list {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 0.35rem;
+      }
+
+      .sidebar-list a {
+        color: #cbd5f5;
+        text-decoration: none;
+        font-size: 0.95rem;
+        padding: 0.3rem 0.4rem;
+        border-radius: 0.5rem;
+        display: block;
+        transition:
+          background 0.2s ease,
+          color 0.2s ease;
+      }
+
+      .sidebar-list a:hover,
+      .sidebar-list a:focus {
+        background: rgba(59, 130, 246, 0.2);
+        color: #e2e8f0;
+        outline: none;
+      }
+
+      main {
+        flex: 1;
+        max-width: none;
+        display: flex;
+        flex-direction: column;
+        gap: 3rem;
+      }
+
+      section h2 {
+        margin: 0 0 0.6rem;
+        font-size: 1.8rem;
+      }
+
+      section > p {
+        margin: 0 0 1rem;
+        color: #a5b4fc;
+      }
+
+      .entry-list {
+        display: flex;
+        flex-direction: column;
+        gap: 2rem;
+      }
+
+      article.entry {
+        padding: 1.5rem 1.5rem 1.5rem 1.75rem;
+        background: rgba(15, 23, 42, 0.75);
+        border-left: 4px solid rgba(59, 130, 246, 0.5);
+        border-radius: 0.85rem;
+        box-shadow: 0 6px 18px rgba(2, 6, 23, 0.55);
+        display: flex;
+        flex-direction: column;
+        gap: 0.85rem;
+      }
+
+      article.entry h3 {
+        margin: 0;
+        font-size: 1.3rem;
+      }
+
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        padding: 0.15rem 0.45rem;
+        border-radius: 999px;
+        font-size: 0.75rem;
+        text-transform: uppercase;
+        font-weight: 700;
+        letter-spacing: 0.05em;
+      }
+
+      .badge-type {
+        background: rgba(16, 185, 129, 0.15);
+        color: #34d399;
+      }
+
+      .badge-feature {
+        background: rgba(248, 113, 113, 0.15);
+        color: #f87171;
+      }
+
+      pre {
+        margin: 0;
+        padding: 0.75rem;
+        border-radius: 0.75rem;
+        background: #0b1121;
+        overflow-x: auto;
+        font-size: 0.9rem;
+      }
+
+      code {
+        font-family: "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace;
+      }
+
+      .example-label {
+        text-transform: uppercase;
+        font-size: 0.7rem;
+        letter-spacing: 0.08em;
+        color: #cbd5f5;
+        margin-bottom: 0.25rem;
+      }
+
+      .empty-state {
+        text-align: center;
+        color: #fca5a5;
+        font-weight: 600;
+      }
+
+      .is-hidden {
+        display: none !important;
+      }
+
+      @media (max-width: 900px) {
+        .content {
+          flex-direction: column;
+        }
+
+        nav.sidebar {
+          position: static;
+          width: 100%;
+        }
+      }
+
+      @media (max-width: 600px) {
+        body {
+          padding: 1.5rem 1rem;
+        }
+
+        h1 {
+          font-size: 2.2rem;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Runic Language Reference</h1>
+      <p>
+        A quick reference to Runic&rsquo;s built-in types and language features.
+        Every entry includes a one-line summary plus an executable snippet
+        pulled from the current design docs so you can mirror the same behavior
+        in your scripts.
+      </p>
+      <div class="search">
+        <label for="search">Search by name, keyword, or capability</label>
+        <input
+          id="search"
+          type="search"
+          placeholder="e.g. promise, pipeline, map, async"
+          autocomplete="off"
+        />
+      </div>
+    </header>
+
+    <div class="content">
+      <nav class="sidebar" aria-label="Reference navigation">
+        <p class="sidebar-title">Jump to</p>
+        <div class="sidebar-group">
+          <h3>Types</h3>
+          <ul id="sidebar-types" class="sidebar-list"></ul>
+        </div>
+        <div class="sidebar-group">
+          <h3>Features</h3>
+          <ul id="sidebar-features" class="sidebar-list"></ul>
+        </div>
+      </nav>
+
+      <main>
+        <section id="types">
+          <h2>Built-in Types</h2>
+          <p>
+            Runic values default to predictable semantics: immutable bindings,
+            explicit mutation, and Zig-inspired wrappers like <code>?T</code>,
+            <code>!T</code>, and <code>^T</code>.
+          </p>
+          <div class="entry-list">
+            <article
+              class="entry"
+              data-searchable
+              data-keywords="str string text primitive"
+            >
+              <h3><span class="badge badge-type">Type</span> Str</h3>
+              <p>
+                Immutable UTF-8 strings. Use <code>Str</code> for command
+                arguments, logging, and any textual data.
+              </p>
+              <div>
+                <div class="example-label">Example</div>
+                <pre><code class="language-rn">let greeting: Str = "hello world"
 echo greeting.upper()</code></pre>
-          </div>
-        </article>
+              </div>
+            </article>
 
-        <article class="entry" data-searchable data-keywords="int integer number primitive mut">
-          <h3><span class="badge badge-type">Type</span> Int</h3>
-          <p>Signed integers that keep arithmetic explicit. Bindings stay immutable unless you declare them with <code>mut</code>.</p>
-          <div>
-            <div class="example-label">Example</div>
-            <pre><code class="language-rn">mut retries: Int = 2
+            <article
+              class="entry"
+              data-searchable
+              data-keywords="int integer number primitive mut"
+            >
+              <h3><span class="badge badge-type">Type</span> Int</h3>
+              <p>
+                Signed integers that keep arithmetic explicit. Bindings stay
+                immutable unless you declare them with <code>mut</code>.
+              </p>
+              <div>
+                <div class="example-label">Example</div>
+                <pre><code class="language-rn">mut retries: Int = 2
 retries = retries + 1</code></pre>
-          </div>
-        </article>
+              </div>
+            </article>
 
-        <article class="entry" data-searchable data-keywords="float number primitive decimal">
-          <h3><span class="badge badge-type">Type</span> Float</h3>
-          <p>Floating-point numbers for precise ratios or measurements. Annotate literal math so conversions are enforced up front.</p>
-          <div>
-            <div class="example-label">Example</div>
-            <pre><code class="language-rn">let pi: Float = 3.14159
-let radius: Float = 2.0
-let area = pi * radius * radius</code></pre>
-          </div>
-        </article>
+            <article
+              class="entry"
+              data-searchable
+              data-keywords="float number primitive decimal"
+            >
+              <h3><span class="badge badge-type">Type</span> Float</h3>
+              <p>
+                Floating-point numbers for precise ratios or measurements.
+                Annotate literal math so conversions are enforced up front.
+              </p>
+              <div>
+                <div class="example-label">Example</div>
+                <pre><code class="language-rn">let pi: Float = 3.14159
+const radius: Float = 2.0
+const area = pi * radius * radius</code></pre>
+              </div>
+            </article>
 
-        <article class="entry" data-searchable data-keywords="bool boolean predicate primitive condition">
-          <h3><span class="badge badge-type">Type</span> Bool</h3>
-          <p>Logical true/false values that drive conditionals. Distinguish command success from custom business logic.</p>
-          <div>
-            <div class="example-label">Example</div>
-            <pre><code class="language-rn">let count: Int = 3
-let is_plural: Bool = count > 1
+            <article
+              class="entry"
+              data-searchable
+              data-keywords="bool boolean predicate primitive condition"
+            >
+              <h3><span class="badge badge-type">Type</span> Bool</h3>
+              <p>
+                Logical true/false values that drive conditionals. Distinguish
+                command success from custom business logic.
+              </p>
+              <div>
+                <div class="example-label">Example</div>
+                <pre><code class="language-rn">let count: Int = 3
+const is_plural: Bool = count > 1
 if is_plural {
   echo "plural branch"
 } else {
   echo "singular branch"
 }</code></pre>
-          </div>
-        </article>
+              </div>
+            </article>
 
-        <article class="entry" data-searchable data-keywords="bytes binary payload primitive">
-          <h3><span class="badge badge-type">Type</span> Bytes</h3>
-          <p>Opaque byte buffers for binary payloads such as HTTP bodies or archive blobs. Keep text/bytes conversions explicit.</p>
-          <div>
-            <div class="example-label">Example</div>
-            <pre><code class="language-rn">let http = import("net/http")
+            <article
+              class="entry"
+              data-searchable
+              data-keywords="bytes binary payload primitive"
+            >
+              <h3><span class="badge badge-type">Type</span> Bytes</h3>
+              <p>
+                Opaque byte buffers for binary payloads such as HTTP bodies or
+                archive blobs. Keep text/bytes conversions explicit.
+              </p>
+              <div>
+                <div class="example-label">Example</div>
+                <pre><code class="language-rn">let http = import("net/http")
 
-let resp = http.get("https://example.com/status")
-let payload: Bytes = resp.body</code></pre>
-          </div>
-        </article>
+const resp = http.get("https://example.com/status")
+const payload: Bytes = resp.body</code></pre>
+              </div>
+            </article>
 
-        <article class="entry" data-searchable data-keywords="void unit return type fn">
-          <h3><span class="badge badge-type">Type</span> Void</h3>
-          <p>Indicates a function returns no value beyond success. Pair it with <code>!Void</code> to signal commands that only fail or succeed.</p>
-          <div>
-            <div class="example-label">Example</div>
-            <pre><code class="language-rn">fn init() !Void {
+            <article
+              class="entry"
+              data-searchable
+              data-keywords="void unit return type fn"
+            >
+              <h3><span class="badge badge-type">Type</span> Void</h3>
+              <p>
+                Indicates a function returns no value beyond success. Pair it
+                with <code>!Void</code> to signal commands that only fail or
+                succeed.
+              </p>
+              <div>
+                <div class="example-label">Example</div>
+                <pre><code class="language-rn">fn init() !Void {
   try bootstrap_network()
   echo "Runtime ready"
 }</code></pre>
-          </div>
-        </article>
+              </div>
+            </article>
 
-        <article class="entry" data-searchable data-keywords="pid process identifier primitive">
-          <h3><span class="badge badge-type">Type</span> Pid</h3>
-          <p>Process identifiers exposed by command handles so you can introspect or manage background work.</p>
-          <div>
-            <div class="example-label">Example</div>
-            <pre><code class="language-rn">let server = tail -f /var/log/app.log &
+            <article
+              class="entry"
+              data-searchable
+              data-keywords="pid process identifier primitive"
+            >
+              <h3><span class="badge badge-type">Type</span> Pid</h3>
+              <p>
+                Process identifiers exposed by command handles so you can
+                introspect or manage background work.
+              </p>
+              <div>
+                <div class="example-label">Example</div>
+                <pre><code class="language-rn">let server = tail -f /var/log/app.log &
 echo "spawned ${server.pid}"</code></pre>
-          </div>
-        </article>
+              </div>
+            </article>
 
-        <article class="entry" data-searchable data-keywords="exit status code primitive process">
-          <h3><span class="badge badge-type">Type</span> ExitStatus</h3>
-          <p>Structured command results that include the exit code plus helpers such as <code>.ok</code> and <code>.failed_stage</code>.</p>
-          <div>
-            <div class="example-label">Example</div>
-            <pre><code class="language-rn">let status: ExitStatus = (build | tee build.log).status
+            <article
+              class="entry"
+              data-searchable
+              data-keywords="exit status code primitive process"
+            >
+              <h3><span class="badge badge-type">Type</span> ExitStatus</h3>
+              <p>
+                Structured command results that include the exit code plus
+                helpers such as <code>.ok</code> and <code>.failed_stage</code>.
+              </p>
+              <div>
+                <div class="example-label">Example</div>
+                <pre><code class="language-rn">let status: ExitStatus = (build | tee build.log).status
 if !status.ok {
   echo "Pipeline failed at ${status.failed_stage}"
 }</code></pre>
-          </div>
-        </article>
+              </div>
+            </article>
 
-        <article class="entry" data-searchable data-keywords="array list collection literal">
-          <h3><span class="badge badge-type">Type</span> Array&lt;T&gt;</h3>
-          <p>Homogeneous, indexable collections that interact with <code>for</code> loops and iterators.</p>
-          <div>
-            <div class="example-label">Example</div>
-            <pre><code class="language-rn">let fruits: Array(Str) = ["apple", "banana", "pear"]
+            <article
+              class="entry"
+              data-searchable
+              data-keywords="array list collection literal"
+            >
+              <h3><span class="badge badge-type">Type</span> Array&lt;T&gt;</h3>
+              <p>
+                Homogeneous, indexable collections that interact with
+                <code>for</code> loops and iterators.
+              </p>
+              <div>
+                <div class="example-label">Example</div>
+                <pre><code class="language-rn">let fruits: Array(Str) = ["apple", "banana", "pear"]
 for (fruits, 0..) |fruit, idx| {
   echo "${idx}: ${fruit.upper()}"
 }</code></pre>
-          </div>
-        </article>
+              </div>
+            </article>
 
-        <article class="entry" data-searchable data-keywords="map dictionary record literal">
-          <h3><span class="badge badge-type">Type</span> Map&lt;K, V&gt;</h3>
-          <p>Key/value dictionaries with literal syntax that preserves structure across commands.</p>
-          <div>
-            <div class="example-label">Example</div>
-            <pre><code class="language-rn">let config: Map(Str, Int) = { port: 8080, retries: 2 }
+            <article
+              class="entry"
+              data-searchable
+              data-keywords="map dictionary record literal"
+            >
+              <h3>
+                <span class="badge badge-type">Type</span> Map&lt;K, V&gt;
+              </h3>
+              <p>
+                Key/value dictionaries with literal syntax that preserves
+                structure across commands.
+              </p>
+              <div>
+                <div class="example-label">Example</div>
+                <pre><code class="language-rn">let config: Map(Str, Int) = { port: 8080, retries: 2 }
 echo "Listening on ${config.port}"</code></pre>
-          </div>
-        </article>
+              </div>
+            </article>
 
-        <article class="entry" data-searchable data-keywords="process handle stdout stderr command type">
-          <h3><span class="badge badge-type">Type</span> ProcessHandle</h3>
-          <p>Structured results returned by every command invocation. Access <code>stdout</code>, <code>stderr</code>, <code>status</code>, and metadata without shell globals.</p>
-          <div>
-            <div class="example-label">Example</div>
-            <pre><code class="language-rn">let status_handle = git status --short
+            <article
+              class="entry"
+              data-searchable
+              data-keywords="process handle stdout stderr command type"
+            >
+              <h3><span class="badge badge-type">Type</span> ProcessHandle</h3>
+              <p>
+                Structured results returned by every command invocation. Access
+                <code>stdout</code>, <code>stderr</code>, <code>status</code>,
+                and metadata without shell globals.
+              </p>
+              <div>
+                <div class="example-label">Example</div>
+                <pre><code class="language-rn">let status_handle = git status --short
 echo status_handle.stdout
 echo status_handle.status.exit_code</code></pre>
-          </div>
-        </article>
+              </div>
+            </article>
 
-        <article class="entry" data-searchable data-keywords="error set union !t enum union type">
-          <h3><span class="badge badge-type">Type</span>Error Sets &amp; <code>!T</code></h3>
-          <p>Declare explicit error families via <code>error</code> enums or unions, then return <code>!T</code> to describe “error or value” results that require handling.</p>
-          <div>
-            <div class="example-label">Example</div>
-            <pre><code class="language-rn">error FileError = union {
+            <article
+              class="entry"
+              data-searchable
+              data-keywords="error set union !t enum union type"
+            >
+              <h3>
+                <span class="badge badge-type">Type</span>Error Sets &amp;
+                <code>!T</code>
+              </h3>
+              <p>
+                Declare explicit error families via <code>error</code> enums or
+                unions, then return <code>!T</code> to describe “error or value”
+                results that require handling.
+              </p>
+              <div>
+                <div class="example-label">Example</div>
+                <pre><code class="language-rn">error FileError = union {
   NotFound: { path: Str },
   PermissionDenied: { user: Str },
 }
@@ -418,92 +530,157 @@ fn read_config(path: Str) FileError!Config {
   }
   return parse_config(path)
 }</code></pre>
-          </div>
-        </article>
+              </div>
+            </article>
 
-        <article class="entry" data-searchable data-keywords="optional maybe ?t null type">
-          <h3><span class="badge badge-type">Type</span> Optionals (<code>?T</code>)</h3>
-          <p>Wrap any type with <code>?T</code> to express nullable values; use optional-aware <code>if</code> captures to unwrap safely.</p>
-          <div>
-            <div class="example-label">Example</div>
-            <pre><code class="language-rn">let maybe_port: ?Int = env.get("PORT")
+            <article
+              class="entry"
+              data-searchable
+              data-keywords="optional maybe ?t null type"
+            >
+              <h3>
+                <span class="badge badge-type">Type</span> Optionals
+                (<code>?T</code>)
+              </h3>
+              <p>
+                Wrap any type with <code>?T</code> to express nullable values;
+                use optional-aware <code>if</code> captures to unwrap safely.
+              </p>
+              <div>
+                <div class="example-label">Example</div>
+                <pre><code class="language-rn">let maybe_port: ?Int = env.get("PORT")
 if (maybe_port) |port| {
   echo "Running on port ${port}"
 } else {
   echo "Using default port"
 }</code></pre>
-          </div>
-        </article>
+              </div>
+            </article>
 
-        <article class="entry" data-searchable data-keywords="promise async await ^t type concurrency">
-          <h3><span class="badge badge-type">Type</span> Promises (<code>^T</code>)</h3>
-          <p>Async functions return <code>^T</code> handles. Await them with the same capture syntax used for optionals, then branch on success or typed errors.</p>
-          <div>
-            <div class="example-label">Example</div>
-            <pre><code class="language-rn">fn fetch_release(tag: Str) ^ReleaseError!Release {
+            <article
+              class="entry"
+              data-searchable
+              data-keywords="promise async await ^t type concurrency"
+            >
+              <h3>
+                <span class="badge badge-type">Type</span> Promises
+                (<code>^T</code>)
+              </h3>
+              <p>
+                Async functions return <code>^T</code> handles. Await them with
+                the same capture syntax used for optionals, then branch on
+                success or typed errors.
+              </p>
+              <div>
+                <div class="example-label">Example</div>
+                <pre><code class="language-rn">fn fetch_release(tag: Str) ^ReleaseError!Release {
   async {
     let resp = try http.get("https://api.example.com/releases/${tag}")
     return try parse_release(resp.body)
   }
 }
 
-let latest = fetch_release("stable")
+const latest = fetch_release("stable")
 await (latest) |release| {
   echo "Shipping ${release.version}"
 } catch |err| {
   echo "Release lookup failed: ${err}"
 }</code></pre>
+              </div>
+            </article>
           </div>
-        </article>
-      </div>
-    </section>
+        </section>
 
-    <section id="features">
-      <h2>Language Features</h2>
-      <p>Feature highlights mirror <code>features.md</code> so you can cross-reference the philosophy and the syntax.</p>
-      <div class="entry-list">
-        <article class="entry" data-searchable data-keywords="command first pipelines shell friendly">
-          <h3><span class="badge badge-feature">Feature</span> Command-first execution</h3>
-          <p>Every bare word starts a pipeline stage, keeping shell muscle memory intact while layering structured data on top.</p>
-          <div>
-            <div class="example-label">Example</div>
-            <pre><code class="language-rn">echo "hello world" | upper</code></pre>
-          </div>
-        </article>
+        <section id="features">
+          <h2>Language Features</h2>
+          <p>
+            Feature highlights mirror <code>features.md</code> so you can
+            cross-reference the philosophy and the syntax.
+          </p>
+          <div class="entry-list">
+            <article
+              class="entry"
+              data-searchable
+              data-keywords="command first pipelines shell friendly"
+            >
+              <h3>
+                <span class="badge badge-feature">Feature</span> Command-first
+                execution
+              </h3>
+              <p>
+                Every bare word starts a pipeline stage, keeping shell muscle
+                memory intact while layering structured data on top.
+              </p>
+              <div>
+                <div class="example-label">Example</div>
+                <pre><code class="language-rn">echo "hello world" | upper</code></pre>
+              </div>
+            </article>
 
-        <article class="entry" data-searchable data-keywords="data semantics let mut typed variables">
-          <h3><span class="badge badge-feature">Feature</span> Strong, predictable data semantics</h3>
-          <p>Immutable <code>let</code> bindings, opt-in <code>mut</code>, and literal arrays/maps eliminate accidental word splitting.</p>
-          <div>
-            <div class="example-label">Example</div>
-            <pre><code class="language-rn">let greeting = "hello"
-mut count = 2
-let items = ["apples", "oranges"]
-let vars = { greeting: greeting, total: count }</code></pre>
-          </div>
-        </article>
+            <article
+              class="entry"
+              data-searchable
+              data-keywords="data semantics let mut typed variables"
+            >
+              <h3>
+                <span class="badge badge-feature">Feature</span> Strong,
+                predictable data semantics
+              </h3>
+              <p>
+                Immutable <code>let</code> bindings, opt-in <code>mut</code>,
+                and literal arrays/maps eliminate accidental word splitting.
+              </p>
+              <div>
+                <div class="example-label">Example</div>
+                <pre><code class="language-rn">let greeting = "hello"
+var count = 2
+const items = ["apples", "oranges"]
+const vars = { greeting: greeting, total: count }</code></pre>
+              </div>
+            </article>
 
-        <article class="entry" data-searchable data-keywords="error handling try catch first class">
-          <h3><span class="badge badge-feature">Feature</span> Errors as first-class types</h3>
-          <p>Model recoverable failures via typed error sets and match over individual variants instead of parsing strings.</p>
-          <div>
-            <div class="example-label">Example</div>
-            <pre><code class="language-rn">let config = load_config() catch |err| {
+            <article
+              class="entry"
+              data-searchable
+              data-keywords="error handling try catch first class"
+            >
+              <h3>
+                <span class="badge badge-feature">Feature</span> Errors as
+                first-class types
+              </h3>
+              <p>
+                Model recoverable failures via typed error sets and match over
+                individual variants instead of parsing strings.
+              </p>
+              <div>
+                <div class="example-label">Example</div>
+                <pre><code class="language-rn">let config = load_config() catch |err| {
   match err {
     error.FileError.NotFound =&gt; |info| echo "Missing ${info.path}"
     error.FileError.PermissionDenied =&gt; |info| echo "Denied for ${info.user}"
     error.NetworkError.Timeout =&gt; echo "Network timeout"
   }
 }</code></pre>
-          </div>
-        </article>
+              </div>
+            </article>
 
-        <article class="entry" data-searchable data-keywords="try catch mandatory handling">
-          <h3><span class="badge badge-feature">Feature</span> Mandatory explicit handling</h3>
-          <p>Every error is either propagated with <code>try</code> or handled with <code>catch</code>, mirroring Zig&rsquo;s guarantees.</p>
-          <div>
-            <div class="example-label">Example</div>
-            <pre><code class="language-rn">fn init() !Void {
+            <article
+              class="entry"
+              data-searchable
+              data-keywords="try catch mandatory handling"
+            >
+              <h3>
+                <span class="badge badge-feature">Feature</span> Mandatory
+                explicit handling
+              </h3>
+              <p>
+                Every error is either propagated with <code>try</code> or
+                handled with <code>catch</code>, mirroring Zig&rsquo;s
+                guarantees.
+              </p>
+              <div>
+                <div class="example-label">Example</div>
+                <pre><code class="language-rn">fn init() !Void {
   try bootstrap_network()
 
   read_config("/etc/runic.conf") catch |err| {
@@ -513,237 +690,356 @@ let vars = { greeting: greeting, total: count }</code></pre>
     echo "Recovered from ${err}"
   }
 }</code></pre>
-          </div>
-        </article>
+              </div>
+            </article>
 
-        <article class="entry" data-searchable data-keywords="error sets restrict function subset">
-          <h3><span class="badge badge-feature">Feature</span> Restrict function error sets</h3>
-          <p>Constrain return signatures (e.g. <code>FileError!Config</code>) so downstream code knows the precise failures to match.</p>
-          <div>
-            <div class="example-label">Example</div>
-            <pre><code class="language-rn">fn read_config(path: Str) FileError!Config {
+            <article
+              class="entry"
+              data-searchable
+              data-keywords="error sets restrict function subset"
+            >
+              <h3>
+                <span class="badge badge-feature">Feature</span> Restrict
+                function error sets
+              </h3>
+              <p>
+                Constrain return signatures (e.g. <code>FileError!Config</code>)
+                so downstream code knows the precise failures to match.
+              </p>
+              <div>
+                <div class="example-label">Example</div>
+                <pre><code class="language-rn">fn read_config(path: Str) FileError!Config {
   if !file.exists(path) {
     return error.FileError.NotFound { path }
   }
   return parse_config(path)
 }</code></pre>
-          </div>
-        </article>
+              </div>
+            </article>
 
-        <article class="entry" data-searchable data-keywords="optional zig style null capture clause">
-          <h3><span class="badge badge-feature">Feature</span> Optional data that behaves like Zig</h3>
-          <p><code>?T</code> pairs with optional-aware <code>if</code> so values only exist inside the capture scope when present.</p>
-          <div>
-            <div class="example-label">Example</div>
-            <pre><code class="language-rn">let maybe_port = env.get("PORT")
+            <article
+              class="entry"
+              data-searchable
+              data-keywords="optional zig style null capture clause"
+            >
+              <h3>
+                <span class="badge badge-feature">Feature</span> Optional data
+                that behaves like Zig
+              </h3>
+              <p>
+                <code>?T</code> pairs with optional-aware <code>if</code> so
+                values only exist inside the capture scope when present.
+              </p>
+              <div>
+                <div class="example-label">Example</div>
+                <pre><code class="language-rn">let maybe_port = env.get("PORT")
 if (maybe_port) |port| {
   echo "Running on port ${port}"
 } else {
   echo "Falling back to default"
 }</code></pre>
-          </div>
-        </article>
+              </div>
+            </article>
 
-        <article class="entry" data-searchable data-keywords="promises async await capture concurrency">
-          <h3><span class="badge badge-feature">Feature</span> Promises as native async values</h3>
-          <p><code>async</code> blocks return <code>^T</code>, and <code>await</code> mirrors optional captures plus <code>catch</code> for typed failures.</p>
-          <div>
-            <div class="example-label">Example</div>
-            <pre><code class="language-rn">let latest = fetch_release("stable")
+            <article
+              class="entry"
+              data-searchable
+              data-keywords="promises async await capture concurrency"
+            >
+              <h3>
+                <span class="badge badge-feature">Feature</span> Promises as
+                native async values
+              </h3>
+              <p>
+                <code>async</code> blocks return <code>^T</code>, and
+                <code>await</code> mirrors optional captures plus
+                <code>catch</code> for typed failures.
+              </p>
+              <div>
+                <div class="example-label">Example</div>
+                <pre><code class="language-rn">let latest = fetch_release("stable")
 await (latest) |release| {
   echo "Shipping ${release.version}"
 } catch |err| {
   echo "Release lookup failed: ${err}"
 }</code></pre>
-          </div>
-        </article>
+              </div>
+            </article>
 
-        <article class="entry" data-searchable data-keywords="structured flow control if else fn blocks">
-          <h3><span class="badge badge-feature">Feature</span> Structured flow control</h3>
-          <p>Functions, conditionals, and loops use modern syntax so scripts read like other languages instead of <code>then/fi</code> pairs.</p>
-          <div>
-            <div class="example-label">Example</div>
-            <pre><code class="language-rn">fn describe(count: Int) {
+            <article
+              class="entry"
+              data-searchable
+              data-keywords="structured flow control if else fn blocks"
+            >
+              <h3>
+                <span class="badge badge-feature">Feature</span> Structured flow
+                control
+              </h3>
+              <p>
+                Functions, conditionals, and loops use modern syntax so scripts
+                read like other languages instead of <code>then/fi</code> pairs.
+              </p>
+              <div>
+                <div class="example-label">Example</div>
+                <pre><code class="language-rn">fn describe(count: Int) {
   if count &gt; 1 {
     echo "plural"
   } else {
     echo "singular"
   }
 }</code></pre>
-          </div>
-        </article>
+              </div>
+            </article>
 
-        <article class="entry" data-searchable data-keywords="iteration loops for while capture clause">
-          <h3><span class="badge badge-feature">Feature</span> Native iteration constructs</h3>
-          <p><code>for</code> and <code>while</code> consume any iterator the runtime exposes, keeping capture bindings explicit.</p>
-          <div>
-            <div class="example-label">Example</div>
-            <pre><code class="language-rn">for (fruits, 0..) |fruit, idx| {
+            <article
+              class="entry"
+              data-searchable
+              data-keywords="iteration loops for while capture clause"
+            >
+              <h3>
+                <span class="badge badge-feature">Feature</span> Native
+                iteration constructs
+              </h3>
+              <p>
+                <code>for</code> and <code>while</code> consume any iterator the
+                runtime exposes, keeping capture bindings explicit.
+              </p>
+              <div>
+                <div class="example-label">Example</div>
+                <pre><code class="language-rn">for (fruits, 0..) |fruit, idx| {
   echo "${idx}: ${fruit.upper()}"
 }
 
-let reader = file.open("debug.log")
+const reader = file.open("debug.log")
 while reader.lines() |line| {
   if line.starts_with("ERR") {
     echo line
   }
 }</code></pre>
-          </div>
-        </article>
+              </div>
+            </article>
 
-        <article class="entry" data-searchable data-keywords="command vs expression separation pipes data">
-          <h3><span class="badge badge-feature">Feature</span> Command vs. expression separation</h3>
-          <p>Differentiate commands from pure expressions so data pipelines stay structured and word splitting disappears.</p>
-          <div>
-            <div class="example-label">Example</div>
-            <pre><code class="language-rn">let files = ls ./src | lines()
-let uppercased = files.map(fn (path) =&gt; path.upper())</code></pre>
-          </div>
-        </article>
+            <article
+              class="entry"
+              data-searchable
+              data-keywords="command vs expression separation pipes data"
+            >
+              <h3>
+                <span class="badge badge-feature">Feature</span> Command vs.
+                expression separation
+              </h3>
+              <p>
+                Differentiate commands from pure expressions so data pipelines
+                stay structured and word splitting disappears.
+              </p>
+              <div>
+                <div class="example-label">Example</div>
+                <pre><code class="language-rn">let files = ls ./src | lines()
+const uppercased = files.map(fn (path) =&gt; path.upper())</code></pre>
+              </div>
+            </article>
 
-        <article class="entry" data-searchable data-keywords="process handles stdout stderr background tee capture">
-          <h3><span class="badge badge-feature">Feature</span> Processes as first-class values</h3>
-          <p>Every command invocation yields a handle with stdout, stderr, status, and metadata instead of relying on global shell state.</p>
-          <div>
-            <div class="example-label">Example</div>
-            <pre><code class="language-rn">let sync_proc = git status --short
+            <article
+              class="entry"
+              data-searchable
+              data-keywords="process handles stdout stderr background tee capture"
+            >
+              <h3>
+                <span class="badge badge-feature">Feature</span> Processes as
+                first-class values
+              </h3>
+              <p>
+                Every command invocation yields a handle with stdout, stderr,
+                status, and metadata instead of relying on global shell state.
+              </p>
+              <div>
+                <div class="example-label">Example</div>
+                <pre><code class="language-rn">let sync_proc = git status --short
 echo sync_proc.stdout
 echo sync_proc.status.exit_code
 
-let async_proc = tail -f /var/log/app.log &amp;
-let finished = await async_proc
+const async_proc = tail -f /var/log/app.log &amp;
+const finished = await async_proc
 if finished.status.ok {
   echo finished.stdout
 }</code></pre>
-          </div>
-        </article>
+              </div>
+            </article>
 
-        <article class="entry" data-searchable data-keywords="pipelines capture multiplexed io tee stream">
-          <h3><span class="badge badge-feature">Feature</span> Capturing pipelines &amp; multiplexed IO</h3>
-          <p>Capture stdout/stderr independently, tee outputs to variables, and redirect streams without losing handle metadata.</p>
-          <div>
-            <div class="example-label">Example</div>
-            <pre><code class="language-rn">make all | tee build.log 1&gt;build_stdout
+            <article
+              class="entry"
+              data-searchable
+              data-keywords="pipelines capture multiplexed io tee stream"
+            >
+              <h3>
+                <span class="badge badge-feature">Feature</span> Capturing
+                pipelines &amp; multiplexed IO
+              </h3>
+              <p>
+                Capture stdout/stderr independently, tee outputs to variables,
+                and redirect streams without losing handle metadata.
+              </p>
+              <div>
+                <div class="example-label">Example</div>
+                <pre><code class="language-rn">make all | tee build.log 1&gt;build_stdout
 if build_stdout.status.exit_code != 0 {
   echo build_stdout.stdout
 }</code></pre>
-          </div>
-        </article>
+              </div>
+            </article>
 
-        <article class="entry" data-searchable data-keywords="error aware pipelines exit codes stage diagnostics">
-          <h3><span class="badge badge-feature">Feature</span> Error-aware pipelines</h3>
-          <p>Pipelines surface per-stage exit codes so you know exactly where a chain failed before deciding how to recover.</p>
-          <div>
-            <div class="example-label">Example</div>
-            <pre><code class="language-rn">let status = (build | tee build.log).status
+            <article
+              class="entry"
+              data-searchable
+              data-keywords="error aware pipelines exit codes stage diagnostics"
+            >
+              <h3>
+                <span class="badge badge-feature">Feature</span> Error-aware
+                pipelines
+              </h3>
+              <p>
+                Pipelines surface per-stage exit codes so you know exactly where
+                a chain failed before deciding how to recover.
+              </p>
+              <div>
+                <div class="example-label">Example</div>
+                <pre><code class="language-rn">let status = (build | tee build.log).status
 if !status.ok {
   echo "Build failed at step ${status.failed_stage}"
   exit 1
 }</code></pre>
-          </div>
-        </article>
+              </div>
+            </article>
 
-        <article class="entry" data-searchable data-keywords="module system import reuse manifest">
-          <h3><span class="badge badge-feature">Feature</span> Module system and reuse</h3>
-          <p>Import reusable helpers from <code>src/</code> via manifest-backed modules so scripts depend on typed APIs.</p>
-          <div>
-            <div class="example-label">Example</div>
-            <pre><code class="language-rn">let http = import("net/http")
+            <article
+              class="entry"
+              data-searchable
+              data-keywords="module system import reuse manifest"
+            >
+              <h3>
+                <span class="badge badge-feature">Feature</span> Module system
+                and reuse
+              </h3>
+              <p>
+                Import reusable helpers from <code>src/</code> via
+                manifest-backed modules so scripts depend on typed APIs.
+              </p>
+              <div>
+                <div class="example-label">Example</div>
+                <pre><code class="language-rn">let http = import("net/http")
 
-let response = http.get("https://example.com/status")
+const response = http.get("https://example.com/status")
 echo response.code</code></pre>
-          </div>
-        </article>
+              </div>
+            </article>
 
-        <article class="entry" data-searchable data-keywords="legacy compatibility bash block escape hatch">
-          <h3><span class="badge badge-feature">Feature</span> Legacy compatibility escape hatch</h3>
-          <p>Embed raw bash blocks verbatim so migrations can proceed incrementally without rewriting everything at once.</p>
-          <div>
-            <div class="example-label">Example</div>
-            <pre><code class="language-rn">bash {
+            <article
+              class="entry"
+              data-searchable
+              data-keywords="legacy compatibility bash block escape hatch"
+            >
+              <h3>
+                <span class="badge badge-feature">Feature</span> Legacy
+                compatibility escape hatch
+              </h3>
+              <p>
+                Embed raw bash blocks verbatim so migrations can proceed
+                incrementally without rewriting everything at once.
+              </p>
+              <div>
+                <div class="example-label">Example</div>
+                <pre><code class="language-rn">bash {
   for f in *.txt; do
     echo "legacy: $f"
   done
 }</code></pre>
+              </div>
+            </article>
           </div>
-        </article>
-      </div>
-    </section>
+        </section>
 
-    <p id="empty-state" class="empty-state is-hidden">No matching types or features. Try another keyword.</p>
-  </main>
-  </div>
+        <p id="empty-state" class="empty-state is-hidden">
+          No matching types or features. Try another keyword.
+        </p>
+      </main>
+    </div>
 
-  <script>
-    const searchInput = document.getElementById('search');
-    const cards = Array.from(document.querySelectorAll('[data-searchable]'));
-    const emptyState = document.getElementById('empty-state');
-    const sidebarTypes = document.getElementById('sidebar-types');
-    const sidebarFeatures = document.getElementById('sidebar-features');
+    <script>
+      const searchInput = document.getElementById("search");
+      const cards = Array.from(document.querySelectorAll("[data-searchable]"));
+      const emptyState = document.getElementById("empty-state");
+      const sidebarTypes = document.getElementById("sidebar-types");
+      const sidebarFeatures = document.getElementById("sidebar-features");
 
-    function slugify(value) {
-      return value
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, '-')
-        .replace(/^-+|-+$/g, '');
-    }
+      function slugify(value) {
+        return value
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, "-")
+          .replace(/^-+|-+$/g, "");
+      }
 
-    function buildSidebar(sectionId, listEl) {
-      if (!listEl) return;
-      const sectionElement = document.getElementById(sectionId);
-      if (!sectionElement) return;
+      function buildSidebar(sectionId, listEl) {
+        if (!listEl) return;
+        const sectionElement = document.getElementById(sectionId);
+        if (!sectionElement) return;
 
-      const fragment = document.createDocumentFragment();
-      sectionElement.querySelectorAll('article.entry').forEach((card) => {
-        const heading = card.querySelector('h3');
-        if (!heading) return;
+        const fragment = document.createDocumentFragment();
+        sectionElement.querySelectorAll("article.entry").forEach((card) => {
+          const heading = card.querySelector("h3");
+          if (!heading) return;
 
-        const label = heading.textContent.trim().replace(/^(Type|Feature)\s+/, '');
-        const baseSlug = slugify(label);
-        let slug = baseSlug || `card-${Math.random().toString(36).slice(2)}`;
-        let suffix = 1;
+          const label = heading.textContent
+            .trim()
+            .replace(/^(Type|Feature)\s+/, "");
+          const baseSlug = slugify(label);
+          let slug = baseSlug || `card-${Math.random().toString(36).slice(2)}`;
+          let suffix = 1;
 
-        while (document.getElementById(slug) && card.id !== slug) {
-          slug = `${baseSlug}-${suffix++}`;
-        }
+          while (document.getElementById(slug) && card.id !== slug) {
+            slug = `${baseSlug}-${suffix++}`;
+          }
 
-        if (!card.id) {
-          card.id = slug;
-        }
+          if (!card.id) {
+            card.id = slug;
+          }
 
-        const li = document.createElement('li');
-        const link = document.createElement('a');
-        link.href = `#${card.id}`;
-        link.textContent = label;
-        li.appendChild(link);
-        fragment.appendChild(li);
+          const li = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${card.id}`;
+          link.textContent = label;
+          li.appendChild(link);
+          fragment.appendChild(li);
+        });
+
+        listEl.innerHTML = "";
+        listEl.appendChild(fragment);
+      }
+
+      function applyFilter(query) {
+        let visibleCount = 0;
+        cards.forEach((card) => {
+          const haystack = (
+            card.dataset.keywords +
+            " " +
+            card.textContent
+          ).toLowerCase();
+          const match = haystack.includes(query);
+          card.classList.toggle("is-hidden", query && !match);
+          if (!query || match) {
+            visibleCount++;
+          }
+        });
+        emptyState.classList.toggle("is-hidden", visibleCount !== 0);
+      }
+
+      searchInput.addEventListener("input", (event) => {
+        const query = event.target.value.trim().toLowerCase();
+        applyFilter(query);
       });
 
-      listEl.innerHTML = '';
-      listEl.appendChild(fragment);
-    }
-
-    function applyFilter(query) {
-      let visibleCount = 0;
-      cards.forEach((card) => {
-        const haystack = (card.dataset.keywords + ' ' + card.textContent).toLowerCase();
-        const match = haystack.includes(query);
-        card.classList.toggle('is-hidden', query && !match);
-        if (!query || match) {
-          visibleCount++;
-        }
-      });
-      emptyState.classList.toggle('is-hidden', visibleCount !== 0);
-    }
-
-    searchInput.addEventListener('input', (event) => {
-      const query = event.target.value.trim().toLowerCase();
-      applyFilter(query);
-    });
-
-    buildSidebar('types', sidebarTypes);
-    buildSidebar('features', sidebarFeatures);
-    applyFilter('');
-  </script>
-</body>
+      buildSidebar("types", sidebarTypes);
+      buildSidebar("features", sidebarFeatures);
+      applyFilter("");
+    </script>
+  </body>
 </html>

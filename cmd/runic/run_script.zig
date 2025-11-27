@@ -1,0 +1,361 @@
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const utils = @import("main-utils.zig");
+const runic = @import("runic");
+const ScriptContext = runic.interpreter.ScriptContext;
+const ScriptExecutor = runic.interpreter.ScriptExecutor;
+const Tracer = runic.tracing.Tracer;
+const CommandRunner = runic.command_runner.CommandRunner;
+const DocumentStore = runic.document.DocumentStore;
+const Parser = runic.document.Parser;
+
+pub fn runScript(
+    allocator: Allocator,
+    script: utils.CliConfig.ScriptInvocation,
+    config: utils.CliConfig,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !u8 {
+    var context = ScriptContext.init(allocator);
+    defer context.deinit();
+
+    var tracer = Tracer.init(config.trace_topics, null);
+    if (tracer.anyTopicEnabled()) tracer.setSink(stderr);
+
+    var env_map = std.process.getEnvMap(allocator) catch |err| {
+        try stderr.print("error: unable to capture environment: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    defer env_map.deinit();
+
+    try utils.applyEnvOverridesToMap(&env_map, config.env_overrides);
+    try utils.exposeScriptMetadata(&env_map, script);
+    try utils.ensureExecutableDirOnPath(allocator, &env_map);
+
+    const script_dir = utils.computeScriptDirectory(allocator, script.path) catch |err| {
+        try stderr.print("error: unable to resolve script directory: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    defer allocator.free(script_dir);
+
+    const tracer_ptr = if (tracer.anyTopicEnabled()) &tracer else null;
+    var runner = CommandRunner.initWithTracer(allocator, tracer_ptr);
+
+    if (config.print_tokens) {
+        return try printTokens(allocator, stdout, stderr, script.path);
+    }
+
+    var documentStore = DocumentStore.init(allocator);
+    defer documentStore.deinit();
+    const entryDocument = try documentStore.requestDocument(script.path);
+
+    const script_ast = entryDocument.parser.parseScript(script.path) catch |err| {
+        handleParseScriptError(&entryDocument.parser, stderr, err) catch |err_| {
+            std.log.err("Could not handle error: {}, Original error: {}", .{ err_, err });
+        };
+        return 1;
+    };
+
+    parseImports(allocator, stderr, &documentStore, script_ast) catch return 1;
+
+    if (config.print_ast) {
+        for (documentStore.map.values()) |document| {
+            utils.printScriptAst(stdout, document.path, document.ast.?) catch |err| {
+                try stderr.print(
+                    "error: failed to print AST for script '{s}': {s}\n",
+                    .{ script.path, @errorName(err) },
+                );
+                return 1;
+            };
+        }
+
+        return 0;
+    }
+
+    entryDocument.script_executor = ScriptExecutor.initWithRunner(
+        allocator,
+        &runner,
+        &env_map,
+        &documentStore,
+    ) catch |err| {
+        try stderr.print(
+            "error: failed to initialize script executor: {s}\n",
+            .{@errorName(err)},
+        );
+        return 1;
+    };
+    const executor = &entryDocument.script_executor.?;
+
+    try executor.reseedFromContext(&context);
+
+    return try executor.execute(script_ast, .{
+        .script_path = script.path,
+        .stdout = stdout,
+        .stderr = stderr,
+        .context = &context,
+    });
+}
+
+const StatementExpressionIterator = struct {
+    allocator: Allocator,
+    script: runic.ast.Script,
+    cursor: Cursor,
+
+    const StackItem = union(enum) {
+        statement: *runic.ast.Statement,
+        expr: *runic.ast.Expression,
+    };
+
+    const Cursor = struct {
+        statementIdx: usize = 0,
+        stack: std.array_list.Managed(StackItem),
+
+        pub fn init(allocator: Allocator, statements: []const *runic.ast.Statement) !Cursor {
+            const list = try std.array_list.Managed(StackItem).initCapacity(allocator, statements.len);
+
+            var cursor = Cursor{
+                .stack = list,
+            };
+
+            try cursor.appendStatements(statements);
+
+            return cursor;
+        }
+
+        pub fn appendStatements(self: *Cursor, statements: []const *runic.ast.Statement) !void {
+            try self.stack.ensureUnusedCapacity(statements.len);
+            for (0..statements.len) |i| {
+                self.stack.appendAssumeCapacity(.{ .statement = statements[statements.len - i - 1] });
+            }
+        }
+
+        pub fn appendExpressions(self: *Cursor, expressions: []const *runic.ast.Expression) !void {
+            try self.stack.ensureUnusedCapacity(expressions.len);
+            for (0..expressions.len) |i| {
+                self.stack.appendAssumeCapacity(.{ .expr = expressions[expressions.len - i - 1] });
+            }
+        }
+
+        pub fn appendStatement(self: *Cursor, statement: *runic.ast.Statement) !void {
+            try self.stack.append(.{ .statement = statement });
+        }
+
+        pub fn appendExpr(self: *Cursor, expr: *runic.ast.Expression) !void {
+            try self.stack.append(.{ .expr = expr });
+        }
+    };
+
+    pub fn init(allocator: Allocator, script: runic.ast.Script) !StatementExpressionIterator {
+        return .{
+            .allocator = allocator,
+            .script = script,
+            .cursor = try .init(allocator, script.statements),
+        };
+    }
+
+    pub fn deinit(self: *StatementExpressionIterator) void {
+        self.cursor.stack.deinit();
+    }
+
+    pub fn next(self: *StatementExpressionIterator) !?StackItem {
+        const item = self.cursor.stack.pop() orelse return null;
+
+        try switch (item) {
+            .expr => |expr| self.populateStackExpr(expr),
+            .statement => |statement| self.populateStackStatement(statement),
+        };
+
+        return item;
+    }
+
+    fn populateStackStatement(self: *StatementExpressionIterator, statement: *runic.ast.Statement) !void {
+        switch (statement.*) {
+            .error_decl, .bash_block => {},
+            .binding_decl => |binding_decl| try self.cursor.appendExpr(binding_decl.initializer),
+            .fn_decl => |fn_decl| {
+                try self.cursor.appendExpr(fn_decl.body.expression);
+                try populateBlockExpr(&self.cursor, fn_decl.body.block);
+            },
+            .for_stmt => |for_stmt| {
+                try self.cursor.appendStatements(for_stmt.body.statements);
+                try self.cursor.appendExpressions(for_stmt.sources);
+            },
+            .while_stmt => |while_stmt| {
+                try self.cursor.appendStatements(while_stmt.body.statements);
+                try self.cursor.appendExpr(while_stmt.condition);
+            },
+            .return_stmt => |return_stmt| if (return_stmt.value) |v| try self.cursor.appendExpr(v),
+            .expression => |expr| try self.cursor.appendExpr(expr.expression),
+        }
+    }
+
+    fn populateStackExpr(self: *StatementExpressionIterator, expr: *runic.ast.Expression) !void {
+        const cursor = &self.cursor;
+        switch (expr.*) {
+            .identifier, .path, .literal, .map, .import_expr => {},
+            .array => |array| try cursor.appendExpressions(array.elements),
+            .range => |range| {
+                try cursor.appendExpr(range.start);
+                if (range.end) |end| try cursor.appendExpr(end);
+            },
+            .pipeline => |pipeline| {
+                for (pipeline.stages) |stage| switch (stage.payload) {
+                    .expression => |p_expr| try cursor.appendExpr(p_expr),
+                    else => {},
+                };
+            },
+            .call => |call| try cursor.appendExpr(call.callee),
+            .member => |member| try cursor.appendExpr(member.object),
+            .index => |index| {
+                try cursor.appendExpr(index.index);
+                try cursor.appendExpr(index.target);
+            },
+            .unary => |unary| try cursor.appendExpr(unary.operand),
+            .binary => |binary| {
+                try cursor.appendExpr(binary.left);
+                try cursor.appendExpr(binary.right);
+            },
+            .block => |block| try populateBlockExpr(cursor, block),
+            .fn_literal => |fn_literal| {
+                try cursor.appendExpr(fn_literal.body.expression);
+                try populateBlockExpr(cursor, fn_literal.body.block);
+                for (fn_literal.params) |param| if (param.default_value) |dv| try cursor.appendExpr(dv);
+            },
+            .async_expr => |async_expr| try populateBlockExpr(cursor, async_expr.body),
+            .await_expr => |await_expr| {
+                if (await_expr.failure) |f| try populateBlockExpr(cursor, f.body);
+                try cursor.appendExpr(await_expr.subject);
+                if (await_expr.success) |s| try populateBlockExpr(cursor, s.body);
+            },
+            .if_expr => |*if_expr| try populateIfExpr(cursor, if_expr),
+            .match_expr => |match_expr| {
+                for (match_expr.cases) |c| try populateBlockExpr(cursor, c.body);
+                try cursor.appendExpr(match_expr.subject);
+            },
+            .try_expr => |try_expr| try cursor.appendExpr(try_expr.subject),
+            .catch_expr => |catch_expr| {
+                try populateBlockExpr(cursor, catch_expr.handler.body);
+                try cursor.appendExpr(catch_expr.subject);
+            },
+        }
+    }
+
+    fn populateBlockExpr(cursor: *Cursor, block: runic.ast.Block) !void {
+        try cursor.appendStatements(block.statements);
+    }
+
+    fn populateIfExpr(cursor: *Cursor, if_expr: *runic.ast.IfExpr) !void {
+        if (if_expr.else_branch) |e| switch (e) {
+            .if_expr => |else_if_expr| try populateIfExpr(cursor, else_if_expr),
+            .block => |block| try populateBlockExpr(cursor, block),
+        };
+        try populateBlockExpr(cursor, if_expr.then_block);
+        try cursor.appendExpr(if_expr.condition);
+    }
+};
+
+fn parseImports(
+    allocator: Allocator,
+    stderr: *std.Io.Writer,
+    documentStore: *DocumentStore,
+    script: runic.ast.Script,
+) !void {
+    var it = try StatementExpressionIterator.init(allocator, script);
+    defer it.deinit();
+    while (try it.next()) |node| {
+        if (node == .statement) continue;
+        const expr = node.expr;
+        switch (expr.*) {
+            .import_expr => |import_expr| {
+                const path = try runic.document.resolveModulePath(
+                    allocator,
+                    import_expr.importer,
+                    import_expr.module_name,
+                );
+                defer allocator.free(path);
+                const importDocument = try documentStore.requestDocument(path);
+                const importScript = importDocument.parser.parseScript(path) catch |err| {
+                    handleParseScriptError(&importDocument.parser, stderr, err) catch |err_| {
+                        std.log.err("Could not handle error: {}, Original error: {}", .{ err_, err });
+                    };
+                    return err;
+                };
+                try parseImports(allocator, stderr, documentStore, importScript);
+            },
+            else => {},
+        }
+    }
+}
+
+fn printTokens(allocator: Allocator, stdout: *std.Io.Writer, stderr: *std.Io.Writer, path: []const u8) !u8 {
+    var file = std.fs.cwd().openFile(path, .{}) catch |err| {
+        try stderr.print("error: failed to open script '{s}': {s}\n", .{ path, @errorName(err) });
+        return 1;
+    };
+    defer file.close();
+
+    const contents = file.readToEndAlloc(allocator, std.math.maxInt(usize)) catch |err| {
+        try stderr.print("error: failed to read script '{s}': {s}\n", .{ path, @errorName(err) });
+        return 1;
+    };
+    defer allocator.free(contents);
+
+    utils.printScriptTokens(allocator, stdout, path, contents) catch |err| {
+        try stderr.print(
+            "error: failed to lex script '{s}': {s}\n",
+            .{ path, @errorName(err) },
+        );
+        return 1;
+    };
+
+    return 0;
+}
+
+fn handleParseScriptError(
+    parser: *const Parser,
+    stderr: *std.Io.Writer,
+    err: anyerror,
+) !void {
+    const lexer = parser.stream.lexer;
+    const line = lexer.line;
+    const column = lexer.column;
+    const contents = parser.source;
+
+    const source_line = blk: {
+        var current_line: usize = 1;
+        var start: usize = 0;
+        var i: usize = 0;
+        while (i < contents.len and current_line < line) : (i += 1) {
+            if (contents[i] == '\n') {
+                current_line += 1;
+                start = i + 1;
+            }
+        }
+        if (current_line != line or start >= contents.len) break :blk "";
+        var end = start;
+        while (end < contents.len and contents[end] != '\n' and contents[end] != '\r') : (end += 1) {}
+        break :blk contents[start..end];
+    };
+
+    try stderr.print(
+        "error: failed to parse script '{s}' at line {d}, column {d}: {s}",
+        .{ parser.path, line, column, @errorName(err) },
+    );
+    const expected = parser.expectedTokens();
+    if (expected.len > 0) {
+        try stderr.writeAll("\n       ");
+        _ = try parser.writeExpectedTokens(stderr);
+        try stderr.writeByte('\n');
+    }
+    try parser.writeBreadcrumbTrail(stderr);
+    try stderr.writeByte('\n');
+    if (source_line.len > 0) {
+        try stderr.print("   {s}\n   ", .{source_line});
+        var spaces: usize = if (column > 1) column - 2 else 0;
+        while (spaces > 0) : (spaces -= 1) {
+            try stderr.writeByte(' ');
+        }
+        try stderr.print("^\n", .{});
+    }
+    try stderr.flush();
+}

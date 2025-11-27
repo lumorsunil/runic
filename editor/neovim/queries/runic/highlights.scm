@@ -6,49 +6,49 @@
 
 ; Keywords --------------------------------------------------------------------
 
-(keyword_declaration) @keyword.declaration.runic
-(keyword_type) @keyword.type.runic
-(keyword_async) @keyword.coroutine.runic
-(keyword_control) @keyword.control.runic
-(keyword_loop) @keyword.repeat.runic
-(keyword_import) @keyword.import.runic
-(keyword_interop) @keyword.special.runic
-(keyword_error) @keyword.exception.runic
-(boolean_literal) @constant.builtin.boolean.runic
-(null_literal) @constant.builtin.nil.runic
+(keyword_declaration) @keyword.modifier
+(keyword_type) @keyword.type
+(keyword_async) @keyword.coroutine
+(keyword_control) @keyword.control
+(keyword_loop) @keyword.repeat
+(keyword_import) @keyword.import
+(keyword_interop) @keyword.special
+(keyword_try) @keyword.exception
 
 ; Literals & builtins ---------------------------------------------------------
 
-(number_literal) @number.runic
-(string_literal) @string.runic
-(escape_sequence) @string.escape.runic
+(boolean_literal) @boolean
+(null_literal) @number
+(number_literal) @number
+(string_literal) @string
+(string_fragment) @string
+(escape_sequence) @string.escape
 (interpolation_expression
-  "${" @string.special.symbol.runic
-  (_) @embedded.runic
-  "}" @string.special.symbol.runic)
-(rune_literal) @character.runic
-(capture_clause) @keyword.capture.runic
-(builtin_command) @function.builtin.runic
-(type_identifier) @type.identifier.runic
+  "${" @string.special.symbol
+  (_) @embedded
+  "}" @string.special.symbol)
+(rune_literal) @character
+;(capture_clause) @keyword.capture
+(builtin_command) @function.builtin
+(type_identifier) @type
 
 ; Operators & punctuation -----------------------------------------------------
 
-(pipeline_operator) @operator.pipeline.runic
-(process_operator) @operator.process.runic
-(logical_operator) @operator.logical.runic
-(assignment_operator) @operator.assignment.runic
-(comparison_operator) @operator.comparison.runic
-(range_operator) @operator.range.runic
-(arrow_operator) @operator.arrow.runic
-(sigil) @operator.sigil.runic
-(bracket) @punctuation.bracket.runic
-(punctuation_delimiter) @punctuation.delimiter.runic
+(pipeline_operator) @keyword.operator
+(process_operator) @keyword.operator
+(logical_operator) @keyword.operator
+(assignment_operator) @keyword.operator
+(comparison_operator) @keyword.operator
+(range_operator) @keyword.operator
+(arrow_operator) @keyword.operator
+(sigil) @keyword.operator
+(bracket) @punctuation.bracket
+(punctuation_delimiter) @punctuation.delimiter
 
 ; Comments & structure --------------------------------------------------------
 
-(line_comment) @comment.line.runic
-(documentation_comment) @comment.documentation.runic
-(block_comment) @comment.block.runic
-(command_head) @function.call.runic
-(stage_separator) @punctuation.special.runic
-(heredoc_fence) @string.special.runic
+(line_comment) @comment
+(documentation_comment) @comment.documentation
+(block_comment) @comment.block
+(command_head) @function.call
+(stage_separator) @punctuation.special

@@ -1,5 +1,7 @@
 const std = @import("std");
 const command_runner = @import("../runtime/command_runner.zig");
+const TypeExpr = @import("../frontend/ast.zig").TypeExpr;
+const ScopeStack = @import("../interpreter/scope.zig").ScopeStack;
 
 const ProcessHandle = command_runner.ProcessHandle;
 
@@ -13,6 +15,7 @@ pub const Value = union(enum) {
     float: f64,
     string: []u8,
     process_handle: ProcessHandle,
+    scope: *ScopeStack,
 
     /// Releases any heap allocations and resets the value to `.void`.
     pub fn deinit(self: *Value, allocator: std.mem.Allocator) void {
@@ -33,6 +36,7 @@ pub const Value = union(enum) {
             .float => |flt| .{ .float = flt },
             .string => |buffer| .{ .string = try allocator.dupe(u8, buffer) },
             .process_handle => |handle| .{ .process_handle = try handle.clone(allocator) },
+            .scope => |scope| .{ .scope = scope },
         };
     }
 

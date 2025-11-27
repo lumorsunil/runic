@@ -1,11 +1,3 @@
-let Result = struct {
-  value: Float,
-  ok: bool,
-}
+# test.rn
 
-let result: Result = .{
-  .value = 1,
-  .ok = false,
-}
-
-echo ${result.value}
+const lib = import "lib.rn"

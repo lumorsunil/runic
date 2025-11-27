@@ -7,5 +7,7 @@ This directory houses the Runic CLI entry point. Build it via `zig build run -- 
 - `--trace <topic>` (repeatable) — enables tracing for specific interpreter subsystems. Current topics: `pipeline` (per-stage logging), `process` (handle summaries), and `async` (scheduler/promise lifecycle).
 - `--module-path <dir>` (repeatable) — adds directories to the module loader search roots so bindings like `let http = import("custom/http")` can point at additional trees.
 - `--env KEY=VALUE` (repeatable) — collects environment overrides that are injected when scripts spawn commands.
+- `--print-ast` — parses the script and prints each recorded AST snippet for debugging before running it.
+- `--print-tokens` — lexes the provided script and prints every token/span pair before execution so you can inspect how the lexer sliced the source.
 
 Script execution now loads the requested file, applies imports/`let` bindings, and runs the pipelines it contains with the same tracing hooks as the REPL. The REPL remains handy for interactive experiments, but both modes exercise the same command runner.

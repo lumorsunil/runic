@@ -1,15 +1,15 @@
 // Tests immutable vs mutable bindings plus literal arrays and maps.
 
-let ensure = import("test_support/ensure").ensure
+const ensure = import("test_support/ensure").ensure
 
-let greeting = "hello"
-mut retries = 2
-let services = ["api", "jobs", "web"]
-let thresholds = .{ .api = 200, .jobs = 350, .web = 150 }
+const greeting = "hello"
+var retries = 2
+const services = ["api", "jobs", "web"]
+const thresholds = .{ .api = 200, .jobs = 350, .web = 150 }
 
 retries = retries + 1
-let first_service = services[0]
-let job_threshold = thresholds.jobs
+const first_service = services[0]
+const job_threshold = thresholds.jobs
 
 ensure(greeting == "hello", "immutable binding preserved")
 ensure(retries == 3, "mutable binding updated explicitly")

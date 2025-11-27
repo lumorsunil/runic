@@ -1,7 +1,7 @@
 // Tests async promises, ^T types, await capture blocks, and typed errors.
 
-let ensure_module = import("test_support/ensure")
-let ensure = ensure_module.ensure
+const ensure_module = import("test_support/ensure")
+const ensure = ensure_module.ensure
 
 error PromiseError = enum { Timeout }
 
@@ -18,12 +18,12 @@ fn async_fail() ^PromiseError!Int {
   }
 }
 
-let pending = async_sum(2, 3)
+const pending = async_sum(2, 3)
 await (pending) |value| {
   ensure(value == 5, "await unwraps resolved value")
 }
 
-let failing = async_fail()
+const failing = async_fail()
 await (failing) |value| {
   echo "Unexpected success ${value}"
   exit 1

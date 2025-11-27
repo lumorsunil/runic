@@ -1,7 +1,7 @@
 // Tests custom error unions, returning typed failures, and pattern matching.
 
-let ensure_module = import("test_support/ensure")
-let ensure = ensure_module.ensure
+const ensure_module = import("test_support/ensure")
+const ensure = ensure_module.ensure
 
 error ParserError = union {
   MissingValue: { name: Str },
@@ -21,13 +21,13 @@ fn parse_flag(name: Str, raw: Str) ParserError!Bool {
   return error.ParserError.InvalidBool{ .name = name, .provided = raw }
 }
 
-let enabled = parse_flag("FEATURE", "true") catch |err| {
+const enabled = parse_flag("FEATURE", "true") catch |err| {
   echo "Unexpected error parsing true: ${err}"
   return false
 }
 ensure(enabled, "happy path returns Bool")
 
-let missing = parse_flag("FEATURE", "") catch |err| {
+const missing = parse_flag("FEATURE", "") catch |err| {
   match err {
     error.ParserError.MissingValue => |info| {
       ensure(info.name == "FEATURE", "MissingValue surfaces context")
@@ -41,7 +41,7 @@ let missing = parse_flag("FEATURE", "") catch |err| {
 }
 ensure(!missing, "missing input falls back to default")
 
-let invalid = parse_flag("FEATURE", "maybe") catch |err| {
+const invalid = parse_flag("FEATURE", "maybe") catch |err| {
   match err {
     error.ParserError.InvalidBool => |info| {
       ensure(info.provided == "maybe", "InvalidBool exposes provided value")

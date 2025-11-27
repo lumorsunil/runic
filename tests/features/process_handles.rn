@@ -1,15 +1,15 @@
 // Tests process handles, destructuring stdout/stderr/exit_code, and background handles.
 
-let ensure_module = import("test_support/ensure")
-let ensure = ensure_module.ensure
+const ensure_module = import("test_support/ensure")
+const ensure = ensure_module.ensure
 
-let { stdout: src_listing, stderr: src_errors, exit_code } = ls ./src
+const { stdout: src_listing, stderr: src_errors, exit_code } = ls ./src
 ensure(exit_code == 0, "ls exited cleanly")
 ensure(src_errors == "", "stderr is empty for successful sync command")
 ensure(src_listing != "", "stdout captured interpreter files")
 
-let background = echo "background-complete" &
-let finished = await background
+const background = echo "background-complete" &
+const finished = await background
 ensure(finished.status.ok, "background process resolved successfully")
 ensure(finished.stdout == "background-complete\n", "await returned buffered stdout")
 

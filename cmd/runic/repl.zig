@@ -1,16 +1,13 @@
 const std = @import("std");
 const runic = @import("runic");
-const pipeline = @import("pipeline.zig");
+const ScriptExecutor = runic.interpreter.ScriptExecutor;
+const ScriptContext = runic.interpreter.ScriptContext;
+const utils = @import("main-utils.zig");
+const DocumentStore = runic.document.DocumentStore;
+const Parser = runic.document.Parser;
 
 const CommandRunner = runic.command_runner.CommandRunner;
-const ProcessHandle = runic.command_runner.ProcessHandle;
-const StackTrace = runic.stack_trace.StackTrace;
 const Tracer = runic.tracing.Tracer;
-const StageStatus = runic.command_runner.StageStatus;
-
-const TokenList = pipeline.TokenList;
-const Pipeline = pipeline.Pipeline;
-const describeStage = pipeline.describeStage;
 
 const writer_buffer_len: usize = 1024;
 
@@ -38,6 +35,12 @@ const Session = struct {
     stdout: std.fs.File.Writer,
     stderr: std.fs.File.Writer,
     tracer: Tracer,
+    context: ScriptContext,
+    env_map: std.process.EnvMap,
+    runner: CommandRunner,
+    executor: ScriptExecutor,
+    modules: utils.ModuleRegistry,
+    script_dir: []u8,
 
     fn init(allocator: std.mem.Allocator, options: Options) !Session {
         const stdout_file = std.fs.File.stdout();
@@ -51,7 +54,21 @@ const Session = struct {
         var editor = try LineEditor.init(allocator, options.history_limit);
         errdefer editor.deinit();
 
-        return Session{
+        var context = ScriptContext.init(allocator);
+        errdefer context.deinit();
+
+        var env_map = std.process.getEnvMap(allocator) catch |err| {
+            return err;
+        };
+        errdefer env_map.deinit();
+
+        var modules = utils.ModuleRegistry.init(allocator);
+        errdefer modules.deinit();
+
+        const script_dir = try std.fs.cwd().realpathAlloc(allocator, ".");
+        errdefer allocator.free(script_dir);
+
+        var session = Session{
             .allocator = allocator,
             .options = options,
             .editor = editor,
@@ -60,11 +77,25 @@ const Session = struct {
             .stdout = stdout_file.writer(stdout_buffer),
             .stderr = stderr_file.writer(stderr_buffer),
             .tracer = Tracer.init(options.trace_topics, null),
+            .context = context,
+            .env_map = env_map,
+            .runner = undefined,
+            .executor = undefined,
+            .modules = modules,
+            .script_dir = script_dir,
         };
+        session.runner = CommandRunner.initWithTracer(allocator, &session.tracer);
+        session.executor = try ScriptExecutor.initWithRunner(allocator, &session.runner, &session.env_map, undefined);
+        return session;
     }
 
     fn deinit(self: *Session) void {
         self.tracer.clearSink();
+        self.executor.deinit();
+        self.env_map.deinit();
+        self.context.deinit();
+        self.modules.deinit();
+        self.allocator.free(self.script_dir);
         self.editor.deinit();
         self.allocator.free(self.stdout_buffer);
         self.allocator.free(self.stderr_buffer);
@@ -137,7 +168,7 @@ const Session = struct {
         if (command[0] == ':') {
             return self.handleMeta(command[1..]);
         }
-        return try self.executePipeline(command);
+        return try self.executeScript(command);
     }
 
     fn handleMeta(self: *Session, command: []const u8) !bool {
@@ -159,7 +190,7 @@ const Session = struct {
             try self.stdout.interface.print(
                 ":history — list recorded inputs\n" ++
                     ":quit/:exit — close the REPL\n" ++
-                    "Anything else runs as a bare command pipeline via CommandRunner.\n",
+                    "Anything else runs as a Runic script snippet.\n",
                 .{},
             );
             return false;
@@ -168,38 +199,40 @@ const Session = struct {
         return false;
     }
 
-    fn executePipeline(self: *Session, command: []const u8) !bool {
+    fn executeScript(self: *Session, source: []const u8) !bool {
         defer self.stderr.interface.flush() catch {};
-        var tokens = TokenList.init(self.allocator);
-        defer tokens.deinit();
+        defer self.stdout.interface.flush() catch {};
 
-        tokens.populate(command) catch |err| {
-            try self.stderr.interface.print("Parse error: {s}\n", .{@errorName(err)});
+        // var parser = Parser.init(self.allocator, source);
+        var documentStoreArena = std.heap.ArenaAllocator.init(self.allocator);
+        defer documentStoreArena.deinit();
+        var documentStore = DocumentStore.init(documentStoreArena.allocator());
+        var parser = Parser.init(self.allocator, &documentStore);
+        defer parser.deinit();
+
+        const script = parser.parseSource(source) catch |err| {
+            try self.stderr.interface.print("Parse error: {s}", .{@errorName(err)});
+            const expected = parser.expectedTokens();
+            if (expected.len > 0) {
+                try self.stderr.interface.writeAll(" (");
+                _ = try parser.writeExpectedTokens(&self.stderr.interface);
+                try self.stderr.interface.writeAll(")");
+            }
+            try self.stderr.interface.writeByte('\n');
             return false;
         };
-        if (tokens.items.len == 0) return false;
 
-        var pipeline_builder = Pipeline.init(self.allocator);
-        defer pipeline_builder.deinit();
+        const code = try self.executor.execute(script, .{
+            .script_path = ":repl",
+            .stdout = &self.stdout.interface,
+            .stderr = &self.stderr.interface,
+            .context = &self.context,
+        });
 
-        pipeline_builder.build(tokens.items) catch |err| {
-            try self.stderr.interface.print("Pipeline error: {s}\n", .{@errorName(err)});
-            return false;
-        };
-
-        var runner = CommandRunner.initWithTracer(self.allocator, &self.tracer);
-        var handle = runner.runPipeline(pipeline_builder.specs) catch |err| {
-            try self.renderRunnerErrorStackTrace(command, err);
-            try self.stderr.interface.print("Command error: {s}\n", .{@errorName(err)});
-            return false;
-        };
-        defer handle.deinit();
-
-        if (!handle.status.ok) {
-            try self.renderStageFailureStackTrace(command, pipeline_builder.specs, &handle);
+        if (code != 0) {
+            try self.stderr.interface.print("Command exited with {d}\n", .{code});
         }
 
-        try self.displayHandle(handle);
         return false;
     }
 
@@ -213,73 +246,6 @@ const Session = struct {
         for (entries, 0..) |entry, idx| {
             try self.stdout.interface.print("{d}: {s}\n", .{ idx + 1, entry });
         }
-    }
-
-    fn displayHandle(self: *Session, handle: ProcessHandle) !void {
-        defer {
-            self.stdout.interface.flush() catch {};
-            self.stderr.interface.flush() catch {};
-        }
-        const stdout_bytes = handle.stdoutBytes();
-        if (stdout_bytes.len > 0) try self.stdout.interface.writeAll(stdout_bytes);
-
-        const stderr_bytes = handle.stderrBytes();
-        if (stderr_bytes.len > 0) try self.stderr.interface.writeAll(stderr_bytes);
-
-        const status = handle.status;
-        if (status.ok) {
-            const code = status.exit_code orelse 0;
-            try self.stdout.interface.print("\n[ok] exit code {d}\n", .{code});
-        } else {
-            const failed = status.failed_stage orelse (handle.stageStatuses().len - 1);
-            const code = status.exit_code orelse 0;
-            if (status.signal) |sig| {
-                try self.stderr.interface.print(
-                    "\n[err] stage {d} stopped by signal {d}\n",
-                    .{ failed + 1, sig },
-                );
-            } else {
-                try self.stderr.interface.print(
-                    "\n[err] stage {d} exited with code {d}\n",
-                    .{ failed + 1, code },
-                );
-            }
-        }
-    }
-
-    fn renderStageFailureStackTrace(
-        self: *Session,
-        command: []const u8,
-        specs: []const CommandRunner.CommandSpec,
-        handle: *const ProcessHandle,
-    ) !void {
-        if (specs.len == 0) return;
-        const failed_idx = handle.status.failed_stage orelse (specs.len - 1);
-        if (failed_idx >= specs.len) return;
-        const statuses = handle.stageStatuses();
-        if (failed_idx >= statuses.len) return;
-
-        var trace = StackTrace.init(self.allocator);
-        defer trace.deinit();
-
-        const stage_label = try std.fmt.allocPrint(self.allocator, "stage {d}", .{failed_idx + 1});
-        defer self.allocator.free(stage_label);
-
-        const stage_detail = try describeStage(self.allocator, specs[failed_idx].argv, statuses[failed_idx]);
-        defer self.allocator.free(stage_detail);
-
-        try trace.push(.{ .label = stage_label, .detail = stage_detail });
-        try trace.push(.{ .label = "pipeline", .detail = command });
-        try trace.render(&self.stderr.interface);
-    }
-
-    fn renderRunnerErrorStackTrace(self: *Session, command: []const u8, err: anyerror) !void {
-        var trace = StackTrace.init(self.allocator);
-        defer trace.deinit();
-
-        try trace.push(.{ .label = "command runner", .detail = @errorName(err) });
-        try trace.push(.{ .label = "pipeline", .detail = command });
-        try trace.render(&self.stderr.interface);
     }
 };
 
@@ -314,7 +280,7 @@ const LineEditor = struct {
             .history = .init(allocator, history_limit),
         };
         editor.is_tty = stdin_file.isTty();
-        if (editor.is_tty) {
+        if (editor.is_tty and @import("builtin").os.tag == .linux) {
             editor.original_termios = try std.posix.tcgetattr(stdin_file.handle);
             try editor.enableRawMode();
         }
@@ -568,7 +534,7 @@ const LineEditor = struct {
     }
 
     fn restoreTerminal(self: *LineEditor) !void {
-        if (!self.is_tty) return;
+        if (!self.is_tty or @import("builtin").os.tag != .linux) return;
         if (self.original_termios) |original| {
             try std.posix.tcsetattr(self.stdin_file.handle, .FLUSH, original);
         }

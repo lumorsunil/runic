@@ -1,4 +1,6 @@
 const std = @import("std");
+const runic = @import("runic");
+const ast = runic.ast;
 
 const Allocator = std.mem.Allocator;
 
@@ -27,35 +29,60 @@ pub const Symbol = struct {
 pub fn collectSymbols(
     allocator: Allocator,
     detail: []const u8,
-    contents: []const u8,
+    script: ast.Script,
     list: *std.ArrayList(Symbol),
 ) !void {
-    var cursor = TokenCursor{ .source = contents };
-    while (true) {
-        cursor.skipTrivia();
-        if (cursor.done()) break;
-        if (cursor.skipStringLiteral()) continue;
-        if (cursor.matchKeyword("pub")) continue;
-        if (cursor.matchKeyword("module")) {
-            if (cursor.readIdentifier()) |name| {
-                try appendSymbol(allocator, list, .module, name, detail);
-            }
-            continue;
+    for (script.statements) |statement| {
+        switch (statement.*) {
+            .bash_block, .error_decl, .fn_decl, .for_stmt, .while_stmt => {
+                // Not Yet Implemented,
+            },
+            .return_stmt, .expression => {
+                // Does not produce symbols
+            },
+            .binding_decl => |let_decl| {
+                switch (let_decl.pattern.*) {
+                    .discard => {},
+                    .record, .tuple => {
+                        // Not Yet Implemented
+                    },
+                    .identifier => |identifier| {
+                        const name = identifier.name;
+                        // const initializer = let_decl.initializer.span().sliceFrom(contents);
+
+                        try appendSymbol(allocator, list, .variable, name, detail);
+                    },
+                }
+            },
         }
-        if (cursor.matchKeyword("fn")) {
-            if (cursor.readIdentifier()) |name| {
-                try appendSymbol(allocator, list, .function, name, detail);
-            }
-            continue;
-        }
-        if (cursor.matchKeyword("let") or cursor.matchKeyword("mut")) {
-            if (cursor.readIdentifier()) |name| {
-                try appendSymbol(allocator, list, .variable, name, detail);
-            }
-            continue;
-        }
-        cursor.advance();
     }
+
+    // var cursor = TokenCursor{ .source = contents };
+    // while (true) {
+    //     cursor.skipTrivia();
+    //     if (cursor.done()) break;
+    //     if (cursor.skipStringLiteral()) continue;
+    //     if (cursor.matchKeyword("pub")) continue;
+    //     if (cursor.matchKeyword("module")) {
+    //         if (cursor.readIdentifier()) |name| {
+    //             try appendSymbol(allocator, list, .module, name, detail);
+    //         }
+    //         continue;
+    //     }
+    //     if (cursor.matchKeyword("fn")) {
+    //         if (cursor.readIdentifier()) |name| {
+    //             try appendSymbol(allocator, list, .function, name, detail);
+    //         }
+    //         continue;
+    //     }
+    //     if (cursor.matchKeyword("const") or cursor.matchKeyword("var")) {
+    //         if (cursor.readIdentifier()) |name| {
+    //             try appendSymbol(allocator, list, .variable, name, detail);
+    //         }
+    //         continue;
+    //     }
+    //     cursor.advance();
+    // }
 }
 
 fn appendSymbol(

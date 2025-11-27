@@ -17,10 +17,10 @@ echo "hello world" | upper
 Variables are typed, immutable by default, and only change through explicit `mut` declarations. Arrays and maps use literal syntax that sidesteps legacy word-splitting quirks.
 
 ```rn
-let greeting = "hello"
-mut count = 2
-let items = ["apples", "oranges"]
-let vars = { greeting: greeting, total: count }
+const greeting = "hello"
+var count = 2
+const items = ["apples", "oranges"]
+const vars = { greeting: greeting, total: count }
 ```
 
 **Result:** `greeting` cannot be reassigned, `count` can be incremented intentionally, and the literals preserve their structure when passed between commands or functions.
@@ -28,9 +28,9 @@ let vars = { greeting: greeting, total: count }
 Type annotations are available when you need to nail down a binding’s shape. Append `: Type` after the variable name so the compiler can enforce conversions up front.
 
 ```rn
-let greeting: Str = "hello"
-mut retries: Int = 2
-let config: Map(Str, Int) = { port: 8080 }
+const greeting: Str = "hello"
+var retries: Int = 2
+const config: Map(Str, Int) = { port: 8080 }
 ```
 
 **Result:** Each declaration advertises its type at the point of definition, catching mismatches such as assigning a string to `retries` before the script ever runs.
@@ -50,7 +50,7 @@ fn load_config() !Config {
   return error.FileError.NotFound { path: "/etc/app.conf" }
 }
 
-let config = load_config() catch |err| {
+const config = load_config() catch |err| {
   match err {
     error.FileError.NotFound => |info| echo "Missing ${info.path}"
     error.FileError.PermissionDenied => |info| echo "Denied for ${info.user}"
@@ -103,7 +103,7 @@ fn read_config(path: Str) FileError!Config {
 Any type can be wrapped in an optional using Zig-style `?T` syntax, and `null` denotes the absence of a value. Optionals participate in control flow: `if` automatically unwraps them and exposes the value to a capture clause that only runs when the optional contains data.
 
 ```rn
-let maybe_port = env.get("PORT") // returns ?Int
+const maybe_port = env.get("PORT") // returns ?Int
 
 if (maybe_port) |port| {
   echo "Running on port ${port}"
@@ -128,7 +128,7 @@ fn fetch_release(tag: Str) ^ReleaseError!Release {
   }
 }
 
-let latest = fetch_release("stable")
+const latest = fetch_release("stable")
 
 await (latest) |release| {
   echo "Shipping ${release.version}"
@@ -160,13 +160,13 @@ fn describe(count) {
 `for` and `while` statements consume any iterator the runtime exposes, so streaming APIs and collections share the same loop syntax. Loops use Zig-style capture clauses to bind each yielded value (and optional index) to a local name.
 
 ```rn
-let fruits = ["apple", "banana", "pear"]
+const fruits = ["apple", "banana", "pear"]
 
 for (fruits, 0..) |fruit, idx| {
   echo "${idx}: ${fruit.upper()}"
 }
 
-let reader = file.open("debug.log")
+const reader = file.open("debug.log")
 while reader.lines() |line| {
   if line.starts_with("ERR") {
     echo line
@@ -181,8 +181,8 @@ while reader.lines() |line| {
 Runic distinguishes between invoking external commands and evaluating expressions, reducing quoting issues by making intent explicit.
 
 ```rn
-let files = ls ./src | lines()
-let uppercased = files.map(fn (path) => path.upper())
+const files = ls ./src | lines()
+const uppercased = files.map(fn (path) => path.upper())
 ```
 
 **Result:** `ls` executes as a command; downstream helpers operate on typed lists so you can transform data without juggling quoting rules.
@@ -192,17 +192,17 @@ let uppercased = files.map(fn (path) => path.upper())
 Starting a program returns a structured process handle whether you run it synchronously or fire it off in the background. Assigning a bare command to a `let` binding now yields that handle directly, eliminating the need for a wrapper function. Handles keep track of the PID, running state, exit code, and captured IO channels so scripts can reason about subprocesses without juggling implicit `$?` globals.
 
 ```rn
-let sync_proc = git status --short
+const sync_proc = git status --short
 echo sync_proc.stdout // already finished, STDOUT buffered
 echo sync_proc.status.exit_code
 
-let { stdout: sync_stdout, stderr: sync_stderr, exit_code: sync_exit_code } = git status --short
+const { stdout: sync_stdout, stderr: sync_stderr, exit_code: sync_exit_code } = git status --short
 git status --short 1>$status_stdout
 git status --short 2>$status_stderr
 
-let async_proc = tail -f /var/log/app.log &
+const async_proc = tail -f /var/log/app.log &
 // later...
-let finished = await async_proc
+const finished = await async_proc
 if finished.status.ok {
   echo finished.stdout
 }
@@ -226,9 +226,9 @@ if build_stdout.status.exit_code != 0 {
   echo build_stdout.stdout
 }
 
-let server = python api.py capture = { stdout: :stream, stderr: :buffer } &
+const server = python api.py capture = { stdout: :stream, stderr: :buffer } &
 server.stdout.on_line(fn (line) => echo "[srv] ${line}")
-let status = server.wait(timeout = 5s)
+const status = server.wait(timeout = 5s)
 if status.timed_out {
   server.stop()
   echo server.stderr // buffered for post-mortem
@@ -242,7 +242,7 @@ if status.timed_out {
 Pipelines expose per-stage exit codes, enabling guarded chaining without relying on `set -e`.
 
 ```rn
-let status = (build | tee build.log).status
+const status = (build | tee build.log).status
 if !status.ok {
   echo "Build failed at step ${status.failed_stage}"
   exit 1
@@ -256,9 +256,9 @@ if !status.ok {
 Libraries live alongside your scripts (or inside shared module directories) and can be imported with clear syntax, enabling teams to package shared utilities across scripts.
 
 ```rn
-let http = import("net/http")
+const http = import("net/http")
 
-let response = http.get("https://example.com/status")
+const response = http.get("https://example.com/status")
 echo response.code
 ```
 
@@ -272,7 +272,7 @@ fn add(lhs: Int, rhs: Int) Int {
   return lhs + rhs
 }
 
-let pi = 3.14159
+const pi = 3.14159
 ```
 
 Each module also carries a manifest named `<file>.module.json` that documents which functions or values are exported and their types. The module loader reads this metadata to surface strongly-typed APIs to consumers:
@@ -320,7 +320,7 @@ bash {
 Structs are a collection of fields, each with their own type.
 
 ```rn
-let Result = struct {
+const Result = struct {
     value: ?Float,
     ok: bool,
 }
@@ -343,7 +343,7 @@ fn add(x: Float, y: Float) Float {
 ```rn
 // main.rn
 
-let lib = import("lib")
+const lib = import("lib")
 
 echo lib.add(3, 5)
 ```

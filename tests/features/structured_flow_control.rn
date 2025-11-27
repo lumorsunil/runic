@@ -1,7 +1,7 @@
 // Tests keyword-driven if/else blocks returning values.
 
-let ensure_module = import("test_support/ensure")
-let ensure = ensure_module.ensure
+const ensure_module = import("test_support/ensure")
+const ensure = ensure_module.ensure
 
 fn classify(count: Int) Str {
   if count > 1 {
@@ -13,9 +13,9 @@ fn classify(count: Int) Str {
   }
 }
 
-let plural = classify(3)
-let singular = classify(1)
-let zero = classify(0)
+const plural = classify(3)
+const singular = classify(1)
+const zero = classify(0)
 
 ensure(plural == "plural", "if branch returns happy path")
 ensure(singular == "singular", "else-if branch honored")

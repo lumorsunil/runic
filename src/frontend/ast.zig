@@ -1,6 +1,8 @@
+const std = @import("std");
 const token = @import("token.zig");
 
 pub const Span = token.Span;
+pub const Spanned = token.Spanned;
 
 /// Identifiers back every binding name as well as module and member
 /// references. The slice is backed by the original source text.
@@ -23,11 +25,14 @@ pub const Block = struct {
     span: Span,
 };
 
-/// Patterns are shared between `let` bindings, destructuring assignment, loop
+/// Patterns are shared between `const` bindings, destructuring assignment, loop
 /// captures, and catch clauses.
 pub const BindingPattern = union(enum) {
+    /// Example: `const identifier = expression`
     identifier: Identifier,
+    /// Example: `const _ = expression`
     discard: Span,
+    /// Example: `const x, const y = position`
     tuple: Tuple,
     record: Record,
 
@@ -82,7 +87,7 @@ pub const TypeExpr = union(enum) {
     promise: PrefixType,
     error_union: ErrorUnion,
     array: ArrayType,
-    record: RecordType,
+    struct_type: StructType,
     tuple: TupleType,
     function: FunctionType,
 
@@ -108,14 +113,25 @@ pub const TypeExpr = union(enum) {
         span: Span,
     };
 
-    pub const RecordType = struct {
-        fields: []const RecordField,
+    pub const StructType = struct {
+        fields: []const StructField,
+        decls: []const StructDecl,
         span: Span,
     };
 
-    pub const RecordField = struct {
+    pub const StructField = struct {
         name: Identifier,
         type_expr: *TypeExpr,
+        span: Span,
+    };
+
+    pub const StructDecl = struct {
+        name: Identifier,
+        type_expr: ?*TypeExpr,
+        decl_source: union(enum) {
+            fn_decl: *FunctionDecl,
+            binding_decl: *BindingDecl,
+        },
         span: Span,
     };
 
@@ -137,7 +153,7 @@ pub const TypeExpr = union(enum) {
             .promise => |promise| promise.span,
             .error_union => |err| err.span,
             .array => |array| array.span,
-            .record => |record| record.span,
+            .struct_type => |record| record.span,
             .tuple => |tuple| tuple.span,
             .function => |func| func.span,
         };
@@ -151,8 +167,15 @@ pub const StringLiteral = struct {
     span: Span,
 
     pub const Segment = union(enum) {
-        text: []const u8,
+        text: Spanned([]const u8),
         interpolation: *Expression,
+
+        pub fn span(self: Segment) Span {
+            return switch (self) {
+                .text => |s| s.span,
+                .interpolation => |s| s.span(),
+            };
+        }
     };
 };
 
@@ -216,30 +239,23 @@ pub const Expression = union(enum) {
     match_expr: MatchExpr,
     try_expr: TryExpr,
     catch_expr: CatchExpr,
+    import_expr: ImportExpr,
 
     pub fn span(self: Expression) Span {
         return switch (self) {
-            .identifier => |id| id.span,
-            .path => |p| p.span,
             .literal => |lit| lit.span(),
-            .array => |arr| arr.span,
-            .map => |map| map.span,
-            .range => |range| range.span,
-            .pipeline => |pipe| pipe.span,
-            .call => |call| call.span,
-            .member => |member| member.span,
-            .index => |index| index.span,
-            .unary => |u| u.span,
-            .binary => |b| b.span,
-            .block => |block| block.span,
-            .fn_literal => |fn_lit| fn_lit.span,
-            .async_expr => |async_node| async_node.span,
-            .await_expr => |await_node| await_node.span,
-            .if_expr => |if_expr| if_expr.span,
-            .match_expr => |match_expr| match_expr.span,
-            .try_expr => |try_expr| try_expr.span,
-            .catch_expr => |catch_expr| catch_expr.span,
+            inline else => |expr| expr.span,
         };
+    }
+
+    pub fn from(expr: anytype) Expression {
+        inline for (std.meta.fields(Expression)) |field| {
+            if (field.type == @TypeOf(expr)) {
+                return @unionInit(Expression, field.name, expr);
+            }
+        }
+
+        @compileError("Invalid expression pass to Expression.from: " ++ @typeName(@TypeOf(expr)));
     }
 };
 
@@ -273,7 +289,7 @@ pub const CallExpr = struct {
 };
 
 pub const CallArgument = struct {
-    label: ?Identifier,
+    label: ?Identifier = null,
     value: *Expression,
     span: Span,
 };
@@ -410,6 +426,12 @@ pub const CatchClause = struct {
     span: Span,
 };
 
+pub const ImportExpr = struct {
+    importer: []const u8,
+    module_name: []const u8,
+    span: Span,
+};
+
 /// Pipelines model chained command and expression stages. Each stage carries a
 /// `StageRole` so the runtime can distinguish external commands from pure
 /// expressions while preserving location metadata for diagnostics.
@@ -453,6 +475,13 @@ pub const CommandPart = union(enum) {
 pub const CommandWord = struct {
     text: []const u8,
     span: Span,
+
+    pub fn fromToken(tok: token.Token) CommandWord {
+        return .{
+            .text = tok.lexeme,
+            .span = tok.span,
+        };
+    }
 };
 
 pub const EnvAssignment = struct {
@@ -521,10 +550,9 @@ pub const Script = struct {
 
 /// Statements represent top-level items as well as imperative expressions.
 pub const Statement = union(enum) {
-    let_decl: LetDecl,
+    binding_decl: BindingDecl,
     fn_decl: FunctionDecl,
     error_decl: ErrorDecl,
-    import_stmt: ImportStmt,
     return_stmt: ReturnStmt,
     for_stmt: ForStmt,
     while_stmt: WhileStmt,
@@ -533,10 +561,9 @@ pub const Statement = union(enum) {
 
     pub fn span(self: Statement) Span {
         return switch (self) {
-            .let_decl => |decl| decl.span,
+            .binding_decl => |decl| decl.span,
             .fn_decl => |fn_decl| fn_decl.span,
             .error_decl => |err| err.span,
-            .import_stmt => |import_stmt| import_stmt.span,
             .return_stmt => |ret| ret.span,
             .for_stmt => |loop_stmt| loop_stmt.span,
             .while_stmt => |loop_stmt| loop_stmt.span,
@@ -546,7 +573,7 @@ pub const Statement = union(enum) {
     }
 };
 
-pub const LetDecl = struct {
+pub const BindingDecl = struct {
     is_mutable: bool,
     pattern: *BindingPattern,
     annotation: ?*TypeExpr,
@@ -564,6 +591,7 @@ pub const Parameter = struct {
 
 pub const FunctionDecl = struct {
     name: Identifier,
+    is_async: bool,
     params: []const Parameter,
     return_type: ?*TypeExpr,
     body: FunctionBody,
@@ -599,12 +627,6 @@ pub const UnionBody = struct {
 pub const UnionVariant = struct {
     name: Identifier,
     payload: ?*TypeExpr,
-    span: Span,
-};
-
-pub const ImportStmt = struct {
-    alias: Identifier,
-    path: ModulePath,
     span: Span,
 };
 

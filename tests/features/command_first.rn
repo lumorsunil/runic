@@ -1,12 +1,12 @@
 // Tests command-first execution and pipeline semantics.
 
-let ensure = import("test_support/ensure").ensure
+const ensure = import("test_support/ensure.rn").ensure
 
-let pipeline = echo "command-first" | upper
+const pipeline = echo "command-first" | upper
 ensure(pipeline.status.ok, "pipeline executed successfully")
 ensure(pipeline.stdout == "COMMAND-FIRST\n", "pipeline transformed input")
 
-let chained = echo "pipeline" | upper | tr "A-Z" "a-z"
+const chained = echo "pipeline" | upper | tr "A-Z" "a-z"
 ensure(chained.status.ok, "chained pipeline executed successfully")
 ensure(chained.stdout == "pipeline\n", "chained pipeline preserved flow")
 

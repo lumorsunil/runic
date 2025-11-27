@@ -19,6 +19,7 @@ token stream:
 | `identifier` | `echo`, `upper` | Every bare command or variable name |
 | `pipe` | `|` | Splits pipeline stages |
 | `pipe_pipe` | `||` | Logical-or operator between stages/expressions |
+| `dollar` | `$` | Starts `${expr}` command arguments or `$ident` captures |
 | `amp` | `&` | Background processes |
 | `amp_amp` | `&&` | Logical-and operator |
 | `newline`, `semicolon` | `\n`, `;` | End of statements or command chains |

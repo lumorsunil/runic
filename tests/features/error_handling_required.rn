@@ -1,6 +1,6 @@
 // Tests explicit try/catch handling and propagation of typed errors.
 
-let ensure = import("test_support/ensure").ensure
+const ensure = import("test_support/ensure").ensure
 
 error IoError = enum { NetworkFailure, PermissionDenied }
 
@@ -22,9 +22,9 @@ fn bootstrap() IoError!Str {
   return try fetch_resource("/denied")
 }
 
-let bs = bootstrap()
+const bs = bootstrap()
 
-let recovered = bs catch |err| {
+const recovered = bs catch |err| {
   match err {
     error.IoError.PermissionDenied => {
       echo "Permission denied, recovering with cached data"

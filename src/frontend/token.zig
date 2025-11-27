@@ -6,6 +6,12 @@ pub const Location = struct {
     line: usize,
     column: usize,
     offset: usize,
+
+    pub const dummy = Location{
+        .line = 0,
+        .column = 0,
+        .offset = 0,
+    };
 };
 
 /// Span represents the start and end location of a token. The end location is
@@ -13,7 +19,40 @@ pub const Location = struct {
 pub const Span = struct {
     start: Location,
     end: Location,
+
+    pub const dummy = Span{ .start = .dummy, .end = .dummy };
+
+    pub fn fromLocs(start: Location, end: Location) Span {
+        return .{ .start = start, .end = end };
+    }
+
+    pub fn fromTo(start: Span, end: Span) Span {
+        return .{ .start = start.start, .end = end.end };
+    }
+
+    pub fn startAt(self: Span, start: Span) Span {
+        var new = self;
+        new.start = start.start;
+        return new;
+    }
+
+    pub fn endAt(self: Span, end: Span) Span {
+        var new = self;
+        new.end = end.end;
+        return new;
+    }
+
+    pub fn sliceFrom(self: Span, source: []const u8) []const u8 {
+        return source[self.start.offset..self.end.offset];
+    }
 };
+
+pub fn Spanned(comptime T: type) type {
+    return struct {
+        payload: T,
+        span: Span,
+    };
+}
 
 /// Token is the basic unit emitted by the lexer.
 pub const Token = struct {
@@ -39,13 +78,19 @@ pub const Tag = enum {
     // Literal tokens
     int_literal,
     float_literal,
-    string_literal,
+
+    // String tokens
+    string_start,
+    string_end,
+    string_interp_start,
+    string_interp_end,
+    string_text,
 
     // Declaration keywords
     /// Immutable variable declarations and destructuring.
-    kw_let,
+    kw_const,
     /// Explicitly mutable variable declarations.
-    kw_mut,
+    kw_var,
     /// Function declarations/expressions.
     kw_fn,
 
@@ -91,6 +136,7 @@ pub const Tag = enum {
     minus,
     star,
     slash,
+    dollar,
     percent,
     /// Promise prefix "^".
     caret,
@@ -130,8 +176,8 @@ pub const Tag = enum {
 
     pub fn toKeyword(tag: Tag) ?[]const u8 {
         return switch (tag) {
-            .kw_let => "let",
-            .kw_mut => "mut",
+            .kw_const => "const",
+            .kw_var => "var",
             .kw_fn => "fn",
             .kw_error => "error",
             .kw_enum => "enum",
@@ -169,8 +215,8 @@ pub fn identifierTag(name: []const u8) Tag {
 }
 
 const keyword_map = std.StaticStringMap(Tag).initComptime(.{
-    .{ "let", .kw_let },
-    .{ "mut", .kw_mut },
+    .{ "const", .kw_const },
+    .{ "var", .kw_var },
     .{ "fn", .kw_fn },
     .{ "error", .kw_error },
     .{ "enum", .kw_enum },

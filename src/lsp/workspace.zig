@@ -1,22 +1,26 @@
 const std = @import("std");
 const symbols = @import("symbols.zig");
+const diag = @import("diagnostics.zig");
+const runic = @import("runic");
+const parseFile = @import("parser.zig").parseFile;
+const Parser = @import("parser.zig").Parser;
+const DocumentStore = @import("server.zig").DocumentStore;
+
+const max_source_bytes: usize = 4 * 1024 * 1024;
 
 const Allocator = std.mem.Allocator;
 
 pub const Workspace = struct {
     allocator: Allocator,
-    roots: std.ArrayList([]const u8),
-    index: std.ArrayList(symbols.Symbol),
+    roots: std.ArrayList([]const u8) = .empty,
+    index: std.ArrayList(symbols.Symbol) = .empty,
+    diagnostics: std.ArrayList(diag.Diagnostic) = .empty,
+    documents: *DocumentStore,
 
     const self_dirs = [_][]const u8{ "src", "examples", "tests" };
-    const max_source_bytes: usize = 4 * 1024 * 1024;
 
-    pub fn init(allocator: Allocator) Workspace {
-        return .{
-            .allocator = allocator,
-            .roots = .{},
-            .index = .{},
-        };
+    pub fn init(allocator: Allocator, documentStore: *DocumentStore) Workspace {
+        return .{ .allocator = allocator, .documents = documentStore };
     }
 
     pub fn deinit(self: *Workspace) void {
@@ -25,6 +29,7 @@ pub const Workspace = struct {
         }
         self.roots.deinit(self.allocator);
         self.clearIndex();
+        self.clearDiagnostics();
         self.index.deinit(self.allocator);
     }
 
@@ -41,6 +46,7 @@ pub const Workspace = struct {
 
     pub fn refresh(self: *Workspace) !void {
         self.clearIndex();
+        self.clearDiagnostics();
         for (self.roots.items) |root| {
             try self.scanRoot(root);
         }
@@ -73,6 +79,13 @@ pub const Workspace = struct {
             entry.deinit(self.allocator);
         }
         self.index.clearRetainingCapacity();
+    }
+
+    pub fn clearDiagnostics(self: *Workspace) void {
+        for (self.diagnostics.items) |*entry| {
+            entry.deinit(self.allocator);
+        }
+        self.diagnostics.clearRetainingCapacity();
     }
 
     fn scanRoot(self: *Workspace, root: []const u8) !void {
@@ -116,7 +129,11 @@ pub const Workspace = struct {
             else => return err,
         };
         defer self.allocator.free(contents);
-        try symbols.collectSymbols(self.allocator, detail, contents, &self.index);
+        // var parser = runic.parser.Parser.init(self.allocator, contents);
+        var parser = Parser.init(self.allocator, self.documents);
+        defer parser.deinit();
+        const script = try parseFile(self.allocator, &self.diagnostics, &parser, absolute_path) orelse return;
+        try symbols.collectSymbols(self.allocator, detail, script, &self.index);
     }
 };
 

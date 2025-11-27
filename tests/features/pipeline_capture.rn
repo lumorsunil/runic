@@ -1,13 +1,13 @@
 // Tests capturing stdout/stderr from pipelines and redirecting into variables.
 
-let ensure_module = import("test_support/ensure")
-let ensure = ensure_module.ensure
+const ensure_module = import("test_support/ensure")
+const ensure = ensure_module.ensure
 
-let tee_run = (echo "capture" | tee /dev/null)
+const tee_run = (echo "capture" | tee /dev/null)
 ensure(tee_run.status.ok, "tee pipeline succeeds")
 ensure(tee_run.stdout == "capture\n", "tee preserved stdout for inspection")
 
-let captured = echo "caps" | upper 1>$upper_stdout 2>$upper_stderr
+const captured = echo "caps" | upper 1>$upper_stdout 2>$upper_stderr
 ensure(captured.status.ok, "redirect pipeline succeeded")
 ensure(upper_stdout.stdout == "CAPS\n", "stdout redirection filled variable")
 ensure(upper_stderr.stdout == "", "stderr redirection stays empty")
