@@ -36,6 +36,7 @@ pub const Value = union(enum) {
             .float => |flt| .{ .float = flt },
             .string => |buffer| .{ .string = try allocator.dupe(u8, buffer) },
             .process_handle => |handle| .{ .process_handle = try handle.clone(allocator) },
+            // TODO: Investigate if we need to clone this (hint: everytime we use a Value in the evaluator, we seem to clone it and deinitialize)
             .scope => |scope| .{ .scope = scope },
         };
     }

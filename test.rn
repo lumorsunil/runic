@@ -1,3 +1,9 @@
 # test.rn
 
 const lib = import "lib.rn"
+const libAgain = import "lib.rn"
+
+echo "${lib.name}"
+echo "${libAgain.name}"
+
+lib.hello

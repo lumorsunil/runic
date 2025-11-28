@@ -39,7 +39,6 @@ const Session = struct {
     env_map: std.process.EnvMap,
     runner: CommandRunner,
     executor: ScriptExecutor,
-    modules: utils.ModuleRegistry,
     script_dir: []u8,
 
     fn init(allocator: std.mem.Allocator, options: Options) !Session {
@@ -62,9 +61,6 @@ const Session = struct {
         };
         errdefer env_map.deinit();
 
-        var modules = utils.ModuleRegistry.init(allocator);
-        errdefer modules.deinit();
-
         const script_dir = try std.fs.cwd().realpathAlloc(allocator, ".");
         errdefer allocator.free(script_dir);
 
@@ -81,7 +77,6 @@ const Session = struct {
             .env_map = env_map,
             .runner = undefined,
             .executor = undefined,
-            .modules = modules,
             .script_dir = script_dir,
         };
         session.runner = CommandRunner.initWithTracer(allocator, &session.tracer);
@@ -94,7 +89,6 @@ const Session = struct {
         self.executor.deinit();
         self.env_map.deinit();
         self.context.deinit();
-        self.modules.deinit();
         self.allocator.free(self.script_dir);
         self.editor.deinit();
         self.allocator.free(self.stdout_buffer);

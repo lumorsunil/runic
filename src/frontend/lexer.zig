@@ -2,6 +2,7 @@ const std = @import("std");
 const token = @import("token.zig");
 
 const max_token_consumption_depth: usize = 1024;
+const MAX_CONTEXT_STACK: usize = 100;
 
 pub const Error = std.mem.Allocator.Error || std.Io.Writer.Error || error{
     UnexpectedCharacter,
@@ -22,7 +23,7 @@ pub const Lexer = struct {
     active_next_depth: usize = 0,
     last_index: ?usize = null,
     last_context_len: ?usize = null,
-    context_stack: std.ArrayList(Context) = .empty,
+    context_stack: std.ArrayList(Context),
     arena: std.heap.ArenaAllocator,
     logging_enabled: bool = false,
 
@@ -64,10 +65,11 @@ pub const Lexer = struct {
         }
     };
 
-    pub fn init(allocator_: std.mem.Allocator, source: []const u8) Lexer {
+    pub fn init(allocator_: std.mem.Allocator, source: []const u8) !Lexer {
         return .{
             .arena = .init(allocator_),
             .source = source,
+            .context_stack = try .initCapacity(allocator_, MAX_CONTEXT_STACK),
             .needs_trailing_newline = source.len > 0 and !endsWithNewline(source),
         };
     }
@@ -90,7 +92,7 @@ pub const Lexer = struct {
     }
 
     pub fn pushContext(self: *Lexer, context: Context) !void {
-        try self.context_stack.append(self.allocator(), context);
+        try self.context_stack.appendBounded(context);
     }
 
     pub fn popContext(self: *Lexer) !void {
@@ -639,13 +641,13 @@ pub const Lexer = struct {
 pub const Stream = struct {
     lexer: Lexer,
     current: ?token.Token = null,
-    peeked: ?token.Token = null,
+    peeked_tokens_buffer: std.ArrayList(token.Token) = .empty,
     active_next_depth: usize = 0,
 
     pub const max_guard_depth: usize = max_token_consumption_depth;
 
-    pub fn init(allocator: std.mem.Allocator, source: []const u8) Stream {
-        return .{ .lexer = Lexer.init(allocator, source) };
+    pub fn init(allocator: std.mem.Allocator, source: []const u8) !Stream {
+        return .{ .lexer = try .init(allocator, source) };
     }
 
     pub fn deinit(self: Stream) void {
@@ -656,13 +658,18 @@ pub const Stream = struct {
         return self;
     }
 
+    /// Invalidates the buffer in the snapshot
     pub fn restore(self: *Stream, s: Stream) void {
+        const clone = try s.peeked_tokens_buffer.clone(self.lexer.allocator());
+        s.peeked_tokens_buffer.deinit(self.lexer.allocator());
+        self.peeked_tokens_buffer.deinit(self.lexer.allocator());
         self.* = s;
+        self.peeked_tokens_buffer = clone;
     }
 
     pub fn next(self: *Stream) Error!token.Token {
-        if (self.peeked) |tok| {
-            self.peeked = null;
+        if (self.peeked_tokens_buffer.items.len > 0) {
+            const tok = self.peeked_tokens_buffer.orderedRemove(0);
             self.current = tok;
             return tok;
         }
@@ -670,10 +677,20 @@ pub const Stream = struct {
     }
 
     pub fn peek(self: *Stream) Error!token.Token {
-        if (self.peeked == null) {
-            self.peeked = try self.guardedNext();
+        if (self.peeked_tokens_buffer.items.len == 0) {
+            try self.peeked_tokens_buffer.append(self.lexer.allocator(), try self.guardedNext());
         }
-        return self.peeked.?;
+        return self.peeked_tokens_buffer.items[0];
+    }
+
+    pub fn peekSlice(self: *Stream, len: usize) Error![]const token.Token {
+        const len_needed = len -| self.peeked_tokens_buffer.items.len;
+
+        if (len_needed > 0) for (0..len_needed) |_| {
+            try self.peeked_tokens_buffer.append(self.lexer.allocator(), try self.guardedNext());
+        };
+
+        return self.peeked_tokens_buffer.items[0..len];
     }
 
     pub fn consumeIf(self: *Stream, tag: token.Tag) Error!bool {

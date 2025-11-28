@@ -149,11 +149,6 @@ pub const ScriptExecutor = struct {
                     else => {},
                 }
             }
-
-            switch (stmt.*) {
-                .binding_decl => |decl| try self.syncContextForLet(options, decl),
-                else => {},
-            }
         }
 
         return 0;
@@ -201,60 +196,6 @@ pub const ScriptExecutor = struct {
         const s = try self.allocator.alloc(u8, 1);
         s[0] = if (literal.value) '1' else '0';
         return s;
-    }
-
-    fn syncContextForLet(self: *ScriptExecutor, options: ExecuteOptions, decl: ast.BindingDecl) BindingError!void {
-        const pattern = decl.pattern.*;
-        switch (pattern) {
-            .identifier => |identifier| try self.syncIdentifierBinding(options, identifier.name, decl.is_mutable),
-            else => {},
-        }
-    }
-
-    fn syncIdentifierBinding(
-        self: *ScriptExecutor,
-        options: ExecuteOptions,
-        name: []const u8,
-        is_mutable: bool,
-    ) BindingError!void {
-        const binding_ref = self.scopes.lookup(name) orelse return;
-        const value = binding_ref.value.*;
-
-        switch (value) {
-            .string => |buffer| {
-                options.context.declareStringBinding(name, buffer, is_mutable) catch |err| {
-                    if (err == BindingError.DuplicateBinding) return;
-                    return err;
-                };
-            },
-            else => {},
-        }
-    }
-
-    fn renderBindingError(
-        self: *ScriptExecutor,
-        stderr: *std.Io.Writer,
-        script_path: []const u8,
-        span: ast.Span,
-        name: []const u8,
-        err: ScriptContext.BindingError,
-    ) !void {
-        _ = self;
-        switch (err) {
-            error.DuplicateBinding => try stderr.print(
-                "{s}:{d}: duplicate binding '{s}'\n",
-                .{ script_path, span.start.line, name },
-            ),
-            error.ImmutableBinding => try stderr.print(
-                "{s}:{d}: cannot reassign immutable binding '{s}'\n",
-                .{ script_path, span.start.line, name },
-            ),
-            error.TypeMismatch => try stderr.print(
-                "{s}:{d}: binding '{s}' has incompatible type\n",
-                .{ script_path, span.start.line, name },
-            ),
-            else => return err,
-        }
     }
 
     fn renderEvaluatorError(

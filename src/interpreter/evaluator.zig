@@ -42,6 +42,8 @@ pub const Evaluator = struct {
             UnsupportedBindingPattern,
             UnsupportedPipelineStage,
             UnsupportedCommandFeature,
+            UnsupportedMemberAccess,
+            MemberNotFound,
             UnknownIdentifier,
             EmptyPipeline,
             InvalidStringCoercion,
@@ -185,6 +187,7 @@ pub const Evaluator = struct {
             .pipeline => |pipeline| try self.evaluatePipeline(scopes, pipeline),
             .block => |block_expr| try self.evaluateBlockExpression(scopes, block_expr),
             .import_expr => |import_expr| try self.evaluateImportExpression(import_expr),
+            .member => |member_expr| try self.evaluateMemberExpression(scopes, member_expr),
             else => Error.UnsupportedExpression,
         };
     }
@@ -265,6 +268,34 @@ pub const Evaluator = struct {
         document.exitCode = exitCode;
 
         return .{ .scope = &executor.scopes };
+    }
+
+    fn evaluateMemberExpression(
+        self: *Evaluator,
+        scopes: *ScopeStack,
+        member: ast.MemberExpr,
+    ) Error!Value {
+        var object = try self.evaluateExpression(scopes, member.object);
+        defer object.deinit(self.allocator);
+
+        switch (object) {
+            .void, .boolean, .integer, .float, .string => return Error.UnsupportedMemberAccess,
+            .process_handle => |p| {
+                if (std.mem.eql(u8, member.member.name, "stdout")) {
+                    return .{ .string = try self.allocator.dupe(u8, p.stdoutBytes()) };
+                } else if (std.mem.eql(u8, member.member.name, "stderr")) {
+                    return .{ .string = try self.allocator.dupe(u8, p.stderrBytes()) };
+                } else if (std.mem.eql(u8, member.member.name, "exitCode")) {
+                    return .{ .integer = p.status.exit_code.? };
+                } else {
+                    return Error.MemberNotFound;
+                }
+            },
+            .scope => |s| {
+                const ref = s.lookup(member.member.name) orelse return Error.MemberNotFound;
+                return ref.value.clone(self.allocator);
+            },
+        }
     }
 
     fn getCachedDocument(self: *Evaluator, importer: []const u8, moduleName: []const u8) Error!*Document {

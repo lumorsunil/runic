@@ -1,4 +1,13 @@
 # lib.rn
 
 const name = echo "lib"
-echo "hello from ${name}"
+const surname = ".rn"
+const fullname = echo "${name.stdout} ${surname}"
+const again = echo "${name}"
+
+echo "hello from ${fullname}"
+echo "hello again ${again}"
+
+fn hello() void {
+  echo "hello from ${fullname}"
+}

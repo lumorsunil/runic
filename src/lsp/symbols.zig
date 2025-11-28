@@ -40,15 +40,15 @@ pub fn collectSymbols(
             .return_stmt, .expression => {
                 // Does not produce symbols
             },
-            .binding_decl => |let_decl| {
-                switch (let_decl.pattern.*) {
+            .binding_decl => |binding_decl| {
+                switch (binding_decl.pattern.*) {
                     .discard => {},
                     .record, .tuple => {
                         // Not Yet Implemented
                     },
                     .identifier => |identifier| {
                         const name = identifier.name;
-                        // const initializer = let_decl.initializer.span().sliceFrom(contents);
+                        // const initializer = binding_decl.initializer.span().sliceFrom(contents);
 
                         try appendSymbol(allocator, list, .variable, name, detail);
                     },

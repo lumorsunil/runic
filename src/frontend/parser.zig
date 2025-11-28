@@ -150,12 +150,25 @@ pub fn Parser(
             return try self.stream.peek();
         }
 
+        fn peekSlice(self: *Self, len: usize) ![]const token.Token {
+            return try self.stream.peekSlice(len);
+        }
+
         fn currentToken(self: Self) ?token.Token {
             return self.stream.current;
         }
 
         fn peekedToken(self: Self) ?token.Token {
-            return self.stream.peeked;
+            if (self.stream.peeked_tokens_buffer.items.len == 0) return null;
+            return self.stream.peeked_tokens_buffer.items[0];
+        }
+
+        fn takeSnapshot(self: *Self) lexer.Stream {
+            return self.stream.snapshot();
+        }
+
+        fn restoreSnapshot(self: *Self, snapshot: lexer.Stream) void {
+            return self.stream.restore(snapshot);
         }
 
         fn currentTokenLocation(self: Self) ?token.Location {
@@ -198,7 +211,7 @@ pub fn Parser(
             self.clearExpectedTokens();
             self.path = path;
             self.source = try getSource(self.ctx, path);
-            self.stream = .init(self.arena.allocator(), self.source);
+            self.stream = try .init(self.arena.allocator(), self.source);
             const statements = try self.parseStatementsUntil(.eof);
 
             const script = ast.Script{
@@ -217,7 +230,7 @@ pub fn Parser(
 
             self.clearExpectedTokens();
             self.source = source;
-            self.stream = .init(self.arena.allocator(), source);
+            self.stream = try .init(self.arena.allocator(), source);
             // self.currentDocument = try self.arena.allocator().create(Document);
             // self.currentDocument.* = .{
             //     .source = source,
@@ -239,6 +252,19 @@ pub fn Parser(
             defer breadcrumb.end();
 
             self.clearExpectedTokens();
+
+            // (a.b).c
+            //
+            // return switch (try self.oneOf(.{
+            //     parseMemberAccessExpression,
+            //     parseImportExpression,
+            //     parseIdentifierExpression,
+            //     parseIfExpression,
+            //     parsePrimaryExpression,
+            // })) {
+            //     inline else => |r| r,
+            // };
+
             const next = try self.peekToken();
 
             return switch (next.tag) {
@@ -249,27 +275,89 @@ pub fn Parser(
             };
         }
 
+        // .{ parseInt, parseString } == .{ .@"0" = parseInt, .@"1" = parseString }
+        // union enum { @"0": i64, @"1": []const u8 }
+        fn OneOf(comptime Parsers: type) type {
+            var fields: []const std.builtin.Type.UnionField = &.{};
+
+            for (std.meta.fields(Parsers)) |field| {
+                const ReturnType = @typeInfo(field.type).@"fn".return_type orelse void;
+                const Payload = @typeInfo(ReturnType).error_union.payload;
+                fields = fields ++ [_]std.builtin.Type.UnionField{
+                    .{
+                        .type = Payload,
+                        .name = field.name,
+                        .alignment = @alignOf(Payload),
+                    },
+                };
+            }
+
+            return @Type(.{
+                .@"union" = .{
+                    .layout = .auto,
+                    .tag_type = std.meta.FieldEnum(Parsers),
+                    .fields = fields,
+                    .decls = &.{},
+                },
+            });
+        }
+
+        // TODO: error handling
+        fn oneOf(self: *Self, parsers: anytype) ParseError!OneOf(@TypeOf(parsers)) {
+            var the_error: ParseError = undefined;
+
+            inline for (std.meta.fields(@TypeOf(parsers))) |field| {
+                const parser = @field(parsers, field.name);
+                const snapshot = self.takeSnapshot();
+
+                if (parser(self)) |result| {
+                    return @unionInit(OneOf(@TypeOf(parsers)), field.name, result);
+                } else |err| {
+                    the_error = err;
+                    self.restoreSnapshot(snapshot);
+                }
+            }
+
+            return the_error;
+        }
+
+        fn parseMemberAccessExpression(self: *Self) ParseError!*ast.Expression {
+            const breadcrumb = try self.createBreadcrumb("parseMemberAccessExpression");
+            defer breadcrumb.end();
+        }
+
         fn parseIdentifierExpression(self: *Self) ParseError!*ast.Expression {
             const breadcrumb = try self.createBreadcrumb("parseIdentifierExpression");
             defer breadcrumb.end();
 
-            // const snapshot = self.stream.snapshot();
-            // const identifier = try self.nextToken();
-            // const next_token = try self.peekToken();
-            // self.stream.restore(snapshot);
+            const p = try self.peekSlice(2);
+            const identifier = p[0];
+            const next_token = p[1];
+
+            if (isExprTerminator(next_token.tag)) {
+                return try self.parsePipeline();
+            }
 
             // TODO: Support assignments and other expressions that start with an identifier
-            // switch (next_token.tag) {
-            //     .r_paren, .r_bracket, .r_brace, .comma, .newline, .eof => {
-            //         return self.allocExpression(.{ .identifier = .{
-            //             .name = identifier.lexeme,
-            //             .span = identifier.span,
-            //         } });
-            //     },
-            //     else => {},
-            // }
+            switch (next_token.tag) {
+                .dot => {
+                    _ = try self.nextToken();
+                    _ = try self.nextToken();
+                    const accessor = try self.expectTokenTag(.identifier);
+                    const object = try self.allocExpression(.{
+                        .identifier = .{ .name = identifier.lexeme, .span = identifier.span },
+                    });
 
-            return try self.parsePipeline();
+                    return try self.allocExpression(.{
+                        .member = .{
+                            .object = object,
+                            .member = .{ .name = accessor.lexeme, .span = accessor.span },
+                            .span = identifier.span.endAt(accessor.span),
+                        },
+                    });
+                },
+                else => return try self.parsePipeline(),
+            }
         }
 
         fn parsePipeline(self: *Self) ParseError!*ast.Expression {
@@ -310,6 +398,13 @@ pub fn Parser(
             }
         }
 
+        fn isExprTerminator(tag: token.Tag) bool {
+            return switch (tag) {
+                .r_paren, .r_bracket, .r_brace, .comma, .pipe, .pipe_pipe, .amp_amp, .amp, .string_interp_end, .newline => true,
+                else => false,
+            };
+        }
+
         fn parsePipelineStage(self: *Self) ParseError!ast.PipelineStage {
             const breadcrumb = try self.createBreadcrumb("parsePipelineStage");
             defer breadcrumb.end();
@@ -324,43 +419,44 @@ pub fn Parser(
             while (true) {
                 const next_token = try self.peekToken();
 
-                switch (next_token.tag) {
-                    .r_paren, .r_bracket, .r_brace, .comma, .pipe, .pipe_pipe, .amp_amp, .amp, .string_interp_end, .newline => {
-                        if (args.items.len == 0) {
-                            return .{
-                                .role = .expression,
-                                .payload = .{
-                                    .expression = try self.allocExpression(.{
-                                        .identifier = .{
-                                            .name = identifier.lexeme,
-                                            .span = identifier.span,
-                                        },
-                                    }),
-                                },
-                                .span = identifier.span,
-                            };
-                        }
+                if (isExprTerminator(next_token.tag)) {
+                    if (args.items.len == 0) {
                         return .{
-                            .role = .command,
+                            .role = .expression,
                             .payload = .{
-                                .command = .{
-                                    .name = .{
-                                        .word = .{
-                                            .text = identifier.lexeme,
-                                            .span = identifier.span,
-                                        },
+                                .expression = try self.allocExpression(.{
+                                    .identifier = .{
+                                        .name = identifier.lexeme,
+                                        .span = identifier.span,
                                     },
-                                    .args = try self.copyToArena(ast.CommandPart, args.items),
-                                    .background = false,
-                                    .capture = null,
-                                    .span = identifier.span.endAt(last_token.span),
-                                    .env_assignments = &.{},
-                                    .redirects = &.{},
-                                },
+                                }),
                             },
-                            .span = identifier.span.endAt(last_token.span),
+                            .span = identifier.span,
                         };
-                    },
+                    }
+                    return .{
+                        .role = .command,
+                        .payload = .{
+                            .command = .{
+                                .name = .{
+                                    .word = .{
+                                        .text = identifier.lexeme,
+                                        .span = identifier.span,
+                                    },
+                                },
+                                .args = try self.copyToArena(ast.CommandPart, args.items),
+                                .background = false,
+                                .capture = null,
+                                .span = identifier.span.endAt(last_token.span),
+                                .env_assignments = &.{},
+                                .redirects = &.{},
+                            },
+                        },
+                        .span = identifier.span.endAt(last_token.span),
+                    };
+                }
+
+                switch (next_token.tag) {
                     .string_start => {
                         const string_literal = try self.parseStringLiteral();
                         try args.append(self.allocator, .{ .string = string_literal });
