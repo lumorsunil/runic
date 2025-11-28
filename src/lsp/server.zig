@@ -775,6 +775,7 @@ const Document = struct {
         allocator.free(self.text);
         for (self.symbols.items) |*entry| entry.deinit(allocator);
         self.symbols.deinit(allocator);
+        if (self.parser) |*p| p.deinit();
         self.* = undefined;
     }
 
@@ -808,6 +809,7 @@ const Document = struct {
         if (self.parser) |*p| p.deinit();
 
         // var parser = runic.parser.Parser.init(allocator, self.text);
+        self.ast = null;
         self.parser = Parser.init(allocator, workspace.documents);
         // defer parser.deinit();
         const script = try parseFile(allocator, &self.diagnostics, &self.parser.?, self.path) orelse return;
