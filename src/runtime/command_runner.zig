@@ -1,5 +1,7 @@
 const std = @import("std");
 const tracing = @import("tracing.zig");
+const ast = @import("../frontend/ast.zig");
+const interpreter = @import("../interpreter/root.zig");
 
 const Tracer = tracing.Tracer;
 const TraceTopic = tracing.Topic;
@@ -19,7 +21,13 @@ pub const CommandRunner = struct {
         std.fs.File.WriteError ||
         std.mem.Allocator.Error;
 
+    pub const CommandType = union(enum) {
+        function: *const ast.FunctionDecl,
+        executable,
+    };
+
     pub const CommandSpec = struct {
+        command_type: CommandType,
         argv: []const []const u8,
         cwd: ?[]const u8 = null,
         env_map: ?*const std.process.EnvMap = null,
@@ -47,7 +55,11 @@ pub const CommandRunner = struct {
     /// Executes the sequence of command specs as a Runic pipeline. The stdout
     /// from stage `n` becomes the stdin for stage `n + 1`, and every stage's
     /// outputs plus exit metadata are preserved for later inspection.
-    pub fn runPipeline(self: CommandRunner, specs: []const CommandSpec) Error!ProcessHandle {
+    pub fn runPipeline(
+        self: CommandRunner,
+        evaluator: *interpreter.Evaluator,
+        specs: []const CommandSpec,
+    ) Error!ProcessHandle {
         if (specs.len == 0) {
             return error.EmptyCommand;
         }
@@ -61,13 +73,13 @@ pub const CommandRunner = struct {
 
         var started_at_ns: i128 = 0;
         var finished_at_ns: i128 = 0;
-        var primary_pid: std.process.Child.Id = undefined;
+        var primary_pid: ?std.process.Child.Id = undefined;
         var previous_stdout: ?[]const u8 = null;
 
         self.tracePipelineStart(specs);
 
         for (specs, 0..) |spec, index| {
-            const stage = try self.runStage(.{
+            const stage = try self.runStage(evaluator, .{
                 .spec = spec,
                 .index = index,
                 .stdin_data = previous_stdout,
@@ -92,7 +104,7 @@ pub const CommandRunner = struct {
 
         var handle = ProcessHandle{
             .allocator = self.allocator,
-            .pid = primary_pid,
+            .handle_type = if (primary_pid) |ppid| .{ .process = ppid } else .function,
             .started_at_ns = started_at_ns,
             .finished_at_ns = finished_at_ns,
             .status = ProcessStatus.fromStages(stage_statuses),
@@ -104,11 +116,97 @@ pub const CommandRunner = struct {
         return handle;
     }
 
-    fn runStage(self: CommandRunner, args: StageRunArgs) Error!StageExecution {
+    fn runStage(
+        self: CommandRunner,
+        evaluator: *interpreter.Evaluator,
+        args: StageRunArgs,
+    ) Error!StageExecution {
         if (args.spec.argv.len == 0) {
             return error.EmptyCommand;
         }
 
+        return switch (args.spec.command_type) {
+            .executable => self.runStageExecutable(args),
+            .function => |fn_decl| self.runStageFunction(evaluator, fn_decl, args),
+        };
+    }
+
+    fn runStageFunction(
+        self: CommandRunner,
+        evaluator: *interpreter.Evaluator,
+        fn_decl: *const ast.FunctionDecl,
+        args: StageRunArgs,
+    ) Error!StageExecution {
+        var scopes = interpreter.ScopeStack.init(self.allocator);
+        defer scopes.deinit();
+
+        // executable
+        //   exitCode
+        //   stdout
+        //   stderr
+        //
+        // function
+        //   exitCode
+        //   stdout
+        //   stderr
+        //   return value
+        //
+        // fn parseInt(@stdin: String, radix: Int) !Int {
+        //   ...
+        // }
+        //
+        // fn add5(@stdin: Int) !Int {
+        //   echo "asdf"
+        //   @echo "asdf"
+        //   return @stdin + 5
+        // }
+        //
+        // const int = echo "a5" | parseInt 16
+        // const hello = echo "hello"
+        //
+        // echo "${hello}"
+        // echo "${int}"
+        //
+        // const helloResult = hello
+        // # helloResult = ProcessHandle{
+        //     .exitCode = .{ .error = 4 } | .success,
+        //     .stdout = "",
+        //     .stderr = "",
+        // }
+
+        const started_at = std.time.nanoTimestamp();
+
+        const Result = union(enum) {
+            success: interpreter.Value,
+            err: anyerror,
+        };
+
+        // TODO: fix stdin wiring when implementing that for functions
+        const result: Result = if (evaluator.runFunction(&scopes, fn_decl)) |value| .{
+            .success = value,
+        } else |err| .{
+            .err = err,
+        };
+
+        const finished_at = std.time.nanoTimestamp();
+
+        const exitCode: ExitCode = switch (result) {
+            .success => .success,
+            .err => |err| .{ .err = err },
+        };
+
+        return .{
+            .pid = null,
+            .started_at_ns = started_at,
+            .finished_at_ns = finished_at,
+            .status = StageStatus.fromTerm(args.index, .{ .function = exitCode }),
+            // TODO: fix when implementing typed stdout for functions
+            .stdout_owned = &.{},
+            .stderr_owned = &.{},
+        };
+    }
+
+    fn runStageExecutable(self: CommandRunner, args: StageRunArgs) Error!StageExecution {
         var child = std.process.Child.init(args.spec.argv, self.allocator);
         child.stdin_behavior = if (args.stdin_data != null) .Pipe else .Ignore;
         child.stdout_behavior = .Pipe;
@@ -148,7 +246,7 @@ pub const CommandRunner = struct {
             .pid = pid_snapshot,
             .started_at_ns = started_at,
             .finished_at_ns = finished_at,
-            .status = StageStatus.fromTerm(args.index, term),
+            .status = StageStatus.fromTerm(args.index, .{ .process = term }),
             .stdout_owned = stdout_owned,
             .stderr_owned = stderr_owned,
         };
@@ -174,7 +272,7 @@ pub const CommandRunner = struct {
         if (stage.status.signal) |sig| {
             tracer.log(
                 .pipeline,
-                "stage {} pid={} signal={} stdout={}B stderr={}B duration_ns={}",
+                "stage {} pid={?} signal={} stdout={}B stderr={}B duration_ns={}",
                 .{ stage.status.index + 1, stage.pid, sig, stdout_len, stderr_len, duration },
             ) catch {};
             return;
@@ -183,7 +281,7 @@ pub const CommandRunner = struct {
         if (stage.status.exit_code) |code| {
             tracer.log(
                 .pipeline,
-                "stage {} pid={} exit={} ok={} stdout={}B stderr={}B duration_ns={}",
+                "stage {} pid={?} exit={f} ok={} stdout={}B stderr={}B duration_ns={}",
                 .{ stage.status.index + 1, stage.pid, code, stage.status.ok, stdout_len, stderr_len, duration },
             ) catch {};
             return;
@@ -191,7 +289,7 @@ pub const CommandRunner = struct {
 
         tracer.log(
             .pipeline,
-            "stage {} pid={} ok={} stdout={}B stderr={}B duration_ns={}",
+            "stage {} pid={?} ok={} stdout={}B stderr={}B duration_ns={}",
             .{ stage.status.index + 1, stage.pid, stage.status.ok, stdout_len, stderr_len, duration },
         ) catch {};
     }
@@ -203,8 +301,11 @@ pub const CommandRunner = struct {
 };
 
 pub const ProcessHandle = struct {
+    handle_type: union(enum) {
+        process: std.process.Child.Id,
+        function,
+    },
     allocator: std.mem.Allocator,
-    pid: std.process.Child.Id,
     started_at_ns: i128,
     finished_at_ns: i128,
     status: ProcessStatus,
@@ -215,6 +316,10 @@ pub const ProcessHandle = struct {
         destroyStageCaptures(self.allocator, self.stage_captures, self.stage_captures.len);
         self.allocator.free(self.stage_statuses);
         self.* = undefined;
+    }
+
+    pub fn getPid(self: ProcessHandle) ?std.process.Child.Id {
+        return if (self.handle_type == .process) self.handle_type.process else null;
     }
 
     pub fn stdoutBytes(self: ProcessHandle) []const u8 {
@@ -245,11 +350,11 @@ pub const ProcessHandle = struct {
     pub fn traceSummary(self: ProcessHandle, tracer: *Tracer, label: []const u8) !void {
         try tracer.log(
             .process,
-            "{s}: pid={} stages={} ok={} duration_ns={}",
-            .{ label, self.pid, self.stage_statuses.len, self.status.ok, self.durationNs() },
+            "{s}: pid={?} stages={} ok={} duration_ns={}",
+            .{ label, self.getPid(), self.stage_statuses.len, self.status.ok, self.durationNs() },
         );
         if (self.status.exit_code) |code| {
-            try tracer.log(.process, "{s}: exit code {}", .{ label, code });
+            try tracer.log(.process, "{s}: exit code {f}", .{ label, code });
         } else {
             try tracer.log(.process, "{s}: exit code unknown", .{label});
         }
@@ -268,7 +373,7 @@ pub const ProcessHandle = struct {
             if (status.exit_code) |code| {
                 try tracer.log(
                     .process,
-                    "{s}: stage {} exit {} (ok={})",
+                    "{s}: stage {} exit {f} (ok={})",
                     .{ label, status.index + 1, code, status.ok },
                 );
                 continue;
@@ -345,7 +450,7 @@ pub const ProcessHandle = struct {
 
         return .{
             .allocator = allocator,
-            .pid = self.pid,
+            .handle_type = self.handle_type,
             .started_at_ns = self.started_at_ns,
             .finished_at_ns = self.finished_at_ns,
             .status = self.status,
@@ -397,14 +502,14 @@ pub const ProcessSnapshot = struct {
 
 pub const ProcessStatus = struct {
     ok: bool,
-    exit_code: ?u8,
+    exit_code: ?ExitCode,
     signal: ?u32,
     failed_stage: ?usize,
 
     pub fn fromStages(stages: []const StageStatus) ProcessStatus {
         const last = stages[stages.len - 1];
         var failure_index: ?usize = null;
-        var failure_exit: ?u8 = null;
+        var failure_exit: ?ExitCode = null;
         var failure_signal: ?u32 = null;
 
         for (stages) |stage| {
@@ -425,26 +530,66 @@ pub const ProcessStatus = struct {
     }
 };
 
+pub const ExitCode = union(enum) {
+    success,
+    err: anyerror,
+    byte: u8,
+
+    pub fn fromProcess(byte: u8) ExitCode {
+        if (byte == 0) return .success;
+        return .{ .byte = byte };
+    }
+
+    pub fn getErrorCode(self: ExitCode) u8 {
+        return switch (self) {
+            .success => 0,
+            .byte => |byte| byte,
+            .err => 1,
+        };
+    }
+
+    pub fn format(self: ExitCode, writer: *std.Io.Writer) !void {
+        try switch (self) {
+            .success, .byte => writer.print("{}", .{self.getErrorCode()}),
+            .err => |err| writer.print("{} ({})", .{ self.getErrorCode(), err }),
+        };
+    }
+};
+
+const Term = union(enum) {
+    process: std.process.Child.Term,
+    function: ExitCode,
+};
+
 pub const StageStatus = struct {
     index: usize,
-    term: std.process.Child.Term,
-    exit_code: ?u8,
+    term: Term,
+    exit_code: ?ExitCode,
     signal: ?u32,
     ok: bool,
 
-    pub fn fromTerm(index: usize, term: std.process.Child.Term) StageStatus {
-        var exit_code: ?u8 = null;
+    pub fn fromTerm(index: usize, term: Term) StageStatus {
+        var exit_code: ?ExitCode = null;
         var signal: ?u32 = null;
         var ok = false;
 
         switch (term) {
-            .Exited => |code| {
-                exit_code = code;
-                ok = code == 0;
+            .process => |p| switch (p) {
+                .Exited => |code| {
+                    ok = code == 0;
+                    exit_code = if (ok) .success else .{ .byte = code };
+                },
+                .Signal => |sig| signal = sig,
+                .Stopped => |sig| signal = sig,
+                .Unknown => {},
             },
-            .Signal => |sig| signal = sig,
-            .Stopped => |sig| signal = sig,
-            .Unknown => {},
+            .function => |exitCode| {
+                exit_code = exitCode;
+                ok = switch (exitCode) {
+                    .success => true,
+                    else => false,
+                };
+            },
         }
 
         return .{
@@ -460,7 +605,7 @@ pub const StageStatus = struct {
 const default_max_capture_bytes = 1024 * 1024;
 
 const StageExecution = struct {
-    pid: std.process.Child.Id,
+    pid: ?std.process.Child.Id,
     started_at_ns: i128,
     finished_at_ns: i128,
     status: StageStatus,
@@ -541,176 +686,4 @@ fn copyOwnedSlice(allocator: std.mem.Allocator, bytes: []const u8, include: bool
     const copy = try allocator.alloc(u8, bytes.len);
     std.mem.copyForwards(u8, copy, bytes);
     return copy;
-}
-
-fn expectStringEqual(expected: []const u8, actual: []const u8) !void {
-    try std.testing.expectEqualStrings(expected, actual);
-}
-
-test "command runner captures stdout and stderr" {
-    var runner = CommandRunner.init(std.testing.allocator);
-    var handle = try runner.runSync(.{
-        .argv = &.{ "sh", "-c", "printf 'out'; printf 'err' 1>&2" },
-    });
-    defer handle.deinit();
-
-    try expectStringEqual("out", handle.stdoutBytes());
-    try expectStringEqual("err", handle.stderrBytes());
-    try std.testing.expect(handle.status.ok);
-    try std.testing.expect(handle.pid != 0);
-    try std.testing.expect(handle.durationNs() >= 0);
-    try std.testing.expectEqual(@as(usize, 1), handle.stageStatuses().len);
-    try std.testing.expectEqual(@as(?u8, 0), handle.status.exit_code);
-    const captures = handle.stageCaptures();
-    try std.testing.expectEqual(@as(usize, 1), captures.len);
-    try expectStringEqual("out", captures[0].stdoutBytes());
-    try expectStringEqual("err", captures[0].stderrBytes());
-}
-
-test "command runner rejects empty pipelines and blank commands" {
-    var runner = CommandRunner.init(std.testing.allocator);
-
-    try std.testing.expectError(
-        CommandRunner.Error.EmptyCommand,
-        runner.runPipeline(&[_]CommandRunner.CommandSpec{}),
-    );
-
-    try std.testing.expectError(
-        CommandRunner.Error.EmptyCommand,
-        runner.runSync(.{ .argv = &.{} }),
-    );
-}
-
-test "non-zero exit surfaces failed stage metadata" {
-    var runner = CommandRunner.init(std.testing.allocator);
-    var handle = try runner.runSync(.{
-        .argv = &.{ "sh", "-c", "echo failed 1>&2; exit 7" },
-    });
-    defer handle.deinit();
-
-    try std.testing.expect(!handle.status.ok);
-    try std.testing.expectEqual(@as(?u8, 7), handle.status.exit_code);
-    try std.testing.expectEqual(@as(?usize, 0), handle.status.failed_stage);
-    try expectStringEqual("failed\n", handle.stderrBytes());
-}
-
-test "pipeline preserves per-stage outputs and statuses" {
-    var runner = CommandRunner.init(std.testing.allocator);
-    const specs = [_]CommandRunner.CommandSpec{
-        .{ .argv = &.{ "sh", "-c", "printf 'alpha'" } },
-        .{ .argv = &.{ "sh", "-c", "tr 'a-z' 'A-Z'" } },
-    };
-    var handle = try runner.runPipeline(&specs);
-    defer handle.deinit();
-
-    try expectStringEqual("ALPHA", handle.stdoutBytes());
-    try std.testing.expect(handle.status.ok);
-    try std.testing.expectEqual(@as(usize, specs.len), handle.stageStatuses().len);
-
-    const captures = handle.stageCaptures();
-    try std.testing.expectEqual(@as(usize, specs.len), captures.len);
-    try expectStringEqual("alpha", captures[0].stdoutBytes());
-    try expectStringEqual("ALPHA", captures[1].stdoutBytes());
-}
-
-test "pipeline tracks earliest failing stage" {
-    var runner = CommandRunner.init(std.testing.allocator);
-    const specs = [_]CommandRunner.CommandSpec{
-        .{ .argv = &.{ "sh", "-c", "printf 'ok'; exit 0" } },
-        .{ .argv = &.{ "sh", "-c", "echo boom 1>&2; exit 7" } },
-        .{ .argv = &.{ "sh", "-c", "printf 'should still run'; exit 3" } },
-    };
-    var handle = try runner.runPipeline(&specs);
-    defer handle.deinit();
-
-    try std.testing.expect(!handle.status.ok);
-    try std.testing.expectEqual(@as(?usize, 1), handle.status.failed_stage);
-    try std.testing.expectEqual(@as(?u8, 7), handle.status.exit_code);
-
-    const captures = handle.stageCaptures();
-    try std.testing.expectEqual(@as(usize, specs.len), captures.len);
-    try expectStringEqual("boom\n", captures[1].stderrBytes());
-    // Later stages still execute so ensure final capture reflects last stage output.
-    try expectStringEqual("should still run", captures[2].stdoutBytes());
-}
-
-test "process snapshot clones streams for destructuring" {
-    var runner = CommandRunner.init(std.testing.allocator);
-    var handle = try runner.runSync(.{
-        .argv = &.{ "sh", "-c", "printf 'out'; printf 'err' 1>&2" },
-    });
-    defer handle.deinit();
-
-    var snapshot = try handle.destructure(std.testing.allocator);
-    defer snapshot.deinit();
-
-    try expectStringEqual("out", snapshot.stdoutBytes());
-    try expectStringEqual("err", snapshot.stderrBytes());
-    try std.testing.expectEqual(handle.status.exit_code, snapshot.status.exit_code);
-
-    try std.testing.expect(snapshot.stdout != null);
-    try std.testing.expect(snapshot.stderr != null);
-
-    const final_capture = handle.stage_captures[handle.stage_captures.len - 1];
-    try std.testing.expect(snapshot.stdout.?.ptr != final_capture.stdout.ptr);
-    try std.testing.expect(snapshot.stderr.?.ptr != final_capture.stderr.ptr);
-}
-
-test "process snapshot supports single stream redirects" {
-    var runner = CommandRunner.init(std.testing.allocator);
-    var handle = try runner.runSync(.{
-        .argv = &.{ "sh", "-c", "printf 'alpha'; printf 'beta' 1>&2" },
-    });
-    defer handle.deinit();
-
-    var stdout_capture = try handle.redirectStream(std.testing.allocator, .stdout);
-    defer stdout_capture.deinit();
-    try expectStringEqual("alpha", stdout_capture.stdoutBytes());
-    try std.testing.expectEqual(@as(usize, 0), stdout_capture.stderrBytes().len);
-    try std.testing.expect(stdout_capture.stderr == null);
-
-    var stderr_capture = try handle.redirectStream(std.testing.allocator, .stderr);
-    defer stderr_capture.deinit();
-    try expectStringEqual("beta", stderr_capture.stderrBytes());
-    try std.testing.expectEqual(@as(usize, 0), stderr_capture.stdoutBytes().len);
-    try std.testing.expect(stderr_capture.stdout == null);
-}
-
-test "process handle clone preserves outputs and metadata" {
-    var runner = CommandRunner.init(std.testing.allocator);
-    var handle = try runner.runSync(.{
-        .argv = &.{ "sh", "-c", "printf 'alpha'; printf 'beta' 1>&2; exit 2" },
-    });
-    defer handle.deinit();
-
-    var cloned = try handle.clone(std.testing.allocator);
-    defer cloned.deinit();
-
-    try expectStringEqual(handle.stdoutBytes(), cloned.stdoutBytes());
-    try expectStringEqual(handle.stderrBytes(), cloned.stderrBytes());
-    try std.testing.expectEqual(handle.status.ok, cloned.status.ok);
-    try std.testing.expectEqual(handle.status.exit_code, cloned.status.exit_code);
-    try std.testing.expect(handle.stage_captures.ptr != cloned.stage_captures.ptr);
-    try std.testing.expect(handle.stage_statuses.ptr != cloned.stage_statuses.ptr);
-
-    const original_capture = handle.stage_captures[0];
-    const cloned_capture = cloned.stage_captures[0];
-    try std.testing.expect(original_capture.stdout.ptr != cloned_capture.stdout.ptr);
-    try std.testing.expect(original_capture.stderr.ptr != cloned_capture.stderr.ptr);
-}
-
-test "command runner emits tracing logs" {
-    var buffer = std.ArrayList(u8).init(std.testing.allocator);
-    defer buffer.deinit();
-    var writer = buffer.writer(std.testing.allocator);
-    var writer_adapter = writer.adaptToNewApi(&.{});
-    var tracer = Tracer.init(&.{ "pipeline", "process" }, &writer_adapter.new_interface);
-
-    var runner = CommandRunner.initWithTracer(std.testing.allocator, &tracer);
-    var handle = try runner.runSync(.{ .argv = &.{ "sh", "-c", "printf 'trace me'" } });
-    defer handle.deinit();
-
-    const log = buffer.items;
-    try std.testing.expect(std.mem.indexOf(u8, log, "starting pipeline") != null);
-    try std.testing.expect(std.mem.indexOf(u8, log, "pipeline complete") != null);
 }

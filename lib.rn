@@ -10,4 +10,5 @@ echo "hello again ${again}"
 
 fn hello() void {
   echo "hello from ${fullname}"
+  echo "hello from ${fullname}"
 }

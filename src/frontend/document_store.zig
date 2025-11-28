@@ -4,6 +4,7 @@ const ast = @import("ast.zig");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 const ScriptExecutor = @import("../interpreter/script_executor.zig").ScriptExecutor;
+const command_runner = @import("../runtime/command_runner.zig");
 
 const MAX_DOCUMENT_LEN = 4 * 1024 * 1024;
 
@@ -13,7 +14,7 @@ pub const Document = struct {
     ast: ?ast.Script = null,
     parser: Parser,
     script_executor: ?ScriptExecutor = null,
-    exitCode: ?u8 = null,
+    exitCode: ?command_runner.ExitCode = null,
 };
 
 /// Made to be used by an arena allocator
@@ -73,7 +74,7 @@ pub const DocumentStore = struct {
         return document;
     }
 
-    fn resolvePath(self: *DocumentStore, path: []const u8) ![]const u8 {
+    pub fn resolvePath(self: *DocumentStore, path: []const u8) ![]const u8 {
         if (std.fs.path.isAbsolute(path)) return self.arena.allocator().dupe(u8, path);
         return std.fs.cwd().realpathAlloc(self.arena.allocator(), path) catch |err| {
             switch (err) {

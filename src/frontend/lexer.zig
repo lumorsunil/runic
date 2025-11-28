@@ -14,6 +14,7 @@ pub const Error = std.mem.Allocator.Error || std.Io.Writer.Error || error{
 };
 
 pub const Lexer = struct {
+    file: []const u8,
     source: []const u8,
     index: usize = 0,
     line: usize = 1,
@@ -65,8 +66,9 @@ pub const Lexer = struct {
         }
     };
 
-    pub fn init(allocator_: std.mem.Allocator, source: []const u8) !Lexer {
+    pub fn init(allocator_: std.mem.Allocator, file: []const u8, source: []const u8) !Lexer {
         return .{
+            .file = file,
             .arena = .init(allocator_),
             .source = source,
             .context_stack = try .initCapacity(allocator_, MAX_CONTEXT_STACK),
@@ -590,6 +592,7 @@ pub const Lexer = struct {
 
     fn location(self: *Lexer) token.Location {
         return .{
+            .file = self.file,
             .line = self.line,
             .column = self.column,
             .offset = self.index,
@@ -646,8 +649,8 @@ pub const Stream = struct {
 
     pub const max_guard_depth: usize = max_token_consumption_depth;
 
-    pub fn init(allocator: std.mem.Allocator, source: []const u8) !Stream {
-        return .{ .lexer = try .init(allocator, source) };
+    pub fn init(allocator: std.mem.Allocator, file: []const u8, source: []const u8) !Stream {
+        return .{ .lexer = try .init(allocator, file, source) };
     }
 
     pub fn deinit(self: Stream) void {

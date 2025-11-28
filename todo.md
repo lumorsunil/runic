@@ -1,8 +1,14 @@
 # todo
 
+- [x] functions
+  - [x] lexer
+  - [x] ast
+  - [x] executor
+  - [x] bug: cannot call functions more than one (thanks ai)
+  - [ ] a lot of things missing (stdin, stdout/stderr capturing and piping, return statements, etc.)
 - [x] lsp didChange support, document diagnostics
-- [ ] lsp now crashes (investigate that we do similar setup as run_script)
-- [ ] imports
+- [x] lsp now crashes (investigate that we do similar setup as run_script)
+- [x] imports
   - [x] struct types
     - [x] f (ast) -> struct type
   - [x] parse imported file
@@ -12,4 +18,4 @@
     - [x] create one script executor for each import that is to be executed
       - [x] pass env map (env map is global, change we get to "sub-shells")
     - [x] cache execution result (module ScopeStack)
-    - [ ] wire up scope to the identifier binding (evaluate an import expression to be the ScopeStack of that module)
+    - [x] wire up scope to the identifier binding (evaluate an import expression to be the ScopeStack of that module)

@@ -1,15 +1,16 @@
 const std = @import("std");
 const utils = @import("main-utils.zig");
 const dispatch = @import("dispatch.zig").dispatch;
+const runic = @import("runic");
 
 pub fn main() !void {
     const exit_code = try mainImpl();
-    if (exit_code != 0) {
-        std.process.exit(exit_code);
+    if (exit_code != .success) {
+        std.process.exit(exit_code.getErrorCode());
     }
 }
 
-fn mainImpl() !u8 {
+fn mainImpl() !runic.command_runner.ExitCode {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer {
         const status = gpa.deinit();
@@ -34,14 +35,14 @@ fn mainImpl() !u8 {
     switch (result) {
         .show_help => {
             try utils.printUsage(stdout);
-            return 0;
+            return .success;
         },
         .usage_error => |message| {
             defer allocator.free(message);
             try stderr.print("error: {s}\n\n", .{message});
             try utils.printUsage(stderr);
             try stderr.flush();
-            return 2;
+            return .fromProcess(2);
         },
         .ready => |config| {
             defer {
@@ -52,5 +53,5 @@ fn mainImpl() !u8 {
         },
     }
 
-    return 0;
+    return .success;
 }

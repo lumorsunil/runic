@@ -3,6 +3,7 @@ const std = @import("std");
 /// Location describes a byte offset inside the original source text alongside
 /// the 1-based line/column pair so diagnostics can point at the exact token.
 pub const Location = struct {
+    file: []const u8,
     line: usize,
     column: usize,
     offset: usize,

@@ -15,7 +15,7 @@ pub fn runScript(
     config: utils.CliConfig,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
-) !u8 {
+) !runic.command_runner.ExitCode {
     var context = ScriptContext.init(allocator);
     defer context.deinit();
 
@@ -24,7 +24,7 @@ pub fn runScript(
 
     var env_map = std.process.getEnvMap(allocator) catch |err| {
         try stderr.print("error: unable to capture environment: {s}\n", .{@errorName(err)});
-        return 1;
+        return .fromProcess(1);
     };
     defer env_map.deinit();
 
@@ -34,7 +34,7 @@ pub fn runScript(
 
     const script_dir = utils.computeScriptDirectory(allocator, script.path) catch |err| {
         try stderr.print("error: unable to resolve script directory: {s}\n", .{@errorName(err)});
-        return 1;
+        return .fromProcess(1);
     };
     defer allocator.free(script_dir);
 
@@ -42,21 +42,23 @@ pub fn runScript(
     var runner = CommandRunner.initWithTracer(allocator, tracer_ptr);
 
     if (config.print_tokens) {
-        return try printTokens(allocator, stdout, stderr, script.path);
+        return .fromProcess(try printTokens(allocator, stdout, stderr, script.path));
     }
 
     var documentStore = DocumentStore.init(allocator);
     defer documentStore.deinit();
     const entryDocument = try documentStore.requestDocument(script.path);
 
-    const script_ast = entryDocument.parser.parseScript(script.path) catch |err| {
+    const resolvedPath = try documentStore.resolvePath(script.path);
+
+    const script_ast = entryDocument.parser.parseScript(resolvedPath) catch |err| {
         handleParseScriptError(&entryDocument.parser, stderr, err) catch |err_| {
             std.log.err("Could not handle error: {}, Original error: {}", .{ err_, err });
         };
-        return 1;
+        return .fromProcess(1);
     };
 
-    parseImports(allocator, stderr, &documentStore, script_ast) catch return 1;
+    parseImports(allocator, stderr, &documentStore, script_ast) catch return .fromProcess(1);
 
     if (config.print_ast) {
         for (documentStore.map.values()) |document| {
@@ -65,35 +67,40 @@ pub fn runScript(
                     "error: failed to print AST for script '{s}': {s}\n",
                     .{ script.path, @errorName(err) },
                 );
-                return 1;
+                return .fromProcess(1);
             };
         }
 
-        return 0;
+        return .success;
     }
+
+    const executeOptions = ScriptExecutor.ExecuteOptions{
+        .script_path = script.path,
+        .stdout = stdout,
+        .stderr = stderr,
+        .context = &context,
+    };
 
     entryDocument.script_executor = ScriptExecutor.initWithRunner(
         allocator,
+        entryDocument.path,
         &runner,
         &env_map,
+        executeOptions,
         &documentStore,
     ) catch |err| {
         try stderr.print(
             "error: failed to initialize script executor: {s}\n",
             .{@errorName(err)},
         );
-        return 1;
+        return .fromProcess(1);
     };
     const executor = &entryDocument.script_executor.?;
 
+    executor.wireCommandBridge();
     try executor.reseedFromContext(&context);
 
-    return try executor.execute(script_ast, .{
-        .script_path = script.path,
-        .stdout = stdout,
-        .stderr = stderr,
-        .context = &context,
-    });
+    return try executor.execute(script_ast, executeOptions);
 }
 
 const StatementExpressionIterator = struct {
@@ -172,9 +179,9 @@ const StatementExpressionIterator = struct {
         switch (statement.*) {
             .error_decl, .bash_block => {},
             .binding_decl => |binding_decl| try self.cursor.appendExpr(binding_decl.initializer),
-            .fn_decl => |fn_decl| {
-                try self.cursor.appendExpr(fn_decl.body.expression);
-                try populateBlockExpr(&self.cursor, fn_decl.body.block);
+            .fn_decl => |fn_decl| switch (fn_decl.body) {
+                .expression => |body_expr| try self.cursor.appendExpr(body_expr),
+                .block => |block| try populateBlockExpr(&self.cursor, block),
             },
             .for_stmt => |for_stmt| {
                 try self.cursor.appendStatements(for_stmt.body.statements);

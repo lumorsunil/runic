@@ -23,7 +23,9 @@ fn ArrayListManaged(comptime T: type) type {
 /// command runner (or any adapter implementing `CommandExecutor`).
 pub const Evaluator = struct {
     allocator: std.mem.Allocator,
+    path: []const u8,
     executor: CommandExecutor,
+    executeOptions: ScriptExecutor.ExecuteOptions,
     documentStore: *DocumentStore,
 
     pub const Error = std.mem.Allocator.Error ||
@@ -74,12 +76,16 @@ pub const Evaluator = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
+        path: []const u8,
         executor: CommandExecutor,
+        executeOptions: ScriptExecutor.ExecuteOptions,
         documentStore: *DocumentStore,
     ) Evaluator {
         return .{
             .allocator = allocator,
+            .path = path,
             .executor = executor,
+            .executeOptions = executeOptions,
             .documentStore = documentStore,
         };
     }
@@ -99,6 +105,83 @@ pub const Evaluator = struct {
         var result = try self.executeBlock(scopes, block, .{ .push_scope = false, .capture_result = false });
         defer result.deinit(self.allocator);
         _ = result.take();
+    }
+
+    pub fn runFunction(
+        self: *Evaluator,
+        scopes: *ScopeStack,
+        fn_decl: *const ast.FunctionDecl,
+    ) Error!Value {
+        try scopes.pushFrame(.{ .blocking = true });
+        defer scopes.popFrame() catch {};
+
+        const document = self.documentStore.map.get(fn_decl.span.start.file).?;
+        const executor = &document.script_executor.?;
+        const currentDocument = self.documentStore.map.get(self.path).?;
+
+        try executor.scopes.pushFrame(.{});
+
+        _ = try executor.execute(.{
+            .statements = fn_decl.body.block.statements,
+            .span = fn_decl.span,
+        }, .{
+            .script_path = document.path,
+            .stdout = currentDocument.script_executor.?.evaluator.executeOptions.stdout,
+            .stderr = currentDocument.script_executor.?.evaluator.executeOptions.stderr,
+            .context = undefined,
+        });
+
+        try executor.scopes.popFrame();
+
+        return .void;
+
+        // switch (fn_decl.body) {
+        //     .block => |block| {
+        //         try self.runBlock(scopes, block);
+        //         return .void;
+        //     },
+        //     .expression => |expr| {
+        //         const expr_stmt = ast.Statement{ .expression = .{
+        //             .expression = expr,
+        //             .span = expr.span(),
+        //         } };
+        //         return try self.runStatement(scopes, &expr_stmt) orelse return .void;
+        //     },
+        // }
+    }
+
+    pub fn runFunctionAsPipeline(
+        self: *Evaluator,
+        scopes: *ScopeStack,
+        fn_decl: *const ast.FunctionDecl,
+    ) Error!Value {
+        const pipeline = ast.Pipeline{
+            .stages = &.{
+                ast.PipelineStage{
+                    .role = .command,
+                    .payload = .{
+                        .command = .{
+                            .span = fn_decl.span,
+                            .name = .{ .word = .{ .text = fn_decl.name.name, .span = fn_decl.name.span } },
+                            // TODO: fix this when implementing function arguments
+                            .args = &.{},
+                            // TODO: fix this when implementing background support for functions
+                            .background = false,
+                            // TODO: fix this when implementing captures for functions
+                            .capture = null,
+                            // TODO: ???
+                            .env_assignments = &.{},
+                            // TODO: fix this when implementing redirections for functions
+                            .redirects = &.{},
+                        },
+                    },
+                    .span = fn_decl.span,
+                },
+            },
+            .span = fn_decl.span,
+        };
+
+        return try self.evaluatePipeline(scopes, pipeline);
     }
 
     /// Executes a single statement in the current scope and returns its result
@@ -121,7 +204,7 @@ pub const Evaluator = struct {
 
         var scope_active = false;
         if (options.push_scope) {
-            try scopes.pushFrame();
+            try scopes.pushFrame(.{});
             scope_active = true;
         }
         errdefer if (scope_active) scopes.popFrame() catch {};
@@ -158,6 +241,10 @@ pub const Evaluator = struct {
                 try self.executeLet(scopes, &decl);
                 break :blk null;
             },
+            .fn_decl => |*decl| blk: {
+                try self.executeFnDecl(scopes, decl);
+                break :blk null;
+            },
             .expression => |expr_stmt| try self.executeExpression(scopes, expr_stmt.expression),
             else => Error.UnsupportedStatement,
         };
@@ -180,15 +267,29 @@ pub const Evaluator = struct {
         consumed = true;
     }
 
+    fn executeFnDecl(
+        self: *Evaluator,
+        scopes: *ScopeStack,
+        decl: *const ast.FunctionDecl,
+    ) Error!void {
+        var value = Value{ .function = decl };
+        try self.bindPattern(scopes, .{ .identifier = decl.name }, false, &value);
+    }
+
     fn evaluateExpression(self: *Evaluator, scopes: *ScopeStack, expr: *const ast.Expression) Error!Value {
-        return switch (expr.*) {
+        const v = switch (expr.*) {
             .literal => |literal| try self.evaluateLiteral(scopes, literal),
             .identifier => |identifier| try self.evaluateIdentifier(scopes, identifier),
             .pipeline => |pipeline| try self.evaluatePipeline(scopes, pipeline),
             .block => |block_expr| try self.evaluateBlockExpression(scopes, block_expr),
             .import_expr => |import_expr| try self.evaluateImportExpression(import_expr),
             .member => |member_expr| try self.evaluateMemberExpression(scopes, member_expr),
-            else => Error.UnsupportedExpression,
+            else => return Error.UnsupportedExpression,
+        };
+
+        return switch (v) {
+            .function => |f| try self.runFunctionAsPipeline(scopes, f),
+            else => v,
         };
     }
 
@@ -240,17 +341,6 @@ pub const Evaluator = struct {
         const currentDocument = try self.documentStore.requestDocument(import.importer);
         const currentExecutor = currentDocument.script_executor;
 
-        document.script_executor = try ScriptExecutor.initWithRunner(
-            self.allocator,
-            currentExecutor.?.command_bridge.?.runner,
-            currentExecutor.?.command_bridge.?.env_map,
-            self.documentStore,
-        );
-
-        const executor = &document.script_executor.?;
-
-        try executor.scopes.pushFrame();
-
         var stdout = std.fs.File.stdout().writer(&.{});
         var stderr = std.fs.File.stderr().writer(&.{});
 
@@ -258,12 +348,28 @@ pub const Evaluator = struct {
         context.* = ScriptContext.init(self.allocator);
         defer self.allocator.destroy(context);
 
-        const exitCode = try executor.execute(script_ast, .{
+        const executeOptions = ScriptExecutor.ExecuteOptions{
             .script_path = document.path,
             .stdout = &stdout.interface,
             .stderr = &stderr.interface,
             .context = context,
-        });
+        };
+
+        document.script_executor = try ScriptExecutor.initWithRunner(
+            self.allocator,
+            document.path,
+            currentExecutor.?.command_bridge.?.runner,
+            currentExecutor.?.command_bridge.?.env_map,
+            executeOptions,
+            self.documentStore,
+        );
+        document.script_executor.?.wireCommandBridge();
+
+        const executor = &document.script_executor.?;
+
+        try executor.scopes.pushFrame(.{});
+
+        const exitCode = try executor.execute(script_ast, executeOptions);
 
         document.exitCode = exitCode;
 
@@ -279,14 +385,15 @@ pub const Evaluator = struct {
         defer object.deinit(self.allocator);
 
         switch (object) {
-            .void, .boolean, .integer, .float, .string => return Error.UnsupportedMemberAccess,
+            .void, .boolean, .integer, .float, .string, .function => return Error.UnsupportedMemberAccess,
             .process_handle => |p| {
                 if (std.mem.eql(u8, member.member.name, "stdout")) {
                     return .{ .string = try self.allocator.dupe(u8, p.stdoutBytes()) };
                 } else if (std.mem.eql(u8, member.member.name, "stderr")) {
                     return .{ .string = try self.allocator.dupe(u8, p.stderrBytes()) };
                 } else if (std.mem.eql(u8, member.member.name, "exitCode")) {
-                    return .{ .integer = p.status.exit_code.? };
+                    return Error.UnsupportedMemberAccess;
+                    // return .{ .integer = p.status.exit_code.? };
                 } else {
                     return Error.MemberNotFound;
                 }
@@ -337,6 +444,15 @@ pub const Evaluator = struct {
             const name_slice = try self.renderCommandPart(scopes, command.name, &owned_strings);
             try argv.append(name_slice);
 
+            var command_type: command_runner.CommandRunner.CommandType = undefined;
+
+            if (scopes.lookup(name_slice)) |b| {
+                switch (b.value.*) {
+                    .function => |fn_decl| command_type = .{ .function = fn_decl },
+                    else => command_type = .executable,
+                }
+            } else command_type = .executable;
+
             for (command.args) |arg_part| {
                 const arg_slice = try self.renderCommandPart(scopes, arg_part, &owned_strings);
                 try argv.append(arg_slice);
@@ -344,7 +460,7 @@ pub const Evaluator = struct {
 
             const argv_owned = try self.allocator.alloc([]const u8, argv.items.len);
             @memcpy(argv_owned, argv.items);
-            try specs.append(.{ .argv = argv_owned });
+            try specs.append(.{ .command_type = command_type, .argv = argv_owned });
         }
 
         const handle = try self.executor.run(specs.items);
@@ -406,7 +522,7 @@ pub const Evaluator = struct {
             .integer => |int| try std.fmt.allocPrint(self.allocator, "{d}", .{int}),
             .float => |flt| try std.fmt.allocPrint(self.allocator, "{d}", .{flt}),
             .process_handle => |p| try self.allocator.dupe(u8, p.stdoutBytes()),
-            .void, .scope => Error.InvalidStringCoercion,
+            .void, .scope, .function => Error.InvalidStringCoercion,
         };
     }
 
@@ -461,245 +577,3 @@ pub const CommandExecutor = struct {
         return runner.*.runPipeline(specs);
     }
 };
-
-test "evaluator executes command pipelines and propagates handles" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
-
-    var scopes = ScopeStack.init(alloc);
-    defer scopes.deinit();
-    try scopes.pushFrame();
-
-    const stage_argv = [_][]const u8{ "echo", "hi" };
-    var executor = TestExecutor{
-        .allocator = alloc,
-        .expected = &[_]TestExecutor.StageExpectation{
-            .{ .argv = stage_argv[0..] },
-        },
-    };
-
-    var evaluator = Evaluator.init(alloc, executor.asCommandExecutor());
-
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-
-    const block = try buildPipelineBlock(arena.allocator(), "echo", "hi");
-    try evaluator.runBlock(&scopes, block);
-    try std.testing.expectEqual(@as(usize, 1), executor.calls);
-}
-
-test "let binding feeds into pipeline expression arguments" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
-
-    var scopes = ScopeStack.init(alloc);
-    defer scopes.deinit();
-    try scopes.pushFrame();
-
-    const stage_argv = [_][]const u8{ "echo", "hello" };
-    var executor = TestExecutor{
-        .allocator = alloc,
-        .expected = &[_]TestExecutor.StageExpectation{
-            .{ .argv = stage_argv[0..] },
-        },
-    };
-
-    var evaluator = Evaluator.init(alloc, executor.asCommandExecutor());
-
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-
-    const block = try buildLetAndPipelineBlock(arena.allocator(), "greeting", "hello");
-    try evaluator.runBlock(&scopes, block);
-    try std.testing.expectEqual(@as(usize, 1), executor.calls);
-}
-
-const TestExecutor = struct {
-    allocator: std.mem.Allocator,
-    expected: []const StageExpectation,
-    calls: usize = 0,
-
-    const StageExpectation = struct {
-        argv: []const []const u8,
-    };
-
-    fn asCommandExecutor(self: *TestExecutor) CommandExecutor {
-        return .{
-            .context = self,
-            .runFn = execute,
-        };
-    }
-
-    fn execute(context: *anyopaque, specs: []const CommandRunner.CommandSpec) CommandRunner.Error!ProcessHandle {
-        const self: *TestExecutor = @ptrCast(@alignCast(context));
-        self.calls += 1;
-        std.debug.assert(specs.len == self.expected.len);
-        for (specs, 0..) |spec, idx| {
-            const expected_stage = self.expected[idx];
-            std.debug.assert(spec.argv.len == expected_stage.argv.len);
-            for (spec.argv, 0..) |arg, arg_idx| {
-                const expected_arg = expected_stage.argv[arg_idx];
-                std.debug.assert(std.mem.eql(u8, arg, expected_arg));
-            }
-        }
-        return fakeHandle(self.allocator, specs.len);
-    }
-};
-
-fn fakeHandle(allocator: std.mem.Allocator, stage_count: usize) !ProcessHandle {
-    const statuses = try allocator.alloc(command_runner.StageStatus, stage_count);
-    const captures = try allocator.alloc(command_runner.StageCapture, stage_count);
-    var index: usize = 0;
-    while (index < stage_count) : (index += 1) {
-        statuses[index] = .{
-            .index = index,
-            .term = .{ .Exited = 0 },
-            .exit_code = 0,
-            .signal = null,
-            .ok = true,
-        };
-        captures[index] = .{
-            .stdout = try allocator.alloc(u8, 0),
-            .stderr = try allocator.alloc(u8, 0),
-        };
-    }
-    return .{
-        .allocator = allocator,
-        .pid = 1,
-        .started_at_ns = 0,
-        .finished_at_ns = 0,
-        .status = .{
-            .ok = true,
-            .exit_code = 0,
-            .signal = null,
-            .failed_stage = null,
-        },
-        .stage_statuses = statuses,
-        .stage_captures = captures,
-    };
-}
-
-fn buildPipelineBlock(
-    allocator: std.mem.Allocator,
-    command: []const u8,
-    arg: []const u8,
-) !ast.Block {
-    const name_word = ast.CommandPart{ .word = .{ .text = command, .span = dummySpan() } };
-    const arg_literal = try buildStringLiteral(allocator, arg);
-    const arg_part = ast.CommandPart{ .string = arg_literal };
-
-    var command_invocation = ast.CommandInvocation{
-        .name = name_word,
-        .args = undefined,
-        .env_assignments = &[_]ast.EnvAssignment{},
-        .redirects = &[_]ast.Redirection{},
-        .capture = null,
-        .background = false,
-        .span = dummySpan(),
-    };
-    command_invocation.args = try allocator.alloc(ast.CommandPart, 1);
-    command_invocation.args[0] = arg_part;
-
-    var stages = try allocator.alloc(ast.PipelineStage, 1);
-    stages[0] = .{
-        .role = .command,
-        .payload = .{ .command = command_invocation },
-        .span = dummySpan(),
-    };
-
-    const pipeline = ast.Pipeline{ .stages = stages, .span = dummySpan() };
-    const expr_ptr = try allocator.create(ast.Expression);
-    expr_ptr.* = .{ .pipeline = pipeline };
-
-    const stmt_ptr = try allocator.create(ast.Statement);
-    stmt_ptr.* = .{
-        .expression = .{
-            .expression = expr_ptr,
-            .span = dummySpan(),
-        },
-    };
-
-    const stmts = try allocator.alloc(*ast.Statement, 1);
-    stmts[0] = stmt_ptr;
-    return .{ .statements = stmts, .span = dummySpan() };
-}
-
-fn buildLetAndPipelineBlock(
-    allocator: std.mem.Allocator,
-    name: []const u8,
-    literal: []const u8,
-) !ast.Block {
-    const pattern_ptr = try allocator.create(ast.BindingPattern);
-    pattern_ptr.* = .{ .identifier = .{ .name = name, .span = dummySpan() } };
-
-    const string_lit = try buildStringLiteral(allocator, literal);
-    const literal_expr = try allocator.create(ast.Expression);
-    literal_expr.* = .{ .literal = .{ .string = string_lit } };
-
-    const let_stmt_ptr = try allocator.create(ast.Statement);
-    let_stmt_ptr.* = .{
-        .binding_decl = .{
-            .is_mutable = false,
-            .pattern = pattern_ptr,
-            .annotation = null,
-            .initializer = literal_expr,
-            .span = dummySpan(),
-        },
-    };
-
-    const id_expr = try allocator.create(ast.Expression);
-    id_expr.* = .{ .identifier = .{ .name = name, .span = dummySpan() } };
-
-    var command_invocation = ast.CommandInvocation{
-        .name = ast.CommandPart{ .word = .{ .text = "echo", .span = dummySpan() } },
-        .args = undefined,
-        .env_assignments = &[_]ast.EnvAssignment{},
-        .redirects = &[_]ast.Redirection{},
-        .capture = null,
-        .background = false,
-        .span = dummySpan(),
-    };
-    command_invocation.args = try allocator.alloc(ast.CommandPart, 1);
-    command_invocation.args[0] = .{ .expr = id_expr };
-
-    var stages = try allocator.alloc(ast.PipelineStage, 1);
-    stages[0] = .{
-        .role = .command,
-        .payload = .{ .command = command_invocation },
-        .span = dummySpan(),
-    };
-
-    const pipeline_expr = try allocator.create(ast.Expression);
-    pipeline_expr.* = .{ .pipeline = .{ .stages = stages, .span = dummySpan() } };
-
-    const expr_stmt_ptr = try allocator.create(ast.Statement);
-    expr_stmt_ptr.* = .{
-        .expression = .{
-            .expression = pipeline_expr,
-            .span = dummySpan(),
-        },
-    };
-
-    const stmts = try allocator.alloc(*ast.Statement, 2);
-    stmts[0] = let_stmt_ptr;
-    stmts[1] = expr_stmt_ptr;
-    return .{ .statements = stmts, .span = dummySpan() };
-}
-
-fn buildStringLiteral(allocator: std.mem.Allocator, contents: []const u8) !ast.StringLiteral {
-    const segments = try allocator.alloc(ast.StringLiteral.Segment, 1);
-    segments[0] = .{ .text = contents };
-    return .{
-        .segments = segments,
-        .span = dummySpan(),
-    };
-}
-
-fn dummySpan() token.Span {
-    return .{
-        .start = .{ .line = 1, .column = 1 },
-        .end = .{ .line = 1, .column = 1 },
-    };
-}

@@ -80,7 +80,8 @@ const Session = struct {
             .script_dir = script_dir,
         };
         session.runner = CommandRunner.initWithTracer(allocator, &session.tracer);
-        session.executor = try ScriptExecutor.initWithRunner(allocator, &session.runner, &session.env_map, undefined);
+        session.executor = try ScriptExecutor.initWithRunner(allocator, "<source>", &session.runner, &session.env_map, undefined, undefined);
+        session.executor.wireCommandBridge();
         return session;
     }
 
@@ -223,8 +224,8 @@ const Session = struct {
             .context = &self.context,
         });
 
-        if (code != 0) {
-            try self.stderr.interface.print("Command exited with {d}\n", .{code});
+        if (code != .success) {
+            try self.stderr.interface.print("Command exited with {f}\n", .{code});
         }
 
         return false;

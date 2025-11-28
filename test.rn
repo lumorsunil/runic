@@ -1,9 +1,14 @@
 # test.rn
 
-const lib = import "lib.rn"
-const libAgain = import "lib.rn"
+// fn Int parseInt(radix: Int) Int {
+// }
 
-echo "${lib.name}"
-echo "${libAgain.name}"
+fn hello() void {
+  echo "hello"
+}
 
-lib.hello
+hello
+hello
+hello
+hello
+hello

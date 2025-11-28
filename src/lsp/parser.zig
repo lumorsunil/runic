@@ -71,6 +71,7 @@ fn writeParseError(
     try writer.flush();
 
     return .{
+        .file = parser.stream.lexer.file,
         .line = parser.stream.lexer.line,
         .column = parser.stream.lexer.column,
         .offset = parser.stream.lexer.index,

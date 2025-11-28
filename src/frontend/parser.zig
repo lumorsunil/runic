@@ -211,7 +211,8 @@ pub fn Parser(
             self.clearExpectedTokens();
             self.path = path;
             self.source = try getSource(self.ctx, path);
-            self.stream = try .init(self.arena.allocator(), self.source);
+
+            self.stream = try .init(self.arena.allocator(), path, self.source);
             const statements = try self.parseStatementsUntil(.eof);
 
             const script = ast.Script{
@@ -230,7 +231,7 @@ pub fn Parser(
 
             self.clearExpectedTokens();
             self.source = source;
-            self.stream = try .init(self.arena.allocator(), source);
+            self.stream = try .init(self.arena.allocator(), "<source>", source);
             // self.currentDocument = try self.arena.allocator().create(Document);
             // self.currentDocument.* = .{
             //     .source = source,
@@ -685,6 +686,12 @@ pub fn Parser(
                 return stmt;
             }
 
+            const maybeFn = try self.parseMaybeFn();
+            if (maybeFn) |fnDecl| {
+                stmt.* = .{ .fn_decl = fnDecl };
+                return stmt;
+            }
+
             const expr = try self.parseExpression();
             const expr_span = expr.span();
             stmt.* = .{
@@ -998,11 +1005,55 @@ pub fn Parser(
             const tok = try self.peekToken();
             switch (tok.tag) {
                 .colon => {
-                    try self.skipTypeExpression();
+                    _ = try self.nextToken();
+                    return try self.parseMaybeTypeAnnotation();
                 },
                 else => {},
             }
 
+            return null;
+        }
+
+        fn parseMaybeFn(self: *Self) ParseError!?ast.FunctionDecl {
+            const breadcrumb = try self.createBreadcrumb("parseMaybeFn");
+            defer breadcrumb.end();
+
+            const next = try self.peekToken();
+            return switch (next.tag) {
+                .kw_fn => try self.parseFn(),
+                else => null,
+            };
+        }
+
+        fn parseFn(self: *Self) ParseError!ast.FunctionDecl {
+            const breadcrumb = try self.createBreadcrumb("parseFn");
+            defer breadcrumb.end();
+
+            const start = try self.expectTokenTag(.kw_fn);
+            const identifier = try self.expectTokenTag(.identifier);
+            _ = try self.expectTokenTag(.l_paren);
+            // TODO: parameters
+            _ = try self.expectTokenTag(.r_paren);
+            // TODO: types
+            const returnType = try self.parseMaybeTypeExpr();
+            // TODO: lambdas
+            const block = try self.parseBlock();
+
+            return .{
+                .name = .{ .name = identifier.lexeme, .span = identifier.span },
+                .is_async = false,
+                .params = &.{}, // TODO: parameters
+                .return_type = returnType,
+                .body = .{ .block = block },
+                .span = start.span.endAt(block.span),
+            };
+        }
+
+        fn parseMaybeTypeExpr(self: *Self) ParseError!?*ast.TypeExpr {
+            const breadcrumb = try self.createBreadcrumb("parseMaybeTypeExpr");
+            defer breadcrumb.end();
+
+            _ = try self.stream.consumeIf(.identifier);
             return null;
         }
 
@@ -1056,6 +1107,7 @@ pub fn Parser(
             }
         }
 
+        /// Consumes the next token
         fn expectTokenTag(self: *Self, tag: token.Tag) ParseError!token.Token {
             const tok = try self.nextToken();
             if (tok.tag != tag) return self.failExpectedToken(tok.tag, tag);

@@ -19,9 +19,10 @@ pub const ScopeStack = struct {
 
     const Frame = struct {
         bindings: ArrayListManaged(Binding),
+        options: FrameOptions,
 
-        fn init(allocator: std.mem.Allocator) Frame {
-            return .{ .bindings = .init(allocator) };
+        fn init(allocator: std.mem.Allocator, options: FrameOptions) Frame {
+            return .{ .bindings = .init(allocator), .options = options };
         }
 
         fn deinit(self: *Frame, allocator: std.mem.Allocator) void {
@@ -32,6 +33,10 @@ pub const ScopeStack = struct {
             self.bindings.deinit();
             self.* = undefined;
         }
+    };
+
+    const FrameOptions = struct {
+        blocking: bool = false,
     };
 
     const Binding = struct {
@@ -60,8 +65,8 @@ pub const ScopeStack = struct {
         self.* = undefined;
     }
 
-    pub fn pushFrame(self: *ScopeStack) Error!void {
-        try self.frames.append(Frame.init(self.allocator));
+    pub fn pushFrame(self: *ScopeStack, options: FrameOptions) Error!void {
+        try self.frames.append(Frame.init(self.allocator, options));
     }
 
     pub fn popFrame(self: *ScopeStack) Error!void {
@@ -96,6 +101,7 @@ pub const ScopeStack = struct {
                     .is_mutable = binding.is_mutable,
                 };
             }
+            if (frame.options.blocking) return null;
         }
         return null;
     }

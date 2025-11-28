@@ -3,6 +3,7 @@ const command_runner = @import("../runtime/command_runner.zig");
 const TypeExpr = @import("../frontend/ast.zig").TypeExpr;
 const ScopeStack = @import("../interpreter/scope.zig").ScopeStack;
 
+const ast = @import("../frontend/ast.zig");
 const ProcessHandle = command_runner.ProcessHandle;
 
 /// Runtime value representation used by the interpreter while evaluating AST
@@ -14,6 +15,7 @@ pub const Value = union(enum) {
     integer: i64,
     float: f64,
     string: []u8,
+    function: *const ast.FunctionDecl,
     process_handle: ProcessHandle,
     scope: *ScopeStack,
 
@@ -30,14 +32,11 @@ pub const Value = union(enum) {
     /// Clones the value into a fresh allocation owned by `allocator`.
     pub fn clone(self: Value, allocator: std.mem.Allocator) !Value {
         return switch (self) {
-            .void => .{ .void = {} },
-            .boolean => |flag| .{ .boolean = flag },
-            .integer => |int| .{ .integer = int },
-            .float => |flt| .{ .float = flt },
+            .void, .boolean, .integer, .float, .function => self,
             .string => |buffer| .{ .string = try allocator.dupe(u8, buffer) },
             .process_handle => |handle| .{ .process_handle = try handle.clone(allocator) },
             // TODO: Investigate if we need to clone this (hint: everytime we use a Value in the evaluator, we seem to clone it and deinitialize)
-            .scope => |scope| .{ .scope = scope },
+            .scope => self,
         };
     }
 

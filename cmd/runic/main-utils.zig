@@ -60,7 +60,7 @@ pub fn printScriptTokens(
     source: []const u8,
 ) (LexerError || std.Io.Writer.Error)!void {
     try stdout.print("Tokens {s}\n", .{script_path});
-    var stream = try lexer_pkg.Stream.init(allocator, source);
+    var stream = try lexer_pkg.Stream.init(allocator, script_path, source);
     defer stream.deinit();
     var index: usize = 0;
     while (true) {
@@ -259,6 +259,17 @@ fn renderStatementAst(writer: *std.Io.Writer, stmt: *const ast.Statement, level:
             try writer.writeByte('\n');
             try renderBindingPatternAst(writer, binding_decl.pattern, level + 1);
             try renderExpressionAst(writer, binding_decl.initializer, level + 1);
+        },
+        .fn_decl => |fn_decl| {
+            try writeIndent(writer, level);
+            try writer.print("fn_decl @ ", .{});
+            try printSpanInline(writer, fn_decl.span);
+            try writer.writeByte('\n');
+            try writeIndent(writer, level + 1);
+            try writer.writeAll(fn_decl.name.name);
+            try writer.writeByte('\n');
+            try writeIndent(writer, level + 1);
+            try writer.print("# statements {}", .{fn_decl.body.block.statements.len});
         },
         else => {
             const tag_name = @tagName(std.meta.activeTag(stmt.*));
