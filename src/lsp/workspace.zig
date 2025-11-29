@@ -4,7 +4,7 @@ const diag = @import("diagnostics.zig");
 const runic = @import("runic");
 const parseFile = @import("parser.zig").parseFile;
 const Parser = @import("parser.zig").Parser;
-const DocumentStore = @import("server.zig").DocumentStore;
+const DocumentStore = @import("document.zig").DocumentStore;
 
 const max_source_bytes: usize = 4 * 1024 * 1024;
 

@@ -4,7 +4,7 @@ const runic = @import("runic");
 const diag = @import("diagnostics.zig");
 const ast = runic.ast;
 const token = runic.token;
-const DocumentStore = @import("server.zig").DocumentStore;
+const DocumentStore = @import("document.zig").DocumentStore;
 
 pub const Parser = runic.parser.Parser(DocumentStore, getCachedAst, putCachedAst, getSource);
 

@@ -1217,13 +1217,39 @@ pub fn Parser(
     };
 }
 
+const TestCtx = struct {
+    source: []const u8,
+    cached: ?ast.Script = null,
+};
+
+fn testGetCachedAst(ctx: *TestCtx, path: []const u8) !?ast.Script {
+    _ = path;
+    return ctx.cached;
+}
+
+fn testPutCachedAst(ctx: *TestCtx, path: []const u8, script: ast.Script) !void {
+    _ = path;
+    ctx.cached = script;
+}
+
+fn testGetSource(ctx: *TestCtx, path: []const u8) ![]const u8 {
+    _ = path;
+    return ctx.source;
+}
+
+const TestParser = Parser(TestCtx, testGetCachedAst, testPutCachedAst, testGetSource);
+
 test "parser preserves breadcrumb trail on unexpected token errors" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var parser = Parser.init(allocator, "foo = 1");
+    var ctx = TestCtx{ .source = "foo = 1" };
+    var parser = TestParser.init(allocator, &ctx);
     defer parser.deinit();
+
+    parser.source = ctx.source;
+    parser.stream = try lexer.Stream.init(parser.arena.allocator(), "<test>", ctx.source);
 
     try std.testing.expectError(ParseError.UnexpectedToken, parser.parseExpression());
 
@@ -1234,4 +1260,48 @@ test "parser preserves breadcrumb trail on unexpected token errors" {
     const expected =
         "expected string literal while parsing parseExpression -> parseIdentifierExpression -> parsePipeline -> parsePipelineStage";
     try std.testing.expectEqualStrings(expected, writer.buffer[0..writer.end]);
+}
+
+test "parser builds command pipelines with string arguments" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var ctx = TestCtx{ .source = "echo \"hi\"" };
+    var parser = TestParser.init(allocator, &ctx);
+    defer parser.deinit();
+
+    const script = try parser.parseSource(ctx.source);
+    try std.testing.expectEqual(@as(usize, 1), script.statements.len);
+    const stmt = script.statements[0].*;
+    try std.testing.expect(std.meta.activeTag(stmt) == .expression);
+    const expr_stmt = stmt.expression;
+    const expr = expr_stmt.expression.*;
+    try std.testing.expect(std.meta.activeTag(expr) == .pipeline);
+    const pipeline = expr.pipeline;
+    try std.testing.expectEqual(@as(usize, 1), pipeline.stages.len);
+    const stage = pipeline.stages[0];
+    try std.testing.expectEqual(ast.StageRole.command, stage.role);
+    const command = stage.payload.command;
+    try std.testing.expectEqualStrings("echo", command.name.word.text);
+    try std.testing.expectEqual(@as(usize, 1), command.args.len);
+    const arg = command.args[0];
+    try std.testing.expect(std.meta.activeTag(arg) == .string);
+    const literal = arg.string;
+    try std.testing.expectEqual(@as(usize, 1), literal.segments.len);
+    const segment = literal.segments[0];
+    try std.testing.expect(std.meta.activeTag(segment) == .text);
+    try std.testing.expectEqualStrings("hi", segment.text.payload);
+}
+
+test "parser rejects interpolation in import module names" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var ctx = TestCtx{ .source = "import \"foo${name}\"" };
+    var parser = TestParser.init(allocator, &ctx);
+    defer parser.deinit();
+
+    try std.testing.expectError(ParseError.StringInterpNotAllowed, parser.parseSource(ctx.source));
 }

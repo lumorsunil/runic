@@ -1,14 +1,7 @@
 # test.rn
 
-// fn Int parseInt(radix: Int) Int {
-// }
-
-fn hello() void {
+fn hello() Void {
   echo "hello"
 }
 
-hello
-hello
-hello
-hello
 hello

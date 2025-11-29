@@ -34,11 +34,14 @@ pub fn collectSymbols(
 ) !void {
     for (script.statements) |statement| {
         switch (statement.*) {
-            .bash_block, .error_decl, .fn_decl, .for_stmt, .while_stmt => {
+            .bash_block, .error_decl, .for_stmt, .while_stmt => {
                 // Not Yet Implemented,
             },
             .return_stmt, .expression => {
                 // Does not produce symbols
+            },
+            .fn_decl => |fn_decl| {
+                try appendSymbol(allocator, list, .function, fn_decl.name.name, detail);
             },
             .binding_decl => |binding_decl| {
                 switch (binding_decl.pattern.*) {

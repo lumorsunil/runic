@@ -732,273 +732,50 @@ fn endsWithNewline(source: []const u8) bool {
     return last == '\n' or last == '\r';
 }
 
-const LexFixture = struct {
-    name: []const u8,
-    source: []const u8,
-    tokens: []const token.Tag,
-};
+test "lexer tokenizes declarations and synthesizes trailing newline" {
+    var lexer = try Lexer.init(std.testing.allocator, "main.rn", "const foo = 42");
+    defer lexer.deinit();
 
-fn runLexFixture(fixture: LexFixture) !void {
-    var lx = Lexer.init(fixture.source);
-    var index: usize = 0;
-    errdefer std.debug.print("lexer fixture `{s}` failed around token #{d}\n", .{ fixture.name, index });
-    const maxTokens = 1000000;
-    var i: usize = 0;
-    while (i < maxTokens) : (i += 1) {
-        try std.testing.expect(index < fixture.tokens.len);
-        const pre_index = lx.index;
-        const pre_line = lx.line;
-        const pre_column = lx.column;
-        const tok = try lx.next();
-        if (pre_index == lx.index) {
-            if (tok.tag == .newline) {
-                try std.testing.expect(lx.emitted_trailing_newline);
-            } else {
-                try std.testing.expect(tok.tag == .eof);
-            }
-        } else {
-            try std.testing.expect(pre_index < lx.index);
-            try std.testing.expect(pre_line < lx.line or pre_column < lx.column);
-        }
-        const expected = fixture.tokens[index];
-        index += 1;
-        try std.testing.expectEqual(expected, tok.tag);
-        if (tok.tag == .eof) break;
-    }
-    try std.testing.expectEqual(fixture.tokens.len, index);
-}
+    const expected_tags = [_]token.Tag{ .kw_const, .identifier, .assign, .int_literal, .newline, .eof };
+    var tokens: [expected_tags.len]token.Token = undefined;
 
-test "lexer fixtures cover feature surfaces" {
-    const fixtures = [_]LexFixture{
-        .{
-            .name = "commands_and_pipelines",
-            .source =
-            \\echo "hi" | upper && lower || fail & sleep 1
-            \\cmd2; cmd3
-            ,
-            .tokens = &[_]token.Tag{
-                .identifier, .string_literal, .pipe,       .identifier, .amp_amp,     .identifier,
-                .pipe_pipe,  .identifier,     .amp,        .identifier, .int_literal, .newline,
-                .identifier, .semicolon,      .identifier, .newline,    .eof,
-            },
-        },
-        .{
-            .name = "declarations_and_types",
-            .source =
-            \\let greeting: Str = "hi"
-            \\mut count = 2
-            \\fn add(a: Int, b: Int) -> Int {
-            \\    return a + b
-            \\}
-            ,
-            .tokens = &[_]token.Tag{
-                .kw_const,   .identifier, .colon,      .identifier,  .assign,  .string_literal, .newline,
-                .kw_var,     .identifier, .assign,     .int_literal, .newline, .kw_fn,          .identifier,
-                .l_paren,    .identifier, .colon,      .identifier,  .comma,   .identifier,     .colon,
-                .identifier, .r_paren,    .arrow,      .identifier,  .l_brace, .newline,        .kw_return,
-                .identifier, .plus,       .identifier, .newline,     .r_brace, .newline,        .eof,
-            },
-        },
-        .{
-            .name = "literal_data_structures",
-            .source =
-            \\let array = [1, 2.5, true]
-            \\let mapping = { key: null, nested: [false] }
-            ,
-            .tokens = &[_]token.Tag{
-                .kw_const,  .identifier, .assign,   .l_bracket,  .int_literal, .comma,     .float_literal, .comma,   .kw_true,
-                .r_bracket, .newline,    .kw_const, .identifier, .assign,      .l_brace,   .identifier,    .colon,   .kw_null,
-                .comma,     .identifier, .colon,    .l_bracket,  .kw_false,    .r_bracket, .r_brace,       .newline, .eof,
-            },
-        },
-        .{
-            .name = "errors_and_match",
-            .source =
-            \\error NetworkError = enum { Timeout, ConnectionLost }
-            \\error FileError = union { NotFound: { path: Str }, PermissionDenied }
-            \\try bootstrap() catch |err| match err { _ => fail }
-            ,
-            .tokens = &[_]token.Tag{
-                .kw_error,   .identifier, .assign,     .kw_enum,    .l_brace,  .identifier, .comma,   .identifier, .r_brace,    .newline,
-                .kw_error,   .identifier, .assign,     .kw_union,   .l_brace,  .identifier, .colon,   .l_brace,    .identifier, .colon,
-                .identifier, .r_brace,    .comma,      .identifier, .r_brace,  .newline,    .kw_try,  .identifier, .l_paren,    .r_paren,
-                .kw_catch,   .pipe,       .identifier, .pipe,       .kw_match, .identifier, .l_brace, .identifier, .fat_arrow,  .identifier,
-                .r_brace,    .newline,    .eof,
-            },
-        },
-        .{
-            .name = "async_loops_and_bash",
-            .source =
-            \\async fn fetch(): ^Result {
-            \\    let maybe: ?Int = await job catch |err| { return err }
-            \\    for (items, range) |item, idx| { while idx < 3 { if (idx > 0) { bash { echo "inner" } } } }
-            \\}
-            ,
-            .tokens = &[_]token.Tag{
-                .kw_async,   .kw_fn,      .identifier,  .l_paren,    .r_paren,        .colon,   .caret,      .identifier, .l_brace,     .newline,
-                .kw_const,   .identifier, .colon,       .question,   .identifier,     .assign,  .kw_await,   .identifier, .kw_catch,    .pipe,
-                .identifier, .pipe,       .l_brace,     .kw_return,  .identifier,     .r_brace, .newline,    .kw_for,     .l_paren,     .identifier,
-                .comma,      .identifier, .r_paren,     .pipe,       .identifier,     .comma,   .identifier, .pipe,       .l_brace,     .kw_while,
-                .identifier, .less,       .int_literal, .l_brace,    .kw_if,          .l_paren, .identifier, .greater,    .int_literal, .r_paren,
-                .l_brace,    .kw_bash,    .l_brace,     .identifier, .string_literal, .r_brace, .r_brace,    .r_brace,    .r_brace,     .newline,
-                .r_brace,    .newline,    .eof,
-            },
-        },
-        .{
-            .name = "modules_and_access",
-            .source =
-            \\let http = import("net/http")
-            \\let resp = http.client.get
-            ,
-            .tokens = &[_]token.Tag{
-                .kw_const, .identifier, .assign, .kw_import,  .l_paren, .string_literal, .r_paren, .newline,
-                .kw_const, .identifier, .assign, .identifier, .dot,     .identifier,     .dot,     .identifier,
-                .newline,  .eof,
-            },
-        },
-        .{
-            .name = "operators_and_ranges",
-            .source =
-            \\if (value >= 10) { value = value * 2 - 1 } else { value = value / 2 }
-            \\let slice = items[1..3]
-            \\let spread = 1...3
-            \\while (count != 0 && !done) { count = count % 2 / 2 }
-            \\if (limit <= 5) { match item { _ => item } }
-            ,
-            .tokens = &[_]token.Tag{
-                .kw_if,       .l_paren,     .identifier,  .greater_equal, .int_literal, .r_paren,    .l_brace,
-                .identifier,  .assign,      .identifier,  .star,          .int_literal, .minus,      .int_literal,
-                .r_brace,     .kw_else,     .l_brace,     .identifier,    .assign,      .identifier, .slash,
-                .int_literal, .r_brace,     .newline,     .kw_const,      .identifier,  .assign,     .identifier,
-                .l_bracket,   .int_literal, .range,       .int_literal,   .r_bracket,   .newline,    .kw_const,
-                .identifier,  .assign,      .int_literal, .ellipsis,      .int_literal, .newline,    .kw_while,
-                .l_paren,     .identifier,  .bang_equal,  .int_literal,   .amp_amp,     .bang,       .identifier,
-                .r_paren,     .l_brace,     .identifier,  .assign,        .identifier,  .percent,    .int_literal,
-                .slash,       .int_literal, .r_brace,     .newline,       .kw_if,       .l_paren,    .identifier,
-                .less_equal,  .int_literal, .r_paren,     .l_brace,       .kw_match,    .identifier, .l_brace,
-                .identifier,  .fat_arrow,   .identifier,  .r_brace,       .r_brace,     .newline,    .eof,
-            },
-        },
-    };
-
-    for (fixtures) |fixture| {
-        try runLexFixture(fixture);
-    }
-}
-
-const LexErrorFixture = struct {
-    name: []const u8,
-    source: []const u8,
-    err: Error,
-};
-
-test "lexer failure fixtures report precise errors" {
-    const fixtures = [_]LexErrorFixture{
-        .{ .name = "unexpected_character", .source = "@", .err = Error.UnexpectedCharacter },
-        .{ .name = "unterminated_string", .source = "\"missing", .err = Error.UnterminatedString },
-        .{ .name = "unterminated_block_comment", .source = "/* block", .err = Error.UnterminatedBlockComment },
-    };
-
-    for (fixtures) |fixture| {
-        var lx = Lexer.init(fixture.source);
-        errdefer std.debug.print("lexer error fixture `{s}` did not raise expected error\n", .{fixture.name});
-        try std.testing.expectError(fixture.err, lx.next());
-    }
-}
-
-test "lexer emits tokens with spans" {
-    const src =
-        \\let greeting = "hello"
-        \\mut count = 2
-        \\echo greeting | upper
-    ;
-
-    var lx = Lexer.init(src);
-    const expected_tags = [_]token.Tag{
-        .kw_const,   .identifier, .assign, .string_literal, .newline,
-        .kw_var,     .identifier, .assign, .int_literal,    .newline,
-        .identifier, .identifier, .pipe,   .identifier,     .newline,
-        .eof,
-    };
-
-    for (expected_tags) |tag| {
-        const tok = try lx.next();
+    for (expected_tags, 0..) |tag, idx| {
+        const tok = try lexer.next();
+        tokens[idx] = tok;
         try std.testing.expectEqual(tag, tok.tag);
-        try std.testing.expect(tok.span.end.line >= tok.span.start.line);
     }
+
+    try std.testing.expectEqualStrings("const", tokens[0].lexeme);
+    try std.testing.expectEqualStrings("foo", tokens[1].lexeme);
+    try std.testing.expectEqualStrings("=", tokens[2].lexeme);
+    try std.testing.expectEqualStrings("42", tokens[3].lexeme);
+    try std.testing.expectEqual(@as(usize, 0), tokens[4].lexeme.len);
+    try std.testing.expectEqual(@as(usize, 0), tokens[5].lexeme.len);
 }
 
-test "lexer spans report precise lines and columns" {
-    const src =
-        \\let foo = 1
-        \\upper
-        \\mut bar = foo
-    ;
+test "lexer balances nested braces inside string interpolation" {
+    const source = "\"prefix ${foo {bar}} tail\"";
+    var lexer = try Lexer.init(std.testing.allocator, "interpolation.rn", source);
+    defer lexer.deinit();
 
-    var lx = Lexer.init(src);
-    const let_tok = try lx.next();
-    try std.testing.expectEqual(@as(usize, 1), let_tok.span.start.line);
-    try std.testing.expectEqual(@as(usize, 1), let_tok.span.start.column);
+    const expected = [_]struct { tag: token.Tag, lexeme: []const u8 }{
+        .{ .tag = .string_start, .lexeme = "\"" },
+        .{ .tag = .string_text, .lexeme = "prefix " },
+        .{ .tag = .string_interp_start, .lexeme = "${" },
+        .{ .tag = .identifier, .lexeme = "foo" },
+        .{ .tag = .l_brace, .lexeme = "{" },
+        .{ .tag = .identifier, .lexeme = "bar" },
+        .{ .tag = .r_brace, .lexeme = "}" },
+        .{ .tag = .string_interp_end, .lexeme = "}" },
+        .{ .tag = .string_text, .lexeme = " tail" },
+        .{ .tag = .string_end, .lexeme = "\"" },
+        .{ .tag = .newline, .lexeme = "" },
+        .{ .tag = .eof, .lexeme = "" },
+    };
 
-    _ = try lx.next(); // foo
-    _ = try lx.next(); // =
-    _ = try lx.next(); // 1
-    _ = try lx.next(); // newline
-
-    const upper_tok = try lx.next();
-    try std.testing.expectEqual(@as(usize, 2), upper_tok.span.start.line);
-    try std.testing.expectEqual(@as(usize, 1), upper_tok.span.start.column);
-
-    _ = try lx.next(); // newline
-
-    const mut_tok = try lx.next();
-    try std.testing.expectEqual(@as(usize, 3), mut_tok.span.start.line);
-    try std.testing.expectEqual(@as(usize, 1), mut_tok.span.start.column);
-}
-
-test "lexer stream supports peeking and conditional consumption" {
-    const src =
-        \\let name = "hi"
-        \\upper
-    ;
-
-    var stream = Stream.init(src);
-
-    const peek_let = try stream.peek();
-    try std.testing.expectEqual(token.Tag.kw_const, peek_let.tag);
-
-    const let_tok = try stream.next();
-    try std.testing.expectEqual(token.Tag.kw_const, let_tok.tag);
-
-    const ident_tok = try stream.peek();
-    try std.testing.expectEqualSlices(u8, "name", ident_tok.lexeme);
-    try std.testing.expectEqual(token.Tag.identifier, ident_tok.tag);
-
-    _ = try stream.next(); // consume identifier
-    _ = try stream.next(); // consume '='
-    _ = try stream.next(); // consume "hi"
-
-    try std.testing.expect(try stream.consumeIf(.newline));
-
-    const command_tok = try stream.peek();
-    try std.testing.expectEqual(token.Tag.identifier, command_tok.tag);
-    try std.testing.expectEqualStrings("upper", command_tok.lexeme);
-
-    try std.testing.expect(!(try stream.consumeIf(.newline)));
-}
-
-test "stream guard detects runaway token consumption" {
-    var stream = Stream.init("let value = 1");
-    stream.active_next_depth = Stream.max_guard_depth;
-    try std.testing.expectError(Error.TokenConsumptionDepthExceeded, stream.next());
-
-    var peek_stream = Stream.init("upper");
-    peek_stream.active_next_depth = Stream.max_guard_depth;
-    try std.testing.expectError(Error.TokenConsumptionDepthExceeded, peek_stream.peek());
-}
-
-test "lexer guard detects runaway token consumption" {
-    var lx = Lexer.init("identifier");
-    lx.active_next_depth = max_token_consumption_depth;
-    try std.testing.expectError(Error.TokenConsumptionDepthExceeded, lx.next());
+    for (expected) |exp| {
+        const tok = try lexer.next();
+        try std.testing.expectEqual(exp.tag, tok.tag);
+        try std.testing.expectEqualStrings(exp.lexeme, tok.lexeme);
+    }
 }

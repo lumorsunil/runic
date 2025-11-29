@@ -1,0 +1,15 @@
+// fn Int parseInt(radix: Int) Int {
+// }
+
+// fn parseInt(in: Int, radix: Int) Int {
+//   ...
+// }
+
+// fn isFive(in: Int) Bool {
+//   return in == 5
+// }
+
+// const isFive = (in: Int) => in == 5
+
+// echo "5" | parseInt 10 | isFive
+
