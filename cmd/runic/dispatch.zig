@@ -14,14 +14,16 @@ pub fn dispatch(
     switch (config.mode) {
         .script => |script| return try runScript(allocator, script, config, stdout, stderr),
         .repl => {
-            try repl.run(allocator, .{
-                .prompt = "runic> ",
-                .continuation_prompt = "...> ",
-                .history_limit = 256,
-                .trace_topics = config.trace_topics,
-                .module_paths = config.module_paths,
-            });
-            return .success;
+            try stderr.print("repl not yet supported\n", .{});
+            return .{ .err = error.ReplNotYetSupported };
+            // try repl.run(allocator, .{
+            //     .prompt = "runic> ",
+            //     .continuation_prompt = "...> ",
+            //     .history_limit = 256,
+            //     .trace_topics = config.trace_topics,
+            //     .module_paths = config.module_paths,
+            // });
+            // return .success;
         },
     }
 }
