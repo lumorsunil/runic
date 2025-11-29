@@ -7,6 +7,7 @@ basic autocompletion queries backed by workspace symbols. Subsequent phases
 can build on this foundation for diagnostics, formatting, and navigation.
 
 ## Scope & Goals
+
 - Ship a standalone binary under `cmd/runic-lsp/` that speaks LSP over stdin /
   stdout so it can be registered by Neovim, VS Code, and other editors.
 - Implement only the protocol methods required for initialization, lifecycle,
@@ -18,6 +19,7 @@ can build on this foundation for diagnostics, formatting, and navigation.
   connectivity + workspace completion milestone.
 
 ## Project Layout & Tooling
+
 - **Binary location:** add a Zig entry point at `cmd/runic-lsp/main.zig` that
   wires into shared runtime helpers inside `src/lsp/`. Keep protocol decoding,
   workspace management, and feature handlers as separate modules under
@@ -25,11 +27,10 @@ can build on this foundation for diagnostics, formatting, and navigation.
 - **Build integration:** extend `build.zig` with a target named `runic-lsp`.
   Document the formatter → build → test workflow in `README.md` once the server
   exists (`zig fmt ., zig build runic-lsp`, etc.).
-- **Testing:** introduce table-driven unit tests alongside the new modules
-  (e.g., `src/lsp/workspace_test.zig`) plus a thin integration smoke test under
-  `tests/` that spawns the server, sends `initialize`, and requests completion.
+- **Testing:** introduce table-driven unit tests alongside the new modules plus a thin integration smoke test under `tests/` that spawns the server, sends `initialize`, and requests completion.
 
 ## Protocol Lifecycle Requirements
+
 - **Initialization:** implement `initialize`, `initialized`, and
   `shutdown`/`exit` handlers. Advertise the following capabilities only:
   `textDocumentSync` (incremental) and `completionProvider` (trigger characters
@@ -43,6 +44,7 @@ can build on this foundation for diagnostics, formatting, and navigation.
   the MVP does not support settings or file watchers beyond manual refresh.
 
 ## Workspace Symbol Indexing
+
 - **Source discovery:** walk the workspace root provided in `initialize` plus
   any `workspaceFolders` to locate `.rn` files under `src/`, `examples/`, and
   `tests/`. Respect `.gitignore` defaults and never traverse outside the
@@ -60,6 +62,7 @@ can build on this foundation for diagnostics, formatting, and navigation.
   snippet so completions can present useful detail text.
 
 ## Completion Behavior
+
 - **Triggering:** respond to `textDocument/completion` by merging the current
   buffer context with the workspace index. For MVP, ignore syntactic context and
   always return the full workspace symbol list filtered by the typed prefix.
@@ -77,6 +80,7 @@ can build on this foundation for diagnostics, formatting, and navigation.
   avoiding blocking file IO during the completion handler.
 
 ## Observability & Development Ergonomics
+
 - Emit structured logs behind a `RUNIC_LSP_LOG` env flag to aid local debugging
   without polluting LSP stdout; logs should go to stderr.
 - Provide a `--stdio` flag (default) plus a hidden `--tcp <port>` option so

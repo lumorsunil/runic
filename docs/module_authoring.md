@@ -11,7 +11,7 @@ Runic modules package reusable functions and values that other scripts can `impo
 
 ## Writing the module file
 
-Author your reusable functions, constants, and helper types inside `<script_dir>/<spec>.rn`. Modules behave the same as regular Runic scripts, so you can define `fn` blocks, declare `let`/`mut` bindings, and spawn commands. The module loader does not currently inspect the file contents; it trusts the manifest to describe what is publicly available. Keep the source of record in the `.rn` file and treat the manifest as structured documentation.
+Author your reusable functions, constants, and helper types inside `<script_dir>/<spec>.rn`. Modules behave the same as regular Runic scripts, so you can define `fn` blocks, declare `const`/`var` bindings, and spawn commands. The module loader does not currently inspect the file contents; it trusts the manifest to describe what is publicly available. Keep the source of record in the `.rn` file and treat the manifest as structured documentation.
 
 ## Describing exports via the manifest
 
@@ -52,14 +52,14 @@ The manifest root object contains a single `exports` array. Each entry advertise
 }
 ```
 
-| Field | Description |
-| --- | --- |
-| `kind` | `"function"` or `"value"`. |
-| `name` | Identifier exposed to consumers (e.g. `http.get`). |
-| `is_async` | Optional flag for functions that resolve via promises/`await`. Defaults to `false`. |
-| `params` | Ordered list of parameters. Each item provides a `name` and `type`. Empty arrays are allowed. |
-| `return_type` | Required for functions. Uses the same type descriptor schema as parameters. |
-| `type` | Required for values. Describes the value's type descriptor. |
+| Field         | Description                                                                                   |
+| ------------- | --------------------------------------------------------------------------------------------- |
+| `kind`        | `"function"` or `"value"`.                                                                    |
+| `name`        | Identifier exposed to consumers (e.g. `http.get`).                                            |
+| `is_async`    | Optional flag for functions that resolve via promises/`await`. Defaults to `false`.           |
+| `params`      | Ordered list of parameters. Each item provides a `name` and `type`. Empty arrays are allowed. |
+| `return_type` | Required for functions. Uses the same type descriptor schema as parameters.                   |
+| `type`        | Required for values. Describes the value's type descriptor.                                   |
 
 ## Supported type descriptors
 
@@ -79,9 +79,9 @@ Nest these descriptors freely to model shapes such as `?Map(Str, Int)` or `^!Pro
 2. Run `zig build run -- path/to/script.rn` from the repository root with a small script that imports your module:
 
    ```rn
-   let http = import("net/http")
+   const http = import "net/http"
 
-   let ping = http.get("https://example.com")
+   const ping = http.get "https://example.com"
    await(ping) |resp| {
      echo resp.code
    }
