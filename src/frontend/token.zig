@@ -43,6 +43,24 @@ pub const Span = struct {
         return new;
     }
 
+    pub fn contains(self: Span, line: usize, column: usize) bool {
+        std.log.debug("contains: {}:{} start: {}:{} end: {}:{}", .{ line, column, self.start.line, self.start.column, self.end.line, self.end.column });
+
+        if (self.start.line == line and self.end.line == line) {
+            return self.start.column <= column and self.end.column >= column;
+        }
+
+        if (self.start.line == line) {
+            return self.start.column <= column;
+        }
+
+        if (self.end.line == line) {
+            return self.end.column >= column;
+        }
+
+        return self.start.line <= line and self.end.line >= line;
+    }
+
     pub fn sliceFrom(self: Span, source: []const u8) []const u8 {
         return source[self.start.offset..self.end.offset];
     }

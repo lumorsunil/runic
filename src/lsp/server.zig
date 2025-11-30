@@ -6,6 +6,7 @@ const diag = @import("diagnostics.zig");
 const types = @import("types.zig");
 const json = @import("json.zig");
 const document_mod = @import("document.zig");
+const runic = @import("runic");
 
 const Allocator = std.mem.Allocator;
 
@@ -294,27 +295,34 @@ pub const Server = struct {
         params: types.CompletionParams,
     ) !void {
         const doc = self.documents.get(params.textDocument.uri);
-        var owned_path: ?[]u8 = null;
+        const owned_path: []u8 = try self.resolveUriPath(params.textDocument.uri);
         var fallback_text: ?[]u8 = null;
-        defer if (owned_path) |path| self.allocator.free(path);
+        defer self.allocator.free(owned_path);
         defer if (fallback_text) |buffer| self.allocator.free(buffer);
 
         const text_slice: []const u8 = blk: {
             if (doc) |existing| break :blk existing.text;
-            owned_path = try self.resolveUriPath(params.textDocument.uri);
-            fallback_text = try readWholeFile(self.allocator, owned_path.?);
+            fallback_text = try readWholeFile(self.allocator, owned_path);
             break :blk fallback_text.?;
         };
 
         const line_val = params.position.line;
         const char_val = params.position.character;
-        const line_index: usize = if (line_val < 0) 0 else @as(usize, @intCast(line_val));
-        const char_index: usize = if (char_val < 0) 0 else @as(usize, @intCast(char_val));
-        const prefix = extractPrefix(text_slice, line_index, char_index);
+        const line_index: usize = @as(usize, @intCast(line_val));
+        const char_index: usize = @as(usize, @intCast(char_val));
+
         const doc_symbols = if (doc) |d| d.symbols.items else &[_]symbols.Symbol{};
         const workspace_symbols = self.workspace.symbolSlice();
 
-        var matches = try completion.collectMatches(self.allocator, prefix, doc_symbols, workspace_symbols);
+        var matches = try completion.collectMatches(.{
+            .allocator = self.allocator,
+            .file = owned_path,
+            .text_slice = text_slice,
+            .line_index = line_index,
+            .char_index = char_index,
+            .doc_symbols = doc_symbols,
+            .workspace_symbols = workspace_symbols,
+        });
         defer matches.deinit();
 
         try self.sendCompletionResult(id, matches.items.items);
@@ -330,7 +338,7 @@ pub const Server = struct {
                     },
                 } },
                 .completionProvider = .{
-                    .triggerCharacters = &.{ ".", ":" },
+                    .triggerCharacters = &.{ ".", ":", "\"", "/" },
                     .resolveProvider = false,
                 },
             },
@@ -439,6 +447,7 @@ pub const Server = struct {
         try stderr.interface.flush();
     }
 
+    /// Returns absolute path
     fn resolveUriPath(self: *Server, uri: []const u8) ![]u8 {
         if (std.mem.startsWith(u8, uri, "file://")) {
             const decoded = try percentDecode(self.allocator, uri[7..]);
@@ -455,30 +464,6 @@ pub const Server = struct {
         return try std.fs.cwd().realpathAlloc(self.allocator, path);
     }
 };
-
-fn extractPrefix(text: []const u8, line: usize, character: usize) []const u8 {
-    var offset: usize = 0;
-    var current_line: usize = 0;
-    while (offset < text.len and current_line < line) {
-        if (text[offset] == '\n') current_line += 1;
-        offset += 1;
-    }
-    var cursor = offset;
-    var consumed: usize = 0;
-    while (cursor < text.len and consumed < character) {
-        if (text[cursor] == '\n') break;
-        cursor += 1;
-        consumed += 1;
-    }
-    var start = cursor;
-    while (start > offset) {
-        const ch = text[start - 1];
-        if (symbols.isIdentifierChar(ch)) {
-            start -= 1;
-        } else break;
-    }
-    return text[start..cursor];
-}
 
 fn readLine(allocator: Allocator, reader: *std.Io.Reader) ![]u8 {
     const line = try reader.takeDelimiterExclusive('\n');

@@ -459,7 +459,7 @@ pub fn Parser(
             }
         }
 
-        fn parseImportExpression(self: *Self) ParseError!*ast.Expression {
+        pub fn parseImportExpression(self: *Self) ParseError!*ast.Expression {
             const breadcrumb = try self.createBreadcrumb("parseImportExpression");
             defer breadcrumb.end();
 

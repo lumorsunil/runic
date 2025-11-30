@@ -15,9 +15,15 @@ pub const Value = union(enum) {
     integer: i64,
     float: f64,
     string: []u8,
-    function: *const ast.FunctionDecl,
+    function: FunctionRef,
     process_handle: ProcessHandle,
     scope: *ScopeStack,
+
+    pub const FunctionRef = struct {
+        fn_decl: *const ast.FunctionDecl,
+        scope: *ScopeStack,
+        // closure: ???
+    };
 
     /// Releases any heap allocations and resets the value to `.void`.
     pub fn deinit(self: *Value, allocator: std.mem.Allocator) void {

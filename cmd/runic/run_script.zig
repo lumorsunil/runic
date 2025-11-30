@@ -274,14 +274,13 @@ fn parseImports(
         const expr = node.expr;
         switch (expr.*) {
             .import_expr => |import_expr| {
-                const path = try runic.document.resolveModulePath(
-                    allocator,
+                const module_path = try runic.document.resolveModulePath(
+                    documentStore.arena.allocator(),
                     import_expr.importer,
                     import_expr.module_name,
                 );
-                defer allocator.free(path);
-                const importDocument = try documentStore.requestDocument(path);
-                const importScript = importDocument.parser.parseScript(path) catch |err| {
+                const importDocument = try documentStore.requestDocument(module_path);
+                const importScript = importDocument.parser.parseScript(importDocument.path) catch |err| {
                     handleParseScriptError(&importDocument.parser, stderr, err) catch |err_| {
                         std.log.err("Could not handle error: {}, Original error: {}", .{ err_, err });
                     };

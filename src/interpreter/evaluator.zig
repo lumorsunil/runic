@@ -45,11 +45,13 @@ pub const Evaluator = struct {
             UnsupportedPipelineStage,
             UnsupportedCommandFeature,
             UnsupportedMemberAccess,
+            UnsupportedCommandType,
             MemberNotFound,
             UnknownIdentifier,
             EmptyPipeline,
             InvalidStringCoercion,
             DocumentNotParsed,
+            DocumentNotFound,
         };
 
     pub const BlockOptions = struct {
@@ -120,7 +122,10 @@ pub const Evaluator = struct {
         try scopes.pushFrame(.{ .blocking = true });
         defer scopes.popFrame() catch {};
 
-        const document = self.documentStore.map.get(fn_decl.span.start.file).?;
+        const document = self.documentStore.map.get(fn_decl.span.start.file) orelse {
+            std.log.err("fatal: could not find document: {s}", .{fn_decl.span.start.file});
+            return Error.DocumentNotFound;
+        };
         const executor = &document.script_executor.?;
         // const currentDocument = self.documentStore.map.get(self.path).?;
 
@@ -290,11 +295,15 @@ pub const Evaluator = struct {
         scopes: *ScopeStack,
         decl: *const ast.FunctionDecl,
     ) Error!void {
-        var value = Value{ .function = decl };
+        var value = Value{ .function = .{ .fn_decl = decl, .scope = scopes } };
         try self.bindPattern(scopes, .{ .identifier = decl.name }, false, &value);
     }
 
-    fn evaluateExpression(self: *Evaluator, scopes: *ScopeStack, expr: *const ast.Expression) Error!Value {
+    fn evaluateExpression(
+        self: *Evaluator,
+        scopes: *ScopeStack,
+        expr: *const ast.Expression,
+    ) Error!Value {
         const v = switch (expr.*) {
             .literal => |literal| try self.evaluateLiteral(scopes, literal),
             .identifier => |identifier| try self.evaluateIdentifier(scopes, identifier),
@@ -306,7 +315,7 @@ pub const Evaluator = struct {
         };
 
         return switch (v) {
-            .function => |f| try self.runFunctionAsPipeline(scopes, f),
+            .function => |f| try self.runFunctionAsPipeline(f.scope, f.fn_decl),
             else => v,
         };
     }
@@ -466,11 +475,20 @@ pub const Evaluator = struct {
 
             if (scopes.lookup(name_slice)) |b| {
                 switch (b.value.*) {
-                    .function => |fn_decl| command_type = .{ .function = fn_decl },
-                    .boolean, .integer, .float, .string => command_type = .{ .value = b.value },
-                    else => command_type = .executable,
+                    .function => |fn_ref| command_type = .{ .function = fn_ref },
+                    .boolean, .integer, .float, .string, .process_handle => command_type = .{ .value = b.value },
+                    else => return Error.UnsupportedCommandType,
                 }
             } else command_type = .executable;
+
+            switch (command_type) {
+                .value => |value| {
+                    if (command.args.len == 0 and pipeline.stages.len == 1) {
+                        return try value.clone(self.allocator);
+                    }
+                },
+                else => {},
+            }
 
             for (command.args) |arg_part| {
                 const arg_slice = try self.renderCommandPart(scopes, arg_part, &owned_strings);

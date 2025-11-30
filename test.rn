@@ -1,20 +1,5 @@
 # test.rn
 
-// const lib = import "lib.rn"
+const lib = import "lib.rn"
 
-fn hello() Void {
-  echo "hello"
-}
-
-// const a = hello | cat
-// echo "${a}"
-
-echo "${"hello"}"
-const a = "a"
-// echo "${a}" // Gives PrimitiveValueInPipelineNotSupported
-
-const b = hello | cat
-// echo "${b}" // Gives FileNotFound
-
-const c = echo "hello" | cat
-echo "${c}" // Gives FileNotFound
+lib.hello

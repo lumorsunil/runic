@@ -22,7 +22,7 @@ pub const CommandRunner = struct {
         std.mem.Allocator.Error;
 
     pub const CommandType = union(enum) {
-        function: *const ast.FunctionDecl,
+        function: interpreter.Value.FunctionRef,
         value: *const interpreter.Value,
         executable,
     };
@@ -128,19 +128,19 @@ pub const CommandRunner = struct {
 
         return switch (args.spec.command_type) {
             .executable => self.runStageExecutable(args),
-            .function => |fn_decl| self.runStageFunction(evaluator, fn_decl, args),
+            .function => |fn_ref| self.runStageFunction(evaluator, fn_ref, args),
             .value => Error.PrimitiveValueInPipelineNotSupported,
         };
     }
 
     fn runStageFunction(
-        self: CommandRunner,
+        _: CommandRunner,
         evaluator: *interpreter.Evaluator,
-        fn_decl: *const ast.FunctionDecl,
+        fn_ref: interpreter.Value.FunctionRef,
         args: StageRunArgs,
     ) Error!StageExecution {
-        var scopes = interpreter.ScopeStack.init(self.allocator);
-        defer scopes.deinit();
+        // var scopes = interpreter.ScopeStack.init(self.allocator);
+        // defer scopes.deinit();
 
         // executable
         //   exitCode
@@ -184,7 +184,7 @@ pub const CommandRunner = struct {
         };
 
         // TODO: fix stdin wiring when implementing that for functions
-        const result: Result = if (evaluator.runFunction(&scopes, fn_decl)) |value| .{
+        const result: Result = if (evaluator.runFunction(fn_ref.scope, fn_ref.fn_decl)) |value| .{
             .success = value,
         } else |err| .{
             .err = err,
