@@ -44,10 +44,10 @@ pub const DocumentStore = struct {
         errdefer document.deinit(self.allocator);
         const entry = try self.map.getOrPut(key);
         entry.value_ptr.* = document;
-        try document.rebuildSymbols(
+        try entry.value_ptr.rebuildSymbols(
             self.allocator,
             workspace,
-            workspace.describePath(document.path),
+            workspace.describePath(entry.value_ptr.path),
         );
     }
 
@@ -69,52 +69,51 @@ pub const DocumentStore = struct {
         version: types.DocumentVersion,
         workspace: *workspace_mod.Workspace,
     ) !bool {
-        if (self.map.getPtr(uri)) |doc| {
-            var text: []const u8 = try self.allocator.dupe(u8, doc.text);
+        const doc = self.map.getPtr(uri) orelse return false;
 
-            for (events) |event| switch (event) {
-                .text => |t| {
-                    self.allocator.free(text);
-                    text = try self.allocator.dupe(u8, t);
-                },
-                .range => |range_params| {
-                    const range = range_params.range;
-                    const startIndex = range.start.findIndex(text) orelse {
-                        std.log.err("range not found: {},{} len: {}", .{ range.start.character, range.start.line, text.len });
-                        const startLineN = range.start.line -| 2;
-                        const endLineN = range.start.line +| 2;
-                        const linesLen = endLineN - startLineN;
-                        for (0..linesLen) |i| {
-                            const lineN = startLineN + i;
-                            const line = getLine(@intCast(lineN), text) orelse "<not found>";
-                            std.log.err("{}: {s}", .{ lineN, line });
-                        }
-                        return error.RangeNotFound;
-                    };
-                    const rangeLength = range_params.rangeLength orelse return error.RangeLengthNotDefined;
-                    const endIndex = startIndex + rangeLength;
-                    const first = text[0..startIndex];
-                    const second = range_params.text;
-                    const third = if (endIndex < text.len) text[endIndex..] else "";
+        var text: []const u8 = try self.allocator.dupe(u8, doc.text);
 
-                    const oldText = text;
-                    text = try std.fmt.allocPrint(self.allocator, "{s}{s}{s}", .{ first, second, third });
-                    self.allocator.free(oldText);
-                },
-            };
+        for (events) |event| switch (event) {
+            .text => |t| {
+                self.allocator.free(text);
+                text = try self.allocator.dupe(u8, t);
+            },
+            .range => |range_params| {
+                const range = range_params.range;
+                const startIndex = range.start.findIndex(text) orelse {
+                    std.log.err("range not found: {},{} len: {}", .{ range.start.character, range.start.line, text.len });
+                    const startLineN = range.start.line -| 2;
+                    const endLineN = range.start.line +| 2;
+                    const linesLen = endLineN - startLineN;
+                    for (0..linesLen) |i| {
+                        const lineN = startLineN + i;
+                        const line = getLine(@intCast(lineN), text) orelse "<not found>";
+                        std.log.err("{}: {s}", .{ lineN, line });
+                    }
+                    return error.RangeNotFound;
+                };
+                const rangeLength = range_params.rangeLength orelse return error.RangeLengthNotDefined;
+                const endIndex = startIndex + rangeLength;
+                const first = text[0..startIndex];
+                const second = range_params.text;
+                const third = if (endIndex < text.len) text[endIndex..] else "";
 
-            std.log.err("new document text: \n\n{s}", .{text});
+                const oldText = text;
+                text = try std.fmt.allocPrint(self.allocator, "{s}{s}{s}", .{ first, second, third });
+                self.allocator.free(oldText);
+            },
+        };
 
-            try doc.setText(self.allocator, text, version);
-            self.allocator.free(text);
-            try doc.rebuildSymbols(
-                self.allocator,
-                workspace,
-                workspace.describePath(doc.path),
-            );
-            return true;
-        }
-        return false;
+        std.log.err("new document text: \n\n{s}", .{text});
+
+        try doc.setText(self.allocator, text, version);
+        self.allocator.free(text);
+        try doc.rebuildSymbols(
+            self.allocator,
+            workspace,
+            workspace.describePath(doc.path),
+        );
+        return true;
     }
 
     pub fn close(self: *DocumentStore, uri: []const u8) void {

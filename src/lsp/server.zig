@@ -3,10 +3,6 @@ const workspace_mod = @import("workspace.zig");
 const symbols = @import("symbols.zig");
 const completion = @import("completion.zig");
 const diag = @import("diagnostics.zig");
-const runic = @import("runic");
-const token = runic.token;
-const parseFile = @import("parser.zig").parseFile;
-const Parser = @import("parser.zig").Parser;
 const types = @import("types.zig");
 const json = @import("json.zig");
 const document_mod = @import("document.zig");
@@ -422,7 +418,7 @@ pub const Server = struct {
     }
 
     fn sendJson(self: *Server, json_body: anytype) !void {
-        try self.log("Sent JSON: {f}", .{std.json.fmt(json_body, .{})});
+        try self.log("Sent JSON: {f}", .{std.json.fmt(json_body, .{ .emit_null_optional_fields = false })});
 
         var buffer: [MAX_OUT_CONTENT]u8 = undefined;
         var writer = std.Io.Writer.fixed(&buffer);

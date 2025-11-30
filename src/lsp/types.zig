@@ -441,7 +441,9 @@ pub fn Either(comptime types: anytype) type {
         }
 
         pub fn jsonStringify(self: @This(), stringify: *std.json.Stringify) std.json.Stringify.Error!void {
-            try stringify.write(self.payload);
+            switch (self.payload) {
+                inline else => |p| try stringify.write(p),
+            }
         }
     };
 }

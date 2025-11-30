@@ -1,13 +1,21 @@
 # todo
 
-- [x] functions
-  - [x] lexer
-  - [x] ast
-  - [x] executor
-  - [x] bug: cannot call functions more than one (thanks ai)
-  - [ ] a lot of things missing (stdin, stdout/stderr capturing and piping, return statements, etc.)
-- [x] lsp didChange support, document diagnostics
-- [x] lsp now crashes (investigate that we do similar setup as run_script)
+## functions
+
+- [x] lexer
+- [x] ast
+- [x] executor
+- [x] bug: cannot call functions more than one (thanks ai)
+- [ ] a lot of things missing (stdin, stdout/stderr capturing and piping, return statements, etc.)
+
+## lsp
+
+- [ ] document change does not reflect new symbols
+- [x] didChange support, document diagnostics
+- [x] crashes (investigate that we do similar setup as run_script)
+
+## imports
+
 - [x] imports
   - [x] struct types
     - [x] f (ast) -> struct type
