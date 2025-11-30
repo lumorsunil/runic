@@ -325,32 +325,39 @@ pub const Server = struct {
     }
 
     fn sendInitializeResult(self: *Server, id: types.RequestId) !void {
-        const buffer = try self.allocator.alloc(u8, MAX_OUT_CONTENT);
-        defer self.allocator.free(buffer);
-        var writer = std.Io.Writer.fixed(buffer);
-        try writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
-        try id.writeJson(&writer);
-        try writer.writeAll(",\"result\":{\"capabilities\":{\"textDocumentSync\":{\"openClose\":true,\"change\":2}," ++
-            "\"completionProvider\":{\"triggerCharacters\":[\".\",\":\"],\"resolveProvider\":false}}," ++
-            "\"serverInfo\":{\"name\":\"runic-lsp\",\"version\":\"0.1\"}}}");
-        try self.sendBody(writer.buffered());
+        const result = types.InitializeResult{
+            .capabilities = .{
+                .textDocumentSync = .{ .payload = .{
+                    .textDocumentSyncOptions = .{
+                        .openClose = true,
+                        .change = .incremental,
+                    },
+                } },
+                .completionProvider = .{
+                    .triggerCharacters = &.{ ".", ":" },
+                    .resolveProvider = false,
+                },
+            },
+            .serverInfo = .{
+                .name = "runic-lsp",
+                .version = "0.1",
+            },
+        };
+
+        try self.sendJson(types.response(id, result));
     }
 
     fn sendCompletionResult(self: *Server, id: types.RequestId, items: []const completion.Match) !void {
-        const buffer = try self.allocator.alloc(u8, MAX_OUT_CONTENT);
-        defer self.allocator.free(buffer);
-        var writer = std.Io.Writer.fixed(buffer);
-        try writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
-        try id.writeJson(&writer);
-        try writer.writeAll(",\"result\":{\"isIncomplete\":false,\"items\":[");
-        var first = true;
-        for (items) |entry| {
-            if (!first) try writer.writeByte(',');
-            first = false;
-            try writeCompletionItem(&writer, entry.symbol);
-        }
-        try writer.writeAll("]}}");
-        try self.sendBody(writer.buffered());
+        var completionItems = try self.allocator.alloc(types.CompletionItem, items.len);
+        defer self.allocator.free(completionItems);
+        for (items, 0..) |item, i| completionItems[i] = .fromSymbol(item.symbol.*);
+
+        const result = types.CompletionList{
+            .isIncomplete = false,
+            .items = completionItems,
+        };
+
+        try self.sendJson(types.response(id, result));
     }
 
     fn sendDiagnostics(
@@ -360,94 +367,30 @@ pub const Server = struct {
         diagnostics: []const diag.Diagnostic,
     ) !void {
         std.log.err("sending diagnostics: {} version: {?} uri: {s}", .{ diagnostics.len, version, uri });
+
         if (diagnostics.len == 1) {
             std.log.err("{f}", .{std.json.fmt(diagnostics[0], .{})});
         }
 
-        const buffer = try self.allocator.alloc(u8, MAX_OUT_CONTENT);
-        defer self.allocator.free(buffer);
-        var writer = std.Io.Writer.fixed(buffer);
+        var diagnosticsResult = try self.allocator.alloc(types.Diagnostic, diagnostics.len);
+        defer self.allocator.free(diagnosticsResult);
+        for (diagnostics, 0..) |d, i| diagnosticsResult[i] = .fromDiag(d);
 
-        try writer.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{");
-        try writer.writeAll("\"uri\":");
-        try json.writeJsonString(&writer, uri);
-        try writer.print(",\"version\":{f},\"diagnostics\":[", .{std.json.fmt(version, .{})});
+        const result: types.PublishDiagnosticsParams = .{
+            .uri = uri,
+            .version = version,
+            .diagnostics = diagnosticsResult,
+        };
 
-        var first = true;
-        for (diagnostics) |d| {
-            if (!first) try writer.writeByte(',');
-            first = false;
-
-            try writer.writeAll("{\"range\":");
-            try writeLspRange(&writer, d.span);
-            try writer.print(",\"severity\":{f}", .{d.severity});
-            try writer.writeAll(",\"source\":\"runic\",\"message\":");
-            try json.writeJsonString(&writer, d.message);
-            try writer.writeByte('}');
-        }
-
-        try writer.writeAll("]}}");
-        try self.sendBody(writer.buffered());
+        try self.sendJson(types.methodResponse("textDocument/publishDiagnostics", result));
     }
 
     fn sendNullResult(self: *Server, id: types.RequestId) !void {
-        const buffer = try self.allocator.alloc(u8, MAX_OUT_CONTENT);
-        defer self.allocator.free(buffer);
-        var writer = std.Io.Writer.fixed(buffer);
-        try writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
-        try id.writeJson(&writer);
-        try writer.writeAll(",\"result\":null}");
-        try self.sendBody(writer.buffered());
+        try self.sendJson(types.response(id, @as(?u32, null)));
     }
 
-    fn sendError(self: *Server, id: types.RequestId, code: i64, message: []const u8) !void {
-        const buffer = try self.allocator.alloc(u8, MAX_OUT_CONTENT);
-        defer self.allocator.free(buffer);
-        var writer = std.Io.Writer.fixed(buffer);
-        try writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
-        try id.writeJson(&writer);
-        try writer.writeAll(",\"error\":{\"code\":");
-        try writer.print("{d}", .{code});
-        try writer.writeAll(",\"message\":");
-        try json.writeJsonString(&writer, message);
-        try writer.writeAll("}}");
-        try self.sendBody(writer.buffered());
-    }
-
-    fn writeCompletionItem(writer: *std.Io.Writer, symbol: *const symbols.Symbol) !void {
-        try writer.writeAll("{\"label\":");
-        try json.writeJsonString(writer, symbol.name);
-        try writer.writeAll(",\"kind\":");
-        try writer.print("{d}", .{completionKind(symbol.kind)});
-        try writer.flush();
-        if (symbol.detail.len != 0) {
-            try writer.writeAll(",\"detail\":");
-            try json.writeJsonString(writer, symbol.detail);
-        }
-        if (symbol.documentation.len != 0) {
-            try writer.writeAll(",\"documentation\":");
-            try json.writeJsonString(writer, symbol.documentation);
-        }
-        try writer.writeAll(",\"sortText\":");
-        try writeSortKey(writer, symbol.name);
-        try writer.writeByte('}');
-    }
-
-    fn completionKind(kind: symbols.SymbolKind) u8 {
-        return switch (kind) {
-            .function => 3,
-            .variable => 6,
-            .module => 9,
-        };
-    }
-
-    fn writeSortKey(writer: *std.Io.Writer, label: []const u8) !void {
-        try writer.writeByte('"');
-        for (label) |ch| {
-            const lower = std.ascii.toLower(ch);
-            try writer.writeByte(lower);
-        }
-        try writer.writeByte('"');
+    fn sendError(self: *Server, id: types.RequestId, code: i32, message: []const u8) !void {
+        try self.sendJson(types.responseError(id, code, message));
     }
 
     fn readMessage(self: *Server) ![]u8 {
@@ -478,7 +421,14 @@ pub const Server = struct {
         return content_length orelse error.ProtocolError;
     }
 
-    fn sendBody(self: *Server, body: []const u8) !void {
+    fn sendJson(self: *Server, json_body: anytype) !void {
+        try self.log("Sent JSON: {f}", .{std.json.fmt(json_body, .{})});
+
+        var buffer: [MAX_OUT_CONTENT]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        try writer.print("{f}", .{std.json.fmt(json_body, .{})});
+        const body = writer.buffered();
+
         try self.writer.print("Content-Length: {d}\r\n\r\n", .{body.len});
         try self.writer.writeAll(body);
         try self.writer.flush();
@@ -532,18 +482,6 @@ fn extractPrefix(text: []const u8, line: usize, character: usize) []const u8 {
         } else break;
     }
     return text[start..cursor];
-}
-
-fn writeLspRange(writer: *std.Io.Writer, span: token.Span) !void {
-    try writer.print(
-        "{{\"start\":{{\"line\":{d},\"character\":{d}}},\"end\":{{\"line\":{d},\"character\":  {d}}}}}",
-        .{
-            span.start.line - 1,
-            span.start.column - 1,
-            span.end.line - 1,
-            span.end.column - 1,
-        },
-    );
 }
 
 fn readLine(allocator: Allocator, reader: *std.Io.Reader) ![]u8 {

@@ -45,7 +45,7 @@ pub fn parseFile(
             .uri = try std.fmt.allocPrint(allocator, "file://{s}", .{absolute_path}),
             .message = try message.toOwnedSlice(),
             .span = .fromLocs(loc, loc),
-            .severity = .err,
+            .severity = .@"error",
         });
 
         return null;
