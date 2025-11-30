@@ -421,20 +421,6 @@ pub fn Parser(
                 const next_token = try self.peekToken();
 
                 if (isExprTerminator(next_token.tag)) {
-                    if (args.items.len == 0) {
-                        return .{
-                            .role = .expression,
-                            .payload = .{
-                                .expression = try self.allocExpression(.{
-                                    .identifier = .{
-                                        .name = identifier.lexeme,
-                                        .span = identifier.span,
-                                    },
-                                }),
-                            },
-                            .span = identifier.span,
-                        };
-                    }
                     return .{
                         .role = .command,
                         .payload = .{
@@ -680,8 +666,8 @@ pub fn Parser(
             const stmt = try self.arena.allocator().create(ast.Statement);
             errdefer self.arena.allocator().destroy(stmt);
 
-            const maybeLet = try self.parseMaybeLet();
-            if (maybeLet) |letDecl| {
+            const maybeBinding = try self.parseMaybeBinding();
+            if (maybeBinding) |letDecl| {
                 stmt.* = .{ .binding_decl = letDecl };
                 return stmt;
             }
@@ -963,25 +949,25 @@ pub fn Parser(
             });
         }
 
-        fn parseMaybeLet(self: *Self) ParseError!?ast.BindingDecl {
-            const breadcrumb = try self.createBreadcrumb("parseMaybeLet");
+        fn parseMaybeBinding(self: *Self) ParseError!?ast.BindingDecl {
+            const breadcrumb = try self.createBreadcrumb("parseMaybeBinding");
             defer breadcrumb.end();
 
             const next = try self.peekToken();
             return switch (next.tag) {
-                .kw_const, .kw_var => try self.parseLet(),
+                .kw_const, .kw_var => try self.parseBinding(),
                 else => null,
             };
         }
 
-        fn parseLet(self: *Self) ParseError!ast.BindingDecl {
-            const breadcrumb = try self.createBreadcrumb("parseLet");
+        fn parseBinding(self: *Self) ParseError!ast.BindingDecl {
+            const breadcrumb = try self.createBreadcrumb("parseBinding");
             defer breadcrumb.end();
 
-            const letOrMut = try self.nextToken();
-            switch (letOrMut.tag) {
+            const constOrVar = try self.nextToken();
+            switch (constOrVar.tag) {
                 .kw_const, .kw_var => {},
-                else => return self.failExpectedTokens(letOrMut.tag, &[_]token.Tag{ .kw_const, .kw_var }),
+                else => return self.failExpectedTokens(constOrVar.tag, &[_]token.Tag{ .kw_const, .kw_var }),
             }
             const pattern = try self.parseBindingPattern();
             const annotation: ?*ast.TypeExpr = try self.parseMaybeTypeAnnotation();
@@ -989,8 +975,8 @@ pub fn Parser(
             const initializer = try self.parseExpression();
 
             return ast.BindingDecl{
-                .is_mutable = letOrMut.tag == .kw_var,
-                .span = letOrMut.span.endAt(initializer.span()),
+                .is_mutable = constOrVar.tag == .kw_var,
+                .span = constOrVar.span.endAt(initializer.span()),
                 .annotation = annotation,
                 .initializer = initializer,
                 .pattern = pattern,

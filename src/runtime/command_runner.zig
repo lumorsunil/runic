@@ -14,7 +14,7 @@ pub const CommandRunner = struct {
     allocator: std.mem.Allocator,
     tracer: ?*Tracer = null,
 
-    pub const Error = error{EmptyCommand} ||
+    pub const Error = error{ EmptyCommand, PrimitiveValueInPipelineNotSupported } ||
         std.process.Child.RunError ||
         std.process.Child.SpawnError ||
         std.process.Child.WaitError ||
@@ -23,6 +23,7 @@ pub const CommandRunner = struct {
 
     pub const CommandType = union(enum) {
         function: *const ast.FunctionDecl,
+        value: *const interpreter.Value,
         executable,
     };
 
@@ -128,6 +129,7 @@ pub const CommandRunner = struct {
         return switch (args.spec.command_type) {
             .executable => self.runStageExecutable(args),
             .function => |fn_decl| self.runStageFunction(evaluator, fn_decl, args),
+            .value => Error.PrimitiveValueInPipelineNotSupported,
         };
     }
 
@@ -177,7 +179,7 @@ pub const CommandRunner = struct {
         const started_at = std.time.nanoTimestamp();
 
         const Result = union(enum) {
-            success: interpreter.Value,
+            success: interpreter.Evaluator.RunFunctionResult,
             err: anyerror,
         };
 
@@ -195,14 +197,23 @@ pub const CommandRunner = struct {
             .err => |err| .{ .err = err },
         };
 
+        const stdout: []u8 = switch (result) {
+            .success => |f| f.stdout,
+            .err => &.{},
+        };
+        const stderr: []u8 = switch (result) {
+            .success => |f| f.stderr,
+            .err => &.{},
+        };
+
         return .{
             .pid = null,
             .started_at_ns = started_at,
             .finished_at_ns = finished_at,
             .status = StageStatus.fromTerm(args.index, .{ .function = exitCode }),
             // TODO: fix when implementing typed stdout for functions
-            .stdout_owned = &.{},
-            .stderr_owned = &.{},
+            .stdout_owned = stdout,
+            .stderr_owned = stderr,
         };
     }
 

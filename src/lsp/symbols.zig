@@ -98,7 +98,7 @@ fn appendSymbol(
     var entry = Symbol{
         .name = try allocator.dupe(u8, name),
         .detail = try allocator.dupe(u8, detail),
-        .documentation = &[_]u8{},
+        .documentation = try std.fmt.allocPrint(allocator, "`{s}`", .{@tagName(kind)}),
         .kind = kind,
     };
     errdefer entry.deinit(allocator);

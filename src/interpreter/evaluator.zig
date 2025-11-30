@@ -107,33 +107,51 @@ pub const Evaluator = struct {
         _ = result.take();
     }
 
+    pub const RunFunctionResult = struct {
+        stdout: []u8,
+        stderr: []u8,
+    };
+
     pub fn runFunction(
         self: *Evaluator,
         scopes: *ScopeStack,
         fn_decl: *const ast.FunctionDecl,
-    ) Error!Value {
+    ) Error!RunFunctionResult {
         try scopes.pushFrame(.{ .blocking = true });
         defer scopes.popFrame() catch {};
 
         const document = self.documentStore.map.get(fn_decl.span.start.file).?;
         const executor = &document.script_executor.?;
-        const currentDocument = self.documentStore.map.get(self.path).?;
+        // const currentDocument = self.documentStore.map.get(self.path).?;
 
         try executor.scopes.pushFrame(.{});
+
+        var stdout_allocating = std.Io.Writer.Allocating.init(self.allocator);
+        defer stdout_allocating.deinit();
+        var stderr_allocating = std.Io.Writer.Allocating.init(self.allocator);
+        defer stderr_allocating.deinit();
+
+        const stdout = &stdout_allocating.writer;
+        const stderr = &stderr_allocating.writer;
 
         _ = try executor.execute(.{
             .statements = fn_decl.body.block.statements,
             .span = fn_decl.span,
         }, .{
             .script_path = document.path,
-            .stdout = currentDocument.script_executor.?.evaluator.executeOptions.stdout,
-            .stderr = currentDocument.script_executor.?.evaluator.executeOptions.stderr,
+            // .stdout = currentDocument.script_executor.?.evaluator.executeOptions.stdout,
+            // .stderr = currentDocument.script_executor.?.evaluator.executeOptions.stderr,
+            .stdout = stdout,
+            .stderr = stderr,
             .context = undefined,
         });
 
         try executor.scopes.popFrame();
 
-        return .void;
+        return .{
+            .stdout = try self.allocator.dupe(u8, stdout.buffered()),
+            .stderr = try self.allocator.dupe(u8, stderr.buffered()),
+        };
 
         // switch (fn_decl.body) {
         //     .block => |block| {
@@ -238,7 +256,7 @@ pub const Evaluator = struct {
     ) Error!?Value {
         return switch (statement.*) {
             .binding_decl => |decl| blk: {
-                try self.executeLet(scopes, &decl);
+                try self.executeBinding(scopes, &decl);
                 break :blk null;
             },
             .fn_decl => |*decl| blk: {
@@ -258,7 +276,7 @@ pub const Evaluator = struct {
         return try self.evaluateExpression(scopes, expression);
     }
 
-    fn executeLet(self: *Evaluator, scopes: *ScopeStack, decl: *const ast.BindingDecl) Error!void {
+    fn executeBinding(self: *Evaluator, scopes: *ScopeStack, decl: *const ast.BindingDecl) Error!void {
         var value = try self.evaluateExpression(scopes, decl.initializer);
         var consumed = false;
         defer if (!consumed) value.deinit(self.allocator);
@@ -449,6 +467,7 @@ pub const Evaluator = struct {
             if (scopes.lookup(name_slice)) |b| {
                 switch (b.value.*) {
                     .function => |fn_decl| command_type = .{ .function = fn_decl },
+                    .boolean, .integer, .float, .string => command_type = .{ .value = b.value },
                     else => command_type = .executable,
                 }
             } else command_type = .executable;

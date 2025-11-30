@@ -1,5 +1,6 @@
 const std = @import("std");
 const symbols = @import("symbols.zig");
+const types = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -8,7 +9,7 @@ pub const MatchList = struct {
     items: std.ArrayList(Match),
 
     pub fn init(allocator: Allocator) MatchList {
-        return .{ .allocator = allocator, .items = .{} };
+        return .{ .allocator = allocator, .items = .empty };
     }
 
     pub fn deinit(self: *MatchList) void {
