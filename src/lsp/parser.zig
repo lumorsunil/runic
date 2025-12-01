@@ -10,18 +10,21 @@ pub const Parser = runic.parser.Parser(DocumentStore, getCachedAst, putCachedAst
 
 fn getCachedAst(self: *DocumentStore, path: []const u8) !?runic.ast.Script {
     const uri = try self.resolveUri(path);
+    defer self.allocator.free(uri);
     const document = self.get(uri) orelse return null;
     return document.ast;
 }
 
 fn putCachedAst(self: *DocumentStore, path: []const u8, script: runic.ast.Script) !void {
     const uri = try self.resolveUri(path);
+    defer self.allocator.free(uri);
     const document = self.get(uri) orelse return error.DocumentNotFound;
     document.ast = script;
 }
 
 fn getSource(self: *DocumentStore, path: []const u8) ![]const u8 {
     const uri = try self.resolveUri(path);
+    defer self.allocator.free(uri);
     const document = self.get(uri);
     if (document) |d| return d.text;
     return error.DocumentNotFound;

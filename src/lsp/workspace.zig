@@ -31,6 +31,7 @@ pub const Workspace = struct {
         self.clearIndex();
         self.clearDiagnostics();
         self.index.deinit(self.allocator);
+        self.diagnostics.deinit(self.allocator);
     }
 
     pub fn resetRoots(self: *Workspace, roots: []const []const u8) !void {

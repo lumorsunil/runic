@@ -24,14 +24,14 @@ pub const ClientRequest = struct {
             jsonrpc: []const u8,
             id: ?RequestId = null,
             method: []const u8,
-            params: std.json.Value,
+            params: ?std.json.Value = null,
         };
 
         const poly: ClientRequestPoly = try std.json.innerParse(ClientRequestPoly, allocator, source, options);
 
         inline for (std.meta.fields(ClientRequestPayload)) |field| {
             if (std.mem.eql(u8, field.name, poly.method)) {
-                const params = if (field.type == void) ({}) else try std.json.innerParseFromValue(field.type, allocator, poly.params, options);
+                const params = if (field.type == void) ({}) else if (poly.params) |ps| try std.json.innerParseFromValue(field.type, allocator, ps, options) else undefined;
                 return .{
                     .jsonrpc = poly.jsonrpc,
                     .id = poly.id,

@@ -354,7 +354,7 @@ pub const Server = struct {
     fn sendCompletionResult(self: *Server, id: types.RequestId, items: []const completion.Match) !void {
         var completionItems = try self.allocator.alloc(types.CompletionItem, items.len);
         defer self.allocator.free(completionItems);
-        for (items, 0..) |item, i| completionItems[i] = .fromSymbol(item.symbol.*);
+        for (items, 0..) |item, i| completionItems[i] = .fromSymbol(item.symbol.get());
 
         const result = types.CompletionList{
             .isIncomplete = false,

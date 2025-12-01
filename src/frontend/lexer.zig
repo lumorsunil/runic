@@ -76,7 +76,8 @@ pub const Lexer = struct {
         };
     }
 
-    pub fn deinit(self: Lexer) void {
+    pub fn deinit(self: *Lexer) void {
+        self.context_stack.deinit(self.arena.child_allocator);
         self.arena.deinit();
     }
 
@@ -653,7 +654,7 @@ pub const Stream = struct {
         return .{ .lexer = try .init(allocator, file, source) };
     }
 
-    pub fn deinit(self: Stream) void {
+    pub fn deinit(self: *Stream) void {
         self.lexer.deinit();
     }
 

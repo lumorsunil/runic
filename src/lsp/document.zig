@@ -167,6 +167,7 @@ const Document = struct {
         for (self.symbols.items) |*entry| entry.deinit(allocator);
         self.symbols.deinit(allocator);
         if (self.parser) |*p| p.deinit();
+        self.diagnostics.deinit(allocator);
         self.* = undefined;
     }
 

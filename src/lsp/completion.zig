@@ -19,13 +19,48 @@ pub const MatchList = struct {
     }
 
     pub fn deinit(self: *MatchList) void {
+        for (self.items.items) |item| item.deinit(self.allocator);
         self.items.deinit(self.allocator);
     }
 };
 
+fn OwnedOrNot(comptime T: type) type {
+    return union(enum) {
+        owned: *T,
+        notOwned: *const T,
+
+        pub fn deinit(self: @This(), allocator: Allocator) void {
+            switch (self) {
+                .owned => |ptr| {
+                    if (std.meta.hasFn(T, "deinit")) {
+                        ptr.deinit(allocator);
+                    }
+                    allocator.destroy(ptr);
+                    ptr.* = undefined;
+                },
+                .notOwned => {},
+            }
+        }
+
+        pub fn get(self: @This()) T {
+            return self.getPtr().*;
+        }
+
+        pub fn getPtr(self: @This()) *const T {
+            return switch (self) {
+                inline else => |ptr| ptr,
+            };
+        }
+    };
+}
+
 pub const Match = struct {
-    symbol: *const symbols.Symbol,
+    symbol: OwnedOrNot(symbols.Symbol),
     source: Source,
+
+    pub fn deinit(self: Match, allocator: Allocator) void {
+        self.symbol.deinit(allocator);
+    }
 };
 
 pub const Source = enum { document, workspace };
@@ -63,6 +98,7 @@ fn determineCompletionKind(context: CollectMatchesContext) !CompletionKind {
     const char_index = context.char_index + 1;
     const line_slice = getLine(context);
     var lexer = try runic.lexer.Stream.init(context.allocator, context.file, line_slice);
+    defer lexer.deinit();
     lexer.lexer.logging_enabled = true;
 
     while (true) {
@@ -134,7 +170,7 @@ fn collectModuleMatches(context: CollectMatchesContext) !MatchList {
                     };
 
                     try matches.items.append(context.allocator, .{
-                        .symbol = symbol,
+                        .symbol = .{ .owned = symbol },
                         .source = .workspace,
                     });
                 }
@@ -156,7 +192,7 @@ fn appendMatches(
 ) !void {
     for (symbol_list) |*entry| {
         if (!symbolMatches(entry.name, prefix, mode)) continue;
-        try matches.items.append(matches.allocator, .{ .symbol = entry, .source = source });
+        try matches.items.append(matches.allocator, .{ .symbol = .{ .notOwned = entry }, .source = source });
     }
 }
 
