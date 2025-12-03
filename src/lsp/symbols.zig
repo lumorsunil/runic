@@ -8,6 +8,7 @@ pub const SymbolKind = enum {
     module,
     function,
     variable,
+    keyword,
 };
 
 pub const Symbol = struct {

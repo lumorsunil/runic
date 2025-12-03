@@ -2,6 +2,7 @@ const std = @import("std");
 const tracing = @import("tracing.zig");
 const ast = @import("../frontend/ast.zig");
 const interpreter = @import("../interpreter/root.zig");
+const mem = @import("../mem/root.zig");
 
 const Tracer = tracing.Tracer;
 const TraceTopic = tracing.Topic;
@@ -15,6 +16,7 @@ pub const CommandRunner = struct {
     tracer: ?*Tracer = null,
 
     pub const Error = error{ EmptyCommand, PrimitiveValueInPipelineNotSupported } ||
+        mem.RCError ||
         std.process.Child.RunError ||
         std.process.Child.SpawnError ||
         std.process.Child.WaitError ||
@@ -29,7 +31,7 @@ pub const CommandRunner = struct {
 
     pub const CommandSpec = struct {
         command_type: CommandType,
-        argv: []const []const u8,
+        argv: []interpreter.Value.String,
         cwd: ?[]const u8 = null,
         env_map: ?*const std.process.EnvMap = null,
         max_output_bytes: usize = default_max_capture_bytes,
@@ -184,7 +186,7 @@ pub const CommandRunner = struct {
         };
 
         // TODO: fix stdin wiring when implementing that for functions
-        const result: Result = if (evaluator.runFunction(fn_ref.scope, fn_ref.fn_decl)) |value| .{
+        const result: Result = if (evaluator.runFunction(fn_ref)) |value| .{
             .success = value,
         } else |err| .{
             .err = err,
@@ -217,8 +219,19 @@ pub const CommandRunner = struct {
         };
     }
 
+    fn dupeArgs(
+        self: CommandRunner,
+        args: []const interpreter.Value.String,
+    ) Error![]const []const u8 {
+        const argv: [][]const u8 = try self.allocator.alloc([]const u8, args.len);
+        for (args, 0..) |arg, i| argv[i] = try arg.get();
+        return argv;
+    }
+
     fn runStageExecutable(self: CommandRunner, args: StageRunArgs) Error!StageExecution {
-        var child = std.process.Child.init(args.spec.argv, self.allocator);
+        const argv = try self.dupeArgs(args.spec.argv);
+        defer self.allocator.free(argv);
+        var child = std.process.Child.init(argv, self.allocator);
         child.stdin_behavior = if (args.stdin_data != null) .Pipe else .Ignore;
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
@@ -615,7 +628,7 @@ pub const StageStatus = struct {
 
 const default_max_capture_bytes = 1024 * 1024;
 
-const StageExecution = struct {
+pub const StageExecution = struct {
     pid: ?std.process.Child.Id,
     started_at_ns: i128,
     finished_at_ns: i128,
@@ -644,7 +657,7 @@ pub const StageCapture = struct {
 };
 
 pub const CommandDisplay = struct {
-    argv: []const []const u8,
+    argv: []const interpreter.Value.String,
 
     pub fn format(
         self: CommandDisplay,

@@ -18,7 +18,7 @@ const Allocator = std.mem.Allocator;
 pub const ScriptExecutor = struct {
     allocator: Allocator,
     evaluator: Evaluator,
-    scopes: ScopeStack,
+    scopes: *ScopeStack,
     command_bridge: ?*CommandBridge = null,
 
     pub const Error = error{
@@ -40,7 +40,8 @@ pub const ScriptExecutor = struct {
     };
 
     pub fn initWithExecutor(allocator: Allocator, executor: CommandExecutor) !ScriptExecutor {
-        var scopes = ScopeStack.init(allocator);
+        var scopes = try allocator.create(ScopeStack);
+        scopes.* = ScopeStack.init(allocator);
         errdefer scopes.deinit();
         try scopes.pushFrame();
 
@@ -68,9 +69,11 @@ pub const ScriptExecutor = struct {
             .env_map = env_map,
         };
 
-        var scopes = ScopeStack.init(allocator);
+        var scopes = try allocator.create(ScopeStack);
+        scopes.* = ScopeStack.init(allocator);
         errdefer {
             scopes.deinit();
+            allocator.destroy(scopes);
             allocator.destroy(bridge);
         }
         try scopes.pushFrame(.{});
@@ -90,6 +93,7 @@ pub const ScriptExecutor = struct {
 
     pub fn deinit(self: *ScriptExecutor) void {
         self.scopes.deinit();
+        self.allocator.destroy(self.scopes);
         if (self.command_bridge) |bridge| {
             self.allocator.destroy(bridge);
         }
@@ -115,7 +119,7 @@ pub const ScriptExecutor = struct {
         for (context.bindings.items) |binding| {
             switch (binding.value) {
                 .string => |literal| {
-                    var runtime_value = RuntimeValue{ .string = try self.allocator.dupe(u8, literal) };
+                    var runtime_value = RuntimeValue{ .string = try .dupe(self.allocator, literal) };
                     errdefer runtime_value.deinit(self.allocator);
                     try fresh.declare(binding.name, &runtime_value, binding.is_mutable);
                 },
@@ -123,8 +127,8 @@ pub const ScriptExecutor = struct {
             }
         }
 
-        var previous = self.scopes;
-        self.scopes = fresh;
+        var previous = self.scopes.*;
+        self.scopes.* = fresh;
         previous.deinit();
     }
 
@@ -136,7 +140,7 @@ pub const ScriptExecutor = struct {
 
     pub fn execute(self: *ScriptExecutor, script: ast.Script, options: ExecuteOptions) !command_runner.ExitCode {
         for (script.statements) |stmt| {
-            const maybe_value = self.evaluator.runStatement(&self.scopes, stmt) catch |err| {
+            const maybe_value = self.evaluator.runStatement(self.scopes, stmt) catch |err| {
                 try self.renderEvaluatorError(options.stderr, options.script_path, stmt.span(), err);
                 return .fromProcess(1);
             };

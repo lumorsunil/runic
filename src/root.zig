@@ -20,3 +20,4 @@ pub const tracing = @import("runtime/tracing.zig");
 pub const interpreter = @import("interpreter/root.zig");
 pub const rainbow = @import("rainbow.zig");
 pub const utils = @import("utils.zig");
+pub const mem = @import("mem/root.zig");

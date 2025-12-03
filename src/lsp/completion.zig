@@ -125,10 +125,15 @@ fn determineCompletionKind(context: CollectMatchesContext) !CompletionKind {
 
 fn collectSymbolMatches(context: CollectMatchesContext) !MatchList {
     const prefix = extractPrefix(context, symbols.isIdentifierChar);
-    const mode = determineMode(prefix, context.doc_symbols, context.workspace_symbols);
+    const all_symbols: []const []const symbols.Symbol = &.{
+        context.doc_symbols,
+        context.workspace_symbols,
+    };
+    const mode = determineMode(prefix, all_symbols);
     var matches = MatchList.init(context.allocator);
-    try appendMatches(&matches, .document, context.doc_symbols, prefix, mode);
-    try appendMatches(&matches, .workspace, context.workspace_symbols, prefix, mode);
+    for (all_symbols) |symbols_| {
+        try appendMatches(&matches, .document, symbols_, prefix, mode);
+    }
     return matches;
 }
 
@@ -191,6 +196,7 @@ fn appendMatches(
     mode: FilterMode,
 ) !void {
     for (symbol_list) |*entry| {
+        std.log.err("Trying to match \"{s}\" against \"{s}\"", .{ prefix, entry.name });
         if (!symbolMatches(entry.name, prefix, mode)) continue;
         try matches.items.append(matches.allocator, .{ .symbol = .{ .notOwned = entry }, .source = source });
     }
@@ -207,12 +213,12 @@ pub const FilterMode = enum {
 
 fn determineMode(
     prefix: []const u8,
-    doc_symbols: []const symbols.Symbol,
-    workspace_symbols: []const symbols.Symbol,
+    symbols_lists: []const []const symbols.Symbol,
 ) FilterMode {
     if (prefix.len == 0) return .prefix;
-    if (hasPrefixMatch(prefix, doc_symbols)) return .prefix;
-    if (hasPrefixMatch(prefix, workspace_symbols)) return .prefix;
+    for (symbols_lists) |symbols_| {
+        if (hasPrefixMatch(prefix, symbols_)) return .prefix;
+    }
     return .substring;
 }
 

@@ -1328,7 +1328,11 @@ pub const CompletionItem = struct {
             .label = symbol.name,
             .kind = kind,
             .detail = detail,
-            .documentation = if (documentation) |d| .{ .payload = .{ .@"[]const u8" = d } } else null,
+            .documentation = if (documentation) |d| .{
+                .payload = .{
+                    .markupContent = .{ .kind = .markdown, .value = d },
+                },
+            } else null,
         };
     }
 };
@@ -1412,7 +1416,37 @@ pub const MarkupContent = struct {
 /// Describes the content type that a client supports in various result literals like `Hover`, `ParameterInfo` or `CompletionItem`.
 ///
 /// Please note that `MarkupKinds` must not start with a `$`. This kinds are reserved for internal usage.
-pub const MarkupKind = []const u8;
+pub const MarkupKind = enum {
+    plaintext,
+    markdown,
+
+    pub fn jsonParse(
+        allocator: Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) std.json.ParseError(@TypeOf(source.*))!@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(
+        _: Allocator,
+        source: std.json.Value,
+        _: std.json.ParseOptions,
+    ) std.json.ParseFromValueError!@This() {
+        switch (source) {
+            .string => |s| std.meta.stringToEnum(@This(), s),
+            else => std.json.ParseFromValueError.InvalidEnumTag,
+        }
+    }
+
+    pub fn jsonStringify(
+        self: @This(),
+        stringify: *std.json.Stringify,
+    ) std.json.Stringify.Error!void {
+        try stringify.write(@tagName(self));
+    }
+};
 
 /// Plain text is supported as a content format
 pub const MarkupKindPlainText = "plaintext";

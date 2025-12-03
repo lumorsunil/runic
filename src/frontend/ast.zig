@@ -9,6 +9,13 @@ pub const Spanned = token.Spanned;
 pub const Identifier = struct {
     name: []const u8,
     span: Span,
+
+    pub fn fromToken(tok: token.Token) Identifier {
+        return .{
+            .name = tok.lexeme,
+            .span = tok.span,
+        };
+    }
 };
 
 /// Path represents qualified identifiers such as `error.FileError.NotFound`.
@@ -240,6 +247,7 @@ pub const Expression = union(enum) {
     try_expr: TryExpr,
     catch_expr: CatchExpr,
     import_expr: ImportExpr,
+    assignment: Assignment,
 
     pub fn span(self: Expression) Span {
         return switch (self) {
@@ -331,14 +339,51 @@ pub const BinaryOp = enum {
     multiply,
     divide,
     remainder,
-    logical_and,
-    logical_or,
-    equal,
-    not_equal,
     greater,
     greater_equal,
     less,
     less_equal,
+    not_equal,
+    equal,
+    logical_and,
+    logical_or,
+
+    pub fn precedence(self: BinaryOp) usize {
+        return switch (self) {
+            .add => 20,
+            .subtract => 20,
+            .multiply => 30,
+            .divide => 30,
+            .remainder => 30,
+            .greater => 15,
+            .greater_equal => 15,
+            .less => 15,
+            .less_equal => 15,
+            .not_equal => 15,
+            .equal => 15,
+            .logical_and => 10,
+            .logical_or => 5,
+        };
+    }
+
+    pub fn fromToken(tok: token.Token) ?BinaryOp {
+        return switch (tok.tag) {
+            .plus => .add,
+            .minus => .subtract,
+            .star => .multiply,
+            .slash => .divide,
+            .percent => .remainder,
+            .greater => .greater,
+            .greater_equal => .greater_equal,
+            .less => .less,
+            .less_equal => .less_equal,
+            .bang_equal => .not_equal,
+            .kw_and => .logical_and,
+            .kw_or => .logical_or,
+            .equal_equal => .equal,
+            else => null,
+        };
+    }
 };
 
 pub const FunctionLiteral = struct {
@@ -651,6 +696,12 @@ pub const WhileStmt = struct {
     condition: *Expression,
     capture: ?CaptureClause,
     body: Block,
+    span: Span,
+};
+
+pub const Assignment = struct {
+    identifier: Identifier,
+    expr: *Expression,
     span: Span,
 };
 

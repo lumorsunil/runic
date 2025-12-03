@@ -12,6 +12,7 @@ fn hello() Void {
   const name = printf "lib"
   const surname = ".rn"
   const fullname = printf "${name.stdout} ${surname}"
+
   echo "hello from ${fullname}"
   echo "hello from ${fullname}"
 }

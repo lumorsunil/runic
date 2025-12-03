@@ -1,5 +1,56 @@
 # test.rn
 
-const lib = import "lib.rn"
+if true {
+  echo "this will get echoed"
+  echo "yes it's true"
+} else {
+  echo "this will get echoed"
+  echo "no, it's not true"
+}
 
-lib.hello
+// var s = "hello" + ", world!" + 3
+// const e = echo "${s}"
+// echo "${e}${4 + 3}"
+
+//  0:[ a ], 1:-----, 2:[ c ], 3:[ d ] ...
+
+
+// var s = "hello"
+// echo "${s}"
+// s = "no"
+// echo "${s}"
+//
+// fn setS() Void {
+//   // s = s + " something else" + " and more" + 2 + 4
+//   s = "${s} something else${" and more"}"
+//   s = s
+//   s = s
+//   s = s
+//   s = s
+//   s = s
+// }
+//
+// setS
+// echo "${s}"
+//
+// var a = 5.5 + 2 * 3 + 1 > 1 + 2 * 6 and true and false
+//
+// echo "a: ${a}"
+//
+// echo "5 == 5: ${5 == 5}"
+// echo "5 == 4: ${5 == 4}"
+// echo "5 != 4: ${5 != 4}"
+// echo "5 != 5: ${5 != 5}"
+// echo "5 < 5: ${5 < 5}"
+// echo "5 <= 5: ${5 <= 5}"
+// echo "5 < 4: ${5 < 4}"
+// echo "5 <= 4: ${5 <= 4}"
+// echo "5 <= 6: ${5 <= 6}"
+// echo "true and true: ${true and true}"
+// echo "true and false: ${true and false}"
+// echo "false and true: ${false and true}"
+// echo "false and false: ${false and false}"
+// echo "true or true: ${true or true}"
+// echo "true or false: ${true or false}"
+// echo "false or true: ${false or true}"
+// echo "false or false: ${false or false}"

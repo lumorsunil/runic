@@ -218,6 +218,20 @@ fn renderExpressionAst(writer: *std.Io.Writer, expr: *const ast.Expression, leve
             try writer.writeByte('\n');
             for (pipeline_expr.stages) |stage| try renderPipelineStage(writer, stage, level + 1);
         },
+        .binary => |binary| {
+            try writeIndent(writer, level);
+            try writer.writeAll("binary @ ");
+            try printSpanInline(writer, binary.span);
+            try writer.writeByte('\n');
+            try writeIndent(writer, level + 1);
+            try writer.print("op: {s}\n", .{@tagName(binary.op)});
+            try writeIndent(writer, level + 1);
+            try writer.writeAll("left: \n");
+            try renderExpressionAst(writer, binary.left, level + 1);
+            try writeIndent(writer, level + 1);
+            try writer.writeAll("right: \n");
+            try renderExpressionAst(writer, binary.right, level + 1);
+        },
         else => {
             const tag_name = @tagName(std.meta.activeTag(node));
             try writeIndent(writer, level);

@@ -84,7 +84,7 @@ pub fn main() !void {
         else => {},
     };
 
-    var server = lsp.server.Server.init(allocator, stdin, std.fs.File.stdout(), std.fs.File.stderr());
+    var server = try lsp.server.Server.init(allocator, stdin, std.fs.File.stdout(), std.fs.File.stderr());
     server.initInterface();
     defer server.deinit();
 

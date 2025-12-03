@@ -35,7 +35,7 @@ pub const Server = struct {
         stdin_file: std.fs.File,
         stdout_file: std.fs.File,
         stderr_file: std.fs.File,
-    ) Server {
+    ) !Server {
         var log_enabled = false;
         if (std.process.getEnvVarOwned(allocator, "RUNIC_LSP_LOG")) |value| {
             defer allocator.free(value);
@@ -53,7 +53,7 @@ pub const Server = struct {
             .reader = undefined,
             .stdout_writer = undefined,
             .writer = undefined,
-            .workspace = workspace_mod.Workspace.init(allocator, undefined),
+            .workspace = try workspace_mod.Workspace.init(allocator, undefined),
             .documents = document_mod.DocumentStore.init(allocator),
             .log_enabled = log_enabled,
         };
@@ -313,6 +313,8 @@ pub const Server = struct {
 
         const doc_symbols = if (doc) |d| d.symbols.items else &[_]symbols.Symbol{};
         const workspace_symbols = self.workspace.symbolSlice();
+
+        std.log.err("workspace_symbols: {}", .{workspace_symbols.len});
 
         var matches = try completion.collectMatches(.{
             .allocator = self.allocator,

@@ -32,6 +32,7 @@ pub const Evaluator = struct {
         ScopeStack.Error ||
         CommandExecutor.Error ||
         ScriptContext.BindingError ||
+        Value.Error ||
         std.fmt.ParseIntError ||
         std.fmt.ParseFloatError ||
         std.fs.Dir.RealPathAllocError ||
@@ -46,6 +47,7 @@ pub const Evaluator = struct {
             UnsupportedCommandFeature,
             UnsupportedMemberAccess,
             UnsupportedCommandType,
+            UnsupportedBinaryExpr,
             MemberNotFound,
             UnknownIdentifier,
             EmptyPipeline,
@@ -112,24 +114,27 @@ pub const Evaluator = struct {
     pub const RunFunctionResult = struct {
         stdout: []u8,
         stderr: []u8,
+        started_at_ns: i128,
+        finished_at_ns: i128,
     };
 
     pub fn runFunction(
         self: *Evaluator,
-        scopes: *ScopeStack,
-        fn_decl: *const ast.FunctionDecl,
+        fn_ref: Value.FunctionRef,
     ) Error!RunFunctionResult {
-        try scopes.pushFrame(.{ .blocking = true });
-        defer scopes.popFrame() catch {};
-
-        const document = self.documentStore.map.get(fn_decl.span.start.file) orelse {
-            std.log.err("fatal: could not find document: {s}", .{fn_decl.span.start.file});
+        const document = self.documentStore.map.get(fn_ref.fn_decl.span.start.file) orelse {
+            std.log.err("fatal: could not find document: {s}", .{fn_ref.fn_decl.span.start.file});
             return Error.DocumentNotFound;
         };
-        const executor = &document.script_executor.?;
+        var executor: *ScriptExecutor = undefined;
+        if (document.script_executor) |*se| executor = se else return Error.DocumentNotParsed;
         // const currentDocument = self.documentStore.map.get(self.path).?;
 
-        try executor.scopes.pushFrame(.{});
+        const executor_scopes = executor.scopes;
+        const scopes = fn_ref.closure;
+        executor.scopes = scopes;
+        defer executor.scopes = executor_scopes;
+        try scopes.pushFrame(.{});
 
         var stdout_allocating = std.Io.Writer.Allocating.init(self.allocator);
         defer stdout_allocating.deinit();
@@ -139,9 +144,11 @@ pub const Evaluator = struct {
         const stdout = &stdout_allocating.writer;
         const stderr = &stderr_allocating.writer;
 
+        const started_at = std.time.nanoTimestamp();
+
         _ = try executor.execute(.{
-            .statements = fn_decl.body.block.statements,
-            .span = fn_decl.span,
+            .statements = fn_ref.fn_decl.body.block.statements,
+            .span = fn_ref.fn_decl.span,
         }, .{
             .script_path = document.path,
             // .stdout = currentDocument.script_executor.?.evaluator.executeOptions.stdout,
@@ -151,9 +158,13 @@ pub const Evaluator = struct {
             .context = undefined,
         });
 
-        try executor.scopes.popFrame();
+        const finished_at = std.time.nanoTimestamp();
+
+        try scopes.popFrame();
 
         return .{
+            .started_at_ns = started_at,
+            .finished_at_ns = finished_at,
             .stdout = try self.allocator.dupe(u8, stdout.buffered()),
             .stderr = try self.allocator.dupe(u8, stderr.buffered()),
         };
@@ -173,10 +184,91 @@ pub const Evaluator = struct {
         // }
     }
 
-    pub fn runFunctionAsPipeline(
+    pub fn runBlockInOwnContext(
         self: *Evaluator,
         scopes: *ScopeStack,
-        fn_decl: *const ast.FunctionDecl,
+        block: ast.Block,
+    ) Error!Value {
+        try scopes.pushFrame(.{});
+
+        const document = try self.getCurrentDocument();
+        var executor: *ScriptExecutor = undefined;
+        if (document.script_executor) |*script_executor| {
+            executor = script_executor;
+        } else {
+            return Error.DocumentNotParsed;
+        }
+
+        var stdout_allocating = std.Io.Writer.Allocating.init(self.allocator);
+        defer stdout_allocating.deinit();
+        var stderr_allocating = std.Io.Writer.Allocating.init(self.allocator);
+        defer stderr_allocating.deinit();
+
+        const stdout = &stdout_allocating.writer;
+        const stderr = &stderr_allocating.writer;
+
+        const started_at = std.time.nanoTimestamp();
+
+        // TODO: use exit code
+        _ = try executor.execute(.{
+            .statements = block.statements,
+            .span = block.span,
+        }, .{
+            .script_path = document.path,
+            .stdout = stdout,
+            .stderr = stderr,
+            .context = undefined,
+        });
+
+        const finished_at = std.time.nanoTimestamp();
+
+        try scopes.popFrame();
+
+        return .{ .process_handle = try self.runFunctionResultToProcessHandle(.{
+            .started_at_ns = started_at,
+            .finished_at_ns = finished_at,
+            .stdout = try self.allocator.dupe(u8, stdout.buffered()),
+            .stderr = try self.allocator.dupe(u8, stderr.buffered()),
+        }) };
+    }
+
+    fn runFunctionResultToProcessHandle(
+        self: *Evaluator,
+        result: RunFunctionResult,
+    ) Error!ProcessHandle {
+        // Fix when blocks can have errors which results in exit codes as errors
+        const exitCode: command_runner.ExitCode = .success;
+
+        const stage = command_runner.StageExecution{
+            .pid = null,
+            .started_at_ns = result.started_at_ns,
+            .finished_at_ns = result.finished_at_ns,
+            .status = .fromTerm(0, .{ .function = exitCode }),
+            // TODO: fix when implementing typed stdout for functions
+            .stdout_owned = result.stdout,
+            .stderr_owned = result.stderr,
+        };
+
+        const stage_statuses = try self.allocator.dupe(command_runner.StageStatus, &.{stage.status});
+        const stage_captures = try self.allocator.dupe(command_runner.StageCapture, &.{.{
+            .stdout = stage.stdout_owned,
+            .stderr = stage.stderr_owned,
+        }});
+
+        return ProcessHandle{
+            .allocator = self.allocator,
+            .handle_type = .function,
+            .started_at_ns = result.started_at_ns,
+            .finished_at_ns = result.finished_at_ns,
+            .status = command_runner.ProcessStatus.fromStages(stage_statuses),
+            .stage_statuses = stage_statuses,
+            .stage_captures = stage_captures,
+        };
+    }
+
+    pub fn runFunctionAsPipeline(
+        self: *Evaluator,
+        fn_ref: Value.FunctionRef,
     ) Error!Value {
         const pipeline = ast.Pipeline{
             .stages = &.{
@@ -184,8 +276,8 @@ pub const Evaluator = struct {
                     .role = .command,
                     .payload = .{
                         .command = .{
-                            .span = fn_decl.span,
-                            .name = .{ .word = .{ .text = fn_decl.name.name, .span = fn_decl.name.span } },
+                            .span = fn_ref.fn_decl.span,
+                            .name = .{ .word = .{ .text = fn_ref.fn_decl.name.name, .span = fn_ref.fn_decl.name.span } },
                             // TODO: fix this when implementing function arguments
                             .args = &.{},
                             // TODO: fix this when implementing background support for functions
@@ -198,13 +290,13 @@ pub const Evaluator = struct {
                             .redirects = &.{},
                         },
                     },
-                    .span = fn_decl.span,
+                    .span = fn_ref.fn_decl.span,
                 },
             },
-            .span = fn_decl.span,
+            .span = fn_ref.fn_decl.span,
         };
 
-        return try self.evaluatePipeline(scopes, pipeline);
+        return try self.evaluatePipeline(fn_ref.scope, pipeline);
     }
 
     /// Executes a single statement in the current scope and returns its result
@@ -295,7 +387,8 @@ pub const Evaluator = struct {
         scopes: *ScopeStack,
         decl: *const ast.FunctionDecl,
     ) Error!void {
-        var value = Value{ .function = .{ .fn_decl = decl, .scope = scopes } };
+        const closure = try scopes.closure();
+        var value = Value{ .function = .{ .fn_decl = decl, .scope = scopes, .closure = closure } };
         try self.bindPattern(scopes, .{ .identifier = decl.name }, false, &value);
     }
 
@@ -311,11 +404,14 @@ pub const Evaluator = struct {
             .block => |block_expr| try self.evaluateBlockExpression(scopes, block_expr),
             .import_expr => |import_expr| try self.evaluateImportExpression(import_expr),
             .member => |member_expr| try self.evaluateMemberExpression(scopes, member_expr),
+            .assignment => |assignment| try self.evaluateAssignment(scopes, assignment),
+            .binary => |binary| try self.evaluateBinary(scopes, binary),
+            .if_expr => |if_expr| try self.evaluateIfExpression(scopes, if_expr),
             else => return Error.UnsupportedExpression,
         };
 
         return switch (v) {
-            .function => |f| try self.runFunctionAsPipeline(f.scope, f.fn_decl),
+            .function => |f| try self.runFunctionAsPipeline(f),
             else => v,
         };
     }
@@ -340,7 +436,7 @@ pub const Evaluator = struct {
     }
 
     fn evaluateIdentifier(self: *Evaluator, scopes: *ScopeStack, identifier: ast.Identifier) Error!Value {
-        const binding = scopes.lookup(identifier.name) orelse return Error.UnknownIdentifier;
+        const binding = try scopes.lookup(identifier.name) orelse return Error.UnknownIdentifier;
         return try binding.value.clone(self.allocator);
     }
 
@@ -360,7 +456,7 @@ pub const Evaluator = struct {
         const document = try self.getCachedDocument(import.importer, import.module_name);
 
         if (document.script_executor) |*script_executor| {
-            return .{ .scope = &script_executor.scopes };
+            return .{ .scope = script_executor.scopes };
         }
 
         const script_ast = document.ast orelse return Error.DocumentNotParsed;
@@ -400,7 +496,7 @@ pub const Evaluator = struct {
 
         document.exitCode = exitCode;
 
-        return .{ .scope = &executor.scopes };
+        return .{ .scope = executor.scopes };
     }
 
     fn evaluateMemberExpression(
@@ -415,9 +511,9 @@ pub const Evaluator = struct {
             .void, .boolean, .integer, .float, .string, .function => return Error.UnsupportedMemberAccess,
             .process_handle => |p| {
                 if (std.mem.eql(u8, member.member.name, "stdout")) {
-                    return .{ .string = try self.allocator.dupe(u8, p.stdoutBytes()) };
+                    return .{ .string = try .dupe(self.allocator, p.stdoutBytes()) };
                 } else if (std.mem.eql(u8, member.member.name, "stderr")) {
-                    return .{ .string = try self.allocator.dupe(u8, p.stderrBytes()) };
+                    return .{ .string = try .dupe(self.allocator, p.stderrBytes()) };
                 } else if (std.mem.eql(u8, member.member.name, "exitCode")) {
                     return Error.UnsupportedMemberAccess;
                     // return .{ .integer = p.status.exit_code.? };
@@ -426,10 +522,239 @@ pub const Evaluator = struct {
                 }
             },
             .scope => |s| {
-                const ref = s.lookup(member.member.name) orelse return Error.MemberNotFound;
+                const ref = try s.lookup(member.member.name) orelse return Error.MemberNotFound;
                 return ref.value.clone(self.allocator);
             },
         }
+    }
+
+    fn evaluateAssignment(
+        self: *Evaluator,
+        scopes: *ScopeStack,
+        assignment: ast.Assignment,
+    ) Error!Value {
+        const bindingRef = try scopes.lookup(assignment.identifier.name) orelse return Error.UnknownIdentifier;
+
+        if (bindingRef.is_mutable) {
+            var newValue = try self.evaluateExpression(scopes, assignment.expr);
+            try bindingRef.value.reassign(self.allocator, &newValue);
+            return bindingRef.value.clone(self.allocator);
+        } else {
+            return Error.ImmutableBinding;
+        }
+    }
+
+    fn evaluateBinary(
+        self: *Evaluator,
+        scopes: *ScopeStack,
+        binary: ast.BinaryExpr,
+    ) Error!Value {
+        switch (binary.op) {
+            .add => {
+                var left = try self.evaluateExpression(scopes, binary.left);
+                var right = try self.evaluateExpression(scopes, binary.right);
+
+                if (left == .string and right == .string) {
+                    defer left.string.release();
+                    defer right.string.release();
+                    return .{ .string = try .print(self.allocator, "{s}{s}", .{
+                        try left.string.get(),
+                        try right.string.get(),
+                    }) };
+                }
+
+                if (left == .integer and right == .integer) {
+                    return .{ .integer = left.integer +| right.integer };
+                } else if (left == .float and right == .float) {
+                    return .{ .float = left.float + right.float };
+                } else if (left == .integer and right == .float) {
+                    const float_left: Value.Float = @floatFromInt(left.integer);
+                    return .{ .float = float_left + right.float };
+                } else if (left == .float and right == .integer) {
+                    const float_right: Value.Float = @floatFromInt(right.integer);
+                    return .{ .float = left.float + float_right };
+                }
+            },
+            .subtract => {
+                const left = try self.evaluateExpression(scopes, binary.left);
+                const right = try self.evaluateExpression(scopes, binary.right);
+
+                if (left == .integer and right == .integer) {
+                    return .{ .integer = left.integer -| right.integer };
+                } else if (left == .float and right == .float) {
+                    return .{ .float = left.float - right.float };
+                } else if (left == .integer and right == .float) {
+                    const float_left: Value.Float = @floatFromInt(left.integer);
+                    return .{ .float = float_left - right.float };
+                } else if (left == .float and right == .integer) {
+                    const float_right: Value.Float = @floatFromInt(right.integer);
+                    return .{ .float = left.float - float_right };
+                }
+            },
+            .multiply => {
+                const left = try self.evaluateExpression(scopes, binary.left);
+                const right = try self.evaluateExpression(scopes, binary.right);
+
+                if (left == .integer and right == .integer) {
+                    return .{ .integer = left.integer *| right.integer };
+                } else if (left == .float and right == .float) {
+                    return .{ .float = left.float * right.float };
+                } else if (left == .integer and right == .float) {
+                    const float_left: Value.Float = @floatFromInt(left.integer);
+                    return .{ .float = float_left * right.float };
+                } else if (left == .float and right == .integer) {
+                    const float_right: Value.Float = @floatFromInt(right.integer);
+                    return .{ .float = left.float * float_right };
+                }
+            },
+            .divide => {
+                const left = try self.evaluateExpression(scopes, binary.left);
+                const right = try self.evaluateExpression(scopes, binary.right);
+
+                if (left == .integer and right == .integer) {
+                    const float_left: Value.Float = @floatFromInt(left.integer);
+                    const float_right: Value.Float = @floatFromInt(right.integer);
+                    return .{ .float = float_left / float_right };
+                } else if (left == .float and right == .float) {
+                    return .{ .float = left.float / right.float };
+                } else if (left == .integer and right == .float) {
+                    const float_left: Value.Float = @floatFromInt(left.integer);
+                    return .{ .float = float_left / right.float };
+                } else if (left == .float and right == .integer) {
+                    const float_right: Value.Float = @floatFromInt(right.integer);
+                    return .{ .float = left.float / float_right };
+                }
+            },
+            .remainder => {
+                const left = try self.evaluateExpression(scopes, binary.left);
+                const right = try self.evaluateExpression(scopes, binary.right);
+
+                if (left == .integer and right == .integer) {
+                    const float_left: Value.Float = @floatFromInt(left.integer);
+                    const float_right: Value.Float = @floatFromInt(right.integer);
+                    return .{ .float = @mod(float_left, float_right) };
+                } else if (left == .float and right == .float) {
+                    return .{ .float = @mod(left.float, right.float) };
+                } else if (left == .integer and right == .float) {
+                    const float_left: Value.Float = @floatFromInt(left.integer);
+                    return .{ .float = @mod(float_left, right.float) };
+                } else if (left == .float and right == .integer) {
+                    const float_right: Value.Float = @floatFromInt(right.integer);
+                    return .{ .float = @mod(left.float, float_right) };
+                }
+            },
+            .greater => {
+                const left = try self.evaluateExpression(scopes, binary.left);
+                const right = try self.evaluateExpression(scopes, binary.right);
+
+                if (left.isNumeric() and right.isNumeric()) {
+                    const left_value: Value.Float = if (left == .integer) @floatFromInt(left.integer) else left.float;
+                    const right_value: Value.Float = if (right == .integer) @floatFromInt(right.integer) else right.float;
+                    return .{ .boolean = left_value > right_value };
+                }
+            },
+            .greater_equal => {
+                const left = try self.evaluateExpression(scopes, binary.left);
+                const right = try self.evaluateExpression(scopes, binary.right);
+
+                if (left.isNumeric() and right.isNumeric()) {
+                    const left_value: Value.Float = if (left == .integer) @floatFromInt(left.integer) else left.float;
+                    const right_value: Value.Float = if (right == .integer) @floatFromInt(right.integer) else right.float;
+                    return .{ .boolean = left_value >= right_value };
+                }
+            },
+            .less => {
+                const left = try self.evaluateExpression(scopes, binary.left);
+                const right = try self.evaluateExpression(scopes, binary.right);
+
+                if (left.isNumeric() and right.isNumeric()) {
+                    const left_value: Value.Float = if (left == .integer) @floatFromInt(left.integer) else left.float;
+                    const right_value: Value.Float = if (right == .integer) @floatFromInt(right.integer) else right.float;
+                    return .{ .boolean = left_value < right_value };
+                }
+            },
+            .less_equal => {
+                const left = try self.evaluateExpression(scopes, binary.left);
+                const right = try self.evaluateExpression(scopes, binary.right);
+
+                if (left.isNumeric() and right.isNumeric()) {
+                    const left_value: Value.Float = if (left == .integer) @floatFromInt(left.integer) else left.float;
+                    const right_value: Value.Float = if (right == .integer) @floatFromInt(right.integer) else right.float;
+                    return .{ .boolean = left_value <= right_value };
+                }
+            },
+            .equal => {
+                const left = try self.evaluateExpression(scopes, binary.left);
+                const right = try self.evaluateExpression(scopes, binary.right);
+
+                if (left.isNumeric() and right.isNumeric()) {
+                    const left_value: Value.Float = if (left == .integer) @floatFromInt(left.integer) else left.float;
+                    const right_value: Value.Float = if (right == .integer) @floatFromInt(right.integer) else right.float;
+                    return .{ .boolean = left_value == right_value };
+                }
+            },
+            .not_equal => {
+                const left = try self.evaluateExpression(scopes, binary.left);
+                const right = try self.evaluateExpression(scopes, binary.right);
+
+                if (left.isNumeric() and right.isNumeric()) {
+                    const left_value: Value.Float = if (left == .integer) @floatFromInt(left.integer) else left.float;
+                    const right_value: Value.Float = if (right == .integer) @floatFromInt(right.integer) else right.float;
+                    return .{ .boolean = left_value != right_value };
+                }
+            },
+            .logical_and => {
+                const left = try self.evaluateExpression(scopes, binary.left);
+                const right = try self.evaluateExpression(scopes, binary.right);
+
+                if (left == .boolean and right == .boolean) {
+                    return .{ .boolean = left.boolean and right.boolean };
+                }
+            },
+            .logical_or => {
+                const left = try self.evaluateExpression(scopes, binary.left);
+                const right = try self.evaluateExpression(scopes, binary.right);
+
+                if (left == .boolean and right == .boolean) {
+                    return .{ .boolean = left.boolean or right.boolean };
+                }
+            },
+        }
+
+        return Error.UnsupportedBinaryExpr;
+    }
+
+    fn evaluateIfExpression(
+        self: *Evaluator,
+        scopes: *ScopeStack,
+        if_expr: ast.IfExpr,
+    ) Error!Value {
+        var condition_value = try self.evaluateExpression(scopes, if_expr.condition);
+        defer condition_value.deinit(self.allocator);
+        const condition = try expectBoolean(condition_value);
+
+        if (condition) {
+            const result = try self.runBlockInOwnContext(scopes, if_expr.then_block);
+            return result;
+        } else if (if_expr.else_branch) |else_branch| {
+            const result = switch (else_branch) {
+                .if_expr => |else_if_expr| try self.evaluateIfExpression(scopes, else_if_expr.*),
+                .block => |else_expr| try self.runBlockInOwnContext(scopes, else_expr),
+            };
+            return result;
+        }
+
+        return .void;
+    }
+
+    fn expectBoolean(value: Value) Error!bool {
+        return (try expectType(value, .boolean)).boolean;
+    }
+
+    fn expectType(value: Value, expected: std.meta.Tag(Value)) Error!Value {
+        if (value == expected) return value;
+        std.log.err("TypeMismatch error: expected {s}, actual {s}", .{ @tagName(expected), @tagName(std.meta.activeTag(value)) });
+        return Error.TypeMismatch;
     }
 
     fn getCachedDocument(self: *Evaluator, importer: []const u8, moduleName: []const u8) Error!*Document {
@@ -438,19 +763,24 @@ pub const Evaluator = struct {
         return try self.documentStore.requestDocument(path);
     }
 
-    fn evaluatePipeline(self: *Evaluator, scopes: *ScopeStack, pipeline: ast.Pipeline) Error!Value {
+    fn getCurrentDocument(self: *Evaluator) Error!*Document {
+        return try self.documentStore.requestDocument(self.path);
+    }
+
+    fn evaluatePipeline(
+        self: *Evaluator,
+        lookup_scope: *ScopeStack,
+        pipeline: ast.Pipeline,
+    ) Error!Value {
         if (pipeline.stages.len == 0) return Error.EmptyPipeline;
 
         var specs = ArrayListManaged(CommandRunner.CommandSpec).init(self.allocator);
         defer {
-            for (specs.items) |spec| self.allocator.free(spec.argv);
+            for (specs.items) |spec| {
+                for (spec.argv) |*arg| arg.release();
+                self.allocator.free(spec.argv);
+            }
             specs.deinit();
-        }
-
-        var owned_strings = ArrayListManaged([]u8).init(self.allocator);
-        defer {
-            for (owned_strings.items) |buffer| self.allocator.free(buffer);
-            owned_strings.deinit();
         }
 
         for (pipeline.stages) |stage| {
@@ -465,15 +795,18 @@ pub const Evaluator = struct {
                 return Error.UnsupportedCommandFeature;
             }
 
-            var argv = ArrayListManaged([]const u8).init(self.allocator);
-            defer argv.deinit();
+            var argv = ArrayListManaged(Value.String).init(self.allocator);
+            defer {
+                for (argv.items) |*arg| arg.release();
+                argv.deinit();
+            }
 
-            const name_slice = try self.renderCommandPart(scopes, command.name, &owned_strings);
+            var name_slice = try self.renderCommandPart(lookup_scope, command.name);
             try argv.append(name_slice);
 
             var command_type: command_runner.CommandRunner.CommandType = undefined;
 
-            if (scopes.lookup(name_slice)) |b| {
+            if (try lookup_scope.lookup(try name_slice.get())) |b| {
                 switch (b.value.*) {
                     .function => |fn_ref| command_type = .{ .function = fn_ref },
                     .boolean, .integer, .float, .string, .process_handle => command_type = .{ .value = b.value },
@@ -491,13 +824,12 @@ pub const Evaluator = struct {
             }
 
             for (command.args) |arg_part| {
-                const arg_slice = try self.renderCommandPart(scopes, arg_part, &owned_strings);
+                const arg_slice = try self.renderCommandPart(lookup_scope, arg_part);
                 try argv.append(arg_slice);
             }
 
-            const argv_owned = try self.allocator.alloc([]const u8, argv.items.len);
-            @memcpy(argv_owned, argv.items);
-            try specs.append(.{ .command_type = command_type, .argv = argv_owned });
+            const spec_argv = try argv.toOwnedSlice();
+            try specs.append(.{ .command_type = command_type, .argv = spec_argv });
         }
 
         const handle = try self.executor.run(specs.items);
@@ -508,16 +840,14 @@ pub const Evaluator = struct {
         self: *Evaluator,
         scopes: *ScopeStack,
         part: ast.CommandPart,
-        owned_strings: *ArrayListManaged([]u8),
-    ) Error![]const u8 {
+    ) Error!Value.String {
         return switch (part) {
-            .word => |word| try self.trackString(owned_strings, try self.allocator.dupe(u8, word.text)),
-            .string => |literal| try self.trackString(owned_strings, try self.renderStringLiteral(scopes, literal)),
+            .word => |word| try .dupe(self.allocator, word.text),
+            .string => |literal| try self.renderStringLiteral(scopes, literal),
             .expr => |expr_ptr| blk: {
                 var value = try self.evaluateExpression(scopes, expr_ptr);
                 defer value.deinit(self.allocator);
-                const rendered = try self.materializeString(&value);
-                break :blk try self.trackString(owned_strings, rendered);
+                break :blk try self.materializeString(&value);
             },
         };
     }
@@ -528,7 +858,7 @@ pub const Evaluator = struct {
         return buffer;
     }
 
-    fn renderStringLiteral(self: *Evaluator, scopes: *ScopeStack, literal: ast.StringLiteral) Error![]u8 {
+    fn renderStringLiteral(self: *Evaluator, scopes: *ScopeStack, literal: ast.StringLiteral) Error!Value.String {
         var buffer = ArrayListManaged(u8).init(self.allocator);
         errdefer buffer.deinit();
 
@@ -538,27 +868,23 @@ pub const Evaluator = struct {
                 .interpolation => |expr_ptr| {
                     var value = try self.evaluateExpression(scopes, expr_ptr);
                     defer value.deinit(self.allocator);
-                    const rendered = try self.materializeString(&value);
-                    defer self.allocator.free(rendered);
-                    try buffer.appendSlice(rendered);
+                    var rendered = try self.materializeString(&value);
+                    defer rendered.release();
+                    try buffer.appendSlice(try rendered.get());
                 },
             }
         }
 
-        return buffer.toOwnedSlice();
+        return .init(self.allocator, try buffer.toOwnedSlice());
     }
 
-    fn materializeString(self: *Evaluator, value: *Value) Error![]u8 {
+    fn materializeString(self: *Evaluator, value: *Value) Error!Value.String {
         return switch (value.*) {
-            .string => |owned| blk: {
-                const slice = owned;
-                value.* = .{ .void = {} };
-                break :blk slice;
-            },
-            .boolean => |flag| try self.allocator.dupe(u8, if (flag) "1" else "0"),
-            .integer => |int| try std.fmt.allocPrint(self.allocator, "{d}", .{int}),
-            .float => |flt| try std.fmt.allocPrint(self.allocator, "{d}", .{flt}),
-            .process_handle => |p| try self.allocator.dupe(u8, p.stdoutBytes()),
+            .string => |ref| try ref.ref(),
+            .boolean => |flag| try .dupe(self.allocator, if (flag) "1" else "0"),
+            .integer => |int| try .print(self.allocator, "{}", .{int}),
+            .float => |flt| try .print(self.allocator, "{}", .{flt}),
+            .process_handle => |p| try .dupe(self.allocator, p.stdoutBytes()),
             .void, .scope, .function => Error.InvalidStringCoercion,
         };
     }

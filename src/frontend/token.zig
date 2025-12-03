@@ -44,8 +44,6 @@ pub const Span = struct {
     }
 
     pub fn contains(self: Span, line: usize, column: usize) bool {
-        std.log.debug("contains: {}:{} start: {}:{} end: {}:{}", .{ line, column, self.start.line, self.start.column, self.end.line, self.end.column });
-
         if (self.start.line == line and self.end.line == line) {
             return self.start.column <= column and self.end.column >= column;
         }
@@ -70,6 +68,13 @@ pub fn Spanned(comptime T: type) type {
     return struct {
         payload: T,
         span: Span,
+
+        pub fn fromToken(tok: Token) ?Spanned(T) {
+            return .{
+                .payload = T.fromToken(tok) orelse return null,
+                .span = tok.span,
+            };
+        }
     };
 }
 
@@ -82,6 +87,10 @@ pub const Token = struct {
 
     pub fn isKeyword(self: Token) bool {
         return self.tag.toKeyword() != null;
+    }
+
+    pub fn format(self: Token, writer: *std.Io.Writer) !void {
+        try writer.writeAll(@tagName(self.tag));
     }
 };
 
@@ -161,9 +170,11 @@ pub const Tag = enum {
     caret,
     amp,
     amp_amp,
+    kw_and,
     /// Stage separator for pipelines.
     pipe,
     pipe_pipe,
+    kw_or,
     bang,
     /// Optional prefix "?".
     question,
@@ -249,10 +260,12 @@ const keyword_map = std.StaticStringMap(Tag).initComptime(.{
     .{ "match", .kw_match },
     .{ "return", .kw_return },
     .{ "import", .kw_import },
-    .{ "bash", .kw_bash },
+    .{ "_bash", .kw_bash },
     .{ "try", .kw_try },
     .{ "catch", .kw_catch },
     .{ "true", .kw_true },
     .{ "false", .kw_false },
     .{ "null", .kw_null },
+    .{ "and", .kw_and },
+    .{ "or", .kw_or },
 });

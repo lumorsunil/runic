@@ -3,6 +3,7 @@ const ast = @import("ast.zig");
 const lexer = @import("lexer.zig");
 const token = @import("token.zig");
 const rainbow = @import("../rainbow.zig");
+const mem = @import("../mem/root.zig");
 const DocumentStore = @import("document_store.zig").DocumentStore;
 const Document = @import("document_store.zig").Document;
 
@@ -12,6 +13,7 @@ pub const ParseError = error{
     UnexpectedToken,
     UnexpectedEOF,
     StringInterpNotAllowed,
+    StringInArithmeticExpressionNotAllowed,
     DuplicateStructDecl,
 } || std.mem.Allocator.Error || lexer.Error;
 
@@ -89,23 +91,56 @@ pub fn Parser(
         pub fn log(self: Self, comptime fmt: []const u8, args: anytype) !void {
             if (!self.logging_enabled) return;
             var stdout = std.fs.File.stderr().writer(&.{});
-            try stdout.interface.print("[parser]:", .{});
-            for (0..self.breadcrumb_depth) |_| {
-                try stdout.interface.writeByte(' ');
-            }
+            const writer = &stdout.interface;
+            try self.writeLogPrefix(writer);
             const maxColors = std.meta.tags(rainbow.RainbowColor).len;
             const color: rainbow.RainbowColor = @enumFromInt(@max(1, @mod(self.breadcrumb_depth, maxColors)));
-            try stdout.interface.writeAll(rainbow.beginColor(color));
-            try stdout.interface.print(fmt, args);
-            try stdout.interface.writeAll(rainbow.endColor());
-            try stdout.interface.writeByte('\n');
-            try self.logCurrentTokenSourceLine(&stdout.interface);
-            try stdout.interface.flush();
+            try writer.writeAll(rainbow.beginColor(color));
+            try writer.print(fmt, args);
+            try writer.writeAll(rainbow.endColor());
+            try writer.writeByte('\n');
+            try self.logCurrentTokenSourceLine(writer);
+            try writer.flush();
+        }
+
+        fn writeLogPrefix(self: Self, writer: *std.Io.Writer) !void {
+            try writer.print("[parser]:", .{});
+            for (0..self.breadcrumb_depth) |_| {
+                try writer.writeByte(' ');
+            }
+        }
+
+        fn logNewlineToken(self: Self, writer: *std.Io.Writer) !void {
+            const tok = self.currentToken() orelse return;
+            const line = tok.span.start.line;
+            const col = tok.span.start.column;
+            const start = tok.span.start.column - 1;
+            const line_slice = self.lineSlice(line) orelse return;
+
+            try self.writeLogPrefix(writer);
+            const pre_token_slice = line_slice[0..start];
+
+            try writer.print("L{d}C{d}: ", .{ line, col });
+            try writer.writeAll(pre_token_slice);
+            try writer.writeAll(rainbow.beginColor(.black));
+            try writer.writeAll(rainbow.beginBgColor(.orange));
+            try writer.writeByte('$');
+            try writer.writeAll(rainbow.endColor());
+            try writer.writeByte('\n');
         }
 
         fn logCurrentTokenSourceLine(self: Self, writer: *std.Io.Writer) !void {
             const tok = self.currentToken() orelse return;
-            if (tok.span.start.line != tok.span.end.line) return;
+            if (tok.span.start.line != tok.span.end.line) {
+                if (tok.lexeme.len == 1 and tok.lexeme[0] == '\n') {
+                    try self.logNewlineToken(writer);
+                    try self.logPeekedTokenSourceLine(writer);
+                    return;
+                }
+                try writer.print("skipping token ({}-{}){s}", .{ tok.span.start.line, tok.span.end.line, tok.lexeme });
+                return;
+            }
+            if (tok.span.end.column <= tok.span.start.column) return;
             const peeked = self.peekedToken();
             const line = tok.span.start.line;
             const col = tok.span.start.column;
@@ -113,10 +148,7 @@ pub fn Parser(
             const end = tok.span.end.column - 1;
             const line_slice = self.lineSlice(line) orelse return;
 
-            try writer.print("[parser]:", .{});
-            for (0..self.breadcrumb_depth) |_| {
-                try writer.writeByte(' ');
-            }
+            try self.writeLogPrefix(writer);
             const pre_token_slice = line_slice[0..start];
             const token_slice = line_slice[start..end];
             const post_token_slice = line_slice[end..];
@@ -127,18 +159,53 @@ pub fn Parser(
             try writer.writeAll(token_slice);
             try writer.writeAll(rainbow.endColor());
             if (peeked) |p| {
-                if (p.span.start.offset != tok.span.start.offset and p.span.start.line == line) {
+                if (p.span.start.offset > tok.span.start.offset and p.span.start.line == line) {
                     try writer.writeAll(rainbow.beginColor(.black));
                     try writer.writeAll(rainbow.beginBgColor(.violet));
-                    try writer.writeAll(line_slice[end .. p.span.start.column - 1]);
+                    try writer.writeAll(line_slice[@min(end, line_slice.len)..@min(p.span.start.column, line_slice.len)]);
                     try writer.writeAll(rainbow.endColor());
-                    try writer.writeAll(line_slice[p.span.start.column - 1 ..]);
+                    try writer.writeAll(line_slice[@min(p.span.start.column, line_slice.len)..]);
                 } else {
                     try writer.writeAll(post_token_slice);
                 }
             } else {
                 try writer.writeAll(post_token_slice);
             }
+            try writer.writeByte('\n');
+            if (peeked) |p| {
+                if (p.span.start.line != tok.span.end.line or p.span.end.line != tok.span.end.line) {
+                    try self.logPeekedTokenSourceLine(writer);
+                }
+            }
+        }
+
+        fn logPeekedTokenSourceLine(self: Self, writer: *std.Io.Writer) !void {
+            const tok = self.peekedToken() orelse return;
+            if (tok.span.start.line != tok.span.end.line) {
+                if (tok.lexeme.len == 1 and tok.lexeme[0] == '\n') {
+                    return self.logNewlineToken(writer);
+                }
+                try writer.print("skipping token ({}-{}){s}", .{ tok.span.start.line, tok.span.end.line, tok.lexeme });
+                return;
+            }
+            if (tok.span.end.column <= tok.span.start.column) return;
+            const line = tok.span.start.line;
+            const col = tok.span.start.column;
+            const start = tok.span.start.column - 1;
+            const end = tok.span.end.column - 1;
+            const line_slice = self.lineSlice(line) orelse return;
+
+            try self.writeLogPrefix(writer);
+            const pre_token_slice = line_slice[0..start];
+            const token_slice = line_slice[start..end];
+            const post_token_slice = line_slice[end..];
+            try writer.print("L{d}C{d}: ", .{ line, col });
+            try writer.writeAll(pre_token_slice);
+            try writer.writeAll(rainbow.beginColor(.black));
+            try writer.writeAll(rainbow.beginBgColor(.violet));
+            try writer.writeAll(token_slice);
+            try writer.writeAll(rainbow.endColor());
+            try writer.writeAll(post_token_slice);
             try writer.writeByte('\n');
         }
 
@@ -163,12 +230,17 @@ pub fn Parser(
             return self.stream.peeked_tokens_buffer.items[0];
         }
 
-        fn takeSnapshot(self: *Self) lexer.Stream {
-            return self.stream.snapshot();
+        fn takeSnapshot(self: *Self) ParseError!lexer.Stream {
+            const snapshot = try self.stream.snapshot();
+            const next = try self.stream.peek();
+            try self.log("took snapshot at {?f}({?}) : {f}({})", .{ snapshot.current, if (snapshot.current) |c| c.span.start.offset else null, next, next.span.start.offset });
+            return snapshot;
         }
 
-        fn restoreSnapshot(self: *Self, snapshot: lexer.Stream) void {
-            return self.stream.restore(snapshot);
+        fn restoreSnapshot(self: *Self, snapshot: *lexer.Stream) ParseError!void {
+            try self.stream.restore(snapshot);
+            const next = try self.stream.peek();
+            try self.log("restored snapshot to {?f}({?}) : {f}({})", .{ snapshot.current, if (snapshot.current) |c| c.span.start.offset else null, next, next.span.start.offset });
         }
 
         fn currentTokenLocation(self: Self) ?token.Location {
@@ -272,7 +344,10 @@ pub fn Parser(
                 .kw_import => self.parseImportExpression(),
                 .identifier => self.parseIdentifierExpression(),
                 .kw_if => self.parseIfExpression(),
-                else => self.parsePrimaryExpression(),
+                else => {
+                    if (try self.parseMaybeBinaryExpression()) |arith_expr| return arith_expr;
+                    return self.parsePrimaryExpression();
+                },
             };
         }
 
@@ -309,7 +384,7 @@ pub fn Parser(
 
             inline for (std.meta.fields(@TypeOf(parsers))) |field| {
                 const parser = @field(parsers, field.name);
-                const snapshot = self.takeSnapshot();
+                const snapshot = try self.takeSnapshot();
 
                 if (parser(self)) |result| {
                     return @unionInit(OneOf(@TypeOf(parsers)), field.name, result);
@@ -330,6 +405,8 @@ pub fn Parser(
         fn parseIdentifierExpression(self: *Self) ParseError!*ast.Expression {
             const breadcrumb = try self.createBreadcrumb("parseIdentifierExpression");
             defer breadcrumb.end();
+
+            if (try self.parseMaybeBinaryExpression()) |expr| return expr;
 
             const p = try self.peekSlice(2);
             const identifier = p[0];
@@ -357,8 +434,294 @@ pub fn Parser(
                         },
                     });
                 },
+                .assign => {
+                    _ = try self.nextToken();
+                    _ = try self.nextToken();
+                    const expr = try self.parseExpression();
+
+                    return try self.allocExpression(.{
+                        .assignment = .{
+                            .expr = expr,
+                            .identifier = .fromToken(identifier),
+                            .span = identifier.span.endAt(expr.span()),
+                        },
+                    });
+                },
                 else => return try self.parsePipeline(),
             }
+        }
+
+        const BinaryComponent = union(enum) {
+            identifier: ast.Identifier,
+            op: token.Spanned(ast.BinaryOp),
+            literal: BinaryComponentLiteral,
+            expr: *ast.Expression,
+
+            pub fn toExpression(self: BinaryComponent, parser: *Self) ParseError!*ast.Expression {
+                return try switch (self) {
+                    .expr => |expr| expr,
+                    .identifier => |identifier| parser.allocExpression(.{
+                        .identifier = identifier,
+                    }),
+                    .literal => |literal| literal.toExpression(parser),
+                    .op => @panic("shouldn't happen :)"),
+                };
+            }
+
+            pub fn span(self: BinaryComponent) token.Span {
+                return switch (self) {
+                    .identifier => |identifier| identifier.span,
+                    .op => |op| op.span,
+                    .literal => |literal| literal.span(),
+                    .expr => |expr| expr.span(),
+                };
+            }
+
+            pub fn format(self: BinaryComponent, writer: *std.Io.Writer) !void {
+                try switch (self) {
+                    .op => |op| writer.writeAll(@tagName(op.payload)),
+                    .expr => |_| writer.writeAll("(expr)"),
+                    .identifier => |iden| writer.print("ident:{s}", .{iden.name}),
+                    .literal => |lit| switch (lit) {
+                        inline .int, .float => |l| writer.writeAll(l.text),
+                        .boolean => |l| writer.print("{}", .{l.value}),
+                    },
+                };
+            }
+        };
+
+        const BinaryComponentLiteral = union(enum) {
+            int: ast.IntegerLiteral,
+            float: ast.FloatLiteral,
+            boolean: ast.BoolLiteral,
+            string: ast.StringLiteral,
+
+            pub fn fromToken(tok: token.Token) BinaryComponentLiteral {
+                return switch (tok.tag) {
+                    .int_literal => .{ .int = .{ .text = tok.lexeme, .span = tok.span } },
+                    .float_literal => .{ .float = .{ .text = tok.lexeme, .span = tok.span } },
+                    .kw_true => .{ .boolean = .{ .value = true, .span = tok.span } },
+                    .kw_false => .{ .boolean = .{ .value = false, .span = tok.span } },
+                    else => @panic("shouldn't happen :)"),
+                };
+            }
+
+            pub fn toExpression(self: BinaryComponentLiteral, parser: *Self) ParseError!*ast.Expression {
+                return try switch (self) {
+                    .int => |int| parser.allocExpression(.{
+                        .literal = .{ .integer = int },
+                    }),
+                    .float => |float| parser.allocExpression(.{
+                        .literal = .{ .float = float },
+                    }),
+                    .boolean => |boolean| parser.allocExpression(.{
+                        .literal = .{ .bool = boolean },
+                    }),
+                    .string => |string| parser.allocExpression(.{
+                        .literal = .{ .string = string },
+                    }),
+                };
+            }
+
+            pub fn span(self: BinaryComponentLiteral) token.Span {
+                return switch (self) {
+                    inline else => |l| l.span,
+                };
+            }
+        };
+
+        const ArithmeticState = enum {
+            expr,
+            op,
+
+            pub fn advance(self: *ArithmeticState) void {
+                switch (self.*) {
+                    .expr => self.* = .op,
+                    .op => self.* = .expr,
+                }
+            }
+        };
+
+        fn parseMaybeBinaryExpression(self: *Self) ParseError!?*ast.Expression {
+            const breadcrumb = try self.createBreadcrumb("parseMaybeBinaryExpression");
+            defer breadcrumb.end();
+
+            var snapshot = try self.takeSnapshot();
+
+            var components = std.ArrayList(BinaryComponent).empty;
+            defer components.deinit(self.allocator);
+
+            var state = ArithmeticState.expr;
+
+            while (true) : (state.advance()) {
+                const next = try self.peekToken();
+
+                switch (state) {
+                    .expr => {
+                        switch (next.tag) {
+                            .identifier => {
+                                const breadcrumbInner = try self.createBreadcrumb("PAE:identifier");
+                                defer breadcrumbInner.end();
+                                try components.append(self.allocator, .{
+                                    .identifier = .fromToken(next),
+                                });
+                            },
+                            .l_paren => {
+                                _ = try self.nextToken();
+                                try components.append(self.allocator, .{
+                                    .expr = try self.parseExpression(),
+                                });
+                                _ = try self.expectTokenTag(.r_paren);
+                                continue;
+                            },
+                            .int_literal, .float_literal, .kw_true, .kw_false => {
+                                const breadcrumbInner = try self.createBreadcrumb("PAE:literal");
+                                defer breadcrumbInner.end();
+                                try components.append(self.allocator, .{
+                                    .literal = .fromToken(next),
+                                });
+                            },
+                            .string_start => {
+                                const breadcrumbInner = try self.createBreadcrumb("PAE:string_literal");
+                                defer breadcrumbInner.end();
+                                try components.append(self.allocator, .{
+                                    .literal = .{ .string = try self.parseStringLiteral() },
+                                });
+                                continue;
+                            },
+                            else => return ParseError.UnexpectedToken,
+                        }
+                    },
+                    .op => {
+                        switch (next.tag) {
+                            .equal_equal, .bang_equal, .greater, .greater_equal, .less, .less_equal, .plus, .minus, .star, .slash, .percent, .kw_and, .kw_or => {
+                                const breadcrumbInner = try self.createBreadcrumb("PAE:binary_op");
+                                defer breadcrumbInner.end();
+                                try components.append(self.allocator, .{
+                                    .op = token.Spanned(ast.BinaryOp).fromToken(next) orelse @panic("shouldn't happen :)"),
+                                });
+                            },
+                            else => {
+                                if (isExprTerminator(next.tag)) break;
+                                try self.restoreSnapshot(&snapshot);
+                                return null;
+                            },
+                        }
+                    },
+                }
+
+                _ = try self.nextToken();
+            }
+
+            if (components.items.len == 0) {
+                try self.restoreSnapshot(&snapshot);
+                return null;
+            }
+
+            if (components.items.len == 1) {
+                if (components.items[0] == .identifier) {
+                    try self.restoreSnapshot(&snapshot);
+                    return null;
+                } else {
+                    return components.items[0].toExpression(self);
+                }
+            }
+
+            return self.parseBinaryExpression(components.items);
+        }
+
+        fn parseBinaryExpression(
+            self: *Self,
+            components: []const BinaryComponent,
+        ) ParseError!*ast.Expression {
+            const breadcrumb = try self.createBreadcrumb("parseBinaryExpression");
+            defer breadcrumb.end();
+
+            if (components.len == 1) return try components[0].toExpression(self);
+
+            if (components.len == 3) {
+                return try self.allocExpression(.{
+                    .binary = .{
+                        .left = try components[0].toExpression(self),
+                        .op = components[1].op.payload,
+                        .right = try components[2].toExpression(self),
+                        .span = components[0].span().endAt(components[2].span()),
+                    },
+                });
+            }
+
+            var lowest_precedence: usize = std.math.maxInt(usize);
+            for (components) |item| {
+                switch (item) {
+                    .op => |op| lowest_precedence = @min(
+                        op.payload.precedence(),
+                        lowest_precedence,
+                    ),
+                    else => continue,
+                }
+            }
+
+            const DelimiterFn = struct {
+                lowest_precedence: usize,
+
+                pub fn isDelimiter(ctx: @This(), component: BinaryComponent) bool {
+                    return switch (component) {
+                        .op => |op| op.payload.precedence() == ctx.lowest_precedence,
+                        else => false,
+                    };
+                }
+            };
+
+            const delimiter = DelimiterFn{ .lowest_precedence = lowest_precedence };
+
+            var it = mem.splitScalarByFn(
+                BinaryComponent,
+                delimiter,
+                components,
+                DelimiterFn.isDelimiter,
+            );
+            const first_components = it.next().?;
+            var lhs: *ast.Expression = try self.parseBinaryExpression(first_components);
+            var i: usize = first_components.len + 1;
+
+            while (it.next()) |sub_components| {
+                const right = try self.parseBinaryExpression(sub_components);
+                lhs = try self.allocExpression(.{
+                    .binary = .{
+                        .left = lhs,
+                        .op = components[i - 1].op.payload,
+                        .right = right,
+                        .span = lhs.span().endAt(right.span()),
+                    },
+                });
+
+                i += sub_components.len + 1;
+            }
+
+            return lhs;
+
+            // list algo:
+            //
+            // ex1:
+            // 1 + 2 + 3 + 4        # equal precedence
+            // -------
+            // (1 + 2) + 3 + 4      # group first 2 terms -> equal precedence
+            // -------------
+            // ((1 + 2) + 3) + 4
+            //
+            // ex2:
+            // 1 + 2 * 3 + 4   # higher precendece on the right op
+            // -------
+            // 1 + (2 * 3 + 4) # group until the end, lower precedence on the right op
+            //      ---------
+            // 1 + ((2 * 3) + 4) # group the left before the right op
+            //
+            // ex3:
+            // 1 + 2 * 3 + 4 > 5 + 1 || true # ((1 + ((2 * 3) + 4)) > (5 + 1)) || true
+            //
+            // (1 + 2 * 3 + 4) > (5 + 1) || (true)
+            //                 -
+            // (((1 + 2 * 3 + 4) > (5 + 1)) || (true)) || (false)
         }
 
         fn parsePipeline(self: *Self) ParseError!*ast.Expression {
@@ -489,9 +852,9 @@ pub fn Parser(
             defer breadcrumb.end();
 
             const if_tok = try self.expect(.kw_if);
-            _ = try self.expect(.l_paren);
+            // _ = try self.expect(.l_paren);
             const condition = try self.parseExpression();
-            _ = try self.expect(.r_paren);
+            // _ = try self.expect(.r_paren);
             const capture = try self.parseOptionalCaptureClause();
             const then_block = try self.parseBlock();
 

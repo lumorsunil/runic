@@ -11,6 +11,7 @@ pub const Error = std.mem.Allocator.Error || std.Io.Writer.Error || error{
     TokenConsumptionDepthExceeded,
     ContextStackUnderflow,
     IndexDidNotIncrease,
+    NewlineInStringNotAllowed,
 };
 
 pub const Lexer = struct {
@@ -120,12 +121,20 @@ pub const Lexer = struct {
         }
     }
 
-    pub fn snapshot(self: Lexer) Lexer {
-        return self;
+    pub fn snapshot(self: *Lexer) !Lexer {
+        var sshot = self.*;
+        sshot.context_stack = try self.context_stack.clone(self.arena.child_allocator);
+        return sshot;
     }
 
-    pub fn restore(self: *Lexer, s: Lexer) void {
-        self.* = s;
+    pub fn restore(self: *Lexer, s: *Lexer) !void {
+        const arena = self.arena;
+        const context_stack = try s.context_stack.clone(self.arena.child_allocator);
+        s.context_stack.deinit(self.arena.child_allocator);
+        self.context_stack.deinit(self.arena.child_allocator);
+        self.* = s.*;
+        self.arena = arena;
+        self.context_stack = context_stack;
     }
 
     pub fn log(self: Lexer, comptime fmt: []const u8, args: anytype) !void {
@@ -658,32 +667,43 @@ pub const Stream = struct {
         self.lexer.deinit();
     }
 
-    pub fn snapshot(self: Stream) Stream {
-        return self;
+    pub fn snapshot(self: *Stream) !Stream {
+        var sshot = self.*;
+        sshot.lexer = try self.lexer.snapshot();
+        sshot.peeked_tokens_buffer = try self.peeked_tokens_buffer.clone(self.lexer.allocator());
+        return sshot;
     }
 
     /// Invalidates the buffer in the snapshot
-    pub fn restore(self: *Stream, s: Stream) void {
+    pub fn restore(self: *Stream, s: *Stream) !void {
         const clone = try s.peeked_tokens_buffer.clone(self.lexer.allocator());
-        s.peeked_tokens_buffer.deinit(self.lexer.allocator());
+        const lexer = &self.lexer;
+        try lexer.restore(&s.lexer);
         self.peeked_tokens_buffer.deinit(self.lexer.allocator());
-        self.* = s;
+        const lexer_copy = lexer.*;
+        self.* = s.*;
         self.peeked_tokens_buffer = clone;
+        self.lexer = lexer_copy;
     }
 
     pub fn next(self: *Stream) Error!token.Token {
         if (self.peeked_tokens_buffer.items.len > 0) {
             const tok = self.peeked_tokens_buffer.orderedRemove(0);
             self.current = tok;
+            try self.lexer.log("next token: {f}", .{tok});
             return tok;
         }
-        return self.guardedNext();
+        const tok = try self.guardedNext();
+        self.current = tok;
+        try self.lexer.log("next token: {f}", .{tok});
+        return tok;
     }
 
     pub fn peek(self: *Stream) Error!token.Token {
         if (self.peeked_tokens_buffer.items.len == 0) {
             try self.peeked_tokens_buffer.append(self.lexer.allocator(), try self.guardedNext());
         }
+        try self.lexer.log("peeked token: {f}", .{self.peeked_tokens_buffer.items[0]});
         return self.peeked_tokens_buffer.items[0];
     }
 
@@ -714,7 +734,6 @@ pub const Stream = struct {
         defer self.active_next_depth -= 1;
         const next_token = try self.lexer.next();
         try self.lexer.log("next token: {}", .{next_token.tag});
-        self.current = next_token;
         return next_token;
     }
 };
@@ -779,4 +798,91 @@ test "lexer balances nested braces inside string interpolation" {
         try std.testing.expectEqual(exp.tag, tok.tag);
         try std.testing.expectEqualStrings(exp.lexeme, tok.lexeme);
     }
+}
+
+test "lexer restores succesfully" {
+    var lexer = try Stream.init(std.testing.allocator, "main.rn", "// comment\n\necho \"${a}\"");
+    defer lexer.deinit();
+
+    const expected_tags = [_]token.Tag{ .newline, .newline, .identifier, .string_start, .string_text, .string_interp_start, .identifier, .string_interp_end, .string_end };
+    var tokens: [expected_tags.len]token.Token = undefined;
+
+    var originalSnapshot = try lexer.snapshot();
+
+    for (expected_tags[0..2], 0..) |tag, idx| {
+        const tok = try lexer.next();
+        tokens[idx] = tok;
+        try std.testing.expectEqual(tag, tok.tag);
+    }
+
+    var snapshot = try lexer.snapshot();
+
+    for (expected_tags[2..], 0..) |tag, idx| {
+        const tok = try lexer.next();
+        tokens[idx] = tok;
+        try std.testing.expectEqual(tag, tok.tag);
+    }
+
+    try lexer.restore(&snapshot);
+
+    for (expected_tags[2..], 0..) |tag, idx| {
+        const tok = try lexer.next();
+        tokens[idx] = tok;
+        try std.testing.expectEqual(tag, tok.tag);
+    }
+
+    try lexer.restore(&originalSnapshot);
+
+    for (expected_tags, 0..) |tag, idx| {
+        const tok = try lexer.next();
+        tokens[idx] = tok;
+        try std.testing.expectEqual(tag, tok.tag);
+    }
+}
+
+test "lexer restores succesfully - peek" {
+    var lexer = try Stream.init(std.testing.allocator, "main.rn", "// comment\n\necho \"${a}\"");
+    defer lexer.deinit();
+
+    const expected_peeked_tags = [_]token.Tag{ .newline, .newline, .identifier };
+
+    _ = try lexer.peekSlice(3);
+
+    var snapshot = try lexer.snapshot();
+
+    _ = try lexer.peekSlice(5);
+
+    try lexer.restore(&snapshot);
+
+    const actual_peeked_tags = try std.testing.allocator.alloc(token.Tag, lexer.peeked_tokens_buffer.items.len);
+    defer std.testing.allocator.free(actual_peeked_tags);
+    for (lexer.peeked_tokens_buffer.items, 0..) |t, i| actual_peeked_tags[i] = t.tag;
+
+    try std.testing.expectEqualSlices(token.Tag, &expected_peeked_tags, actual_peeked_tags);
+}
+
+test "lexer restores succesfully - peek and next" {
+    var lexer = try Stream.init(std.testing.allocator, "main.rn", "// comment\n\necho \"${a}\"");
+    defer lexer.deinit();
+
+    const expected_peeked_tags = [_]token.Tag{ .newline, .identifier, .string_start, .string_text, .string_interp_start, .identifier };
+
+    _ = try lexer.peekSlice(3);
+
+    var snapshot = try lexer.snapshot();
+
+    _ = try lexer.peekSlice(4);
+    _ = try lexer.next();
+    _ = try lexer.peekSlice(5);
+
+    try lexer.restore(&snapshot);
+
+    _ = try lexer.next();
+    _ = try lexer.peekSlice(6);
+
+    const actual_peeked_tags = try std.testing.allocator.alloc(token.Tag, lexer.peeked_tokens_buffer.items.len);
+    defer std.testing.allocator.free(actual_peeked_tags);
+    for (lexer.peeked_tokens_buffer.items, 0..) |t, i| actual_peeked_tags[i] = t.tag;
+
+    try std.testing.expectEqualSlices(token.Tag, &expected_peeked_tags, actual_peeked_tags);
 }

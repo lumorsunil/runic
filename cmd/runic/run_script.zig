@@ -95,7 +95,8 @@ pub fn runScript(
         );
         return .fromProcess(1);
     };
-    const executor = &entryDocument.script_executor.?;
+    var executor: *ScriptExecutor = undefined;
+    if (entryDocument.script_executor) |*script_executor| executor = script_executor else return .{ .err = error.ExecutorNotDefined };
 
     executor.wireCommandBridge();
     try executor.reseedFromContext(&context);
@@ -244,6 +245,7 @@ const StatementExpressionIterator = struct {
                 try populateBlockExpr(cursor, catch_expr.handler.body);
                 try cursor.appendExpr(catch_expr.subject);
             },
+            .assignment => |assignment| try cursor.appendExpr(assignment.expr),
         }
     }
 

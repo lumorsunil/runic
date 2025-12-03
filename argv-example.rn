@@ -1,0 +1,18 @@
+const sub_command_name = argv[1]
+var sub_command: SubCommand
+
+printf "${sub_command_name}" | validateSubCommand >sub_command || printUsage
+printf "${sub_command_name}" | validateSubCommand | runSubCommand || printUsage
+
+fn String validateSubCommand() SubCommand {
+  ...
+}
+
+fn SubCommand runSubCommand() Void {
+  ...
+}
+
+fn Void printUsage() Void {
+  echo "usage: ..."
+  exit 1
+}

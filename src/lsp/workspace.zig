@@ -10,6 +10,44 @@ const max_source_bytes: usize = 4 * 1024 * 1024;
 
 const Allocator = std.mem.Allocator;
 
+fn makeKeyword(allocator: Allocator, name: []const u8, documentation: []const u8) !symbols.Symbol {
+    return .{
+        .detail = try allocator.dupe(u8, "keyword"),
+        .documentation = try allocator.dupe(u8, documentation),
+        .name = try allocator.dupe(u8, name),
+        .kind = .keyword,
+    };
+}
+
+fn keywordSymbols(allocator: Allocator) ![]const symbols.Symbol {
+    var list = std.ArrayList(symbols.Symbol).empty;
+
+    try list.appendSlice(allocator, &.{
+        try makeKeyword(allocator, "import", "# import\nImport a runic module.\n\n```runic\nconst lib = import \"lib.rn\"\n```"),
+        try makeKeyword(allocator, "const", "Define a constant.\n\n```runic\nconst myConst = 5\n```"),
+        try makeKeyword(allocator, "var", "Define a variable.\n\n```runic\nvar myConst = 5\nmyConst = 3\n```"),
+        try makeKeyword(allocator, "fn", "Declare a function.\n\n```runic\nfn hello() Void {\n    echo \"hello\"\n}\n```"),
+    });
+
+    return try list.toOwnedSlice(allocator);
+
+    // .kw_error => "error",
+    // .kw_enum => "enum",
+    // .kw_union => "union",
+    // .kw_if => "if",
+    // .kw_else => "else",
+    // .kw_for => "for",
+    // .kw_while => "while",
+    // .kw_match => "match",
+    // .kw_return => "return",
+    // .kw_bash => "bash",
+    // .kw_try => "try",
+    // .kw_catch => "catch",
+    // .kw_true => "true",
+    // .kw_false => "false",
+    // .kw_null => "null",
+}
+
 pub const Workspace = struct {
     allocator: Allocator,
     roots: std.ArrayList([]const u8) = .empty,
@@ -19,8 +57,15 @@ pub const Workspace = struct {
 
     const self_dirs = [_][]const u8{ "src", "examples", "tests" };
 
-    pub fn init(allocator: Allocator, documentStore: *DocumentStore) Workspace {
-        return .{ .allocator = allocator, .documents = documentStore };
+    pub fn init(allocator: Allocator, documentStore: *DocumentStore) !Workspace {
+        var workspace = Workspace{
+            .allocator = allocator,
+            .documents = documentStore,
+        };
+
+        try workspace.addKeywordsToIndex();
+
+        return workspace;
     }
 
     pub fn deinit(self: *Workspace) void {
@@ -32,6 +77,12 @@ pub const Workspace = struct {
         self.clearDiagnostics();
         self.index.deinit(self.allocator);
         self.diagnostics.deinit(self.allocator);
+    }
+
+    fn addKeywordsToIndex(self: *Workspace) !void {
+        const keywords = try keywordSymbols(self.allocator);
+        defer self.allocator.free(keywords);
+        try self.index.appendSlice(self.allocator, keywords);
     }
 
     pub fn resetRoots(self: *Workspace, roots: []const []const u8) !void {
@@ -47,6 +98,7 @@ pub const Workspace = struct {
 
     pub fn refresh(self: *Workspace) !void {
         self.clearIndex();
+        try self.addKeywordsToIndex();
         self.clearDiagnostics();
         for (self.roots.items) |root| {
             try self.scanRoot(root);
