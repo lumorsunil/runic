@@ -234,7 +234,7 @@ const Document = struct {
                     try self.diagnostics.append(allocator, .{
                         .uri = try self.uri(allocator),
                         .message = try allocator.dupe(u8, d.message),
-                        .span = d.expr.span(),
+                        .span = d.span(),
                         .severity = std.meta.stringToEnum(
                             types.DiagnosticSeverity,
                             @tagName(d.severity),

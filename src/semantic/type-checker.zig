@@ -18,13 +18,27 @@ pub const TypeChecker = struct {
         UnresolvedTypeLiteral,
         MemberAccessOnOptional,
         ForSourcesAndBindingsNeedToBeTheSameLength,
+        ErrorNotInErrorSet,
+        TypeMismatch,
     };
 
     pub const Diagnostic = struct {
         err: Error,
-        expr: *ast.Expression,
+        data: Data,
         message: []const u8,
         severity: Severity,
+
+        pub const Data = union(enum) {
+            expr: *ast.Expression,
+            span_: ast.Span,
+
+            pub fn span(self: Data) ast.Span {
+                return switch (self) {
+                    .expr => |expr| expr.span(),
+                    .span_ => |span_| span_,
+                };
+            }
+        };
 
         pub const Severity = enum {
             @"error",
@@ -32,6 +46,10 @@ pub const TypeChecker = struct {
             information,
             hint,
         };
+
+        pub fn span(self: Diagnostic) ast.Span {
+            return self.data.span();
+        }
     };
 
     pub const Result = union(enum) {
@@ -54,15 +72,49 @@ pub const TypeChecker = struct {
         self: *TypeChecker,
         expr: *ast.Expression,
         err: Error,
-        message: []const u8,
         severity: Diagnostic.Severity,
+        comptime fmt: []const u8,
+        args: anytype,
     ) Error!void {
         try self.diagnostics.append(self.arena.allocator(), .{
             .err = err,
-            .expr = expr,
-            .message = message,
+            .data = .{ .expr = expr },
+            .message = try std.fmt.allocPrint(
+                self.arena.allocator(),
+                fmt,
+                args,
+            ),
             .severity = severity,
         });
+    }
+
+    fn reportSpanError(
+        self: *TypeChecker,
+        span: ast.Span,
+        err: Error,
+        severity: Diagnostic.Severity,
+        comptime fmt: []const u8,
+        args: anytype,
+    ) Error!void {
+        try self.diagnostics.append(self.arena.allocator(), .{
+            .err = err,
+            .data = .{ .span_ = span },
+            .message = try std.fmt.allocPrint(
+                self.arena.allocator(),
+                fmt,
+                args,
+            ),
+            .severity = severity,
+        });
+    }
+
+    fn reportAssignmentError(
+        self: *TypeChecker,
+        span: ast.Span,
+        expected: anytype,
+        actual: anytype,
+    ) Error!void {
+        try self.reportSpanError(span, Error.TypeMismatch, .@"error", "expected type {f}, actual: {f}", .{ expected, actual });
     }
 
     pub fn typeCheck(self: *TypeChecker) Error!Result {
@@ -85,6 +137,11 @@ pub const TypeChecker = struct {
         }
     }
 
+    fn runBlockInNewScope(self: *TypeChecker, scope: *Scope, block: *ast.Block) Error!void {
+        const block_scope = try scope.addChild(self.arena.allocator());
+        try self.runBlock(block_scope, block);
+    }
+
     fn runStatement(self: *TypeChecker, scope: *Scope, statement: *ast.Statement) Error!void {
         return switch (statement.*) {
             .binding_decl => |*binding_decl| self.runBindingDecl(scope, binding_decl),
@@ -102,7 +159,10 @@ pub const TypeChecker = struct {
         try self.runBindingPattern(
             scope,
             binding_decl.pattern,
-            try binding_decl.initializer.resolveType(self.arena.allocator(), scope),
+            try binding_decl.initializer.resolveType(
+                self.arena.allocator(),
+                scope,
+            ),
         );
     }
 
@@ -131,6 +191,25 @@ pub const TypeChecker = struct {
             fn_decl.name.name,
             try fn_decl.resolveType(self.arena.allocator(), scope),
         );
+
+        const fn_scope = try scope.addChild(self.arena.allocator());
+
+        for (fn_decl.params) |*param| {
+            const param_type = try param.resolveType(
+                self.arena.allocator(),
+                fn_scope,
+            );
+            try self.runBindingPattern(
+                fn_scope,
+                param.pattern,
+                param_type,
+            );
+        }
+
+        switch (fn_decl.body) {
+            .expression => |expr| try self.runExpression(fn_scope, expr),
+            .block => |*block| try self.runBlock(fn_scope, block),
+        }
     }
 
     fn runExpressionStatement(
@@ -154,7 +233,7 @@ pub const TypeChecker = struct {
             .pipeline => |*pipeline| self.runPipeline(scope, pipeline),
             .member => |*member| self.runMember(scope, member),
             .binary => |*binary| self.runBinary(scope, binary),
-            .block => |*block| self.runBlock(scope, block),
+            .block => |*block| self.runBlockInNewScope(scope, block),
             .if_expr => |*if_expr| self.runIfExpr(scope, if_expr),
             .for_expr => |*for_expr| self.runForExpr(scope, for_expr),
             .import_expr => |*import_expr| self.runImportExpr(scope, import_expr),
@@ -212,13 +291,13 @@ pub const TypeChecker = struct {
         };
 
         switch (object_type.*) {
-            .identifier => return error.UnresolvedTypeLiteral,
+            // .identifier => return error.UnresolvedTypeLiteral,
             .optional => return error.MemberAccessOnOptional,
-            .promise, .error_union, .array, .struct_type, .tuple, .function, .integer, .float, .boolean => return error.UnsupportedMemberAccess,
-            .lazy => {
-                // TODO: Figure out what to do here, do we setup a check after the lazy type has been resolved, or do we always assume we have the types resolved here? <|:)---<
-                return error.UnsupportedMemberAccess;
-            },
+            .promise, .error_union, .error_set, .err, .array, .struct_type, .tuple, .function, .integer, .float, .boolean, .byte => return error.UnsupportedMemberAccess,
+            // .lazy => {
+            //     // TODO: Figure out what to do here, do we setup a check after the lazy type has been resolved, or do we always assume we have the types resolved here? <|:)---<
+            //     return error.UnsupportedMemberAccess;
+            // },
         }
 
         try self.runIdentifier(scope, member.member);
@@ -320,12 +399,302 @@ pub const TypeChecker = struct {
             try self.reportExprError(
                 parent_expr,
                 err,
-                try std.fmt.allocPrint(self.arena.allocator(), "identifier \"{s}\" not declared", .{assignment.identifier.name}),
                 .@"error",
+                "identifier \"{s}\" not declared",
+                .{assignment.identifier.name},
             );
         };
         try self.runExpression(scope, assignment.expr);
+
+        try self.materializeBindingType(
+            scope,
+            assignment.identifier.name,
+            try assignment.expr.resolveType(
+                self.arena.allocator(),
+                scope,
+            ),
+        );
     }
+
+    fn materializeBindingType(
+        self: *TypeChecker,
+        scope: *Scope,
+        name: []const u8,
+        maybe_type_expr: ?*ast.TypeExpr,
+    ) Error!void {
+        const type_expr = maybe_type_expr orelse return;
+
+        const binding_ref = try scope.lookup(name) orelse return Error.IdentifierNotFound;
+        if (binding_ref.type_expr) |binding_type| {
+            try self.validateTypeAssignment(
+                binding_type,
+                type_expr,
+            );
+        }
+
+        binding_ref.type_expr = type_expr;
+    }
+
+    fn validateTypeAssignment(
+        self: *TypeChecker,
+        binding_type: *ast.TypeExpr,
+        assignment_type: *ast.TypeExpr,
+    ) Error!void {
+        try switch (binding_type.*) {
+            // .identifier => return Error.UnresolvedTypeLiteral,
+            .optional => |optional| self.validateTypeAssignmentOptional(
+                optional,
+                assignment_type,
+            ),
+            .promise => |promise| self.validateTypeAssignmentPromise(
+                promise,
+                assignment_type,
+            ),
+            .error_union => |error_union| self.validateTypeAssignmentErrorUnion(
+                error_union,
+                assignment_type,
+            ),
+            .error_set => |error_set| self.validateTypeAssignmentErrorSet(
+                error_set,
+                assignment_type,
+            ),
+            .err => |err| self.validateTypeAssignmentErrorType(
+                err,
+                assignment_type,
+            ),
+            .array => |array| self.validateTypeAssignmentArray(
+                array,
+                assignment_type,
+            ),
+            .struct_type => |struct_type| self.validateTypeAssignmentStruct(
+                struct_type,
+                assignment_type,
+            ),
+            .tuple => |tuple| self.validateTypeAssignmentTuple(
+                tuple,
+                assignment_type,
+            ),
+            .function => |function| self.validateTypeAssignmentFunction(
+                function,
+                assignment_type,
+            ),
+            .integer => |*integer| self.validateTypeAssignmentInteger(
+                integer,
+                assignment_type,
+            ),
+            .float => |*float| self.validateTypeAssignmentFloat(
+                float,
+                assignment_type,
+            ),
+            .boolean => |*boolean| self.validateTypeAssignmentBoolean(
+                boolean,
+                assignment_type,
+            ),
+            .byte => |*byte| self.validateTypeAssignmentByte(
+                byte,
+                assignment_type,
+            ),
+            // .lazy => |lazy| self.validateTypeAssignmentLazy(
+            //     lazy,
+            //     assignment_type,
+            // ),
+        };
+    }
+
+    pub fn validateTypeAssignmentOptional(
+        self: *TypeChecker,
+        assignee: ast.TypeExpr.PrefixType,
+        assignment_type: *ast.TypeExpr,
+    ) Error!void {
+        switch (assignment_type.*) {
+            .optional => |optional| try self.validateTypeAssignment(
+                assignee.child,
+                optional.child,
+            ),
+            else => try self.validateTypeAssignment(assignee.child, assignment_type),
+        }
+    }
+
+    pub fn validateTypeAssignmentPromise(
+        self: *TypeChecker,
+        assignee: ast.TypeExpr.PrefixType,
+        assignment_type: *ast.TypeExpr,
+    ) Error!void {
+        switch (assignment_type.*) {
+            .promise => |promise| try self.validateTypeAssignment(
+                assignee.child,
+                promise.child,
+            ),
+            else => try self.validateTypeAssignment(assignee.child, assignment_type),
+        }
+    }
+
+    pub fn validateTypeAssignmentErrorUnion(
+        self: *TypeChecker,
+        assignee: ast.TypeExpr.ErrorUnion,
+        assignment_type: *ast.TypeExpr,
+    ) Error!void {
+        switch (assignment_type.*) {
+            .error_union => |error_union| {
+                try self.validateTypeAssignmentErrorSet(
+                    assignee.err_set.error_set,
+                    error_union.err_set,
+                );
+                try self.validateTypeAssignment(
+                    assignee.payload,
+                    error_union.payload,
+                );
+            },
+            .err => try self.validateErrorInSet(assignee.err_set.error_set, assignment_type),
+            else => try self.validateTypeAssignment(assignee.payload, assignment_type),
+        }
+    }
+
+    pub fn validateTypeAssignmentErrorSet(
+        self: *TypeChecker,
+        error_set: ast.TypeExpr.ErrorSet,
+        assignment_type: *ast.TypeExpr,
+    ) Error!void {
+        for (assignment_type.error_set.error_types) |error_set_type| {
+            try self.validateErrorInSet(error_set, error_set_type);
+        }
+    }
+
+    pub fn validateErrorInSet(
+        self: *TypeChecker,
+        error_set: ast.TypeExpr.ErrorSet,
+        err: *ast.TypeExpr,
+    ) Error!void {
+        for (error_set.error_types) |error_set_type| {
+            if (error_set_type == err) return;
+        }
+
+        try self.reportSpanError(
+            err.span(),
+            Error.ErrorNotInErrorSet,
+            .@"error",
+            "error not in expected error set",
+            .{},
+        );
+    }
+
+    pub fn validateTypeAssignmentErrorType(
+        self: *TypeChecker,
+        error_type: ast.TypeExpr.ErrorType,
+        assignment_type: *ast.TypeExpr,
+    ) Error!void {
+        // TODO: see if we need to have a resolve type on assignment_type here
+        if (error_type.error_payload == assignment_type) {
+            return;
+        }
+
+        try self.reportAssignmentError(
+            assignment_type.span(),
+            error_type,
+            assignment_type,
+        );
+    }
+
+    pub fn validateTypeAssignmentArray(
+        self: *TypeChecker,
+        assignee: ast.TypeExpr.ArrayType,
+        assignment_type: *ast.TypeExpr,
+    ) Error!void {
+        switch (assignment_type.*) {
+            .array => |array| {
+                try self.validateTypeAssignment(assignee.element, array.element);
+            },
+            else => try self.reportAssignmentError(assignment_type.span(), assignee, assignment_type),
+        }
+    }
+
+    pub fn validateTypeAssignmentStruct(
+        _: *TypeChecker,
+        _: ast.TypeExpr.StructType,
+        _: *ast.TypeExpr,
+    ) Error!void {
+        // TODO: implement
+    }
+
+    pub fn validateTypeAssignmentTuple(
+        _: *TypeChecker,
+        _: ast.TypeExpr.TupleType,
+        _: *ast.TypeExpr,
+    ) Error!void {}
+
+    pub fn validateTypeAssignmentFunction(
+        _: *TypeChecker,
+        _: ast.TypeExpr.FunctionType,
+        _: *ast.TypeExpr,
+    ) Error!void {
+        // TODO: should this even be implement or should we have dynamic function pointers? (no?)
+    }
+
+    pub fn validateTypeAssignmentInteger(
+        self: *TypeChecker,
+        assignee: *ast.TypeExpr.PrimitiveType,
+        assignment_type: *ast.TypeExpr,
+    ) Error!void {
+        switch (assignment_type.*) {
+            .integer => {},
+            else => try self.reportAssignmentError(
+                assignment_type.span(),
+                @as(*ast.TypeExpr, @fieldParentPtr("integer", assignee)),
+                assignment_type,
+            ),
+        }
+    }
+
+    pub fn validateTypeAssignmentFloat(
+        self: *TypeChecker,
+        assignee: *ast.TypeExpr.PrimitiveType,
+        assignment_type: *ast.TypeExpr,
+    ) Error!void {
+        switch (assignment_type.*) {
+            .integer, .float => {},
+            else => try self.reportAssignmentError(
+                assignment_type.span(),
+                @as(*ast.TypeExpr, @fieldParentPtr("float", assignee)),
+                assignment_type,
+            ),
+        }
+    }
+
+    pub fn validateTypeAssignmentBoolean(
+        self: *TypeChecker,
+        assignee: *ast.TypeExpr.PrimitiveType,
+        assignment_type: *ast.TypeExpr,
+    ) Error!void {
+        switch (assignment_type.*) {
+            .boolean => {},
+            else => try self.reportAssignmentError(
+                assignment_type.span(),
+                @as(*ast.TypeExpr, @fieldParentPtr("boolean", assignee)),
+                assignment_type,
+            ),
+        }
+    }
+
+    pub fn validateTypeAssignmentByte(
+        self: *TypeChecker,
+        assignee: *ast.TypeExpr.PrimitiveType,
+        assignment_type: *ast.TypeExpr,
+    ) Error!void {
+        switch (assignment_type.*) {
+            .byte => {},
+            else => try self.reportAssignmentError(
+                assignment_type.span(),
+                @as(*ast.TypeExpr, @fieldParentPtr("byte", assignee)),
+                assignment_type,
+            ),
+        }
+    }
+
+    pub fn validateTypeAssignmentLazy(
+        _: *TypeChecker,
+        _: ast.TypeExpr.LazyType,
+        _: *ast.TypeExpr,
+    ) Error!void {}
 
     fn resolveLazyTypes(self: *TypeChecker, scope: *Scope) Error!void {
         _ = self;

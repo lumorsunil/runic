@@ -10,6 +10,7 @@ pub const Scope = struct {
         std.mem.Allocator.Error ||
         error{
             IdentifierAlreadyDeclared,
+            TypeNotFound,
         };
 
     pub fn init() Scope {
@@ -33,8 +34,8 @@ pub const Scope = struct {
         return &self.children.items[self.children.items.len - 1];
     }
 
-    pub fn lookup(self: *Scope, name: []const u8) Error!?Binding {
-        return self.bindings.get(name) orelse {
+    pub fn lookup(self: *Scope, name: []const u8) Error!?*Binding {
+        return self.bindings.getPtr(name) orelse {
             const parent = self.parent orelse return null;
             return parent.lookup(name);
         };

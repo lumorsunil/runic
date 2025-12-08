@@ -3,8 +3,16 @@
 var b = "this is b"
 const s = 5
 
-var y = b
-y = s
+fn hello() Void {
+  b = 3
+}
+
+{ 
+  var y = b
+  y = s
+}
+
+y = "hello"
 
 a = 5
 c = 23

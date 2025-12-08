@@ -115,10 +115,12 @@ pub const CaptureBlock = struct {
 /// Type expressions span primitive names, optional/promise modifiers, error
 /// unions, and inline record/tuple types.
 pub const TypeExpr = union(enum) {
-    identifier: NamedType,
+    // identifier: NamedType,
     optional: PrefixType,
     promise: PrefixType,
     error_union: ErrorUnion,
+    error_set: ErrorSet,
+    err: ErrorType,
     array: ArrayType,
     struct_type: StructType,
     tuple: TupleType,
@@ -126,7 +128,8 @@ pub const TypeExpr = union(enum) {
     integer: PrimitiveType,
     float: PrimitiveType,
     boolean: PrimitiveType,
-    lazy: LazyType,
+    byte: PrimitiveType,
+    // lazy: LazyType,
 
     pub const NamedType = struct {
         path: Path,
@@ -137,29 +140,74 @@ pub const TypeExpr = union(enum) {
     pub const PrefixType = struct {
         child: *TypeExpr,
         span: Span,
+
+        pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try writer.print("{f}", .{self.child});
+        }
     };
 
     pub const ErrorUnion = struct {
         err_set: *TypeExpr,
         payload: *TypeExpr,
         span: Span,
+
+        pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try writer.print("{f}!{f}", .{ self.err_set, self.payload });
+        }
+    };
+
+    pub const ErrorSet = struct {
+        error_types: []*TypeExpr,
+        span: Span,
+
+        pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try writer.writeAll("error{");
+            for (self.error_types, 0..) |err, i| {
+                try err.format(writer);
+                if (i < self.error_types.len - 1) {
+                    try writer.writeByte(',');
+                }
+            }
+            try writer.writeByte('}');
+        }
+    };
+
+    pub const ErrorType = struct {
+        error_payload: *TypeExpr,
+        span: Span,
+
+        pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try writer.print("Error({f})", .{self.error_payload});
+        }
     };
 
     pub const ArrayType = struct {
         element: *TypeExpr,
         span: Span,
+
+        pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try writer.print("[]{f}", .{self.element});
+        }
     };
 
     pub const StructType = struct {
         fields: []const StructField,
         decls: []const StructDecl,
         span: Span,
+
+        pub fn format(_: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try writer.writeAll("<struct>");
+        }
     };
 
     pub const StructField = struct {
         name: Identifier,
         type_expr: *TypeExpr,
         span: Span,
+
+        pub fn format(_: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try writer.writeAll("<struct_field>");
+        }
     };
 
     pub const StructDecl = struct {
@@ -170,17 +218,38 @@ pub const TypeExpr = union(enum) {
             binding_decl: *BindingDecl,
         },
         span: Span,
+
+        pub fn format(_: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try writer.writeAll("<struct_decl>");
+        }
     };
 
     pub const TupleType = struct {
         elements: []const *TypeExpr,
         span: Span,
+
+        pub fn format(_: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try writer.writeAll("<tuple>");
+        }
     };
 
     pub const FunctionType = struct {
         params: []const ?*TypeExpr,
         return_type: ?*TypeExpr,
         span: Span,
+
+        pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try writer.writeAll("fn (");
+            for (self.params, 0..) |param, i| {
+                try if (param) |p| p.format(writer) else writer.writeAll("<not_found>");
+
+                if (i < self.params.len - 1) {
+                    try writer.writeAll(", ");
+                }
+            }
+            try writer.writeAll(") ");
+            try if (self.return_type) |r| r.format(writer) else writer.writeAll("<not_found>");
+        }
     };
 
     pub const PrimitiveType = struct {
@@ -237,15 +306,34 @@ pub const TypeExpr = union(enum) {
 
     pub fn span(self: TypeExpr) Span {
         return switch (self) {
-            .identifier => |named| named.span,
-            .optional => |opt| opt.span,
-            .promise => |promise| promise.span,
-            .error_union => |err| err.span,
-            .array => |array| array.span,
-            .struct_type => |record| record.span,
-            .tuple => |tuple| tuple.span,
-            .function => |func| func.span,
+            inline else => |s| s.span,
         };
+    }
+
+    pub fn format(self: *TypeExpr, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (self.*) {
+            .optional => |optional| {
+                try writer.writeByte('?');
+                try optional.format(writer);
+            },
+            .promise => |promise| {
+                try writer.writeByte('^');
+                try promise.format(writer);
+            },
+            .integer => {
+                try writer.writeAll("Int");
+            },
+            .float => {
+                try writer.writeAll("Float");
+            },
+            .boolean => {
+                try writer.writeAll("Bool");
+            },
+            .byte => {
+                try writer.writeAll("Byte");
+            },
+            inline else => |s| try s.format(writer),
+        }
     }
 };
 
@@ -277,20 +365,35 @@ pub const Literal = union(enum) {
 
     pub fn span(self: Literal) Span {
         return switch (self) {
-            .integer => |int| int.span,
-            .float => |flt| flt.span,
-            .bool => |b| b.span,
-            .string => |str| str.span,
-            .null => |n| n.span,
+            inline else => |s| s.span,
         };
     }
 
     pub fn resolveType(
-        _: *@This(),
-        _: std.mem.Allocator,
+        self: *@This(),
+        allocator: std.mem.Allocator,
         _: *semantic.Scope,
     ) semantic.Scope.Error!?*TypeExpr {
-        return null;
+        const type_expr = try allocator.create(TypeExpr);
+
+        type_expr.* = switch (self.*) {
+            .integer => .{ .integer = .{ .span = self.span() } },
+            .float => .{ .float = .{ .span = self.span() } },
+            .bool => .{ .boolean = .{ .span = self.span() } },
+            .string => brk: {
+                const element = try allocator.create(TypeExpr);
+                element.* = .{ .byte = .{ .span = self.span() } };
+                break :brk .{
+                    .array = .{ .element = element, .span = self.span() },
+                };
+            },
+            else => {
+                allocator.destroy(type_expr);
+                return null;
+            },
+        };
+
+        return type_expr;
     }
 };
 
@@ -864,7 +967,7 @@ pub const BindingDecl = struct {
 };
 
 pub const Parameter = struct {
-    name: Identifier,
+    pattern: *BindingPattern,
     type_annotation: ?*TypeExpr,
     default_value: ?*Expression,
     is_mutable: bool,
@@ -872,11 +975,15 @@ pub const Parameter = struct {
 
     pub fn resolveType(
         self: *@This(),
-        _: std.mem.Allocator,
-        _: *semantic.Scope,
+        allocator: std.mem.Allocator,
+        scope: *semantic.Scope,
     ) semantic.Scope.Error!?*TypeExpr {
-        // TODO: Fix when implementing parameters
-        return self.type_annotation;
+        if (self.type_annotation) |type_annot| return type_annot;
+        if (self.default_value) |def_val| return def_val.resolveType(
+            allocator,
+            scope,
+        );
+        return semantic.Scope.Error.TypeNotFound;
     }
 };
 

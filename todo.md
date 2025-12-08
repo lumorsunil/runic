@@ -111,6 +111,7 @@
 - [x] document change does not reflect new symbols
 - [x] didChange support, document diagnostics
 - [x] crashes (investigate that we do similar setup as run_script)
+- [x] type checker integration
 - [ ] bug: takes 100% cpu after a while
 - [ ] bug: stops working after a while, may be related to bug above
 
@@ -133,11 +134,23 @@
 - [ ] std lib special import module name "std"
 - [ ] stored on file system so that you can access the source code through the lsp
 
+## parser
+
+- [ ] parse error bail and continue
+  - when parsing fails entirely in a statement or expression, look for the next expression terminator and continue parsing from there, storing the error for later diagnostics
+  - still produce a valid ast for the type checker to use
+- [ ] type expression parser
+
 ## type checker
 
 - [x] basic scope structure and semantic checker in place
 - [ ] do we even need lazy types? how will it work?
 - [ ] implement more of this now, high prio because it's going to be so much work to redo potentially otherwise, also type checking is cool
+- [x] gather diagnostics foundation
+- [ ] fast reverse lookup to find correct scope of position for correct lsp context
+  - store scope spans?
+  - binary search? (with start and end lines)
+  - index scopes by line?
 
 ## error handling
 

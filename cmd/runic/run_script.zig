@@ -91,7 +91,7 @@ pub fn runScript(
         },
         .err => |diagnostics| {
             for (diagnostics) |d| {
-                const span = d.expr.span();
+                const span = d.span();
                 const document = try documentStore.requestDocument(span.start.file);
                 try stderr.print("[{s}]: ", .{@tagName(d.severity)});
                 try logFileLineAndCol(allocator, stderr, span);
