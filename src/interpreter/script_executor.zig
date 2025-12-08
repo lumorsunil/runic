@@ -12,6 +12,10 @@ const command_runner = @import("../runtime/command_runner.zig");
 const CommandRunner = command_runner.CommandRunner;
 const DocumentStore = @import("../frontend/document_store.zig").DocumentStore;
 const BindingError = ScriptContext.BindingError;
+const rainbow = @import("../rainbow.zig");
+
+const span_color = rainbow.beginBgColor(.red) ++ rainbow.beginColor(.black);
+const end_color = rainbow.endColor();
 
 const Allocator = std.mem.Allocator;
 
@@ -178,23 +182,29 @@ pub const ScriptExecutor = struct {
 
     pub fn execute(self: *ScriptExecutor, script: ast.Script, options: ExecuteOptions) !command_runner.ExitCode {
         try self.scopes.pushFrame(@src().fn_name, .initForwardContext(options.forward_context));
-        const stderr = self.scopes.getForwardContext().stderr.materialized.writer;
 
         for (script.statements) |stmt| {
             const maybe_value = self.evaluator.runStatement(self.scopes, stmt) catch |err| {
-                try self.renderEvaluatorError(stderr, options.script_path, stmt.span(), err);
+                // TODO: redirect properly when error handling is implemented for function calls and blocks etc.
+                var stderr_file_writer = std.fs.File.stderr().writer(&.{});
+                // const stderr = self.scopes.getForwardContext().stderr.materialized.writer;
+                try self.renderEvaluatorError(&stderr_file_writer.interface, options.script_path, stmt.span(), err);
                 return .fromProcess(1);
             };
 
             if (maybe_value) |value| {
                 var owned = value;
+                defer owned.deinit();
                 // const code = try forwardHandleOutputIfProcessHandle(
                 const code = getExitCode(&owned);
                 if (code) |the_code| {
-                    if (the_code == .success) {} else return the_code;
+                    if (the_code == .success) {} else {
+                        // TODO: redirect properly when error handling is implemented for function calls and blocks etc.
+                        var stderr_file_writer = std.fs.File.stderr().writer(&.{});
+                        try self.renderExitCodeError(&stderr_file_writer.interface, stmt.span(), the_code);
+                        return the_code;
+                    }
                 }
-
-                owned.deinitMain();
             }
         }
 
@@ -215,6 +225,73 @@ pub const ScriptExecutor = struct {
             "{s}:{d}:{d}: script execution error: {s}\n",
             .{ script_path, span.start.line, span.start.column, @errorName(err) },
         );
+    }
+
+    fn renderExitCodeError(
+        self: *ScriptExecutor,
+        writer: *std.Io.Writer,
+        span: ast.Span,
+        exit_code: command_runner.ExitCode,
+    ) !void {
+        const document = try self.evaluator.documentStore.requestDocument(span.start.file);
+
+        try logSpan(writer, span, document.source);
+
+        switch (exit_code) {
+            .success => return,
+            .byte => |byte| try writer.print(
+                "{s}:{d}:{d}: script execution error: terminated with exit code {}\n",
+                .{ span.start.file, span.start.line, span.start.column, byte },
+            ),
+            .err => |err| try writer.print(
+                "{s}:{d}:{d}: script execution error: {s}\n",
+                .{ span.start.file, span.start.line, span.start.column, @errorName(err) },
+            ),
+        }
+    }
+
+    fn logSpan(writer: *std.Io.Writer, span: ast.Span, source: []const u8) !void {
+        var lineIt = std.mem.splitScalar(u8, source, '\n');
+        var i: usize = 0;
+        while (lineIt.next()) |line| : (i += 1) {
+            if (i >= span.start.line -| 3 and i <= span.end.line +| 3) {
+                if (span.start.line == i + 1 and span.end.line == i + 1) {
+                    try writer.print("{:>4}:{s}{s}{s}{s}{s}\n", .{
+                        i + 1,
+                        line[0 .. span.start.column - 1],
+                        span_color,
+                        line[span.start.column - 1 .. span.end.column - 1],
+                        end_color,
+                        line[span.end.column - 1 ..],
+                    });
+                } else if (span.start.line == i + 1) {
+                    try writer.print("{:>4}:{s}{s}{s}{s}\n", .{
+                        i + 1,
+                        line[0 .. span.start.column - 1],
+                        span_color,
+                        line[span.start.column - 1 ..],
+                        end_color,
+                    });
+                } else if (span.end.line == i + 1) {
+                    try writer.print("{:>4}:{s}{s}{s}{s}\n", .{
+                        i + 1,
+                        span_color,
+                        line[0 .. span.end.column - 1],
+                        end_color,
+                        line[span.end.column - 1 ..],
+                    });
+                } else if (span.start.line - 1 <= i and i <= span.end.line - 1) {
+                    try writer.print("{:>4}:{s}{s}{s}\n", .{
+                        i + 1,
+                        span_color,
+                        line,
+                        end_color,
+                    });
+                } else {
+                    try writer.print("{:>4}:{s}\n", .{ i + 1, line });
+                }
+            }
+        }
     }
 };
 

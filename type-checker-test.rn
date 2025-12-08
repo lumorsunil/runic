@@ -1,0 +1,10 @@
+# type-checker-test.rn
+
+var b = "this is b"
+const s = 5
+
+var y = b
+y = s
+
+a = 5
+

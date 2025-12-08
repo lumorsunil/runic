@@ -1,0 +1,5 @@
+const module = import "closures-module.rn"
+
+var p = "this is a string"
+
+module.hello

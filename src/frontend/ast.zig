@@ -1,5 +1,6 @@
 const std = @import("std");
 const token = @import("token.zig");
+const semantic = @import("../semantic/root.zig");
 
 pub const Span = token.Span;
 pub const Spanned = token.Spanned;
@@ -16,12 +17,29 @@ pub const Identifier = struct {
             .span = tok.span,
         };
     }
+
+    pub fn resolveType(
+        self: *@This(),
+        _: std.mem.Allocator,
+        scope: *semantic.Scope,
+    ) semantic.Scope.Error!?*TypeExpr {
+        const binding = try scope.lookup(self.name) orelse return null;
+        return binding.type_expr;
+    }
 };
 
 /// Path represents qualified identifiers such as `error.FileError.NotFound`.
 pub const Path = struct {
     segments: []const Identifier,
     span: Span,
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*TypeExpr {
+        return null;
+    }
 };
 
 /// Blocks appear in functions, control flow, and expression contexts. The
@@ -30,6 +48,14 @@ pub const Path = struct {
 pub const Block = struct {
     statements: []const *Statement,
     span: Span,
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*TypeExpr {
+        return null;
+    }
 };
 
 /// Patterns are shared between `const` bindings, destructuring assignment, loop
@@ -97,6 +123,10 @@ pub const TypeExpr = union(enum) {
     struct_type: StructType,
     tuple: TupleType,
     function: FunctionType,
+    integer: PrimitiveType,
+    float: PrimitiveType,
+    boolean: PrimitiveType,
+    lazy: LazyType,
 
     pub const NamedType = struct {
         path: Path,
@@ -148,9 +178,61 @@ pub const TypeExpr = union(enum) {
     };
 
     pub const FunctionType = struct {
-        params: []const *TypeExpr,
-        return_type: *TypeExpr,
+        params: []const ?*TypeExpr,
+        return_type: ?*TypeExpr,
         span: Span,
+    };
+
+    pub const PrimitiveType = struct {
+        span: Span,
+    };
+
+    pub const LazyType = struct {
+        type_expr: ?*TypeExpr = null,
+        dependencies: std.ArrayList(*LazyType) = .empty,
+        dependees: std.ArrayList(*LazyType) = .empty,
+        materializer: Materializer,
+
+        const Materializer = union(enum) {
+            same: struct {
+                pub fn materialize(
+                    _: @This(),
+                    _: std.mem.Allocator,
+                    type_expr: *TypeExpr,
+                ) std.mem.Allocator!*TypeExpr {
+                    return type_expr;
+                }
+            },
+
+            pub fn materialize(
+                self: Materializer,
+                allocator: std.mem.Allocator,
+                type_expr: *TypeExpr,
+            ) std.mem.Allocator!*TypeExpr {
+                return switch (self) {
+                    inline else => |m| m.materialize(allocator, type_expr),
+                };
+            }
+        };
+
+        pub fn materializeType(
+            self: *LazyType,
+            allocator: std.mem.Allocator,
+            type_expr: *TypeExpr,
+        ) std.mem.Allocator.Error!void {
+            self.type_expr = try self.materializer.materialize(allocator, type_expr);
+            for (self.dependees.items) |dependee| {
+                try dependee.materializeType(type_expr);
+            }
+        }
+
+        pub fn resolveType(
+            self: *@This(),
+            _: std.mem.Allocator,
+            _: *semantic.Scope,
+        ) semantic.Scope.Error!?*TypeExpr {
+            return self.type_expr;
+        }
     };
 
     pub fn span(self: TypeExpr) Span {
@@ -202,6 +284,14 @@ pub const Literal = union(enum) {
             .null => |n| n.span,
         };
     }
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*TypeExpr {
+        return null;
+    }
 };
 
 pub const IntegerLiteral = struct {
@@ -213,6 +303,14 @@ pub const IntegerLiteral = struct {
             .text = tok.lexeme,
             .span = tok.span,
         };
+    }
+
+    pub fn resolveType(
+        self: *@This(),
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*TypeExpr {
+        return .{ .integer = .{ .span = self.span } };
     }
 };
 
@@ -247,8 +345,6 @@ pub const Expression = union(enum) {
     binary: BinaryExpr,
     block: Block,
     fn_literal: FunctionLiteral,
-    async_expr: AsyncExpr,
-    await_expr: AwaitExpr,
     if_expr: IfExpr,
     for_expr: ForExpr,
     match_expr: MatchExpr,
@@ -273,11 +369,29 @@ pub const Expression = union(enum) {
 
         @compileError("Invalid expression pass to Expression.from: " ++ @typeName(@TypeOf(expr)));
     }
+
+    pub fn resolveType(
+        self: *@This(),
+        allocator: std.mem.Allocator,
+        scope: *semantic.Scope,
+    ) semantic.Scope.Error!?*TypeExpr {
+        return switch (self.*) {
+            inline else => |*expr| expr.resolveType(allocator, scope),
+        };
+    }
 };
 
 pub const ArrayLiteral = struct {
     elements: []const *Expression,
     span: Span,
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*TypeExpr {
+        return null;
+    }
 };
 
 pub const MapLiteral = struct {
@@ -289,6 +403,14 @@ pub const MapLiteral = struct {
         value: *Expression,
         span: Span,
     };
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*TypeExpr {
+        return null;
+    }
 };
 
 pub const RangeLiteral = struct {
@@ -296,12 +418,28 @@ pub const RangeLiteral = struct {
     end: ?*Expression,
     inclusive_end: bool,
     span: Span,
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*TypeExpr {
+        return null;
+    }
 };
 
 pub const CallExpr = struct {
     callee: *Expression,
     arguments: []const CallArgument,
     span: Span,
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*TypeExpr {
+        return null;
+    }
 };
 
 pub const CallArgument = struct {
@@ -314,18 +452,42 @@ pub const MemberExpr = struct {
     object: *Expression,
     member: Identifier,
     span: Span,
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*TypeExpr {
+        return null;
+    }
 };
 
 pub const IndexExpr = struct {
     target: *Expression,
     index: *Expression,
     span: Span,
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*TypeExpr {
+        return null;
+    }
 };
 
 pub const UnaryExpr = struct {
     op: UnaryOp,
     operand: *Expression,
     span: Span,
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*TypeExpr {
+        return null;
+    }
 };
 
 pub const UnaryOp = enum {
@@ -339,6 +501,14 @@ pub const BinaryExpr = struct {
     left: *Expression,
     right: *Expression,
     span: Span,
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*TypeExpr {
+        return null;
+    }
 };
 
 pub const BinaryOp = enum {
@@ -399,23 +569,19 @@ pub const FunctionLiteral = struct {
     return_type: ?*TypeExpr,
     body: FunctionBody,
     span: Span,
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*TypeExpr {
+        return null;
+    }
 };
 
 pub const FunctionBody = union(enum) {
     block: Block,
     expression: *Expression,
-};
-
-pub const AsyncExpr = struct {
-    body: Block,
-    span: Span,
-};
-
-pub const AwaitExpr = struct {
-    subject: *Expression,
-    success: ?CaptureBlock,
-    failure: ?CatchClause,
-    span: Span,
 };
 
 pub const IfExpr = struct {
@@ -429,12 +595,28 @@ pub const IfExpr = struct {
         block: Block,
         if_expr: *IfExpr,
     };
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*TypeExpr {
+        return null;
+    }
 };
 
 pub const MatchExpr = struct {
     subject: *Expression,
     cases: []const MatchCase,
     span: Span,
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*TypeExpr {
+        return null;
+    }
 };
 
 pub const MatchCase = struct {
@@ -465,12 +647,28 @@ pub const MatchPattern = union(enum) {
 pub const TryExpr = struct {
     subject: *Expression,
     span: Span,
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*TypeExpr {
+        return null;
+    }
 };
 
 pub const CatchExpr = struct {
     subject: *Expression,
     handler: CatchClause,
     span: Span,
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*TypeExpr {
+        return null;
+    }
 };
 
 pub const CatchClause = struct {
@@ -483,6 +681,14 @@ pub const ImportExpr = struct {
     importer: []const u8,
     module_name: []const u8,
     span: Span,
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*TypeExpr {
+        return null;
+    }
 };
 
 /// Pipelines model chained command and expression stages. Each stage carries a
@@ -491,6 +697,14 @@ pub const ImportExpr = struct {
 pub const Pipeline = struct {
     stages: []const PipelineStage,
     span: Span,
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*TypeExpr {
+        return null;
+    }
 };
 
 pub const PipelineStage = struct {
@@ -596,20 +810,18 @@ pub const BashBlock = struct {
 };
 
 /// Script is the root of every parsed Runic file.
-pub const Script = struct {
-    statements: []const *Statement,
-    span: Span,
-};
+pub const Script = Block;
 
 /// Statements represent top-level items as well as imperative expressions.
 pub const Statement = union(enum) {
     binding_decl: BindingDecl,
     fn_decl: FunctionDecl,
+    expression: ExpressionStmt,
+
     error_decl: ErrorDecl,
     return_stmt: ReturnStmt,
     while_stmt: WhileStmt,
     bash_block: BashBlock,
-    expression: ExpressionStmt,
 
     pub fn span(self: Statement) Span {
         return switch (self) {
@@ -623,6 +835,16 @@ pub const Statement = union(enum) {
             .expression => |expr_stmt| expr_stmt.span,
         };
     }
+
+    pub fn resolveType(
+        self: *@This(),
+        allocator: std.mem.Allocator,
+        scope: *semantic.Scope,
+    ) semantic.Scope.Error!?*TypeExpr {
+        return switch (self) {
+            inline else => |s| s.resolveType(allocator, scope),
+        };
+    }
 };
 
 pub const BindingDecl = struct {
@@ -631,6 +853,14 @@ pub const BindingDecl = struct {
     annotation: ?*TypeExpr,
     initializer: *Expression,
     span: Span,
+
+    pub fn resolveType(
+        self: *@This(),
+        allocator: std.mem.Allocator,
+        scope: *semantic.Scope,
+    ) semantic.Scope.Error!?*TypeExpr {
+        return self.annotation orelse self.initializer.resolveType(allocator, scope);
+    }
 };
 
 pub const Parameter = struct {
@@ -639,15 +869,46 @@ pub const Parameter = struct {
     default_value: ?*Expression,
     is_mutable: bool,
     span: Span,
+
+    pub fn resolveType(
+        self: *@This(),
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*TypeExpr {
+        // TODO: Fix when implementing parameters
+        return self.type_annotation;
+    }
 };
 
 pub const FunctionDecl = struct {
     name: Identifier,
     is_async: bool,
-    params: []const Parameter,
+    params: []Parameter,
     return_type: ?*TypeExpr,
     body: FunctionBody,
     span: Span,
+
+    pub fn resolveType(
+        self: *@This(),
+        allocator: std.mem.Allocator,
+        scope: *semantic.Scope,
+    ) semantic.Scope.Error!?*TypeExpr {
+        const params_types = try allocator.alloc(?*TypeExpr, self.params.len);
+
+        for (params_types, self.params) |*param_type, *param| {
+            param_type.* = try param.resolveType(allocator, scope);
+        }
+
+        const fn_type = try allocator.create(TypeExpr);
+
+        fn_type.* = .{ .function = .{
+            .params = params_types,
+            .return_type = self.return_type,
+            .span = self.span,
+        } };
+
+        return fn_type;
+    }
 };
 
 pub const ErrorDecl = struct {
@@ -697,6 +958,14 @@ pub const ForExpr = struct {
     capture: CaptureClause,
     body: Block,
     span: Span,
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*TypeExpr {
+        return null;
+    }
 };
 
 pub const WhileStmt = struct {
@@ -710,9 +979,25 @@ pub const Assignment = struct {
     identifier: Identifier,
     expr: *Expression,
     span: Span,
+
+    pub fn resolveType(
+        self: *@This(),
+        allocator: std.mem.Allocator,
+        scope: *semantic.Scope,
+    ) semantic.Scope.Error!?*TypeExpr {
+        return self.expr.resolveType(allocator, scope);
+    }
 };
 
 pub const ExpressionStmt = struct {
     expression: *Expression,
     span: Span,
+
+    pub fn resolveType(
+        self: *@This(),
+        allocator: std.mem.Allocator,
+        scope: *semantic.Scope,
+    ) semantic.Scope.Error!?*TypeExpr {
+        return self.expression.resolveType(allocator, scope);
+    }
 };

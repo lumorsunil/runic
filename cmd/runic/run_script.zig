@@ -8,6 +8,9 @@ const Tracer = runic.tracing.Tracer;
 const CommandRunner = runic.command_runner.CommandRunner;
 const DocumentStore = runic.document.DocumentStore;
 const Parser = runic.document.Parser;
+const TypeChecker = runic.semantic.TypeChecker;
+const rainbow = runic.rainbow;
+const ast = runic.ast;
 
 pub fn runScript(
     allocator: Allocator,
@@ -51,7 +54,7 @@ pub fn runScript(
 
     const resolvedPath = try documentStore.resolvePath(script.path);
 
-    const script_ast = entryDocument.parser.parseScript(resolvedPath) catch |err| {
+    var script_ast = entryDocument.parser.parseScript(resolvedPath) catch |err| {
         handleParseScriptError(&entryDocument.parser, stderr, err) catch |err_| {
             std.log.err("Could not handle error: {}, Original error: {}", .{ err_, err });
         };
@@ -70,6 +73,22 @@ pub fn runScript(
                 return .fromProcess(1);
             };
         }
+
+        return .success;
+    }
+
+    if (config.type_check_only) {
+        var type_checker = TypeChecker.init(allocator, &script_ast);
+        defer type_checker.deinit();
+        _ = type_checker.typeCheck() catch |err| {
+            const expr_that_errorered = type_checker.expr_that_errorered.?;
+            const span = expr_that_errorered.span();
+            const document = try documentStore.requestDocument(span.start.file);
+            try logSpan(stderr, span, document.source);
+            try stderr.print("Type Checker error: {}\n", .{err});
+            try stderr.flush();
+            return .fromProcess(1);
+        };
 
         return .success;
     }
@@ -228,12 +247,6 @@ const StatementExpressionIterator = struct {
                 try populateBlockExpr(cursor, fn_literal.body.block);
                 for (fn_literal.params) |param| if (param.default_value) |dv| try cursor.appendExpr(dv);
             },
-            .async_expr => |async_expr| try populateBlockExpr(cursor, async_expr.body),
-            .await_expr => |await_expr| {
-                if (await_expr.failure) |f| try populateBlockExpr(cursor, f.body);
-                try cursor.appendExpr(await_expr.subject);
-                if (await_expr.success) |s| try populateBlockExpr(cursor, s.body);
-            },
             .if_expr => |*if_expr| try populateIfExpr(cursor, if_expr),
             .match_expr => |match_expr| {
                 for (match_expr.cases) |c| try populateBlockExpr(cursor, c.body);
@@ -369,4 +382,51 @@ fn handleParseScriptError(
         try stderr.print("^\n", .{});
     }
     try stderr.flush();
+}
+
+const span_color = rainbow.beginBgColor(.red) ++ rainbow.beginColor(.black);
+const end_color = rainbow.endColor();
+
+fn logSpan(writer: *std.Io.Writer, span: ast.Span, source: []const u8) !void {
+    var lineIt = std.mem.splitScalar(u8, source, '\n');
+    var i: usize = 0;
+    while (lineIt.next()) |line| : (i += 1) {
+        if (i >= span.start.line -| 3 and i <= span.end.line +| 3) {
+            if (span.start.line == i + 1 and span.end.line == i + 1) {
+                try writer.print("{:>4}:{s}{s}{s}{s}{s}\n", .{
+                    i + 1,
+                    line[0 .. span.start.column - 1],
+                    span_color,
+                    line[span.start.column - 1 .. span.end.column - 1],
+                    end_color,
+                    line[span.end.column - 1 ..],
+                });
+            } else if (span.start.line == i + 1) {
+                try writer.print("{:>4}:{s}{s}{s}{s}\n", .{
+                    i + 1,
+                    line[0 .. span.start.column - 1],
+                    span_color,
+                    line[span.start.column - 1 ..],
+                    end_color,
+                });
+            } else if (span.end.line == i + 1) {
+                try writer.print("{:>4}:{s}{s}{s}{s}\n", .{
+                    i + 1,
+                    span_color,
+                    line[0 .. span.end.column - 1],
+                    end_color,
+                    line[span.end.column - 1 ..],
+                });
+            } else if (span.start.line - 1 <= i and i <= span.end.line - 1) {
+                try writer.print("{:>4}:{s}{s}{s}\n", .{
+                    i + 1,
+                    span_color,
+                    line,
+                    end_color,
+                });
+            } else {
+                try writer.print("{:>4}:{s}\n", .{ i + 1, line });
+            }
+        }
+    }
 }

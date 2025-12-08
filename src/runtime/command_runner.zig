@@ -91,6 +91,8 @@ pub const CommandRunner = struct {
         scopes: *interpreter.ScopeStack,
         specs: []const CommandSpec,
     ) Error!ProcessHandle {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+
         try self.log("{s}", .{@src().fn_name});
 
         if (specs.len == 0) {
@@ -119,6 +121,10 @@ pub const CommandRunner = struct {
                 .stdin_data = previous_stdout,
             };
             const stage = try self.runStage(evaluator, scopes, &stage_run_args, specs);
+
+            if (!stage.status.ok) {
+                // TODO: error handling
+            }
 
             if (index == 0) {
                 primary_pid = stage.pid;
@@ -158,6 +164,8 @@ pub const CommandRunner = struct {
         args: *StageRunArgs,
         specs: []const CommandSpec,
     ) Error!StageExecution {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+
         const stdout_pipe = scopes.getStdoutPipe();
 
         try self.log("{s}: {{stdout.is_streaming: {}}}", .{ @src().fn_name, stdout_pipe.is_streaming });
@@ -273,6 +281,8 @@ pub const CommandRunner = struct {
         args: *StageRunArgs,
         specs: []const CommandSpec,
     ) Error!StageExecution {
+        errdefer self.log(@src().fn_name ++ ": error", .{}) catch {};
+
         try self.log("{s}: \"{s}\"", .{ @src().fn_name, try args.spec.argv[0].get() });
 
         const argv = try self.dupeArgs(args.spec.argv);

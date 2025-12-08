@@ -157,6 +157,9 @@ pub const Evaluator = struct {
         try scopes.pushFrame(@src().fn_name, .initBlocking());
         try scopes.pushFrame(@src().fn_name, .initScopeRefSpecial(fn_ref.closure.?));
         try scopes.pushFrame(@src().fn_name, try .initSingleNew(self.allocator));
+        errdefer scopes.popFrameN(@src().fn_name, 3) catch {
+            std.log.err(@src().fn_name ++ ": Could not pop the frames.", .{});
+        };
 
         var fn_ref_value = Value{ .function = try fn_ref_ref.ref(.{}) };
         try scopes.declare(fn_ref.fn_decl.name.name, &fn_ref_value, false);
@@ -194,6 +197,7 @@ pub const Evaluator = struct {
         scopes: *ScopeStack,
         block: ast.Block,
     ) Error!Value {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logEvaluationTrace(@src().fn_name);
 
         try scopes.pushFrame(@src().fn_name, try .initSingleNew(self.allocator));
@@ -267,6 +271,7 @@ pub const Evaluator = struct {
         scopes: *ScopeStack,
         statement: *const ast.Statement,
     ) Error!?Value {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.log(@src().fn_name, .{});
         return self.executeStatement(scopes, statement);
     }
@@ -276,6 +281,7 @@ pub const Evaluator = struct {
         scopes: *ScopeStack,
         statement: *const ast.Statement,
     ) Error!?Value {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.log(@src().fn_name, .{});
 
         return switch (statement.*) {
@@ -297,12 +303,14 @@ pub const Evaluator = struct {
         scopes: *ScopeStack,
         expression: *ast.Expression,
     ) Error!?Value {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.log(@src().fn_name, .{});
 
         return try self.evaluateExpression(scopes, expression);
     }
 
     fn executeBinding(self: *Evaluator, scopes: *ScopeStack, decl: *const ast.BindingDecl) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.log(@src().fn_name, .{});
 
         var stdout_buf_writer = std.Io.Writer.Allocating.init(self.allocator);
@@ -343,6 +351,7 @@ pub const Evaluator = struct {
         scopes: *ScopeStack,
         decl: *const ast.FunctionDecl,
     ) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.log(@src().fn_name, .{});
 
         const closure = try scopes.closure();
@@ -359,6 +368,7 @@ pub const Evaluator = struct {
         scopes: *ScopeStack,
         expr: *const ast.Expression,
     ) Error!Value {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logEvaluationTrace(@src().fn_name);
         try self.log("<{s}>", .{@tagName(expr.*)});
         try self.logEvaluateExpression(expr);
@@ -376,7 +386,7 @@ pub const Evaluator = struct {
             .for_expr => |for_expr| try self.evaluateForExpression(scopes, for_expr),
             .range => |range| try self.evaluateRangeExpression(scopes, range),
             .array => |array| try self.evaluateArrayExpression(scopes, array),
-            else => return Error.UnsupportedExpression,
+            else => return error.UnsupportedExpression,
         };
 
         return switch (v) {
@@ -439,6 +449,7 @@ pub const Evaluator = struct {
     }
 
     fn evaluateLiteral(self: *Evaluator, scopes: *ScopeStack, literal: ast.Literal) Error!Value {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logEvaluationTrace(@src().fn_name);
         return switch (literal) {
             .null => Value{ .void = {} },
@@ -459,12 +470,14 @@ pub const Evaluator = struct {
     }
 
     fn evaluateIdentifier(self: *Evaluator, scopes: *ScopeStack, identifier: ast.Identifier) Error!Value {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logEvaluationTrace(@src().fn_name);
-        const binding = try scopes.lookup(identifier.name) orelse return Error.UnknownIdentifier;
+        const binding = try scopes.lookup(identifier.name) orelse return error.UnknownIdentifier;
         return try binding.value.clone(self.allocator);
     }
 
     fn evaluateBlockExpression(self: *Evaluator, scopes: *ScopeStack, block: ast.Block) Error!Value {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logEvaluationTrace(@src().fn_name);
 
         return try self.runBlockInOwnContext(scopes, block);
@@ -476,11 +489,12 @@ pub const Evaluator = struct {
         scopes: *ScopeStack,
         import: ast.ImportExpr,
     ) Error!Value {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logEvaluationTrace(@src().fn_name);
 
         const document = try self.getCachedDocument(import.importer, import.module_name);
 
-        const script_ast = document.ast orelse return Error.DocumentNotParsed;
+        const script_ast = document.ast orelse return error.DocumentNotParsed;
 
         try scopes.pushFrame(@src().fn_name, .initBlocking());
         try scopes.pushFrame(@src().fn_name, try .initSingleNew(self.allocator));
@@ -503,6 +517,7 @@ pub const Evaluator = struct {
         scopes: *ScopeStack,
         member: ast.MemberExpr,
     ) Error!Value {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logEvaluationTrace(@src().fn_name);
 
         var object = try self.evaluateExpression(scopes, member.object);
@@ -563,16 +578,17 @@ pub const Evaluator = struct {
         scopes: *ScopeStack,
         assignment: ast.Assignment,
     ) Error!Value {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logEvaluationTrace(@src().fn_name);
 
-        const bindingRef = try scopes.lookup(assignment.identifier.name) orelse return Error.UnknownIdentifier;
+        const bindingRef = try scopes.lookup(assignment.identifier.name) orelse return error.UnknownIdentifier;
 
         if (bindingRef.is_mutable) {
             var newValue = try self.evaluateExpression(scopes, assignment.expr);
             try bindingRef.value.reassign(&newValue);
             return bindingRef.value.clone(self.allocator);
         } else {
-            return Error.ImmutableBinding;
+            return error.ImmutableBinding;
         }
     }
 
@@ -581,6 +597,7 @@ pub const Evaluator = struct {
         scopes: *ScopeStack,
         binary: ast.BinaryExpr,
     ) Error!Value {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logEvaluationTrace(@src().fn_name);
 
         switch (binary.op) {
@@ -755,7 +772,7 @@ pub const Evaluator = struct {
             },
         }
 
-        return Error.UnsupportedBinaryExpr;
+        return error.UnsupportedBinaryExpr;
     }
 
     fn evaluateIfExpression(
@@ -763,6 +780,7 @@ pub const Evaluator = struct {
         scopes: *ScopeStack,
         if_expr: ast.IfExpr,
     ) Error!Value {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logEvaluationTrace(@src().fn_name);
 
         var condition_value = try self.evaluateExpression(scopes, if_expr.condition);
@@ -787,6 +805,7 @@ pub const Evaluator = struct {
         scopes: *ScopeStack,
         for_expr: ast.ForExpr,
     ) Error!Value {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logEvaluationTrace(@src().fn_name);
 
         // for (0..) |i| {...}
@@ -1002,6 +1021,7 @@ pub const Evaluator = struct {
         scopes: *ScopeStack,
         range: ast.RangeLiteral,
     ) Error!Value {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logEvaluationTrace(@src().fn_name);
 
         var start_value = try self.evaluateExpression(scopes, range.start);
@@ -1073,6 +1093,7 @@ pub const Evaluator = struct {
         scopes: *ScopeStack,
         pipeline: ast.Pipeline,
     ) Error!Value {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logEvaluationTrace(@src().fn_name);
         switch (pipeline.stages[0].payload) {
             .command => |command| {
@@ -1086,7 +1107,7 @@ pub const Evaluator = struct {
             .expression => try self.log("<expr>", .{}),
         }
 
-        if (pipeline.stages.len == 0) return Error.EmptyPipeline;
+        if (pipeline.stages.len == 0) return error.EmptyPipeline;
 
         var specs = ArrayListManaged(CommandRunner.CommandSpec).init(self.allocator);
         defer {
@@ -1099,7 +1120,7 @@ pub const Evaluator = struct {
 
         for (pipeline.stages, 0..) |stage, i| {
             try self.log("processing stage[{}] information", .{i});
-            if (stage.role != .command) return Error.UnsupportedPipelineStage;
+            if (stage.role != .command) return error.UnsupportedPipelineStage;
             const command = stage.payload.command;
 
             if (command.env_assignments.len > 0 or
@@ -1107,7 +1128,7 @@ pub const Evaluator = struct {
                 command.capture != null or
                 command.background)
             {
-                return Error.UnsupportedCommandFeature;
+                return error.UnsupportedCommandFeature;
             }
 
             var argv = ArrayListManaged(Value.String).init(self.allocator);
@@ -1130,7 +1151,7 @@ pub const Evaluator = struct {
                     .boolean, .integer, .float, .string, .array, .process_handle => command_type = .{ .value = b.value },
                     else => {
                         try self.log("unsupported command type {s}", .{@tagName(b.value.*)});
-                        return Error.UnsupportedCommandType;
+                        return error.UnsupportedCommandType;
                     },
                 }
             } else command_type = .executable;

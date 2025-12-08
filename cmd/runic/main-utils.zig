@@ -14,6 +14,7 @@ pub const CliConfig = struct {
     env_overrides: []EnvOverride,
     print_ast: bool = false,
     print_tokens: bool = false,
+    type_check_only: bool = false,
 
     const Mode = union(enum) {
         script: ScriptInvocation,
@@ -263,7 +264,7 @@ fn renderBlockStatements(writer: *std.Io.Writer, block: ast.Block, level: usize)
     }
 }
 
-fn renderStatementAst(writer: *std.Io.Writer, stmt: *const ast.Statement, level: usize) !void {
+fn renderStatementAst(writer: *std.Io.Writer, stmt: *const ast.Statement, level: usize) std.Io.Writer.Error!void {
     switch (stmt.*) {
         .expression => |expr_stmt| {
             try writeIndent(writer, level);
@@ -292,7 +293,16 @@ fn renderStatementAst(writer: *std.Io.Writer, stmt: *const ast.Statement, level:
             try writer.writeAll(fn_decl.name.name);
             try writer.writeByte('\n');
             try writeIndent(writer, level + 1);
-            try writer.print("# statements {}", .{fn_decl.body.block.statements.len});
+            switch (fn_decl.body) {
+                .block => |block| {
+                    try writer.print("# statements {}\n", .{block.statements.len});
+                    try renderBlockStatements(writer, block, level + 1);
+                },
+                .expression => |expr| {
+                    try writer.print("expression:\n", .{});
+                    try renderExpressionAst(writer, expr, level + 1);
+                },
+            }
         },
         else => {
             const tag_name = @tagName(std.meta.activeTag(stmt.*));
@@ -543,6 +553,7 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
     var repl_requested = false;
     var print_ast = false;
     var print_tokens = false;
+    var type_check_only = false;
     var parsing_options = true;
     var idx: usize = 1;
 
@@ -569,6 +580,10 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
             }
             if (argEqual(arg, "--print-tokens")) {
                 print_tokens = true;
+                continue;
+            }
+            if (argEqual(arg, "--type-check-only")) {
+                type_check_only = true;
                 continue;
             }
             if (std.mem.startsWith(u8, arg, trace_prefix)) {
@@ -653,6 +668,12 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
     if (print_tokens and script_path == null) {
         return usageError(allocator, "--print-tokens requires a script path.", .{});
     }
+    if (type_check_only and repl_requested) {
+        return usageError(allocator, "--type-check-only requires a script path.", .{});
+    }
+    if (type_check_only and script_path == null) {
+        return usageError(allocator, "--type-check-only requires a script path.", .{});
+    }
 
     const trace_slice = try finalizeList([]const u8, &trace_topics, &trace_cleanup);
     const module_slice = try finalizeList([]const u8, &module_paths, &module_cleanup);
@@ -668,6 +689,7 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
                 .env_overrides = env_slice,
                 .print_ast = print_ast,
                 .print_tokens = print_tokens,
+                .type_check_only = type_check_only,
             },
         };
     }
@@ -681,6 +703,7 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
             .env_overrides = env_slice,
             .print_ast = print_ast,
             .print_tokens = print_tokens,
+            .type_check_only = type_check_only,
         },
     };
 }
@@ -700,6 +723,7 @@ pub fn printUsage(writer: *std.Io.Writer) !void {
         \\  --env KEY=VALUE      Override an environment variable during execution.
         \\  --print-ast          Parse the script and emit its AST instead of executing.
         \\  --print-tokens       Dump the raw lexer tokens for the provided script path.
+        \\  --type-check-only    Dry run with only type checking.
         \\
         \\Additional arguments after -- are forwarded to the script unchanged.
         \\Scripts honor the same tracing, module-path, and env override flags as the REPL.

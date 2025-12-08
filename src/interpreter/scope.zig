@@ -359,6 +359,7 @@ pub const ScopeStack = struct {
     }
 
     pub fn detach(self: *ScopeStack, levels: usize) Error!Value.ScopeRef {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         std.debug.assert(levels <= self.frames.items.len);
 
         const detached_ref: Value.ScopeRef = try .init(
@@ -395,6 +396,7 @@ pub const ScopeStack = struct {
     }
 
     pub fn pushFrame(self: *ScopeStack, label: []const u8, frame: Frame) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.log("{s}:{s}({}) : {s}", .{ label, @src().fn_name, self.frames.items.len, @tagName(frame) });
         try self.frames.append(self.allocator, frame);
     }
@@ -405,6 +407,7 @@ pub const ScopeStack = struct {
         stdout: *std.Io.Writer,
         stderr: *std.Io.Writer,
     ) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         const tag: std.meta.Tag(Frame) = .forward_context;
         try self.log("{s}:{s}({}) : {s}", .{ label, @src().fn_name, self.frames.items.len, @tagName(tag) });
         try self.frames.append(self.allocator, .initForwardContext(.init(
@@ -414,6 +417,7 @@ pub const ScopeStack = struct {
     }
 
     pub fn popFrame(self: *ScopeStack, label: []const u8) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         const level = self.frames.items.len - 1;
         try self.log("{s}:{s}({}):", .{ label, @src().fn_name, level });
         try self.logBindings(@src().fn_name, level, level);
@@ -438,6 +442,8 @@ pub const ScopeStack = struct {
         value: *Value,
         is_mutable: bool,
     ) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+
         try self.log("{s}(\"{s}\" : {s} {s}):", .{
             @src().fn_name,
             name,
@@ -446,7 +452,7 @@ pub const ScopeStack = struct {
         });
 
         var frame = try self.currentFrameSingle();
-        if (try findInFrame(frame, name) != null) return Error.DuplicateBinding;
+        if (try findInFrame(frame, name) != null) return error.DuplicateBinding;
 
         const name_owned = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(name_owned);
@@ -490,6 +496,7 @@ pub const ScopeStack = struct {
     }
 
     pub fn lookup(self: *ScopeStack, name: []const u8) Error!?BindingRef {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.log(@src().fn_name ++ "(\"{s}\")", .{name});
         var index = self.frames.items.len;
         while (index > 0) {
@@ -511,10 +518,14 @@ pub const ScopeStack = struct {
                         };
                     }
                 },
-                .blocking => return null,
+                .blocking => {
+                    try self.log(@src().fn_name ++ ": blocking, returning null", .{});
+                    return null;
+                },
                 .forward_context => continue,
             }
         }
+        try self.log(@src().fn_name ++ ": not found, returning null", .{});
         return null;
     }
 
@@ -597,6 +608,7 @@ pub const ScopeStack = struct {
     }
 
     pub fn closure(self: *ScopeStack) Error!*ScopeStack {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.log("{s}({})", .{ @src().fn_name, self.frames.items.len });
         const scope = try self.allocator.create(ScopeStack);
         scope.* = .init(self.allocator, .child);

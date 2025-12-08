@@ -135,5 +135,10 @@
 
 ## type checker
 
-- [ ] re-use scope structure?
-- [ ] use expression walker for checking types?
+- [x] basic scope structure and semantic checker in place
+- [ ] do we even need lazy types? how will it work?
+- [ ] implement more of this now, high prio because it's going to be so much work to redo potentially otherwise, also type checking is cool
+
+## error handling
+
+- [ ] call stack when executing functions

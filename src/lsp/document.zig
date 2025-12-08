@@ -49,6 +49,7 @@ pub const DocumentStore = struct {
             workspace,
             workspace.describePath(entry.value_ptr.path),
         );
+        try entry.value_ptr.reportTypeChecker(self.allocator);
     }
 
     fn getLine(line: u32, source: []const u8) ?[]const u8 {
@@ -113,6 +114,7 @@ pub const DocumentStore = struct {
             workspace,
             workspace.describePath(doc.path),
         );
+        try doc.reportTypeChecker(self.allocator);
         return true;
     }
 
@@ -211,5 +213,24 @@ const Document = struct {
         // defer parser.deinit();
         const script = try parseFile(allocator, &self.diagnostics, &self.parser.?, self.path) orelse return;
         try symbols.collectSymbols(allocator, detail, script, &self.symbols);
+    }
+
+    fn reportTypeChecker(
+        self: *Document,
+        allocator: Allocator,
+    ) !void {
+        var type_checker = runic.semantic.TypeChecker.init(allocator, &self.ast.?);
+        defer type_checker.deinit();
+        _ = type_checker.typeCheck() catch |err| {
+            const expr_that_errorered = type_checker.expr_that_errorered.?;
+            const span = expr_that_errorered.span();
+
+            try self.diagnostics.append(allocator, .{
+                .uri = try self.uri(allocator),
+                .message = try allocator.dupe(u8, @errorName(err)),
+                .span = span,
+                .severity = .@"error",
+            });
+        };
     }
 };
