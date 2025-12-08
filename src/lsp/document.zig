@@ -218,7 +218,9 @@ const Document = struct {
         self: *Document,
         allocator: Allocator,
     ) !void {
-        var type_checker = runic.semantic.TypeChecker.init(allocator, &self.ast.?);
+        const ast = if (self.ast) |*ast| ast else return;
+
+        var type_checker = runic.semantic.TypeChecker.init(allocator, ast);
         defer type_checker.deinit();
         const result = type_checker.typeCheck() catch |err| {
             std.log.err("Type checker failed to run: {}", .{err});
