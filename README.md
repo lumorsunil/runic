@@ -2,6 +2,36 @@
 
 Runic is an experiment in designing a modern bash-compatible scripting language. Its goal is to keep the terseness and command-focused workflow of traditional shell scripts while removing long-standing ergonomics issues around quoting, data safety, and program structure.
 
+## Quick examples
+
+Runic scripts keep the familiar "just run commands" flow you get in bash, but with clearer data handling and explicit types:
+
+```runic
+#!/usr/bin/env runic
+
+// greet with a default when no args are passed
+const name: Str = args.get(0) orelse "world"
+echo "hello ${name}"
+
+// capture stdout and status from a pipeline
+const recent = (ls ./src | head -n 5)
+if recent.status.ok {
+  echo "first few entries:"
+  echo recent.stdout
+}
+
+// simple function that reuses existing tools
+fn check_git() void {
+  const summary = git status --short
+  if summary.stdout != "" {
+    echo "working tree changes:"
+    echo summary.stdout
+  }
+}
+
+check_git()
+```
+
 ## Why another shell?
 
 Classic bash is ubiquitous, but it is notoriously difficult to reason about:

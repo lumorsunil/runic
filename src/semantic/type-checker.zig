@@ -6,7 +6,7 @@ const Scope = @import("scope.zig").Scope;
 pub const TypeChecker = struct {
     ast: *ast.Script,
     arena: std.heap.ArenaAllocator,
-    expr_that_errorered: ?*ast.Expression = null,
+    diagnostics: std.ArrayList(Diagnostic) = .empty,
 
     pub const Error = Scope.Error || error{
         UnsupportedExpression,
@@ -20,7 +20,24 @@ pub const TypeChecker = struct {
         ForSourcesAndBindingsNeedToBeTheSameLength,
     };
 
-    pub const Result = struct {};
+    pub const Diagnostic = struct {
+        err: Error,
+        expr: *ast.Expression,
+        message: []const u8,
+        severity: Severity,
+
+        pub const Severity = enum {
+            @"error",
+            warning,
+            information,
+            hint,
+        };
+    };
+
+    pub const Result = union(enum) {
+        err: []Diagnostic,
+        success,
+    };
 
     pub fn init(allocator: std.mem.Allocator, script: *ast.Script) TypeChecker {
         return .{
@@ -33,9 +50,19 @@ pub const TypeChecker = struct {
         self.arena.deinit();
     }
 
-    fn reportExprError(self: *TypeChecker, expr: *ast.Expression, err: Error) Error!void {
-        self.expr_that_errorered = expr;
-        return err;
+    fn reportExprError(
+        self: *TypeChecker,
+        expr: *ast.Expression,
+        err: Error,
+        message: []const u8,
+        severity: Diagnostic.Severity,
+    ) Error!void {
+        try self.diagnostics.append(self.arena.allocator(), .{
+            .err = err,
+            .expr = expr,
+            .message = message,
+            .severity = severity,
+        });
     }
 
     pub fn typeCheck(self: *TypeChecker) Error!Result {
@@ -290,7 +317,12 @@ pub const TypeChecker = struct {
     pub fn runAssignment(self: *TypeChecker, scope: *Scope, assignment: *ast.Assignment) Error!void {
         self.runIdentifier(scope, &assignment.identifier) catch |err| {
             const parent_expr: *ast.Expression = @fieldParentPtr("assignment", assignment);
-            try self.reportExprError(parent_expr, err);
+            try self.reportExprError(
+                parent_expr,
+                err,
+                try std.fmt.allocPrint(self.arena.allocator(), "identifier \"{s}\" not declared", .{assignment.identifier.name}),
+                .@"error",
+            );
         };
         try self.runExpression(scope, assignment.expr);
     }
@@ -300,10 +332,11 @@ pub const TypeChecker = struct {
         _ = scope;
     }
 
-    fn typeCheckInner(self: *TypeChecker, scope: *Scope) Error!Result {
-        _ = self;
-        _ = scope;
+    fn typeCheckInner(self: *TypeChecker, _: *Scope) Error!Result {
+        if (self.diagnostics.items.len > 0) {
+            return .{ .err = self.diagnostics.items };
+        }
 
-        return .{};
+        return .success;
     }
 };

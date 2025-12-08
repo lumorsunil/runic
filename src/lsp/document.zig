@@ -207,10 +207,9 @@ const Document = struct {
 
         if (self.parser) |*p| p.deinit();
 
-        // var parser = runic.parser.Parser.init(allocator, self.text);
         self.ast = null;
         self.parser = Parser.init(allocator, workspace.documents);
-        // defer parser.deinit();
+
         const script = try parseFile(allocator, &self.diagnostics, &self.parser.?, self.path) orelse return;
         try symbols.collectSymbols(allocator, detail, script, &self.symbols);
     }
@@ -221,16 +220,26 @@ const Document = struct {
     ) !void {
         var type_checker = runic.semantic.TypeChecker.init(allocator, &self.ast.?);
         defer type_checker.deinit();
-        _ = type_checker.typeCheck() catch |err| {
-            const expr_that_errorered = type_checker.expr_that_errorered.?;
-            const span = expr_that_errorered.span();
-
-            try self.diagnostics.append(allocator, .{
-                .uri = try self.uri(allocator),
-                .message = try allocator.dupe(u8, @errorName(err)),
-                .span = span,
-                .severity = .@"error",
-            });
+        const result = type_checker.typeCheck() catch |err| {
+            std.log.err("Type checker failed to run: {}", .{err});
+            return;
         };
+
+        switch (result) {
+            .success => {},
+            .err => |diagnostics| {
+                for (diagnostics) |d| {
+                    try self.diagnostics.append(allocator, .{
+                        .uri = try self.uri(allocator),
+                        .message = try allocator.dupe(u8, d.message),
+                        .span = d.expr.span(),
+                        .severity = std.meta.stringToEnum(
+                            types.DiagnosticSeverity,
+                            @tagName(d.severity),
+                        ).?,
+                    });
+                }
+            },
+        }
     }
 };

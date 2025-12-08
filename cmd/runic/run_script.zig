@@ -77,20 +77,30 @@ pub fn runScript(
         return .success;
     }
 
-    if (config.type_check_only) {
-        var type_checker = TypeChecker.init(allocator, &script_ast);
-        defer type_checker.deinit();
-        _ = type_checker.typeCheck() catch |err| {
-            const expr_that_errorered = type_checker.expr_that_errorered.?;
-            const span = expr_that_errorered.span();
-            const document = try documentStore.requestDocument(span.start.file);
-            try logSpan(stderr, span, document.source);
-            try stderr.print("Type Checker error: {}\n", .{err});
-            try stderr.flush();
-            return .fromProcess(1);
-        };
+    var type_checker = TypeChecker.init(allocator, &script_ast);
+    defer type_checker.deinit();
 
-        return .success;
+    const type_checker_result = type_checker.typeCheck() catch |err| {
+        std.log.err("Type checker failed to run: {}", .{err});
+        return .fromProcess(1);
+    };
+
+    switch (type_checker_result) {
+        .success => {
+            if (config.type_check_only) return .success;
+        },
+        .err => |diagnostics| {
+            for (diagnostics) |d| {
+                const span = d.expr.span();
+                const document = try documentStore.requestDocument(span.start.file);
+                try stderr.print("[{s}]: ", .{@tagName(d.severity)});
+                try logFileLineAndCol(allocator, stderr, span);
+                try stderr.print(" {s}\n", .{d.message});
+                try logSpan(stderr, span, document.source);
+                try stderr.flush();
+            }
+            return .fromProcess(1);
+        },
     }
 
     const executeOptions = ScriptExecutor.ExecuteOptions.init(
@@ -387,6 +397,14 @@ fn handleParseScriptError(
 const span_color = rainbow.beginBgColor(.red) ++ rainbow.beginColor(.black);
 const end_color = rainbow.endColor();
 
+fn logFileLineAndCol(allocator: Allocator, writer: *std.Io.Writer, span: ast.Span) !void {
+    var file_path_buffer: [512]u8 = undefined;
+    const cwd = try std.fs.cwd().realpath(".", &file_path_buffer);
+    const relative = try std.fs.path.relative(allocator, cwd, span.start.file);
+    defer allocator.free(relative);
+    try writer.print("{s}:{}:{}:", .{ relative, span.start.line, span.start.column });
+}
+
 fn logSpan(writer: *std.Io.Writer, span: ast.Span, source: []const u8) !void {
     var lineIt = std.mem.splitScalar(u8, source, '\n');
     var i: usize = 0;
@@ -429,4 +447,6 @@ fn logSpan(writer: *std.Io.Writer, span: ast.Span, source: []const u8) !void {
             }
         }
     }
+
+    try writer.writeByte('\n');
 }
