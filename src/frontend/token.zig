@@ -199,10 +199,9 @@ pub const Tag = enum {
     l_brace,
     /// Scope/map literal closer.
     r_brace,
-    /// Array literal opener.
     l_bracket,
-    /// Array literal closer.
     r_bracket,
+    dot_l_brace,
 
     pub fn toKeyword(tag: Tag) ?[]const u8 {
         return switch (tag) {

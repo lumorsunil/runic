@@ -29,29 +29,27 @@ pub const ScriptExecutor = struct {
         allocator: Allocator,
         runner: *CommandRunner,
         evaluator: *Evaluator,
+        scopes: *ScopeStack,
         env_map: ?*std.process.EnvMap,
     };
 
     pub const ExecuteOptions = struct {
         script_path: []const u8,
-        stdout: *std.Io.Writer,
-        stderr: *std.Io.Writer,
+        forward_context: ScopeStack.ForwardContext,
         context: *ScriptContext,
+
+        pub fn init(
+            script_path: []const u8,
+            forward_context: ScopeStack.ForwardContext,
+            context: *ScriptContext,
+        ) ExecuteOptions {
+            return .{
+                .script_path = script_path,
+                .forward_context = forward_context,
+                .context = context,
+            };
+        }
     };
-
-    pub fn initWithExecutor(allocator: Allocator, executor: CommandExecutor) !ScriptExecutor {
-        var scopes = try allocator.create(ScopeStack);
-        scopes.* = ScopeStack.init(allocator);
-        errdefer scopes.deinit();
-        try scopes.pushFrame();
-
-        return .{
-            .allocator = allocator,
-            .evaluator = Evaluator.init(allocator, executor),
-            .scopes = scopes,
-            .command_bridge = null,
-        };
-    }
 
     pub fn initWithRunner(
         allocator: Allocator,
@@ -66,17 +64,23 @@ pub const ScriptExecutor = struct {
             .allocator = allocator,
             .runner = runner,
             .evaluator = undefined,
+            .scopes = undefined,
             .env_map = env_map,
         };
 
         var scopes = try allocator.create(ScopeStack);
-        scopes.* = ScopeStack.init(allocator);
+        scopes.* = .init(allocator, .main);
+        try scopes.log(@src().fn_name ++ ": init", .{});
         errdefer {
             scopes.deinit();
             allocator.destroy(scopes);
             allocator.destroy(bridge);
         }
-        try scopes.pushFrame(.{});
+        try scopes.pushFrame(
+            @src().fn_name,
+            .initForwardContext(executeOptions.forward_context),
+        );
+        try scopes.pushFrame(@src().fn_name, try .initSingleNew(allocator));
 
         const evaluator = Evaluator.init(allocator, path, CommandExecutor{
             .context = bridge,
@@ -93,7 +97,6 @@ pub const ScriptExecutor = struct {
 
     pub fn deinit(self: *ScriptExecutor) void {
         self.scopes.deinit();
-        self.allocator.destroy(self.scopes);
         if (self.command_bridge) |bridge| {
             self.allocator.destroy(bridge);
         }
@@ -132,38 +135,70 @@ pub const ScriptExecutor = struct {
         previous.deinit();
     }
 
-    pub fn wireCommandBridge(self: *ScriptExecutor) void {
+    pub fn wireCommandBridge(self: *ScriptExecutor, scopes: *ScopeStack) void {
         if (self.command_bridge) |bridge| {
             bridge.evaluator = &self.evaluator;
+            bridge.scopes = scopes;
         }
     }
 
+    fn forwardHandleOutputIfProcessHandle(value: *interpreter.Value, options: ExecuteOptions) !?command_runner.ExitCode {
+        switch (value.*) {
+            .array => |*array| {
+                const items = try array.get();
+                for (items) |item| {
+                    var copy = item;
+                    _ = try forwardHandleOutputIfProcessHandle(&copy, options);
+                }
+            },
+            .process_handle => |*handle| {
+                try utils.forwardHandleOutput(handle, options.stdout, options.stderr);
+                if (!handle.status.ok) {
+                    return handle.status.exit_code orelse .fromProcess(1);
+                }
+            },
+            else => {},
+        }
+
+        return null;
+    }
+
+    fn getExitCode(value: *interpreter.Value) ?command_runner.ExitCode {
+        switch (value.*) {
+            .process_handle => |*handle| {
+                if (!handle.status.ok) {
+                    return handle.status.exit_code orelse .fromProcess(1);
+                }
+            },
+            else => {},
+        }
+
+        return null;
+    }
+
     pub fn execute(self: *ScriptExecutor, script: ast.Script, options: ExecuteOptions) !command_runner.ExitCode {
+        try self.scopes.pushFrame(@src().fn_name, .initForwardContext(options.forward_context));
+        const stderr = self.scopes.getForwardContext().stderr.materialized.writer;
+
         for (script.statements) |stmt| {
             const maybe_value = self.evaluator.runStatement(self.scopes, stmt) catch |err| {
-                try self.renderEvaluatorError(options.stderr, options.script_path, stmt.span(), err);
+                try self.renderEvaluatorError(stderr, options.script_path, stmt.span(), err);
                 return .fromProcess(1);
             };
 
             if (maybe_value) |value| {
                 var owned = value;
-                var consumed = false;
-                defer if (!consumed) owned.deinit(self.allocator);
-
-                switch (owned) {
-                    .process_handle => |*handle| {
-                        try utils.forwardHandleOutput(handle, options.stdout, options.stderr);
-                        if (!handle.status.ok) {
-                            const code: command_runner.ExitCode = handle.status.exit_code orelse .fromProcess(1);
-                            handle.deinit();
-                            consumed = true;
-                            return code;
-                        }
-                    },
-                    else => {},
+                // const code = try forwardHandleOutputIfProcessHandle(
+                const code = getExitCode(&owned);
+                if (code) |the_code| {
+                    if (the_code == .success) {} else return the_code;
                 }
+
+                owned.deinitMain();
             }
         }
+
+        try self.scopes.popFrame(@src().fn_name);
 
         return .success;
     }
@@ -198,5 +233,5 @@ fn runWithEnvMap(
         patched[idx].env_map = bridge.env_map;
     }
 
-    return bridge.runner.runPipeline(bridge.evaluator, patched);
+    return bridge.runner.runPipeline(bridge.evaluator, bridge.scopes, patched);
 }

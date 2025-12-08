@@ -1,0 +1,24 @@
+# streaming.rn
+
+// const string_stream = Stream(String)
+//
+// string_stream >> "server.log" &
+//
+// echo "hello" | cat >> "server.log"
+//
+// ...
+//
+// string_stream.next "log entry"
+
+// for (.{
+//   echo "one",
+//   echo "two",
+//   3,
+// }) |item| {
+//   echo "${item}"
+// }
+
+// tail "-f" "server.log"
+
+echo "hello" | cat
+

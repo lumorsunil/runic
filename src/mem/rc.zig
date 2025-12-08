@@ -1,9 +1,29 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const rainbow = @import("../rainbow.zig");
 
-pub const RCError = Allocator.Error || error{ NotAllocated, InvalidRef };
+pub const RCError =
+    Allocator.Error ||
+    std.Io.Writer.Error ||
+    error{
+        NotAllocated,
+        InvalidRef,
+    };
 
 const log_enabled = false;
+
+const prefix_color = rainbow.beginColor(.yellow);
+const prefix_ref_color = rainbow.beginColor(.orange);
+const init_color = rainbow.beginColor(.blue);
+const release_color = rainbow.beginColor(.green);
+const ref_color = rainbow.beginColor(.violet);
+const error_color = rainbow.beginColor(.red);
+const warn_color = rainbow.beginColor(.red);
+const end_color = rainbow.endColor();
+
+pub const RCInitOptions = struct {
+    label: ?[]const u8 = null,
+};
 
 pub fn RC(comptime T: type) type {
     return struct {
@@ -12,61 +32,120 @@ pub fn RC(comptime T: type) type {
         refs: usize = 0,
 
         pub const Ref = struct {
+            id: usize,
             rc: ?*RC(T),
+            options: RCInitOptions,
 
-            pub fn init(allocator: Allocator, value: T) RCError!Ref {
-                const rc = try RC(T).init(allocator, value);
-                return try rc.ref();
+            pub const RCType = RC(T);
+
+            pub fn init(allocator_: Allocator, value: T, options: RCInitOptions) RCError!Ref {
+                const rc = try RC(T).init(allocator_, value);
+                const ref_ = try rc.ref(options);
+                try ref_.log("{s}init{s}", .{ init_color, end_color });
+                return ref_;
             }
 
-            pub fn dupe(allocator: Allocator, value: T) RCError!Ref {
-                const rc = try RC(T).dupe(allocator, value);
-                return try rc.ref();
-            }
-
-            pub fn print(
-                allocator: Allocator,
-                comptime fmt: []const u8,
-                args: anytype,
-            ) RCError!Ref {
-                const rc = try RC(T).print(allocator, fmt, args);
-                return try rc.ref();
-            }
-
-            pub fn get(self: Ref) RCError!T {
-                if (self.rc) |rc| return rc.get();
-                return RCError.InvalidRef;
-            }
-
-            pub fn getPtr(self: Ref) RCError!*T {
-                if (self.rc) |rc| return rc.getPtr();
-                return RCError.InvalidRef;
-            }
-
-            pub fn ref(self: Ref) RCError!Ref {
-                if (self.rc) |rc| return rc.ref();
-                return RCError.InvalidRef;
-            }
-
-            pub fn release(self: *Ref) void {
+            pub fn deinit(self: *Ref, options: DeinitOptions) void {
                 if (self.rc) |rc| {
-                    rc.release();
+                    self.log("{s}release{s} (refs left before release: {})", .{ release_color, end_color, rc.refs }) catch {};
+                    rc.release(options);
                 } else {
-                    std.log.warn("RC: called release on already released RC.Ref", .{});
+                    self.log("{s}release called on already released RC.Ref{s}", .{ warn_color, end_color }) catch {};
                     return;
                 }
                 self.rc = null;
+            }
+
+            pub fn log(self: Ref, comptime fmt: []const u8, args: anytype) !void {
+                if (!log_enabled) return;
+
+                var stderr = std.fs.File.stderr().writer(&.{});
+                const writer = &stderr.interface;
+
+                if (self.options.label) |label| {
+                    try writer.print("{s}{?*}{s} (\"{s}\"):\n", .{ prefix_ref_color, self.rc, end_color, label });
+                    try writer.print(fmt, args);
+                } else {
+                    try writer.print("{s}{?*}{s} (id: {}):\n", .{ prefix_ref_color, self.rc, end_color, self.id });
+                    try writer.print(fmt, args);
+                }
+                try writer.writeByte('\n');
+                try writer.flush();
+            }
+
+            pub fn dupe(allocator_: Allocator, value: ConstSlice, options: RCInitOptions) RCError!Ref {
+                const rc = try RC(T).dupe(allocator_, value);
+                const ref_ = try rc.ref(options);
+                try ref_.log("{s}dupe{s}", .{ init_color, end_color });
+                return ref_;
+            }
+
+            pub fn print(
+                allocator_: Allocator,
+                comptime fmt: []const u8,
+                args: anytype,
+                options: RCInitOptions,
+            ) RCError!Ref {
+                const rc = try RC(T).print(allocator_, fmt, args);
+                const ref_ = try rc.ref(options);
+                try ref_.log("{s}print{s}", .{ init_color, end_color });
+                return ref_;
+            }
+
+            pub fn get(self: Ref) RCError!T {
+                const rc = self.rc orelse {
+                    self.log(@src().fn_name ++ " {s}InvalidRef{s}", .{ error_color, end_color }) catch {};
+                    return RCError.InvalidRef;
+                };
+                return rc.get();
+            }
+
+            pub fn getPtr(self: Ref) RCError!*T {
+                const rc = self.rc orelse {
+                    self.log(@src().fn_name ++ " {s}InvalidRef{s}", .{ error_color, end_color }) catch {};
+                    return RCError.InvalidRef;
+                };
+                return rc.getPtr();
+            }
+
+            pub fn ref(self: Ref, options: RCInitOptions) RCError!Ref {
+                const rc = self.rc orelse {
+                    self.log(@src().fn_name ++ " {s}InvalidRef{s}", .{ error_color, end_color }) catch {};
+                    return RCError.InvalidRef;
+                };
+
+                const ref_ = try rc.ref(options);
+                try self.log("{s}new ref{s} (source) (refs: {})", .{ ref_color, end_color, rc.refs });
+                try ref_.log("{s}new ref{s} (new)", .{ ref_color, end_color });
+                return ref_;
+            }
+
+            pub fn clone(self: Ref, options: RCInitOptions) RCError!Ref {
+                const rc = self.rc orelse {
+                    self.log(@src().fn_name ++ " {s}InvalidRef{s}", .{ error_color, end_color }) catch {};
+                    return RCError.InvalidRef;
+                };
+
+                const rc_clone = try rc.clone();
+                return try rc_clone.ref(options);
+            }
+
+            pub fn allocator(self: Ref) RCError!Allocator {
+                const rc = self.rc orelse {
+                    self.log(@src().fn_name ++ " {s}InvalidRef{s}", .{ error_color, end_color }) catch {};
+                    return RCError.InvalidRef;
+                };
+                return rc.allocator;
             }
         };
 
         pub fn init(allocator: Allocator, value: T) RCError!*RC(T) {
             const rcPtr = try allocator.create(RC(T));
-            if (log_enabled) std.log.debug("rc init: {*}", .{rcPtr});
-            rcPtr.* = try .initInner(allocator, value);
+            try rcPtr.initInner(allocator, value);
             return rcPtr;
         }
 
-        pub fn dupe(allocator: Allocator, value: T) RCError!*RC(T) {
+        pub fn dupe(allocator: Allocator, value: ConstSlice) RCError!*RC(T) {
             if (!isSlice) @compileError("Cannot dupe non-slice types");
             const duped = try allocator.dupe(@typeInfo(T).pointer.child, value);
             return try .init(allocator, duped);
@@ -84,15 +163,46 @@ pub fn RC(comptime T: type) type {
             return try .init(allocator, buffer);
         }
 
-        fn initInner(allocator: Allocator, value: T) RCError!RC(T) {
+        /// Will not clone the child.
+        pub fn clone(
+            self: *RC(T),
+        ) RCError!*RC(T) {
+            if (self.isPtrAllocated()) |ptr| return .init(self.allocator, ptr.*);
+            return RCError.NotAllocated;
+        }
+
+        fn initInner(self: *RC(T), allocator: Allocator, value: T) RCError!void {
             const ptr = try allocator.create(T);
             ptr.* = value;
 
-            return .{
+            self.* = .{
                 .allocator = allocator,
                 .ptr = ptr,
             };
+
+            try self.log(@src().fn_name ++ ": created {*}", .{ptr});
         }
+
+        pub fn log(self: *RC(T), comptime fmt: []const u8, args: anytype) !void {
+            if (!log_enabled) return;
+
+            var stderr = std.fs.File.stderr().writer(&.{});
+            const writer = &stderr.interface;
+
+            try writer.print("{s}{*}{s}:\n", .{ prefix_color, self, end_color });
+            try writer.print("  " ++ fmt, args);
+            try writer.writeByte('\n');
+            try writer.flush();
+        }
+
+        const isArrayList: bool = switch (@typeInfo(T)) {
+            .@"struct" => if (@hasField(T, "items")) brk: {
+                const field = std.meta.fieldInfo(T, .items);
+                const Elem_ = std.meta.Elem(field.type);
+                break :brk T == std.ArrayList(Elem_);
+            } else false,
+            else => false,
+        };
 
         const isSlice = brk: {
             switch (@typeInfo(T)) {
@@ -112,21 +222,114 @@ pub fn RC(comptime T: type) type {
             break :brk false;
         };
 
-        fn deinit(self: *RC(T)) void {
+        const Elem: ?type = brk: {
+            if (isSlice) {
+                break :brk std.meta.Elem(T);
+            } else if (isArrayList) {
+                break :brk std.meta.Elem(std.meta.fieldInfo(T, .items).type);
+            }
+
+            break :brk null;
+        };
+
+        const isElemDeinitable = if (Elem) |E| switch (@typeInfo(E)) {
+            .pointer, .@"struct", .@"union", .@"enum" => true,
+            else => false,
+        } else false;
+
+        const ConstSlice = if (Elem) |E| []const E else void;
+
+        pub const DeinitOptions = struct {
+            deinit_child: bool = true,
+            /// Custom deinit function for child value.
+            /// Needs to destroy `*T` as well.
+            deinit_child_fn: ?DeinitChildFn(T) = null,
+            /// Custom deinit function for array elements.
+            deinit_array_child_fn: if (Elem) |E| ?DeinitChildFn(E) else ?void = null,
+        };
+
+        pub fn DeinitChildFn(comptime Child: type) type {
+            return union(enum) {
+                with_allocator: *const fn (*Child, Allocator) void,
+                without_allocator: *const fn (*Child) void,
+
+                pub fn withAllocator(deinit_fn: *const fn (*Child, Allocator) void) @This() {
+                    return .{ .with_allocator = deinit_fn };
+                }
+
+                pub fn withoutAllocator(deinit_fn: *const fn (*Child) void) @This() {
+                    return .{ .without_allocator = deinit_fn };
+                }
+
+                pub fn call(self: @This(), child: *Child, allocator: Allocator) void {
+                    switch (self) {
+                        .with_allocator => |deinit_fn| deinit_fn(child, allocator),
+                        .without_allocator => |deinit_fn| deinit_fn(child),
+                    }
+                }
+            };
+        }
+
+        pub fn deinit(self: *RC(T), options: DeinitOptions) void {
+            self.log(@src().fn_name ++ " {{deinit_child: {}}}", .{options.deinit_child}) catch {};
+            if (options.deinit_array_child_fn) |deinit_fn| {
+                self.log("deinit_array_child_fn: {any}", .{deinit_fn}) catch {};
+            }
+            if (options.deinit_child) {
+                if (options.deinit_child_fn) |deinit_fn| {
+                    self.log("deinit_child_fn: {any}", .{deinit_fn}) catch {};
+                    deinit_fn.call(self.ptr.?, self.allocator);
+                } else {
+                    self.deinitChild(options);
+                }
+            }
+            self.ptr = null;
+            self.refs = 0;
+            self.allocator.destroy(self);
+        }
+
+        fn deinitChild(self: *RC(T), options: DeinitOptions) void {
+            self.log(@src().fn_name, .{}) catch {};
             if (self.isAllocated()) |ptr| {
-                if (std.meta.hasFn(T, "deinit")) {
+                if (isArrayList) {
+                    self.log(@src().fn_name ++ " array list", .{}) catch {};
+                    self.deinitArrayElements(ptr.items, options);
                     ptr.deinit(self.allocator);
+                } else if (callDeinitIfExists(self.allocator, ptr)) |_| {
+                    self.log(@src().fn_name ++ " struct with deinit", .{}) catch {};
                 } else if (isSlice) {
+                    self.log(@src().fn_name ++ " slice", .{}) catch {};
+                    self.deinitArrayElements(ptr.*, options);
                     self.allocator.free(ptr.*);
                 } else if (isPtrOne) {
+                    self.log(@src().fn_name ++ " pointer one", .{}) catch {};
                     self.allocator.destroy(ptr.*);
                 }
                 ptr.* = undefined;
                 self.allocator.destroy(ptr);
             }
-            self.ptr = null;
-            self.refs = 0;
-            self.allocator.destroy(self);
+        }
+
+        fn deinitArrayElements(
+            self: *RC(T),
+            items: [](Elem orelse void),
+            options: DeinitOptions,
+        ) void {
+            if (!isElemDeinitable) return;
+            for (items) |*item| self.deinitArrayElement(item, options);
+        }
+
+        fn deinitArrayElement(
+            self: *RC(T),
+            item: *(Elem orelse void),
+            options: DeinitOptions,
+        ) void {
+            if (options.deinit_array_child_fn) |deinit_fn| {
+                self.log("deinit_array_child_fn: {any}", .{deinit_fn}) catch {};
+                deinit_fn.call(item, self.allocator);
+            } else {
+                _ = callDeinitIfExists(self.allocator, item);
+            }
         }
 
         fn get(self: RC(T)) RCError!T {
@@ -139,18 +342,15 @@ pub fn RC(comptime T: type) type {
             return RCError.NotAllocated;
         }
 
-        fn release(self: *RC(T)) void {
+        fn release(self: *RC(T), options: DeinitOptions) void {
             if (self.isAllocated() == null) {
                 std.log.warn("RC: called release on non-allocated released RC ({*})", .{self});
                 return;
             }
             if (self.refs <= 1) {
-                if (log_enabled) std.log.debug("{*}: deinit", .{self});
-                self.deinit();
-            } else {
-                if (log_enabled) std.log.debug("{*}: releasing ref ({})", .{ self, self.refs });
-                self.refs -= 1;
+                self.deinit(options);
             }
+            self.refs -|= 1;
         }
 
         fn isAllocated(self: *RC(T)) ?*T {
@@ -161,25 +361,68 @@ pub fn RC(comptime T: type) type {
             return self.ptr;
         }
 
-        pub fn ref(self: *RC(T)) RCError!Ref {
-            if (self.isAllocated() == null) return RCError.NotAllocated;
+        pub fn ref(self: *RC(T), options: RCInitOptions) RCError!Ref {
+            if (self.isAllocated() == null) {
+                if (log_enabled) self.log("releasing ref error: NotAllocated", .{}) catch {};
+                return RCError.NotAllocated;
+            }
+            const id = self.refs;
             self.refs += 1;
             return .{
+                .id = id,
                 .rc = self,
+                .options = options,
             };
         }
     };
 }
 
+fn callDeinitIfExists(allocator: Allocator, deinitee: anytype) ?void {
+    const T: type = switch (@typeInfo(@TypeOf(deinitee))) {
+        .pointer => |pointer| brk: {
+            if (pointer.size == .one) break :brk pointer.child;
+            return null;
+        },
+        else => @TypeOf(deinitee),
+    };
+
+    if (std.meta.hasFn(T, "deinit")) {
+        const params = @typeInfo(@TypeOf(T.deinit)).@"fn".params;
+
+        const DeinitOptions = if (@hasDecl(T, "RCType")) T.RCType.DeinitOptions else void;
+
+        if (params.len == 3 and params[1].type == Allocator and params[2].type == DeinitOptions) {
+            return deinitee.deinit(allocator, .{});
+        } else if (params.len == 2 and params[1].type == DeinitOptions) {
+            return deinitee.deinit(.{});
+        } else if (params.len == 2 and params[1].type == Allocator) {
+            return deinitee.deinit(allocator);
+        } else if (params.len == 1) {
+            return deinitee.deinit();
+        } else comptime {
+            var errorMessage: []const u8 = "Unsupported deinit with more than 3 parameter. (self: " ++ @typeName(T) ++ ") Found ";
+
+            for (params, 0..) |param, i| {
+                errorMessage = errorMessage ++ @typeName(param.type orelse void);
+                if (i < params.len - 1) errorMessage = errorMessage ++ ", ";
+            }
+
+            @compileError(errorMessage);
+        }
+    }
+
+    return null;
+}
+
 test "RC ref get" {
     const testing = @import("std").testing;
-    const rc = try RC([]const u8).init(testing.allocator, "the string");
+    const rc = try RC([]u8).dupe(testing.allocator, "the string");
     try testing.expectEqual(0, rc.refs);
-    var ref = try rc.ref();
-    defer ref.release();
+    var ref = try rc.ref(.{});
+    defer ref.deinit(.{});
     try testing.expectEqual(1, rc.refs);
-    var ref2 = try rc.ref();
-    defer ref2.release();
+    var ref2 = try rc.ref(.{});
+    defer ref2.deinit(.{});
     try testing.expectEqual(2, rc.refs);
     const refGet = try ref.getPtr();
     const ref2Get = try ref2.getPtr();
@@ -191,21 +434,140 @@ test "RC ref get" {
 
 test "RC ref release" {
     const testing = @import("std").testing;
-    const rc = try RC([]const u8).init(testing.allocator, "the string");
-    var ref = try rc.ref();
-    ref.release();
+    const rc = try RC([]u8).dupe(testing.allocator, "the string");
+    var ref = try rc.ref(.{});
+    ref.deinit(.{});
 }
 
 test "RC ref release multiple" {
     const testing = @import("std").testing;
-    const rc = try RC([]const u8).init(testing.allocator, "the string");
-    var ref = try rc.ref();
-    var ref2 = try rc.ref();
+    const rc = try RC([]u8).dupe(testing.allocator, "the string");
+    var ref = try rc.ref(.{});
+    var ref2 = try rc.ref(.{});
     try testing.expectEqual(2, rc.refs);
-    ref.release();
+    ref.deinit(.{});
     try testing.expectEqual(null, ref.rc);
     try testing.expectEqual(1, rc.refs);
     try testing.expect(rc.isAllocated() != null);
-    ref2.release();
+    ref2.deinit(.{});
     try testing.expectEqual(null, ref2.rc);
+}
+
+test "RC ref deinit children" {
+    const testing = @import("std").testing;
+    var rcs = std.ArrayList(RC([]u8).Ref).empty;
+    defer rcs.deinit(testing.allocator);
+    try rcs.append(testing.allocator, try .dupe(testing.allocator, "the first string", .{}));
+    try rcs.append(testing.allocator, try .dupe(testing.allocator, "the second string", .{}));
+    try rcs.append(testing.allocator, try .dupe(testing.allocator, "the third string", .{}));
+    const rc = try RC([]RC([]u8).Ref).dupe(testing.allocator, rcs.items);
+    var ref = try rc.ref(.{});
+    var ref2 = try rc.ref(.{});
+    try testing.expectEqual(2, rc.refs);
+    ref.deinit(.{});
+    try testing.expectEqual(null, ref.rc);
+    try testing.expectEqual(1, rc.refs);
+    try testing.expect(rc.isAllocated() != null);
+    ref2.deinit(.{});
+    try testing.expectEqual(null, ref2.rc);
+}
+
+test "RC deinit uses deinit_child_fn with allocator" {
+    const testing = std.testing;
+
+    const Payload = struct {
+        freed: *bool,
+    };
+
+    const destroy = struct {
+        fn call(payload: *Payload, allocator: Allocator) void {
+            const freed_ptr = payload.*.freed;
+            freed_ptr.* = true;
+            allocator.destroy(payload);
+        }
+    }.call;
+
+    var freed = false;
+    const rc = try RC(Payload).init(testing.allocator, .{ .freed = &freed });
+    var ref = try rc.ref(.{});
+    ref.deinit(.{ .deinit_child_fn = .withAllocator(destroy) });
+
+    try testing.expect(freed);
+}
+
+test "RC deinit uses deinit_child_fn without allocator" {
+    const testing = std.testing;
+
+    const Payload = struct {
+        freed: *bool,
+        allocator: Allocator,
+    };
+
+    const destroy = struct {
+        fn call(payload: *Payload) void {
+            const freed_ptr = payload.*.freed;
+            freed_ptr.* = true;
+            payload.*.allocator.destroy(payload);
+        }
+    }.call;
+
+    var freed = false;
+    const rc = try RC(Payload).init(testing.allocator, .{
+        .freed = &freed,
+        .allocator = testing.allocator,
+    });
+    var ref = try rc.ref(.{});
+    ref.deinit(.{ .deinit_child_fn = .withoutAllocator(destroy) });
+
+    try testing.expect(freed);
+}
+
+test "RC deinit skips child when disabled" {
+    const testing = std.testing;
+
+    const Payload = struct {
+        freed: *bool,
+
+        fn deinit(self: *@This(), allocator: Allocator) void {
+            self.freed.* = true;
+            allocator.destroy(self);
+        }
+    };
+
+    var freed = false;
+    const rc = try RC(Payload).init(testing.allocator, .{ .freed = &freed });
+    var ref = try rc.ref(.{});
+    const payload_ptr = try ref.getPtr();
+    ref.deinit(.{ .deinit_child = false });
+
+    try testing.expectEqual(false, freed);
+    payload_ptr.deinit(testing.allocator);
+}
+
+test "RC deinit uses custom array child deinit" {
+    const testing = std.testing;
+
+    const Elem = struct {
+        freed: *bool,
+    };
+
+    const markFreed = struct {
+        fn call(elem: *Elem, allocator: Allocator) void {
+            const freed_ptr = elem.*.freed;
+            freed_ptr.* = true;
+            _ = allocator;
+        }
+    }.call;
+
+    var freed = [_]bool{ false, false, false };
+    const rc = try RC([]Elem).dupe(testing.allocator, &[_]Elem{
+        .{ .freed = &freed[0] },
+        .{ .freed = &freed[1] },
+        .{ .freed = &freed[2] },
+    });
+
+    var ref = try rc.ref(.{});
+    ref.deinit(.{ .deinit_array_child_fn = .withAllocator(markFreed) });
+
+    try testing.expectEqualSlices(bool, &[_]bool{ true, true, true }, freed[0..]);
 }

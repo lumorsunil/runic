@@ -1,12 +1,23 @@
 # test.rn
 
-if true {
-  echo "this will get echoed"
-  echo "yes it's true"
+const x = 5
+
+if x < 5 {
+  echo "x < 5"
+} else if x == 5 {
+  echo "x == 5"
+} else if x > 5 {
+  echo "x > 5"
 } else {
-  echo "this will get echoed"
-  echo "no, it's not true"
+  echo "shouldn't happen :)"
 }
+
+const y = {
+  const s = "hello"
+  echo "${s}"
+}
+
+echo "${y}"
 
 // var s = "hello" + ", world!" + 3
 // const e = echo "${s}"

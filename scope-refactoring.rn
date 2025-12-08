@@ -1,0 +1,81 @@
+# scope-refactoring.rn
+
+// {
+//   var s = "hello"
+//   echo "hello"
+//   echo "${s}"
+// }
+//
+// const p = {
+//   echo "hello"
+// }
+//
+// // const p = echo "hello"
+//
+// echo "p: ${p}"
+
+// fn Void hello() String {
+//   echo "hello: p: ${p}"
+// }
+//
+// fn String parseInt() ParseIntError!Int {
+//   const in = @stdin
+//   ...
+// }
+//
+// echo "5" | parseInt
+//
+// import "something_runnable.rn"
+// const lib = import "lib.rn"
+
+// fn String @() String
+
+const module = import "module.rn"
+
+// var s = "this is s now"
+
+// echo "${s}"
+
+module.module_fn
+
+// echo "${s}"
+
+// echo "${module}"
+
+var p = "this is p"
+
+fn hello() String {
+  echo "hello: p: ${p}"
+  p = "p is something else now"
+}
+
+if (2 < 3) {
+  echo "this is true"
+} else {
+  echo "this is false"
+}
+
+for (0..10) |i| {
+  echo "${i}"
+}
+
+const arr = .{ 1, "two", 2 }
+
+for (arr, 0..) |item, i| {
+  echo "${i}: ${item}"
+}
+
+// echo "p before hello: ${p}"
+const result = hello
+echo "${result}"
+// echo "p after hello: ${p}"
+
+// const p = hello
+//
+// echo "${p}"
+//
+// echo "${p.stdout}"
+// echo "${p.stderr}"
+// echo "${p.exitCode}"
+//
+//

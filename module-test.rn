@@ -1,0 +1,5 @@
+# module-test.rn
+
+const module = import "module.rn"
+
+module.module_fn

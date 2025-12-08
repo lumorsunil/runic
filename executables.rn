@@ -1,0 +1,14 @@
+# executables.rn
+
+# const echo = &!echo
+const !echo
+
+fn Void add(x: Int, y: Int) Int {
+  return x + y
+}
+
+const add5 = &add 5
+
+const echoWithGreeting = &echo "hello"
+echoWithGreeting ", world!"
+

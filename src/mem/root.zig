@@ -1,3 +1,4 @@
 pub const RC = @import("rc.zig").RC;
 pub const RCError = @import("rc.zig").RCError;
+pub const RCInitOptions = @import("rc.zig").RCInitOptions;
 pub const splitScalarByFn = @import("split.zig").splitScalarByFn;

@@ -74,12 +74,11 @@ pub fn runScript(
         return .success;
     }
 
-    const executeOptions = ScriptExecutor.ExecuteOptions{
-        .script_path = script.path,
-        .stdout = stdout,
-        .stderr = stderr,
-        .context = &context,
-    };
+    const executeOptions = ScriptExecutor.ExecuteOptions.init(
+        script.path,
+        .init(.init(stdout, .streaming), .init(stderr, .streaming)),
+        &context,
+    );
 
     entryDocument.script_executor = ScriptExecutor.initWithRunner(
         allocator,
@@ -98,8 +97,8 @@ pub fn runScript(
     var executor: *ScriptExecutor = undefined;
     if (entryDocument.script_executor) |*script_executor| executor = script_executor else return .{ .err = error.ExecutorNotDefined };
 
-    executor.wireCommandBridge();
-    try executor.reseedFromContext(&context);
+    executor.wireCommandBridge(entryDocument.script_executor.?.scopes);
+    // try executor.reseedFromContext(&context);
 
     return try executor.execute(script_ast, executeOptions);
 }
@@ -184,10 +183,10 @@ const StatementExpressionIterator = struct {
                 .expression => |body_expr| try self.cursor.appendExpr(body_expr),
                 .block => |block| try populateBlockExpr(&self.cursor, block),
             },
-            .for_stmt => |for_stmt| {
-                try self.cursor.appendStatements(for_stmt.body.statements);
-                try self.cursor.appendExpressions(for_stmt.sources);
-            },
+            // .for_stmt => |for_stmt| {
+            //     try self.cursor.appendStatements(for_stmt.body.statements);
+            //     try self.cursor.appendExpressions(for_stmt.sources);
+            // },
             .while_stmt => |while_stmt| {
                 try self.cursor.appendStatements(while_stmt.body.statements);
                 try self.cursor.appendExpr(while_stmt.condition);
@@ -246,6 +245,10 @@ const StatementExpressionIterator = struct {
                 try cursor.appendExpr(catch_expr.subject);
             },
             .assignment => |assignment| try cursor.appendExpr(assignment.expr),
+            .for_expr => |for_expr| {
+                try self.cursor.appendStatements(for_expr.body.statements);
+                try self.cursor.appendExpressions(for_expr.sources);
+            },
         }
     }
 

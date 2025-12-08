@@ -207,6 +207,13 @@ pub const Literal = union(enum) {
 pub const IntegerLiteral = struct {
     text: []const u8,
     span: Span,
+
+    pub fn fromToken(tok: token.Token) IntegerLiteral {
+        return .{
+            .text = tok.lexeme,
+            .span = tok.span,
+        };
+    }
 };
 
 pub const FloatLiteral = struct {
@@ -243,6 +250,7 @@ pub const Expression = union(enum) {
     async_expr: AsyncExpr,
     await_expr: AwaitExpr,
     if_expr: IfExpr,
+    for_expr: ForExpr,
     match_expr: MatchExpr,
     try_expr: TryExpr,
     catch_expr: CatchExpr,
@@ -599,7 +607,6 @@ pub const Statement = union(enum) {
     fn_decl: FunctionDecl,
     error_decl: ErrorDecl,
     return_stmt: ReturnStmt,
-    for_stmt: ForStmt,
     while_stmt: WhileStmt,
     bash_block: BashBlock,
     expression: ExpressionStmt,
@@ -610,7 +617,7 @@ pub const Statement = union(enum) {
             .fn_decl => |fn_decl| fn_decl.span,
             .error_decl => |err| err.span,
             .return_stmt => |ret| ret.span,
-            .for_stmt => |loop_stmt| loop_stmt.span,
+            // .for_stmt => |loop_stmt| loop_stmt.span,
             .while_stmt => |loop_stmt| loop_stmt.span,
             .bash_block => |bash_block| bash_block.span,
             .expression => |expr_stmt| expr_stmt.span,
@@ -685,7 +692,7 @@ pub const ReturnStmt = struct {
     span: Span,
 };
 
-pub const ForStmt = struct {
+pub const ForExpr = struct {
     sources: []const *Expression,
     capture: CaptureClause,
     body: Block,

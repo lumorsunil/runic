@@ -1,0 +1,23 @@
+# recursive.rn
+
+var i = 0
+
+// i = i + 1
+//
+// echo "${i}"
+
+for (0..3) |i| {
+  echo "for loop iteration: ${i}"
+}
+
+fn myRecursiveFunction() String {
+  echo "running myRecursiveFunction"
+
+  i = i + 1
+
+  if (i < 3) {
+    myRecursiveFunction
+  }
+}
+
+myRecursiveFunction

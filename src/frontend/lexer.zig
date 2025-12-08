@@ -4,15 +4,19 @@ const token = @import("token.zig");
 const max_token_consumption_depth: usize = 1024;
 const MAX_CONTEXT_STACK: usize = 100;
 
-pub const Error = std.mem.Allocator.Error || std.Io.Writer.Error || error{
-    UnexpectedCharacter,
-    UnterminatedString,
-    UnterminatedBlockComment,
-    TokenConsumptionDepthExceeded,
-    ContextStackUnderflow,
-    IndexDidNotIncrease,
-    NewlineInStringNotAllowed,
-};
+pub const Error =
+    std.mem.Allocator.Error ||
+    std.Io.Writer.Error ||
+    std.process.GetEnvVarOwnedError ||
+    error{
+        UnexpectedCharacter,
+        UnterminatedString,
+        UnterminatedBlockComment,
+        TokenConsumptionDepthExceeded,
+        ContextStackUnderflow,
+        IndexDidNotIncrease,
+        NewlineInStringNotAllowed,
+    };
 
 pub const Lexer = struct {
     file: []const u8,
@@ -27,7 +31,7 @@ pub const Lexer = struct {
     last_context_len: ?usize = null,
     context_stack: std.ArrayList(Context),
     arena: std.heap.ArenaAllocator,
-    logging_enabled: bool = false,
+    logging_enabled: bool,
 
     const Context = union(enum) {
         root,
@@ -68,12 +72,19 @@ pub const Lexer = struct {
     };
 
     pub fn init(allocator_: std.mem.Allocator, file: []const u8, source: []const u8) !Lexer {
+        const logging_enabled_s = std.process.getEnvVarOwned(allocator_, "RUNIC_LOG_LEXER") catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => null,
+            else => return err,
+        };
+        defer if (logging_enabled_s) |le| allocator_.free(le);
+
         return .{
             .file = file,
             .arena = .init(allocator_),
             .source = source,
             .context_stack = try .initCapacity(allocator_, MAX_CONTEXT_STACK),
             .needs_trailing_newline = source.len > 0 and !endsWithNewline(source),
+            .logging_enabled = if (logging_enabled_s) |le| std.mem.eql(u8, le, "1") else false,
         };
     }
 
@@ -452,11 +463,16 @@ pub const Lexer = struct {
     fn lexDotLike(self: *Lexer) token.Token {
         const start = self.mark();
         _ = self.advance();
-        if (self.match('.')) {
+        const peeked = self.peek() orelse return self.finish(.startAt(start), .dot);
+        if (peeked == '.') {
+            _ = self.advance();
             if (self.match('.')) {
                 return self.finish(.startAt(start), .ellipsis);
             }
             return self.finish(.startAt(start), .range);
+        } else if (peeked == '{') {
+            _ = self.advance();
+            return self.finish(.startAt(start), .dot_l_brace);
         }
         return self.finish(.startAt(start), .dot);
     }
@@ -649,6 +665,30 @@ pub const Lexer = struct {
     }
 };
 
+pub const StreamSnapshot = struct {
+    stream: Stream,
+    used: bool = false,
+
+    pub fn init(stream: *Stream) !StreamSnapshot {
+        var sshot = stream.*;
+        sshot.lexer = try stream.lexer.snapshot();
+        sshot.peeked_tokens_buffer = try stream.peeked_tokens_buffer.clone(
+            stream.lexer.allocator(),
+        );
+
+        return .{
+            .stream = sshot,
+        };
+    }
+
+    pub fn deinit(self: *StreamSnapshot) void {
+        if (self.used) return;
+        self.used = true;
+        self.stream.peeked_tokens_buffer.deinit(self.stream.lexer.allocator());
+        self.stream.lexer.context_stack.deinit(self.stream.lexer.arena.child_allocator);
+    }
+};
+
 /// Stream provides a higher-level, pull-based view over the lexer so the
 /// parser can peek ahead without materializing the entire token list.
 pub const Stream = struct {
@@ -667,23 +707,22 @@ pub const Stream = struct {
         self.lexer.deinit();
     }
 
-    pub fn snapshot(self: *Stream) !Stream {
-        var sshot = self.*;
-        sshot.lexer = try self.lexer.snapshot();
-        sshot.peeked_tokens_buffer = try self.peeked_tokens_buffer.clone(self.lexer.allocator());
-        return sshot;
+    pub fn snapshot(self: *Stream) !StreamSnapshot {
+        return .init(self);
     }
 
     /// Invalidates the buffer in the snapshot
-    pub fn restore(self: *Stream, s: *Stream) !void {
-        const clone = try s.peeked_tokens_buffer.clone(self.lexer.allocator());
+    pub fn restore(self: *Stream, s: *StreamSnapshot) !void {
+        if (s.used) return;
+        const clone = try s.stream.peeked_tokens_buffer.clone(self.lexer.allocator());
         const lexer = &self.lexer;
-        try lexer.restore(&s.lexer);
+        try lexer.restore(&s.stream.lexer);
         self.peeked_tokens_buffer.deinit(self.lexer.allocator());
         const lexer_copy = lexer.*;
-        self.* = s.*;
+        self.* = s.stream;
         self.peeked_tokens_buffer = clone;
         self.lexer = lexer_copy;
+        s.used = true;
     }
 
     pub fn next(self: *Stream) Error!token.Token {
@@ -808,6 +847,7 @@ test "lexer restores succesfully" {
     var tokens: [expected_tags.len]token.Token = undefined;
 
     var originalSnapshot = try lexer.snapshot();
+    defer originalSnapshot.deinit();
 
     for (expected_tags[0..2], 0..) |tag, idx| {
         const tok = try lexer.next();
@@ -816,6 +856,7 @@ test "lexer restores succesfully" {
     }
 
     var snapshot = try lexer.snapshot();
+    defer snapshot.deinit();
 
     for (expected_tags[2..], 0..) |tag, idx| {
         const tok = try lexer.next();
@@ -849,6 +890,7 @@ test "lexer restores succesfully - peek" {
     _ = try lexer.peekSlice(3);
 
     var snapshot = try lexer.snapshot();
+    defer snapshot.deinit();
 
     _ = try lexer.peekSlice(5);
 
@@ -870,6 +912,7 @@ test "lexer restores succesfully - peek and next" {
     _ = try lexer.peekSlice(3);
 
     var snapshot = try lexer.snapshot();
+    defer snapshot.deinit();
 
     _ = try lexer.peekSlice(4);
     _ = try lexer.next();

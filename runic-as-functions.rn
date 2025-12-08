@@ -1,0 +1,14 @@
+# max.rn
+
+config {
+  @stdin : Int
+  @stdout : String
+  @args : Tuple(Int)
+}
+
+# other.rn
+
+const max = import &max.rn
+
+const result = echo "5" | parseInt | max 3
+echo "${result}" // "5"

@@ -232,6 +232,15 @@ fn renderExpressionAst(writer: *std.Io.Writer, expr: *const ast.Expression, leve
             try writer.writeAll("right: \n");
             try renderExpressionAst(writer, binary.right, level + 1);
         },
+        .assignment => |assignment| {
+            try writeIndent(writer, level);
+            try writer.writeAll("assignment @ ");
+            try printSpanInline(writer, assignment.span);
+            try writer.writeByte('\n');
+            try writeIndent(writer, level + 1);
+            try writer.print("{s} =\n", .{assignment.identifier.name});
+            try renderExpressionAst(writer, assignment.expr, level + 1);
+        },
         else => {
             const tag_name = @tagName(std.meta.activeTag(node));
             try writeIndent(writer, level);

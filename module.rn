@@ -1,0 +1,12 @@
+# module.rn
+
+var my_string = "this is my string"
+
+fn module_fn() String {
+  echo "hello from module"
+  echo "${my_string}"
+
+  // s = "this is s after module_fn"
+}
+
+module_fn

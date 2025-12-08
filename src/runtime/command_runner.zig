@@ -3,9 +3,14 @@ const tracing = @import("tracing.zig");
 const ast = @import("../frontend/ast.zig");
 const interpreter = @import("../interpreter/root.zig");
 const mem = @import("../mem/root.zig");
+const rainbow = @import("../rainbow.zig");
 
 const Tracer = tracing.Tracer;
 const TraceTopic = tracing.Topic;
+
+const logging_name = "EXECUTOR";
+const prefix_color = rainbow.beginColor(.orange);
+const end_color = rainbow.endColor();
 
 /// CommandRunner encapsulates the lower-level mechanics for spawning external
 /// programs and collecting their outputs. Higher-level runtime components feed
@@ -14,6 +19,7 @@ const TraceTopic = tracing.Topic;
 pub const CommandRunner = struct {
     allocator: std.mem.Allocator,
     tracer: ?*Tracer = null,
+    logging_enabled: bool = false,
 
     pub const Error = error{ EmptyCommand, PrimitiveValueInPipelineNotSupported } ||
         mem.RCError ||
@@ -21,6 +27,7 @@ pub const CommandRunner = struct {
         std.process.Child.SpawnError ||
         std.process.Child.WaitError ||
         std.fs.File.WriteError ||
+        std.Io.Reader.Error ||
         std.mem.Allocator.Error;
 
     pub const CommandType = union(enum) {
@@ -41,11 +48,31 @@ pub const CommandRunner = struct {
         return CommandRunner.initWithTracer(allocator, null);
     }
 
-    pub fn initWithTracer(allocator: std.mem.Allocator, tracer: ?*Tracer) CommandRunner {
+    pub fn initWithTracer(
+        allocator: std.mem.Allocator,
+        tracer: ?*Tracer,
+    ) CommandRunner {
+        const logging_enabled_s = std.process.getEnvVarOwned(allocator, "RUNIC_LOG_" ++ logging_name) catch null;
+        defer if (logging_enabled_s) |le| allocator.free(le);
+        const logging_enabled = if (logging_enabled_s) |le| std.mem.eql(u8, le, "1") else false;
+
         return .{
             .allocator = allocator,
             .tracer = tracer,
+            .logging_enabled = logging_enabled,
         };
+    }
+
+    pub fn log(self: *@This(), comptime fmt: []const u8, args: anytype) !void {
+        if (@hasField(@This(), "logging_enabled")) {
+            if (!self.logging_enabled) return;
+        }
+
+        var stderr = std.fs.File.stderr().writer(&.{});
+        const writer = &stderr.interface;
+
+        try writer.print("[{s}{*}{s}] ", .{ prefix_color, self, end_color });
+        try writer.print(fmt ++ "\n", args);
     }
 
     /// Runs `spec` synchronously, capturing stdout/stderr, and returns a
@@ -59,10 +86,13 @@ pub const CommandRunner = struct {
     /// from stage `n` becomes the stdin for stage `n + 1`, and every stage's
     /// outputs plus exit metadata are preserved for later inspection.
     pub fn runPipeline(
-        self: CommandRunner,
+        self: *CommandRunner,
         evaluator: *interpreter.Evaluator,
+        scopes: *interpreter.ScopeStack,
         specs: []const CommandSpec,
     ) Error!ProcessHandle {
+        try self.log("{s}", .{@src().fn_name});
+
         if (specs.len == 0) {
             return error.EmptyCommand;
         }
@@ -82,11 +112,13 @@ pub const CommandRunner = struct {
         self.tracePipelineStart(specs);
 
         for (specs, 0..) |spec, index| {
-            const stage = try self.runStage(evaluator, .{
+            // TODO: Fix streaming, each stage will be spawned in parallel, and each forward should happen in a streaming manner, the last stage should be using the current implementation
+            var stage_run_args: StageRunArgs = .{
                 .spec = spec,
                 .index = index,
                 .stdin_data = previous_stdout,
-            });
+            };
+            const stage = try self.runStage(evaluator, scopes, &stage_run_args, specs);
 
             if (index == 0) {
                 primary_pid = stage.pid;
@@ -120,17 +152,23 @@ pub const CommandRunner = struct {
     }
 
     fn runStage(
-        self: CommandRunner,
+        self: *CommandRunner,
         evaluator: *interpreter.Evaluator,
-        args: StageRunArgs,
+        scopes: *interpreter.ScopeStack,
+        args: *StageRunArgs,
+        specs: []const CommandSpec,
     ) Error!StageExecution {
+        const stdout_pipe = scopes.getStdoutPipe();
+
+        try self.log("{s}: {{stdout.is_streaming: {}}}", .{ @src().fn_name, stdout_pipe.is_streaming });
+
         if (args.spec.argv.len == 0) {
             return error.EmptyCommand;
         }
 
         return switch (args.spec.command_type) {
-            .executable => self.runStageExecutable(args),
-            .function => |fn_ref| self.runStageFunction(evaluator, fn_ref, args),
+            .executable => self.runStageExecutable(scopes, args, specs),
+            .function => |fn_ref| self.runStageFunction(evaluator, scopes, fn_ref, args),
             .value => Error.PrimitiveValueInPipelineNotSupported,
         };
     }
@@ -138,8 +176,9 @@ pub const CommandRunner = struct {
     fn runStageFunction(
         _: CommandRunner,
         evaluator: *interpreter.Evaluator,
+        scopes: *interpreter.ScopeStack,
         fn_ref: interpreter.Value.FunctionRef,
-        args: StageRunArgs,
+        args: *StageRunArgs,
     ) Error!StageExecution {
         // var scopes = interpreter.ScopeStack.init(self.allocator);
         // defer scopes.deinit();
@@ -186,7 +225,7 @@ pub const CommandRunner = struct {
         };
 
         // TODO: fix stdin wiring when implementing that for functions
-        const result: Result = if (evaluator.runFunction(fn_ref)) |value| .{
+        const result: Result = if (evaluator.runFunction(scopes, fn_ref)) |value| .{
             .success = value,
         } else |err| .{
             .err = err,
@@ -228,7 +267,14 @@ pub const CommandRunner = struct {
         return argv;
     }
 
-    fn runStageExecutable(self: CommandRunner, args: StageRunArgs) Error!StageExecution {
+    fn runStageExecutable(
+        self: *CommandRunner,
+        scopes: *interpreter.ScopeStack,
+        args: *StageRunArgs,
+        specs: []const CommandSpec,
+    ) Error!StageExecution {
+        try self.log("{s}: \"{s}\"", .{ @src().fn_name, try args.spec.argv[0].get() });
+
         const argv = try self.dupeArgs(args.spec.argv);
         defer self.allocator.free(argv);
         var child = std.process.Child.init(argv, self.allocator);
@@ -238,17 +284,29 @@ pub const CommandRunner = struct {
         child.cwd = args.spec.cwd;
         child.env_map = args.spec.env_map;
 
-        var stdout_buf = std.ArrayList(u8).empty;
-        defer stdout_buf.deinit(self.allocator);
-        var stderr_buf = std.ArrayList(u8).empty;
-        defer stderr_buf.deinit(self.allocator);
+        var stdout_buf_writer = std.Io.Writer.Allocating.init(self.allocator);
+        defer stdout_buf_writer.deinit();
+        var stderr_buf_writer = std.Io.Writer.Allocating.init(self.allocator);
+        defer stderr_buf_writer.deinit();
 
         const started_at = std.time.nanoTimestamp();
-        try child.spawn();
+        child.spawn() catch |err| switch (err) {
+            error.FileNotFound => {
+                std.log.err("command `{s}` not found", .{argv[0]});
+                return err;
+            },
+            else => {
+                std.log.err("error when trying to run command `{s}`: {}", .{ argv[0], err });
+                return err;
+            },
+        };
         errdefer {
             _ = child.kill() catch {};
         }
 
+        const pid_snapshot = child.id;
+
+        // TODO: Implement streaming input
         if (args.stdin_data) |input| {
             var stdin_file = child.stdin orelse unreachable;
             defer {
@@ -258,13 +316,65 @@ pub const CommandRunner = struct {
             try stdin_file.writeAll(input);
         }
 
-        const pid_snapshot = child.id;
-        try child.collectOutput(self.allocator, &stdout_buf, &stderr_buf, args.spec.max_output_bytes);
-        const term = try child.wait();
+        var forward_stdout = scopes.getStdoutPipe();
+        var forward_stderr = scopes.getStderrPipe();
+
+        forward_stdout.is_streaming = if (specs.len > 1) .non_streaming else forward_stdout.is_streaming;
+        forward_stderr.is_streaming = if (specs.len > 1) .non_streaming else forward_stderr.is_streaming;
+
+        var stdout_fwd_buffer: [512]u8 = undefined;
+        var stdout_file_reader = child.stdout.?.readerStreaming(&stdout_fwd_buffer);
+        const stdout_reader = &stdout_file_reader.interface;
+
+        var stderr_fwd_buffer: [512]u8 = undefined;
+        var stderr_file_reader = child.stdout.?.readerStreaming(&stderr_fwd_buffer);
+        const stderr_reader = &stderr_file_reader.interface;
+
+        var stdout_closed = false;
+        var stderr_closed = false;
+
+        const stdout_writer = if (forward_stdout.is_streaming == .streaming) forward_stdout.writer else &stdout_buf_writer.writer;
+        const stderr_writer = if (forward_stderr.is_streaming == .streaming) forward_stderr.writer else &stderr_buf_writer.writer;
+
+        try self.log("forward stdout: {}", .{forward_stdout.is_streaming});
+        try self.log("forward stderr: {}", .{forward_stderr.is_streaming});
+
+        while (true) {
+            if (child.term != null) break;
+            stdout_closed = try stream(stdout_reader, stdout_writer);
+            stderr_closed = try stream(stderr_reader, stderr_writer);
+
+            if (stdout_closed and stderr_closed) {
+                break;
+            }
+        }
+
+        const term = child.wait() catch |err| switch (err) {
+            error.FileNotFound => {
+                std.log.err("command `{s}` not found", .{argv[0]});
+                return err;
+            },
+            else => {
+                std.log.err("error when trying to run command `{s}`: {}", .{ argv[0], err });
+                return err;
+            },
+        };
         const finished_at = std.time.nanoTimestamp();
 
-        const stdout_owned = try stdout_buf.toOwnedSlice(self.allocator);
-        const stderr_owned = try stderr_buf.toOwnedSlice(self.allocator);
+        const stdout_owned = switch (forward_stdout.is_streaming) {
+            .streaming => try self.allocator.dupe(u8, ""),
+            .non_streaming => brk: {
+                try forward_stdout.writer.writeAll(stdout_buf_writer.written());
+                break :brk try stdout_buf_writer.toOwnedSlice();
+            },
+        };
+        const stderr_owned = switch (forward_stderr.is_streaming) {
+            .streaming => try self.allocator.dupe(u8, ""),
+            .non_streaming => brk: {
+                try forward_stderr.writer.writeAll(stderr_buf_writer.written());
+                break :brk try stderr_buf_writer.toOwnedSlice();
+            },
+        };
 
         return StageExecution{
             .pid = pid_snapshot,
@@ -274,6 +384,22 @@ pub const CommandRunner = struct {
             .stdout_owned = stdout_owned,
             .stderr_owned = stderr_owned,
         };
+    }
+
+    /// Returns true if stream was closed
+    fn stream(reader: *std.Io.Reader, writer: *std.Io.Writer) Error!bool {
+        const bytes_streamed = reader.stream(
+            writer,
+            .unlimited,
+        ) catch |err| switch (err) {
+            std.Io.Reader.StreamError.EndOfStream => return true,
+            else => return err,
+        };
+        if (bytes_streamed > 0) {
+            try writer.flush();
+        }
+
+        return false;
     }
 
     fn tracePipelineStart(self: CommandRunner, specs: []const CommandSpec) void {

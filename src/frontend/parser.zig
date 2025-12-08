@@ -15,6 +15,7 @@ pub const ParseError = error{
     StringInterpNotAllowed,
     StringInArithmeticExpressionNotAllowed,
     DuplicateStructDecl,
+    ForCapturesMustMatchSources,
 } || std.mem.Allocator.Error || lexer.Error;
 
 /// Parser consumes tokens from the streaming lexer and produces AST nodes.
@@ -230,17 +231,17 @@ pub fn Parser(
             return self.stream.peeked_tokens_buffer.items[0];
         }
 
-        fn takeSnapshot(self: *Self) ParseError!lexer.Stream {
+        fn takeSnapshot(self: *Self) ParseError!lexer.StreamSnapshot {
             const snapshot = try self.stream.snapshot();
             const next = try self.stream.peek();
-            try self.log("took snapshot at {?f}({?}) : {f}({})", .{ snapshot.current, if (snapshot.current) |c| c.span.start.offset else null, next, next.span.start.offset });
+            try self.log("took snapshot at {?f}({?}) : {f}({})", .{ snapshot.stream.current, if (snapshot.stream.current) |c| c.span.start.offset else null, next, next.span.start.offset });
             return snapshot;
         }
 
-        fn restoreSnapshot(self: *Self, snapshot: *lexer.Stream) ParseError!void {
+        fn restoreSnapshot(self: *Self, snapshot: *lexer.StreamSnapshot) ParseError!void {
             try self.stream.restore(snapshot);
             const next = try self.stream.peek();
-            try self.log("restored snapshot to {?f}({?}) : {f}({})", .{ snapshot.current, if (snapshot.current) |c| c.span.start.offset else null, next, next.span.start.offset });
+            try self.log("restored snapshot to {?f}({?}) : {f}({})", .{ snapshot.stream.current, if (snapshot.stream.current) |c| c.span.start.offset else null, next, next.span.start.offset });
         }
 
         fn currentTokenLocation(self: Self) ?token.Location {
@@ -276,7 +277,14 @@ pub fn Parser(
         }
 
         pub fn parseScript(self: *Self, path: []const u8) !ast.Script {
-            const breadcrumb = try self.createBreadcrumb("parseScript");
+            const logging_enabled = std.process.getEnvVarOwned(self.allocator, "RUNIC_LOG_PARSER") catch |err| switch (err) {
+                error.EnvironmentVariableNotFound => null,
+                else => return err,
+            };
+            defer if (logging_enabled) |le| self.allocator.free(le);
+            if (logging_enabled) |le| self.logging_enabled = std.mem.eql(u8, le, "1");
+
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
             defer breadcrumb.end();
 
             if (try getCachedAst(self.ctx, path)) |script| return script;
@@ -298,7 +306,7 @@ pub fn Parser(
         }
 
         pub fn parseSource(self: *Self, source: []const u8) !ast.Script {
-            const breadcrumb = try self.createBreadcrumb("parseSource");
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
             defer breadcrumb.end();
 
             self.clearExpectedTokens();
@@ -321,22 +329,10 @@ pub fn Parser(
         }
 
         fn parseExpression(self: *Self) ParseError!*ast.Expression {
-            const breadcrumb = try self.createBreadcrumb("parseExpression");
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
             defer breadcrumb.end();
 
             self.clearExpectedTokens();
-
-            // (a.b).c
-            //
-            // return switch (try self.oneOf(.{
-            //     parseMemberAccessExpression,
-            //     parseImportExpression,
-            //     parseIdentifierExpression,
-            //     parseIfExpression,
-            //     parsePrimaryExpression,
-            // })) {
-            //     inline else => |r| r,
-            // };
 
             const next = try self.peekToken();
 
@@ -344,11 +340,19 @@ pub fn Parser(
                 .kw_import => self.parseImportExpression(),
                 .identifier => self.parseIdentifierExpression(),
                 .kw_if => self.parseIfExpression(),
+                .kw_for => self.parseForExpression(),
                 else => {
                     if (try self.parseMaybeBinaryExpression()) |arith_expr| return arith_expr;
                     return self.parsePrimaryExpression();
                 },
             };
+        }
+
+        fn ParserPayload(comptime T: type) type {
+            const ReturnType = @typeInfo(T).@"fn".return_type orelse void;
+            const Payload = @typeInfo(ReturnType).error_union.payload;
+
+            return Payload;
         }
 
         // .{ parseInt, parseString } == .{ .@"0" = parseInt, .@"1" = parseString }
@@ -357,8 +361,7 @@ pub fn Parser(
             var fields: []const std.builtin.Type.UnionField = &.{};
 
             for (std.meta.fields(Parsers)) |field| {
-                const ReturnType = @typeInfo(field.type).@"fn".return_type orelse void;
-                const Payload = @typeInfo(ReturnType).error_union.payload;
+                const Payload = ParserPayload(field.type);
                 fields = fields ++ [_]std.builtin.Type.UnionField{
                     .{
                         .type = Payload,
@@ -384,7 +387,8 @@ pub fn Parser(
 
             inline for (std.meta.fields(@TypeOf(parsers))) |field| {
                 const parser = @field(parsers, field.name);
-                const snapshot = try self.takeSnapshot();
+                var snapshot = try self.takeSnapshot();
+                defer snapshot.deinit();
 
                 if (parser(self)) |result| {
                     return @unionInit(OneOf(@TypeOf(parsers)), field.name, result);
@@ -398,12 +402,12 @@ pub fn Parser(
         }
 
         fn parseMemberAccessExpression(self: *Self) ParseError!*ast.Expression {
-            const breadcrumb = try self.createBreadcrumb("parseMemberAccessExpression");
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
             defer breadcrumb.end();
         }
 
         fn parseIdentifierExpression(self: *Self) ParseError!*ast.Expression {
-            const breadcrumb = try self.createBreadcrumb("parseIdentifierExpression");
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
             defer breadcrumb.end();
 
             if (try self.parseMaybeBinaryExpression()) |expr| return expr;
@@ -543,24 +547,34 @@ pub fn Parser(
         };
 
         fn parseMaybeBinaryExpression(self: *Self) ParseError!?*ast.Expression {
-            const breadcrumb = try self.createBreadcrumb("parseMaybeBinaryExpression");
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
             defer breadcrumb.end();
 
             var snapshot = try self.takeSnapshot();
+            defer snapshot.deinit();
 
             var components = std.ArrayList(BinaryComponent).empty;
             defer components.deinit(self.allocator);
 
             var state = ArithmeticState.expr;
 
+            var next = try self.peekToken();
+
+            const abort_initial_tokens = [_]token.Tag{
+                .l_brace,
+                .dot_l_brace,
+            };
+
+            for (abort_initial_tokens) |tag| if (next.tag == tag) return null;
+
             while (true) : (state.advance()) {
-                const next = try self.peekToken();
+                next = try self.peekToken();
 
                 switch (state) {
                     .expr => {
                         switch (next.tag) {
                             .identifier => {
-                                const breadcrumbInner = try self.createBreadcrumb("PAE:identifier");
+                                const breadcrumbInner = try self.createBreadcrumb("PBE:identifier");
                                 defer breadcrumbInner.end();
                                 try components.append(self.allocator, .{
                                     .identifier = .fromToken(next),
@@ -575,14 +589,14 @@ pub fn Parser(
                                 continue;
                             },
                             .int_literal, .float_literal, .kw_true, .kw_false => {
-                                const breadcrumbInner = try self.createBreadcrumb("PAE:literal");
+                                const breadcrumbInner = try self.createBreadcrumb("PBE:literal");
                                 defer breadcrumbInner.end();
                                 try components.append(self.allocator, .{
                                     .literal = .fromToken(next),
                                 });
                             },
                             .string_start => {
-                                const breadcrumbInner = try self.createBreadcrumb("PAE:string_literal");
+                                const breadcrumbInner = try self.createBreadcrumb("PBE:string");
                                 defer breadcrumbInner.end();
                                 try components.append(self.allocator, .{
                                     .literal = .{ .string = try self.parseStringLiteral() },
@@ -595,13 +609,14 @@ pub fn Parser(
                     .op => {
                         switch (next.tag) {
                             .equal_equal, .bang_equal, .greater, .greater_equal, .less, .less_equal, .plus, .minus, .star, .slash, .percent, .kw_and, .kw_or => {
-                                const breadcrumbInner = try self.createBreadcrumb("PAE:binary_op");
+                                const breadcrumbInner = try self.createBreadcrumb("PBE:op");
                                 defer breadcrumbInner.end();
                                 try components.append(self.allocator, .{
                                     .op = token.Spanned(ast.BinaryOp).fromToken(next) orelse @panic("shouldn't happen :)"),
                                 });
                             },
                             else => {
+                                if (next.tag == .range) break;
                                 if (isExprTerminator(next.tag)) break;
                                 try self.restoreSnapshot(&snapshot);
                                 return null;
@@ -634,7 +649,7 @@ pub fn Parser(
             self: *Self,
             components: []const BinaryComponent,
         ) ParseError!*ast.Expression {
-            const breadcrumb = try self.createBreadcrumb("parseBinaryExpression");
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
             defer breadcrumb.end();
 
             if (components.len == 1) return try components[0].toExpression(self);
@@ -725,7 +740,7 @@ pub fn Parser(
         }
 
         fn parsePipeline(self: *Self) ParseError!*ast.Expression {
-            const breadcrumb = try self.createBreadcrumb("parsePipeline");
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
             defer breadcrumb.end();
 
             var stages = std.ArrayList(ast.PipelineStage).empty;
@@ -764,13 +779,13 @@ pub fn Parser(
 
         fn isExprTerminator(tag: token.Tag) bool {
             return switch (tag) {
-                .r_paren, .r_bracket, .r_brace, .comma, .pipe, .pipe_pipe, .amp_amp, .amp, .string_interp_end, .newline => true,
+                .r_paren, .r_bracket, .r_brace, .comma, .pipe, .pipe_pipe, .amp_amp, .amp, .string_interp_end, .newline, .l_brace, .range, .dot_l_brace => true,
                 else => false,
             };
         }
 
         fn parsePipelineStage(self: *Self) ParseError!ast.PipelineStage {
-            const breadcrumb = try self.createBreadcrumb("parsePipelineStage");
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
             defer breadcrumb.end();
 
             const identifier = try self.expectTokenTag(.identifier);
@@ -823,7 +838,7 @@ pub fn Parser(
         }
 
         pub fn parseImportExpression(self: *Self) ParseError!*ast.Expression {
-            const breadcrumb = try self.createBreadcrumb("parseImportExpression");
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
             defer breadcrumb.end();
 
             const start = try self.expectTokenTag(.kw_import);
@@ -839,7 +854,7 @@ pub fn Parser(
         }
 
         pub fn expectEnd(self: *Self) ParseError!void {
-            const breadcrumb = try self.createBreadcrumb("expectEnd");
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
             defer breadcrumb.end();
 
             self.skipNewlines();
@@ -848,7 +863,7 @@ pub fn Parser(
         }
 
         fn parseIfExpression(self: *Self) ParseError!*ast.Expression {
-            const breadcrumb = try self.createBreadcrumb("parseIfExpression");
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
             defer breadcrumb.end();
 
             const if_tok = try self.expect(.kw_if);
@@ -891,8 +906,129 @@ pub fn Parser(
             });
         }
 
+        // for (items) |item| {...}
+        // for (items, 0..) |item, i| {...}
+        fn parseForExpression(self: *Self) ParseError!*ast.Expression {
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+            defer breadcrumb.end();
+
+            const for_tok = try self.expect(.kw_for);
+            _ = try self.expect(.l_paren);
+            const sources = try self.parseForSources();
+            _ = try self.expect(.r_paren);
+            const capture = try self.parseCaptureClause();
+
+            if (capture.bindings.len != sources.len) return ParseError.ForCapturesMustMatchSources;
+
+            const body = try self.parseBlock();
+
+            return self.allocExpression(.{
+                .for_expr = .{
+                    .sources = sources,
+                    .capture = capture,
+                    .body = body,
+                    .span = for_tok.span.endAt(body.span),
+                },
+            });
+        }
+
+        fn parseForSources(self: *Self) ParseError![]const *ast.Expression {
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+            defer breadcrumb.end();
+
+            const sources = try self.parseList(.comma, parseForSource, .{});
+            return sources.payload;
+        }
+
+        // expr | 0.. | 1..4
+        fn parseForSource(self: *Self) ParseError!*ast.Expression {
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+            defer breadcrumb.end();
+
+            return try self.parseTry(parseRange) orelse self.parseExpression();
+        }
+
+        fn parseTry(
+            self: *Self,
+            parser: anytype,
+        ) ParseError!?ParserPayload(@TypeOf(parser)) {
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+            defer breadcrumb.end();
+
+            var snapshot = try self.takeSnapshot();
+            defer snapshot.deinit();
+
+            return parser(self) catch {
+                try self.restoreSnapshot(&snapshot);
+                return null;
+            };
+        }
+
+        // 0.. | 1..4
+        fn parseRange(self: *Self) ParseError!*ast.Expression {
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+            defer breadcrumb.end();
+
+            const range_terminators = [_]token.Tag{
+                .pipe,
+                .l_brace,
+                .r_paren,
+            };
+
+            const start = try self.parseExpression();
+            const dots = try self.expectTokenTag(.range);
+            const next = try self.peekToken();
+            const end: ?*ast.Expression = for (range_terminators) |term| {
+                if (next.tag == term) break null;
+            } else try self.parseExpression();
+            const end_span = if (end) |e| e.span() else dots.span;
+
+            return self.allocExpression(.{
+                .range = .{
+                    .start = start,
+                    .end = end,
+                    .inclusive_end = false,
+                    .span = start.span().endAt(end_span),
+                },
+            });
+        }
+
+        fn parseIntegerLiteral(self: *Self) ParseError!ast.IntegerLiteral {
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+            defer breadcrumb.end();
+
+            const integer = try self.expectTokenTag(.int_literal);
+            return .fromToken(integer);
+        }
+
+        fn parseArrayLiteralExpression(self: *Self) ParseError!*ast.Expression {
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+            defer breadcrumb.end();
+
+            _ = try self.expectTokenTag(.dot_l_brace);
+
+            const elements = try self.parseList(.comma, parseExpression, .{ .skipNewLines = true });
+            const array = try self.allocExpression(.{
+                .array = .{
+                    .elements = elements.payload,
+                    .span = elements.span,
+                },
+            });
+
+            _ = try self.expectTokenTag(.r_brace);
+
+            return array;
+        }
+
+        fn parseCaptureClause(self: *Self) ParseError!ast.CaptureClause {
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+            defer breadcrumb.end();
+
+            return try self.parseOptionalCaptureClause() orelse return self.failExpectedToken(null, .pipe);
+        }
+
         fn parseOptionalCaptureClause(self: *Self) ParseError!?ast.CaptureClause {
-            const breadcrumb = try self.createBreadcrumb("parseOptionalCaptureClause");
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
             defer breadcrumb.end();
 
             const next = try self.peekToken();
@@ -900,32 +1036,17 @@ pub fn Parser(
 
             _ = try self.nextToken(); // consume opening '|'
             const capture_start = next.span.start;
-
-            var bindings = std.ArrayList(*ast.BindingPattern).empty;
-            defer bindings.deinit(self.allocator);
-
-            while (true) {
-                const pattern = try self.parseBindingPattern();
-                try bindings.append(self.allocator, pattern);
-
-                const maybe_comma = try self.peekToken();
-                if (maybe_comma.tag == .comma) {
-                    _ = try self.nextToken();
-                    continue;
-                }
-                break;
-            }
-
+            const bindings = try self.parseList(.comma, parseBindingPattern, .{});
             const close_tok = try self.expect(.pipe);
-            const owned = try self.copyToArena(*ast.BindingPattern, bindings.items);
+
             return ast.CaptureClause{
-                .bindings = owned,
+                .bindings = bindings.payload,
                 .span = .{ .start = capture_start, .end = close_tok.span.end },
             };
         }
 
         fn parseBindingPattern(self: *Self) ParseError!*ast.BindingPattern {
-            const breadcrumb = try self.createBreadcrumb("parseBindingPattern");
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
             defer breadcrumb.end();
 
             // TODO: Support deconstructions
@@ -949,13 +1070,19 @@ pub fn Parser(
             return *const fn (*Self) ParseError!T;
         }
 
-        fn parseAndSkipLinesUntil(
+        const ParseAndSkipUntilOptions = struct {
+            skipNewLines: bool = false,
+        };
+
+        fn parseList(
             self: *Self,
-            comptime T: type,
             comptime delimiter: token.Tag,
-            parser: ParserFn(T),
-        ) ParseError!ast.Spanned([]const T) {
-            const breadcrumb = try self.createBreadcrumb("parseAndSkipLinesUntil");
+            parser: anytype,
+            options: ParseAndSkipUntilOptions,
+        ) ParseError!ast.Spanned([]const ParserPayload(@TypeOf(parser))) {
+            const T = ParserPayload(@TypeOf(parser));
+
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
             defer breadcrumb.end();
 
             const open = try self.peekToken();
@@ -963,7 +1090,38 @@ pub fn Parser(
             defer parsed.deinit(self.allocator);
 
             while (true) {
-                self.skipNewlines();
+                if (options.skipNewLines) self.skipNewlines();
+
+                try parsed.append(self.allocator, try parser(self));
+
+                const next = try self.peekToken();
+                if (next.tag != delimiter) {
+                    return .{
+                        .payload = try self.copyToArena(T, parsed.items),
+                        .span = .{ .start = open.span.start, .end = next.span.end },
+                    };
+                }
+                _ = try self.nextToken();
+            }
+        }
+
+        fn parseUntil(
+            self: *Self,
+            comptime delimiter: token.Tag,
+            parser: anytype,
+            options: ParseAndSkipUntilOptions,
+        ) ParseError!ast.Spanned([]const ParserPayload(@TypeOf(parser))) {
+            const T = ParserPayload(@TypeOf(parser));
+
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+            defer breadcrumb.end();
+
+            const open = try self.peekToken();
+            var parsed = std.ArrayList(T).empty;
+            defer parsed.deinit(self.allocator);
+
+            while (true) {
+                if (options.skipNewLines) self.skipNewlines();
                 const next = try self.peekToken();
 
                 if (next.tag == delimiter) {
@@ -985,18 +1143,18 @@ pub fn Parser(
             self: *Self,
             comptime end: token.Tag,
         ) ParseError!ast.Spanned([]const *ast.Statement) {
-            const breadcrumb = try self.createBreadcrumb("parseStatementsUntil");
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
             defer breadcrumb.end();
 
-            return try self.parseAndSkipLinesUntil(
-                *ast.Statement,
+            return try self.parseUntil(
                 end,
                 parseStatement,
+                .{ .skipNewLines = true },
             );
         }
 
         fn parseBlock(self: *Self) ParseError!ast.Block {
-            const breadcrumb = try self.createBreadcrumb("parseBlock");
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
             defer breadcrumb.end();
 
             const open = try self.expect(.l_brace);
@@ -1009,20 +1167,20 @@ pub fn Parser(
         }
 
         fn parseBlockExpression(self: *Self) ParseError!*ast.Expression {
-            const breadcrumb = try self.createBreadcrumb("parseBlockExpression");
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
             defer breadcrumb.end();
 
             const open = try self.expect(.l_brace);
             const statements = try self.parseStatementsUntil(.r_brace);
 
-            return ast.Block{
+            return self.allocExpression(.{ .block = ast.Block{
                 .statements = statements.payload,
                 .span = open.span.endAt(statements.span),
-            };
+            } });
         }
 
         fn parseStatement(self: *Self) ParseError!*ast.Statement {
-            const breadcrumb = try self.createBreadcrumb("parseStatement");
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
             defer breadcrumb.end();
 
             self.skipNewlines();
@@ -1054,7 +1212,7 @@ pub fn Parser(
         }
 
         fn consumeStatementTerminator(self: *Self) ParseError!void {
-            const breadcrumb = try self.createBreadcrumb("consumeStatementTerminator");
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
             defer breadcrumb.end();
 
             while (true) {
@@ -1070,7 +1228,7 @@ pub fn Parser(
         }
 
         fn parsePrimaryExpression(self: *Self) ParseError!*ast.Expression {
-            const breadcrumb = try self.createBreadcrumb("parsePrimaryExpression");
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
             defer breadcrumb.end();
 
             const expected_primary_tokens = [_]token.Tag{
@@ -1082,6 +1240,8 @@ pub fn Parser(
                 .float_literal,
                 .string_start,
                 .l_paren,
+                .l_brace,
+                .dot_l_brace,
             };
 
             const p = self.peekToken() catch {
@@ -1090,6 +1250,8 @@ pub fn Parser(
 
             if (p.tag == .string_start) return self.parseStringLiteralExpr();
 
+            var snapshot = try self.takeSnapshot();
+            defer snapshot.deinit();
             const tok = try self.nextToken();
             return switch (tok.tag) {
                 .identifier => self.allocExpression(.{
@@ -1114,6 +1276,14 @@ pub fn Parser(
                     const expr = try self.parseExpression();
                     _ = try self.expect(.r_paren);
                     break :blk expr;
+                },
+                .l_brace => blk: {
+                    try self.restoreSnapshot(&snapshot);
+                    break :blk try self.parseBlockExpression();
+                },
+                .dot_l_brace => blk: {
+                    try self.restoreSnapshot(&snapshot);
+                    break :blk try self.parseArrayLiteralExpression();
                 },
                 else => self.failExpectedTokens(tok.tag, &expected_primary_tokens),
             };
@@ -1242,7 +1412,7 @@ pub fn Parser(
         }
 
         fn parseStringLiteralWithoutInterp(self: *Self) ParseError!ast.Spanned([]const u8) {
-            const breadcrumb = try self.createBreadcrumb("parseStringLiteralWithoutInterp");
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
             defer breadcrumb.end();
 
             const stringLiteral = try self.parseStringLiteral();
@@ -1262,7 +1432,7 @@ pub fn Parser(
         }
 
         fn parseStringLiteral(self: *Self) ParseError!ast.StringLiteral {
-            const breadcrumb = try self.createBreadcrumb("parseStringLiteral");
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
             defer breadcrumb.end();
 
             const start_token = try self.expectTokenTag(.string_start);
@@ -1304,7 +1474,7 @@ pub fn Parser(
         }
 
         fn parseStringLiteralExpr(self: *Self) ParseError!*ast.Expression {
-            const breadcrumb = try self.createBreadcrumb("parseStringLiteralExpr");
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
             defer breadcrumb.end();
 
             return self.allocExpression(.{
@@ -1313,7 +1483,7 @@ pub fn Parser(
         }
 
         fn parseMaybeBinding(self: *Self) ParseError!?ast.BindingDecl {
-            const breadcrumb = try self.createBreadcrumb("parseMaybeBinding");
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
             defer breadcrumb.end();
 
             const next = try self.peekToken();
@@ -1324,7 +1494,7 @@ pub fn Parser(
         }
 
         fn parseBinding(self: *Self) ParseError!ast.BindingDecl {
-            const breadcrumb = try self.createBreadcrumb("parseBinding");
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
             defer breadcrumb.end();
 
             const constOrVar = try self.nextToken();
@@ -1347,7 +1517,7 @@ pub fn Parser(
         }
 
         fn parseMaybeTypeAnnotation(self: *Self) ParseError!?*ast.TypeExpr {
-            const breadcrumb = try self.createBreadcrumb("parseMaybeTypeAnnotation");
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
             defer breadcrumb.end();
 
             // TODO: Implement an actual parser for type expressions
@@ -1364,7 +1534,7 @@ pub fn Parser(
         }
 
         fn parseMaybeFn(self: *Self) ParseError!?ast.FunctionDecl {
-            const breadcrumb = try self.createBreadcrumb("parseMaybeFn");
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
             defer breadcrumb.end();
 
             const next = try self.peekToken();
@@ -1375,7 +1545,7 @@ pub fn Parser(
         }
 
         fn parseFn(self: *Self) ParseError!ast.FunctionDecl {
-            const breadcrumb = try self.createBreadcrumb("parseFn");
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
             defer breadcrumb.end();
 
             const start = try self.expectTokenTag(.kw_fn);
@@ -1399,7 +1569,7 @@ pub fn Parser(
         }
 
         fn parseMaybeTypeExpr(self: *Self) ParseError!?*ast.TypeExpr {
-            const breadcrumb = try self.createBreadcrumb("parseMaybeTypeExpr");
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
             defer breadcrumb.end();
 
             _ = try self.stream.consumeIf(.identifier);
@@ -1414,7 +1584,7 @@ pub fn Parser(
         }
 
         fn skipTypeExpression(self: *Self) ParseError!void {
-            const breadcrumb = try self.createBreadcrumb("skipTypeExpression");
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
             defer breadcrumb.end();
 
             while (true) {
@@ -1435,7 +1605,7 @@ pub fn Parser(
         }
 
         fn skipNestedStructure(self: *Self, comptime open: token.Tag) ParseError!void {
-            const breadcrumb = try self.createBreadcrumb("skipNestedStructure");
+            const breadcrumb = try self.createBreadcrumb(@src().fn_name);
             defer breadcrumb.end();
 
             const close = switch (open) {

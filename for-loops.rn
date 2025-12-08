@@ -1,0 +1,18 @@
+# for-loops.rn
+
+const items = .{ "one", 2, "three", 4.4 }
+for (items) |item| {
+  echo "${item}"
+}
+
+// const first_loop = for (0..10) |i| {
+//   printf "${i}"
+// }
+//
+// for (items, 0..) |item, i| {
+//   echo "${i}: ${item}"
+// }
+//
+// for (first_loop) |item| {
+//   echo "${item}"
+// }

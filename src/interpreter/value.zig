@@ -1,3 +1,5 @@
+//! Module containing Value that represents a value in runic runtime.
+
 const std = @import("std");
 const command_runner = @import("../runtime/command_runner.zig");
 const TypeExpr = @import("../frontend/ast.zig").TypeExpr;
@@ -16,33 +18,98 @@ pub const Value = union(enum) {
     integer: Integer,
     float: Float,
     string: String,
+    range: Range,
+    array: Array,
     function: FunctionRef,
     process_handle: ProcessHandle,
-    scope: *ScopeStack,
+    scope: ScopeRef,
 
-    pub const FunctionRef = struct {
+    pub const FunctionRef = mem.RC(FunctionRefInner).Ref;
+
+    const FunctionRefInner = struct {
         fn_decl: *const ast.FunctionDecl,
-        scope: *ScopeStack,
-        closure: *ScopeStack,
+        closure: ?*ScopeStack,
 
-        pub fn deinit(self: FunctionRef, allocator: std.mem.Allocator) void {
-            self.closure.deinit();
-            allocator.destroy(self.closure);
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            const closure = self.closure orelse return;
+            self.closure = null;
+            closure.deinit();
+            allocator.destroy(self);
+        }
+
+        pub fn deinitMain(self: *@This(), allocator: std.mem.Allocator) void {
+            const closure = self.closure orelse return;
+            self.closure = null;
+            closure.deinitMain();
+            allocator.destroy(self);
         }
     };
 
     pub const Integer = i64;
     pub const Float = f64;
-    pub const String = mem.RC([]const u8).Ref;
+    pub const String = mem.RC([]u8).Ref;
+    pub const Array = mem.RC(std.ArrayList(Value)).Ref;
+
+    pub const Range = struct {
+        start: Integer,
+        end: ?Integer,
+        inclusive_end: bool,
+
+        pub fn usizeStart(self: Range) !usize {
+            if (self.start < 0) return error.NegativeLength;
+            return @intCast(self.start);
+        }
+
+        pub fn usizeEnd(self: Range) !?usize {
+            const end_i64 = self.end orelse return null;
+            if (end_i64 < 0) return error.NegativeLength;
+            return @intCast(end_i64);
+        }
+
+        pub fn getLen(self: Range) !?usize {
+            const end = try self.usizeEnd() orelse return null;
+            const start = try self.usizeStart();
+            const inclusive: usize = if (self.inclusive_end) 1 else 0;
+            return end - start + inclusive;
+        }
+    };
+
+    pub const ScopeRef = mem.RC(ScopeStack).Ref;
 
     pub const Error = error{TypeMismatch};
 
     /// Releases any heap allocations and resets the value to `.void`.
-    pub fn deinit(self: *Value, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Value) void {
         switch (self.*) {
-            .string => |*ref| ref.release(),
+            .string => |*ref| ref.deinit(.{}),
             .process_handle => |*handle| handle.deinit(),
-            .function => |f| f.deinit(allocator),
+            .function => |*f| f.deinit(.{}),
+            .array => |*arr| arr.deinit(.{}),
+            .scope => |*scope| scope.deinit(.{
+                .deinit_child_fn = .withoutAllocator(ScopeStack.deinit),
+            }),
+            else => {},
+        }
+        self.* = .{ .void = {} };
+    }
+
+    /// Releases any heap allocations and resets the value to `.void`.
+    pub fn deinitMain(self: *Value) void {
+        switch (self.*) {
+            .string => |*ref| ref.deinit(.{}),
+            .process_handle => |*handle| handle.deinit(),
+            .function => |*f| f.deinit(.{
+                .deinit_child_fn = .withAllocator(FunctionRefInner.deinitMain),
+            }),
+            .array => |*array_ref| {
+                // <|:)--<
+                array_ref.deinit(.{
+                    .deinit_array_child_fn = .withoutAllocator(Value.deinitMain),
+                });
+            },
+            .scope => |*scope| scope.deinit(.{
+                .deinit_child_fn = .withoutAllocator(ScopeStack.deinitMain),
+            }),
             else => {},
         }
         self.* = .{ .void = {} };
@@ -51,11 +118,13 @@ pub const Value = union(enum) {
     /// Clones the value into a fresh allocation owned by `allocator`.
     pub fn clone(self: Value, allocator: std.mem.Allocator) !Value {
         return switch (self) {
-            .void, .boolean, .integer, .float, .function => self,
-            .string => |ref| .{ .string = try ref.ref() },
+            .void, .boolean, .integer, .float, .range => self,
+            .function => |ref| .{ .function = try ref.ref(.{}) },
+            .string => |ref| .{ .string = try ref.ref(.{}) },
+            .array => |ref| .{ .array = try ref.ref(.{}) },
             .process_handle => |handle| .{ .process_handle = try handle.clone(allocator) },
             // TODO: Investigate if we need to clone this (hint: everytime we use a Value in the evaluator, we seem to clone it and deinitialize)
-            .scope => self,
+            .scope => |scope| .{ .scope = try scope.ref(.{}) },
         };
     }
 
@@ -67,13 +136,35 @@ pub const Value = union(enum) {
         return snapshot;
     }
 
-    pub fn reassign(self: *Value, allocator: std.mem.Allocator, newValue: *Value) Error!void {
+    pub fn reassign(self: *Value, newValue: *Value) Error!void {
         if (std.meta.activeTag(self.*) != std.meta.activeTag(newValue.*)) return Error.TypeMismatch;
-        self.deinit(allocator);
+        self.deinit();
         self.* = newValue.move();
     }
 
     pub fn isNumeric(self: Value) bool {
         return self == .integer or self == .float;
+    }
+
+    pub fn format(self: Value, writer: *std.Io.Writer) !void {
+        switch (self) {
+            .void => try writer.writeAll("void"),
+            inline .boolean, .integer, .float => |v| try writer.print("{}", .{v}),
+            inline .string => |v| {
+                if (v.get()) |string| {
+                    try writer.print("{f}", .{std.json.fmt(string, .{})});
+                } else |err| {
+                    try writer.print("RCError:{}", .{err});
+                }
+            },
+            .range => |r| {
+                if (r.end) |end| return try writer.print("{}..{}", .{ r.start, end });
+                try writer.print("{}..", .{r.start});
+            },
+            .array => try writer.writeAll("[...]"),
+            .function => try writer.writeAll("fn"),
+            .process_handle => try writer.writeAll("handle"),
+            .scope => try writer.writeAll("module"),
+        }
     }
 };
