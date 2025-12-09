@@ -7,6 +7,7 @@ pub const ast = @import("frontend/ast.zig");
 pub const parser = @import("frontend/parser.zig");
 pub const diagnostics = @import("frontend/diagnostics.zig");
 pub const document = @import("frontend/document_store.zig");
+pub const DocumentStore = @import("document_store.zig").DocumentStore;
 pub const command_runner = @import("runtime/command_runner.zig");
 pub const bash_executor = @import("runtime/bash_executor.zig");
 pub const scheduler = @import("runtime/scheduler.zig");

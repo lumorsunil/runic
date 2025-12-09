@@ -10,9 +10,9 @@ const ScopeStack = interpreter.ScopeStack;
 const RuntimeValue = interpreter.Value;
 const command_runner = @import("../runtime/command_runner.zig");
 const CommandRunner = command_runner.CommandRunner;
-const DocumentStore = @import("../frontend/document_store.zig").DocumentStore;
 const BindingError = ScriptContext.BindingError;
 const rainbow = @import("../rainbow.zig");
+const DocumentStore = @import("../document_store.zig").DocumentStore;
 
 const span_color = rainbow.beginBgColor(.red) ++ rainbow.beginColor(.black);
 const end_color = rainbow.endColor();
@@ -61,7 +61,7 @@ pub const ScriptExecutor = struct {
         runner: *CommandRunner,
         env_map: ?*std.process.EnvMap,
         executeOptions: ExecuteOptions,
-        documentStore: *DocumentStore,
+        documentStore: DocumentStore,
     ) !ScriptExecutor {
         const bridge = try allocator.create(CommandBridge);
         bridge.* = .{
@@ -233,9 +233,9 @@ pub const ScriptExecutor = struct {
         span: ast.Span,
         exit_code: command_runner.ExitCode,
     ) !void {
-        const document = try self.evaluator.documentStore.requestDocument(span.start.file);
+        const source = try self.evaluator.document_store.getSource(span.start.file);
 
-        try logSpan(writer, span, document.source);
+        try logSpan(writer, span, source);
 
         switch (exit_code) {
             .success => return,

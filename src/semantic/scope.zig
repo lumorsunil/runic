@@ -1,9 +1,10 @@
 const std = @import("std");
 const ast = @import("../frontend/ast.zig");
 
+// TODO: add spans to the identifiers so that we can go to where they were defined
 pub const Scope = struct {
     bindings: std.StringArrayHashMapUnmanaged(Binding) = .empty,
-    children: std.ArrayList(Scope) = .empty,
+    children: std.ArrayList(*Scope) = .empty,
     parent: ?*Scope = null,
 
     pub const Error =
@@ -18,9 +19,7 @@ pub const Scope = struct {
     }
 
     pub fn initWithParent(parent: *Scope) Scope {
-        return .{
-            .parent = parent,
-        };
+        return .{ .parent = parent };
     }
 
     pub fn deinit(self: *Scope, allocator: std.mem.Allocator) void {
@@ -30,8 +29,10 @@ pub const Scope = struct {
     }
 
     pub fn addChild(self: *Scope, allocator: std.mem.Allocator) Error!*Scope {
-        try self.children.append(allocator, .initWithParent(self));
-        return &self.children.items[self.children.items.len - 1];
+        const child = try allocator.create(Scope);
+        child.* = .initWithParent(self);
+        try self.children.append(allocator, child);
+        return self.children.getLast();
     }
 
     pub fn lookup(self: *Scope, name: []const u8) Error!?*Binding {

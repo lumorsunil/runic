@@ -1,9 +1,14 @@
 # type-checker-test.rn
 
+const module = import "module.rn"
+
+module.module_fn
+
 var b = "this is b"
 const s = 5
 
 fn hello() Void {
+  
   b = 3
 }
 
@@ -13,6 +18,9 @@ fn hello() Void {
 }
 
 y = "hello"
+y = "hello ${name = "my name"}"
+
+echo "hello"
 
 a = 5
 c = 23

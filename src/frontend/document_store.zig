@@ -5,6 +5,7 @@ const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 const ScriptExecutor = @import("../interpreter/script_executor.zig").ScriptExecutor;
 const command_runner = @import("../runtime/command_runner.zig");
+const DocumentStore = @import("../document_store.zig").DocumentStore;
 
 const MAX_DOCUMENT_LEN = 4 * 1024 * 1024;
 
@@ -12,25 +13,25 @@ pub const Document = struct {
     path: []const u8,
     source: []const u8,
     ast: ?ast.Script = null,
-    parser: Parser,
+    parser: parser.Parser,
     script_executor: ?ScriptExecutor = null,
     exitCode: ?command_runner.ExitCode = null,
 };
 
 /// Made to be used by an arena allocator
-pub const DocumentStore = struct {
+pub const FrontendDocumentStore = struct {
     allocator: Allocator,
     arena: std.heap.ArenaAllocator,
     map: std.StringArrayHashMapUnmanaged(*Document) = .empty,
 
-    pub fn init(allocator: Allocator) DocumentStore {
+    pub fn init(allocator: Allocator) FrontendDocumentStore {
         return .{
             .allocator = allocator,
             .arena = .init(allocator),
         };
     }
 
-    pub fn deinit(self: *DocumentStore) void {
+    pub fn deinit(self: *FrontendDocumentStore) void {
         for (self.map.values()) |document| {
             if (document.script_executor) |*se| se.deinit();
             document.parser.deinit();
@@ -38,8 +39,50 @@ pub const DocumentStore = struct {
         self.arena.deinit();
     }
 
+    pub fn documentStore(self: *FrontendDocumentStore) DocumentStore {
+        return .{
+            .ptr = self,
+            .vtable = vtable,
+        };
+    }
+
+    const vtable = &DocumentStore.VTable{
+        .getSource = FrontendDocumentStore.getSource,
+        .getAst = FrontendDocumentStore.getAst,
+        .putAst = FrontendDocumentStore.putAst,
+        .getParser = FrontendDocumentStore.getParser,
+    };
+
+    pub fn getDocument(ptr: *anyopaque, path: []const u8) DocumentStore.Error!*Document {
+        const ctx: *FrontendDocumentStore = @ptrCast(@alignCast(ptr));
+        return ctx.requestDocument(path) catch |err| return switch (err) {
+            error.FileNotFound => DocumentStore.Error.DocumentNotFound,
+            else => DocumentStore.Error.GetFailed,
+        };
+    }
+
+    pub fn getSource(ptr: *anyopaque, path: []const u8) DocumentStore.Error![]const u8 {
+        const document = try getDocument(ptr, path);
+        return document.source;
+    }
+
+    pub fn getAst(ptr: *anyopaque, path: []const u8) DocumentStore.Error!?ast.Script {
+        const document = try getDocument(ptr, path);
+        return document.ast;
+    }
+
+    pub fn putAst(ptr: *anyopaque, path: []const u8, script: ast.Script) DocumentStore.Error!void {
+        const document = try getDocument(ptr, path);
+        document.ast = script;
+    }
+
+    pub fn getParser(ptr: *anyopaque, path: []const u8) DocumentStore.Error!*parser.Parser {
+        const document = try getDocument(ptr, path);
+        return &document.parser;
+    }
+
     pub fn requestDocument(
-        self: *DocumentStore,
+        self: *FrontendDocumentStore,
         path: []const u8,
     ) !*Document {
         const resolvedPath = try self.resolvePath(path);
@@ -52,12 +95,12 @@ pub const DocumentStore = struct {
         return entry.value_ptr.*;
     }
 
-    pub fn invalidate(self: *DocumentStore, path: []const u8) !void {
+    pub fn invalidate(self: *FrontendDocumentStore, path: []const u8) !void {
         const resolvedPath = try self.resolvePath(path);
         _ = self.map.swapRemove(resolvedPath);
     }
 
-    fn loadDocument(self: *DocumentStore, path: []const u8) !*Document {
+    fn loadDocument(self: *FrontendDocumentStore, path: []const u8) !*Document {
         const file = try std.fs.openFileAbsolute(path, .{});
         defer file.close();
         var buffer: [512]u8 = undefined;
@@ -68,13 +111,13 @@ pub const DocumentStore = struct {
         document.* = .{
             .path = path,
             .source = contentBuffer[0..bytesRead],
-            .parser = .init(self.allocator, self),
+            .parser = .init(self.allocator, self.documentStore()),
         };
 
         return document;
     }
 
-    pub fn resolvePath(self: *DocumentStore, path: []const u8) ![]const u8 {
+    pub fn resolvePath(self: *FrontendDocumentStore, path: []const u8) ![]const u8 {
         if (std.fs.path.isAbsolute(path)) return self.arena.allocator().dupe(u8, path);
         return std.fs.cwd().realpathAlloc(self.arena.allocator(), path) catch |err| {
             switch (err) {
@@ -87,23 +130,6 @@ pub const DocumentStore = struct {
         };
     }
 };
-
-pub const Parser = parser.Parser(DocumentStore, getCachedAst, putCachedAst, getSource);
-
-fn getCachedAst(self: *DocumentStore, path: []const u8) !?ast.Script {
-    const document = try self.requestDocument(path);
-    return document.ast;
-}
-
-fn putCachedAst(self: *DocumentStore, path: []const u8, script: ast.Script) !void {
-    const document = try self.requestDocument(path);
-    document.ast = script;
-}
-
-fn getSource(self: *DocumentStore, path: []const u8) ![]const u8 {
-    const document = try self.requestDocument(path);
-    return document.source;
-}
 
 pub fn resolveModulePath(
     allocator: Allocator,

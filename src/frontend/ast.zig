@@ -1,6 +1,7 @@
 const std = @import("std");
 const token = @import("token.zig");
 const semantic = @import("../semantic/root.zig");
+const resolveModulePath = @import("document_store.zig").resolveModulePath;
 
 pub const Span = token.Span;
 pub const Spanned = token.Spanned;
@@ -123,6 +124,7 @@ pub const TypeExpr = union(enum) {
     err: ErrorType,
     array: ArrayType,
     struct_type: StructType,
+    module: ModuleType,
     tuple: TupleType,
     function: FunctionType,
     integer: PrimitiveType,
@@ -197,6 +199,15 @@ pub const TypeExpr = union(enum) {
 
         pub fn format(_: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
             try writer.writeAll("<struct>");
+        }
+    };
+
+    pub const ModuleType = struct {
+        path: []const u8,
+        span: Span,
+
+        pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try writer.print("<module:{s}>", .{self.path});
         }
     };
 
@@ -697,6 +708,12 @@ pub const IfExpr = struct {
     pub const ElseBranch = union(enum) {
         block: Block,
         if_expr: *IfExpr,
+
+        pub fn span(self: ElseBranch) Span {
+            return switch (self) {
+                inline else => |s| s.span,
+            };
+        }
     };
 
     pub fn resolveType(
@@ -786,11 +803,19 @@ pub const ImportExpr = struct {
     span: Span,
 
     pub fn resolveType(
-        _: *@This(),
-        _: std.mem.Allocator,
+        self: *@This(),
+        allocator: std.mem.Allocator,
         _: *semantic.Scope,
     ) semantic.Scope.Error!?*TypeExpr {
-        return null;
+        const module_path = resolveModulePath(
+            allocator,
+            self.importer,
+            self.module_name,
+        ) catch return null;
+
+        const type_expr = try allocator.create(TypeExpr);
+        type_expr.* = .{ .module = .{ .path = module_path, .span = self.span } };
+        return type_expr;
     }
 };
 
@@ -840,6 +865,13 @@ pub const CommandPart = union(enum) {
     word: CommandWord,
     string: StringLiteral,
     expr: *Expression,
+
+    pub fn span(self: CommandPart) Span {
+        return switch (self) {
+            .expr => |expr| expr.span(),
+            inline else => |s| s.span,
+        };
+    }
 };
 
 pub const CommandWord = struct {

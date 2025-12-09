@@ -3,8 +3,7 @@ const symbols = @import("symbols.zig");
 const diag = @import("diagnostics.zig");
 const runic = @import("runic");
 const parseFile = @import("parser.zig").parseFile;
-const Parser = @import("parser.zig").Parser;
-const DocumentStore = @import("document.zig").DocumentStore;
+const DocumentStore = @import("document.zig").LspDocumentStore;
 
 const max_source_bytes: usize = 4 * 1024 * 1024;
 
@@ -100,9 +99,9 @@ pub const Workspace = struct {
         self.clearIndex();
         try self.addKeywordsToIndex();
         self.clearDiagnostics();
-        for (self.roots.items) |root| {
-            try self.scanRoot(root);
-        }
+        // for (self.roots.items) |root| {
+        //     try self.scanRoot(root);
+        // }
     }
 
     pub fn symbolSlice(self: *Workspace) []const symbols.Symbol {
@@ -183,7 +182,7 @@ pub const Workspace = struct {
         };
         defer self.allocator.free(contents);
         // var parser = runic.parser.Parser.init(self.allocator, contents);
-        var parser = Parser.init(self.allocator, self.documents);
+        var parser = runic.parser.Parser.init(self.allocator, self.documents.documentStore());
         defer parser.deinit();
         const script = try parseFile(self.allocator, &self.diagnostics, &parser, absolute_path) orelse return;
         try symbols.collectSymbols(self.allocator, detail, script, &self.index);

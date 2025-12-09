@@ -112,8 +112,10 @@
 - [x] didChange support, document diagnostics
 - [x] crashes (investigate that we do similar setup as run_script)
 - [x] type checker integration
+  - [x] type checking imports
 - [ ] bug: takes 100% cpu after a while
 - [ ] bug: stops working after a while, may be related to bug above
+- [ ] add support for document links?
 
 ## imports
 
@@ -144,8 +146,8 @@
 ## type checker
 
 - [x] basic scope structure and semantic checker in place
+- [x] imports
 - [ ] do we even need lazy types? how will it work?
-- [ ] implement more of this now, high prio because it's going to be so much work to redo potentially otherwise, also type checking is cool
 - [x] gather diagnostics foundation
 - [ ] fast reverse lookup to find correct scope of position for correct lsp context
   - store scope spans?

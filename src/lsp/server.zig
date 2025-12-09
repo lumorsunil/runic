@@ -25,7 +25,7 @@ pub const Server = struct {
     stdout_writer: std.fs.File.Writer,
     writer: *std.Io.Writer,
     workspace: workspace_mod.Workspace,
-    documents: document_mod.DocumentStore,
+    documents: document_mod.LspDocumentStore,
     initialized: bool = false,
     shutting_down: bool = false,
     log_enabled: bool = false,
@@ -53,8 +53,8 @@ pub const Server = struct {
             .reader = undefined,
             .stdout_writer = undefined,
             .writer = undefined,
-            .workspace = try workspace_mod.Workspace.init(allocator, undefined),
-            .documents = document_mod.DocumentStore.init(allocator),
+            .workspace = try .init(allocator, undefined),
+            .documents = undefined,
             .log_enabled = log_enabled,
         };
     }
@@ -65,6 +65,7 @@ pub const Server = struct {
     }
 
     pub fn initInterface(self: *Server) void {
+        self.documents = .init(self.allocator, &self.workspace);
         self.workspace.documents = &self.documents;
         self.stdin_reader = self.stdin_file.readerStreaming(&self.reader_buffer);
         self.reader = &self.stdin_reader.interface;
@@ -185,11 +186,13 @@ pub const Server = struct {
     ) !void {
         var docIt = self.documents.map.iterator();
         while (docIt.next()) |docEntry| {
-            if (!docEntry.value_ptr.shouldSendDiagnostics) continue;
-            docEntry.value_ptr.shouldSendDiagnostics = false;
+            const document = docEntry.value_ptr.*;
 
-            const diagnostics = docEntry.value_ptr.diagnostics.items;
-            const uri = try docEntry.value_ptr.uri(self.allocator);
+            if (!document.shouldSendDiagnostics) continue;
+            document.shouldSendDiagnostics = false;
+
+            const diagnostics = document.diagnostics.items;
+            const uri = try document.uri(self.allocator);
             const entry = try groups.getOrPut(uri);
 
             if (!entry.found_existing) {
@@ -197,7 +200,7 @@ pub const Server = struct {
             }
 
             try entry.value_ptr.diagnostics.appendSlice(self.allocator, diagnostics);
-            entry.value_ptr.version = docEntry.value_ptr.version;
+            entry.value_ptr.version = document.version;
         }
     }
 
@@ -212,7 +215,7 @@ pub const Server = struct {
             groups.deinit();
             self.workspace.clearDiagnostics();
             var docIt = self.documents.map.iterator();
-            while (docIt.next()) |entry| entry.value_ptr.clearDiagnostics(self.allocator);
+            while (docIt.next()) |entry| entry.value_ptr.*.clearDiagnostics(self.allocator);
         }
 
         // try self.groupWorkspaceDiagnostics(&groups);
@@ -271,8 +274,14 @@ pub const Server = struct {
     fn handleDidOpen(self: *Server, params: types.DidOpenTextDocumentParams) !void {
         const version = params.textDocument.version orelse 0;
         const path = try self.resolveUriPath(params.textDocument.uri);
-        errdefer self.allocator.free(path);
-        try self.documents.openOrReplace(params.textDocument.uri, path, params.textDocument.text, version, &self.workspace);
+        defer self.allocator.free(path);
+        try self.documents.openOrReplace(
+            params.textDocument.uri,
+            path,
+            params.textDocument.text,
+            version,
+            .parse_and_type_check,
+        );
     }
 
     fn handleDidChange(self: *Server, params: types.DidChangeTextDocumentParams) !void {

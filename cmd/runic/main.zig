@@ -4,7 +4,10 @@ const dispatch = @import("dispatch.zig").dispatch;
 const runic = @import("runic");
 
 pub fn main() !void {
-    const exit_code = try mainImpl();
+    const exit_code = mainImpl() catch |err| {
+        std.log.err("runic exited with error: {t}", .{err});
+        std.process.exit(1);
+    };
     if (exit_code != .success) {
         std.process.exit(exit_code.getErrorCode());
     }

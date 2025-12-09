@@ -6,8 +6,8 @@ const ScriptContext = runic.interpreter.ScriptContext;
 const ScriptExecutor = runic.interpreter.ScriptExecutor;
 const Tracer = runic.tracing.Tracer;
 const CommandRunner = runic.command_runner.CommandRunner;
-const DocumentStore = runic.document.DocumentStore;
-const Parser = runic.document.Parser;
+const FrontendDocumentStore = runic.document.FrontendDocumentStore;
+const Parser = runic.parser.Parser;
 const TypeChecker = runic.semantic.TypeChecker;
 const rainbow = runic.rainbow;
 const ast = runic.ast;
@@ -48,20 +48,25 @@ pub fn runScript(
         return .fromProcess(try printTokens(allocator, stdout, stderr, script.path));
     }
 
-    var documentStore = DocumentStore.init(allocator);
+    var documentStore = FrontendDocumentStore.init(allocator);
     defer documentStore.deinit();
     const entryDocument = try documentStore.requestDocument(script.path);
 
     const resolvedPath = try documentStore.resolvePath(script.path);
 
-    var script_ast = entryDocument.parser.parseScript(resolvedPath) catch |err| {
+    const script_ast = entryDocument.parser.parseScript(resolvedPath) catch |err| {
         handleParseScriptError(&entryDocument.parser, stderr, err) catch |err_| {
             std.log.err("Could not handle error: {}, Original error: {}", .{ err_, err });
         };
         return .fromProcess(1);
     };
 
-    parseImports(allocator, stderr, &documentStore, script_ast) catch return .fromProcess(1);
+    parseImports(
+        allocator,
+        stderr,
+        documentStore.documentStore(),
+        script_ast,
+    ) catch return .fromProcess(1);
 
     if (config.print_ast) {
         for (documentStore.map.values()) |document| {
@@ -77,10 +82,10 @@ pub fn runScript(
         return .success;
     }
 
-    var type_checker = TypeChecker.init(allocator, &script_ast);
+    var type_checker = TypeChecker.init(allocator, documentStore.documentStore());
     defer type_checker.deinit();
 
-    const type_checker_result = type_checker.typeCheck() catch |err| {
+    const type_checker_result = type_checker.typeCheck(resolvedPath) catch |err| {
         std.log.err("Type checker failed to run: {}", .{err});
         return .fromProcess(1);
     };
@@ -115,7 +120,7 @@ pub fn runScript(
         &runner,
         &env_map,
         executeOptions,
-        &documentStore,
+        documentStore.documentStore(),
     ) catch |err| {
         try stderr.print(
             "error: failed to initialize script executor: {s}\n",
@@ -292,7 +297,7 @@ const StatementExpressionIterator = struct {
 fn parseImports(
     allocator: Allocator,
     stderr: *std.Io.Writer,
-    documentStore: *DocumentStore,
+    documentStore: runic.DocumentStore,
     script: runic.ast.Script,
 ) !void {
     var it = try StatementExpressionIterator.init(allocator, script);
@@ -303,13 +308,14 @@ fn parseImports(
         switch (expr.*) {
             .import_expr => |import_expr| {
                 const module_path = try runic.document.resolveModulePath(
-                    documentStore.arena.allocator(),
+                    allocator,
                     import_expr.importer,
                     import_expr.module_name,
                 );
-                const importDocument = try documentStore.requestDocument(module_path);
-                const importScript = importDocument.parser.parseScript(importDocument.path) catch |err| {
-                    handleParseScriptError(&importDocument.parser, stderr, err) catch |err_| {
+                defer allocator.free(module_path);
+                const parser = try documentStore.getParser(module_path);
+                const importScript = parser.parseScript(module_path) catch |err| {
+                    handleParseScriptError(parser, stderr, err) catch |err_| {
                         std.log.err("Could not handle error: {}, Original error: {}", .{ err_, err });
                     };
                     return err;

@@ -1,0 +1,6 @@
+fn Void runic_file(one: String, two: Int) Void {
+  const greeting = "hello"
+}
+
+const runic_file_result = runic_file "one" 2
+runic_file_result.greeting

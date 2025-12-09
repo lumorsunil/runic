@@ -4,8 +4,8 @@ const token = @import("../frontend/token.zig");
 const command_runner = @import("../runtime/command_runner.zig");
 const Value = @import("value.zig").Value;
 const ScopeStack = @import("scope.zig").ScopeStack;
-const Parser = @import("../frontend/document_store.zig").Parser;
-const DocumentStore = @import("../frontend/document_store.zig").DocumentStore;
+const Parser = @import("../frontend/parser.zig").Parser;
+const DocumentStore = @import("../document_store.zig").DocumentStore;
 const Document = @import("../frontend/document_store.zig").Document;
 const resolveModulePath = @import("../frontend/document_store.zig").resolveModulePath;
 const ScriptExecutor = @import("script_executor.zig").ScriptExecutor;
@@ -33,13 +33,14 @@ pub const Evaluator = struct {
     executor: CommandExecutor,
     /// Refers to the outermost context
     executeOptions: ScriptExecutor.ExecuteOptions,
-    documentStore: *DocumentStore,
+    document_store: DocumentStore,
     logging_enabled: bool,
 
     pub const Error = std.mem.Allocator.Error ||
         ScopeStack.Error ||
         CommandExecutor.Error ||
         ScriptContext.BindingError ||
+        DocumentStore.Error ||
         Value.Error ||
         std.fmt.ParseIntError ||
         std.fmt.ParseFloatError ||
@@ -80,7 +81,7 @@ pub const Evaluator = struct {
         path: []const u8,
         executor: CommandExecutor,
         executeOptions: ScriptExecutor.ExecuteOptions,
-        documentStore: *DocumentStore,
+        documentStore: DocumentStore,
     ) Evaluator {
         const logging_enabled_s = std.process.getEnvVarOwned(allocator, "RUNIC_LOG_" ++ logging_name) catch null;
         defer if (logging_enabled_s) |le| allocator.free(le);
@@ -91,7 +92,7 @@ pub const Evaluator = struct {
             .path = path,
             .executor = executor,
             .executeOptions = executeOptions,
-            .documentStore = documentStore,
+            .document_store = documentStore,
             .logging_enabled = logging_enabled,
         };
     }
@@ -404,8 +405,8 @@ pub const Evaluator = struct {
         }
 
         const span = expr.span();
-        const document = try self.documentStore.requestDocument(span.start.file);
-        var lineIt = std.mem.splitScalar(u8, document.source, '\n');
+        const source = try self.document_store.getSource(span.start.file);
+        var lineIt = std.mem.splitScalar(u8, source, '\n');
         var i: usize = 0;
         while (lineIt.next()) |line| : (i += 1) {
             if (i >= span.start.line -| 3 and i <= span.end.line +| 3) {
@@ -492,9 +493,8 @@ pub const Evaluator = struct {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logEvaluationTrace(@src().fn_name);
 
-        const document = try self.getCachedDocument(import.importer, import.module_name);
-
-        const script_ast = document.ast orelse return error.DocumentNotParsed;
+        const module_path = try resolveModulePath(self.allocator, import.importer, import.module_name);
+        const script_ast = try self.document_store.getAst(module_path) orelse return error.DocumentNotParsed;
 
         try scopes.pushFrame(@src().fn_name, .initBlocking());
         try scopes.pushFrame(@src().fn_name, try .initSingleNew(self.allocator));
@@ -1081,11 +1081,11 @@ pub const Evaluator = struct {
     fn getCachedDocument(self: *Evaluator, importer: []const u8, moduleName: []const u8) Error!*Document {
         const path = try resolveModulePath(self.allocator, importer, moduleName);
         defer self.allocator.free(path);
-        return try self.documentStore.requestDocument(path);
+        return try self.document_store.requestDocument(path);
     }
 
     fn getCurrentDocument(self: *Evaluator) Error!*Document {
-        return try self.documentStore.requestDocument(self.path);
+        return try self.document_store.requestDocument(self.path);
     }
 
     fn evaluatePipeline(

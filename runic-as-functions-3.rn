@@ -1,0 +1,3 @@
+fn @main
+fn ?String @(...[]String) Byte!?String
+fn String @(one: String, two: Int) String
