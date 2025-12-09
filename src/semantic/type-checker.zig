@@ -14,7 +14,7 @@ pub const TypeChecker = struct {
     arena: std.heap.ArenaAllocator,
     diagnostics: std.ArrayList(Diagnostic) = .empty,
     logging_enabled: bool,
-    document_store: DocumentStore,
+    document_store: *DocumentStore,
     modules: std.StringArrayHashMapUnmanaged(*Scope),
 
     pub const Error = Scope.Error ||
@@ -77,7 +77,7 @@ pub const TypeChecker = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
-        document_store: DocumentStore,
+        document_store: *DocumentStore,
     ) TypeChecker {
         const logging_enabled_s = std.process.getEnvVarOwned(allocator, "RUNIC_LOG_" ++ logging_name) catch null;
         defer if (logging_enabled_s) |le| allocator.free(le);

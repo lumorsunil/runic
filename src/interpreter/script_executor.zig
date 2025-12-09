@@ -61,7 +61,7 @@ pub const ScriptExecutor = struct {
         runner: *CommandRunner,
         env_map: ?*std.process.EnvMap,
         executeOptions: ExecuteOptions,
-        documentStore: DocumentStore,
+        documentStore: *DocumentStore,
     ) !ScriptExecutor {
         const bridge = try allocator.create(CommandBridge);
         bridge.* = .{

@@ -33,7 +33,7 @@ pub const Evaluator = struct {
     executor: CommandExecutor,
     /// Refers to the outermost context
     executeOptions: ScriptExecutor.ExecuteOptions,
-    document_store: DocumentStore,
+    document_store: *DocumentStore,
     logging_enabled: bool,
 
     pub const Error = std.mem.Allocator.Error ||
@@ -81,7 +81,7 @@ pub const Evaluator = struct {
         path: []const u8,
         executor: CommandExecutor,
         executeOptions: ScriptExecutor.ExecuteOptions,
-        documentStore: DocumentStore,
+        documentStore: *DocumentStore,
     ) Evaluator {
         const logging_enabled_s = std.process.getEnvVarOwned(allocator, "RUNIC_LOG_" ++ logging_name) catch null;
         defer if (logging_enabled_s) |le| allocator.free(le);

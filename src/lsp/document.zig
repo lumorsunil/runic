@@ -10,6 +10,7 @@ const DocumentStore = runic.DocumentStore;
 
 pub const LspDocumentStore = struct {
     allocator: Allocator,
+    document_store: DocumentStore = .{ .vtable = vtable },
     map: std.StringHashMap(*Document),
     workspace: *workspace_mod.Workspace,
 
@@ -30,13 +31,6 @@ pub const LspDocumentStore = struct {
         self.map.deinit();
     }
 
-    pub fn documentStore(self: *LspDocumentStore) DocumentStore {
-        return .{
-            .ptr = self,
-            .vtable = vtable,
-        };
-    }
-
     const vtable = &DocumentStore.VTable{
         .getSource = LspDocumentStore.getSource,
         .getAst = LspDocumentStore.getAst,
@@ -44,11 +38,14 @@ pub const LspDocumentStore = struct {
         .getParser = LspDocumentStore.getParser,
     };
 
-    pub fn getDocument(ptr: *anyopaque, path: []const u8) DocumentStore.Error!*Document {
-        const ctx: *LspDocumentStore = @ptrCast(@alignCast(ptr));
-        const uri = ctx.resolveUri(path) catch return DocumentStore.Error.GetFailed;
-        defer ctx.allocator.free(uri);
-        return ctx.requestDocument(
+    pub fn getDocument(
+        doc_store: *DocumentStore,
+        path: []const u8,
+    ) DocumentStore.Error!*Document {
+        const self: *@This() = @fieldParentPtr("document_store", doc_store);
+        const uri = self.resolveUri(path) catch return DocumentStore.Error.GetFailed;
+        defer self.allocator.free(uri);
+        return self.requestDocument(
             uri,
             path,
             .open_and_parse_only,
@@ -56,33 +53,33 @@ pub const LspDocumentStore = struct {
             DocumentStore.Error.DocumentNotFound => return DocumentStore.Error.DocumentNotFound,
             else => DocumentStore.Error.GetFailed,
         };
-        // return ctx.get(uri) orelse return DocumentStore.Error.DocumentNotFound;
+        // return self.get(uri) orelse return DocumentStore.Error.DocumentNotFound;
     }
 
-    pub fn getSource(ptr: *anyopaque, path: []const u8) DocumentStore.Error![]const u8 {
-        const document = try getDocument(ptr, path);
+    pub fn getSource(doc_store: *DocumentStore, path: []const u8) DocumentStore.Error![]const u8 {
+        const document = try getDocument(doc_store, path);
         return document.text;
     }
 
-    pub fn getAst(ptr: *anyopaque, path: []const u8) DocumentStore.Error!?runic.ast.Script {
-        const document = try getDocument(ptr, path);
+    pub fn getAst(doc_store: *DocumentStore, path: []const u8) DocumentStore.Error!?runic.ast.Script {
+        const document = try getDocument(doc_store, path);
         return document.ast;
     }
 
     pub fn putAst(
-        ptr: *anyopaque,
+        doc_store: *DocumentStore,
         path: []const u8,
         script: runic.ast.Script,
     ) DocumentStore.Error!void {
-        const document = try getDocument(ptr, path);
+        const document = try getDocument(doc_store, path);
         document.ast = script;
     }
 
     pub fn getParser(
-        ptr: *anyopaque,
+        doc_store: *DocumentStore,
         path: []const u8,
     ) DocumentStore.Error!*runic.parser.Parser {
-        const document = try getDocument(ptr, path);
+        const document = try getDocument(doc_store, path);
         return if (document.parser) |*parser| parser else unreachable;
     }
 
@@ -136,7 +133,7 @@ pub const LspDocumentStore = struct {
         if (options.shouldRebuildSymbols()) {
             try document.rebuildSymbols(
                 self.allocator,
-                self.documentStore(),
+                &self.document_store,
                 self.workspace.describePath(document.path),
             );
         }
@@ -263,7 +260,7 @@ pub const LspDocumentStore = struct {
         self.allocator.free(text);
         try doc.rebuildSymbols(
             self.allocator,
-            self.documentStore(),
+            &self.document_store,
             workspace.describePath(doc.path),
         );
         try doc.reportTypeChecker(self.allocator, workspace);
@@ -357,7 +354,7 @@ const Document = struct {
     fn rebuildSymbols(
         self: *Document,
         allocator: Allocator,
-        document_store: DocumentStore,
+        document_store: *DocumentStore,
         detail: []const u8,
     ) !void {
         self.shouldSendDiagnostics = true;
@@ -382,7 +379,7 @@ const Document = struct {
     ) !void {
         var type_checker = runic.semantic.TypeChecker.init(
             allocator,
-            workspace.documents.documentStore(),
+            &workspace.documents.document_store,
         );
         defer type_checker.deinit();
         const result = type_checker.typeCheck(self.path) catch |err| switch (err) {

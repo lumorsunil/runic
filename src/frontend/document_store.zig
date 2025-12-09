@@ -22,6 +22,7 @@ pub const Document = struct {
 pub const FrontendDocumentStore = struct {
     allocator: Allocator,
     arena: std.heap.ArenaAllocator,
+    document_store: DocumentStore = .{ .vtable = vtable },
     map: std.StringArrayHashMapUnmanaged(*Document) = .empty,
 
     pub fn init(allocator: Allocator) FrontendDocumentStore {
@@ -39,13 +40,6 @@ pub const FrontendDocumentStore = struct {
         self.arena.deinit();
     }
 
-    pub fn documentStore(self: *FrontendDocumentStore) DocumentStore {
-        return .{
-            .ptr = self,
-            .vtable = vtable,
-        };
-    }
-
     const vtable = &DocumentStore.VTable{
         .getSource = FrontendDocumentStore.getSource,
         .getAst = FrontendDocumentStore.getAst,
@@ -53,31 +47,38 @@ pub const FrontendDocumentStore = struct {
         .getParser = FrontendDocumentStore.getParser,
     };
 
-    pub fn getDocument(ptr: *anyopaque, path: []const u8) DocumentStore.Error!*Document {
-        const ctx: *FrontendDocumentStore = @ptrCast(@alignCast(ptr));
-        return ctx.requestDocument(path) catch |err| return switch (err) {
+    pub fn getDocument(doc_store: *DocumentStore, path: []const u8) DocumentStore.Error!*Document {
+        const self: *FrontendDocumentStore = @fieldParentPtr("document_store", doc_store);
+        return self.requestDocument(path) catch |err| return switch (err) {
             error.FileNotFound => DocumentStore.Error.DocumentNotFound,
             else => DocumentStore.Error.GetFailed,
         };
     }
 
-    pub fn getSource(ptr: *anyopaque, path: []const u8) DocumentStore.Error![]const u8 {
-        const document = try getDocument(ptr, path);
+    pub fn getSource(doc_store: *DocumentStore, path: []const u8) DocumentStore.Error![]const u8 {
+        const document = try getDocument(doc_store, path);
         return document.source;
     }
 
-    pub fn getAst(ptr: *anyopaque, path: []const u8) DocumentStore.Error!?ast.Script {
-        const document = try getDocument(ptr, path);
+    pub fn getAst(doc_store: *DocumentStore, path: []const u8) DocumentStore.Error!?ast.Script {
+        const document = try getDocument(doc_store, path);
         return document.ast;
     }
 
-    pub fn putAst(ptr: *anyopaque, path: []const u8, script: ast.Script) DocumentStore.Error!void {
-        const document = try getDocument(ptr, path);
+    pub fn putAst(
+        doc_store: *DocumentStore,
+        path: []const u8,
+        script: ast.Script,
+    ) DocumentStore.Error!void {
+        const document = try getDocument(doc_store, path);
         document.ast = script;
     }
 
-    pub fn getParser(ptr: *anyopaque, path: []const u8) DocumentStore.Error!*parser.Parser {
-        const document = try getDocument(ptr, path);
+    pub fn getParser(
+        doc_store: *DocumentStore,
+        path: []const u8,
+    ) DocumentStore.Error!*parser.Parser {
+        const document = try getDocument(doc_store, path);
         return &document.parser;
     }
 
@@ -111,7 +112,7 @@ pub const FrontendDocumentStore = struct {
         document.* = .{
             .path = path,
             .source = contentBuffer[0..bytesRead],
-            .parser = .init(self.allocator, self.documentStore()),
+            .parser = .init(self.allocator, &self.document_store),
         };
 
         return document;

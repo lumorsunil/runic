@@ -3,7 +3,7 @@ const symbols = @import("symbols.zig");
 const diag = @import("diagnostics.zig");
 const runic = @import("runic");
 const parseFile = @import("parser.zig").parseFile;
-const DocumentStore = @import("document.zig").LspDocumentStore;
+const LspDocumentStore = @import("document.zig").LspDocumentStore;
 
 const max_source_bytes: usize = 4 * 1024 * 1024;
 
@@ -52,11 +52,11 @@ pub const Workspace = struct {
     roots: std.ArrayList([]const u8) = .empty,
     index: std.ArrayList(symbols.Symbol) = .empty,
     diagnostics: std.ArrayList(diag.Diagnostic) = .empty,
-    documents: *DocumentStore,
+    documents: *LspDocumentStore,
 
     const self_dirs = [_][]const u8{ "src", "examples", "tests" };
 
-    pub fn init(allocator: Allocator, documentStore: *DocumentStore) !Workspace {
+    pub fn init(allocator: Allocator, documentStore: *LspDocumentStore) !Workspace {
         var workspace = Workspace{
             .allocator = allocator,
             .documents = documentStore,

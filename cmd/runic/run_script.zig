@@ -64,7 +64,7 @@ pub fn runScript(
     parseImports(
         allocator,
         stderr,
-        documentStore.documentStore(),
+        &documentStore.document_store,
         script_ast,
     ) catch return .fromProcess(1);
 
@@ -82,7 +82,7 @@ pub fn runScript(
         return .success;
     }
 
-    var type_checker = TypeChecker.init(allocator, documentStore.documentStore());
+    var type_checker = TypeChecker.init(allocator, &documentStore.document_store);
     defer type_checker.deinit();
 
     const type_checker_result = type_checker.typeCheck(resolvedPath) catch |err| {
@@ -120,7 +120,7 @@ pub fn runScript(
         &runner,
         &env_map,
         executeOptions,
-        documentStore.documentStore(),
+        &documentStore.document_store,
     ) catch |err| {
         try stderr.print(
             "error: failed to initialize script executor: {s}\n",
@@ -297,7 +297,7 @@ const StatementExpressionIterator = struct {
 fn parseImports(
     allocator: Allocator,
     stderr: *std.Io.Writer,
-    documentStore: runic.DocumentStore,
+    documentStore: *runic.DocumentStore,
     script: runic.ast.Script,
 ) !void {
     var it = try StatementExpressionIterator.init(allocator, script);

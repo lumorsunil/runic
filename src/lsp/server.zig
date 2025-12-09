@@ -118,7 +118,7 @@ pub const Server = struct {
             .shutdown => {
                 self.shutting_down = true;
                 if (request.id) |id| try self.sendNullResult(id);
-                return true;
+                return false;
             },
             .exit => {
                 return false;

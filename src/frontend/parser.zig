@@ -26,7 +26,7 @@ const max_breadcrumbs = 32;
 pub const Parser = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
-    document_store: DocumentStore,
+    document_store: *DocumentStore,
     path: []const u8 = undefined,
     source: []const u8 = undefined,
     stream: lexer.Stream = undefined,
@@ -49,7 +49,7 @@ pub const Parser = struct {
     // pub fn init(allocator: std.mem.Allocator, source: []const u8) Parser {
     pub fn init(
         allocator: std.mem.Allocator,
-        document_store: DocumentStore,
+        document_store: *DocumentStore,
         // getCachedAst: *const fn (path: []const u8) ?ast.Script,
         // getSource: *const fn (path: []const u8) []const u8,
     ) Self {
