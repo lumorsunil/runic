@@ -4,6 +4,8 @@ const ast = @import("../frontend/ast.zig");
 const interpreter = @import("../interpreter/root.zig");
 const mem = @import("../mem/root.zig");
 const rainbow = @import("../rainbow.zig");
+const Stream = @import("../stream.zig").Stream;
+const StreamError = @import("../stream.zig").StreamError;
 
 const Tracer = tracing.Tracer;
 const TraceTopic = tracing.Topic;
@@ -177,7 +179,7 @@ pub const CommandRunner = struct {
         return switch (args.spec.command_type) {
             .executable => self.runStageExecutable(scopes, args, specs),
             .function => |fn_ref| self.runStageFunction(evaluator, scopes, fn_ref, args),
-            .value => Error.PrimitiveValueInPipelineNotSupported,
+            .value => |value| self.runValueAsStream(value, args),
         };
     }
 
@@ -240,6 +242,72 @@ pub const CommandRunner = struct {
         };
 
         const finished_at = std.time.nanoTimestamp();
+
+        const exitCode: ExitCode = switch (result) {
+            .success => .success,
+            .err => |err| .{ .err = err },
+        };
+
+        const stdout: []u8 = switch (result) {
+            .success => |f| f.stdout,
+            .err => &.{},
+        };
+        const stderr: []u8 = switch (result) {
+            .success => |f| f.stderr,
+            .err => &.{},
+        };
+
+        return .{
+            .pid = null,
+            .started_at_ns = started_at,
+            .finished_at_ns = finished_at,
+            .status = StageStatus.fromTerm(args.index, .{ .function = exitCode }),
+            // TODO: fix when implementing typed stdout for functions
+            .stdout_owned = stdout,
+            .stderr_owned = stderr,
+        };
+    }
+
+    fn runValueAsStream(
+        self: CommandRunner,
+        value: *const interpreter.Value,
+        args: *StageRunArgs,
+    ) Error!StageExecution {
+        const started_at = std.time.nanoTimestamp();
+
+        const Result = union(enum) {
+            success: interpreter.Evaluator.RunFunctionResult,
+            err: anyerror,
+        };
+
+        // TODO: fix stdin wiring when implementing that for functions
+        const value_stream = try Stream([]const u8).fromValue(self.allocator, value.*);
+        defer value_stream.deinit();
+
+        var alloc_writer = std.Io.Writer.Allocating.init(self.allocator);
+        defer alloc_writer.deinit();
+        var stream_error: ?StreamError = null;
+
+        while (true) switch (value_stream.next() catch |err| {
+            stream_error = err;
+            break;
+        } orelse continue) {
+            .completed => break,
+            .next => |string| try alloc_writer.writer.writeAll(string),
+        };
+
+        const finished_at = std.time.nanoTimestamp();
+
+        const result: Result = if (stream_error) |err| .{
+            .err = err,
+        } else .{
+            .success = .{
+                .stdout = try alloc_writer.toOwnedSlice(),
+                .stderr = &.{},
+                .started_at_ns = started_at,
+                .finished_at_ns = finished_at,
+            },
+        };
 
         const exitCode: ExitCode = switch (result) {
             .success => .success,
@@ -337,7 +405,7 @@ pub const CommandRunner = struct {
         const stdout_reader = &stdout_file_reader.interface;
 
         var stderr_fwd_buffer: [512]u8 = undefined;
-        var stderr_file_reader = child.stdout.?.readerStreaming(&stderr_fwd_buffer);
+        var stderr_file_reader = child.stderr.?.readerStreaming(&stderr_fwd_buffer);
         const stderr_reader = &stderr_file_reader.interface;
 
         var stdout_closed = false;

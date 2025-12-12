@@ -1,0 +1,26 @@
+// const b = {
+//   echo "hello, world!"
+//   var c = 5
+// }
+// echo "${b}"
+
+"hello, world!"
+var s = "hello, world!"
+s = "hello, ${s}"
+
+if (true) echo "this is true" else echo "this is false"
+
+// fn Void hello() String "hello ,world!"
+
+// "hello, world!" | cat
+
+// echo "${hello}"
+//
+// echo : fn ?Stream(String) echo(...[]String) Byte!?Stream(String)
+//
+// fn Stream(String) my_echo(...args: []String) Byte!?Stream(String) {
+//   for (args) |arg| "${arg}\n"
+// }
+
+// const x = if (true) hello "true" else hello "false"
+

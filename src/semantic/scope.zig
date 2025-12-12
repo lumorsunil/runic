@@ -6,6 +6,7 @@ pub const Scope = struct {
     bindings: std.StringArrayHashMapUnmanaged(Binding) = .empty,
     children: std.ArrayList(*Scope) = .empty,
     parent: ?*Scope = null,
+    span: ast.Span,
 
     pub const Error =
         std.mem.Allocator.Error ||
@@ -14,12 +15,12 @@ pub const Scope = struct {
             TypeNotFound,
         };
 
-    pub fn init() Scope {
-        return .{};
+    pub fn init(span: ast.Span) Scope {
+        return .{ .span = span };
     }
 
-    pub fn initWithParent(parent: *Scope) Scope {
-        return .{ .parent = parent };
+    pub fn initWithParent(parent: *Scope, span: ast.Span) Scope {
+        return .{ .parent = parent, .span = span };
     }
 
     pub fn deinit(self: *Scope, allocator: std.mem.Allocator) void {
@@ -28,14 +29,14 @@ pub const Scope = struct {
         self.children.deinit(allocator);
     }
 
-    pub fn addChild(self: *Scope, allocator: std.mem.Allocator) Error!*Scope {
+    pub fn addChild(self: *Scope, allocator: std.mem.Allocator, span: ast.Span) Error!*Scope {
         const child = try allocator.create(Scope);
-        child.* = .initWithParent(self);
+        child.* = .initWithParent(self, span);
         try self.children.append(allocator, child);
         return self.children.getLast();
     }
 
-    pub fn lookup(self: *Scope, name: []const u8) Error!?*Binding {
+    pub fn lookup(self: *Scope, name: []const u8) ?*Binding {
         return self.bindings.getPtr(name) orelse {
             const parent = self.parent orelse return null;
             return parent.lookup(name);
@@ -45,23 +46,26 @@ pub const Scope = struct {
     pub fn declare(
         self: *Scope,
         allocator: std.mem.Allocator,
-        name: []const u8,
-        type_expr: ?*ast.TypeExpr,
+        identifier: ast.Identifier,
+        type_expr: ?*const ast.TypeExpr,
+        is_mutable: bool,
     ) Error!void {
-        const entry = try self.bindings.getOrPut(allocator, name);
+        const entry = try self.bindings.getOrPut(allocator, identifier.name);
 
         if (entry.found_existing) {
             return error.IdentifierAlreadyDeclared;
         }
 
         entry.value_ptr.* = .{
-            .name = name,
+            .identifier = identifier,
             .type_expr = type_expr,
+            .is_mutable = is_mutable,
         };
     }
 
     pub const Binding = struct {
-        name: []const u8,
-        type_expr: ?*ast.TypeExpr,
+        identifier: ast.Identifier,
+        type_expr: ?*const ast.TypeExpr,
+        is_mutable: bool,
     };
 };

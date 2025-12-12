@@ -7,6 +7,7 @@ const diag = @import("diagnostics.zig");
 const runic = @import("runic");
 const parseFile = @import("parser.zig").parseFile;
 const DocumentStore = runic.DocumentStore;
+const reportErrors = @import("reporter.zig").reportErrors;
 
 pub const LspDocumentStore = struct {
     allocator: Allocator,
@@ -139,7 +140,7 @@ pub const LspDocumentStore = struct {
         }
 
         if (options.shouldTypeCheck()) {
-            try document.reportTypeChecker(self.allocator, self.workspace);
+            try document.reportTypeChecker(self.workspace);
         }
     }
 
@@ -221,6 +222,25 @@ pub const LspDocumentStore = struct {
         const doc = self.get(uri) orelse return false;
         doc.manage_mode = .client;
 
+        const text = try self.updateDocumentText(doc, events);
+        std.log.err("new document text: \n\n{s}", .{text});
+
+        try doc.setText(self.allocator, text, version);
+        self.allocator.free(text);
+        try doc.rebuildSymbols(
+            self.allocator,
+            &self.document_store,
+            workspace.describePath(doc.path),
+        );
+        try doc.reportTypeChecker(workspace);
+        return true;
+    }
+
+    fn updateDocumentText(
+        self: *LspDocumentStore,
+        doc: *Document,
+        events: []const types.TextDocumentContentChangeEvent,
+    ) ![]const u8 {
         var text: []const u8 = try self.allocator.dupe(u8, doc.text);
 
         for (events) |event| switch (event) {
@@ -254,17 +274,7 @@ pub const LspDocumentStore = struct {
             },
         };
 
-        std.log.err("new document text: \n\n{s}", .{text});
-
-        try doc.setText(self.allocator, text, version);
-        self.allocator.free(text);
-        try doc.rebuildSymbols(
-            self.allocator,
-            &self.document_store,
-            workspace.describePath(doc.path),
-        );
-        try doc.reportTypeChecker(self.allocator, workspace);
-        return true;
+        return text;
     }
 
     pub fn close(self: *LspDocumentStore, uri: []const u8) void {
@@ -368,21 +378,26 @@ const Document = struct {
         self.ast = null;
         self.parser = runic.parser.Parser.init(allocator, document_store);
 
-        const script = try parseFile(allocator, &self.diagnostics, &self.parser.?, self.path) orelse return;
+        const lsp_doc_store: *LspDocumentStore = @fieldParentPtr(
+            "document_store",
+            document_store,
+        );
+
+        const script = try parseFile(
+            lsp_doc_store.workspace,
+            &self.parser.?,
+            self.path,
+        ) orelse return;
+
         try symbols.collectSymbols(allocator, detail, script, &self.symbols);
     }
 
     fn reportTypeChecker(
         self: *Document,
-        allocator: Allocator,
         workspace: *workspace_mod.Workspace,
     ) !void {
-        var type_checker = runic.semantic.TypeChecker.init(
-            allocator,
-            &workspace.documents.document_store,
-        );
-        defer type_checker.deinit();
-        const result = type_checker.typeCheck(self.path) catch |err| switch (err) {
+        workspace.type_checker.invalidateDocument(self.path);
+        const result = workspace.type_checker.typeCheck(self.path) catch |err| switch (err) {
             error.DocumentNotParsed => return,
             else => {
                 std.log.err("Type checker failed to run: {}", .{err});
@@ -392,22 +407,7 @@ const Document = struct {
 
         switch (result) {
             .success => {},
-            .err => |diagnostics| {
-                for (diagnostics) |d| {
-                    const diag_uri = try workspace.documents.resolveUri(d.span().start.file);
-                    const diag_doc = workspace.documents.get(diag_uri).?;
-
-                    try diag_doc.diagnostics.append(allocator, .{
-                        .uri = diag_uri,
-                        .message = try allocator.dupe(u8, d.message),
-                        .span = d.span(),
-                        .severity = std.meta.stringToEnum(
-                            types.DiagnosticSeverity,
-                            @tagName(d.severity),
-                        ).?,
-                    });
-                }
-            },
+            .err => |err_info| try reportErrors(workspace, err_info),
         }
     }
 };

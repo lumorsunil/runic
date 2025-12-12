@@ -12,6 +12,15 @@ pub const RCError =
 
 const log_enabled = false;
 
+// const prefix_color = "";
+// const prefix_ref_color = "";
+// const init_color = "";
+// const release_color = "";
+// const ref_color = "";
+// const error_color = "";
+// const warn_color = "";
+// const end_color = "";
+
 const prefix_color = rainbow.beginColor(.yellow);
 const prefix_ref_color = rainbow.beginColor(.orange);
 const init_color = rainbow.beginColor(.blue);
@@ -48,12 +57,17 @@ pub fn RC(comptime T: type) type {
             pub fn deinit(self: *Ref, options: DeinitOptions) void {
                 if (self.rc) |rc| {
                     self.log("{s}release{s} (refs left before release: {})", .{ release_color, end_color, rc.refs }) catch {};
-                    rc.release(options);
+                    if (rc.release(options)) {
+                        self.rc = null;
+                        return;
+                    }
                 } else {
                     self.log("{s}release called on already released RC.Ref{s}", .{ warn_color, end_color }) catch {};
                     return;
                 }
-                self.rc = null;
+                if (self.rc.?.refs == 0 or !options.refresh_ref) {
+                    self.rc = null;
+                }
             }
 
             pub fn log(self: Ref, comptime fmt: []const u8, args: anytype) !void {
@@ -136,6 +150,11 @@ pub fn RC(comptime T: type) type {
                     return RCError.InvalidRef;
                 };
                 return rc.allocator;
+            }
+
+            pub fn refs(self: Ref) usize {
+                const rc = self.rc orelse return 0;
+                return rc.refs;
             }
         };
 
@@ -246,6 +265,8 @@ pub fn RC(comptime T: type) type {
             deinit_child_fn: ?DeinitChildFn(T) = null,
             /// Custom deinit function for array elements.
             deinit_array_child_fn: if (Elem) |E| ?DeinitChildFn(E) else ?void = null,
+            /// Don't set rc = null if we still have other refs.
+            refresh_ref: bool = false,
         };
 
         pub fn DeinitChildFn(comptime Child: type) type {
@@ -342,15 +363,19 @@ pub fn RC(comptime T: type) type {
             return RCError.NotAllocated;
         }
 
-        fn release(self: *RC(T), options: DeinitOptions) void {
+        /// Returns true if RC was invalidated
+        fn release(self: *RC(T), options: DeinitOptions) bool {
             if (self.isAllocated() == null) {
                 std.log.warn("RC: called release on non-allocated released RC ({*})", .{self});
-                return;
-            }
-            if (self.refs <= 1) {
-                self.deinit(options);
+                return true;
             }
             self.refs -|= 1;
+            if (self.refs == 0) {
+                self.deinit(options);
+                return true;
+            }
+
+            return false;
         }
 
         fn isAllocated(self: *RC(T)) ?*T {
@@ -388,6 +413,8 @@ fn callDeinitIfExists(allocator: Allocator, deinitee: anytype) ?void {
 
     if (std.meta.hasFn(T, "deinit")) {
         const params = @typeInfo(@TypeOf(T.deinit)).@"fn".params;
+        const is_self = if (params.len > 0) params[0].type == *T or params[0].type == T else false;
+        if (!is_self) return null;
 
         const DeinitOptions = if (@hasDecl(T, "RCType")) T.RCType.DeinitOptions else void;
 
@@ -416,18 +443,16 @@ fn callDeinitIfExists(allocator: Allocator, deinitee: anytype) ?void {
 
 test "RC ref get" {
     const testing = @import("std").testing;
-    const rc = try RC([]u8).dupe(testing.allocator, "the string");
-    try testing.expectEqual(0, rc.refs);
-    var ref = try rc.ref(.{});
+    var ref: RC([]u8).Ref = try .dupe(testing.allocator, "the string", .{});
     defer ref.deinit(.{});
-    try testing.expectEqual(1, rc.refs);
-    var ref2 = try rc.ref(.{});
+    try testing.expectEqual(1, ref.refs());
+    var ref2 = try ref.ref(.{});
     defer ref2.deinit(.{});
-    try testing.expectEqual(2, rc.refs);
+    try testing.expectEqual(2, ref.refs());
     const refGet = try ref.getPtr();
     const ref2Get = try ref2.getPtr();
-    try testing.expectEqual(2, rc.refs);
-    try testing.expectEqual(rc.ptr, refGet);
+    try testing.expectEqual(2, ref.refs());
+    try testing.expectEqual(ref.rc.?.ptr, refGet);
     try testing.expectEqual(refGet, ref2Get);
     try testing.expectEqualStrings("the string", refGet.*);
 }

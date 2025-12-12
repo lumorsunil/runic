@@ -1,29 +1,23 @@
 const std = @import("std");
-const Allocator = std.mem.Allocator;
 const runic = @import("runic");
-const diag = @import("diagnostics.zig");
 const ast = runic.ast;
 const token = runic.token;
-const DocumentStore = @import("document.zig").LspDocumentStore;
+const reportErrors = @import("reporter.zig").reportErrors;
+const Workspace = @import("workspace.zig").Workspace;
 
 pub fn parseFile(
-    allocator: Allocator,
-    list: *std.ArrayList(diag.Diagnostic),
+    workspace: *Workspace,
     parser: *runic.parser.Parser,
     absolute_path: []const u8,
 ) !?ast.Script {
-    return parser.parseScript(absolute_path) catch |err| {
-        var message = std.Io.Writer.Allocating.init(allocator);
-        const loc = try writeParseError(parser, &message.writer, err);
-        try list.append(allocator, .{
-            .uri = try std.fmt.allocPrint(allocator, "file://{s}", .{absolute_path}),
-            .message = try message.toOwnedSlice(),
-            .span = .fromLocs(loc, loc),
-            .severity = .@"error",
-        });
+    const result = parser.parseScript(absolute_path);
 
-        return null;
-    };
+    switch (result) {
+        .success => |script| return script,
+        .err => |err_info| try reportErrors(workspace, err_info),
+    }
+
+    return null;
 }
 
 fn writeParseError(

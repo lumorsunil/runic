@@ -28,6 +28,9 @@
 - [x] executor
 - [x] bug: cannot call functions more than one (thanks ai)
 - [x] calling a function using member access from imported module results in FileNotFound
+- [ ] function signature
+  - [ ] stdin type
+  - [ ] parameters
 - [ ] stdin special bindings
   - `@stdin`
   - `@stdin | cat`
@@ -98,12 +101,17 @@
     - [x] create a new context when binding identifiers
     - [x] explore idea of creating a context stack that we can push/pop same as the scope stack
       - [x] OR we could modify scope to have the evaluator context in it
+- [ ] expressions as pipeline stages
+  - [ ] auto-coerce non-strings into strings? (or force interpolation? lsp hint?)
 
 ## lsp
 
 - [ ] completions for member access (need some sort of scope machinery around collecting symbols and stuff, and it would help a ton with semantic analysis)
 - [ ] add more information to completion results (symbol type, etc)
 - [ ] implement basic snippets (const/var/fn)
+- [ ] hover
+  - [x] basic hover implementation, identifier lookup
+- [ ] go to definition
 - [x] completions for keywords
   - [ ] bug: markdown syntax highlighting does not work for runic
 - [x] restart causes leaks and crashes
@@ -141,7 +149,9 @@
 - [ ] parse error bail and continue
   - when parsing fails entirely in a statement or expression, look for the next expression terminator and continue parsing from there, storing the error for later diagnostics
   - still produce a valid ast for the type checker to use
+  - [x] in progress
 - [ ] type expression parser
+  - [x] in progress
 
 ## type checker
 
@@ -149,10 +159,11 @@
 - [x] imports
 - [ ] do we even need lazy types? how will it work?
 - [x] gather diagnostics foundation
-- [ ] fast reverse lookup to find correct scope of position for correct lsp context
-  - store scope spans?
-  - binary search? (with start and end lines)
-  - index scopes by line?
+- [x] scope lookup based on location
+  - [x] finds outermost scope
+  - [x] when finding scope by location, properly return the innermost scope found
+- [x] bug: when reassigning a variable, the type gets overwritten to the assignment type
+- [x] resolve types for pipelines that are actually just identifiers
 
 ## error handling
 

@@ -24,8 +24,8 @@ pub const Server = struct {
     reader_buffer: [4096]u8 = undefined,
     stdout_writer: std.fs.File.Writer,
     writer: *std.Io.Writer,
-    workspace: workspace_mod.Workspace,
-    documents: document_mod.LspDocumentStore,
+    workspace: *workspace_mod.Workspace,
+    documents: *document_mod.LspDocumentStore,
     initialized: bool = false,
     shutting_down: bool = false,
     log_enabled: bool = false,
@@ -44,6 +44,12 @@ pub const Server = struct {
             }
         } else |_| {}
 
+        const workspace = try allocator.create(workspace_mod.Workspace);
+        const document_store = try allocator.create(document_mod.LspDocumentStore);
+
+        workspace.* = try .init(allocator, document_store);
+        document_store.* = .init(allocator, workspace);
+
         return .{
             .allocator = allocator,
             .stdin_file = stdin_file,
@@ -53,8 +59,8 @@ pub const Server = struct {
             .reader = undefined,
             .stdout_writer = undefined,
             .writer = undefined,
-            .workspace = try .init(allocator, undefined),
-            .documents = undefined,
+            .workspace = workspace,
+            .documents = document_store,
             .log_enabled = log_enabled,
         };
     }
@@ -65,8 +71,6 @@ pub const Server = struct {
     }
 
     pub fn initInterface(self: *Server) void {
-        self.documents = .init(self.allocator, &self.workspace);
-        self.workspace.documents = &self.documents;
         self.stdin_reader = self.stdin_file.readerStreaming(&self.reader_buffer);
         self.reader = &self.stdin_reader.interface;
         self.stdout_writer = self.stdout_file.writerStreaming(&.{});
@@ -140,6 +144,15 @@ pub const Server = struct {
                     // try self.handleCompletion(id, params);
                     self.handleCompletion(id, params) catch |err| {
                         std.log.err("Could not handleCompletion: {}, writer error: {?}", .{ err, self.stdout_writer.err });
+                        return err;
+                    };
+                }
+                return true;
+            },
+            .@"textDocument/hover" => |params| {
+                if (request.id) |id| {
+                    self.handleHover(id, params) catch |err| {
+                        std.log.err("Could not handleHover: {}, writer error: {?}", .{ err, self.stdout_writer.err });
                         return err;
                     };
                 }
@@ -291,7 +304,7 @@ pub const Server = struct {
         const version = params.textDocument.version orelse 0;
         const changes = params.contentChanges;
 
-        _ = try self.documents.update(uri, changes, version, &self.workspace);
+        _ = try self.documents.update(uri, changes, version, self.workspace);
     }
 
     fn handleDidClose(self: *Server, params: types.DidCloseTextDocumentParams) !void {
@@ -339,6 +352,104 @@ pub const Server = struct {
         try self.sendCompletionResult(id, matches.items.items);
     }
 
+    fn handleHover(
+        self: *Server,
+        id: types.RequestId,
+        params: types.HoverParams,
+    ) !void {
+        const path = try self.resolveUriPath(params.textDocument.uri);
+        defer self.allocator.free(path);
+
+        const doc = self.documents.get(params.textDocument.uri);
+
+        var loc = params.position.toLocation(path);
+        if (doc) |d| loc.offset = params.position.findIndex(d.text) orelse 0;
+        const extracted_identifier = if (doc) |d| self.extractIdentifier(loc, d.text) else null;
+        const scope = self.workspace.type_checker.getScopeFromLoc(loc);
+
+        const binding: ?*runic.semantic.Scope.Binding = brk: {
+            if (scope) |s| if (extracted_identifier) |i| {
+                break :brk s.lookup(i.name);
+            };
+
+            break :brk null;
+        };
+
+        const range: types.Range = brk: {
+            if (binding) |b| break :brk .fromSpan(b.identifier.span);
+            if (extracted_identifier) |i| break :brk .fromSpan(i.span);
+            break :brk .fromLocation(loc);
+        };
+
+        var alloc_writer = std.Io.Writer.Allocating.init(self.allocator);
+        defer alloc_writer.deinit();
+
+        if (binding) |b| {
+            alloc_writer.writer.writeAll("```runic\n") catch {};
+            if (b.is_mutable) {
+                alloc_writer.writer.writeAll("var ") catch {};
+            } else {
+                alloc_writer.writer.writeAll("const ") catch {};
+            }
+            alloc_writer.writer.writeAll(b.identifier.name) catch {};
+            if (b.identifier.isTypeIdentifier()) {
+                alloc_writer.writer.writeAll(" = ") catch {};
+            } else {
+                alloc_writer.writer.writeAll(": ") catch {};
+            }
+            alloc_writer.writer.print("{?f}\n", .{b.type_expr}) catch {};
+            alloc_writer.writer.writeAll("```") catch {};
+        } else {
+            // alloc_writer.writer.writeAll("Something went wrong.") catch {};
+        }
+
+        const result = types.Hover{
+            .contents = .{
+                .kind = .markdown,
+                .value = alloc_writer.written(),
+            },
+            .range = range,
+        };
+
+        try self.sendJson(types.response(id, result));
+    }
+
+    const ExtractedIdentifier = struct {
+        name: []const u8,
+        span: runic.ast.Span,
+    };
+
+    fn extractIdentifier(
+        self: *@This(),
+        loc: runic.token.Location,
+        text: []const u8,
+    ) ?ExtractedIdentifier {
+        const ch = text[loc.offset];
+
+        if (!runic.lexer.isIdentifierStart(ch) and !runic.lexer.isIdentifierContinue(ch)) {
+            return null;
+        }
+
+        var start = loc.offset -| 1;
+        while (start > 0) : (start -|= 1) {
+            if (runic.lexer.isIdentifierContinue(text[start])) continue;
+            break;
+        }
+
+        if (!runic.lexer.isIdentifierStart(text[start])) start += 1;
+
+        var lexer = runic.lexer.Lexer.init(self.allocator, loc.file, text[start..]) catch return null;
+        const tok = lexer.next() catch return null;
+
+        return switch (tok.tag) {
+            .identifier => .{
+                .name = tok.lexeme,
+                .span = tok.span,
+            },
+            else => null,
+        };
+    }
+
     fn sendInitializeResult(self: *Server, id: types.RequestId) !void {
         const result = types.InitializeResult{
             .capabilities = .{
@@ -352,6 +463,11 @@ pub const Server = struct {
                     .triggerCharacters = &.{ ".", ":", "\"", "/" },
                     .resolveProvider = false,
                 },
+                .hoverProvider = .{ .payload = .{
+                    .hoverOptions = .{
+                        .workDoneProgress = false,
+                    },
+                } },
             },
             .serverInfo = .{
                 .name = "runic-lsp",

@@ -8,13 +8,15 @@ const DocumentStore = @import("../document_store.zig").DocumentStore;
 
 pub const module_parser = @import("module_parser_deprecated.zig");
 
-pub const ParseError = error{
+pub const Error = error{
     UnexpectedToken,
     UnexpectedEOF,
     StringInterpNotAllowed,
     StringInArithmeticExpressionNotAllowed,
     DuplicateStructDecl,
     ForCapturesMustMatchSources,
+    ExpectedTypeIdentifier,
+    ExpectedTypeExpr,
 } || std.mem.Allocator.Error || lexer.Error;
 
 /// Parser consumes tokens from the streaming lexer and produces AST nodes.
@@ -42,9 +44,92 @@ pub const Parser = struct {
     breadcrumb_snapshot: [max_breadcrumbs][]const u8 = undefined,
     breadcrumb_snapshot_depth: usize = 0,
     interp_counter: usize = 0,
+    diagnostics: std.ArrayList(Diagnostic) = .empty,
     logging_enabled: bool = false,
 
     const Self = @This();
+
+    pub const Result = union(enum) {
+        err: struct {
+            _diagnostics: []const Diagnostic,
+            script: ?ast.Script,
+
+            pub fn diagnostics(self: @This()) []const Diagnostic {
+                return self._diagnostics;
+            }
+        },
+        success: ast.Script,
+
+        pub fn fromScript(script: ?ast.Script) @This() {
+            return if (script) |s| .{ .success = s } else .errNoDiagnostics(script);
+        }
+
+        pub fn errDiagnostics(_diagnostics: []const Diagnostic, script: ?ast.Script) @This() {
+            return .{ .err = .{ ._diagnostics = _diagnostics, .script = script } };
+        }
+
+        pub fn errNoDiagnostics(script: ?ast.Script) @This() {
+            return .{ .err = .{ ._diagnostics = &.{}, .script = script } };
+        }
+    };
+
+    pub const Diagnostic = struct {
+        span_: ast.Span,
+        message: []const u8,
+        err: Error,
+
+        pub fn span(self: Diagnostic) ast.Span {
+            return self.span_;
+        }
+
+        pub fn severity(_: Diagnostic) []const u8 {
+            return "error";
+        }
+    };
+
+    pub const Snapshot = struct {
+        diagnostics: []const Diagnostic,
+        stream_snapshot: lexer.StreamSnapshot,
+
+        pub fn init(parser: *Self) !Snapshot {
+            const stream_snapshot = try parser.stream.snapshot();
+            const next = try parser.stream.peek();
+            try parser.log(
+                "took snapshot at {?f}({?}) : {f}({})",
+                .{
+                    stream_snapshot.stream.current,
+                    if (stream_snapshot.stream.current) |c| c.span.start.offset else null,
+                    next,
+                    next.span.start.offset,
+                },
+            );
+
+            return .{
+                .diagnostics = try parser.arena.allocator().dupe(
+                    Diagnostic,
+                    parser.diagnostics.items,
+                ),
+                .stream_snapshot = stream_snapshot,
+            };
+        }
+
+        pub fn deinit(self: *Snapshot) void {
+            self.stream_snapshot.deinit();
+        }
+
+        pub fn restore(self: *Snapshot, parser: *Self) !void {
+            try parser.stream.restore(&self.stream_snapshot);
+            const next = try parser.stream.peek();
+            parser.diagnostics.clearRetainingCapacity();
+            try parser.diagnostics.appendSlice(parser.arena.allocator(), self.diagnostics);
+            try parser.log("restored snapshot to {?f}({?}) : {f}({})", .{
+                parser.stream.current,
+                if (parser.stream.current) |c| c.span.start.offset else null,
+                next,
+                next.span.start.offset,
+            });
+        }
+    };
 
     // pub fn init(allocator: std.mem.Allocator, source: []const u8) Parser {
     pub fn init(
@@ -67,6 +152,31 @@ pub const Parser = struct {
     pub fn deinit(self: *Self) void {
         self.arena.deinit();
         // self.stream.deinit();
+    }
+
+    pub fn reportParseError(
+        self: *Self,
+        err: Error,
+        span: ast.Span,
+        comptime fmt: []const u8,
+        args: anytype,
+    ) !void {
+        try self.diagnostics.append(self.arena.allocator(), .{
+            .err = err,
+            .span_ = span,
+            .message = try std.fmt.allocPrint(self.arena.allocator(), fmt, args),
+        });
+    }
+
+    fn compileResult(self: *Self, script: ?ast.Script) Result {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        self.log(@src().fn_name, .{}) catch {};
+
+        if (self.diagnostics.items.len > 0) {
+            return .errDiagnostics(self.diagnostics.items, script);
+        }
+
+        return .fromScript(script);
     }
 
     pub fn expectedTokens(self: *const Self) []const token.Tag {
@@ -94,6 +204,14 @@ pub const Parser = struct {
         try writer.writeAll(rainbow.endColor());
         try writer.writeByte('\n');
         try self.logCurrentTokenSourceLine(writer);
+        try writer.flush();
+    }
+
+    pub fn logWithoutPrefix(self: Self, comptime fmt: []const u8, args: anytype) !void {
+        if (!self.logging_enabled) return;
+        var stdout = std.fs.File.stderr().writer(&.{});
+        const writer = &stdout.interface;
+        try writer.print(fmt, args);
         try writer.flush();
     }
 
@@ -131,7 +249,13 @@ pub const Parser = struct {
                 try self.logPeekedTokenSourceLine(writer);
                 return;
             }
-            try writer.print("skipping token ({}-{}){s}", .{ tok.span.start.line, tok.span.end.line, tok.lexeme });
+            try writer.print("skipping token ({}-{})[{}]{*}", .{
+                tok.span.start.line,
+                tok.span.end.line,
+                tok.lexeme.len,
+                tok.lexeme.ptr,
+                    // if (std.ascii.isPrint(tok.lexeme[0])) tok.lexeme[0..32] else "<invalid>",
+            });
             return;
         }
         if (tok.span.end.column <= tok.span.start.column) return;
@@ -224,17 +348,12 @@ pub const Parser = struct {
         return self.stream.peeked_tokens_buffer.items[0];
     }
 
-    fn takeSnapshot(self: *Self) ParseError!lexer.StreamSnapshot {
-        const snapshot = try self.stream.snapshot();
-        const next = try self.stream.peek();
-        try self.log("took snapshot at {?f}({?}) : {f}({})", .{ snapshot.stream.current, if (snapshot.stream.current) |c| c.span.start.offset else null, next, next.span.start.offset });
-        return snapshot;
+    fn takeSnapshot(self: *Self) Error!Snapshot {
+        return .init(self);
     }
 
-    fn restoreSnapshot(self: *Self, snapshot: *lexer.StreamSnapshot) ParseError!void {
-        try self.stream.restore(snapshot);
-        const next = try self.stream.peek();
-        try self.log("restored snapshot to {?f}({?}) : {f}({})", .{ snapshot.stream.current, if (snapshot.stream.current) |c| c.span.start.offset else null, next, next.span.start.offset });
+    fn restoreSnapshot(self: *Self, snapshot: *Snapshot) Error!void {
+        try snapshot.restore(self);
     }
 
     fn currentTokenLocation(self: Self) ?token.Location {
@@ -269,8 +388,18 @@ pub const Parser = struct {
         return null;
     }
 
-    pub fn parseScript(self: *Self, path: []const u8) !ast.Script {
+    pub fn parseScript(self: *Self, path: []const u8) Result {
+        return self.compileResult(self.parseScriptInner(path) catch |err| brk: {
+            self.log("error: {}", .{err}) catch {};
+            break :brk null;
+        });
+    }
+
+    fn parseScriptInner(self: *Self, path: []const u8) !ast.Script {
         const duped_path = try self.arena.allocator().dupe(u8, path);
+        self.path = duped_path;
+        self.source = try self.document_store.getSource(duped_path);
+        self.stream = try .init(self.arena.allocator(), duped_path, self.source);
 
         const logging_enabled = std.process.getEnvVarOwned(self.allocator, "RUNIC_LOG_PARSER") catch |err| switch (err) {
             error.EnvironmentVariableNotFound => null,
@@ -282,12 +411,12 @@ pub const Parser = struct {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
-        if (try self.document_store.getAst(duped_path)) |script| return script;
+        if (try self.document_store.getAst(duped_path)) |script| {
+            try self.logWithoutPrefix("returning cached ast", .{});
+            return script;
+        }
         self.clearExpectedTokens();
-        self.path = duped_path;
-        self.source = try self.document_store.getSource(duped_path);
 
-        self.stream = try .init(self.arena.allocator(), duped_path, self.source);
         const statements = try self.parseStatementsUntil(.eof);
 
         const script = ast.Script{
@@ -323,7 +452,7 @@ pub const Parser = struct {
         return script;
     }
 
-    fn parseExpression(self: *Self) ParseError!*ast.Expression {
+    fn parseExpression(self: *Self) Error!*ast.Expression {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -377,8 +506,8 @@ pub const Parser = struct {
     }
 
     // TODO: error handling
-    fn oneOf(self: *Self, parsers: anytype) ParseError!OneOf(@TypeOf(parsers)) {
-        var the_error: ParseError = undefined;
+    fn oneOf(self: *Self, parsers: anytype) Error!OneOf(@TypeOf(parsers)) {
+        var the_error: Error = undefined;
 
         inline for (std.meta.fields(@TypeOf(parsers))) |field| {
             const parser = @field(parsers, field.name);
@@ -396,12 +525,12 @@ pub const Parser = struct {
         return the_error;
     }
 
-    fn parseMemberAccessExpression(self: *Self) ParseError!*ast.Expression {
+    fn parseMemberAccessExpression(self: *Self) Error!*ast.Expression {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
     }
 
-    fn parseIdentifierExpression(self: *Self) ParseError!*ast.Expression {
+    fn parseIdentifierExpression(self: *Self) Error!*ast.Expression {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -456,7 +585,7 @@ pub const Parser = struct {
         literal: BinaryComponentLiteral,
         expr: *ast.Expression,
 
-        pub fn toExpression(self: BinaryComponent, parser: *Self) ParseError!*ast.Expression {
+        pub fn toExpression(self: BinaryComponent, parser: *Self) Error!*ast.Expression {
             return try switch (self) {
                 .expr => |expr| expr,
                 .identifier => |identifier| parser.allocExpression(.{
@@ -505,7 +634,7 @@ pub const Parser = struct {
             };
         }
 
-        pub fn toExpression(self: BinaryComponentLiteral, parser: *Self) ParseError!*ast.Expression {
+        pub fn toExpression(self: BinaryComponentLiteral, parser: *Self) Error!*ast.Expression {
             return try switch (self) {
                 .int => |int| parser.allocExpression(.{
                     .literal = .{ .integer = int },
@@ -541,7 +670,7 @@ pub const Parser = struct {
         }
     };
 
-    fn parseMaybeBinaryExpression(self: *Self) ParseError!?*ast.Expression {
+    fn parseMaybeBinaryExpression(self: *Self) Error!?*ast.Expression {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -598,7 +727,7 @@ pub const Parser = struct {
                             });
                             continue;
                         },
-                        else => return ParseError.UnexpectedToken,
+                        else => return Error.UnexpectedToken,
                     }
                 },
                 .op => {
@@ -643,7 +772,7 @@ pub const Parser = struct {
     fn parseBinaryExpression(
         self: *Self,
         components: []const BinaryComponent,
-    ) ParseError!*ast.Expression {
+    ) Error!*ast.Expression {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -734,7 +863,7 @@ pub const Parser = struct {
         // (((1 + 2 * 3 + 4) > (5 + 1)) || (true)) || (false)
     }
 
-    fn parsePipeline(self: *Self) ParseError!*ast.Expression {
+    fn parsePipeline(self: *Self) Error!*ast.Expression {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -774,12 +903,12 @@ pub const Parser = struct {
 
     fn isExprTerminator(tag: token.Tag) bool {
         return switch (tag) {
-            .r_paren, .r_bracket, .r_brace, .comma, .pipe, .pipe_pipe, .amp_amp, .amp, .string_interp_end, .newline, .l_brace, .range, .dot_l_brace => true,
+            .r_paren, .r_bracket, .r_brace, .comma, .pipe, .pipe_pipe, .amp_amp, .amp, .string_interp_end, .newline, .l_brace, .range, .dot_l_brace, .kw_else => true,
             else => false,
         };
     }
 
-    fn parsePipelineStage(self: *Self) ParseError!ast.PipelineStage {
+    fn parsePipelineStage(self: *Self) Error!ast.PipelineStage {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -832,7 +961,7 @@ pub const Parser = struct {
         }
     }
 
-    pub fn parseImportExpression(self: *Self) ParseError!*ast.Expression {
+    pub fn parseImportExpression(self: *Self) Error!*ast.Expression {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -848,7 +977,7 @@ pub const Parser = struct {
         } });
     }
 
-    pub fn expectEnd(self: *Self) ParseError!void {
+    pub fn expectEnd(self: *Self) Error!void {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -857,7 +986,7 @@ pub const Parser = struct {
         if (tok.tag != .eof) return self.failExpectedToken(tok.tag, .eof);
     }
 
-    fn parseIfExpression(self: *Self) ParseError!*ast.Expression {
+    fn parseIfExpression(self: *Self) Error!*ast.Expression {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -866,10 +995,11 @@ pub const Parser = struct {
         const condition = try self.parseExpression();
         // _ = try self.expect(.r_paren);
         const capture = try self.parseOptionalCaptureClause();
-        const then_block = try self.parseBlock();
+        // const then_block = try self.parseBlock();
+        const then_expr = try self.parseExpression();
 
         var else_branch: ?ast.IfExpr.ElseBranch = null;
-        var span_end = then_block.span.end;
+        var end_span = then_expr.span();
 
         const maybe_else = try self.peekToken();
         if (maybe_else.tag == .kw_else) {
@@ -879,14 +1009,14 @@ pub const Parser = struct {
                 const nested = try self.parseIfExpression();
                 const nested_if = switch (nested.*) {
                     .if_expr => |*payload| payload,
-                    else => return ParseError.UnexpectedToken,
+                    else => return Error.UnexpectedToken,
                 };
-                span_end = nested_if.span.end;
+                end_span = nested_if.span;
                 else_branch = .{ .if_expr = nested_if };
             } else {
-                const else_block = try self.parseBlock();
-                span_end = else_block.span.end;
-                else_branch = .{ .block = else_block };
+                const else_expr = try self.parseExpression();
+                end_span = else_expr.span();
+                else_branch = .{ .expr = else_expr };
             }
         }
 
@@ -894,16 +1024,16 @@ pub const Parser = struct {
             .if_expr = .{
                 .condition = condition,
                 .capture = capture,
-                .then_block = then_block,
+                .then_expr = then_expr,
                 .else_branch = else_branch,
-                .span = .{ .start = if_tok.span.start, .end = span_end },
+                .span = if_tok.span.endAt(end_span),
             },
         });
     }
 
     // for (items) |item| {...}
     // for (items, 0..) |item, i| {...}
-    fn parseForExpression(self: *Self) ParseError!*ast.Expression {
+    fn parseForExpression(self: *Self) Error!*ast.Expression {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -913,7 +1043,7 @@ pub const Parser = struct {
         _ = try self.expect(.r_paren);
         const capture = try self.parseCaptureClause();
 
-        if (capture.bindings.len != sources.len) return ParseError.ForCapturesMustMatchSources;
+        if (capture.bindings.len != sources.len) return Error.ForCapturesMustMatchSources;
 
         const body = try self.parseBlock();
 
@@ -927,7 +1057,7 @@ pub const Parser = struct {
         });
     }
 
-    fn parseForSources(self: *Self) ParseError![]const *ast.Expression {
+    fn parseForSources(self: *Self) Error![]const *ast.Expression {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -936,7 +1066,7 @@ pub const Parser = struct {
     }
 
     // expr | 0.. | 1..4
-    fn parseForSource(self: *Self) ParseError!*ast.Expression {
+    fn parseForSource(self: *Self) Error!*ast.Expression {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -946,7 +1076,7 @@ pub const Parser = struct {
     fn parseTry(
         self: *Self,
         parser: anytype,
-    ) ParseError!?ParserPayload(@TypeOf(parser)) {
+    ) Error!?ParserPayload(@TypeOf(parser)) {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -960,7 +1090,7 @@ pub const Parser = struct {
     }
 
     // 0.. | 1..4
-    fn parseRange(self: *Self) ParseError!*ast.Expression {
+    fn parseRange(self: *Self) Error!*ast.Expression {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -988,7 +1118,7 @@ pub const Parser = struct {
         });
     }
 
-    fn parseIntegerLiteral(self: *Self) ParseError!ast.IntegerLiteral {
+    fn parseIntegerLiteral(self: *Self) Error!ast.IntegerLiteral {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -996,7 +1126,7 @@ pub const Parser = struct {
         return .fromToken(integer);
     }
 
-    fn parseArrayLiteralExpression(self: *Self) ParseError!*ast.Expression {
+    fn parseArrayLiteralExpression(self: *Self) Error!*ast.Expression {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -1015,14 +1145,14 @@ pub const Parser = struct {
         return array;
     }
 
-    fn parseCaptureClause(self: *Self) ParseError!ast.CaptureClause {
+    fn parseCaptureClause(self: *Self) Error!ast.CaptureClause {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
         return try self.parseOptionalCaptureClause() orelse return self.failExpectedToken(null, .pipe);
     }
 
-    fn parseOptionalCaptureClause(self: *Self) ParseError!?ast.CaptureClause {
+    fn parseOptionalCaptureClause(self: *Self) Error!?ast.CaptureClause {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -1040,7 +1170,7 @@ pub const Parser = struct {
         };
     }
 
-    fn parseBindingPattern(self: *Self) ParseError!*ast.BindingPattern {
+    fn parseBindingPattern(self: *Self) Error!*ast.BindingPattern {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -1062,11 +1192,12 @@ pub const Parser = struct {
     }
 
     fn ParserFn(comptime T: type) type {
-        return *const fn (*Self) ParseError!T;
+        return *const fn (*Self) Error!T;
     }
 
     const ParseAndSkipUntilOptions = struct {
         skipNewLines: bool = false,
+        terminators: []const token.Tag = &.{},
     };
 
     fn parseList(
@@ -1074,13 +1205,21 @@ pub const Parser = struct {
         comptime delimiter: token.Tag,
         parser: anytype,
         options: ParseAndSkipUntilOptions,
-    ) ParseError!ast.Spanned([]const ParserPayload(@TypeOf(parser))) {
+    ) Error!ast.Spanned([]ParserPayload(@TypeOf(parser))) {
         const T = ParserPayload(@TypeOf(parser));
 
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
-        const open = try self.peekToken();
+        const start = try self.peekToken();
+
+        if (std.mem.containsAtLeastScalar(token.Tag, options.terminators, 1, start.tag)) {
+            return .{
+                .payload = &.{},
+                .span = start.span,
+            };
+        }
+
         var parsed = std.ArrayList(T).empty;
         defer parsed.deinit(self.allocator);
 
@@ -1091,9 +1230,23 @@ pub const Parser = struct {
 
             const next = try self.peekToken();
             if (next.tag != delimiter) {
+                const last_item = parsed.getLast();
+                const last_item_span = brk: {
+                    const Item = switch (@typeInfo(T)) {
+                        .pointer => |pointer| pointer.child,
+                        else => T,
+                    };
+
+                    if (std.meta.hasFn(Item, "span")) {
+                        break :brk last_item.span();
+                    } else {
+                        break :brk last_item.span;
+                    }
+                };
+
                 return .{
                     .payload = try self.copyToArena(T, parsed.items),
-                    .span = .{ .start = open.span.start, .end = next.span.end },
+                    .span = start.span.endAt(last_item_span),
                 };
             }
             _ = try self.nextToken();
@@ -1105,7 +1258,7 @@ pub const Parser = struct {
         comptime delimiter: token.Tag,
         parser: anytype,
         options: ParseAndSkipUntilOptions,
-    ) ParseError!ast.Spanned([]const ParserPayload(@TypeOf(parser))) {
+    ) Error!ast.Spanned([]const ParserPayload(@TypeOf(parser))) {
         const T = ParserPayload(@TypeOf(parser));
 
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
@@ -1126,7 +1279,7 @@ pub const Parser = struct {
                     .span = .{ .start = open.span.start, .end = next.span.end },
                 };
             } else if (next.tag == .eof) {
-                return ParseError.UnexpectedEOF;
+                return Error.UnexpectedEOF;
             }
 
             const nextParsed = try parser(self);
@@ -1137,7 +1290,7 @@ pub const Parser = struct {
     fn parseStatementsUntil(
         self: *Self,
         comptime end: token.Tag,
-    ) ParseError!ast.Spanned([]const *ast.Statement) {
+    ) Error!ast.Spanned([]const *ast.Statement) {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -1148,7 +1301,7 @@ pub const Parser = struct {
         );
     }
 
-    fn parseBlock(self: *Self) ParseError!ast.Block {
+    fn parseBlock(self: *Self) Error!ast.Block {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -1161,7 +1314,7 @@ pub const Parser = struct {
         };
     }
 
-    fn parseBlockExpression(self: *Self) ParseError!*ast.Expression {
+    fn parseBlockExpression(self: *Self) Error!*ast.Expression {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -1174,7 +1327,7 @@ pub const Parser = struct {
         } });
     }
 
-    fn parseStatement(self: *Self) ParseError!*ast.Statement {
+    fn parseStatement(self: *Self) Error!*ast.Statement {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -1182,14 +1335,17 @@ pub const Parser = struct {
         const stmt = try self.arena.allocator().create(ast.Statement);
         errdefer self.arena.allocator().destroy(stmt);
 
-        const maybeBinding = try self.parseMaybeBinding();
-        if (maybeBinding) |letDecl| {
-            stmt.* = .{ .binding_decl = letDecl };
+        if (try self.parseMaybeTypeBinding()) |type_binding_decl| {
+            stmt.* = .{ .type_binding_decl = type_binding_decl };
             return stmt;
         }
 
-        const maybeFn = try self.parseMaybeFn();
-        if (maybeFn) |fnDecl| {
+        if (try self.parseMaybeBinding()) |binding_decl| {
+            stmt.* = .{ .binding_decl = binding_decl };
+            return stmt;
+        }
+
+        if (try self.parseMaybeFn()) |fnDecl| {
             stmt.* = .{ .fn_decl = fnDecl };
             return stmt;
         }
@@ -1206,7 +1362,7 @@ pub const Parser = struct {
         return stmt;
     }
 
-    fn consumeStatementTerminator(self: *Self) ParseError!void {
+    fn consumeStatementTerminator(self: *Self) Error!void {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -1222,7 +1378,7 @@ pub const Parser = struct {
         }
     }
 
-    fn parsePrimaryExpression(self: *Self) ParseError!*ast.Expression {
+    fn parsePrimaryExpression(self: *Self) Error!*ast.Expression {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -1316,14 +1472,14 @@ pub const Parser = struct {
         }
     }
 
-    fn failExpectedTokens(self: *Self, unexpected: ?token.Tag, expected: []const token.Tag) ParseError {
+    fn failExpectedTokens(self: *Self, unexpected: ?token.Tag, expected: []const token.Tag) Error {
         self.captureBreadcrumbSnapshot();
         self.recordExpectedTokens(expected);
         self.unexpected_token = unexpected;
-        return ParseError.UnexpectedToken;
+        return Error.UnexpectedToken;
     }
 
-    fn failExpectedToken(self: *Self, unexpected: ?token.Tag, tag: token.Tag) ParseError {
+    fn failExpectedToken(self: *Self, unexpected: ?token.Tag, tag: token.Tag) Error {
         const single = [_]token.Tag{tag};
         return self.failExpectedTokens(unexpected, &single);
     }
@@ -1394,19 +1550,25 @@ pub const Parser = struct {
         }
     }
 
-    fn expect(self: *Self, tag: token.Tag) ParseError!token.Token {
+    fn expect(self: *Self, tag: token.Tag) Error!token.Token {
         const tok = try self.nextToken();
         if (tok.tag != tag) return self.failExpectedToken(tok.tag, tag);
         return tok;
     }
 
-    fn allocExpression(self: *Self, value: ast.Expression) ParseError!*ast.Expression {
+    fn allocExpression(self: *Self, value: ast.Expression) Error!*ast.Expression {
         const node = try self.arena.allocator().create(ast.Expression);
         node.* = value;
         return node;
     }
 
-    fn parseStringLiteralWithoutInterp(self: *Self) ParseError!ast.Spanned([]const u8) {
+    fn allocTypeExpression(self: *Self, value: ast.TypeExpr) Error!*const ast.TypeExpr {
+        const node = try self.arena.allocator().create(ast.TypeExpr);
+        node.* = value;
+        return node;
+    }
+
+    fn parseStringLiteralWithoutInterp(self: *Self) Error!ast.Spanned([]const u8) {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -1415,7 +1577,7 @@ pub const Parser = struct {
         defer result.deinit(self.allocator);
         for (stringLiteral.segments) |segment| {
             if (segment == .interpolation) {
-                return ParseError.StringInterpNotAllowed;
+                return Error.StringInterpNotAllowed;
             }
             try result.appendSlice(self.allocator, segment.text.payload);
         }
@@ -1426,7 +1588,7 @@ pub const Parser = struct {
         };
     }
 
-    fn parseStringLiteral(self: *Self) ParseError!ast.StringLiteral {
+    fn parseStringLiteral(self: *Self) Error!ast.StringLiteral {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -1435,7 +1597,7 @@ pub const Parser = struct {
         var segments = std.ArrayList(ast.StringLiteral.Segment).empty;
         defer segments.deinit(self.allocator);
 
-        while (true) {
+        const end = while (true) {
             const tok = try self.nextToken();
             try self.log("stok: {}:{s}", .{ tok.tag, tok.lexeme });
 
@@ -1455,20 +1617,18 @@ pub const Parser = struct {
                     );
                     _ = try self.expectTokenTag(.string_interp_end);
                 },
-                .string_end => break,
+                .string_end => break tok,
                 else => return self.failExpectedTokens(tok.tag, &.{ .string_text, .string_end, .string_interp_start }),
             }
-        }
-
-        const end = if (segments.getLastOrNull()) |s| s.span() else start_token.span;
+        };
 
         return .{
             .segments = try self.copyToArena(ast.StringLiteral.Segment, segments.items),
-            .span = start_token.span.endAt(end),
+            .span = start_token.span.endAt(end.span),
         };
     }
 
-    fn parseStringLiteralExpr(self: *Self) ParseError!*ast.Expression {
+    fn parseStringLiteralExpr(self: *Self) Error!*ast.Expression {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -1477,7 +1637,34 @@ pub const Parser = struct {
         });
     }
 
-    fn parseMaybeBinding(self: *Self) ParseError!?ast.BindingDecl {
+    fn parseMaybeTypeBinding(self: *Self) Error!?ast.TypeBindingDecl {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const next = try self.peekToken();
+        return switch (next.tag) {
+            .kw_const => try self.parseTry(parseTypeBinding),
+            else => null,
+        };
+    }
+
+    fn parseTypeBinding(self: *Self) Error!ast.TypeBindingDecl {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const start = try self.expectTokenTag(.kw_const);
+        const identifier = try self.parseTypeIdentifier();
+        _ = try self.expectTokenTag(.assign);
+        const type_expr = try self.parseTypeExpr();
+
+        return .{
+            .span = start.span.endAt(type_expr.span()),
+            .identifier = identifier,
+            .type_expr = type_expr,
+        };
+    }
+
+    fn parseMaybeBinding(self: *Self) Error!?ast.BindingDecl {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -1488,7 +1675,7 @@ pub const Parser = struct {
         };
     }
 
-    fn parseBinding(self: *Self) ParseError!ast.BindingDecl {
+    fn parseBinding(self: *Self) Error!ast.BindingDecl {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -1498,7 +1685,7 @@ pub const Parser = struct {
             else => return self.failExpectedTokens(constOrVar.tag, &[_]token.Tag{ .kw_const, .kw_var }),
         }
         const pattern = try self.parseBindingPattern();
-        const annotation: ?*ast.TypeExpr = try self.parseMaybeTypeAnnotation();
+        const annotation = try self.parseMaybeTypeAnnotation();
         _ = try self.expectTokenTag(.assign);
         const initializer = try self.parseExpression();
 
@@ -1511,16 +1698,15 @@ pub const Parser = struct {
         };
     }
 
-    fn parseMaybeTypeAnnotation(self: *Self) ParseError!?*ast.TypeExpr {
+    fn parseMaybeTypeAnnotation(self: *Self) Error!?*const ast.TypeExpr {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
-        // TODO: Implement an actual parser for type expressions
         const tok = try self.peekToken();
         switch (tok.tag) {
             .colon => {
                 _ = try self.nextToken();
-                return try self.parseMaybeTypeAnnotation();
+                return try self.parseTypeExpr();
             },
             else => {},
         }
@@ -1528,7 +1714,7 @@ pub const Parser = struct {
         return null;
     }
 
-    fn parseMaybeFn(self: *Self) ParseError!?ast.FunctionDecl {
+    fn parseMaybeFn(self: *Self) Error!?ast.FunctionDecl {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -1539,46 +1725,207 @@ pub const Parser = struct {
         };
     }
 
-    fn parseFn(self: *Self) ParseError!ast.FunctionDecl {
+    fn parseFn(self: *Self) Error!ast.FunctionDecl {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
         const start = try self.expectTokenTag(.kw_fn);
+        const stdinType = try self.parseMaybeTypeExpr();
         const identifier = try self.expectTokenTag(.identifier);
         _ = try self.expectTokenTag(.l_paren);
-        // TODO: parameters
+        const params = try self.parseList(.comma, parseParam, .{ .terminators = &.{.r_paren} });
         _ = try self.expectTokenTag(.r_paren);
-        // TODO: types
         const returnType = try self.parseMaybeTypeExpr();
         // TODO: lambdas
-        const block = try self.parseBlock();
+        // const block = try self.parseBlock();
+        const body = try self.parseExpression();
 
         return .{
             .name = .{ .name = identifier.lexeme, .span = identifier.span },
             .is_async = false,
-            .params = &.{}, // TODO: parameters
+            .params = params.payload,
+            .stdin_type = stdinType,
             .return_type = returnType,
-            .body = .{ .block = block },
-            .span = start.span.endAt(block.span),
+            .body = .{ .expression = body },
+            .span = start.span.endAt(body.span()),
         };
     }
 
-    fn parseMaybeTypeExpr(self: *Self) ParseError!?*ast.TypeExpr {
+    fn parseParam(self: *Self) Error!*ast.Parameter {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
-        _ = try self.stream.consumeIf(.identifier);
+        const pattern = try self.parseBindingPattern();
+        const annotation = try self.parseMaybeTypeAnnotation();
+        const default_value = try self.parseMaybeDefaultValue();
+
+        const end = if (default_value) |e| e.span() else if (annotation) |e| e.span() else pattern.span();
+
+        const param = try self.arena.allocator().create(ast.Parameter);
+        param.* = .{
+            .pattern = pattern,
+            .type_annotation = annotation,
+            .default_value = default_value,
+            .is_mutable = false,
+            .span = pattern.span().endAt(end),
+        };
+
+        return param;
+    }
+
+    fn parseMaybeDefaultValue(self: *Self) Error!?*ast.Expression {
+        const peek = try self.peekToken();
+
+        if (peek.tag == .assign) {
+            _ = try self.nextToken();
+            return try self.parseExpression();
+        }
+
         return null;
     }
 
-    fn copyToArena(self: *Self, comptime T: type, values: []const T) ParseError![]const T {
+    fn parseMaybeTypeExpr(self: *Self) Error!?*const ast.TypeExpr {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        // TODO: implement
+
+        const next = try self.peekToken();
+
+        if (isTypeExprTerminator(next.tag)) return null;
+
+        return switch (next.tag) {
+            .identifier => self.parseIdentifierTypeExpr(),
+            // .kw_enum => self.parseEnumTypeExpr(),
+            // .kw_union => self.parseUnionTypeExpr(),
+            // .kw_struct => self.parseStructTypeExpr(),
+            // .kw_error => self.parseErrorTypeExpr(),
+            .l_bracket => self.parseArrayTypeExpr(),
+            // .caret => self.parsePromiseTypeExpr(),
+            // .question => self.parseOptionalTypeExpr(),
+            .l_paren => {
+                _ = try self.nextToken();
+                const type_expr = try self.parseTypeExpr();
+                _ = try self.expectTokenTag(.r_paren);
+                return type_expr;
+            },
+            else => null,
+        };
+    }
+
+    fn parseTypeExpr(self: *Self) Error!*const ast.TypeExpr {
+        const next = try self.peekToken();
+        return try self.parseMaybeTypeExpr() orelse {
+            try self.reportParseError(
+                Error.ExpectedTypeExpr,
+                next.span,
+                "expected type, actual: {s}",
+                .{next.lexeme},
+            );
+
+            return Error.ExpectedTypeExpr;
+        };
+    }
+
+    fn parseTypeIdentifier(self: *Self) Error!ast.Identifier {
+        const identifier = try self.expectTokenTag(.identifier);
+        if (std.ascii.isLower(identifier.lexeme[0])) {
+            const identifier_capitalized = try self.arena.allocator().dupe(
+                u8,
+                identifier.lexeme,
+            );
+            identifier_capitalized[0] = std.ascii.toUpper(identifier_capitalized[0]);
+            try self.reportParseError(
+                Error.ExpectedTypeIdentifier,
+                identifier.span,
+                "expected type identifier (did you mean {s}?)",
+                .{identifier_capitalized},
+            );
+            return Error.ExpectedTypeIdentifier;
+        }
+
+        return .fromToken(identifier);
+    }
+
+    fn parseIdentifier(self: *Self) Error!ast.Identifier {
+        const identifier = try self.expectTokenTag(.identifier);
+        return .fromToken(identifier);
+    }
+
+    fn parseIdentifierTypeExpr(self: *Self) Error!*const ast.TypeExpr {
+        const spanned_path: ast.Spanned([]ast.Identifier) = try self.parseList(
+            .dot,
+            parseIdentifier,
+            .{},
+        );
+        const last_segment: ast.Identifier = brk: {
+            if (spanned_path.payload.len > 0) {
+                break :brk spanned_path.payload[spanned_path.payload.len - 1];
+            }
+
+            try self.reportParseError(
+                Error.ExpectedTypeIdentifier,
+                spanned_path.span,
+                "expected type identifier",
+                .{},
+            );
+
+            return Error.ExpectedTypeIdentifier;
+        };
+
+        if (std.ascii.isLower(last_segment.name[0])) {
+            const identifier_capitalized = try self.arena.allocator().dupe(
+                u8,
+                last_segment.name,
+            );
+            identifier_capitalized[0] = std.ascii.toUpper(identifier_capitalized[0]);
+            try self.reportParseError(
+                Error.ExpectedTypeIdentifier,
+                last_segment.span,
+                "expected type identifier (did you mean {s}?)",
+                .{identifier_capitalized},
+            );
+
+            return Error.ExpectedTypeIdentifier;
+        }
+
+        // TODO: implement generic function type expressions
+
+        return self.allocTypeExpression(.{ .identifier = .{
+            .path = .{ .segments = spanned_path.payload, .span = spanned_path.span },
+            .span = spanned_path.span,
+        } });
+    }
+
+    fn parseArrayTypeExpr(self: *Self) Error!*const ast.TypeExpr {
+        const start = try self.expectTokenTag(.l_bracket);
+        _ = try self.expectTokenTag(.r_bracket);
+
+        const element = try self.parseTypeExpr();
+
+        return try self.allocTypeExpression(.{
+            .array = .{
+                .element = element,
+                .span = start.span.endAt(element.span()),
+            },
+        });
+    }
+
+    fn isTypeExprTerminator(tag: token.Tag) bool {
+        return switch (tag) {
+            .l_paren, .l_brace, .identifier, .star, .caret, .bang, .question, .kw_enum, .kw_error, .kw_union, .kw_struct => false,
+            else => true,
+        };
+    }
+
+    fn copyToArena(self: *Self, comptime T: type, values: []const T) Error![]T {
         if (values.len == 0) return &[0]T{};
         const buffer = try self.arena.allocator().alloc(T, values.len);
         std.mem.copyForwards(T, buffer, values);
         return buffer;
     }
 
-    fn skipTypeExpression(self: *Self) ParseError!void {
+    fn skipTypeExpression(self: *Self) Error!void {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -1591,7 +1938,7 @@ pub const Parser = struct {
                     try self.skipNestedStructure(tag);
                     continue;
                 },
-                .eof => return ParseError.UnexpectedEOF,
+                .eof => return Error.UnexpectedEOF,
                 else => {
                     _ = try self.nextToken();
                 },
@@ -1599,7 +1946,7 @@ pub const Parser = struct {
         }
     }
 
-    fn skipNestedStructure(self: *Self, comptime open: token.Tag) ParseError!void {
+    fn skipNestedStructure(self: *Self, comptime open: token.Tag) Error!void {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -1613,7 +1960,7 @@ pub const Parser = struct {
         while (depth > 0) {
             const tok = try self.nextToken();
             switch (tok.tag) {
-                .eof => return ParseError.UnexpectedEOF,
+                .eof => return Error.UnexpectedEOF,
                 open => depth += 1,
                 close => depth -= 1,
                 else => {},
@@ -1622,7 +1969,7 @@ pub const Parser = struct {
     }
 
     /// Consumes the next token
-    fn expectTokenTag(self: *Self, tag: token.Tag) ParseError!token.Token {
+    fn expectTokenTag(self: *Self, tag: token.Tag) Error!token.Token {
         const tok = try self.nextToken();
         if (tok.tag != tag) return self.failExpectedToken(tok.tag, tag);
         return tok;
@@ -1678,7 +2025,7 @@ pub const Parser = struct {
     pub fn structFromScript(
         self: *Self,
         script: ast.Script,
-    ) ParseError!ast.TypeExpr.StructType {
+    ) Error!ast.TypeExpr.StructType {
         var fields: std.StringArrayHashMap(ast.TypeExpr.StructField) = .init(self.allocator);
         var decls: std.StringArrayHashMap(ast.TypeExpr.StructDecl) = .init(self.allocator);
         defer {
@@ -1694,7 +2041,7 @@ pub const Parser = struct {
                             const entry = try decls.getOrPut(identifier.name);
 
                             if (entry.found_existing) {
-                                return ParseError.DuplicateStructDecl;
+                                return Error.DuplicateStructDecl;
                             }
 
                             entry.value_ptr.* = .{
@@ -1710,7 +2057,7 @@ pub const Parser = struct {
                     const entry = try decls.getOrPut(s.name.name);
 
                     if (entry.found_existing) {
-                        return ParseError.DuplicateStructDecl;
+                        return Error.DuplicateStructDecl;
                     }
 
                     entry.value_ptr.* = .{
@@ -1764,7 +2111,7 @@ test "parser preserves breadcrumb trail on unexpected token errors" {
     parser.source = ctx.source;
     parser.stream = try lexer.Stream.init(parser.arena.allocator(), "<test>", ctx.source);
 
-    try std.testing.expectError(ParseError.UnexpectedToken, parser.parseExpression());
+    try std.testing.expectError(Error.UnexpectedToken, parser.parseExpression());
 
     var buffer: [256]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
@@ -1816,5 +2163,5 @@ test "parser rejects interpolation in import module names" {
     var parser = TestParser.init(allocator, &ctx);
     defer parser.deinit();
 
-    try std.testing.expectError(ParseError.StringInterpNotAllowed, parser.parseSource(ctx.source));
+    try std.testing.expectError(Error.StringInterpNotAllowed, parser.parseSource(ctx.source));
 }

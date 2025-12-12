@@ -14,7 +14,7 @@ pub fn main() !void {
 }
 
 fn mainImpl() !runic.command_runner.ExitCode {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.GeneralPurposeAllocator(.{ .stack_trace_frames = 24 }){};
     defer {
         const status = gpa.deinit();
         if (status == .leak) std.log.err("runic CLI leaked memory", .{});

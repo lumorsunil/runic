@@ -8,9 +8,10 @@ pub const Location = struct {
     column: usize,
     offset: usize,
 
-    pub const dummy = Location{
-        .line = 0,
+    pub const global = Location{
+        .file = "<global scope>",
         .column = 0,
+        .line = 0,
         .offset = 0,
     };
 };
@@ -21,7 +22,7 @@ pub const Span = struct {
     start: Location,
     end: Location,
 
-    pub const dummy = Span{ .start = .dummy, .end = .dummy };
+    pub const global: Span = .{ .start = .global, .end = .global };
 
     pub fn fromLocs(start: Location, end: Location) Span {
         return .{ .start = start, .end = end };
@@ -41,6 +42,10 @@ pub const Span = struct {
         var new = self;
         new.end = end.end;
         return new;
+    }
+
+    pub fn containsLoc(self: Span, loc: Location) bool {
+        return std.mem.eql(u8, loc.file, self.start.file) and self.contains(loc.line, loc.column);
     }
 
     pub fn contains(self: Span, line: usize, column: usize) bool {
@@ -129,6 +134,8 @@ pub const Tag = enum {
     kw_enum,
     /// Tagged union error variant blocks.
     kw_union,
+    /// Struct.
+    kw_struct,
 
     // Async/promise keywords
     /// Async blocks/functions returning ^T.
@@ -147,8 +154,6 @@ pub const Tag = enum {
     // Module/interop keywords
     /// Module import keyword.
     kw_import,
-    /// Starts legacy bash { ... } blocks.
-    kw_bash,
 
     // Error-handling keywords
     kw_try,
@@ -211,6 +216,7 @@ pub const Tag = enum {
             .kw_error => "error",
             .kw_enum => "enum",
             .kw_union => "union",
+            .kw_struct => "struct",
             .kw_async => "async",
             .kw_await => "await",
             .kw_if => "if",
@@ -220,7 +226,6 @@ pub const Tag = enum {
             .kw_match => "match",
             .kw_return => "return",
             .kw_import => "import",
-            .kw_bash => "bash",
             .kw_try => "try",
             .kw_catch => "catch",
             .kw_true => "true",
@@ -250,6 +255,7 @@ const keyword_map = std.StaticStringMap(Tag).initComptime(.{
     .{ "error", .kw_error },
     .{ "enum", .kw_enum },
     .{ "union", .kw_union },
+    .{ "struct", .kw_struct },
     .{ "async", .kw_async },
     .{ "await", .kw_await },
     .{ "if", .kw_if },
@@ -259,7 +265,6 @@ const keyword_map = std.StaticStringMap(Tag).initComptime(.{
     .{ "match", .kw_match },
     .{ "return", .kw_return },
     .{ "import", .kw_import },
-    .{ "_bash", .kw_bash },
     .{ "try", .kw_try },
     .{ "catch", .kw_catch },
     .{ "true", .kw_true },

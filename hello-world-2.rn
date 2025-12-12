@@ -1,0 +1,9 @@
+const s = .{ "hello", ", ", "world!", "\n" }
+const s2 = "anything that can be coerced into a stream of strings\n" 
+
+tail "-f" "server.log" | cat
+
+echo "hello" > 
+
+s2 | cat "-" "server.log"
+

@@ -48,28 +48,27 @@ pub fn runScript(
         return .fromProcess(try printTokens(allocator, stdout, stderr, script.path));
     }
 
-    var documentStore = FrontendDocumentStore.init(allocator);
-    defer documentStore.deinit();
-    const entryDocument = try documentStore.requestDocument(script.path);
+    var document_store = FrontendDocumentStore.init(allocator);
+    defer document_store.deinit();
+    const entryDocument = try document_store.requestDocument(script.path);
+    const resolvedPath = try document_store.resolvePath(script.path);
+    const parser_result = entryDocument.parser.parseScript(resolvedPath);
+    const script_ast = try processResult(&document_store.document_store, stderr, parser_result) orelse return .fromProcess(1);
 
-    const resolvedPath = try documentStore.resolvePath(script.path);
-
-    const script_ast = entryDocument.parser.parseScript(resolvedPath) catch |err| {
-        handleParseScriptError(&entryDocument.parser, stderr, err) catch |err_| {
-            std.log.err("Could not handle error: {}, Original error: {}", .{ err_, err });
-        };
-        return .fromProcess(1);
-    };
-
-    parseImports(
+    const parse_imports_result = try parseImports(
         allocator,
         stderr,
-        &documentStore.document_store,
+        &document_store.document_store,
         script_ast,
-    ) catch return .fromProcess(1);
+    );
+
+    switch (parse_imports_result) {
+        .success => {},
+        inline else => return parse_imports_result,
+    }
 
     if (config.print_ast) {
-        for (documentStore.map.values()) |document| {
+        for (document_store.map.values()) |document| {
             utils.printScriptAst(stdout, document.path, document.ast.?) catch |err| {
                 try stderr.print(
                     "error: failed to print AST for script '{s}': {s}\n",
@@ -82,30 +81,20 @@ pub fn runScript(
         return .success;
     }
 
-    var type_checker = TypeChecker.init(allocator, &documentStore.document_store);
-    defer type_checker.deinit();
+    if (!config.skip_type_check) {
+        var type_checker = TypeChecker.init(allocator, &document_store.document_store);
+        defer type_checker.deinit();
 
-    const type_checker_result = type_checker.typeCheck(resolvedPath) catch |err| {
-        std.log.err("Type checker failed to run: {}", .{err});
-        return .fromProcess(1);
-    };
-
-    switch (type_checker_result) {
-        .success => {
-            if (config.type_check_only) return .success;
-        },
-        .err => |diagnostics| {
-            for (diagnostics) |d| {
-                const span = d.span();
-                const document = try documentStore.requestDocument(span.start.file);
-                try stderr.print("[{s}]: ", .{@tagName(d.severity)});
-                try logFileLineAndCol(allocator, stderr, span);
-                try stderr.print(" {s}\n", .{d.message});
-                try logSpan(stderr, span, document.source);
-                try stderr.flush();
-            }
+        const type_checker_result = type_checker.typeCheck(resolvedPath) catch |err| {
+            std.log.err("Type checker failed to run: {}", .{err});
             return .fromProcess(1);
-        },
+        };
+
+        if (try processResult(&document_store.document_store, stderr, type_checker_result)) |_| {
+            if (config.type_check_only) return .success;
+        } else {
+            return .fromProcess(1);
+        }
     }
 
     const executeOptions = ScriptExecutor.ExecuteOptions.init(
@@ -120,7 +109,7 @@ pub fn runScript(
         &runner,
         &env_map,
         executeOptions,
-        &documentStore.document_store,
+        &document_store.document_store,
     ) catch |err| {
         try stderr.print(
             "error: failed to initialize script executor: {s}\n",
@@ -212,6 +201,7 @@ const StatementExpressionIterator = struct {
     fn populateStackStatement(self: *StatementExpressionIterator, statement: *runic.ast.Statement) !void {
         switch (statement.*) {
             .error_decl, .bash_block => {},
+            .type_binding_decl => {},
             .binding_decl => |binding_decl| try self.cursor.appendExpr(binding_decl.initializer),
             .fn_decl => |fn_decl| switch (fn_decl.body) {
                 .expression => |body_expr| try self.cursor.appendExpr(body_expr),
@@ -287,19 +277,47 @@ const StatementExpressionIterator = struct {
     fn populateIfExpr(cursor: *Cursor, if_expr: *runic.ast.IfExpr) !void {
         if (if_expr.else_branch) |e| switch (e) {
             .if_expr => |else_if_expr| try populateIfExpr(cursor, else_if_expr),
-            .block => |block| try populateBlockExpr(cursor, block),
+            .expr => |expr| try cursor.appendExpr(expr),
         };
-        try populateBlockExpr(cursor, if_expr.then_block);
+        try cursor.appendExpr(if_expr.then_expr);
         try cursor.appendExpr(if_expr.condition);
     }
 };
 
+fn processResult(
+    document_store: *runic.DocumentStore,
+    writer: *std.Io.Writer,
+    result: anytype,
+) !?std.meta.fieldInfo(@TypeOf(result), .success).type {
+    return switch (result) {
+        .success => |payload| payload,
+        .err => |err_info| {
+            const diagnostics = err_info.diagnostics();
+            for (diagnostics) |d| {
+                const span = d.span();
+                const source = document_store.getSource(span.start.file) catch |err| brk: {
+                    try writer.print("<error getting document {s} : {}>", .{ span.start.file, err });
+                    break :brk null;
+                };
+                try writer.print("[{s}]: ", .{d.severity()});
+                logFileLineAndCol(writer, span) catch |err| {
+                    try writer.print("<error logging file path : {}>", .{err});
+                };
+                try writer.print(" {s}\n", .{d.message});
+                try if (source) |src| logSpan(writer, span, src) else writer.writeAll("<unable to get the source>\n\n");
+                try writer.flush();
+            }
+            return null;
+        },
+    };
+}
+
 fn parseImports(
     allocator: Allocator,
-    stderr: *std.Io.Writer,
-    documentStore: *runic.DocumentStore,
+    writer: *std.Io.Writer,
+    document_store: *runic.DocumentStore,
     script: runic.ast.Script,
-) !void {
+) !runic.command_runner.ExitCode {
     var it = try StatementExpressionIterator.init(allocator, script);
     defer it.deinit();
     while (try it.next()) |node| {
@@ -313,18 +331,16 @@ fn parseImports(
                     import_expr.module_name,
                 );
                 defer allocator.free(module_path);
-                const parser = try documentStore.getParser(module_path);
-                const importScript = parser.parseScript(module_path) catch |err| {
-                    handleParseScriptError(parser, stderr, err) catch |err_| {
-                        std.log.err("Could not handle error: {}, Original error: {}", .{ err_, err });
-                    };
-                    return err;
-                };
-                try parseImports(allocator, stderr, documentStore, importScript);
+                const parser = try document_store.getParser(module_path);
+                const result = parser.parseScript(module_path);
+                const import_script = try processResult(document_store, writer, result) orelse return .fromProcess(1);
+                _ = try parseImports(allocator, writer, document_store, import_script);
             },
             else => {},
         }
     }
+
+    return .success;
 }
 
 fn printTokens(allocator: Allocator, stdout: *std.Io.Writer, stderr: *std.Io.Writer, path: []const u8) !u8 {
@@ -403,11 +419,14 @@ fn handleParseScriptError(
 const span_color = rainbow.beginBgColor(.red) ++ rainbow.beginColor(.black);
 const end_color = rainbow.endColor();
 
-fn logFileLineAndCol(allocator: Allocator, writer: *std.Io.Writer, span: ast.Span) !void {
-    var file_path_buffer: [512]u8 = undefined;
-    const cwd = try std.fs.cwd().realpath(".", &file_path_buffer);
+fn logFileLineAndCol(writer: *std.Io.Writer, span: ast.Span) !void {
+    var fix_allocator = std.heap.FixedBufferAllocator.init(&.{});
+    var buf_allocator = std.heap.stackFallback(1024, fix_allocator.allocator());
+    const allocator = buf_allocator.get();
+
+    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
     const relative = try std.fs.path.relative(allocator, cwd, span.start.file);
-    defer allocator.free(relative);
+
     try writer.print("{s}:{}:{}:", .{ relative, span.start.line, span.start.column });
 }
 

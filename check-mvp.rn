@@ -1,0 +1,34 @@
+const bash_result = bash "mvp.sh"
+const runic_result = runic "--skip-type-check" "mvp.rn"
+
+const verbose = true
+
+if (verbose) {
+  echo "\n===BASH RESULT===:\n"
+  echo "${bash_result}"
+  echo "\n===END OF BASH RESULT===:\n"
+
+  echo "\n===RUNIC RESULT===:\n"
+  echo "${runic_result}"
+  echo "\n===END OF RUNIC RESULT===:\n"
+}
+
+if ("${bash_result}" == "${runic_result}") {
+  echo "They are the same!"
+} else {
+  echo "They are not the same!"
+
+  const bash_result_file = "mvp-bash.log"
+  const runic_result_file = "mvp-runic.log"
+
+  const store_bash_result_cmd = "cat <<EOF > ${bash_result_file}\n${bash_result}\nEOF"
+  const store_runic_result_cmd = "cat <<EOF > ${runic_result_file}\n${runic_result}\nEOF"
+
+  bash "-c" "${store_bash_result_cmd}"
+  bash "-c" "${store_runic_result_cmd}"
+
+  diff "-c" "${bash_result_file}" "${runic_result_file}"
+
+  rm "${bash_result_file}"
+  rm "${runic_result_file}"
+}

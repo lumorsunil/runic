@@ -11,6 +11,8 @@ const resolveModulePath = @import("../frontend/document_store.zig").resolveModul
 const ScriptExecutor = @import("script_executor.zig").ScriptExecutor;
 const ScriptContext = @import("script_context.zig").ScriptContext;
 const rainbow = @import("../rainbow.zig");
+const Stream = @import("../stream.zig").Stream;
+const Transformer = @import("../stream.zig").Transformer;
 
 const CommandRunner = command_runner.CommandRunner;
 const ProcessHandle = command_runner.ProcessHandle;
@@ -286,6 +288,7 @@ pub const Evaluator = struct {
         try self.log(@src().fn_name, .{});
 
         return switch (statement.*) {
+            .type_binding_decl => null,
             .binding_decl => |decl| blk: {
                 try self.executeBinding(scopes, &decl);
                 break :blk null;
@@ -307,7 +310,31 @@ pub const Evaluator = struct {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.log(@src().fn_name, .{});
 
-        return try self.evaluateExpression(scopes, expression);
+        const v = try self.evaluateExpression(scopes, expression);
+        var value_as_stream = try Stream([]const u8).fromValue(self.allocator, v);
+        defer value_as_stream.deinit();
+
+        try self.forwardStringStream(scopes, value_as_stream);
+
+        return v;
+    }
+
+    fn forwardStringStream(
+        self: *Evaluator,
+        scopes: *ScopeStack,
+        stream: *Stream([]const u8),
+    ) Error!void {
+        const stdout = scopes.getStdoutPipe();
+
+        while (stream.next() catch |err| {
+            try self.log("error reading stream: {}", .{err});
+            return;
+        }) |e| {
+            switch (e) {
+                .next => |string| try stdout.writer.writeAll(string),
+                .completed => break,
+            }
+        }
     }
 
     fn executeBinding(self: *Evaluator, scopes: *ScopeStack, decl: *const ast.BindingDecl) Error!void {
@@ -605,9 +632,10 @@ pub const Evaluator = struct {
                 var left = try self.evaluateExpression(scopes, binary.left);
                 var right = try self.evaluateExpression(scopes, binary.right);
 
+                defer left.deinit();
+                defer right.deinit();
+
                 if (left == .string and right == .string) {
-                    defer left.string.deinit(.{});
-                    defer right.string.deinit(.{});
                     return .{ .string = try .print(self.allocator, "{s}{s}", .{
                         try left.string.get(),
                         try right.string.get(),
@@ -627,8 +655,11 @@ pub const Evaluator = struct {
                 }
             },
             .subtract => {
-                const left = try self.evaluateExpression(scopes, binary.left);
-                const right = try self.evaluateExpression(scopes, binary.right);
+                var left = try self.evaluateExpression(scopes, binary.left);
+                var right = try self.evaluateExpression(scopes, binary.right);
+
+                defer left.deinit();
+                defer right.deinit();
 
                 if (left == .integer and right == .integer) {
                     return .{ .integer = left.integer -| right.integer };
@@ -643,8 +674,11 @@ pub const Evaluator = struct {
                 }
             },
             .multiply => {
-                const left = try self.evaluateExpression(scopes, binary.left);
-                const right = try self.evaluateExpression(scopes, binary.right);
+                var left = try self.evaluateExpression(scopes, binary.left);
+                var right = try self.evaluateExpression(scopes, binary.right);
+
+                defer left.deinit();
+                defer right.deinit();
 
                 if (left == .integer and right == .integer) {
                     return .{ .integer = left.integer *| right.integer };
@@ -659,8 +693,11 @@ pub const Evaluator = struct {
                 }
             },
             .divide => {
-                const left = try self.evaluateExpression(scopes, binary.left);
-                const right = try self.evaluateExpression(scopes, binary.right);
+                var left = try self.evaluateExpression(scopes, binary.left);
+                var right = try self.evaluateExpression(scopes, binary.right);
+
+                defer left.deinit();
+                defer right.deinit();
 
                 if (left == .integer and right == .integer) {
                     const float_left: Value.Float = @floatFromInt(left.integer);
@@ -677,8 +714,11 @@ pub const Evaluator = struct {
                 }
             },
             .remainder => {
-                const left = try self.evaluateExpression(scopes, binary.left);
-                const right = try self.evaluateExpression(scopes, binary.right);
+                var left = try self.evaluateExpression(scopes, binary.left);
+                var right = try self.evaluateExpression(scopes, binary.right);
+
+                defer left.deinit();
+                defer right.deinit();
 
                 if (left == .integer and right == .integer) {
                     const float_left: Value.Float = @floatFromInt(left.integer);
@@ -695,8 +735,11 @@ pub const Evaluator = struct {
                 }
             },
             .greater => {
-                const left = try self.evaluateExpression(scopes, binary.left);
-                const right = try self.evaluateExpression(scopes, binary.right);
+                var left = try self.evaluateExpression(scopes, binary.left);
+                var right = try self.evaluateExpression(scopes, binary.right);
+
+                defer left.deinit();
+                defer right.deinit();
 
                 if (left.isNumeric() and right.isNumeric()) {
                     const left_value: Value.Float = if (left == .integer) @floatFromInt(left.integer) else left.float;
@@ -705,8 +748,11 @@ pub const Evaluator = struct {
                 }
             },
             .greater_equal => {
-                const left = try self.evaluateExpression(scopes, binary.left);
-                const right = try self.evaluateExpression(scopes, binary.right);
+                var left = try self.evaluateExpression(scopes, binary.left);
+                var right = try self.evaluateExpression(scopes, binary.right);
+
+                defer left.deinit();
+                defer right.deinit();
 
                 if (left.isNumeric() and right.isNumeric()) {
                     const left_value: Value.Float = if (left == .integer) @floatFromInt(left.integer) else left.float;
@@ -715,8 +761,11 @@ pub const Evaluator = struct {
                 }
             },
             .less => {
-                const left = try self.evaluateExpression(scopes, binary.left);
-                const right = try self.evaluateExpression(scopes, binary.right);
+                var left = try self.evaluateExpression(scopes, binary.left);
+                var right = try self.evaluateExpression(scopes, binary.right);
+
+                defer left.deinit();
+                defer right.deinit();
 
                 if (left.isNumeric() and right.isNumeric()) {
                     const left_value: Value.Float = if (left == .integer) @floatFromInt(left.integer) else left.float;
@@ -725,8 +774,11 @@ pub const Evaluator = struct {
                 }
             },
             .less_equal => {
-                const left = try self.evaluateExpression(scopes, binary.left);
-                const right = try self.evaluateExpression(scopes, binary.right);
+                var left = try self.evaluateExpression(scopes, binary.left);
+                var right = try self.evaluateExpression(scopes, binary.right);
+
+                defer left.deinit();
+                defer right.deinit();
 
                 if (left.isNumeric() and right.isNumeric()) {
                     const left_value: Value.Float = if (left == .integer) @floatFromInt(left.integer) else left.float;
@@ -735,18 +787,29 @@ pub const Evaluator = struct {
                 }
             },
             .equal => {
-                const left = try self.evaluateExpression(scopes, binary.left);
-                const right = try self.evaluateExpression(scopes, binary.right);
+                var left = try self.evaluateExpression(scopes, binary.left);
+                var right = try self.evaluateExpression(scopes, binary.right);
+
+                defer left.deinit();
+                defer right.deinit();
 
                 if (left.isNumeric() and right.isNumeric()) {
                     const left_value: Value.Float = if (left == .integer) @floatFromInt(left.integer) else left.float;
                     const right_value: Value.Float = if (right == .integer) @floatFromInt(right.integer) else right.float;
                     return .{ .boolean = left_value == right_value };
+                } else if (left == .string and right == .string) {
+                    const l = try left.string.get();
+                    const r = try right.string.get();
+
+                    return .{ .boolean = std.mem.eql(u8, l, r) };
                 }
             },
             .not_equal => {
-                const left = try self.evaluateExpression(scopes, binary.left);
-                const right = try self.evaluateExpression(scopes, binary.right);
+                var left = try self.evaluateExpression(scopes, binary.left);
+                var right = try self.evaluateExpression(scopes, binary.right);
+
+                defer left.deinit();
+                defer right.deinit();
 
                 if (left.isNumeric() and right.isNumeric()) {
                     const left_value: Value.Float = if (left == .integer) @floatFromInt(left.integer) else left.float;
@@ -755,16 +818,22 @@ pub const Evaluator = struct {
                 }
             },
             .logical_and => {
-                const left = try self.evaluateExpression(scopes, binary.left);
-                const right = try self.evaluateExpression(scopes, binary.right);
+                var left = try self.evaluateExpression(scopes, binary.left);
+                var right = try self.evaluateExpression(scopes, binary.right);
+
+                defer left.deinit();
+                defer right.deinit();
 
                 if (left == .boolean and right == .boolean) {
                     return .{ .boolean = left.boolean and right.boolean };
                 }
             },
             .logical_or => {
-                const left = try self.evaluateExpression(scopes, binary.left);
-                const right = try self.evaluateExpression(scopes, binary.right);
+                var left = try self.evaluateExpression(scopes, binary.left);
+                var right = try self.evaluateExpression(scopes, binary.right);
+
+                defer left.deinit();
+                defer right.deinit();
 
                 if (left == .boolean and right == .boolean) {
                     return .{ .boolean = left.boolean or right.boolean };
@@ -786,13 +855,15 @@ pub const Evaluator = struct {
         var condition_value = try self.evaluateExpression(scopes, if_expr.condition);
         const condition = try expectBoolean(&condition_value);
 
+        // TODO: handle captures
+
         if (condition) {
-            const result = try self.runBlockInOwnContext(scopes, if_expr.then_block);
+            const result = try self.evaluateExpression(scopes, if_expr.then_expr);
             return result;
         } else if (if_expr.else_branch) |else_branch| {
             const result = switch (else_branch) {
                 .if_expr => |else_if_expr| try self.evaluateIfExpression(scopes, else_if_expr.*),
-                .block => |else_expr| try self.runBlockInOwnContext(scopes, else_expr),
+                .expr => |else_expr| try self.evaluateExpression(scopes, else_expr),
             };
             return result;
         }
@@ -1204,13 +1275,17 @@ pub const Evaluator = struct {
         return buffer;
     }
 
-    fn renderStringLiteral(self: *Evaluator, scopes: *ScopeStack, literal: ast.StringLiteral) Error!Value.String {
+    fn renderStringLiteral(
+        self: *Evaluator,
+        scopes: *ScopeStack,
+        literal: ast.StringLiteral,
+    ) Error!Value.String {
         var buffer = ArrayListManaged(u8).init(self.allocator);
         errdefer buffer.deinit();
 
         for (literal.segments) |segment| {
             switch (segment) {
-                .text => |t| try buffer.appendSlice(t.payload),
+                .text => |t| try decodeString(&buffer, t.payload),
                 .interpolation => |expr_ptr| {
                     var value = try self.evaluateExpression(scopes, expr_ptr);
                     defer value.deinit();
@@ -1222,6 +1297,35 @@ pub const Evaluator = struct {
         }
 
         return .init(self.allocator, try buffer.toOwnedSlice(), .{});
+    }
+
+    fn decodeString(dynamic_string: *ArrayListManaged(u8), encoded_string: []const u8) !void {
+        var i: usize = 0;
+        while (i < encoded_string.len) : (i += 1) {
+            const rest = encoded_string[i..];
+            const ch = encoded_string[i];
+
+            if (rest.len < 2) {
+                try dynamic_string.append(ch);
+                break;
+            }
+
+            if (std.mem.eql(u8, rest[0..2], "\\n")) {
+                try dynamic_string.append('\n');
+                i += 1;
+                continue;
+            } else if (std.mem.eql(u8, rest[0..2], "\\t")) {
+                try dynamic_string.append('\t');
+                i += 1;
+                continue;
+            } else if (std.mem.eql(u8, rest[0..2], "\\r")) {
+                try dynamic_string.append('\r');
+                i += 1;
+                continue;
+            }
+
+            try dynamic_string.append(ch);
+        }
     }
 
     fn materializeString(self: *Evaluator, value: *Value) Error!Value.String {

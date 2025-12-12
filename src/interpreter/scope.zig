@@ -161,6 +161,18 @@ pub const ScopeStack = struct {
         }
     };
 
+    pub const MaterializedForwardContext = struct {
+        stdout: PipeMaterialized,
+        stderr: PipeMaterialized,
+
+        pub fn init(stdout: PipeMaterialized, stderr: PipeMaterialized) MaterializedForwardContext {
+            return .{
+                .stdout = stdout,
+                .stderr = stderr,
+            };
+        }
+    };
+
     const PipeInfo = union(enum) {
         inherit,
         materialized: PipeMaterialized,
@@ -199,6 +211,7 @@ pub const ScopeStack = struct {
             pub fn deinit(self: *BindingValue, allocator: Allocator) void {
                 allocator.free(self.name);
                 self.value.deinit();
+                // TODO: this causes a double-free when we release the mutable RC while popping the scope
                 allocator.destroy(self);
             }
 
@@ -250,7 +263,9 @@ pub const ScopeStack = struct {
         pub fn deinit(self: *Binding, allocator: Allocator) void {
             switch (self.*) {
                 .constant => |c| c.deinit(allocator),
-                .mutable => |*m| m.deinit(.{}),
+                .mutable => |*m| m.deinit(.{
+                    .deinit_child_fn = .withAllocator(BindingValue.deinit),
+                }),
             }
         }
 
@@ -490,7 +505,10 @@ pub const ScopeStack = struct {
                 ));
             },
             .mutable => {
-                try frame.single.append(self.allocator, try binding.ref(.{ .label = @src().fn_name }));
+                try frame.single.append(
+                    self.allocator,
+                    try binding.ref(.{ .label = @src().fn_name }),
+                );
             },
         }
     }
@@ -658,7 +676,7 @@ pub const ScopeStack = struct {
 
     pub fn getForwardContext(
         self: *ScopeStack,
-    ) ForwardContext {
+    ) MaterializedForwardContext {
         var index = self.frames.items.len - 1;
         var stdout: ?PipeMaterialized = null;
         var stderr: ?PipeMaterialized = null;
@@ -682,10 +700,7 @@ pub const ScopeStack = struct {
             }
 
             if (stdout != null and stderr != null) {
-                return .init(
-                    .{ .materialized = stdout.? },
-                    .{ .materialized = stderr.? },
-                );
+                return .init(stdout.?, stderr.?);
             }
 
             if (index == 0) @panic("shouldn't happen :)");
@@ -722,12 +737,12 @@ pub const ScopeStack = struct {
 
     pub fn getStdoutPipe(self: *ScopeStack) PipeMaterialized {
         const forward_context = self.getForwardContext();
-        return forward_context.stdout.materialized;
+        return forward_context.stdout;
     }
 
     pub fn getStderrPipe(self: *ScopeStack) PipeMaterialized {
         const forward_context = self.getForwardContext();
-        return forward_context.stderr.materialized;
+        return forward_context.stderr;
     }
 };
 

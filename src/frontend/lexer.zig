@@ -777,11 +777,11 @@ pub const Stream = struct {
     }
 };
 
-fn isIdentifierStart(ch: u8) bool {
+pub fn isIdentifierStart(ch: u8) bool {
     return std.ascii.isAlphabetic(ch) or ch == '_';
 }
 
-fn isIdentifierContinue(ch: u8) bool {
+pub fn isIdentifierContinue(ch: u8) bool {
     return isIdentifierStart(ch) or std.ascii.isDigit(ch);
 }
 

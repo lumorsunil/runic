@@ -53,6 +53,7 @@ pub const Workspace = struct {
     index: std.ArrayList(symbols.Symbol) = .empty,
     diagnostics: std.ArrayList(diag.Diagnostic) = .empty,
     documents: *LspDocumentStore,
+    type_checker: runic.semantic.TypeChecker,
 
     const self_dirs = [_][]const u8{ "src", "examples", "tests" };
 
@@ -60,6 +61,10 @@ pub const Workspace = struct {
         var workspace = Workspace{
             .allocator = allocator,
             .documents = documentStore,
+            .type_checker = .init(
+                allocator,
+                &documentStore.document_store,
+            ),
         };
 
         try workspace.addKeywordsToIndex();
@@ -76,6 +81,7 @@ pub const Workspace = struct {
         self.clearDiagnostics();
         self.index.deinit(self.allocator);
         self.diagnostics.deinit(self.allocator);
+        self.type_checker.deinit();
     }
 
     fn addKeywordsToIndex(self: *Workspace) !void {

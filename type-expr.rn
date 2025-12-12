@@ -1,0 +1,25 @@
+# type-expr.rn
+
+const a: Byte = 5
+const MyString = String
+const MyOtherString = MyString;
+const b: MyString = "this is a string"
+
+const c: MyOtherString = "my string"
+
+var d = 5
+
+fn hello(in: String = 3) Void {
+  in
+}
+
+
+var in_outer_scope = 6
+
+{
+  var in_inner_scope = 2
+}
+
+b = 5
+b = d
+d = c

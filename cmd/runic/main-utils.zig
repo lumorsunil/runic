@@ -15,6 +15,7 @@ pub const CliConfig = struct {
     print_ast: bool = false,
     print_tokens: bool = false,
     type_check_only: bool = false,
+    skip_type_check: bool = false,
 
     const Mode = union(enum) {
         script: ScriptInvocation,
@@ -181,13 +182,13 @@ fn renderExpressionAst(writer: *std.Io.Writer, expr: *const ast.Expression, leve
 
             try writeIndent(writer, level + 1);
             try writer.print("then:\n", .{});
-            try renderBlockStatements(writer, if_expr.then_block, level + 2);
+            try renderExpressionAst(writer, if_expr.then_expr, level + 2);
 
             if (if_expr.else_branch) |branch| {
                 try writeIndent(writer, level + 1);
                 try writer.print("else:\n", .{});
                 switch (branch) {
-                    .block => |else_block| try renderBlockStatements(writer, else_block, level + 2),
+                    .expr => |else_expr| try renderExpressionAst(writer, else_expr, level + 2),
                     .if_expr => |nested_if| try renderExpressionAst(writer, &.from(nested_if.*), level + 2),
                 }
             }
@@ -273,6 +274,17 @@ fn renderStatementAst(writer: *std.Io.Writer, stmt: *const ast.Statement, level:
             try writer.writeByte('\n');
             try renderExpressionAst(writer, expr_stmt.expression, level + 1);
         },
+        .type_binding_decl => |type_binding_decl| {
+            try writeIndent(writer, level);
+            try writer.print("type_binding_decl @ ", .{});
+            try printSpanInline(writer, type_binding_decl.span);
+            try writer.writeByte('\n');
+            try writeIndent(writer, level + 1);
+            try writer.print("binding {s} @ ", .{type_binding_decl.identifier.name});
+            try printSpanInline(writer, type_binding_decl.identifier.span);
+            try writer.writeByte('\n');
+            try renderTypeExpr(writer, type_binding_decl.type_expr, level + 1);
+        },
         .binding_decl => |binding_decl| {
             try writeIndent(writer, level);
             try writer.print("binding_decl @ ", .{});
@@ -282,6 +294,7 @@ fn renderStatementAst(writer: *std.Io.Writer, stmt: *const ast.Statement, level:
             try writer.print("is_mutable {}", .{binding_decl.is_mutable});
             try writer.writeByte('\n');
             try renderBindingPatternAst(writer, binding_decl.pattern, level + 1);
+            try renderTypeExpr(writer, binding_decl.annotation, level + 1);
             try renderExpressionAst(writer, binding_decl.initializer, level + 1);
         },
         .fn_decl => |fn_decl| {
@@ -374,6 +387,15 @@ fn renderBindingPatternAst(
             }
         },
     }
+}
+
+fn renderTypeExpr(
+    writer: *std.Io.Writer,
+    type_expr: ?*const ast.TypeExpr,
+    level: usize,
+) !void {
+    try writeIndent(writer, level);
+    try writer.print("type: {?f}\n", .{type_expr});
 }
 
 fn renderLiteralAst(writer: *std.Io.Writer, literal: ast.Literal, level: usize) !void {
@@ -554,6 +576,7 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
     var print_ast = false;
     var print_tokens = false;
     var type_check_only = false;
+    var skip_type_check = false;
     var parsing_options = true;
     var idx: usize = 1;
 
@@ -584,6 +607,10 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
             }
             if (argEqual(arg, "--type-check-only")) {
                 type_check_only = true;
+                continue;
+            }
+            if (argEqual(arg, "--skip-type-check")) {
+                skip_type_check = true;
                 continue;
             }
             if (std.mem.startsWith(u8, arg, trace_prefix)) {
@@ -674,6 +701,12 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
     if (type_check_only and script_path == null) {
         return usageError(allocator, "--type-check-only requires a script path.", .{});
     }
+    if (skip_type_check and repl_requested) {
+        return usageError(allocator, "--skip-type-check requires a script path.", .{});
+    }
+    if (skip_type_check and script_path == null) {
+        return usageError(allocator, "--skip-type-check requires a script path.", .{});
+    }
 
     const trace_slice = try finalizeList([]const u8, &trace_topics, &trace_cleanup);
     const module_slice = try finalizeList([]const u8, &module_paths, &module_cleanup);
@@ -690,6 +723,7 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
                 .print_ast = print_ast,
                 .print_tokens = print_tokens,
                 .type_check_only = type_check_only,
+                .skip_type_check = skip_type_check,
             },
         };
     }
@@ -704,6 +738,7 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
             .print_ast = print_ast,
             .print_tokens = print_tokens,
             .type_check_only = type_check_only,
+            .skip_type_check = skip_type_check,
         },
     };
 }

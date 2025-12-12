@@ -108,6 +108,7 @@ pub const ClientRequestPayload = union(enum) {
     @"textDocument/didChange": DidChangeTextDocumentParams,
     @"textDocument/didClose": DidCloseTextDocumentParams,
     @"textDocument/completion": CompletionParams,
+    @"textDocument/hover": HoverParams,
     @"workspace/didChangeConfiguration": DidChangeConfigurationParams,
     @"workspace/didChangeWatchedFiles": DidChangeWatchedFilesParams,
     @"$/cancelRequest",
@@ -149,6 +150,14 @@ pub const CompletionParams = struct {
     workDoneToken: ?ProgressToken = null,
     partialResultToken: ?ProgressToken = null,
     context: ?CompletionContext = null,
+};
+
+pub const HoverParams = struct {
+    /// The text document.
+    textDocument: TextDocumentIdentifier,
+
+    /// The position inside the text document.
+    position: Position,
 };
 
 pub const ProgressToken = IntegerOrString;
@@ -280,6 +289,13 @@ pub const Range = struct {
             .end = .fromLocation(span.end),
         };
     }
+
+    pub fn fromLocation(location: runic.token.Location) @This() {
+        return .{
+            .start = .fromLocation(location),
+            .end = .fromLocation(location),
+        };
+    }
 };
 
 pub const Position = struct {
@@ -288,8 +304,17 @@ pub const Position = struct {
 
     pub fn fromLocation(location: runic.token.Location) @This() {
         return .{
-            .line = @intCast(location.line - 1),
-            .character = @intCast(location.column - 1),
+            .line = @intCast(location.line -| 1),
+            .character = @intCast(location.column -| 1),
+        };
+    }
+
+    pub fn toLocation(self: Position, path: []const u8) runic.token.Location {
+        return .{
+            .file = path,
+            .line = @intCast(self.line + 1),
+            .column = @intCast(self.character + 1),
+            .offset = 0,
         };
     }
 
@@ -729,6 +754,16 @@ pub const CompletionOptions = struct {
 
 pub const HoverOptions = struct {
     workDoneProgress: ?bool = null,
+};
+
+/// The result of a hover request.
+pub const Hover = struct {
+    /// The hover's content
+    contents: MarkupContent,
+
+    /// An optional range is a range inside a text document
+    /// that is used to visualize a hover, e.g. by changing the background color.
+    range: ?Range,
 };
 
 pub const SignatureHelpOptions = struct {

@@ -44,6 +44,8 @@ pub fn collectSymbols(
             .fn_decl => |fn_decl| {
                 try appendSymbol(allocator, list, .function, fn_decl.name.name, detail);
             },
+            // TODO: implement?
+            .type_binding_decl => {},
             .binding_decl => |binding_decl| {
                 switch (binding_decl.pattern.*) {
                     .discard => {},
