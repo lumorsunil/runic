@@ -1,1 +1,2 @@
-echo "hello"
+"hello\n"
+echo "hello" | cat

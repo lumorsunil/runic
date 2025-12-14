@@ -26,7 +26,7 @@ pub fn Transformer(comptime T: type) type {
                     },
                     .array => |array_ref| {
                         const array = array_ref.get() catch return null;
-                        const source = try Stream(Value).initBuffer(allocator, array.items);
+                        const source = try Stream(Value).initFixed(allocator, array.items);
                         defer source.deinit();
                         return source.map(Transformer([]const u8).transform);
                     },

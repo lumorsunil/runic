@@ -32,7 +32,7 @@ pub const StreamError = RCError || error{
     InitFailed,
 };
 
-fn BufferedStream(comptime T: type) type {
+fn FixedStream(comptime T: type) type {
     return struct {
         stream: Stream(T) = .init(&vtable),
         ref: RC(@This()).Ref = undefined,
@@ -129,6 +129,69 @@ fn SingleStream(comptime T: type) type {
         }
     };
 }
+
+const IoReaderByteStream = struct {
+    stream: Stream([]const u8) = .init(&vtable),
+    ref: RC(@This()).Ref = undefined,
+    source: *std.Io.Reader,
+
+    const vtable = Stream([]const u8).VTable{
+        .next = next,
+        .deinit = deinit,
+        .getAllocator = getAllocator,
+        .newRef = newRef,
+    };
+
+    pub fn init(source: *std.Io.Reader) RCError!@This() {
+        return .{
+            .source = source,
+        };
+    }
+
+    fn getParent(self: *Stream([]const u8)) *@This() {
+        return @fieldParentPtr("stream", self);
+    }
+
+    pub fn newRef(self: *Stream([]const u8)) RCError!void {
+        _ = try getParent(self).ref.ref(.{});
+    }
+
+    pub fn next(self: *Stream([]const u8)) StreamError!?StreamEvent([]const u8) {
+        return getParent(self).nextInner();
+    }
+
+    pub fn nextInner(self: *@This()) StreamError!?StreamEvent([]const u8) {
+        const source_next = try self.source.next() orelse return null;
+        return switch (source_next) {
+            .completed => .completed,
+            .next => |n| {
+                const result = self.mapFn(try self.ref.allocator(), n) catch |err| {
+                    self.stream.err = err;
+                    return err;
+                } orelse return null;
+
+                return .{ .next = result };
+            },
+        };
+    }
+
+    pub fn deinit(self: *Stream([]const u8)) void {
+        const parent = getParent(self);
+        parent.source.deinit();
+        parent.ref.deinit(.{ .refresh_ref = true });
+    }
+
+    pub fn getAllocator(self: *Stream([]const u8)) RCError!std.mem.Allocator {
+        return getParent(self).ref.allocator();
+    }
+};
+
+// fn ByteTransformerStream(comptime T: type) type {
+//     return struct {
+//         source: *Stream(u8),
+//         stream: Stream(u8),
+//     };
+// }
 
 fn MappedStream(comptime In: type, comptime Out: type) type {
     const MapFn = *const fn (std.mem.Allocator, In) StreamError!?Out;
@@ -274,8 +337,8 @@ pub fn Stream(comptime T: type) type {
             return &single_stream.stream;
         }
 
-        pub fn initBuffer(allocator: std.mem.Allocator, buffer: []const T) RCError!*Stream(T) {
-            const buffered_stream_ref = try RC(BufferedStream(T)).Ref.init(
+        pub fn initFixed(allocator: std.mem.Allocator, buffer: []const T) RCError!*Stream(T) {
+            const buffered_stream_ref = try RC(FixedStream(T)).Ref.init(
                 allocator,
                 .init(buffer),
                 .{},
