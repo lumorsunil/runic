@@ -939,7 +939,7 @@ pub const ScopeStack = struct {
         while (idx >= 0) : (idx -= 1) {
             const frame = &self.frames.items[idx];
             switch (frame.*) {
-                .cwd => |cwd| return try cwd.clone(.{}),
+                .cwd => |cwd| return try cwd.ref(.{}),
                 else => continue,
             }
         }

@@ -10,7 +10,7 @@ pub const RCError =
         InvalidRef,
     };
 
-const log_enabled = false;
+const log_enabled = true;
 
 // const prefix_color = "";
 // const prefix_ref_color = "";
@@ -33,6 +33,10 @@ const end_color = rainbow.endColor();
 pub const RCInitOptions = struct {
     label: ?[]const u8 = null,
 };
+
+fn isLoggingEnabled() bool {
+    return std.process.hasEnvVar(std.heap.page_allocator, "RUNIC_LOG_RC") catch false;
+}
 
 pub fn RC(comptime T: type) type {
     return struct {
@@ -71,7 +75,7 @@ pub fn RC(comptime T: type) type {
             }
 
             pub fn log(self: Ref, comptime fmt: []const u8, args: anytype) !void {
-                if (!log_enabled) return;
+                if (!isLoggingEnabled()) return;
 
                 var stderr = std.fs.File.stderr().writer(&.{});
                 const writer = &stderr.interface;
@@ -140,6 +144,7 @@ pub fn RC(comptime T: type) type {
                     return RCError.InvalidRef;
                 };
 
+                try self.log("{s}clone rc{s} (source)", .{ ref_color, end_color });
                 const rc_clone = try rc.clone();
                 return try rc_clone.ref(options);
             }
@@ -215,7 +220,7 @@ pub fn RC(comptime T: type) type {
         }
 
         pub fn log(self: *RC(T), comptime fmt: []const u8, args: anytype) !void {
-            if (!log_enabled) return;
+            if (!isLoggingEnabled()) return;
 
             var stderr = std.fs.File.stderr().writer(&.{});
             const writer = &stderr.interface;

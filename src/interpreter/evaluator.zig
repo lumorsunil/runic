@@ -466,7 +466,7 @@ pub const Evaluator = struct {
         self: *Evaluator,
         identifier: ast.Identifier,
     ) Error!*ast.FunctionDecl {
-        const fn_decl = try self.allocator.create(ast.FunctionDecl);
+        const fn_decl = try self.loose_ends_arena.allocator().create(ast.FunctionDecl);
 
         const span = identifier.span;
 
