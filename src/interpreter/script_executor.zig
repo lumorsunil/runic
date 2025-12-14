@@ -1,5 +1,4 @@
 const std = @import("std");
-const ScriptContext = @import("script_context.zig").ScriptContext;
 
 const ast = @import("../frontend/ast.zig");
 const utils = @import("../utils.zig");
@@ -9,8 +8,6 @@ const CommandExecutor = interpreter.CommandExecutor;
 const ScopeStack = interpreter.ScopeStack;
 const RuntimeValue = interpreter.Value;
 const command_runner = @import("../runtime/command_runner.zig");
-const CommandRunner = command_runner.CommandRunner;
-const BindingError = ScriptContext.BindingError;
 const rainbow = @import("../rainbow.zig");
 const DocumentStore = @import("../document_store.zig").DocumentStore;
 
@@ -31,7 +28,6 @@ pub const ScriptExecutor = struct {
 
     const CommandBridge = struct {
         allocator: Allocator,
-        runner: *CommandRunner,
         evaluator: *Evaluator,
         scopes: *ScopeStack,
         env_map: ?*std.process.EnvMap,
@@ -39,18 +35,21 @@ pub const ScriptExecutor = struct {
 
     pub const ExecuteOptions = struct {
         script_path: []const u8,
+        cwd: []const u8,
+        env_map: std.process.EnvMap,
         forward_context: ScopeStack.ForwardContext,
-        context: *ScriptContext,
 
         pub fn init(
             script_path: []const u8,
+            cwd: []const u8,
+            env_map: std.process.EnvMap,
             forward_context: ScopeStack.ForwardContext,
-            context: *ScriptContext,
         ) ExecuteOptions {
             return .{
+                .cwd = cwd,
+                .env_map = env_map,
                 .script_path = script_path,
                 .forward_context = forward_context,
-                .context = context,
             };
         }
     };
@@ -58,7 +57,6 @@ pub const ScriptExecutor = struct {
     pub fn initWithRunner(
         allocator: Allocator,
         path: []const u8,
-        runner: *CommandRunner,
         env_map: ?*std.process.EnvMap,
         executeOptions: ExecuteOptions,
         documentStore: *DocumentStore,
@@ -66,7 +64,6 @@ pub const ScriptExecutor = struct {
         const bridge = try allocator.create(CommandBridge);
         bridge.* = .{
             .allocator = allocator,
-            .runner = runner,
             .evaluator = undefined,
             .scopes = undefined,
             .env_map = env_map,
@@ -86,10 +83,7 @@ pub const ScriptExecutor = struct {
         );
         try scopes.pushFrame(@src().fn_name, try .initSingleNew(allocator));
 
-        const evaluator = Evaluator.init(allocator, path, CommandExecutor{
-            .context = bridge,
-            .runFn = runWithEnvMap,
-        }, executeOptions, documentStore);
+        const evaluator = Evaluator.init(allocator, path, executeOptions, documentStore);
 
         return .{
             .allocator = allocator,
@@ -104,39 +98,8 @@ pub const ScriptExecutor = struct {
         if (self.command_bridge) |bridge| {
             self.allocator.destroy(bridge);
         }
+        self.evaluator.deinit();
         self.* = undefined;
-    }
-
-    pub fn reseedFromContext(
-        self: *ScriptExecutor,
-        context: *const ScriptContext,
-    ) (Allocator.Error || ScopeStack.Error)!void {
-        try self.reseedInterpreterScopeWithContext(context);
-    }
-
-    pub fn reseedInterpreterScopeWithContext(
-        self: *ScriptExecutor,
-        context: *const ScriptContext,
-    ) (Allocator.Error || ScopeStack.Error)!void {
-        var fresh = ScopeStack.init(self.allocator);
-        errdefer fresh.deinit();
-
-        try fresh.pushFrame(.{});
-
-        for (context.bindings.items) |binding| {
-            switch (binding.value) {
-                .string => |literal| {
-                    var runtime_value = RuntimeValue{ .string = try .dupe(self.allocator, literal) };
-                    errdefer runtime_value.deinit(self.allocator);
-                    try fresh.declare(binding.name, &runtime_value, binding.is_mutable);
-                },
-                else => {},
-            }
-        }
-
-        var previous = self.scopes.*;
-        self.scopes.* = fresh;
-        previous.deinit();
     }
 
     pub fn wireCommandBridge(self: *ScriptExecutor, scopes: *ScopeStack) void {
@@ -158,7 +121,7 @@ pub const ScriptExecutor = struct {
             .process_handle => |*handle| {
                 try utils.forwardHandleOutput(handle, options.stdout, options.stderr);
                 if (!handle.status.ok) {
-                    return handle.status.exit_code orelse .fromProcess(1);
+                    return handle.status.exit_code orelse .fromTerm(1);
                 }
             },
             else => {},
@@ -167,21 +130,22 @@ pub const ScriptExecutor = struct {
         return null;
     }
 
-    fn getExitCode(value: *interpreter.Value) ?command_runner.ExitCode {
-        switch (value.*) {
-            .process_handle => |*handle| {
-                if (!handle.status.ok) {
-                    return handle.status.exit_code orelse .fromProcess(1);
-                }
-            },
-            else => {},
+    pub fn execute(
+        self: *ScriptExecutor,
+        script: ast.Script,
+        options: ExecuteOptions,
+    ) !command_runner.ExitCode {
+        try self.scopes.pushCwd(@src().fn_name, options.cwd);
+        try self.scopes.pushEnvMap(@src().fn_name);
+        try self.scopes.pushFrameForwarding(@src().fn_name, options.forward_context);
+
+        var env_it = options.env_map.iterator();
+        while (env_it.next()) |entry| {
+            var value = interpreter.Value{
+                .string = try .dupe(self.allocator, entry.value_ptr.*, .{}),
+            };
+            try self.scopes.declareEnvVar(entry.key_ptr.*, &value, true);
         }
-
-        return null;
-    }
-
-    pub fn execute(self: *ScriptExecutor, script: ast.Script, options: ExecuteOptions) !command_runner.ExitCode {
-        try self.scopes.pushFrame(@src().fn_name, .initForwardContext(options.forward_context));
 
         for (script.statements) |stmt| {
             const maybe_value = self.evaluator.runStatement(self.scopes, stmt) catch |err| {
@@ -189,22 +153,22 @@ pub const ScriptExecutor = struct {
                 var stderr_file_writer = std.fs.File.stderr().writer(&.{});
                 // const stderr = self.scopes.getForwardContext().stderr.materialized.writer;
                 try self.renderEvaluatorError(&stderr_file_writer.interface, options.script_path, stmt.span(), err);
-                return .fromProcess(1);
+                return .fromByte(1);
             };
 
             if (maybe_value) |value| {
                 var owned = value;
                 defer owned.deinit();
                 // const code = try forwardHandleOutputIfProcessHandle(
-                const code = getExitCode(&owned);
-                if (code) |the_code| {
-                    if (the_code == .success) {} else {
-                        // TODO: redirect properly when error handling is implemented for function calls and blocks etc.
-                        var stderr_file_writer = std.fs.File.stderr().writer(&.{});
-                        try self.renderExitCodeError(&stderr_file_writer.interface, stmt.span(), the_code);
-                        return the_code;
-                    }
-                }
+                // const code = getExitCode(&owned);
+                // if (code) |the_code| {
+                //     if (the_code == .success) {} else {
+                //         // TODO: redirect properly when error handling is implemented for function calls and blocks etc.
+                //         var stderr_file_writer = std.fs.File.stderr().writer(&.{});
+                //         try self.renderExitCodeError(&stderr_file_writer.interface, stmt.span(), the_code);
+                //         return the_code;
+                //     }
+                // }
             }
         }
 
@@ -239,10 +203,16 @@ pub const ScriptExecutor = struct {
 
         switch (exit_code) {
             .success => return,
-            .byte => |byte| try writer.print(
-                "{s}:{d}:{d}: script execution error: terminated with exit code {}\n",
-                .{ span.start.file, span.start.line, span.start.column, byte },
-            ),
+            .term => |term| switch (term) {
+                .Exited => |byte| try writer.print(
+                    "{s}:{d}:{d}: script execution error: terminated with exit code {}\n",
+                    .{ span.start.file, span.start.line, span.start.column, byte },
+                ),
+                inline else => |signal| try writer.print(
+                    "{s}:{d}:{d}: script execution error: terminated with signal {x:04}\n",
+                    .{ span.start.file, span.start.line, span.start.column, signal },
+                ),
+            },
             .err => |err| try writer.print(
                 "{s}:{d}:{d}: script execution error: {s}\n",
                 .{ span.start.file, span.start.line, span.start.column, @errorName(err) },
@@ -294,21 +264,3 @@ pub const ScriptExecutor = struct {
         }
     }
 };
-
-fn runWithEnvMap(
-    context: *anyopaque,
-    specs: []const CommandRunner.CommandSpec,
-) CommandRunner.Error!command_runner.ProcessHandle {
-    const bridge: *ScriptExecutor.CommandBridge = @ptrCast(@alignCast(context));
-    if (specs.len == 0) return error.EmptyCommand;
-
-    var patched = try bridge.allocator.alloc(CommandRunner.CommandSpec, specs.len);
-    defer bridge.allocator.free(patched);
-
-    for (specs, 0..) |spec, idx| {
-        patched[idx] = spec;
-        patched[idx].env_map = bridge.env_map;
-    }
-
-    return bridge.runner.runPipeline(bridge.evaluator, bridge.scopes, patched);
-}

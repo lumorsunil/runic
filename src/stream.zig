@@ -315,6 +315,11 @@ pub fn Stream(comptime T: type) type {
             return self.vtable.getAllocator(self);
         }
 
+        pub fn clone(self: *@This()) RCError!*@This() {
+            try self.newRef();
+            return self;
+        }
+
         pub fn map(
             self: *@This(),
             mapFn: anytype,
@@ -327,6 +332,29 @@ pub fn Stream(comptime T: type) type {
             var mapped_stream = try mapped_stream_ref.getPtr();
             mapped_stream.ref = mapped_stream_ref;
             return &mapped_stream.stream;
+        }
+
+        pub const TakeAllResult = struct {
+            list: []T = &.{},
+            err: ?StreamError = null,
+        };
+
+        /// Is blocking until underlying stream has ended or failed.
+        pub fn takeAll(self: *@This()) RCError!TakeAllResult {
+            const allocator = try self.getAllocator();
+            var list = std.ArrayList(T).empty;
+
+            while (true) {
+                if (self.next() catch |err| return .{
+                    .err = err,
+                    .list = try list.toOwnedSlice(allocator),
+                }) |e| switch (e) {
+                    .completed => break,
+                    .next => |n| try list.append(allocator, n),
+                };
+            }
+
+            return .{ .list = try list.toOwnedSlice(allocator) };
         }
     };
 }

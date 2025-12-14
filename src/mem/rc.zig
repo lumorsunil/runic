@@ -156,6 +156,18 @@ pub fn RC(comptime T: type) type {
                 const rc = self.rc orelse return 0;
                 return rc.refs;
             }
+
+            pub fn format(self: Ref, writer: *std.Io.Writer) !void {
+                const value = self.get() catch {
+                    try writer.writeAll("<ref error>");
+                    return;
+                };
+                if (T == []u8 or T == []const u8) {
+                    try writer.print("{s}", .{value});
+                } else {
+                    try writer.print("{f}", .{value});
+                }
+            }
         };
 
         pub fn init(allocator: Allocator, value: T) RCError!*RC(T) {

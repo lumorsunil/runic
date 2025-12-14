@@ -243,6 +243,20 @@ fn renderExpressionAst(writer: *std.Io.Writer, expr: *const ast.Expression, leve
             try writer.print("{s} =\n", .{assignment.identifier.name});
             try renderExpressionAst(writer, assignment.expr, level + 1);
         },
+        .call => |call| {
+            try writeIndent(writer, level);
+            try writer.writeAll("call @ ");
+            try printSpanInline(writer, call.span);
+            try writer.writeByte('\n');
+            try writeIndent(writer, level + 1);
+            try writer.writeAll("callee:\n");
+            try renderExpressionAst(writer, call.callee, level + 2);
+            for (call.arguments, 0..) |arg, i| {
+                try writeIndent(writer, level + 1);
+                try writer.print("arg {}:\n", .{i});
+                try renderExpressionAst(writer, arg, level + 2);
+            }
+        },
         else => {
             const tag_name = @tagName(std.meta.activeTag(node));
             try writeIndent(writer, level);
@@ -306,16 +320,8 @@ fn renderStatementAst(writer: *std.Io.Writer, stmt: *const ast.Statement, level:
             try writer.writeAll(fn_decl.name.name);
             try writer.writeByte('\n');
             try writeIndent(writer, level + 1);
-            switch (fn_decl.body) {
-                .block => |block| {
-                    try writer.print("# statements {}\n", .{block.statements.len});
-                    try renderBlockStatements(writer, block, level + 1);
-                },
-                .expression => |expr| {
-                    try writer.print("expression:\n", .{});
-                    try renderExpressionAst(writer, expr, level + 1);
-                },
-            }
+            try writer.print("body:\n", .{});
+            try renderExpressionAst(writer, fn_decl.body, level + 2);
         },
         else => {
             const tag_name = @tagName(std.meta.activeTag(stmt.*));

@@ -8,11 +8,19 @@ const runic = @import("runic");
 pub fn dispatch(
     allocator: Allocator,
     config: utils.CliConfig,
+    // stdin: *std.Io.Reader,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
 ) !runic.command_runner.ExitCode {
     switch (config.mode) {
-        .script => |script| return try runScript(allocator, script, config, stdout, stderr),
+        .script => |script| return try runScript(
+            allocator,
+            script,
+            config,
+            // stdin,
+            stdout,
+            stderr,
+        ),
         .repl => {
             try stderr.print("repl not yet supported\n", .{});
             return .{ .err = error.ReplNotYetSupported };

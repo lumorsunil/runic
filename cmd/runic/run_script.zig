@@ -2,10 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const utils = @import("main-utils.zig");
 const runic = @import("runic");
-const ScriptContext = runic.interpreter.ScriptContext;
 const ScriptExecutor = runic.interpreter.ScriptExecutor;
-const Tracer = runic.tracing.Tracer;
-const CommandRunner = runic.command_runner.CommandRunner;
 const FrontendDocumentStore = runic.document.FrontendDocumentStore;
 const Parser = runic.parser.Parser;
 const TypeChecker = runic.semantic.TypeChecker;
@@ -16,18 +13,13 @@ pub fn runScript(
     allocator: Allocator,
     script: utils.CliConfig.ScriptInvocation,
     config: utils.CliConfig,
+    // stdin: *std.Io.Reader,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
 ) !runic.command_runner.ExitCode {
-    var context = ScriptContext.init(allocator);
-    defer context.deinit();
-
-    var tracer = Tracer.init(config.trace_topics, null);
-    if (tracer.anyTopicEnabled()) tracer.setSink(stderr);
-
     var env_map = std.process.getEnvMap(allocator) catch |err| {
         try stderr.print("error: unable to capture environment: {s}\n", .{@errorName(err)});
-        return .fromProcess(1);
+        return .fromByte(1);
     };
     defer env_map.deinit();
 
@@ -37,15 +29,12 @@ pub fn runScript(
 
     const script_dir = utils.computeScriptDirectory(allocator, script.path) catch |err| {
         try stderr.print("error: unable to resolve script directory: {s}\n", .{@errorName(err)});
-        return .fromProcess(1);
+        return .fromByte(1);
     };
     defer allocator.free(script_dir);
 
-    const tracer_ptr = if (tracer.anyTopicEnabled()) &tracer else null;
-    var runner = CommandRunner.initWithTracer(allocator, tracer_ptr);
-
     if (config.print_tokens) {
-        return .fromProcess(try printTokens(allocator, stdout, stderr, script.path));
+        return .fromByte(try printTokens(allocator, stdout, stderr, script.path));
     }
 
     var document_store = FrontendDocumentStore.init(allocator);
@@ -53,7 +42,7 @@ pub fn runScript(
     const entryDocument = try document_store.requestDocument(script.path);
     const resolvedPath = try document_store.resolvePath(script.path);
     const parser_result = entryDocument.parser.parseScript(resolvedPath);
-    const script_ast = try processResult(&document_store.document_store, stderr, parser_result) orelse return .fromProcess(1);
+    const script_ast = try processResult(&document_store.document_store, stderr, parser_result) orelse return .fromByte(1);
 
     const parse_imports_result = try parseImports(
         allocator,
@@ -74,7 +63,7 @@ pub fn runScript(
                     "error: failed to print AST for script '{s}': {s}\n",
                     .{ script.path, @errorName(err) },
                 );
-                return .fromProcess(1);
+                return .fromByte(1);
             };
         }
 
@@ -87,26 +76,34 @@ pub fn runScript(
 
         const type_checker_result = type_checker.typeCheck(resolvedPath) catch |err| {
             std.log.err("Type checker failed to run: {}", .{err});
-            return .fromProcess(1);
+            return .fromByte(1);
         };
 
         if (try processResult(&document_store.document_store, stderr, type_checker_result)) |_| {
             if (config.type_check_only) return .success;
         } else {
-            return .fromProcess(1);
+            return .fromByte(1);
         }
     }
 
+    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+
     const executeOptions = ScriptExecutor.ExecuteOptions.init(
         script.path,
-        .init(.init(stdout, .streaming), .init(stderr, .streaming)),
-        &context,
+        cwd,
+        env_map,
+        .init(
+            // .init(stdin, .streaming),
+            .blocked(),
+            .init(stdout, .streaming),
+            .init(stderr, .streaming),
+        ),
     );
 
     entryDocument.script_executor = ScriptExecutor.initWithRunner(
         allocator,
         entryDocument.path,
-        &runner,
         &env_map,
         executeOptions,
         &document_store.document_store,
@@ -115,7 +112,7 @@ pub fn runScript(
             "error: failed to initialize script executor: {s}\n",
             .{@errorName(err)},
         );
-        return .fromProcess(1);
+        return .fromByte(1);
     };
     var executor: *ScriptExecutor = undefined;
     if (entryDocument.script_executor) |*script_executor| executor = script_executor else return .{ .err = error.ExecutorNotDefined };
@@ -203,10 +200,7 @@ const StatementExpressionIterator = struct {
             .error_decl, .bash_block => {},
             .type_binding_decl => {},
             .binding_decl => |binding_decl| try self.cursor.appendExpr(binding_decl.initializer),
-            .fn_decl => |fn_decl| switch (fn_decl.body) {
-                .expression => |body_expr| try self.cursor.appendExpr(body_expr),
-                .block => |block| try populateBlockExpr(&self.cursor, block),
-            },
+            .fn_decl => |fn_decl| try self.cursor.appendExpr(fn_decl.body),
             // .for_stmt => |for_stmt| {
             //     try self.cursor.appendStatements(for_stmt.body.statements);
             //     try self.cursor.appendExpressions(for_stmt.sources);
@@ -248,8 +242,7 @@ const StatementExpressionIterator = struct {
             },
             .block => |block| try populateBlockExpr(cursor, block),
             .fn_literal => |fn_literal| {
-                try cursor.appendExpr(fn_literal.body.expression);
-                try populateBlockExpr(cursor, fn_literal.body.block);
+                try cursor.appendExpr(fn_literal.body);
                 for (fn_literal.params) |param| if (param.default_value) |dv| try cursor.appendExpr(dv);
             },
             .if_expr => |*if_expr| try populateIfExpr(cursor, if_expr),
@@ -267,6 +260,7 @@ const StatementExpressionIterator = struct {
                 try self.cursor.appendStatements(for_expr.body.statements);
                 try self.cursor.appendExpressions(for_expr.sources);
             },
+            .executable => {},
         }
     }
 
@@ -333,7 +327,7 @@ fn parseImports(
                 defer allocator.free(module_path);
                 const parser = try document_store.getParser(module_path);
                 const result = parser.parseScript(module_path);
-                const import_script = try processResult(document_store, writer, result) orelse return .fromProcess(1);
+                const import_script = try processResult(document_store, writer, result) orelse return .fromByte(1);
                 _ = try parseImports(allocator, writer, document_store, import_script);
             },
             else => {},

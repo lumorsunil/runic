@@ -22,15 +22,18 @@ fn mainImpl() !runic.command_runner.ExitCode {
 
     const allocator = gpa.allocator();
 
+    // var stdin_buffer: [1024]u8 = undefined;
     var stdout_buffer: [1024]u8 = undefined;
     var stderr_buffer: [1024]u8 = undefined;
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
 
-    var stdoutWriter = std.fs.File.stdout().writer(&stdout_buffer);
-    var stderrWriter = std.fs.File.stderr().writer(&stderr_buffer);
-    const stdout = &stdoutWriter.interface;
-    const stderr = &stderrWriter.interface;
+    // var stdin_reader = std.fs.File.stdin().readerStreaming(&stdin_buffer);
+    var stdout_writer = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+    var stderr_writer = std.fs.File.stderr().writerStreaming(&stderr_buffer);
+    // const stdin = &stdin_reader.interface;
+    const stdout = &stdout_writer.interface;
+    const stderr = &stderr_writer.interface;
     defer stdout.flush() catch {};
     defer stderr.flush() catch {};
 
@@ -45,14 +48,20 @@ fn mainImpl() !runic.command_runner.ExitCode {
             try stderr.print("error: {s}\n\n", .{message});
             try utils.printUsage(stderr);
             try stderr.flush();
-            return .fromProcess(2);
+            return .fromByte(2);
         },
         .ready => |config| {
             defer {
                 var cfg = config;
                 cfg.deinit(allocator);
             }
-            return try dispatch(allocator, config, stdout, stderr);
+            return try dispatch(
+                allocator,
+                config,
+                // stdin,
+                stdout,
+                stderr,
+            );
         },
     }
 

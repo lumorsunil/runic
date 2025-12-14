@@ -551,23 +551,34 @@ pub const TypeChecker = struct {
 
         const fn_scope = try scope.addChild(self.arena.allocator(), fn_decl.span);
 
-        for (fn_decl.params) |param| {
-            const param_type = try self.resolveExprType(
-                fn_scope,
-                param,
-            );
-            try self.runBindingPattern(
-                fn_scope,
-                param.pattern,
-                param_type,
-                false,
-            );
+        switch (fn_decl.params) {
+            ._non_variadic => |params| for (params) |param| {
+                const param_type = try self.resolveExprType(
+                    fn_scope,
+                    param,
+                );
+                try self.runBindingPattern(
+                    fn_scope,
+                    param.pattern,
+                    param_type,
+                    false,
+                );
+            },
+            ._variadic => |param| {
+                const param_type = try self.resolveExprType(
+                    fn_scope,
+                    param,
+                );
+                try self.runBindingPattern(
+                    fn_scope,
+                    param.pattern,
+                    param_type,
+                    false,
+                );
+            },
         }
 
-        switch (fn_decl.body) {
-            .expression => |expr| try self.runExpression(fn_scope, expr),
-            .block => |*block| try self.runBlock(fn_scope, block),
-        }
+        try self.runExpression(fn_scope, fn_decl.body);
     }
 
     fn runExpressionStatement(
@@ -623,7 +634,7 @@ pub const TypeChecker = struct {
             .alias => |*alias| self.runTypeAlias(alias),
             .failed => {},
             .integer, .float, .boolean, .byte => {},
-            // .array => |*array| self.runTypeArray(scope, array),
+            .array => |*array| self.runTypeArray(scope, array),
             else => return error.UnsupportedTypeExpression,
         };
     }
@@ -651,6 +662,17 @@ pub const TypeChecker = struct {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, alias.span);
         // this has to be valid because when we create an alias we check it
+    }
+
+    fn runTypeArray(
+        self: *TypeChecker,
+        scope: *Scope,
+        array: *const ast.TypeExpr.ArrayType,
+    ) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.logTypeCheckTrace(@src().fn_name, array.span);
+
+        try self.runTypeExpression(scope, array.element);
     }
 
     pub fn runForExpr(self: *TypeChecker, scope: *Scope, for_expr: *ast.ForExpr) Error!void {

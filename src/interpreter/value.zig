@@ -5,9 +5,9 @@ const command_runner = @import("../runtime/command_runner.zig");
 const TypeExpr = @import("../frontend/ast.zig").TypeExpr;
 const ScopeStack = @import("../interpreter/scope.zig").ScopeStack;
 const mem = @import("../mem/root.zig");
+const Stream = @import("../stream.zig").Stream;
 
 const ast = @import("../frontend/ast.zig");
-const ProcessHandle = command_runner.ProcessHandle;
 
 /// Runtime value representation used by the interpreter while evaluating AST
 /// nodes. Every variant owns its storage so scopes can safely clone or move
@@ -21,8 +21,8 @@ pub const Value = union(enum) {
     range: Range,
     array: Array,
     function: FunctionRef,
-    process_handle: ProcessHandle,
     scope: ScopeRef,
+    stream: *Stream(Value),
 
     pub const FunctionRef = mem.RC(FunctionRefInner).Ref;
 
@@ -82,12 +82,12 @@ pub const Value = union(enum) {
     pub fn deinit(self: *Value) void {
         switch (self.*) {
             .string => |*ref| ref.deinit(.{}),
-            .process_handle => |*handle| handle.deinit(),
             .function => |*f| f.deinit(.{}),
             .array => |*arr| arr.deinit(.{}),
             .scope => |*scope| scope.deinit(.{
                 .deinit_child_fn = .withoutAllocator(ScopeStack.deinit),
             }),
+            .stream => |stream| stream.deinit(),
             else => {},
         }
         self.* = .{ .void = {} };
@@ -97,7 +97,6 @@ pub const Value = union(enum) {
     pub fn deinitMain(self: *Value) void {
         switch (self.*) {
             .string => |*ref| ref.deinit(.{}),
-            .process_handle => |*handle| handle.deinit(),
             .function => |*f| f.deinit(.{
                 .deinit_child_fn = .withAllocator(FunctionRefInner.deinitMain),
             }),
@@ -110,21 +109,22 @@ pub const Value = union(enum) {
             .scope => |*scope| scope.deinit(.{
                 .deinit_child_fn = .withoutAllocator(ScopeStack.deinitMain),
             }),
+            .stream => |stream| stream.deinit(),
             else => {},
         }
         self.* = .{ .void = {} };
     }
 
     /// Clones the value into a fresh allocation owned by `allocator`.
-    pub fn clone(self: Value, allocator: std.mem.Allocator) !Value {
+    pub fn clone(self: Value, _: std.mem.Allocator) !Value {
         return switch (self) {
             .void, .boolean, .integer, .float, .range => self,
             .function => |ref| .{ .function = try ref.ref(.{}) },
             .string => |ref| .{ .string = try ref.ref(.{}) },
             .array => |ref| .{ .array = try ref.ref(.{}) },
-            .process_handle => |handle| .{ .process_handle = try handle.clone(allocator) },
             // TODO: Investigate if we need to clone this (hint: everytime we use a Value in the evaluator, we seem to clone it and deinitialize)
             .scope => |scope| .{ .scope = try scope.ref(.{}) },
+            .stream => |stream| .{ .stream = try stream.clone() },
         };
     }
 
@@ -162,9 +162,9 @@ pub const Value = union(enum) {
                 try writer.print("{}..", .{r.start});
             },
             .array => try writer.writeAll("[...]"),
-            .function => try writer.writeAll("fn"),
-            .process_handle => try writer.writeAll("handle"),
-            .scope => try writer.writeAll("module"),
+            .function => try writer.writeAll("<fn>"),
+            .scope => try writer.writeAll("<module>"),
+            .stream => try writer.writeAll("<stream>"),
         }
     }
 };
