@@ -5,9 +5,10 @@ const command_runner = @import("../runtime/command_runner.zig");
 const TypeExpr = @import("../frontend/ast.zig").TypeExpr;
 const ScopeStack = @import("../interpreter/scope.zig").ScopeStack;
 const mem = @import("../mem/root.zig");
+const Stream = @import("../stream.zig").Stream;
 
 const ast = @import("../frontend/ast.zig");
-const ProcessHandle = command_runner.ProcessHandle;
+const ExitCode = command_runner.ExitCode;
 
 /// Runtime value representation used by the interpreter while evaluating AST
 /// nodes. Every variant owns its storage so scopes can safely clone or move
@@ -21,8 +22,11 @@ pub const Value = union(enum) {
     range: Range,
     array: Array,
     function: FunctionRef,
-    process_handle: ProcessHandle,
     scope: ScopeRef,
+    stream: *Stream(Value),
+    process: std.process.Child.Id,
+    execution: ExecutionRef,
+    exit_code: ?ExitCode,
 
     pub const FunctionRef = mem.RC(FunctionRefInner).Ref;
 
@@ -76,18 +80,37 @@ pub const Value = union(enum) {
 
     pub const ScopeRef = mem.RC(ScopeStack).Ref;
 
+    pub const ExecutionRef = mem.RC(ExecutionRefInner).Ref;
+
+    const ExecutionRefInner = struct {
+        stdout: Value.String,
+        stderr: Value.String,
+        exit_code: ?ExitCode,
+
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            self.stdout.deinit(.{});
+            self.stderr.deinit(.{});
+            allocator.destroy(self);
+        }
+    };
+
     pub const Error = error{TypeMismatch};
 
     /// Releases any heap allocations and resets the value to `.void`.
     pub fn deinit(self: *Value) void {
         switch (self.*) {
             .string => |*ref| ref.deinit(.{}),
-            .process_handle => |*handle| handle.deinit(),
-            .function => |*f| f.deinit(.{}),
+            .function => |*f| f.deinit(.{
+                .deinit_child_fn = .withAllocator(FunctionRefInner.deinit),
+            }),
             .array => |*arr| arr.deinit(.{}),
             .scope => |*scope| scope.deinit(.{
                 .deinit_child_fn = .withoutAllocator(ScopeStack.deinit),
             }),
+            .stream => |stream| stream.deinit(),
+            .execution => |*execution| execution.deinit(
+                .{ .deinit_child_fn = .withAllocator(ExecutionRefInner.deinit) },
+            ),
             else => {},
         }
         self.* = .{ .void = {} };
@@ -97,7 +120,6 @@ pub const Value = union(enum) {
     pub fn deinitMain(self: *Value) void {
         switch (self.*) {
             .string => |*ref| ref.deinit(.{}),
-            .process_handle => |*handle| handle.deinit(),
             .function => |*f| f.deinit(.{
                 .deinit_child_fn = .withAllocator(FunctionRefInner.deinitMain),
             }),
@@ -110,21 +132,34 @@ pub const Value = union(enum) {
             .scope => |*scope| scope.deinit(.{
                 .deinit_child_fn = .withoutAllocator(ScopeStack.deinitMain),
             }),
+            .stream => |stream| stream.deinit(),
+            .execution => |*execution| execution.deinit(
+                .{ .deinit_child_fn = .withAllocator(ExecutionRefInner.deinit) },
+            ),
             else => {},
         }
         self.* = .{ .void = {} };
     }
 
     /// Clones the value into a fresh allocation owned by `allocator`.
-    pub fn clone(self: Value, allocator: std.mem.Allocator) !Value {
+    pub fn clone(self: Value, _: std.mem.Allocator, options: mem.RCInitOptions) !Value {
         return switch (self) {
-            .void, .boolean, .integer, .float, .range => self,
-            .function => |ref| .{ .function = try ref.ref(.{}) },
-            .string => |ref| .{ .string = try ref.ref(.{}) },
-            .array => |ref| .{ .array = try ref.ref(.{}) },
-            .process_handle => |handle| .{ .process_handle = try handle.clone(allocator) },
+            .void, .boolean, .integer, .float, .range, .process => self,
+            .function => |ref| .{ .function = try ref.ref(options) },
+            .string => |ref| .{ .string = try ref.ref(options) },
+            .array => |ref| .{ .array = try ref.ref(options) },
             // TODO: Investigate if we need to clone this (hint: everytime we use a Value in the evaluator, we seem to clone it and deinitialize)
-            .scope => |scope| .{ .scope = try scope.ref(.{}) },
+            .scope => |scope| .{ .scope = try scope.ref(options) },
+            .stream => |stream| .{ .stream = try stream.clone() },
+            .execution => |execution| .{ .execution = brk: {
+                const clone_ = try execution.clone(options);
+                const inner = try clone_.getPtr();
+                inner.stdout = try inner.stdout.ref(options);
+                inner.stderr = try inner.stderr.ref(options);
+                break :brk clone_;
+            } },
+            // TODO: implement error values
+            .exit_code => self,
         };
     }
 
@@ -161,10 +196,13 @@ pub const Value = union(enum) {
                 if (r.end) |end| return try writer.print("{}..{}", .{ r.start, end });
                 try writer.print("{}..", .{r.start});
             },
-            .array => try writer.writeAll("[...]"),
-            .function => try writer.writeAll("fn"),
-            .process_handle => try writer.writeAll("handle"),
-            .scope => try writer.writeAll("module"),
+            .array => try writer.writeAll("<array>"),
+            .function => try writer.writeAll("<fn>"),
+            .scope => |scope_ref| try writer.print("<module:{?*}>", .{scope_ref.getPtr() catch null}),
+            .stream => |stream| try writer.print("<stream:{*}>", .{stream}),
+            .process => |pid| try writer.print("<process:{any}>", .{pid}),
+            .execution => try writer.print("<execution>", .{}),
+            .exit_code => |exit_code| try writer.print("<exit_code:{?f}>", .{exit_code}),
         }
     }
 };

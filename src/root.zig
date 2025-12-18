@@ -19,3 +19,5 @@ pub const rainbow = @import("rainbow.zig");
 pub const utils = @import("utils.zig");
 pub const mem = @import("mem/root.zig");
 pub const semantic = @import("semantic/root.zig");
+pub const stream = @import("stream.zig");
+pub const closeable = @import("closeable.zig");

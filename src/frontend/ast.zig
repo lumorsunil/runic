@@ -270,18 +270,36 @@ pub const TypeExpr = union(enum) {
     };
 
     pub const FunctionType = struct {
-        params: []const ?*const TypeExpr,
+        params: Parameters,
         return_type: ?*const TypeExpr,
         span: Span,
 
+        pub const Parameters = union(enum) {
+            _non_variadic: []const ?*const TypeExpr,
+            _variadic: ?*const TypeExpr,
+
+            pub fn nonVariadic(_non_variadic: []const ?*const TypeExpr) @This() {
+                return .{ ._non_variadic = _non_variadic };
+            }
+
+            pub fn variadic(_variadic: ?*const TypeExpr) @This() {
+                return .{ ._variadic = _variadic };
+            }
+        };
+
         pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
             try writer.writeAll("fn (");
-            for (self.params, 0..) |param, i| {
-                try if (param) |p| p.format(writer) else writer.writeAll("<not_found>");
+            switch (self.params) {
+                ._non_variadic => |params| {
+                    for (params, 0..) |param, i| {
+                        try if (param) |p| p.format(writer) else writer.writeAll("<not_found>");
 
-                if (i < self.params.len - 1) {
-                    try writer.writeAll(", ");
-                }
+                        if (i < params.len - 1) {
+                            try writer.writeAll(", ");
+                        }
+                    }
+                },
+                ._variadic => |params| try writer.print("...[]{?f}", .{params}),
             }
             try writer.writeAll(") ");
             try if (self.return_type) |r| r.format(writer) else writer.writeAll("<not_found>");
@@ -494,13 +512,14 @@ pub const Expression = union(enum) {
     map: MapLiteral,
     range: RangeLiteral,
     pipeline: Pipeline,
+    pipeline_deprecated: Pipeline_deprecated,
     call: CallExpr,
     member: MemberExpr,
     index: IndexExpr,
     unary: UnaryExpr,
     binary: BinaryExpr,
     block: Block,
-    fn_literal: FunctionLiteral,
+    fn_decl: FunctionDecl,
     if_expr: IfExpr,
     for_expr: ForExpr,
     match_expr: MatchExpr,
@@ -508,6 +527,8 @@ pub const Expression = union(enum) {
     catch_expr: CatchExpr,
     import_expr: ImportExpr,
     assignment: Assignment,
+    executable: ExecutableExpr,
+    builtin: BuiltinExpr,
 
     pub fn span(self: Expression) Span {
         return switch (self) {
@@ -586,7 +607,7 @@ pub const RangeLiteral = struct {
 
 pub const CallExpr = struct {
     callee: *Expression,
-    arguments: []const CallArgument,
+    arguments: []const *Expression,
     span: Span,
 
     pub fn resolveType(
@@ -594,14 +615,10 @@ pub const CallExpr = struct {
         _: std.mem.Allocator,
         _: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
+        // 1. turn expression into function (or already function)
+        // 2. return return type of function
         return null;
     }
-};
-
-pub const CallArgument = struct {
-    label: ?Identifier = null,
-    value: *Expression,
-    span: Span,
 };
 
 pub const MemberExpr = struct {
@@ -681,6 +698,13 @@ pub const BinaryOp = enum {
     equal,
     logical_and,
     logical_or,
+    /// (Stream(T) | fn Stream(T) (...Args) Stream(E!U)) : Stream(E!U)
+    /// (Stream(E1!T) | fn Stream(T) (...Args) Stream(E2!U)) : Stream(E1||E2!U)
+    /// (Stream(E1||E2!U) || do_something_else) : Stream(U)
+    /// (Stream(String) | parseFloat | Stream(Float) + Stream(Float))
+    pipe,
+    apply,
+    member,
 
     pub fn precedence(self: BinaryOp) usize {
         return switch (self) {
@@ -697,6 +721,9 @@ pub const BinaryOp = enum {
             .equal => 15,
             .logical_and => 10,
             .logical_or => 5,
+            .pipe => 50,
+            .apply => 70,
+            .member => 90,
         };
     }
 
@@ -715,7 +742,16 @@ pub const BinaryOp = enum {
             .kw_and => .logical_and,
             .kw_or => .logical_or,
             .equal_equal => .equal,
+            .pipe => .pipe,
+            .dot => .member,
             else => null,
+        };
+    }
+
+    pub fn capturesStdin(self: @This()) bool {
+        return switch (self) {
+            .pipe => true,
+            else => false,
         };
     }
 };
@@ -723,7 +759,7 @@ pub const BinaryOp = enum {
 pub const FunctionLiteral = struct {
     params: []const Parameter,
     return_type: ?*const TypeExpr,
-    body: FunctionBody,
+    body: *Expression,
     span: Span,
 
     pub fn resolveType(
@@ -733,11 +769,6 @@ pub const FunctionLiteral = struct {
     ) semantic.Scope.Error!?*const TypeExpr {
         return null;
     }
-};
-
-pub const FunctionBody = union(enum) {
-    block: Block,
-    expression: *Expression,
 };
 
 pub const IfExpr = struct {
@@ -862,10 +893,23 @@ pub const ImportExpr = struct {
     }
 };
 
+pub const Pipeline = struct {
+    stages: []*Expression,
+    span: Span,
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*const TypeExpr {
+        return null;
+    }
+};
+
 /// Pipelines model chained command and expression stages. Each stage carries a
 /// `StageRole` so the runtime can distinguish external commands from pure
 /// expressions while preserving location metadata for diagnostics.
-pub const Pipeline = struct {
+pub const Pipeline_deprecated = struct {
     stages: []const PipelineStage,
     span: Span,
 
@@ -1011,7 +1055,6 @@ pub const Script = Block;
 pub const Statement = union(enum) {
     type_binding_decl: TypeBindingDecl,
     binding_decl: BindingDecl,
-    fn_decl: FunctionDecl,
     expression: ExpressionStmt,
 
     error_decl: ErrorDecl,
@@ -1023,7 +1066,6 @@ pub const Statement = union(enum) {
         return switch (self) {
             .type_binding_decl => |decl| decl.span,
             .binding_decl => |decl| decl.span,
-            .fn_decl => |fn_decl| fn_decl.span,
             .error_decl => |err| err.span,
             .return_stmt => |ret| ret.span,
             // .for_stmt => |loop_stmt| loop_stmt.span,
@@ -1096,24 +1138,45 @@ pub const Parameter = struct {
 };
 
 pub const FunctionDecl = struct {
-    name: Identifier,
-    is_async: bool,
-    params: []*Parameter,
+    name: ?Identifier,
+    params: Parameters,
     stdin_type: ?*const TypeExpr,
     return_type: ?*const TypeExpr,
-    body: FunctionBody,
+    body: *Expression,
     span: Span,
+
+    pub const Parameters = union(enum) {
+        _non_variadic: []*Parameter,
+        _variadic: *Parameter,
+
+        pub const none = nonVariadic(&.{});
+
+        pub fn nonVariadic(_non_variadic: []*Parameter) @This() {
+            return .{ ._non_variadic = _non_variadic };
+        }
+
+        pub fn variadic(_variadic: *Parameter) @This() {
+            return .{ ._variadic = _variadic };
+        }
+    };
 
     pub fn resolveType(
         self: *@This(),
         allocator: std.mem.Allocator,
         scope: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
-        const params_types = try allocator.alloc(?*const TypeExpr, self.params.len);
+        const params_types: TypeExpr.FunctionType.Parameters = switch (self.params) {
+            ._non_variadic => |params| brk: {
+                const params_types = try allocator.alloc(?*const TypeExpr, params.len);
 
-        for (params_types, self.params) |*param_type, param| {
-            param_type.* = try param.resolveType(allocator, scope);
-        }
+                for (params_types, params) |*param_type, param| {
+                    param_type.* = try param.resolveType(allocator, scope);
+                }
+
+                break :brk .nonVariadic(params_types);
+            },
+            ._variadic => |params| .variadic(try params.resolveType(allocator, scope)),
+        };
 
         const fn_type = try allocator.create(TypeExpr);
 
@@ -1124,6 +1187,33 @@ pub const FunctionDecl = struct {
         } };
 
         return fn_type;
+    }
+};
+
+pub const ExecutableExpr = struct {
+    span: Span,
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*const TypeExpr {
+        return null;
+    }
+};
+
+pub const BuiltinExpr = struct {
+    tag: Tag,
+    span: Span,
+
+    pub const Tag = enum { inspect };
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*const TypeExpr {
+        return null;
     }
 };
 

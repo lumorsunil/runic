@@ -1,0 +1,4 @@
+const s = "hello, world!"
+
+(s)
+

@@ -3,6 +3,20 @@ const Value = @import("interpreter/value.zig").Value;
 const Transformer = @import("transformer.zig").Transformer;
 const RC = @import("mem/root.zig").RC;
 const RCError = @import("mem/root.zig").RCError;
+const CloseableReader = @import("closeable.zig").CloseableReader;
+const CloseableWriter = @import("closeable.zig").CloseableWriter;
+const ExitCode = @import("runtime/command_runner.zig").ExitCode;
+
+const log_enabled = false;
+
+fn log(self: *ReaderWriterStream, comptime fmt: []const u8, args: anytype) void {
+    if (!log_enabled) return;
+    std.log.debug("[{*}:\"{s}\"]", .{ self, self.label });
+    if (self.source) |source| if (self.destination) |destination| {
+        std.log.debug("{*} >>> {*}", .{ source.reader, destination.writer });
+    };
+    std.log.debug(fmt, args);
+}
 
 fn ReturnType(f: anytype) type {
     return @typeInfo(@TypeOf(f)).@"fn".return_type orelse void;
@@ -17,26 +31,55 @@ fn JoinOptional(comptime T: type) type {
 }
 
 fn MapFnResult(f: anytype) type {
-    return JoinOptional(JoinError(ReturnType(f)));
+    return JoinError(ReturnType(f));
 }
 
 pub fn StreamEvent(comptime T: type) type {
     return union(enum) {
-        next: T,
+        next: struct {
+            payload: []T,
+            allocator: std.mem.Allocator,
+        },
         completed,
+
+        pub const empty = initNext(
+            std.heap.page_allocator,
+            &.{},
+        ) catch unreachable;
+
+        pub fn initNext(
+            allocator: std.mem.Allocator,
+            payload: []T,
+        ) std.mem.Allocator.Error!@This() {
+            return .{
+                .next = .{
+                    .payload = try allocator.dupe(T, payload),
+                    .allocator = allocator,
+                },
+            };
+        }
+
+        pub fn deinit(self: @This()) void {
+            switch (self) {
+                .next => |n| n.allocator.free(n.payload),
+                .completed => {},
+            }
+        }
     };
 }
 
 pub const StreamError = RCError || error{
     InvalidSource,
     InitFailed,
+    ReadFailed,
+    WriteFailed,
 };
 
-fn BufferedStream(comptime T: type) type {
+fn FixedStream(comptime T: type) type {
     return struct {
         stream: Stream(T) = .init(&vtable),
         ref: RC(@This()).Ref = undefined,
-        buffer: []const T,
+        buffer: []T,
         index: ?usize = 0,
 
         const vtable = Stream(T).VTable{
@@ -46,8 +89,11 @@ fn BufferedStream(comptime T: type) type {
             .newRef = newRef,
         };
 
-        pub fn init(buffer: []const T) @This() {
-            return .{ .buffer = buffer };
+        pub fn init(
+            allocator: std.mem.Allocator,
+            buffer: []const T,
+        ) std.mem.Allocator.Error!@This() {
+            return .{ .buffer = try allocator.dupe(T, buffer) };
         }
 
         fn getParent(self: *Stream(T)) *@This() {
@@ -58,22 +104,29 @@ fn BufferedStream(comptime T: type) type {
             _ = try getParent(self).ref.ref(.{});
         }
 
-        pub fn next(self: *Stream(T)) StreamError!?StreamEvent(T) {
-            return getParent(self).nextInner();
+        pub fn next(self: *Stream(T), limit: std.Io.Limit) StreamError!StreamEvent(T) {
+            return getParent(self).nextInner(limit);
         }
 
-        fn nextInner(self: *@This()) StreamError!?StreamEvent(T) {
+        fn nextInner(self: *@This(), limit: std.Io.Limit) StreamError!StreamEvent(T) {
             const index = self.index orelse return .completed;
             if (index >= self.buffer.len) {
                 self.index = null;
                 return .completed;
             }
-            defer self.index = index + 1;
-            return .{ .next = self.buffer[index] };
+
+            const end = limit.minInt(self.buffer.len - index);
+            const result = self.buffer[index..end];
+            self.index = end;
+
+            return .initNext(try self.stream.getAllocator(), result);
         }
 
         pub fn deinit(self: *Stream(T)) void {
-            getParent(self).ref.deinit(.{ .refresh_ref = true });
+            const allocator = self.getAllocator() catch null;
+            const parent = getParent(self);
+            if (allocator) |a| a.free(parent.buffer);
+            parent.ref.deinit(.{ .refresh_ref = true });
         }
 
         pub fn getAllocator(self: *Stream(T)) RCError!std.mem.Allocator {
@@ -82,56 +135,386 @@ fn BufferedStream(comptime T: type) type {
     };
 }
 
-fn SingleStream(comptime T: type) type {
-    return struct {
-        stream: Stream(T) = .init(&vtable),
-        ref: RC(@This()).Ref = undefined,
-        value: T,
-        consumed: bool = false,
+/// Consumer needs to free the return strings.
+const IoReaderByteStream = struct {
+    stream: Stream(u8) = .init(&vtable),
+    ref: RC(@This()).Ref = undefined,
+    source: *std.Io.Reader,
+    is_completed: bool = false,
 
-        const vtable = Stream(T).VTable{
-            .next = next,
-            .deinit = deinit,
-            .getAllocator = getAllocator,
-            .newRef = newRef,
+    const vtable = Stream(u8).VTable{
+        .next = next,
+        .deinit = deinit,
+        .getAllocator = getAllocator,
+        .newRef = newRef,
+    };
+
+    pub fn init(source: *std.Io.Reader) @This() {
+        return .{
+            .source = source,
+        };
+    }
+
+    fn getParent(self: *Stream(u8)) *@This() {
+        return @fieldParentPtr("stream", self);
+    }
+
+    pub fn newRef(self: *Stream(u8)) RCError!void {
+        _ = try getParent(self).ref.ref(.{});
+    }
+
+    pub fn next(self: *Stream(u8), limit: std.Io.Limit) StreamError!StreamEvent(u8) {
+        return getParent(self).nextInner(limit);
+    }
+
+    pub fn nextInner(self: *@This(), limit: std.Io.Limit) StreamError!StreamEvent(u8) {
+        if (self.is_completed) return .completed;
+
+        const allocator = try self.stream.getAllocator();
+        var alloc_writer = std.Io.Writer.Allocating.init(allocator);
+        defer alloc_writer.deinit();
+
+        _ = self.source.stream(&alloc_writer.writer, limit) catch |err| switch (err) {
+            std.Io.Reader.StreamError.EndOfStream => return .completed,
+            std.Io.Reader.StreamError.ReadFailed => return StreamError.ReadFailed,
+            std.Io.Reader.StreamError.WriteFailed => return StreamError.WriteFailed,
         };
 
-        pub fn init(value: T) @This() {
-            return .{
-                .value = value,
-            };
-        }
+        return .{ .next = try alloc_writer.toOwnedSlice() };
+    }
 
-        fn getParent(self: *Stream(T)) *@This() {
-            return @fieldParentPtr("stream", self);
-        }
+    pub fn deinit(self: *Stream(u8)) void {
+        const parent = getParent(self);
+        parent.ref.deinit(.{ .refresh_ref = true });
+    }
 
-        pub fn newRef(self: *Stream(T)) RCError!void {
-            _ = try getParent(self).ref.ref(.{});
-        }
+    pub fn getAllocator(self: *Stream(u8)) RCError!std.mem.Allocator {
+        return getParent(self).ref.allocator();
+    }
+};
 
-        pub fn next(self: *Stream(T)) StreamError!?StreamEvent(T) {
-            return getParent(self).nextInner();
-        }
+/// Consumer needs to free the return strings.
+const IoWriterByteStream = struct {
+    stream: Stream(u8) = .init(&vtable),
+    ref: RC(@This()).Ref = undefined,
+    destination: *std.Io.Writer,
+    is_completed: bool = false,
 
-        fn nextInner(self: *@This()) StreamError!?StreamEvent(T) {
-            if (self.consumed) return .completed;
-            self.consumed = true;
-            return .{ .next = self.value };
-        }
-
-        pub fn deinit(self: *Stream(T)) void {
-            getParent(self).ref.deinit(.{ .refresh_ref = true });
-        }
-
-        pub fn getAllocator(self: *Stream(T)) RCError!std.mem.Allocator {
-            return getParent(self).ref.allocator();
-        }
+    const vtable = Stream(u8).VTable{
+        .next = next,
+        .deinit = deinit,
+        .getAllocator = getAllocator,
+        .newRef = newRef,
     };
-}
+
+    pub fn init(source: *std.Io.Reader) @This() {
+        return .{
+            .source = source,
+        };
+    }
+
+    fn getParent(self: *Stream(u8)) *@This() {
+        return @fieldParentPtr("stream", self);
+    }
+
+    pub fn newRef(self: *Stream(u8)) RCError!void {
+        _ = try getParent(self).ref.ref(.{});
+    }
+
+    pub fn next(self: *Stream(u8), limit: std.Io.Limit) StreamError!StreamEvent(u8) {
+        return getParent(self).nextInner(limit);
+    }
+
+    pub fn nextInner(self: *@This(), limit: std.Io.Limit) StreamError!StreamEvent(u8) {
+        if (self.is_completed) return .completed;
+
+        const allocator = try self.stream.getAllocator();
+        var alloc_writer = std.Io.Writer.Allocating.init(allocator);
+        defer alloc_writer.deinit();
+
+        _ = self.source.stream(&alloc_writer.writer, limit) catch |err| switch (err) {
+            std.Io.Reader.StreamError.EndOfStream => return .completed,
+            std.Io.Reader.StreamError.ReadFailed => return StreamError.ReadFailed,
+            std.Io.Reader.StreamError.WriteFailed => return StreamError.WriteFailed,
+        };
+
+        return .{ .next = try alloc_writer.toOwnedSlice() };
+    }
+
+    pub fn deinit(self: *Stream(u8)) void {
+        const parent = getParent(self);
+        parent.ref.deinit(.{ .refresh_ref = true });
+    }
+
+    pub fn getAllocator(self: *Stream(u8)) RCError!std.mem.Allocator {
+        return getParent(self).ref.allocator();
+    }
+};
+
+pub const ReaderWriterStream = struct {
+    stream: Stream(u8) = .init(&vtable),
+    ref: RC(@This()).Ref = undefined,
+    writer: std.Io.Writer = .{ .vtable = &writer_vtable, .buffer = &.{} },
+    buffer_writer: std.Io.Writer.Allocating,
+    source: ?CloseableReader(ExitCode) = null,
+    destination: ?CloseableWriter(ExitCode) = null,
+    is_completed: bool = false,
+    label: []const u8,
+
+    const vtable = Stream(u8).VTable{
+        .next = next,
+        .deinit = deinit,
+        .getAllocator = getAllocator,
+        .newRef = newRef,
+    };
+
+    const writer_vtable = std.Io.Writer.VTable{
+        .drain = writer_drain,
+        .sendFile = writer_sendFile,
+        .flush = writer_flush,
+        .rebase = writer_rebase,
+    };
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        label: []const u8,
+    ) @This() {
+        return .{ .buffer_writer = .init(allocator), .label = label };
+    }
+
+    fn getParent(self: *Stream(u8)) *@This() {
+        return @fieldParentPtr("stream", self);
+    }
+
+    pub fn connectSource(
+        self: *@This(),
+        source: CloseableReader(ExitCode),
+    ) StreamError!void {
+        log(
+            self,
+            @src().fn_name ++ ": {*} + {*}",
+            .{ source.reader, source.closeable },
+        );
+
+        self.source = source;
+    }
+
+    pub fn connectDestination(
+        self: *@This(),
+        destination: CloseableWriter(ExitCode),
+    ) StreamError!void {
+        log(
+            self,
+            @src().fn_name ++ ": {*} + {*}",
+            .{ destination.writer, destination.closeable },
+        );
+
+        self.destination = destination;
+        const buffered = try self.buffer_writer.toOwnedSlice();
+        try destination.writer.writeAll(buffered);
+        log(self, "bytes forwarded: {}", .{buffered.len});
+        if (self.source) |source| if (source.isClosed()) {
+            _ = destination.close();
+        };
+    }
+
+    pub fn newRef(self: *Stream(u8)) RCError!void {
+        const parent = getParent(self);
+        log(parent, @src().fn_name, .{});
+
+        _ = try parent.ref.ref(.{});
+    }
+
+    pub fn next(self: *Stream(u8), limit: std.Io.Limit) StreamError!StreamEvent(u8) {
+        return getParent(self).nextInner(limit);
+    }
+
+    pub fn nextInner(_: *@This(), _: std.Io.Limit) StreamError!StreamEvent(u8) {
+        return .completed;
+    }
+
+    pub fn deinit(self: *Stream(u8)) void {
+        getParent(self).deinitParent();
+    }
+
+    pub fn deinitParent(self: *@This()) void {
+        log(self, @src().fn_name, .{});
+
+        self.buffer_writer.deinit();
+        self.ref.deinit(.{ .refresh_ref = true });
+    }
+
+    pub fn getAllocator(self: *Stream(u8)) RCError!std.mem.Allocator {
+        return getParent(self).ref.allocator();
+    }
+
+    fn getDestinationWriter(self: *@This()) *std.Io.Writer {
+        const destination = self.destination orelse return &self.buffer_writer.writer;
+        return destination.writer;
+    }
+
+    fn writer_getParent(self: *std.Io.Writer) *@This() {
+        return @fieldParentPtr("writer", self);
+    }
+
+    fn writer_getDestination(self: *std.Io.Writer) *std.Io.Writer {
+        return writer_getParent(self).getDestinationWriter();
+    }
+
+    fn writer_drain(
+        self: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
+        return writer_getDestination(self).writeSplat(data, splat);
+    }
+
+    fn writer_sendFile(
+        self: *std.Io.Writer,
+        file_reader: *std.fs.File.Reader,
+        limit: std.Io.Limit,
+    ) std.Io.Writer.FileError!usize {
+        return writer_getDestination(self).sendFile(file_reader, limit);
+    }
+
+    fn writer_flush(self: *std.Io.Writer) std.Io.Writer.Error!void {
+        return writer_getDestination(self).flush();
+    }
+
+    fn writer_rebase(
+        self: *std.Io.Writer,
+        preserve: usize,
+        capacity: usize,
+    ) std.Io.Writer.Error!void {
+        return writer_getDestination(self).rebase(preserve, capacity);
+    }
+
+    pub const ForwardEvent = enum { no_source, closed, not_done };
+
+    /// Returns true if source is completed.
+    pub fn forward(self: *@This(), limit: std.Io.Limit) std.Io.Reader.StreamError!ForwardEvent {
+        log(self, @src().fn_name, .{});
+
+        const source = self.source orelse {
+            log(self, "no source connected", .{});
+            return .no_source;
+        };
+        const destination_writer = self.getDestinationWriter();
+
+        log(self, "checking isClosed: {?f}", .{source.getResult()});
+        if (source.isClosed()) {
+            return .closed;
+        }
+
+        const bytes_forwarded = source.reader.stream(
+            destination_writer,
+            limit,
+        ) catch |err| switch (err) {
+            error.EndOfStream => {
+                log(self, "ended stream", .{});
+                _ = self.source.?.close();
+                if (self.destination) |d| _ = d.close();
+                return .closed;
+            },
+            else => {
+                _ = self.source.?.close();
+                if (self.destination) |d| _ = d.close();
+                // TODO: store error somewhere?
+                return .closed;
+            },
+        };
+        if (destination_writer != &self.buffer_writer.writer) {
+            try destination_writer.flush();
+        }
+
+        log(self, "bytes forwarded: {}", .{bytes_forwarded});
+
+        return .not_done;
+    }
+};
+
+// fn ByteTransformerStream(comptime T: type) type {
+//     return struct {
+//         source: *Stream([]const u8),
+//         stream: Stream(T) = .init(&vtable),
+//         /// Buffer that is going to hold the data of the next item.
+//         buffer: [@sizeOf(T)]u8 = undefined,
+//         /// Cursor into buffer where we have written up until now for the current item being read.
+//         cursor: usize = 0,
+//
+//         const vtable = Stream(T).VTable{
+//             .next = next,
+//             .deinit = deinit,
+//             .getAllocator = getAllocator,
+//             .newRef = newRef,
+//         };
+//
+//         pub fn init(source: *Stream([]const u8)) RCError!@This() {
+//             try source.newRef();
+//
+//             return .{
+//                 .source = source,
+//             };
+//         }
+//
+//         fn getParent(self: *Stream(T)) *@This() {
+//             return @fieldParentPtr("stream", self);
+//         }
+//
+//         pub fn newRef(self: *Stream(T)) RCError!void {
+//             _ = try getParent(self).ref.ref(.{});
+//         }
+//
+//         pub fn next(self: *Stream(T)) StreamError!?StreamEvent([]const u8) {
+//             return getParent(self).nextInner();
+//         }
+//
+//         pub fn nextInner(self: *@This()) StreamError!?StreamEvent([]const u8) {
+//             const source_next = try self.source.next() orelse return null;
+//
+//             switch (source_next) {
+//                 .completed => {
+//                     if (self.cursor != 0) {
+//                         return StreamError.ReadAborted;
+//                     }
+//
+//                     return .completed;
+//                 },
+//                 .next => |n| return self.produce(n),
+//             }
+//         }
+//
+//         fn produce(self: *@This(), n: []const u8) StreamEvent(T) {
+//             // If we can fill up the buffer, transform it from a string of bytes to T and return it, fill up buffer with eventual rest bytes
+//             // If we can't just fill up until the source is empty and set cursor to new position
+//             //
+//
+//             var n_cursor: usize = 0;
+//
+//             while(true) {
+//                 const bytes_needed = self.buffer.len - self.cursor;
+//                 const bytes_source_left = n.len - n_cursor;
+//
+//                 if (bytes_source_left >= bytes_needed) {
+//
+//                 }
+//             }
+//         }
+//
+//         pub fn deinit(self: *Stream(T)) void {
+//             const parent = getParent(self);
+//             parent.source.deinit();
+//             parent.ref.deinit(.{ .refresh_ref = true });
+//         }
+//
+//         pub fn getAllocator(self: *Stream(T)) RCError!std.mem.Allocator {
+//             return getParent(self).ref.allocator();
+//         }
+//     };
+// }
 
 fn MappedStream(comptime In: type, comptime Out: type) type {
-    const MapFn = *const fn (std.mem.Allocator, In) StreamError!?Out;
+    const MapFn = *const fn (std.mem.Allocator, In) StreamError!Out;
 
     return struct {
         stream: Stream(Out) = .init(&vtable),
@@ -163,21 +546,27 @@ fn MappedStream(comptime In: type, comptime Out: type) type {
             _ = try getParent(self).ref.ref(.{});
         }
 
-        pub fn next(self: *Stream(Out)) StreamError!?StreamEvent(Out) {
-            return getParent(self).nextInner();
+        pub fn next(self: *Stream(Out), limit: std.Io.Limit) StreamError!StreamEvent(Out) {
+            return getParent(self).nextInner(limit);
         }
 
-        pub fn nextInner(self: *@This()) StreamError!?StreamEvent(Out) {
-            const source_next = try self.source.next() orelse return null;
+        pub fn nextInner(self: *@This(), limit: std.Io.Limit) StreamError!StreamEvent(Out) {
+            const source_next = try self.source.next(limit);
+
             return switch (source_next) {
                 .completed => .completed,
                 .next => |n| {
-                    const result = self.mapFn(try self.ref.allocator(), n) catch |err| {
+                    defer source_next.deinit();
+                    const allocator = try self.stream.getAllocator();
+                    const result = try allocator.alloc(Out, n.payload.len);
+                    defer allocator.free(result);
+
+                    for (result, n.payload) |*out, in| out.* = self.mapFn(allocator, in) catch |err| {
                         self.stream.err = err;
                         return err;
-                    } orelse return null;
+                    };
 
-                    return .{ .next = result };
+                    return .initNext(allocator, result);
                 },
             };
         }
@@ -221,7 +610,7 @@ fn FailedStream(comptime T: type) type {
             _ = try getParent(self).ref.ref(.{});
         }
 
-        pub fn next(self: *Stream(T)) StreamError!?StreamEvent(T) {
+        pub fn next(self: *Stream(T), _: std.Io.Limit) StreamError!StreamEvent(T) {
             return self.err.?;
         }
 
@@ -242,7 +631,7 @@ pub fn Stream(comptime T: type) type {
         vtable: *const VTable,
 
         pub const VTable = struct {
-            next: *const fn (*Stream(T)) StreamError!?StreamEvent(T),
+            next: *const fn (*Stream(T), std.Io.Limit) StreamError!StreamEvent(T),
             deinit: *const fn (*Stream(T)) void,
             getAllocator: *const fn (*Stream(T)) RCError!std.mem.Allocator,
             newRef: *const fn (*Stream(T)) RCError!void,
@@ -264,9 +653,9 @@ pub fn Stream(comptime T: type) type {
         }
 
         pub fn initSingle(allocator: std.mem.Allocator, item: T) RCError!*Stream(T) {
-            const single_stream_ref = try RC(SingleStream(T)).Ref.init(
+            const single_stream_ref = try RC(FixedStream(T)).Ref.init(
                 allocator,
-                .init(item),
+                try .init(allocator, &.{item}),
                 .{},
             );
             var single_stream = try single_stream_ref.getPtr();
@@ -274,15 +663,36 @@ pub fn Stream(comptime T: type) type {
             return &single_stream.stream;
         }
 
-        pub fn initBuffer(allocator: std.mem.Allocator, buffer: []const T) RCError!*Stream(T) {
-            const buffered_stream_ref = try RC(BufferedStream(T)).Ref.init(
+        pub fn initFixed(allocator: std.mem.Allocator, buffer: []const T) RCError!*Stream(T) {
+            const buffered_stream_ref = try RC(FixedStream(T)).Ref.init(
                 allocator,
-                .init(buffer),
+                try .init(allocator, buffer),
                 .{},
             );
             var buffered_stream = try buffered_stream_ref.getPtr();
             buffered_stream.ref = buffered_stream_ref;
             return &buffered_stream.stream;
+        }
+
+        pub fn initReaderWriter(
+            allocator: std.mem.Allocator,
+            label: []const u8,
+        ) RCError!*ReaderWriterStream {
+            if (T != u8) @compileError(
+                @src().fn_name ++ " is only available on Stream(u8), actual: Stream(" ++ @typeName(T) ++ ")",
+            );
+
+            const reader_writer_stream_ref = try RC(ReaderWriterStream).Ref.init(
+                allocator,
+                .init(allocator, label),
+                .{},
+            );
+            var reader_writer_stream = try reader_writer_stream_ref.getPtr();
+            reader_writer_stream.ref = reader_writer_stream_ref;
+
+            log(reader_writer_stream, @src().fn_name, .{});
+
+            return reader_writer_stream;
         }
 
         pub fn fromValue(allocator: std.mem.Allocator, value: Value) RCError!*Stream(T) {
@@ -306,13 +716,22 @@ pub fn Stream(comptime T: type) type {
             return self.vtable.newRef(self);
         }
 
-        pub fn next(self: *@This()) StreamError!?StreamEvent(T) {
+        /// Stream owns the returned slice if StreamEvent is next.
+        pub fn next(
+            self: *@This(),
+            limit: std.Io.Limit,
+        ) StreamError!StreamEvent(T) {
             if (self.err) |err| return err;
-            return self.vtable.next(self);
+            return self.vtable.next(self, limit);
         }
 
         pub fn getAllocator(self: *@This()) RCError!std.mem.Allocator {
             return self.vtable.getAllocator(self);
+        }
+
+        pub fn clone(self: *@This()) RCError!*@This() {
+            try self.newRef();
+            return self;
         }
 
         pub fn map(
@@ -327,6 +746,52 @@ pub fn Stream(comptime T: type) type {
             var mapped_stream = try mapped_stream_ref.getPtr();
             mapped_stream.ref = mapped_stream_ref;
             return &mapped_stream.stream;
+        }
+
+        pub const TakeAllResult = struct {
+            list: []T = &.{},
+            err: ?StreamError = null,
+        };
+
+        /// Is blocking until underlying stream has ended or failed.
+        pub fn takeAll(self: *@This()) RCError!TakeAllResult {
+            const allocator = try self.getAllocator();
+            var list = std.ArrayList(T).empty;
+
+            while (true) {
+                const stream_next = self.next(.unlimited) catch |err| return .{
+                    .err = err,
+                    .list = try list.toOwnedSlice(allocator),
+                };
+                defer stream_next.deinit();
+
+                switch (stream_next) {
+                    .completed => break,
+                    .next => |n| try list.appendSlice(allocator, n.payload),
+                }
+            }
+
+            return .{ .list = try list.toOwnedSlice(allocator) };
+        }
+
+        /// Caller needs to deinit returned value.
+        pub fn stream(
+            self: *@This(),
+            w: *std.Io.Writer,
+            limit: std.Io.Limit,
+        ) StreamError!StreamEvent(T) {
+            if (T != u8) @compileError(
+                @src().fn_name ++ " is only available on Stream(u8), actual: Stream(" ++ @typeName(T) ++ ")",
+            );
+
+            const e = try self.next(limit);
+
+            switch (e) {
+                .completed => {},
+                .next => |n| try w.writeAll(n.payload),
+            }
+
+            return e;
         }
     };
 }

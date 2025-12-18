@@ -1,0 +1,5 @@
+1: cat "file.txt"
+1: cd "logs"
+2: cat "server.log"
+2: cd "asdf"
+3: asdf

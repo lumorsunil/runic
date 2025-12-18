@@ -5,6 +5,8 @@ const RC = @import("../mem/root.zig").RC;
 const RCError = @import("../mem/root.zig").RCError;
 const RCInitOptions = @import("../mem/root.zig").RCInitOptions;
 const rainbow = @import("../rainbow.zig");
+const ReaderWriterStream = @import("../stream.zig").ReaderWriterStream;
+const CloseableProcessIo = @import("../process.zig").CloseableProcessIo;
 
 const prefix_color = rainbow.beginColor(.violet);
 const end_color = rainbow.endColor();
@@ -35,6 +37,10 @@ pub const ScopeStack = struct {
         scope_ref: ScopeRef,
         scope_ref_special: *ScopeStack,
         forward_context: ForwardContext,
+        env_map: Single,
+        cwd: Value.String,
+        allocating: Allocating,
+        processes: ChildProcessContext,
         blocking,
 
         pub const Single = RC(std.ArrayList(Binding)).Ref;
@@ -42,6 +48,18 @@ pub const ScopeStack = struct {
 
         pub fn initSingleNew(allocator: Allocator) !Frame {
             return .{ .single = try .init(allocator, .empty, .{}) };
+        }
+
+        pub fn initEnvMap(allocator: Allocator) !Frame {
+            return .{ .env_map = try .init(allocator, .empty, .{}) };
+        }
+
+        pub fn initAllocating(allocator: Allocator) !Frame {
+            return .{ .allocating = .init(allocator) };
+        }
+
+        pub fn initProcesses(allocator: Allocator) !Frame {
+            return .{ .processes = .init(allocator) };
         }
 
         pub fn initSingleRef(single: Single) !Frame {
@@ -77,21 +95,35 @@ pub const ScopeStack = struct {
             return .blocking;
         }
 
+        pub fn initCwd(cwd: Value.String) Frame {
+            return .{ .cwd = cwd };
+        }
+
         fn deinit(self: *Frame) void {
             switch (self.*) {
-                .single => |*bindings_ref| bindings_ref.deinit(.{}),
+                .single, .env_map => |*bindings_ref| bindings_ref.deinit(.{}),
                 .scope_ref => |*scope_ref| scope_ref.deinit(.{}),
-                .scope_ref_special => {},
-                .forward_context => {},
-                .blocking => {},
+                .scope_ref_special, .forward_context, .blocking => {},
+                .cwd => |*string| string.deinit(.{}),
+                .allocating => |*allocating| allocating.deinit(),
+                .processes => |*processes| processes.deinit(),
             }
             self.* = undefined;
         }
 
-        fn deinitMain(self: *Frame, allocator: Allocator, scope: *ScopeStack, level: usize) void {
-            scope.log(@src().fn_name ++ " frame {} : {s}", .{ level, @tagName(self.*) }) catch {};
+        fn deinitMain(
+            self: *Frame,
+            allocator: Allocator,
+            scope: *ScopeStack,
+            level: usize,
+        ) void {
+            scope.log(
+                @src().fn_name ++ " frame {} : {s}",
+                .{ level, @tagName(self.*) },
+            ) catch {};
+
             switch (self.*) {
-                .single => |*bindings_ref| {
+                .single, .env_map => |*bindings_ref| {
                     const bindings = bindings_ref.getPtr() catch {
                         @panic("shouldn't happen :)");
                     };
@@ -102,10 +134,13 @@ pub const ScopeStack = struct {
                     defer allocator.free(bindings_items);
 
                     for (bindings_items) |*binding| {
-                        const name = binding.getName() catch "<error>";
-                        const value = binding.getValuePtr() catch null;
-                        const value_type = if (value) |v| @tagName(v.*) else null;
-                        scope.log(@src().fn_name ++ " binding \"{s}\" : {?s}", .{ name, value_type }) catch {};
+                        if (self.* == .single) {
+                            const name = binding.getName() catch "<error>";
+                            const value = binding.getValuePtr() catch null;
+                            const value_type = if (value) |v| @tagName(v.*) else null;
+                            scope.log(@src().fn_name ++ " binding \"{s}\" : {?s}", .{ name, value_type }) catch {};
+                        }
+
                         binding.deinitMain(allocator);
                     }
 
@@ -116,9 +151,10 @@ pub const ScopeStack = struct {
                         .deinit_child_fn = .withoutAllocator(ScopeStack.deinitMain),
                     });
                 },
-                .scope_ref_special => {},
-                .forward_context => {},
-                .blocking => {},
+                .scope_ref_special, .forward_context, .blocking => {},
+                .cwd => |*string| string.deinit(.{}),
+                .allocating => |*allocating| allocating.deinit(),
+                .processes => |*processes| processes.deinit(),
             }
             self.* = undefined;
         }
@@ -145,16 +181,41 @@ pub const ScopeStack = struct {
                 },
                 .forward_context => {},
                 .blocking => {},
+                .cwd => |string| try writer.print("cwd: {f}\n", .{string}),
+                .env_map => try writer.print("<env_map>", .{}),
+                .allocating => |allocating| try writer.print("<allocating: {} pointers>", .{allocating.pointers.items.len}),
+                .processes => |processes| try writer.print("<processes: {} children>", .{processes.processes.count()}),
             }
+        }
+
+        pub fn toStdEnvMap(self: *Frame) RCError!std.process.EnvMap {
+            var env_map = std.process.EnvMap.init(try self.env_map.allocator());
+            const bindings = try self.env_map.get();
+
+            for (bindings.items) |item| {
+                const key = try item.getName();
+                const value = try item.getValue();
+                const env_value = try value.string.get();
+
+                try env_map.put(key, env_value);
+            }
+
+            return env_map;
         }
     };
 
     pub const ForwardContext = struct {
+        stdin: PipeInfo,
         stdout: PipeInfo,
         stderr: PipeInfo,
 
-        pub fn init(stdout: PipeInfo, stderr: PipeInfo) ForwardContext {
+        pub fn init(
+            stdin: PipeInfo,
+            stdout: PipeInfo,
+            stderr: PipeInfo,
+        ) ForwardContext {
             return .{
+                .stdin = stdin,
                 .stdout = stdout,
                 .stderr = stderr,
             };
@@ -162,42 +223,130 @@ pub const ScopeStack = struct {
     };
 
     pub const MaterializedForwardContext = struct {
-        stdout: PipeMaterialized,
-        stderr: PipeMaterialized,
+        stdin: *PipeMaterialized,
+        stdout: *PipeMaterialized,
+        stderr: *PipeMaterialized,
 
-        pub fn init(stdout: PipeMaterialized, stderr: PipeMaterialized) MaterializedForwardContext {
+        pub fn init(
+            stdin: *PipeMaterialized,
+            stdout: *PipeMaterialized,
+            stderr: *PipeMaterialized,
+        ) MaterializedForwardContext {
             return .{
+                .stdin = stdin,
                 .stdout = stdout,
                 .stderr = stderr,
             };
         }
     };
 
-    const PipeInfo = union(enum) {
+    pub const PipeInfo = union(enum) {
         inherit,
         materialized: PipeMaterialized,
 
         pub fn init(
-            writer: *std.Io.Writer,
+            stream: *ReaderWriterStream,
             streaming: PipeMaterialized.StreamingMode,
         ) PipeInfo {
             return .{
                 .materialized = .{
                     .is_streaming = streaming,
-                    .writer = writer,
+                    .stream = stream,
+                },
+            };
+        }
+
+        pub fn blocked() PipeInfo {
+            return .{
+                .materialized = .{
+                    .is_streaming = .streaming,
+                    .stream = null,
                 },
             };
         }
     };
 
-    const PipeMaterialized = struct {
+    pub const PipeMaterialized = struct {
         is_streaming: StreamingMode,
-        writer: *std.Io.Writer,
+        stream: ?*ReaderWriterStream,
 
         pub const StreamingMode = enum {
             non_streaming,
             streaming,
         };
+    };
+
+    pub const Allocating = struct {
+        allocator: std.mem.Allocator,
+        pointers: std.ArrayList([]u8) = .empty,
+
+        pub fn init(allocator: std.mem.Allocator) @This() {
+            return .{ .allocator = allocator };
+        }
+
+        pub fn deinit(self: *@This()) void {
+            for (self.pointers.items) |ptr| self.allocator.free(ptr);
+            self.pointers.deinit(self.allocator);
+        }
+    };
+
+    pub const ChildProcessContext = struct {
+        allocator: Allocator,
+        processes: std.AutoArrayHashMapUnmanaged(
+            std.process.Child.Id,
+            *CloseableProcessIo,
+        ) = .empty,
+
+        pub fn init(allocator: Allocator) @This() {
+            return .{ .allocator = allocator };
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.wait() catch {};
+            for (self.processes.values()) |value| {
+                for (value.process.argv) |arg| self.allocator.free(arg);
+                self.allocator.free(value.process.argv);
+                self.allocator.destroy(value.process);
+                self.allocator.destroy(value);
+            }
+            self.processes.deinit(self.allocator);
+        }
+
+        pub fn wait(self: *@This()) std.process.Child.WaitError!void {
+            for (self.processes.values()) |child| {
+                // std.log.debug(
+                //     "waiting for child \"{s}\" to terminate",
+                //     .{child.process.argv[0]},
+                // );
+                _ = child.closeable().close();
+                // std.log.debug("child \"{s}\" terminated", .{child.process.argv[0]});
+            }
+        }
+
+        pub fn register(
+            self: *@This(),
+            spawned_child: std.process.Child,
+        ) !*CloseableProcessIo {
+            const entry = try self.processes.getOrPut(self.allocator, spawned_child.id);
+            const process_io = try self.allocator.create(CloseableProcessIo);
+            const stable_child = try self.allocator.create(std.process.Child);
+            entry.value_ptr.* = process_io;
+
+            stable_child.* = spawned_child;
+            const duped_argv = try self.allocator.dupe([]const u8, spawned_child.argv);
+            stable_child.argv = duped_argv;
+            for (duped_argv) |*arg| arg.* = try self.allocator.dupe(u8, arg.*);
+            process_io.* = .init(stable_child);
+            process_io.connect();
+
+            return process_io;
+        }
+
+        pub fn getTerm(self: *@This(), id: std.process.Child.Id) ?std.process.Child.Term {
+            const child = self.processes.get(id) orelse return null;
+            const term = child.term orelse return null;
+            return if (term) |t| t else |_| null;
+        }
     };
 
     const Binding = union(enum) {
@@ -225,7 +374,7 @@ pub const ScopeStack = struct {
                 const ptr = try allocator.create(BindingValue);
                 ptr.* = .{
                     .name = try allocator.dupe(u8, self.name),
-                    .value = try self.value.clone(allocator),
+                    .value = try self.value.clone(allocator, .{ .label = @src().fn_name }),
                 };
 
                 return ptr;
@@ -333,6 +482,7 @@ pub const ScopeStack = struct {
 
     pub fn deinit(self: *ScopeStack) void {
         self.logBindings(@src().fn_name, 0, 0) catch {};
+
         switch (self.scope_type) {
             .main => self.deinitMain(),
             .child => self.deinitChild(),
@@ -341,6 +491,7 @@ pub const ScopeStack = struct {
 
     pub fn deinitNoDestroySelf(self: *ScopeStack) void {
         self.logBindings(@src().fn_name, 0, 0) catch {};
+
         switch (self.scope_type) {
             .main => self.deinitMainNoDestroySelf(),
             .child => self.deinitChildNoDestroySelf(),
@@ -419,16 +570,41 @@ pub const ScopeStack = struct {
     pub fn pushFrameForwarding(
         self: *ScopeStack,
         label: []const u8,
-        stdout: *std.Io.Writer,
-        stderr: *std.Io.Writer,
+        options: ForwardContext,
     ) Error!void {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         const tag: std.meta.Tag(Frame) = .forward_context;
         try self.log("{s}:{s}({}) : {s}", .{ label, @src().fn_name, self.frames.items.len, @tagName(tag) });
-        try self.frames.append(self.allocator, .initForwardContext(.init(
-            .init(stdout, self.getStdoutPipe().is_streaming),
-            .init(stderr, self.getStderrPipe().is_streaming),
-        )));
+
+        try self.frames.append(self.allocator, .initForwardContext(options));
+    }
+
+    pub fn pushCwd(self: *ScopeStack, label: []const u8, cwd: []const u8) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.log("{s}:{s}({}) : cwd", .{ label, @src().fn_name, self.frames.items.len });
+
+        try self.frames.append(self.allocator, .initCwd(try .dupe(self.allocator, cwd, .{})));
+    }
+
+    pub fn pushEnvMap(self: *ScopeStack, label: []const u8) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.log("{s}:{s}({}) : env map", .{ label, @src().fn_name, self.frames.items.len });
+
+        try self.frames.append(self.allocator, try .initEnvMap(self.allocator));
+    }
+
+    pub fn pushAllocating(self: *ScopeStack, label: []const u8) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.log("{s}:{s}({}) : allocating", .{ label, @src().fn_name, self.frames.items.len });
+
+        try self.frames.append(self.allocator, try .initAllocating(self.allocator));
+    }
+
+    pub fn pushProcesses(self: *ScopeStack, label: []const u8) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.log("{s}:{s}({}) : processes", .{ label, @src().fn_name, self.frames.items.len });
+
+        try self.frames.append(self.allocator, try .initProcesses(self.allocator));
     }
 
     pub fn popFrame(self: *ScopeStack, label: []const u8) Error!void {
@@ -466,7 +642,7 @@ pub const ScopeStack = struct {
             @tagName(value.*),
         });
 
-        var frame = try self.currentFrameSingle();
+        var frame = try self.currentFrameByTag(.single);
         if (try findInFrame(frame, name) != null) return error.DuplicateBinding;
 
         const name_owned = try self.allocator.dupe(u8, name);
@@ -494,7 +670,7 @@ pub const ScopeStack = struct {
             .constant => |c| {
                 const name_owned = try self.allocator.dupe(u8, name);
                 errdefer self.allocator.free(name_owned);
-                var value_owned = try c.value.clone(self.allocator);
+                var value_owned = try c.value.clone(self.allocator, .{ .label = @src().fn_name });
                 errdefer value_owned.deinit(self.allocator);
 
                 try frame.single.append(self.allocator, try .init(
@@ -513,9 +689,41 @@ pub const ScopeStack = struct {
         }
     }
 
+    pub fn declareEnvVar(
+        self: *ScopeStack,
+        name: []const u8,
+        value: *Value,
+        is_mutable: bool,
+    ) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+
+        // try self.log("{s}(\"{s}\" : {s} {s}):", .{
+        //     @src().fn_name,
+        //     name,
+        //     if (is_mutable) "var" else "const",
+        //     @tagName(value.*),
+        // });
+
+        var frame = try self.getEnvMap();
+        if (try findInFrame(frame, name) != null) return error.DuplicateBinding;
+
+        const name_owned = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(name_owned);
+
+        const moved_value = value.move();
+        const bindings = try frame.env_map.getPtr();
+        try bindings.append(self.allocator, try .init(
+            self.allocator,
+            name_owned,
+            moved_value,
+            is_mutable,
+        ));
+    }
+
     pub fn lookup(self: *ScopeStack, name: []const u8) Error!?BindingRef {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.log(@src().fn_name ++ "(\"{s}\")", .{name});
+
         var index = self.frames.items.len;
         while (index > 0) {
             index -= 1;
@@ -540,7 +748,38 @@ pub const ScopeStack = struct {
                     try self.log(@src().fn_name ++ ": blocking, returning null", .{});
                     return null;
                 },
-                .forward_context => continue,
+                .forward_context, .cwd, .env_map, .allocating, .processes => continue,
+            }
+        }
+        try self.log(@src().fn_name ++ ": not found, returning null", .{});
+        return null;
+    }
+
+    pub fn getEnvVar(self: *ScopeStack, name: []const u8) Error!?BindingRef {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.log(@src().fn_name ++ "(\"{s}\")", .{name});
+
+        var index = self.frames.items.len;
+        while (index > 0) {
+            index -= 1;
+            const frame = &self.frames.items[index];
+            switch (frame.*) {
+                .env_map, .scope_ref, .scope_ref_special => {
+                    if (try findInFrame(frame, name)) |binding| {
+                        const value = try binding.getValuePtr();
+                        var format_buf: [512]u8 = undefined;
+                        try self.log(@src().fn_name ++ ": found {s}{s}", .{
+                            @tagName(value.*),
+                            formatValueValue(&format_buf, value) catch unreachable,
+                        });
+                        return .{
+                            .value = value,
+                            .is_mutable = binding.* == .mutable,
+                            .rc = if (binding.* == .mutable) binding.mutable else null,
+                        };
+                    }
+                },
+                .blocking, .forward_context, .cwd, .env_map => continue,
             }
         }
         try self.log(@src().fn_name ++ ": not found, returning null", .{});
@@ -553,8 +792,7 @@ pub const ScopeStack = struct {
         try writer.writeAll(" = ");
 
         switch (value.*) {
-            .integer => |integer| try writer.print("{}", .{integer}),
-            .float => |float| try writer.print("{}", .{float}),
+            .integer, .float, .boolean, .range, .void, .array, .scope, .stream, .process, .execution, .exit_code => try writer.print("{f}", .{value.*}),
             .string => |string_ref| {
                 const string = try string_ref.get();
                 try writer.print("\"{s}{s}\"", .{
@@ -562,24 +800,15 @@ pub const ScopeStack = struct {
                     if (string.len >= 16) "..." else "",
                 });
             },
-            .boolean => |boolean| try writer.print("{}", .{boolean}),
-            .void => try writer.print("{{}}", .{}),
-            .range => |range| {
-                if (range.end) |end| {
-                    try writer.print("{}..{}", .{ range.start, end });
-                } else {
-                    try writer.print("{}..", .{range.start});
-                }
-            },
-            .array => |array| try writer.print("<array:{}>", .{
-                (try array.get()).items.len,
-            }),
             .function => |fn_ref| try writer.print("<function:{s}>", .{
-                (try fn_ref.getPtr()).fn_decl.name.name,
-            }),
-            .process_handle => try writer.print("<process_handle>", .{}),
-            .scope => |scope_ref| try writer.print("<scope:{*}>", .{
-                try scope_ref.getPtr(),
+                brk: {
+                    const fn_decl = (try fn_ref.getPtr()).fn_decl;
+                    if (fn_decl.name) |identifier| {
+                        break :brk identifier.name;
+                    } else {
+                        break :brk "<anonymous>";
+                    }
+                },
             }),
         }
 
@@ -588,13 +817,13 @@ pub const ScopeStack = struct {
         return writer.buffered();
     }
 
-    fn currentFrameSingle(self: *ScopeStack) Error!*Frame {
+    fn currentFrameByTag(self: *ScopeStack, comptime tag: std.meta.Tag(Frame)) Error!*Frame {
         if (self.frames.items.len == 0) return Error.ScopeUnderflow;
         for (0..self.frames.items.len) |i| {
             const j = self.frames.items.len - i - 1;
             const frame = &self.frames.items[j];
             switch (frame.*) {
-                .single => return frame,
+                tag => return frame,
                 else => continue,
             }
         }
@@ -604,7 +833,7 @@ pub const ScopeStack = struct {
 
     fn findInFrame(frame: *Frame, name: []const u8) Error!?*Binding {
         switch (frame.*) {
-            .single => |bindings_ref| {
+            .single, .env_map => |bindings_ref| {
                 const bindings = try bindings_ref.getPtr();
                 for (bindings.items) |*binding| {
                     if (std.mem.eql(u8, try binding.getName(), name)) return binding;
@@ -612,15 +841,14 @@ pub const ScopeStack = struct {
             },
             .scope_ref => |scope_ref| {
                 const scope = try scope_ref.getPtr();
-                const current = try scope.currentFrameSingle();
+                const current = try scope.currentFrameByTag(.single);
                 return findInFrame(current, name);
             },
             .scope_ref_special => |scope_ref_special| {
-                const current = try scope_ref_special.currentFrameSingle();
+                const current = try scope_ref_special.currentFrameByTag(.single);
                 return findInFrame(current, name);
             },
-            .forward_context => return Error.FindInNonBindingFrame,
-            .blocking => return Error.FindInNonBindingFrame,
+            .forward_context, .blocking, .cwd, .allocating, .processes => return Error.FindInNonBindingFrame,
         }
         return null;
     }
@@ -643,12 +871,10 @@ pub const ScopeStack = struct {
                 .scope_ref_special => |scope_ref_special| {
                     try scope.pushFrame(@src().fn_name, .initScopeRefSpecial(scope_ref_special));
                 },
-                .forward_context => |forward_context| {
-                    try scope.pushFrame(@src().fn_name, .initForwardContext(forward_context));
-                },
                 .blocking => {
                     try scope.pushFrame(@src().fn_name, .initBlocking());
                 },
+                .env_map, .allocating, .processes, .forward_context, .cwd => {},
             }
         }
 
@@ -678,41 +904,49 @@ pub const ScopeStack = struct {
         self: *ScopeStack,
     ) MaterializedForwardContext {
         var index = self.frames.items.len - 1;
-        var stdout: ?PipeMaterialized = null;
-        var stderr: ?PipeMaterialized = null;
+        var stdin: ?*PipeMaterialized = null;
+        var stdout: ?*PipeMaterialized = null;
+        var stderr: ?*PipeMaterialized = null;
 
         while (true) {
             const idx, const forward_context = self.getForwardContextFromIndex(index);
             index = idx -| 1;
 
+            if (stdin == null) {
+                switch (forward_context.stdin) {
+                    .materialized => |*materialized| stdin = materialized,
+                    .inherit => {},
+                }
+            }
+
             if (stdout == null) {
                 switch (forward_context.stdout) {
-                    .materialized => |materialized| stdout = materialized,
+                    .materialized => |*materialized| stdout = materialized,
                     .inherit => {},
                 }
             }
 
             if (stderr == null) {
                 switch (forward_context.stderr) {
-                    .materialized => |materialized| stderr = materialized,
+                    .materialized => |*materialized| stderr = materialized,
                     .inherit => {},
                 }
             }
 
-            if (stdout != null and stderr != null) {
-                return .init(stdout.?, stderr.?);
+            if (stdin != null and stdout != null and stderr != null) {
+                return .init(stdin.?, stdout.?, stderr.?);
             }
 
             if (index == 0) @panic("shouldn't happen :)");
         }
     }
 
-    pub fn getForwardContextFromIndex(self: *ScopeStack, index: usize) struct { usize, ForwardContext } {
+    pub fn getForwardContextFromIndex(self: *ScopeStack, index: usize) struct { usize, *ForwardContext } {
         var idx = index;
         while (idx >= 0) : (idx -= 1) {
             const frame = &self.frames.items[idx];
             switch (frame.*) {
-                .forward_context => |forward_context| {
+                .forward_context => |*forward_context| {
                     return .{ idx, forward_context };
                 },
                 else => continue,
@@ -735,14 +969,77 @@ pub const ScopeStack = struct {
         };
     }
 
-    pub fn getStdoutPipe(self: *ScopeStack) PipeMaterialized {
+    pub fn getStdinPipe(self: *ScopeStack) *PipeMaterialized {
+        const forward_context = self.getForwardContext();
+        return forward_context.stdin;
+    }
+
+    pub fn getStdoutPipe(self: *ScopeStack) *PipeMaterialized {
         const forward_context = self.getForwardContext();
         return forward_context.stdout;
     }
 
-    pub fn getStderrPipe(self: *ScopeStack) PipeMaterialized {
+    pub fn getStderrPipe(self: *ScopeStack) *PipeMaterialized {
         const forward_context = self.getForwardContext();
         return forward_context.stderr;
+    }
+
+    pub fn getCwd(self: *ScopeStack) RCError!Value.String {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.log(@src().fn_name, .{});
+
+        var idx = self.frames.items.len - 1;
+        while (idx >= 0) : (idx -= 1) {
+            const frame = &self.frames.items[idx];
+            switch (frame.*) {
+                .cwd => |cwd| return try cwd.ref(.{}),
+                else => continue,
+            }
+        }
+
+        @panic("missing cwd context");
+    }
+
+    pub fn getEnvMap(self: *ScopeStack) RCError!*Frame {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.log(@src().fn_name, .{});
+
+        var idx = self.frames.items.len - 1;
+        while (idx >= 0) : (idx -= 1) {
+            const frame = &self.frames.items[idx];
+            switch (frame.*) {
+                .env_map => return frame,
+                else => continue,
+            }
+        }
+
+        @panic("missing env map context");
+    }
+
+    pub fn alloc(self: *ScopeStack, comptime T: type, n: usize) Error![]T {
+        const frame = try self.currentFrameByTag(.allocating);
+        const allocated = try frame.allocating.allocator.alloc(u8, @sizeOf(T) * n);
+        try frame.allocating.pointers.append(frame.allocating.allocator, allocated);
+        return std.mem.bytesAsSlice(T, allocated);
+    }
+
+    pub fn create(self: *ScopeStack, comptime T: type) Error!*T {
+        const frame = try self.currentFrameByTag(.allocating);
+        const allocated = try frame.allocating.allocator.alloc(u8, @sizeOf(T));
+        try frame.allocating.pointers.append(frame.allocating.allocator, allocated);
+        return @ptrCast(@alignCast(allocated));
+    }
+
+    pub fn spawn(self: *ScopeStack, child: *std.process.Child) !*CloseableProcessIo {
+        const frame = try self.currentFrameByTag(.processes);
+        try child.spawn();
+        return frame.processes.register(child.*);
+    }
+
+    pub fn wait(self: *ScopeStack) (Error || std.process.Child.WaitError)!*ChildProcessContext {
+        const frame = try self.currentFrameByTag(.processes);
+        try frame.processes.wait();
+        return &frame.processes;
     }
 };
 

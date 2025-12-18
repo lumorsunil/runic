@@ -10,7 +10,7 @@ pub const RCError =
         InvalidRef,
     };
 
-const log_enabled = false;
+const log_enabled = true;
 
 // const prefix_color = "";
 // const prefix_ref_color = "";
@@ -33,6 +33,10 @@ const end_color = rainbow.endColor();
 pub const RCInitOptions = struct {
     label: ?[]const u8 = null,
 };
+
+fn isLoggingEnabled() bool {
+    return std.process.hasEnvVar(std.heap.page_allocator, "RUNIC_LOG_RC") catch false;
+}
 
 pub fn RC(comptime T: type) type {
     return struct {
@@ -57,8 +61,10 @@ pub fn RC(comptime T: type) type {
             pub fn deinit(self: *Ref, options: DeinitOptions) void {
                 if (self.rc) |rc| {
                     self.log("{s}release{s} (refs left before release: {})", .{ release_color, end_color, rc.refs }) catch {};
-                    if (rc.release(options)) {
+                    if (rc.refs == 1) {
                         self.rc = null;
+                    }
+                    if (rc.release(options)) {
                         return;
                     }
                 } else {
@@ -71,7 +77,7 @@ pub fn RC(comptime T: type) type {
             }
 
             pub fn log(self: Ref, comptime fmt: []const u8, args: anytype) !void {
-                if (!log_enabled) return;
+                if (!isLoggingEnabled()) return;
 
                 var stderr = std.fs.File.stderr().writer(&.{});
                 const writer = &stderr.interface;
@@ -140,6 +146,7 @@ pub fn RC(comptime T: type) type {
                     return RCError.InvalidRef;
                 };
 
+                try self.log("{s}clone rc{s} (source)", .{ ref_color, end_color });
                 const rc_clone = try rc.clone();
                 return try rc_clone.ref(options);
             }
@@ -155,6 +162,18 @@ pub fn RC(comptime T: type) type {
             pub fn refs(self: Ref) usize {
                 const rc = self.rc orelse return 0;
                 return rc.refs;
+            }
+
+            pub fn format(self: Ref, writer: *std.Io.Writer) !void {
+                const value = self.get() catch {
+                    try writer.writeAll("<ref error>");
+                    return;
+                };
+                if (T == []u8 or T == []const u8) {
+                    try writer.print("{s}", .{value});
+                } else {
+                    try writer.print("{f}", .{value});
+                }
             }
         };
 
@@ -203,7 +222,7 @@ pub fn RC(comptime T: type) type {
         }
 
         pub fn log(self: *RC(T), comptime fmt: []const u8, args: anytype) !void {
-            if (!log_enabled) return;
+            if (!isLoggingEnabled()) return;
 
             var stderr = std.fs.File.stderr().writer(&.{});
             const writer = &stderr.interface;

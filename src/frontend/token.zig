@@ -14,6 +14,10 @@ pub const Location = struct {
         .line = 0,
         .offset = 0,
     };
+
+    pub fn isGlobal(self: Location) bool {
+        return self.column == 0 and self.line == 0 and self.offset == 0;
+    }
 };
 
 /// Span represents the start and end location of a token. The end location is
@@ -66,6 +70,10 @@ pub const Span = struct {
 
     pub fn sliceFrom(self: Span, source: []const u8) []const u8 {
         return source[self.start.offset..self.end.offset];
+    }
+
+    pub fn isGlobal(self: Span) bool {
+        return self.start.isGlobal();
     }
 };
 
