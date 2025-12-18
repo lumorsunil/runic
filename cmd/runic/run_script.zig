@@ -8,6 +8,9 @@ const Parser = runic.parser.Parser;
 const TypeChecker = runic.semantic.TypeChecker;
 const rainbow = runic.rainbow;
 const ast = runic.ast;
+const Stream = runic.stream.Stream;
+const closeable = runic.closeable;
+const ExitCode = runic.command_runner.ExitCode;
 
 pub fn runScript(
     allocator: Allocator,
@@ -16,7 +19,7 @@ pub fn runScript(
     // stdin: *std.Io.Reader,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
-) !runic.command_runner.ExitCode {
+) !ExitCode {
     var env_map = std.process.getEnvMap(allocator) catch |err| {
         try stderr.print("error: unable to capture environment: {s}\n", .{@errorName(err)});
         return .fromByte(1);
@@ -89,15 +92,39 @@ pub fn runScript(
     const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(cwd);
 
+    const stdout_stream = try Stream(u8).initReaderWriter(allocator, "<<<stdout>>>");
+    defer stdout_stream.stream.deinit();
+    const stderr_stream = try Stream(u8).initReaderWriter(allocator, "<<<stderr>>>");
+    defer stderr_stream.stream.deinit();
+
+    var stdout_closeable = closeable.NeverCloses(ExitCode){};
+    var stderr_closeable = closeable.NeverCloses(ExitCode){};
+
+    const stdout_closeable_writer = closeable.CloseableWriter(ExitCode).init(
+        stdout,
+        &stdout_closeable.closeable,
+    );
+    const stderr_closeable_writer = closeable.CloseableWriter(ExitCode).init(
+        stderr,
+        &stderr_closeable.closeable,
+    );
+
+    try stdout_stream.connectDestination(stdout_closeable_writer);
+    try stderr_stream.connectDestination(stderr_closeable_writer);
+
+    // std.log.debug("stdout >>> {*}", .{stdout});
+    // std.log.debug("stderr >>> {*}", .{stderr});
+
     const executeOptions = ScriptExecutor.ExecuteOptions.init(
         script.path,
         cwd,
         env_map,
         .init(
+            // TODO: connect up stdin from parent process
             // .init(stdin, .streaming),
             .blocked(),
-            .init(stdout, .streaming),
-            .init(stderr, .streaming),
+            .init(stdout_stream, .streaming),
+            .init(stderr_stream, .streaming),
         ),
     );
 
@@ -120,7 +147,57 @@ pub fn runScript(
     executor.wireCommandBridge(entryDocument.script_executor.?.scopes);
     // try executor.reseedFromContext(&context);
 
+    var builtin_arena = std.heap.ArenaAllocator.init(allocator);
+    defer builtin_arena.deinit();
+    try addBuiltinFns(builtin_arena.allocator(), executor.scopes);
+
     return try executor.execute(script_ast, executeOptions);
+}
+
+fn declareBuiltinFn(
+    allocator: std.mem.Allocator,
+    scopes: *runic.interpreter.ScopeStack,
+    name: []const u8,
+    params: []const []const u8,
+) !void {
+    const identifier: ast.Identifier = .{ .name = name, .span = .global };
+    const params_slice = try allocator.alloc(*ast.Parameter, params.len);
+    for (params, 0..) |param, i| {
+        params_slice[i] = try allocator.create(ast.Parameter);
+        const pattern = try allocator.create(ast.BindingPattern);
+        pattern.* = .{ .identifier = .{ .name = param, .span = .global } };
+        params_slice[i].* = .{
+            .span = .global,
+            .is_mutable = false,
+            .pattern = pattern,
+            .type_annotation = null,
+            .default_value = null,
+        };
+    }
+    const inspect_params: ast.FunctionDecl.Parameters = .nonVariadic(params_slice);
+    const inspect_body = try allocator.create(runic.ast.Expression);
+    inspect_body.* = .{ .builtin = .{ .tag = std.meta.stringToEnum(ast.BuiltinExpr.Tag, name).?, .span = .global } };
+    const inspect_decl = try allocator.create(runic.ast.FunctionDecl);
+    inspect_decl.* = .{
+        .body = inspect_body,
+        .name = identifier,
+        .span = .global,
+        .params = inspect_params,
+        .return_type = null,
+        .stdin_type = null,
+    };
+    var inspect_value: runic.interpreter.Value = .{ .function = try .init(allocator, .{
+        .fn_decl = inspect_decl,
+        .closure = null,
+    }, .{}) };
+    try scopes.declare(identifier.name, &inspect_value, false);
+}
+
+fn addBuiltinFns(
+    allocator: std.mem.Allocator,
+    scopes: *runic.interpreter.ScopeStack,
+) !void {
+    try declareBuiltinFn(allocator, scopes, "inspect", &.{"value"});
 }
 
 const StatementExpressionIterator = struct {
@@ -200,11 +277,6 @@ const StatementExpressionIterator = struct {
             .error_decl, .bash_block => {},
             .type_binding_decl => {},
             .binding_decl => |binding_decl| try self.cursor.appendExpr(binding_decl.initializer),
-            .fn_decl => |fn_decl| try self.cursor.appendExpr(fn_decl.body),
-            // .for_stmt => |for_stmt| {
-            //     try self.cursor.appendStatements(for_stmt.body.statements);
-            //     try self.cursor.appendExpressions(for_stmt.sources);
-            // },
             .while_stmt => |while_stmt| {
                 try self.cursor.appendStatements(while_stmt.body.statements);
                 try self.cursor.appendExpr(while_stmt.condition);
@@ -217,18 +289,13 @@ const StatementExpressionIterator = struct {
     fn populateStackExpr(self: *StatementExpressionIterator, expr: *runic.ast.Expression) !void {
         const cursor = &self.cursor;
         switch (expr.*) {
-            .identifier, .path, .literal, .map, .import_expr => {},
+            .identifier, .path, .literal, .map, .import_expr, .pipeline_deprecated, .builtin => {},
             .array => |array| try cursor.appendExpressions(array.elements),
             .range => |range| {
                 try cursor.appendExpr(range.start);
                 if (range.end) |end| try cursor.appendExpr(end);
             },
-            .pipeline => |pipeline| {
-                for (pipeline.stages) |stage| switch (stage.payload) {
-                    .expression => |p_expr| try cursor.appendExpr(p_expr),
-                    else => {},
-                };
-            },
+            .pipeline => |pipeline| for (pipeline.stages) |stage| try cursor.appendExpr(stage),
             .call => |call| try cursor.appendExpr(call.callee),
             .member => |member| try cursor.appendExpr(member.object),
             .index => |index| {
@@ -241,10 +308,7 @@ const StatementExpressionIterator = struct {
                 try cursor.appendExpr(binary.right);
             },
             .block => |block| try populateBlockExpr(cursor, block),
-            .fn_literal => |fn_literal| {
-                try cursor.appendExpr(fn_literal.body);
-                for (fn_literal.params) |param| if (param.default_value) |dv| try cursor.appendExpr(dv);
-            },
+            .fn_decl => |fn_decl| try self.cursor.appendExpr(fn_decl.body),
             .if_expr => |*if_expr| try populateIfExpr(cursor, if_expr),
             .match_expr => |match_expr| {
                 for (match_expr.cases) |c| try populateBlockExpr(cursor, c.body);

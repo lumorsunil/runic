@@ -61,8 +61,10 @@ pub fn RC(comptime T: type) type {
             pub fn deinit(self: *Ref, options: DeinitOptions) void {
                 if (self.rc) |rc| {
                     self.log("{s}release{s} (refs left before release: {})", .{ release_color, end_color, rc.refs }) catch {};
-                    if (rc.release(options)) {
+                    if (rc.refs == 1) {
                         self.rc = null;
+                    }
+                    if (rc.release(options)) {
                         return;
                     }
                 } else {

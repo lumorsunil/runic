@@ -218,7 +218,7 @@ fn renderExpressionAst(writer: *std.Io.Writer, expr: *const ast.Expression, leve
             try writer.print("pipeline @ ", .{});
             try printSpanInline(writer, pipeline_expr.span);
             try writer.writeByte('\n');
-            for (pipeline_expr.stages) |stage| try renderPipelineStage(writer, stage, level + 1);
+            for (pipeline_expr.stages) |stage| try renderExpressionAst(writer, stage, level + 1);
         },
         .binary => |binary| {
             try writeIndent(writer, level);
@@ -256,6 +256,22 @@ fn renderExpressionAst(writer: *std.Io.Writer, expr: *const ast.Expression, leve
                 try writer.print("arg {}:\n", .{i});
                 try renderExpressionAst(writer, arg, level + 2);
             }
+        },
+        .fn_decl => |fn_decl| {
+            try writeIndent(writer, level);
+            try writer.print("fn_decl @ ", .{});
+            try printSpanInline(writer, fn_decl.span);
+            try writer.writeByte('\n');
+            try writeIndent(writer, level + 1);
+            if (fn_decl.name) |identifier| {
+                try writer.writeAll(identifier.name);
+            } else {
+                try writer.writeAll("<anonymous>");
+            }
+            try writer.writeByte('\n');
+            try writeIndent(writer, level + 1);
+            try writer.print("body:\n", .{});
+            try renderExpressionAst(writer, fn_decl.body, level + 2);
         },
         else => {
             const tag_name = @tagName(std.meta.activeTag(node));
@@ -310,18 +326,6 @@ fn renderStatementAst(writer: *std.Io.Writer, stmt: *const ast.Statement, level:
             try renderBindingPatternAst(writer, binding_decl.pattern, level + 1);
             try renderTypeExpr(writer, binding_decl.annotation, level + 1);
             try renderExpressionAst(writer, binding_decl.initializer, level + 1);
-        },
-        .fn_decl => |fn_decl| {
-            try writeIndent(writer, level);
-            try writer.print("fn_decl @ ", .{});
-            try printSpanInline(writer, fn_decl.span);
-            try writer.writeByte('\n');
-            try writeIndent(writer, level + 1);
-            try writer.writeAll(fn_decl.name.name);
-            try writer.writeByte('\n');
-            try writeIndent(writer, level + 1);
-            try writer.print("body:\n", .{});
-            try renderExpressionAst(writer, fn_decl.body, level + 2);
         },
         else => {
             const tag_name = @tagName(std.meta.activeTag(stmt.*));

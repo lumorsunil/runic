@@ -774,11 +774,15 @@ pub const ExitCode = union(enum) {
         return .{ .term = .{ .Exited = byte } };
     }
 
-    pub fn fromTerm(term: std.process.Child.Term) ExitCode {
-        return switch (term) {
-            .Exited => |byte| fromByte(byte),
-            else => .{ .term = term },
-        };
+    pub fn fromTerm(term: std.process.Child.SpawnError!std.process.Child.Term) ExitCode {
+        if (term) |t| {
+            return switch (t) {
+                .Exited => |byte| fromByte(byte),
+                else => .{ .term = t },
+            };
+        } else |err| {
+            return .{ .err = err };
+        }
     }
 
     pub fn getErrorCode(self: ExitCode) u8 {

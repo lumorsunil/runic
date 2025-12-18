@@ -77,9 +77,10 @@ pub const ScriptExecutor = struct {
             allocator.destroy(scopes);
             allocator.destroy(bridge);
         }
-        try scopes.pushFrame(
+        try scopes.pushAllocating(@src().fn_name);
+        try scopes.pushFrameForwarding(
             @src().fn_name,
-            .initForwardContext(executeOptions.forward_context),
+            executeOptions.forward_context,
         );
         try scopes.pushFrame(@src().fn_name, try .initSingleNew(allocator));
 
@@ -138,6 +139,7 @@ pub const ScriptExecutor = struct {
         try self.scopes.pushCwd(@src().fn_name, options.cwd);
         try self.scopes.pushEnvMap(@src().fn_name);
         try self.scopes.pushFrameForwarding(@src().fn_name, options.forward_context);
+        try self.scopes.pushProcesses(@src().fn_name);
 
         var env_it = options.env_map.iterator();
         while (env_it.next()) |entry| {
@@ -172,7 +174,7 @@ pub const ScriptExecutor = struct {
             }
         }
 
-        try self.scopes.popFrame(@src().fn_name);
+        try self.scopes.popFrameN(@src().fn_name, 4);
 
         return .success;
     }

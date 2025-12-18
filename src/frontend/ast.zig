@@ -512,13 +512,14 @@ pub const Expression = union(enum) {
     map: MapLiteral,
     range: RangeLiteral,
     pipeline: Pipeline,
+    pipeline_deprecated: Pipeline_deprecated,
     call: CallExpr,
     member: MemberExpr,
     index: IndexExpr,
     unary: UnaryExpr,
     binary: BinaryExpr,
     block: Block,
-    fn_literal: FunctionLiteral,
+    fn_decl: FunctionDecl,
     if_expr: IfExpr,
     for_expr: ForExpr,
     match_expr: MatchExpr,
@@ -527,6 +528,7 @@ pub const Expression = union(enum) {
     import_expr: ImportExpr,
     assignment: Assignment,
     executable: ExecutableExpr,
+    builtin: BuiltinExpr,
 
     pub fn span(self: Expression) Span {
         return switch (self) {
@@ -702,6 +704,7 @@ pub const BinaryOp = enum {
     /// (Stream(String) | parseFloat | Stream(Float) + Stream(Float))
     pipe,
     apply,
+    member,
 
     pub fn precedence(self: BinaryOp) usize {
         return switch (self) {
@@ -720,6 +723,7 @@ pub const BinaryOp = enum {
             .logical_or => 5,
             .pipe => 50,
             .apply => 70,
+            .member => 90,
         };
     }
 
@@ -739,7 +743,15 @@ pub const BinaryOp = enum {
             .kw_or => .logical_or,
             .equal_equal => .equal,
             .pipe => .pipe,
+            .dot => .member,
             else => null,
+        };
+    }
+
+    pub fn capturesStdin(self: @This()) bool {
+        return switch (self) {
+            .pipe => true,
+            else => false,
         };
     }
 };
@@ -881,10 +893,23 @@ pub const ImportExpr = struct {
     }
 };
 
+pub const Pipeline = struct {
+    stages: []*Expression,
+    span: Span,
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*const TypeExpr {
+        return null;
+    }
+};
+
 /// Pipelines model chained command and expression stages. Each stage carries a
 /// `StageRole` so the runtime can distinguish external commands from pure
 /// expressions while preserving location metadata for diagnostics.
-pub const Pipeline = struct {
+pub const Pipeline_deprecated = struct {
     stages: []const PipelineStage,
     span: Span,
 
@@ -1030,7 +1055,6 @@ pub const Script = Block;
 pub const Statement = union(enum) {
     type_binding_decl: TypeBindingDecl,
     binding_decl: BindingDecl,
-    fn_decl: FunctionDecl,
     expression: ExpressionStmt,
 
     error_decl: ErrorDecl,
@@ -1042,7 +1066,6 @@ pub const Statement = union(enum) {
         return switch (self) {
             .type_binding_decl => |decl| decl.span,
             .binding_decl => |decl| decl.span,
-            .fn_decl => |fn_decl| fn_decl.span,
             .error_decl => |err| err.span,
             .return_stmt => |ret| ret.span,
             // .for_stmt => |loop_stmt| loop_stmt.span,
@@ -1115,8 +1138,7 @@ pub const Parameter = struct {
 };
 
 pub const FunctionDecl = struct {
-    name: Identifier,
-    is_async: bool,
+    name: ?Identifier,
     params: Parameters,
     stdin_type: ?*const TypeExpr,
     return_type: ?*const TypeExpr,
@@ -1126,6 +1148,8 @@ pub const FunctionDecl = struct {
     pub const Parameters = union(enum) {
         _non_variadic: []*Parameter,
         _variadic: *Parameter,
+
+        pub const none = nonVariadic(&.{});
 
         pub fn nonVariadic(_non_variadic: []*Parameter) @This() {
             return .{ ._non_variadic = _non_variadic };
@@ -1168,6 +1192,21 @@ pub const FunctionDecl = struct {
 
 pub const ExecutableExpr = struct {
     span: Span,
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*const TypeExpr {
+        return null;
+    }
+};
+
+pub const BuiltinExpr = struct {
+    tag: Tag,
+    span: Span,
+
+    pub const Tag = enum { inspect };
 
     pub fn resolveType(
         _: *@This(),

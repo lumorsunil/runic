@@ -1,2 +1,4 @@
-"hello\n"
-echo "hello" | cat
+const s = echo "hello"
+inspect (s.stdout)
+echo "${s}"
+

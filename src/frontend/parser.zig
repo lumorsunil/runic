@@ -461,6 +461,7 @@ pub const Parser = struct {
         const next = try self.peekToken();
 
         return switch (next.tag) {
+            .kw_fn => self.parseFn(),
             .kw_import => self.parseImportExpression(),
             .identifier => self.parseIdentifierExpression(),
             .kw_if => self.parseIfExpression(),
@@ -585,15 +586,38 @@ pub const Parser = struct {
         literal: BinaryComponentLiteral,
         expr: *ast.Expression,
 
-        pub fn toExpression(self: BinaryComponent, parser: *Self) Error!*ast.Expression {
+        pub fn toExpression(
+            self: BinaryComponent,
+            parser: *Self,
+            op: ?ast.BinaryOp,
+        ) Error!*ast.Expression {
             return try switch (self) {
                 .expr => |expr| expr,
-                .identifier => |identifier| parser.allocExpression(.{
-                    .identifier = identifier,
-                }),
+                .identifier => |identifier| self.toIdentifierExpression(parser, identifier, op),
                 .literal => |literal| literal.toExpression(parser),
                 .op => @panic("shouldn't happen :)"),
             };
+        }
+
+        fn toIdentifierExpression(
+            _: BinaryComponent,
+            parser: *Self,
+            identifier: ast.Identifier,
+            op: ?ast.BinaryOp,
+        ) Error!*ast.Expression {
+            if (op == .member) {
+                return parser.allocExpression(.{ .identifier = identifier });
+            } else {
+                return parser.allocExpression(.{
+                    .call = .{
+                        .callee = try parser.allocExpression(.{
+                            .identifier = identifier,
+                        }),
+                        .arguments = &.{},
+                        .span = identifier.span,
+                    },
+                });
+            }
         }
 
         pub fn span(self: BinaryComponent) token.Span {
@@ -748,7 +772,7 @@ pub const Parser = struct {
                 },
                 .op => {
                     switch (next.tag) {
-                        .equal_equal, .bang_equal, .greater, .greater_equal, .less, .less_equal, .plus, .minus, .star, .slash, .percent, .kw_and, .kw_or, .pipe => {
+                        .equal_equal, .bang_equal, .greater, .greater_equal, .less, .less_equal, .plus, .minus, .star, .slash, .percent, .kw_and, .kw_or, .pipe, .dot => {
                             const breadcrumbInner = try self.createBreadcrumb("PBE:op");
                             defer breadcrumbInner.end();
                             try components.append(self.allocator, .{
@@ -825,6 +849,24 @@ pub const Parser = struct {
                     },
                 },
             },
+            .pipe => switch (left.*) {
+                .pipeline => |pipeline| .{
+                    .pipeline = .{
+                        .stages = try std.mem.concat(
+                            self.arena.allocator(),
+                            *ast.Expression,
+                            &.{ pipeline.stages, &.{right} },
+                        ),
+                        .span = binary.span(),
+                    },
+                },
+                else => .{
+                    .pipeline = .{
+                        .stages = try self.copyToArena(*ast.Expression, &.{ left, right }),
+                        .span = binary.span(),
+                    },
+                },
+            },
             else => binary,
         };
     }
@@ -836,17 +878,21 @@ pub const Parser = struct {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
-        if (components.len == 1) return try components[0].toExpression(self);
+        if (components.len == 1) return try components[0].toExpression(self, null);
 
         if (components.len == 3) {
-            return try self.allocExpression(try self.flattenBinaryExpression(.{
-                .binary = .{
-                    .left = try components[0].toExpression(self),
-                    .op = components[1].op.payload,
-                    .right = try components[2].toExpression(self),
-                    .span = components[0].span().endAt(components[2].span()),
-                },
-            }));
+            const op = components[1].op.payload;
+
+            return try self.allocExpression(
+                try self.flattenBinaryExpression(
+                    try self.initBinaryExpression(
+                        try components[0].toExpression(self, op),
+                        op,
+                        try components[2].toExpression(self, op),
+                        components[0].span().endAt(components[2].span()),
+                    ),
+                ),
+            );
         }
 
         var lowest_precedence: usize = std.math.maxInt(usize);
@@ -885,14 +931,18 @@ pub const Parser = struct {
 
         while (it.next()) |sub_components| {
             const right = try self.parseBinaryExpression(sub_components);
-            lhs = try self.allocExpression(try self.flattenBinaryExpression(.{
-                .binary = .{
-                    .left = lhs,
-                    .op = components[i - 1].op.payload,
-                    .right = right,
-                    .span = lhs.span().endAt(right.span()),
-                },
-            }));
+            const op = components[i - 1].op.payload;
+
+            lhs = try self.allocExpression(
+                try self.flattenBinaryExpression(
+                    try self.initBinaryExpression(
+                        lhs,
+                        op,
+                        right,
+                        lhs.span().endAt(right.span()),
+                    ),
+                ),
+            );
 
             i += sub_components.len + 1;
         }
@@ -921,6 +971,30 @@ pub const Parser = struct {
         // (1 + 2 * 3 + 4) > (5 + 1) || (true)
         //                 -
         // (((1 + 2 * 3 + 4) > (5 + 1)) || (true)) || (false)
+    }
+
+    pub fn initBinaryExpression(
+        self: *Self,
+        left: *ast.Expression,
+        op: ast.BinaryOp,
+        right: *ast.Expression,
+        span: ast.Span,
+    ) Error!ast.Expression {
+        if (op == .member and right.* != .identifier) {
+            try self.reportParseError(
+                Error.UnexpectedToken,
+                right.span(),
+                "expected identifier after member access operator",
+                .{},
+            );
+        }
+
+        return .{ .binary = .{
+            .left = left,
+            .op = op,
+            .right = right,
+            .span = span,
+        } };
     }
 
     fn parsePipeline(self: *Self) Error!*ast.Expression {
@@ -953,7 +1027,7 @@ pub const Parser = struct {
                         return stages.items[0].payload.expression;
                     }
 
-                    return try self.allocExpression(.{ .pipeline = .{
+                    return try self.allocExpression(.{ .pipeline_deprecated = .{
                         .stages = try self.copyToArena(ast.PipelineStage, stages.items),
                         .span = start_token.span.endAt(stage.span),
                     } });
@@ -1424,11 +1498,6 @@ pub const Parser = struct {
             return stmt;
         }
 
-        if (try self.parseMaybeFn()) |fnDecl| {
-            stmt.* = .{ .fn_decl = fnDecl };
-            return stmt;
-        }
-
         const expr = try self.parseExpression();
         const expr_span = expr.span();
         stmt.* = .{
@@ -1793,18 +1862,7 @@ pub const Parser = struct {
         return null;
     }
 
-    fn parseMaybeFn(self: *Self) Error!?ast.FunctionDecl {
-        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
-        defer breadcrumb.end();
-
-        const next = try self.peekToken();
-        return switch (next.tag) {
-            .kw_fn => try self.parseFn(),
-            else => null,
-        };
-    }
-
-    fn parseFn(self: *Self) Error!ast.FunctionDecl {
+    fn parseFn(self: *Self) Error!*ast.Expression {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -1821,15 +1879,14 @@ pub const Parser = struct {
         // const block = try self.parseBlock();
         const body = try self.parseExpression();
 
-        return .{
+        return self.allocExpression(.{ .fn_decl = .{
             .name = .{ .name = identifier.lexeme, .span = identifier.span },
-            .is_async = false,
             .params = .nonVariadic(params.payload),
             .stdin_type = stdinType,
             .return_type = returnType,
             .body = body,
             .span = start.span.endAt(body.span()),
-        };
+        } });
     }
 
     fn parseParam(self: *Self) Error!*ast.Parameter {

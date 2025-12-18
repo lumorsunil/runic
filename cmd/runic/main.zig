@@ -29,8 +29,8 @@ fn mainImpl() !runic.command_runner.ExitCode {
     defer std.process.argsFree(allocator, argv);
 
     // var stdin_reader = std.fs.File.stdin().readerStreaming(&stdin_buffer);
-    var stdout_writer = std.fs.File.stdout().writerStreaming(&stdout_buffer);
-    var stderr_writer = std.fs.File.stderr().writerStreaming(&stderr_buffer);
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
     // const stdin = &stdin_reader.interface;
     const stdout = &stdout_writer.interface;
     const stderr = &stderr_writer.interface;
