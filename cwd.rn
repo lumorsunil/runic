@@ -1,4 +1,20 @@
-const s = echo "hello"
+jq "asdawegawegaw" "test.json"
+const j = jq "awregaerhgaer" "test.json"
+
+inspect j
+inspect j.exit_code
+inspect j.stdout
+inspect j.stderr
+
+const s = echo "hello" | jq "."
+inspect (s)
+inspect (s.exit_code)
 inspect (s.stdout)
-echo "${s}"
+inspect (s.stderr)
+echo "stdout: ${s}"
+echo "stderr: ${s.stderr}"
+
+// for (0..10) |i| {
+//   echo "${i}"
+// }
 

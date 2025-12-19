@@ -93,9 +93,8 @@ pub const ProcessCloseable = struct {
 
     fn check_close_parent(self: *@This()) void {
         log(@typeName(@This()) ++ "." ++ @src().fn_name, .{});
-        if (self.stdin.isClosed() and self.stdout.isClosed()) {
+        if (self.stdin.isClosed() and self.stdout.isClosed() and self.stderr.isClosed()) {
             log(@typeName(@This()) ++ "." ++ @src().fn_name, .{});
-            _ = self.stderr.close();
             _ = self.closeable.close();
         }
     }
@@ -161,14 +160,73 @@ pub const ProcessCloseable = struct {
     }
 };
 
+const PipeReader = struct {
+    file: ?std.fs.File,
+    file_reader: ?std.fs.File.Reader,
+    reader: std.Io.Reader = .{ .vtable = &vtable, .buffer = &.{}, .seek = 0, .end = 0 },
+
+    const vtable = std.Io.Reader.VTable{
+        .stream = stream,
+    };
+
+    pub fn init(file: ?std.fs.File, buffer: []u8) PipeReader {
+        return .{
+            .file = file,
+            .file_reader = if (file) |f| f.reader(buffer) else null,
+        };
+    }
+
+    fn getParent(r: *std.Io.Reader) *PipeReader {
+        return @fieldParentPtr("reader", r);
+    }
+
+    pub fn stream(
+        r: *std.Io.Reader,
+        w: *std.Io.Writer,
+        limit: std.Io.Limit,
+    ) std.Io.Reader.StreamError!usize {
+        const parent = getParent(r);
+        const file = parent.file orelse return 0;
+        const file_reader = if (parent.file_reader) |*fr| fr else return 0;
+
+        var poll_fds = [_]std.posix.pollfd{
+            .{
+                .fd = file.handle,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            },
+        };
+        const poll_fd = &poll_fds[0];
+
+        const result = std.posix.poll(&poll_fds, 0) catch return 0;
+        std.log.debug("poll result: {}", .{result});
+        std.log.debug("POLLIN: {}", .{poll_fd.revents & std.posix.POLL.IN});
+        std.log.debug("POLLHUP: {}", .{poll_fd.revents & std.posix.POLL.HUP});
+        std.log.debug("POLLNVAL: {}", .{poll_fd.revents & std.posix.POLL.NVAL});
+        if (std.posix.errno(result) == std.posix.E.SUCCESS) {
+            if (poll_fd.revents & std.posix.POLL.IN > 0) {
+                return try file_reader.interface.stream(w, limit);
+            } else if (poll_fd.revents & (std.posix.POLL.HUP | std.posix.POLL.NVAL) > 0) {
+                return error.EndOfStream;
+            }
+
+            return 0;
+        } else {
+            return error.ReadFailed;
+        }
+    }
+};
+
 pub const CloseableProcessIo = struct {
     process: *std.process.Child,
     stdin_buffer: [1024]u8 = undefined,
     stdin_writer: ?std.fs.File.Writer = null,
     stdout_buffer: [1024]u8 = undefined,
-    stdout_reader: ?std.fs.File.Reader = null,
+    // stdout_reader: ?std.fs.File.Reader = null,
+    stdout_reader: ?PipeReader = null,
     stderr_buffer: [1024]u8 = undefined,
-    stderr_reader: ?std.fs.File.Reader = null,
+    // stderr_reader: ?std.fs.File.Reader = null,
+    stderr_reader: ?PipeReader = null,
     process_closeable: ProcessCloseable = undefined,
 
     pub fn init(process: *std.process.Child) @This() {
@@ -177,8 +235,10 @@ pub const CloseableProcessIo = struct {
 
     pub fn connect(self: *@This()) void {
         if (self.process.stdin) |f| self.stdin_writer = f.writer(&self.stdin_buffer);
-        if (self.process.stdout) |f| self.stdout_reader = f.reader(&self.stdout_buffer);
-        if (self.process.stderr) |f| self.stderr_reader = f.reader(&self.stderr_buffer);
+        // if (self.process.stdout) |f| self.stdout_reader = f.reader(&self.stdout_buffer);
+        // if (self.process.stderr) |f| self.stderr_reader = f.reader(&self.stderr_buffer);
+        if (self.process.stdout) |f| self.stdout_reader = .init(f, &self.stdout_buffer);
+        if (self.process.stderr) |f| self.stderr_reader = .init(f, &self.stderr_buffer);
         self.process_closeable = .init(self.process);
     }
 
@@ -187,11 +247,11 @@ pub const CloseableProcessIo = struct {
     }
 
     pub fn stdout(self: *@This()) *std.Io.Reader {
-        return &self.stdout_reader.?.interface;
+        return &self.stdout_reader.?.reader;
     }
 
     pub fn stderr(self: *@This()) *std.Io.Reader {
-        return &self.stderr_reader.?.interface;
+        return &self.stderr_reader.?.reader;
     }
 
     pub fn closeable(self: *@This()) *Closeable(ExitCode) {

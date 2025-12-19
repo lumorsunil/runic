@@ -7,7 +7,7 @@ const CloseableReader = @import("closeable.zig").CloseableReader;
 const CloseableWriter = @import("closeable.zig").CloseableWriter;
 const ExitCode = @import("runtime/command_runner.zig").ExitCode;
 
-const log_enabled = false;
+const log_enabled = true;
 
 fn log(self: *ReaderWriterStream, comptime fmt: []const u8, args: anytype) void {
     if (!log_enabled) return;
@@ -417,15 +417,14 @@ pub const ReaderWriterStream = struct {
                 return .closed;
             },
             else => {
+                // TODO: put result in close arg?
                 _ = self.source.?.close();
                 if (self.destination) |d| _ = d.close();
                 // TODO: store error somewhere?
                 return .closed;
             },
         };
-        if (destination_writer != &self.buffer_writer.writer) {
-            try destination_writer.flush();
-        }
+        try destination_writer.flush();
 
         log(self, "bytes forwarded: {}", .{bytes_forwarded});
 

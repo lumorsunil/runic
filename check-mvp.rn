@@ -1,7 +1,7 @@
 const bash_result = bash "mvp.sh"
 const runic_result = runic "--skip-type-check" "mvp.rn"
 
-const verbose = true
+const verbose = false
 
 if (verbose) {
   echo "\n===BASH RESULT===:\n"

@@ -30,13 +30,12 @@ fn ArrayListManaged(comptime T: type) type {
 }
 
 /// Evaluator drives statement/expressions execution for AST blocks. It owns
-/// the allocator used for temporary strings and forwards pipelines to the
-/// command runner (or any adapter implementing `CommandExecutor`).
+/// the allocator used for temporary strings.
 pub const Evaluator = struct {
     allocator: std.mem.Allocator,
+    // TODO: remove this and try to use RC refs instead or something
     loose_ends_arena: std.heap.ArenaAllocator,
     path: []const u8,
-    /// Refers to the outermost context
     executeOptions: ScriptExecutor.ExecuteOptions,
     document_store: *DocumentStore,
     logging_enabled: bool,
@@ -203,7 +202,7 @@ pub const Evaluator = struct {
         const fn_ref = try fn_ref_ref.getPtr();
         const number_of_frames: usize = if (fn_ref.closure == null) 2 else 3;
 
-        try scopes.pushFrame(@src().fn_name, .initBlocking());
+        try scopes.pushBlocking(@src().fn_name);
         if (fn_ref.closure) |closure| try scopes.pushFrame(@src().fn_name, .initScopeRefSpecial(closure));
         try scopes.pushFrame(@src().fn_name, try .initSingleNew(self.allocator));
         errdefer scopes.popFrameN(@src().fn_name, number_of_frames) catch {
@@ -224,32 +223,6 @@ pub const Evaluator = struct {
         return value;
     }
 
-    pub fn runBlockInOwnContext(
-        self: *Evaluator,
-        scopes: *ScopeStack,
-        block: ast.Block,
-    ) Error!Value {
-        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
-        try self.logEvaluationTrace(@src().fn_name);
-
-        try scopes.pushFrame(@src().fn_name, try .initSingleNew(self.allocator));
-
-        for (block.statements) |statement| {
-            // TODO: do something with these values?
-            if (try self.runStatement(scopes, statement)) |value| {
-                var owned = value;
-                owned.deinit();
-            }
-        }
-
-        try scopes.popFrame(
-            @src().fn_name,
-        );
-
-        // TODO: change this to be an execution result
-        return .void;
-    }
-
     /// Executes a single statement in the current scope and returns its result
     /// if the statement produces a value (expression statements).
     pub fn runStatement(
@@ -259,6 +232,7 @@ pub const Evaluator = struct {
     ) Error!?Value {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.log(@src().fn_name, .{});
+        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
         return self.executeStatement(scopes, statement);
     }
 
@@ -269,6 +243,7 @@ pub const Evaluator = struct {
     ) Error!?Value {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.log(@src().fn_name, .{});
+        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
 
         return switch (statement.*) {
             .type_binding_decl => null,
@@ -288,18 +263,55 @@ pub const Evaluator = struct {
     ) Error!Value {
         // errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.log(@src().fn_name, .{});
+        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
 
+        var frames: usize = 1;
         try scopes.pushProcesses(@src().fn_name);
+
+        var stdout_pipe: ?*ReaderWriterStream = null;
+        var stderr_pipe: ?*ReaderWriterStream = null;
+        defer {
+            if (stdout_pipe) |pipe| pipe.stream.deinit();
+            if (stderr_pipe) |pipe| pipe.stream.deinit();
+        }
+
+        if (scopes.getStdoutPipe().stream) |stdout_stream| {
+            if (stdout_stream.destination) |destination| {
+                stdout_pipe = try Stream(u8).initReaderWriter(
+                    self.allocator,
+                    @src().fn_name,
+                );
+                errdefer stdout_pipe.?.stream.deinit();
+                try stdout_pipe.?.connectDestination(destination);
+            }
+        }
+
+        if (scopes.getStderrPipe().stream) |stderr_stream| {
+            if (stderr_stream.destination) |destination| {
+                stderr_pipe = try Stream(u8).initReaderWriter(
+                    self.allocator,
+                    @src().fn_name,
+                );
+                errdefer stderr_pipe.?.stream.deinit();
+                try stderr_pipe.?.connectDestination(destination);
+            }
+        }
+
+        if (stdout_pipe != null or stderr_pipe != null) {
+            frames += 1;
+            try scopes.pushFrameForwarding(@src().fn_name, .{
+                .stdin = .blocked(),
+                .stdout = if (stdout_pipe) |pipe| .init(pipe, .streaming) else .inherit,
+                .stderr = if (stderr_pipe) |pipe| .init(pipe, .streaming) else .inherit,
+            });
+        }
 
         var v = try self.evaluateExpression(scopes, expression);
         errdefer v.deinit();
 
-        const stdout = scopes.getStdoutPipe();
-        if (stdout.stream) |stdout_stream| {
-            while (try stdout_stream.forward(.unlimited) == .not_done) {}
-        }
+        try self.forwardOutput(scopes);
 
-        try scopes.popFrame(@src().fn_name);
+        try scopes.popFrameN(@src().fn_name, frames);
 
         var value_as_string = self.materializeString(v) catch |err| switch (err) {
             error.InvalidStringCoercion => return v,
@@ -319,13 +331,159 @@ pub const Evaluator = struct {
     }
 
     fn forwardString(
-        _: *Evaluator,
+        self: *Evaluator,
         scopes: *ScopeStack,
         value: Value.String,
     ) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.log(@src().fn_name, .{});
+        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
+
         const stdout = scopes.getStdoutPipe();
         const stdout_stream = stdout.stream orelse return;
         try stdout_stream.writer.print("{f}", .{value});
+    }
+
+    fn pushCaptureOutputFrames(self: *Evaluator, scopes: *ScopeStack) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.log(@src().fn_name, .{});
+        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
+
+        const stdout = try Stream(u8).initReaderWriter(self.allocator, @src().fn_name);
+        const stderr = try Stream(u8).initReaderWriter(self.allocator, @src().fn_name);
+
+        try scopes.pushAllocating(@src().fn_name);
+        try scopes.pushProcesses(@src().fn_name);
+        try scopes.pushFrameForwarding(@src().fn_name, .{
+            .stdin = .blocked(),
+            .stdout = .init(stdout, .non_streaming),
+            .stderr = .init(stderr, .non_streaming),
+        });
+    }
+
+    fn popCaptureOutputFrames(self: *Evaluator, scopes: *ScopeStack) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.log(@src().fn_name, .{});
+        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
+
+        const stdout = scopes.getStdoutPipe().stream.?;
+        stdout.stream.deinit();
+        const stderr = scopes.getStderrPipe().stream.?;
+        stderr.stream.deinit();
+
+        try scopes.popFrameN(@src().fn_name, 3);
+    }
+
+    fn capturePipes(self: *Evaluator, pipes: []const ?*ReaderWriterStream) Error![][]const u8 {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.log(@src().fn_name, .{});
+        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
+
+        const done = try self.allocator.alloc(bool, pipes.len);
+        for (done) |*d| d.* = false;
+        defer self.allocator.free(done);
+
+        const results = try self.allocator.alloc([]const u8, pipes.len);
+        errdefer self.allocator.free(results);
+
+        outer: while (true) {
+            for (pipes, 0..) |pipe, i| {
+                if (pipe) |p| {
+                    done[i] = try p.forward(.unlimited) != .not_done;
+                } else {
+                    done[i] = true;
+                }
+            }
+
+            for (done) |d| if (!d) continue :outer;
+            break;
+        }
+
+        for (pipes, 0..) |pipe, i| {
+            if (pipe) |p| {
+                results[i] = p.buffer_writer.written();
+            } else {
+                results[i] = "";
+            }
+        }
+
+        return results;
+    }
+
+    fn capturePipe(self: *Evaluator, pipe: ?*ReaderWriterStream) Error![]const u8 {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.log(@src().fn_name, .{});
+        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
+
+        return if (pipe) |p| brk: {
+            while (try p.forward(.unlimited) == .not_done) {}
+            break :brk p.buffer_writer.written();
+        } else "";
+    }
+
+    fn forwardPipes(self: *Evaluator, pipes: []const ?*ReaderWriterStream) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.log(@src().fn_name, .{});
+        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
+
+        const done = try self.allocator.alloc(bool, pipes.len);
+        for (done) |*d| d.* = false;
+        defer self.allocator.free(done);
+
+        outer: while (true) {
+            for (pipes, 0..) |pipe, i| {
+                if (pipe) |p| {
+                    done[i] = try p.forward(.unlimited) != .not_done;
+                } else {
+                    done[i] = true;
+                }
+            }
+
+            for (done) |d| if (!d) continue :outer;
+            break;
+        }
+    }
+
+    fn forwardPipe(self: *Evaluator, pipe: ?*ReaderWriterStream) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.log(@src().fn_name, .{});
+        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
+
+        if (pipe) |p| {
+            while (try p.forward(.unlimited) == .not_done) {}
+        }
+    }
+
+    fn captureOutput(self: *Evaluator, scopes: *ScopeStack) Error!Value.ExecutionRef {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.log(@src().fn_name, .{});
+        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
+
+        const stdout = scopes.getStdoutPipe().stream;
+        const stderr = scopes.getStderrPipe().stream;
+
+        const result = try self.capturePipes(&.{ stdout, stderr });
+        defer self.allocator.free(result);
+
+        const stdout_result = result[0];
+        const stderr_result = result[1];
+
+        return try .init(self.allocator, .{
+            .stdout = try .dupe(self.allocator, stdout_result, .{}),
+            .stderr = try .dupe(self.allocator, stderr_result, .{}),
+            .exit_code = null,
+        }, .{});
+    }
+
+    fn forwardOutput(self: *Evaluator, scopes: *ScopeStack) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.log(@src().fn_name, .{});
+        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
+
+        const stdout = scopes.getStdoutPipe().stream;
+        const stderr = scopes.getStderrPipe().stream;
+
+        try self.forwardPipes(&.{ stdout, stderr });
     }
 
     fn executeBinding(
@@ -335,28 +493,18 @@ pub const Evaluator = struct {
     ) Error!void {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.log(@src().fn_name, .{});
+        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
 
-        const stdout = try Stream(u8).initReaderWriter(self.allocator, @src().fn_name);
-        defer stdout.stream.deinit();
-        const stderr = try Stream(u8).initReaderWriter(self.allocator, @src().fn_name);
-        defer stderr.stream.deinit();
+        try self.pushCaptureOutputFrames(scopes);
 
-        try scopes.pushProcesses(@src().fn_name);
-        try scopes.pushFrameForwarding(@src().fn_name, .{
-            .stdin = .blocked(),
-            .stdout = .init(stdout, .non_streaming),
-            .stderr = .init(stderr, .non_streaming),
-        });
-
-        var value = try self.executeExpression(scopes, decl.initializer);
-        try self.log(@src().fn_name ++ "binding value: {f}", .{value});
-        try self.processBindingValue(&value, stdout, stderr);
-        try self.log(@src().fn_name ++ "binding value aftering processing: {f}", .{value});
+        var value = try self.evaluateExpression(scopes, decl.initializer);
+        try self.log(@src().fn_name ++ ": binding value: {f}", .{value});
+        try self.processBindingValue(scopes, &value);
+        try self.log(@src().fn_name ++ ": binding value aftering processing: {f}", .{value});
 
         _ = try scopes.wait();
 
-        try scopes.popFrame(@src().fn_name);
-        try scopes.popFrame(@src().fn_name);
+        try self.popCaptureOutputFrames(scopes);
 
         errdefer value.deinit();
 
@@ -367,20 +515,28 @@ pub const Evaluator = struct {
 
     fn processBindingValue(
         self: *Evaluator,
+        scopes: *ScopeStack,
         value: *Value,
-        stdout: *ReaderWriterStream,
-        stderr: *ReaderWriterStream,
     ) Error!void {
         switch (value.*) {
-            .process => {
-                value.deinit();
-                value.* = .{
-                    .execution = try .init(self.allocator, .{
-                        .stdout = try .dupe(self.allocator, stdout.buffer_writer.written(), .{}),
-                        .stderr = try .dupe(self.allocator, stderr.buffer_writer.written(), .{}),
-                        .exit_code = stdout.source.?.getResult(),
-                    }, .{}),
-                };
+            .pipeline => |pipeline| {
+                var owned = value.*;
+                defer owned.deinit();
+
+                const exit_code = try self.consumePipeline(pipeline);
+                const execution_result = try self.captureOutput(scopes);
+                (try execution_result.getPtr()).exit_code = exit_code;
+                value.* = .{ .execution = execution_result };
+            },
+            .process => |process| {
+                var owned = value.*;
+                defer owned.deinit();
+
+                const execution_result = try self.captureOutput(scopes);
+                const processes = try scopes.wait();
+                const exit_code = processes.getExitCode(process);
+                (try execution_result.getPtr()).exit_code = exit_code;
+                value.* = .{ .execution = execution_result };
             },
             else => return,
         }
@@ -393,6 +549,7 @@ pub const Evaluator = struct {
     ) Error!Value {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.log(@src().fn_name, .{});
+        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
 
         const closure = try scopes.closure();
         var value = Value{ .function = try .init(self.allocator, .{
@@ -446,6 +603,7 @@ pub const Evaluator = struct {
         try self.logEvaluationTrace(@src().fn_name);
         try self.log("<{s}>", .{@tagName(expr.*)});
         try self.logEvaluateExpression(expr);
+        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
 
         return switch (expr.*) {
             .literal => |literal| try self.evaluateLiteral(scopes, literal),
@@ -529,6 +687,8 @@ pub const Evaluator = struct {
     fn evaluateLiteral(self: *Evaluator, scopes: *ScopeStack, literal: ast.Literal) Error!Value {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logEvaluationTrace(@src().fn_name);
+        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
+
         return switch (literal) {
             .null => Value{ .void = {} },
             .bool => |payload| Value{ .boolean = payload.value },
@@ -620,6 +780,7 @@ pub const Evaluator = struct {
     ) Error!Value {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logEvaluationTrace(@src().fn_name);
+        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
         // TODO: add safety for unknown identifiers as executables (explicit executables?)
         // backup: const binding = try scopes.lookup(identifier.name) orelse return error.UnknownIdentifier;
         const binding = try scopes.lookup(identifier.name) orelse return .{
@@ -639,8 +800,24 @@ pub const Evaluator = struct {
     fn evaluateBlockExpression(self: *Evaluator, scopes: *ScopeStack, block: ast.Block) Error!Value {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logEvaluationTrace(@src().fn_name);
+        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
 
-        return try self.runBlockInOwnContext(scopes, block);
+        try scopes.pushFrame(@src().fn_name, try .initSingleNew(self.allocator));
+
+        for (block.statements) |statement| {
+            // TODO: do something with these values?
+            if (try self.runStatement(scopes, statement)) |value| {
+                var owned = value;
+                owned.deinit();
+            }
+        }
+
+        try scopes.popFrame(
+            @src().fn_name,
+        );
+
+        // TODO: change this to be an execution result
+        return .void;
     }
 
     // TODO: change this to run the module as a function?
@@ -651,6 +828,7 @@ pub const Evaluator = struct {
     ) Error!Value {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logEvaluationTrace(@src().fn_name);
+        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
 
         const module_path = try resolveModulePath(self.allocator, import.importer, import.module_name);
         const script_ast = try self.document_store.getAst(module_path) orelse return error.DocumentNotParsed;
@@ -678,6 +856,7 @@ pub const Evaluator = struct {
     ) Error!Value {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logEvaluationTrace(@src().fn_name);
+        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
 
         var object = try self.evaluateExpression(scopes, member.object);
         defer object.deinit();
@@ -691,7 +870,7 @@ pub const Evaluator = struct {
         object: Value,
     ) Error!Value {
         switch (object) {
-            .void, .boolean, .integer, .float, .string, .function, .array, .range, .stream, .process => return Error.UnsupportedMemberAccess,
+            .void, .boolean, .integer, .float, .string, .function, .array, .range, .stream, .process, .pipeline => return Error.UnsupportedMemberAccess,
             .scope => |scope_ref| {
                 const scope = try scope_ref.getPtr();
                 const ref = try scope.lookup(name) orelse return Error.MemberNotFound;
@@ -742,6 +921,7 @@ pub const Evaluator = struct {
     ) Error!Value {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logEvaluationTrace(@src().fn_name);
+        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
 
         const bindingRef = try scopes.lookup(assignment.identifier.name) orelse return error.UnknownIdentifier;
 
@@ -761,6 +941,7 @@ pub const Evaluator = struct {
     ) Error!Value {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logEvaluationTrace(@src().fn_name);
+        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
 
         switch (binary.op) {
             .apply, .pipe => {
@@ -792,6 +973,11 @@ pub const Evaluator = struct {
                     const float_right: Value.Float = @floatFromInt(right.integer);
                     return .{ .float = left.float + float_right };
                 }
+
+                try self.logWithoutPrefix(
+                    "{t} expression not supported for: {t} and {t}\n",
+                    .{ binary.op, left, right },
+                );
             },
             .subtract => {
                 var left = try self.evaluateExpression(scopes, binary.left);
@@ -987,8 +1173,31 @@ pub const Evaluator = struct {
 
                 return try self.evaluateMemberExpression(scopes, member_access_expr);
             },
+            .assign => {
+                if (binary.left.* != .identifier) {
+                    try self.logWithoutPrefix(
+                        "expression {t} cannot be assigned to\n",
+                        .{binary.left.*},
+                    );
+                    return error.UnsupportedBinaryExpr;
+                }
+
+                const binding = try scopes.lookup(binary.left.identifier.name) orelse return error.UnknownIdentifier;
+
+                if (!binding.is_mutable) return error.ImmutableBinding;
+
+                var prev_value = binding.value.*;
+                defer prev_value.deinit();
+                binding.value.* = try self.evaluateExpression(scopes, binary.right);
+
+                return binding.value.clone(self.allocator, .{});
+            },
         }
 
+        try self.logWithoutPrefix(
+            "binary operation {t} {t} {t} not supported\n",
+            .{ binary.left.*, binary.op, binary.right.* },
+        );
         return error.UnsupportedBinaryExpr;
     }
 
@@ -999,33 +1208,22 @@ pub const Evaluator = struct {
     ) Error!Value {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logEvaluationTrace(@src().fn_name);
+        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
 
-        try scopes.pushProcesses(@src().fn_name);
-
-        const rw_list = try self.allocator.alloc(*ReaderWriterStream, pipeline.stages.len - 1);
-        for (rw_list) |*rw| {
-            rw.* = try Stream(u8).initReaderWriter(self.allocator, @src().fn_name);
+        const pipes = try self.allocator.alloc(*ReaderWriterStream, pipeline.stages.len - 1);
+        for (pipes) |*pipe| {
+            pipe.* = try Stream(u8).initReaderWriter(self.allocator, @src().fn_name);
         }
-        defer {
-            for (rw_list) |rw| rw.stream.deinit();
-            self.allocator.free(rw_list);
-        }
-
-        const stdout_inherit_pipe = scopes.getStdoutPipe();
-        // const stderr_inherit_pipe = scopes.getStderrPipe();
-        const stdout_inherit = stdout_inherit_pipe.stream;
-        // const stderr_inherit = stderr_inherit_pipe.stream;
 
         for (0..pipeline.stages.len) |i| {
             const index = i;
-            // const index = pipeline.stages.len - 1 - i;
             const stage = pipeline.stages[index];
 
             var stdin: ScopeStack.PipeInfo = undefined;
             var stdout: ScopeStack.PipeInfo = undefined;
 
             if (index > 0) {
-                stdin = .init(rw_list[index - 1], .non_streaming);
+                stdin = .init(pipes[index - 1], .non_streaming);
             } else {
                 stdin = .blocked();
             }
@@ -1033,7 +1231,7 @@ pub const Evaluator = struct {
             if (index == pipeline.stages.len - 1) {
                 stdout = .inherit;
             } else {
-                stdout = .init(rw_list[index], .non_streaming);
+                stdout = .init(pipes[index], .non_streaming);
             }
 
             try scopes.pushFrameForwarding(@src().fn_name, .{
@@ -1048,38 +1246,55 @@ pub const Evaluator = struct {
             try scopes.popFrame(@src().fn_name);
         }
 
-        var rw_closed = try self.allocator.alloc(bool, rw_list.len);
-        defer self.allocator.free(rw_closed);
-        for (rw_closed) |*closed| closed.* = false;
-        var stdout_closed = false;
+        return .{ .pipeline = try .init(self.allocator, .{ .pipes = pipes }, .{}) };
+    }
+
+    fn consumePipeline(self: *Evaluator, pipeline_ref: Value.PipelineExecution) Error!?ExitCode {
+        const pipeline = try pipeline_ref.getPtr();
+        var pipes_closed = try self.allocator.alloc(bool, pipeline.pipes.len);
+        defer self.allocator.free(pipes_closed);
+        for (pipes_closed) |*closed| closed.* = false;
 
         outer: while (true) {
-            for (rw_list, 0..) |rw, i| {
-                if (rw_closed[i]) continue;
-                rw_closed[i] = try rw.forward(.unlimited) == .closed;
-                // if (stderr_inherit) |stream| _ = try stream.forward(.unlimited);
+            for (pipeline.pipes, 0..) |pipe, i| {
+                if (pipes_closed[i]) continue;
+                pipes_closed[i] = try pipe.forward(.unlimited) == .closed;
             }
 
-            if (stdout_inherit) |stream| stdout_closed = try stream.forward(.unlimited) == .closed;
-
-            if (!stdout_closed) continue;
-
-            for (rw_closed) |closed| {
+            for (pipes_closed) |closed| {
                 if (!closed) continue :outer;
             }
 
             break;
         }
 
-        // std.log.debug("calling wait", .{});
-        // const processes = try scopes.wait();
-        // TODO: examine the term signals of the processes and handle them accordingly
-        // _ = processes;
+        return getPipelineExitCode(pipeline_ref);
+    }
 
-        try scopes.popFrame(@src().fn_name);
+    fn getPipelineExitCode(pipeline_ref: Value.PipelineExecution) Error!?ExitCode {
+        var exit_code: ?ExitCode = null;
 
-        // TODO: return process id or something
-        return .void;
+        const pipeline = try pipeline_ref.getPtr();
+
+        for (pipeline.pipes) |p| {
+            const source = p.source orelse continue;
+
+            if (source.getResult()) |source_exit_code| {
+                exit_code = source_exit_code;
+
+                if (source_exit_code == .success) {
+                    continue;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        return exit_code;
+    }
+
+    fn isTermSuccess(term: std.process.Child.Term) bool {
+        return term == .Exited and term.Exited == 0;
     }
 
     fn evaluateIfExpression(
@@ -1089,6 +1304,7 @@ pub const Evaluator = struct {
     ) Error!Value {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logEvaluationTrace(@src().fn_name);
+        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
 
         var condition_value = try self.evaluateExpression(scopes, if_expr.condition);
         const condition = try expectBoolean(&condition_value);
@@ -1116,6 +1332,7 @@ pub const Evaluator = struct {
     ) Error!Value {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logEvaluationTrace(@src().fn_name);
+        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
 
         // for (0..) |i| {...}
         //
@@ -1151,7 +1368,7 @@ pub const Evaluator = struct {
             try declareForSources(scopes, iteration_elements, bindings);
 
             // TODO: be able to forward block result directly for streaming stdout etc
-            const result = try self.runBlockInOwnContext(scopes, for_expr.body);
+            const result = try self.executeExpression(scopes, for_expr.body);
             try results.append(self.allocator, result);
 
             try scopes.popFrame(
@@ -1332,6 +1549,7 @@ pub const Evaluator = struct {
     ) Error!Value {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logEvaluationTrace(@src().fn_name);
+        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
 
         var start_value = try self.evaluateExpression(scopes, range.start);
         const start = try expectInteger(&start_value);
@@ -1358,6 +1576,7 @@ pub const Evaluator = struct {
     ) Error!Value {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logEvaluationTrace(@src().fn_name);
+        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
 
         var elements = try std.ArrayList(Value).initCapacity(self.allocator, array.elements.len);
 
@@ -1484,6 +1703,7 @@ pub const Evaluator = struct {
     ) Error!Value {
         errdefer self.log(@src().fn_name ++ ": error", .{}) catch {};
         try self.log(@src().fn_name, .{});
+        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
 
         const child = try self.spawnProcess(scopes);
 
@@ -1493,6 +1713,7 @@ pub const Evaluator = struct {
     fn spawnProcess(self: *Evaluator, scopes: *ScopeStack) Error!*CloseableProcessIo {
         errdefer self.log(@src().fn_name ++ ": error", .{}) catch {};
         try self.log(@src().fn_name, .{});
+        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
 
         const argv = try self.getContextArgv(scopes);
         defer {
@@ -1510,6 +1731,7 @@ pub const Evaluator = struct {
         defer std_env_map.deinit();
 
         try self.log(@src().fn_name, .{});
+        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
         try self.logWithoutPrefix("child init\n", .{});
         try self.logWithoutPrefix("cwd: {s}\n", .{try cwd.get()});
         try self.logWithoutPrefix("stdin: {s}, stdout: {s}, stderr: {s}\n", .{
@@ -1541,24 +1763,24 @@ pub const Evaluator = struct {
 
         if (stdin) |stream| {
             // std.log.debug("child \"{s}\" stdin: {*}", .{
-            //     stable_child.argv[0],
-            //     &stdin_writer.interface,
+            //     process_io.process.argv[0],
+            //     &process_io.stdin_writer.?.interface,
             // });
             try stream.connectDestination(process_io.closeableStdin());
         }
 
         if (stdout) |stream| {
             // std.log.debug("child \"{s}\" stdout: {*}", .{
-            //     stable_child.argv[0],
-            //     &stdout_reader.interface,
+            //     process_io.process.argv[0],
+            //     &process_io.stdout_reader.?.file_reader.?,
             // });
             try stream.connectSource(process_io.closeableStdout());
         }
 
         if (stderr) |stream| {
             // std.log.debug("child \"{s}\" stderr: {*}", .{
-            //     stable_child.argv[0],
-            //     &stderr_reader.interface,
+            //     process_io.process.argv[0],
+            //     &process_io.stderr_reader.?.file_reader.?,
             // });
             try stream.connectSource(process_io.closeableStderr());
         }
@@ -1705,8 +1927,11 @@ pub const Evaluator = struct {
             switch (segment) {
                 .text => |t| try decodeString(&buffer, t.payload),
                 .interpolation => |expr_ptr| {
+                    try self.pushCaptureOutputFrames(scopes);
                     var value = try self.evaluateExpression(scopes, expr_ptr);
                     defer value.deinit();
+                    try self.processBindingValue(scopes, &value);
+                    try self.popCaptureOutputFrames(scopes);
                     var rendered = try self.materializeString(value);
                     defer rendered.deinit(.{});
                     try buffer.appendSlice(try rendered.get());
@@ -1775,7 +2000,6 @@ pub const Evaluator = struct {
 
                 return .init(self.allocator, result.written(), .{});
             },
-            .void, .scope, .function, .array, .range, .process => Error.InvalidStringCoercion,
             .execution => |execution_ref| {
                 const execution = try execution_ref.getPtr();
                 return execution.stdout.ref(.{});
@@ -1783,6 +2007,7 @@ pub const Evaluator = struct {
             .exit_code => |exit_code| {
                 return .print(self.allocator, "{?f}", .{exit_code}, .{});
             },
+            .void, .scope, .function, .array, .range, .process, .pipeline => Error.InvalidStringCoercion,
         };
     }
 

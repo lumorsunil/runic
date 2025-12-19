@@ -705,6 +705,7 @@ pub const BinaryOp = enum {
     pipe,
     apply,
     member,
+    assign,
 
     pub fn precedence(self: BinaryOp) usize {
         return switch (self) {
@@ -724,6 +725,7 @@ pub const BinaryOp = enum {
             .pipe => 50,
             .apply => 70,
             .member => 90,
+            .assign => 0,
         };
     }
 
@@ -744,6 +746,7 @@ pub const BinaryOp = enum {
             .equal_equal => .equal,
             .pipe => .pipe,
             .dot => .member,
+            .assign => .assign,
             else => null,
         };
     }
@@ -1262,7 +1265,7 @@ pub const ReturnStmt = struct {
 pub const ForExpr = struct {
     sources: []const *Expression,
     capture: CaptureClause,
-    body: Block,
+    body: *Expression,
     span: Span,
 
     pub fn resolveType(

@@ -321,7 +321,7 @@ const StatementExpressionIterator = struct {
             },
             .assignment => |assignment| try cursor.appendExpr(assignment.expr),
             .for_expr => |for_expr| {
-                try self.cursor.appendStatements(for_expr.body.statements);
+                try cursor.appendExpr(for_expr.body);
                 try self.cursor.appendExpressions(for_expr.sources);
             },
             .executable => {},

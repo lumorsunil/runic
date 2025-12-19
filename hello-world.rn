@@ -1,1 +1,6 @@
 "hello, world!\n"
+var i = 5
+const j = i = i + 5
+"${j}\n"
+"${i = i + 5}"
+const _ = i = i + 5

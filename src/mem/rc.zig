@@ -50,6 +50,7 @@ pub fn RC(comptime T: type) type {
             options: RCInitOptions,
 
             pub const RCType = RC(T);
+            pub const Payload = T;
 
             pub fn init(allocator_: Allocator, value: T, options: RCInitOptions) RCError!Ref {
                 const rc = try RC(T).init(allocator_, value);
