@@ -99,11 +99,15 @@ pub const Value = union(enum) {
     pub const PipelineExecution = mem.RC(PipelineExecutionInner).Ref;
 
     const PipelineExecutionInner = struct {
-        pipes: []*ReaderWriterStream,
+        is_consumed: bool = false,
+        stdout_pipes: []*ReaderWriterStream,
+        stderr_pipes: []*ReaderWriterStream,
 
         pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-            for (self.pipes) |pipe| pipe.stream.deinit();
-            allocator.free(self.pipes);
+            for (self.stdout_pipes) |pipe| pipe.stream.deinit();
+            for (self.stderr_pipes) |pipe| pipe.stream.deinit();
+            allocator.free(self.stdout_pipes);
+            allocator.free(self.stderr_pipes);
             allocator.destroy(self);
         }
     };

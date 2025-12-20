@@ -265,53 +265,61 @@ pub const Evaluator = struct {
         try self.log(@src().fn_name, .{});
         defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
 
-        var frames: usize = 1;
+        // var frames: usize = 1;
         try scopes.pushProcesses(@src().fn_name);
 
-        var stdout_pipe: ?*ReaderWriterStream = null;
-        var stderr_pipe: ?*ReaderWriterStream = null;
-        defer {
-            if (stdout_pipe) |pipe| pipe.stream.deinit();
-            if (stderr_pipe) |pipe| pipe.stream.deinit();
-        }
+        // try self.pushCaptureOutputFrames(scopes);
 
-        if (scopes.getStdoutPipe().stream) |stdout_stream| {
-            if (stdout_stream.destination) |destination| {
-                stdout_pipe = try Stream(u8).initReaderWriter(
-                    self.allocator,
-                    @src().fn_name,
-                );
-                errdefer stdout_pipe.?.stream.deinit();
-                try stdout_pipe.?.connectDestination(destination);
-            }
-        }
+        // var stdout_pipe: ?*ReaderWriterStream = null;
+        // var stderr_pipe: ?*ReaderWriterStream = null;
+        // defer {
+        //     if (stdout_pipe) |pipe| pipe.stream.deinit();
+        //     if (stderr_pipe) |pipe| pipe.stream.deinit();
+        // }
+        //
+        // if (scopes.getStdoutPipe().stream) |stdout_stream| {
+        //     if (stdout_stream.destination) |destination| {
+        //         stdout_pipe = try Stream(u8).initReaderWriter(
+        //             self.allocator,
+        //             @src().fn_name,
+        //         );
+        //         errdefer stdout_pipe.?.stream.deinit();
+        //         try stdout_pipe.?.connectDestination(destination);
+        //     }
+        // }
+        //
+        // if (scopes.getStderrPipe().stream) |stderr_stream| {
+        //     if (stderr_stream.destination) |destination| {
+        //         stderr_pipe = try Stream(u8).initReaderWriter(
+        //             self.allocator,
+        //             @src().fn_name,
+        //         );
+        //         errdefer stderr_pipe.?.stream.deinit();
+        //         try stderr_pipe.?.connectDestination(destination);
+        //     }
+        // }
 
-        if (scopes.getStderrPipe().stream) |stderr_stream| {
-            if (stderr_stream.destination) |destination| {
-                stderr_pipe = try Stream(u8).initReaderWriter(
-                    self.allocator,
-                    @src().fn_name,
-                );
-                errdefer stderr_pipe.?.stream.deinit();
-                try stderr_pipe.?.connectDestination(destination);
-            }
-        }
-
-        if (stdout_pipe != null or stderr_pipe != null) {
-            frames += 1;
-            try scopes.pushFrameForwarding(@src().fn_name, .{
-                .stdin = .blocked(),
-                .stdout = if (stdout_pipe) |pipe| .init(pipe, .streaming) else .inherit,
-                .stderr = if (stderr_pipe) |pipe| .init(pipe, .streaming) else .inherit,
-            });
-        }
+        // if (stdout_pipe != null or stderr_pipe != null) {
+        //     frames += 1;
+        //     try scopes.pushFrameForwarding(@src().fn_name, .{
+        //         .stdin = .blocked(),
+        //         .stdout = if (stdout_pipe) |pipe| .init(pipe, .streaming) else .inherit,
+        //         .stderr = if (stderr_pipe) |pipe| .init(pipe, .streaming) else .inherit,
+        //     });
+        // }
 
         var v = try self.evaluateExpression(scopes, expression);
         errdefer v.deinit();
 
-        try self.forwardOutput(scopes);
+        try self.processOutput(scopes, &v);
 
-        try scopes.popFrameN(@src().fn_name, frames);
+        // try self.forwardOutput(scopes);
+
+        try scopes.popFrame(@src().fn_name);
+
+        // try scopes.popFrameN(@src().fn_name, frames);
+
+        // try self.popCaptureOutputFrames(scopes);
 
         var value_as_string = self.materializeString(v) catch |err| switch (err) {
             error.InvalidStringCoercion => return v,
@@ -321,6 +329,17 @@ pub const Evaluator = struct {
 
         try self.log("forwardString: <{t}>\n", .{expression.*});
         try self.logEvaluateExpression(expression);
+
+        // TODO: figure how to do this properly
+        switch (expression.*) {
+            .pipeline, .assignment, .call => return v,
+            .binary => |binary| {
+                if (binary.op == .assign) {
+                    return v;
+                }
+            },
+            else => {},
+        }
 
         self.forwardString(scopes, value_as_string) catch |err| switch (err) {
             StreamError.InvalidSource => {},
@@ -374,7 +393,11 @@ pub const Evaluator = struct {
         try scopes.popFrameN(@src().fn_name, 3);
     }
 
-    fn capturePipes(self: *Evaluator, pipes: []const ?*ReaderWriterStream) Error![][]const u8 {
+    fn capturePipes(
+        self: *Evaluator,
+        pipes: []const ?*ReaderWriterStream,
+        mode: CaptureOutputOptions.Mode,
+    ) Error![][]const u8 {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.log(@src().fn_name, .{});
         defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
@@ -386,17 +409,22 @@ pub const Evaluator = struct {
         const results = try self.allocator.alloc([]const u8, pipes.len);
         errdefer self.allocator.free(results);
 
-        outer: while (true) {
-            for (pipes, 0..) |pipe, i| {
-                if (pipe) |p| {
-                    done[i] = try p.forward(.unlimited) != .not_done;
-                } else {
-                    done[i] = true;
-                }
-            }
+        switch (mode) {
+            .forward_pipes => {
+                outer: while (true) {
+                    for (pipes, 0..) |pipe, i| {
+                        if (pipe) |p| {
+                            done[i] = try p.forward(.unlimited) != .not_done;
+                        } else {
+                            done[i] = true;
+                        }
+                    }
 
-            for (done) |d| if (!d) continue :outer;
-            break;
+                    for (done) |d| if (!d) continue :outer;
+                    break;
+                }
+            },
+            .dont_forward_pipes => {},
         }
 
         for (pipes, 0..) |pipe, i| {
@@ -454,7 +482,25 @@ pub const Evaluator = struct {
         }
     }
 
-    fn captureOutput(self: *Evaluator, scopes: *ScopeStack) Error!Value.ExecutionRef {
+    const CaptureOutputOptions = struct {
+        mode: Mode,
+
+        pub const Mode = enum { forward_pipes, dont_forward_pipes };
+
+        pub fn forwardPipes() @This() {
+            return .{ .mode = .forward_pipes };
+        }
+
+        pub fn dontForwardPipes() @This() {
+            return .{ .mode = .dont_forward_pipes };
+        }
+    };
+
+    fn captureOutput(
+        self: *Evaluator,
+        scopes: *ScopeStack,
+        options: CaptureOutputOptions,
+    ) Error!Value.ExecutionRef {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.log(@src().fn_name, .{});
         defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
@@ -462,7 +508,7 @@ pub const Evaluator = struct {
         const stdout = scopes.getStdoutPipe().stream;
         const stderr = scopes.getStderrPipe().stream;
 
-        const result = try self.capturePipes(&.{ stdout, stderr });
+        const result = try self.capturePipes(&.{ stdout, stderr }, options.mode);
         defer self.allocator.free(result);
 
         const stdout_result = result[0];
@@ -513,6 +559,33 @@ pub const Evaluator = struct {
         try bindPattern(scopes, decl.pattern.*, decl.is_mutable, &value);
     }
 
+    fn processOutput(
+        self: *Evaluator,
+        scopes: *ScopeStack,
+        value: *Value,
+    ) Error!void {
+        switch (value.*) {
+            .pipeline => |pipeline| {
+                var owned = value.*;
+                defer owned.deinit();
+
+                const exit_code = try self.consumePipeline(pipeline);
+                try self.forwardOutput(scopes);
+                value.* = .{ .exit_code = exit_code };
+            },
+            .process => |process| {
+                var owned = value.*;
+                defer owned.deinit();
+
+                try self.forwardOutput(scopes);
+                const processes = try scopes.wait();
+                const exit_code = processes.getExitCode(process);
+                value.* = .{ .exit_code = exit_code };
+            },
+            else => return,
+        }
+    }
+
     fn processBindingValue(
         self: *Evaluator,
         scopes: *ScopeStack,
@@ -524,7 +597,7 @@ pub const Evaluator = struct {
                 defer owned.deinit();
 
                 const exit_code = try self.consumePipeline(pipeline);
-                const execution_result = try self.captureOutput(scopes);
+                const execution_result = try self.captureOutput(scopes, .dontForwardPipes());
                 (try execution_result.getPtr()).exit_code = exit_code;
                 value.* = .{ .execution = execution_result };
             },
@@ -532,7 +605,7 @@ pub const Evaluator = struct {
                 var owned = value.*;
                 defer owned.deinit();
 
-                const execution_result = try self.captureOutput(scopes);
+                const execution_result = try self.captureOutput(scopes, .forwardPipes());
                 const processes = try scopes.wait();
                 const exit_code = processes.getExitCode(process);
                 (try execution_result.getPtr()).exit_code = exit_code;
@@ -1210,34 +1283,112 @@ pub const Evaluator = struct {
         try self.logEvaluationTrace(@src().fn_name);
         defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
 
-        const pipes = try self.allocator.alloc(*ReaderWriterStream, pipeline.stages.len - 1);
-        for (pipes) |*pipe| {
-            pipe.* = try Stream(u8).initReaderWriter(self.allocator, @src().fn_name);
+        const stdout_context = scopes.getStdoutPipe().stream;
+
+        var stdout_pipes = std.ArrayList(*ReaderWriterStream).empty;
+        defer stdout_pipes.deinit(self.allocator);
+        errdefer {
+            for (stdout_pipes.items) |item| {
+                item.stream.deinit();
+            }
+        }
+
+        try stdout_pipes.ensureTotalCapacity(self.allocator, pipeline.stages.len);
+        for (0..pipeline.stages.len - 1) |i| {
+            const stage = pipeline.stages[i];
+            const span = stage.span();
+            const source = try self.document_store.getSource(span.start.file);
+            stdout_pipes.appendAssumeCapacity(
+                try Stream(u8).initReaderWriter(
+                    self.allocator,
+                    try std.fmt.allocPrint(
+                        self.loose_ends_arena.allocator(),
+                        @src().fn_name ++ "<{s}:stdin_stdout>",
+                        .{span.sliceFrom(source)},
+                    ),
+                ),
+            );
+        }
+
+        if (stdout_context) |stdout_context_pipe| {
+            const stage = pipeline.stages[pipeline.stages.len - 1];
+            const span = stage.span();
+            const source = try self.document_store.getSource(span.start.file);
+            const stdout_last_pipe = try Stream(u8).initReaderWriter(
+                self.allocator,
+                try std.fmt.allocPrint(
+                    self.loose_ends_arena.allocator(),
+                    @src().fn_name ++ "<{s}:stdout_context>",
+                    .{span.sliceFrom(source)},
+                ),
+            );
+            stdout_pipes.appendAssumeCapacity(stdout_last_pipe);
+            try stdout_last_pipe.connectDestination(
+                stdout_context_pipe.closeableWriter(),
+            );
+        }
+
+        const stderr_context = scopes.getStderrPipe().stream;
+
+        var stderr_pipes = std.ArrayList(*ReaderWriterStream).empty;
+        defer stderr_pipes.deinit(self.allocator);
+        errdefer {
+            for (stderr_pipes.items) |item| {
+                item.stream.deinit();
+            }
+        }
+        if (stderr_context) |stderr_context_pipe| {
+            try stderr_pipes.ensureTotalCapacity(self.allocator, pipeline.stages.len);
+            for (0..pipeline.stages.len) |i| {
+                const stage = pipeline.stages[i];
+                const span = stage.span();
+                const source = try self.document_store.getSource(span.start.file);
+                stderr_pipes.appendAssumeCapacity(
+                    try Stream(u8).initReaderWriter(
+                        self.allocator,
+                        try std.fmt.allocPrint(
+                            self.loose_ends_arena.allocator(),
+                            @src().fn_name ++ "<{s}:stderr>",
+                            .{span.sliceFrom(source)},
+                        ),
+                    ),
+                );
+                try stderr_pipes.getLast().connectDestination(
+                    stderr_context_pipe.closeableWriter(),
+                );
+            }
         }
 
         for (0..pipeline.stages.len) |i| {
             const index = i;
             const stage = pipeline.stages[index];
 
-            var stdin: ScopeStack.PipeInfo = undefined;
-            var stdout: ScopeStack.PipeInfo = undefined;
+            var stdin_pipe_info: ScopeStack.PipeInfo = undefined;
+            var stdout_pipe_info: ScopeStack.PipeInfo = undefined;
+            var stderr_pipe_info: ScopeStack.PipeInfo = undefined;
 
             if (index > 0) {
-                stdin = .init(pipes[index - 1], .non_streaming);
+                stdin_pipe_info = .init(stdout_pipes.items[index - 1], .streaming);
             } else {
-                stdin = .blocked();
+                stdin_pipe_info = .blocked();
             }
 
-            if (index == pipeline.stages.len - 1) {
-                stdout = .inherit;
+            if (stdout_context) |_| {
+                stdout_pipe_info = .init(stdout_pipes.items[index], .streaming);
             } else {
-                stdout = .init(pipes[index], .non_streaming);
+                stdout_pipe_info = .blocked();
+            }
+
+            if (stderr_context) |_| {
+                stderr_pipe_info = .init(stderr_pipes.items[index], .streaming);
+            } else {
+                stderr_pipe_info = .blocked();
             }
 
             try scopes.pushFrameForwarding(@src().fn_name, .{
-                .stdin = stdin,
-                .stdout = stdout,
-                .stderr = .inherit,
+                .stdin = stdin_pipe_info,
+                .stdout = stdout_pipe_info,
+                .stderr = stderr_pipe_info,
             });
 
             var v = try self.evaluateExpression(scopes, stage);
@@ -1246,37 +1397,72 @@ pub const Evaluator = struct {
             try scopes.popFrame(@src().fn_name);
         }
 
-        return .{ .pipeline = try .init(self.allocator, .{ .pipes = pipes }, .{}) };
+        return .{ .pipeline = try .init(
+            self.allocator,
+            .{
+                .stdout_pipes = try stdout_pipes.toOwnedSlice(self.allocator),
+                .stderr_pipes = try stderr_pipes.toOwnedSlice(self.allocator),
+            },
+            .{},
+        ) };
     }
 
     fn consumePipeline(self: *Evaluator, pipeline_ref: Value.PipelineExecution) Error!?ExitCode {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.logEvaluationTrace(@src().fn_name);
+        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
+
         const pipeline = try pipeline_ref.getPtr();
-        var pipes_closed = try self.allocator.alloc(bool, pipeline.pipes.len);
-        defer self.allocator.free(pipes_closed);
-        for (pipes_closed) |*closed| closed.* = false;
+
+        if (pipeline.is_consumed) return self.getPipelineExitCode(pipeline_ref);
+        pipeline.is_consumed = true;
+
+        var stdout_pipes_closed = try self.allocator.alloc(bool, pipeline.stdout_pipes.len);
+        defer self.allocator.free(stdout_pipes_closed);
+        for (stdout_pipes_closed) |*closed| closed.* = false;
+
+        var stderr_pipes_closed = try self.allocator.alloc(bool, pipeline.stderr_pipes.len);
+        defer self.allocator.free(stderr_pipes_closed);
+        for (stderr_pipes_closed) |*closed| closed.* = false;
 
         outer: while (true) {
-            for (pipeline.pipes, 0..) |pipe, i| {
-                if (pipes_closed[i]) continue;
-                pipes_closed[i] = try pipe.forward(.unlimited) == .closed;
+            for (pipeline.stdout_pipes, 0..) |pipe, i| {
+                if (stdout_pipes_closed[i]) continue;
+                stdout_pipes_closed[i] = try pipe.forward(.unlimited) != .not_done;
             }
 
-            for (pipes_closed) |closed| {
+            for (pipeline.stderr_pipes, 0..) |pipe, i| {
+                if (stderr_pipes_closed[i]) continue;
+                stderr_pipes_closed[i] = try pipe.forward(.unlimited) != .not_done;
+            }
+
+            for (stdout_pipes_closed) |closed| {
+                if (!closed) continue :outer;
+            }
+
+            for (stderr_pipes_closed) |closed| {
                 if (!closed) continue :outer;
             }
 
             break;
         }
 
-        return getPipelineExitCode(pipeline_ref);
+        return self.getPipelineExitCode(pipeline_ref);
     }
 
-    fn getPipelineExitCode(pipeline_ref: Value.PipelineExecution) Error!?ExitCode {
+    fn getPipelineExitCode(
+        self: *Evaluator,
+        pipeline_ref: Value.PipelineExecution,
+    ) Error!?ExitCode {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.logEvaluationTrace(@src().fn_name);
+        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
+
         var exit_code: ?ExitCode = null;
 
         const pipeline = try pipeline_ref.getPtr();
 
-        for (pipeline.pipes) |p| {
+        for (pipeline.stdout_pipes) |p| {
             const source = p.source orelse continue;
 
             if (source.getResult()) |source_exit_code| {
