@@ -28,7 +28,7 @@ pub const Identifier = struct {
         _: std.mem.Allocator,
         scope: *semantic.Scope,
     ) ?*const TypeExpr {
-        const binding = scope.lookup(self.name) orelse return null;
+        const binding = scope.lookup(self.name) orelse return &TypeExpr.executableType;
         return binding.type_expr;
     }
 };
@@ -137,6 +137,7 @@ pub const TypeExpr = union(enum) {
     float: PrimitiveType,
     boolean: PrimitiveType,
     byte: PrimitiveType,
+    execution: PrimitiveType,
     failed: FailedType,
     // lazy: LazyType,
 
@@ -271,6 +272,7 @@ pub const TypeExpr = union(enum) {
 
     pub const FunctionType = struct {
         params: Parameters,
+        stdin_type: ?*const TypeExpr,
         return_type: ?*const TypeExpr,
         span: Span,
 
@@ -403,9 +405,32 @@ pub const TypeExpr = union(enum) {
             .byte => {
                 try writer.writeAll("Byte");
             },
+            .execution => {
+                try writer.writeAll("Execution");
+            },
             inline else => |s| try s.format(writer),
         }
     }
+
+    const globalByteType = TypeExpr{
+        .byte = .{ .span = .global },
+    };
+    const globalStringType = TypeExpr{
+        .array = .{ .element = &globalByteType, .span = .global },
+    };
+    const executableParameterType = globalStringType;
+    const executableReturnType = TypeExpr{
+        .execution = .{ .span = .global },
+    };
+    pub const executableType = TypeExpr{
+        .function = .{
+            .params = .variadic(&executableParameterType),
+            // TODO: implement
+            .stdin_type = null,
+            .return_type = &executableReturnType,
+            .span = .global,
+        },
+    };
 };
 
 /// StringLiteral supports interpolation segments so command arguments and
@@ -1185,6 +1210,7 @@ pub const FunctionDecl = struct {
 
         fn_type.* = .{ .function = .{
             .params = params_types,
+            .stdin_type = self.stdin_type,
             .return_type = self.return_type,
             .span = self.span,
         } };

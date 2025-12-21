@@ -1,7 +1,9 @@
 # executables.rn
 
-# const echo = &!echo
-const !echo
+const echo = &!echo
+const !echo, !cat
+
+cat "file.file" | cat
 
 fn Void add(x: Int, y: Int) Int {
   return x + y

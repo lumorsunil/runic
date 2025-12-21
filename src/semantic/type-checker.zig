@@ -33,6 +33,7 @@ pub const TypeChecker = struct {
             IdentifierNotFound,
             MemberAccessOnOptional,
             MemberObjectTypeUndefined,
+            MemberNotFound,
             ModuleNotFound,
             TypeMismatch,
             UnresolvedTypeLiteral,
@@ -582,6 +583,11 @@ pub const TypeChecker = struct {
         try self.runExpression(fn_scope, fn_decl.body);
     }
 
+    fn runCall(self: *TypeChecker, scope: *Scope, call: *ast.CallExpr) Error!void {
+        try self.runExpression(scope, call.callee);
+        for (call.arguments) |arg| try self.runExpression(scope, arg);
+    }
+
     fn runExpressionStatement(
         self: *TypeChecker,
         scope: *Scope,
@@ -617,6 +623,7 @@ pub const TypeChecker = struct {
             .import_expr => |*import_expr| self.runImportExpr(scope, import_expr),
             .assignment => |*assignment| self.runAssignment(scope, assignment),
             .fn_decl => |*fn_decl| self.runFnDecl(scope, fn_decl),
+            .call => |*call| self.runCall(scope, call),
             else => return error.UnsupportedExpression,
         };
     }
@@ -753,6 +760,7 @@ pub const TypeChecker = struct {
             .optional => return error.MemberAccessOnOptional,
             .promise, .error_union, .error_set, .err, .array, .struct_type, .tuple, .function, .integer, .float, .boolean, .byte, .alias, .void => return error.UnsupportedMemberAccess,
             .module => |module| try self.runModuleMemberAccess(module, &member.member),
+            .execution => |execution| try self.runExecutionMemberAccess(execution, &member.member),
             // .lazy => {
             //     // TODO: Figure out what to do here, do we setup a check after the lazy type has been resolved, or do we always assume we have the types resolved here? <|:)---<
             //     return error.UnsupportedMemberAccess;
@@ -770,6 +778,23 @@ pub const TypeChecker = struct {
 
         const module_scope = try self.requestModuleScope(module) orelse return;
         _ = try self.runIdentifier(module_scope, identifier);
+    }
+
+    pub fn runExecutionMemberAccess(
+        self: *TypeChecker,
+        _: ast.TypeExpr.PrimitiveType,
+        identifier: *ast.Identifier,
+    ) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.logTypeCheckTrace(@src().fn_name, identifier.span);
+
+        const valid_members: []const []const u8 = &.{ "exit_code", "stdout", "stderr" };
+
+        for (valid_members) |m| if (std.mem.eql(u8, m, identifier.name)) {
+            return;
+        };
+
+        return error.MemberNotFound;
     }
 
     pub fn runPipeline(self: *TypeChecker, scope: *Scope, pipeline: *ast.Pipeline) Error!void {
@@ -885,13 +910,13 @@ pub const TypeChecker = struct {
         try self.logTypeCheckTrace(@src().fn_name, identifier.span);
 
         if (scope.lookup(identifier.name) == null) {
-            try self.reportSpanError(
-                identifier.span,
-                error.IdentifierNotFound,
-                .@"error",
-                "identifier \"{s}\" not declared",
-                .{identifier.name},
-            );
+            // try self.reportSpanError(
+            //     identifier.span,
+            //     error.IdentifierNotFound,
+            //     .@"error",
+            //     "identifier \"{s}\" not declared",
+            //     .{identifier.name},
+            // );
 
             return .not_found;
         }
@@ -1109,6 +1134,11 @@ pub const TypeChecker = struct {
             ),
             .byte => |*byte| self.validateTypeAssignmentByte(
                 byte,
+                assignment_type,
+                options,
+            ),
+            .execution => |*execution| self.validateTypeAssignmentExecution(
+                execution,
                 assignment_type,
                 options,
             ),
@@ -1450,6 +1480,25 @@ pub const TypeChecker = struct {
             .byte => {},
             else => try self.reportAssignmentError(
                 @as(*const ast.TypeExpr, @fieldParentPtr("byte", assignee)),
+                assignment_type,
+                options,
+            ),
+        }
+    }
+
+    pub fn validateTypeAssignmentExecution(
+        self: *TypeChecker,
+        assignee: *const ast.TypeExpr.PrimitiveType,
+        assignment_type: *const ast.TypeExpr,
+        options: ValidateTypeAssignmentOptions,
+    ) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.logTypeCheckTrace(@src().fn_name, assignment_type.span());
+
+        switch (assignment_type.*) {
+            .execution => {},
+            else => try self.reportAssignmentError(
+                @as(*const ast.TypeExpr, @fieldParentPtr("execution", assignee)),
                 assignment_type,
                 options,
             ),
