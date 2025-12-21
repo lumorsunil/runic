@@ -1,0 +1,18 @@
+fn Void hello(greeting: String) String {
+  echo "Hello! ${greeting}"
+}
+
+// hello "I'm runic" | cat
+
+// const s = hello "I'm runic."
+// inspect(s)
+
+echo "hello" | { 0> cat | inside_block; echo "hello from block" } | after_block
+
+1: echo "hello" | cat | inside_block | after_block
+2: echo "hello from block" | after_block
+
+const b = {
+  echo "I'm a block"
+}
+inspect(b)

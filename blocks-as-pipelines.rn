@@ -1,0 +1,25 @@
+const s = {
+  echo "hello"
+  echo "hello again"
+}
+
+// const s = {
+//   echo "hello"
+//   echo "hello again"
+// }
+//
+// {
+//   echo "first"
+//   echo "second"
+// } | cat
+//
+//
+// pipe
+//
+//
+// 1. pipe destination connects to context stdin
+// 2. echo "first" connects to pipe source
+// 3. echo "first" completes
+// 4. do we have more sources?
+//   4a. no -> close pipe destination
+//   4b. yes -> spin up next pipeline and connect to pipe source

@@ -693,7 +693,7 @@ pub const TypeChecker = struct {
             try self.runBindingPattern(for_scope, pattern, type_expr, false);
         }
 
-        try self.runBlock(for_scope, &for_expr.body);
+        try self.runExpression(for_scope, for_expr.body);
     }
 
     pub fn runIfExpr(self: *TypeChecker, scope: *Scope, if_expr: *ast.IfExpr) Error!void {

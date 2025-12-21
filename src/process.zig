@@ -44,25 +44,29 @@ pub const ProcessCloseable = struct {
     const vtable = Closeable(ExitCode).VTable{
         .close = close,
         .getResult = getResult,
+        .getLabel = getLabel,
     };
 
     const stdin_vtable = Closeable(ExitCode).VTable{
         .close = stdin_close,
         .getResult = stdin_getResult,
+        .getLabel = stdin_getLabel,
     };
 
     const stdout_vtable = Closeable(ExitCode).VTable{
         .close = stdout_close,
         .getResult = stdout_getResult,
+        .getLabel = stdout_getLabel,
     };
 
     const stderr_vtable = Closeable(ExitCode).VTable{
         .close = stderr_close,
         .getResult = stderr_getResult,
+        .getLabel = stderr_getLabel,
     };
 
     pub fn init(process: *std.process.Child) @This() {
-        log(@typeName(@This()) ++ "." ++ @src().fn_name, .{});
+        log(@typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{process.argv[0]});
         log("{s}: stdin {}", .{ process.argv[0], process.stdin != null });
         log("{s}: stdout {}", .{ process.argv[0], process.stdout != null });
         log("{s}: stderr {}", .{ process.argv[0], process.stderr != null });
@@ -76,33 +80,45 @@ pub const ProcessCloseable = struct {
     }
 
     fn close(self: *Closeable(ExitCode)) ExitCode {
-        log(@typeName(@This()) ++ "." ++ @src().fn_name, .{});
         const parent: *@This() = @fieldParentPtr("closeable", self);
+        log(@typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{parent.process.argv[0]});
         log("closing {s}", .{parent.process.argv[0]});
         if (parent.waited) return .fromTerm(parent.process.term.?);
         parent.waited = true;
         log("waiting for {s} to terminate", .{parent.process.argv[0]});
-        return .fromTerm(parent.process.wait());
+        const exit_code: ExitCode = .fromTerm(parent.process.wait());
+        log("{s} exited with {any}", .{ parent.process.argv[0], exit_code });
+        return exit_code;
     }
 
     fn getResult(self: *Closeable(ExitCode)) ?ExitCode {
-        log(@typeName(@This()) ++ "." ++ @src().fn_name, .{});
         const parent: *@This() = @fieldParentPtr("closeable", self);
+        log(@typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{parent.process.argv[0]});
         return if (parent.process.term) |term| .fromTerm(term) else null;
     }
 
-    fn check_close_parent(self: *@This()) void {
-        log(@typeName(@This()) ++ "." ++ @src().fn_name, .{});
-        if (self.stdin.isClosed() and self.stdout.isClosed()) {
-            log(@typeName(@This()) ++ "." ++ @src().fn_name, .{});
-            _ = self.stderr.close();
-            _ = self.closeable.close();
+    pub fn getLabel(self: *Closeable(ExitCode)) []const u8 {
+        const parent: *@This() = @fieldParentPtr("closeable", self);
+        return parent.process.argv[0];
+    }
+
+    fn check_close_parent(self: *@This()) ?ExitCode {
+        log(@typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{self.process.argv[0]});
+
+        log("stdin: {}, stdout: {}, stderr: {}", .{
+            self.stdin.isClosed(), self.stdout.isClosed(), self.stderr.isClosed(),
+        });
+
+        if (self.stdin.isClosed() and self.stdout.isClosed() and self.stderr.isClosed()) {
+            return self.closeable.close();
         }
+
+        return null;
     }
 
     fn stdin_close(self: *Closeable(ExitCode)) ExitCode {
-        log(@typeName(@This()) ++ "." ++ @src().fn_name, .{});
         const parent: *@This() = @fieldParentPtr("stdin", self);
+        log(@typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{parent.process.argv[0]});
         log("closing stdin of {s}", .{parent.process.argv[0]});
         if (parent.process.stdin) |stdin| {
             stdin.close();
@@ -110,19 +126,24 @@ pub const ProcessCloseable = struct {
         }
         if (parent.stdin_term) |term| return term;
         parent.stdin_term = .success;
-        parent.check_close_parent();
+        parent.stdin_term = parent.check_close_parent() orelse .success;
         return parent.stdin_term.?;
     }
 
     fn stdin_getResult(self: *Closeable(ExitCode)) ?ExitCode {
-        log(@typeName(@This()) ++ "." ++ @src().fn_name, .{});
         const parent: *@This() = @fieldParentPtr("stdin", self);
-        return parent.stdin_term;
+        log(@typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{parent.process.argv[0]});
+        return parent.closeable.getResult() orelse parent.stdin_term;
+    }
+
+    fn stdin_getLabel(self: *Closeable(ExitCode)) []const u8 {
+        const parent: *@This() = @fieldParentPtr("stdin", self);
+        return parent.closeable.getLabel();
     }
 
     fn stdout_close(self: *Closeable(ExitCode)) ExitCode {
-        log(@typeName(@This()) ++ "." ++ @src().fn_name, .{});
         const parent: *@This() = @fieldParentPtr("stdout", self);
+        log(@typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{parent.process.argv[0]});
         log("closing stdout of {s}", .{parent.process.argv[0]});
         if (parent.process.stdout) |stdout| {
             stdout.close();
@@ -130,19 +151,24 @@ pub const ProcessCloseable = struct {
         }
         if (parent.stdout_term) |term| return term;
         parent.stdout_term = .success;
-        parent.check_close_parent();
+        parent.stdout_term = parent.check_close_parent() orelse .success;
         return parent.stdout_term.?;
     }
 
     fn stdout_getResult(self: *Closeable(ExitCode)) ?ExitCode {
-        log(@typeName(@This()) ++ "." ++ @src().fn_name, .{});
         const parent: *@This() = @fieldParentPtr("stdout", self);
-        return parent.stdout_term;
+        log(@typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{parent.process.argv[0]});
+        return parent.closeable.getResult() orelse parent.stdout_term;
+    }
+
+    fn stdout_getLabel(self: *Closeable(ExitCode)) []const u8 {
+        const parent: *@This() = @fieldParentPtr("stdout", self);
+        return parent.closeable.getLabel();
     }
 
     fn stderr_close(self: *Closeable(ExitCode)) ExitCode {
-        log(@typeName(@This()) ++ "." ++ @src().fn_name, .{});
         const parent: *@This() = @fieldParentPtr("stderr", self);
+        log(@typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{parent.process.argv[0]});
         log("closing stderr of {s}", .{parent.process.argv[0]});
         if (parent.process.stderr) |stderr| {
             stderr.close();
@@ -150,14 +176,77 @@ pub const ProcessCloseable = struct {
         }
         if (parent.stderr_term) |term| return term;
         parent.stderr_term = .success;
-        parent.check_close_parent();
+        parent.stderr_term = parent.check_close_parent() orelse .success;
         return parent.stderr_term.?;
     }
 
     fn stderr_getResult(self: *Closeable(ExitCode)) ?ExitCode {
-        log(@typeName(@This()) ++ "." ++ @src().fn_name, .{});
         const parent: *@This() = @fieldParentPtr("stderr", self);
-        return parent.stderr_term;
+        log(@typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{parent.process.argv[0]});
+        return parent.closeable.getResult() orelse parent.stderr_term;
+    }
+
+    fn stderr_getLabel(self: *Closeable(ExitCode)) []const u8 {
+        const parent: *@This() = @fieldParentPtr("stderr", self);
+        return parent.closeable.getLabel();
+    }
+};
+
+const PipeReader = struct {
+    file: ?std.fs.File,
+    file_reader: ?std.fs.File.Reader,
+    reader: std.Io.Reader = .{ .vtable = &vtable, .buffer = &.{}, .seek = 0, .end = 0 },
+
+    const vtable = std.Io.Reader.VTable{
+        .stream = stream,
+    };
+
+    pub fn init(file: ?std.fs.File, buffer: []u8) PipeReader {
+        return .{
+            .file = file,
+            .file_reader = if (file) |f| f.reader(buffer) else null,
+        };
+    }
+
+    fn getParent(r: *std.Io.Reader) *PipeReader {
+        return @fieldParentPtr("reader", r);
+    }
+
+    pub fn stream(
+        r: *std.Io.Reader,
+        w: *std.Io.Writer,
+        limit: std.Io.Limit,
+    ) std.Io.Reader.StreamError!usize {
+        const parent = getParent(r);
+        const file = parent.file orelse return 0;
+        const file_reader = if (parent.file_reader) |*fr| fr else return 0;
+
+        var poll_fds = [_]std.posix.pollfd{
+            .{
+                .fd = file.handle,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            },
+        };
+        const poll_fd = &poll_fds[0];
+
+        const result = std.posix.errno(std.posix.poll(&poll_fds, 0) catch return 0);
+        log("poll result: {}", .{result});
+        log("POLLIN: {}", .{poll_fd.revents & std.posix.POLL.IN});
+        log("POLLHUP: {}", .{poll_fd.revents & std.posix.POLL.HUP});
+        log("POLLNVAL: {}", .{poll_fd.revents & std.posix.POLL.NVAL});
+        switch (result) {
+            .SUCCESS => {
+                if (poll_fd.revents & std.posix.POLL.IN > 0) {
+                    return try file_reader.interface.stream(w, limit);
+                } else if (poll_fd.revents & (std.posix.POLL.HUP | std.posix.POLL.NVAL) > 0) {
+                    return error.EndOfStream;
+                }
+
+                return 0;
+            },
+            else => return error.ReadFailed,
+        }
     }
 };
 
@@ -166,9 +255,11 @@ pub const CloseableProcessIo = struct {
     stdin_buffer: [1024]u8 = undefined,
     stdin_writer: ?std.fs.File.Writer = null,
     stdout_buffer: [1024]u8 = undefined,
-    stdout_reader: ?std.fs.File.Reader = null,
+    // stdout_reader: ?std.fs.File.Reader = null,
+    stdout_reader: ?PipeReader = null,
     stderr_buffer: [1024]u8 = undefined,
-    stderr_reader: ?std.fs.File.Reader = null,
+    // stderr_reader: ?std.fs.File.Reader = null,
+    stderr_reader: ?PipeReader = null,
     process_closeable: ProcessCloseable = undefined,
 
     pub fn init(process: *std.process.Child) @This() {
@@ -177,8 +268,10 @@ pub const CloseableProcessIo = struct {
 
     pub fn connect(self: *@This()) void {
         if (self.process.stdin) |f| self.stdin_writer = f.writer(&self.stdin_buffer);
-        if (self.process.stdout) |f| self.stdout_reader = f.reader(&self.stdout_buffer);
-        if (self.process.stderr) |f| self.stderr_reader = f.reader(&self.stderr_buffer);
+        // if (self.process.stdout) |f| self.stdout_reader = f.reader(&self.stdout_buffer);
+        // if (self.process.stderr) |f| self.stderr_reader = f.reader(&self.stderr_buffer);
+        if (self.process.stdout) |f| self.stdout_reader = .init(f, &self.stdout_buffer);
+        if (self.process.stderr) |f| self.stderr_reader = .init(f, &self.stderr_buffer);
         self.process_closeable = .init(self.process);
     }
 
@@ -187,11 +280,11 @@ pub const CloseableProcessIo = struct {
     }
 
     pub fn stdout(self: *@This()) *std.Io.Reader {
-        return &self.stdout_reader.?.interface;
+        return &self.stdout_reader.?.reader;
     }
 
     pub fn stderr(self: *@This()) *std.Io.Reader {
-        return &self.stderr_reader.?.interface;
+        return &self.stderr_reader.?.reader;
     }
 
     pub fn closeable(self: *@This()) *Closeable(ExitCode) {
