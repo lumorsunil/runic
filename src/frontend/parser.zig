@@ -6,8 +6,6 @@ const rainbow = @import("../rainbow.zig");
 const mem = @import("../mem/root.zig");
 const DocumentStore = @import("../document_store.zig").DocumentStore;
 
-pub const module_parser = @import("module_parser_deprecated.zig");
-
 pub const Error = error{
     UnexpectedToken,
     UnexpectedEOF,

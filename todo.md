@@ -105,9 +105,9 @@
   - [ ] block streaming into a pipeline (only needed if we want to pipe functions or blocks into other things)
 - [ ] expressions as pipeline stages
   - [x] auto-coerce non-strings into strings? (or force interpolation? lsp hint?)
-- [ ] exit code in execution result
-- [ ] bug: when binding to a pipeline, runic hangs
-- [ ] figure out what to do with stderr
+- [x] exit code in execution result
+- [x] bug: when binding to a pipeline, runic hangs
+- [x] figure out what to do with stderr
 
 ## lsp
 
