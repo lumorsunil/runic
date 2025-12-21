@@ -581,6 +581,17 @@ pub const Expression = union(enum) {
             inline else => |*expr| expr.resolveType(allocator, scope),
         };
     }
+
+    pub fn isReference(self: *@This()) bool {
+        return switch (self.*) {
+            .identifier, .member => true,
+            .binary => |binary| switch (binary.op) {
+                .member => true,
+                else => false,
+            },
+            else => false,
+        };
+    }
 };
 
 pub const ArrayLiteral = struct {
@@ -731,6 +742,11 @@ pub const BinaryOp = enum {
     apply,
     member,
     assign,
+    add_assign,
+    minus_assign,
+    mul_assign,
+    div_assign,
+    rem_assign,
 
     pub fn precedence(self: BinaryOp) usize {
         return switch (self) {
@@ -751,6 +767,11 @@ pub const BinaryOp = enum {
             .apply => 70,
             .member => 90,
             .assign => 0,
+            .add_assign => 0,
+            .minus_assign => 0,
+            .mul_assign => 0,
+            .div_assign => 0,
+            .rem_assign => 0,
         };
     }
 
@@ -772,6 +793,11 @@ pub const BinaryOp = enum {
             .pipe => .pipe,
             .dot => .member,
             .assign => .assign,
+            .plus_assign => .add_assign,
+            .minus_assign => .minus_assign,
+            .mul_assign => .mul_assign,
+            .div_assign => .div_assign,
+            .rem_assign => .rem_assign,
             else => null,
         };
     }
@@ -780,6 +806,24 @@ pub const BinaryOp = enum {
         return switch (self) {
             .pipe => true,
             else => false,
+        };
+    }
+
+    pub fn isAssignment(self: @This()) bool {
+        return switch (self) {
+            .assign, .add_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign => true,
+            else => false,
+        };
+    }
+
+    pub fn unwrapAssign(self: @This()) @This() {
+        return switch (self) {
+            .add_assign => .add,
+            .minus_assign => .subtract,
+            .mul_assign => .multiply,
+            .div_assign => .divide,
+            .rem_assign => .remainder,
+            else => @panic("shouldn't happen <|:)-|--<"),
         };
     }
 };

@@ -45,8 +45,21 @@ echo "my_integer = $my_integer"
 echo "my_float = $my_float"
 echo "my_integer + my_float = $(echo "$my_integer + $my_float" | bc)"
 
-# arrays
+# compound assignment
+my_var_int=1
+echo "my_var_int = $my_var_int"
+((my_var_int+=3))
+echo "my_var_int += 3 = $my_var_int"
+((my_var_int-=1))
+echo "my_var_int -= 1 = $my_var_int"
+((my_var_int*=4))
+echo "my_var_int *= 4 = $my_var_int"
+((my_var_int/=2))
+echo "my_var_int /= 2 = $my_var_int"
+((my_var_int%=2))
+echo "my_var_int %= 2 = $my_var_int"
 
+# arrays
 my_array=("one" "two" "three")
 for item in ${my_array[@]}; do
     echo "$item"

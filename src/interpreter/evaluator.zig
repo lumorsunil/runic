@@ -1021,6 +1021,18 @@ pub const Evaluator = struct {
                 try self.log(@src().fn_name ++ ": error, encountered {t} binary expression", .{binary.op});
                 try self.logEvaluateSpan(binary.span);
             },
+            .add_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign => {
+                const result = try self.evaluateBinary(scopes, .{
+                    .left = binary.left,
+                    .right = binary.right,
+                    .op = binary.op.unwrapAssign(),
+                    .span = binary.span,
+                });
+
+                try self.assign(scopes, binary.left.identifier.name, result);
+
+                return result.clone(self.allocator, .{});
+            },
             .add => {
                 var left = try self.evaluateExpression(scopes, binary.left);
                 var right = try self.evaluateExpression(scopes, binary.right);
@@ -1255,15 +1267,11 @@ pub const Evaluator = struct {
                     return error.UnsupportedBinaryExpr;
                 }
 
-                const binding = try scopes.lookup(binary.left.identifier.name) orelse return error.UnknownIdentifier;
+                const value = try self.evaluateExpression(scopes, binary.right);
 
-                if (!binding.is_mutable) return error.ImmutableBinding;
+                try self.assign(scopes, binary.left.identifier.name, value);
 
-                var prev_value = binding.value.*;
-                defer prev_value.deinit();
-                binding.value.* = try self.evaluateExpression(scopes, binary.right);
-
-                return binding.value.clone(self.allocator, .{});
+                return value.clone(self.allocator, .{});
             },
         }
 
@@ -1272,6 +1280,16 @@ pub const Evaluator = struct {
             .{ binary.left.*, binary.op, binary.right.* },
         );
         return error.UnsupportedBinaryExpr;
+    }
+
+    fn assign(_: *Evaluator, scopes: *ScopeStack, name: []const u8, value: Value) Error!void {
+        const binding = try scopes.lookup(name) orelse return error.UnknownIdentifier;
+
+        if (!binding.is_mutable) return error.ImmutableBinding;
+
+        var prev_value = binding.value.*;
+        defer prev_value.deinit();
+        binding.value.* = value;
     }
 
     fn evaluatePipeline(

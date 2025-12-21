@@ -609,7 +609,7 @@ pub const Parser = struct {
         ) Error!*ast.Expression {
             if (op == .member) {
                 return parser.allocExpression(.{ .identifier = identifier });
-            } else if (op == .assign and chirality == .left) {
+            } else if (op != null and op.?.isAssignment() and chirality == .left) {
                 return parser.allocExpression(.{ .identifier = identifier });
             } else {
                 return parser.allocExpression(.{
@@ -791,7 +791,7 @@ pub const Parser = struct {
                 },
                 .op => {
                     switch (next.tag) {
-                        .equal_equal, .bang_equal, .greater, .greater_equal, .less, .less_equal, .plus, .minus, .star, .slash, .percent, .kw_and, .kw_or, .pipe, .dot, .assign => {
+                        .equal_equal, .bang_equal, .greater, .greater_equal, .less, .less_equal, .plus, .minus, .star, .slash, .percent, .kw_and, .kw_or, .pipe, .dot, .assign, .plus_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign => {
                             const breadcrumbInner = try self.createBreadcrumb("PBE:op");
                             defer breadcrumbInner.end();
                             try components.append(self.allocator, .{
@@ -1007,6 +1007,13 @@ pub const Parser = struct {
                 right.span(),
                 "expected identifier after member access operator",
                 .{},
+            );
+        } else if (op.isAssignment() and !left.isReference()) {
+            try self.reportParseError(
+                Error.UnexpectedToken,
+                left.span(),
+                "expected reference before assignment operator, actual: {t}",
+                .{left.*},
             );
         }
 
