@@ -108,8 +108,10 @@ pub fn runScript(
     var stdout_closeable = closeable.NeverCloses(ExitCode){ .label = "<<<stdout>>>" };
     var stderr_closeable = closeable.NeverCloses(ExitCode){ .label = "<<<stderr>>>" };
 
-    var wrapped_stdout = TraceWriter.init(stdout, "<<<t_stdout>>>");
-    var wrapped_stderr = TraceWriter.init(stderr, "<<<t_stderr>>>");
+    var wrapped_stdout_buffer: [1024]u8 = undefined;
+    var wrapped_stderr_buffer: [1024]u8 = undefined;
+    var wrapped_stdout = TraceWriter.init(&wrapped_stdout_buffer, stdout, "<<<t_stdout>>>");
+    var wrapped_stderr = TraceWriter.init(&wrapped_stderr_buffer, stderr, "<<<t_stderr>>>");
 
     const stdout_closeable_writer = closeable.CloseableWriter(ExitCode).init(
         &wrapped_stdout.writer,

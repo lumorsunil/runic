@@ -321,30 +321,30 @@ pub const Evaluator = struct {
 
         // try self.popCaptureOutputFrames(scopes);
 
-        var value_as_string = self.materializeString(v) catch |err| switch (err) {
-            error.InvalidStringCoercion => return v,
-            else => return err,
-        };
-        defer value_as_string.deinit(.{});
+        // var value_as_string = self.materializeString(v) catch |err| switch (err) {
+        //     error.InvalidStringCoercion => return v,
+        //     else => return err,
+        // };
+        // defer value_as_string.deinit(.{});
 
-        try self.log("forwardString: <{t}>\n", .{expression.*});
-        try self.logEvaluateExpression(expression);
+        // try self.log("forwardString: <{t}>\n", .{expression.*});
+        // try self.logEvaluateExpression(expression);
 
         // TODO: figure how to do this properly
-        switch (expression.*) {
-            .pipeline, .assignment, .call => return v,
-            .binary => |binary| {
-                if (binary.op == .assign) {
-                    return v;
-                }
-            },
-            else => {},
-        }
+        // switch (expression.*) {
+        //     .pipeline, .assignment, .call => return v,
+        //     .binary => |binary| {
+        //         if (binary.op == .assign) {
+        //             return v;
+        //         }
+        //     },
+        //     else => {},
+        // }
 
-        self.forwardString(scopes, value_as_string) catch |err| switch (err) {
-            StreamError.InvalidSource => {},
-            else => return err,
-        };
+        // self.forwardString(scopes, value_as_string) catch |err| switch (err) {
+        //     StreamError.InvalidSource => {},
+        //     else => return err,
+        // };
 
         return v;
     }

@@ -9,8 +9,9 @@ const CloseableWriter = @import("closeable.zig").CloseableWriter;
 const NeverCloses = @import("closeable.zig").NeverCloses;
 const ExitCode = @import("runtime/command_runner.zig").ExitCode;
 const rainbow = @import("rainbow.zig");
+const TraceWriter = @import("trace-writer.zig").TraceWriter;
 
-const log_enabled = true;
+const log_enabled = false;
 const log_writer_enabled = true;
 
 const prefix_color = rainbow.beginColor(.indigo);
@@ -278,6 +279,7 @@ pub const ReaderWriterStream = struct {
     stream: Stream(u8) = .init(&vtable),
     ref: RC(@This()).Ref = undefined,
     writer: std.Io.Writer,
+    trace_writer: TraceWriter = undefined,
     buffer_writer: std.Io.Writer.Allocating,
     closeable: Closeable(ExitCode) = .{ .vtable = &closeable_vtable },
     source: ?CloseableReader(ExitCode) = null,
@@ -314,8 +316,8 @@ pub const ReaderWriterStream = struct {
             .label = label,
             .writer = .{
                 .vtable = &writer_vtable,
-                // .buffer = try allocator.alloc(u8, 1024),
-                .buffer = &.{},
+                .buffer = try allocator.alloc(u8, 1024),
+                //.buffer = &.{},
             },
         };
     }
@@ -347,10 +349,17 @@ pub const ReaderWriterStream = struct {
             .{ destination.getLabel(), destination.writer, destination.closeable },
         );
 
+        try self.writer.flush();
         self.destination = destination;
-        self.writer.buffer = destination.writer.buffer;
+        self.trace_writer = .init(
+            try self.buffer_writer.allocator.alloc(u8, 1024),
+            destination.writer,
+            self.label,
+        );
+        // self.writer.buffer = destination.writer.buffer;
         const buffered = try self.buffer_writer.toOwnedSlice();
-        try destination.writer.writeAll(buffered);
+        try self.writer.writeAll(buffered);
+        try self.writer.flush();
         log(self, "bytes forwarded: {}", .{buffered.len});
         if (self.source) |source| if (source.isClosed()) {
             _ = destination.close();
@@ -379,7 +388,8 @@ pub const ReaderWriterStream = struct {
     pub fn deinitParent(self: *@This()) void {
         log(self, @src().fn_name, .{});
 
-        // self.buffer_writer.allocator.free(self.writer.buffer);
+        self.buffer_writer.allocator.free(self.writer.buffer);
+        if (self.destination) |_| self.buffer_writer.allocator.free(self.trace_writer.writer.buffer);
         self.buffer_writer.deinit();
         self.ref.deinit(.{ .refresh_ref = true });
     }
@@ -390,7 +400,9 @@ pub const ReaderWriterStream = struct {
 
     fn getDestinationWriter(self: *@This()) *std.Io.Writer {
         const destination = self.destination orelse return &self.buffer_writer.writer;
-        return destination.writer;
+        _ = destination;
+        return &self.trace_writer.writer;
+        //return destination.writer;
     }
 
     fn writer_getParent(self: *std.Io.Writer) *@This() {
@@ -412,7 +424,17 @@ pub const ReaderWriterStream = struct {
             "." ++ @src().fn_name ++ " >>> {*} ({})",
             .{ destination, destination.buffered().len },
         );
-        return destination.vtable.drain(destination, data, splat);
+        const buffer_written = try destination.writeSplat(&.{self.buffered()}, 1);
+        self.end -= buffer_written;
+
+        var written: usize = 0;
+
+        if (self.end == 0) {
+            written = try destination.writeSplat(data, splat);
+        }
+
+        try destination.flush();
+        return written;
     }
 
     fn writer_sendFile(
@@ -426,7 +448,9 @@ pub const ReaderWriterStream = struct {
             "." ++ @src().fn_name ++ " >>> {*} ({})",
             .{ destination, destination.buffered().len },
         );
-        return destination.vtable.sendFile(destination, file_reader, limit);
+        const written = try destination.sendFile(file_reader, limit);
+        try destination.flush();
+        return written;
     }
 
     fn writer_flush(self: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -436,7 +460,7 @@ pub const ReaderWriterStream = struct {
             "." ++ @src().fn_name ++ " >>> {*} ({*}:{})",
             .{ destination, destination.buffer, destination.buffered().len },
         );
-        return destination.vtable.flush(destination);
+        return self.defaultFlush();
     }
 
     fn writer_rebase(
@@ -450,7 +474,7 @@ pub const ReaderWriterStream = struct {
             "." ++ @src().fn_name ++ " >>> {*} ({})",
             .{ destination, destination.buffered().len },
         );
-        return destination.vtable.rebase(destination, preserve, capacity);
+        return self.defaultRebase(preserve, capacity);
     }
 
     pub fn closeable_getLabel(self: *Closeable(ExitCode)) []const u8 {
@@ -475,7 +499,7 @@ pub const ReaderWriterStream = struct {
             log(self, "no source connected", .{});
             return .no_source;
         };
-        const destination_writer = self.getDestinationWriter();
+        // const destination_writer = self.getDestinationWriter();
 
         log(self, "checking isClosed: {?f}", .{source.getResult()});
         if (source.isClosed()) {
@@ -483,7 +507,7 @@ pub const ReaderWriterStream = struct {
         }
 
         const bytes_forwarded = source.reader.stream(
-            destination_writer,
+            &self.writer,
             limit,
         ) catch |err| switch (err) {
             error.EndOfStream => {

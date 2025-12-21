@@ -1,7 +1,7 @@
 const std = @import("std");
 const rainbow = @import("rainbow.zig");
 
-const log_enabled = true;
+const log_enabled = false;
 
 const prefix_color = rainbow.beginColor(.blue);
 const end_color = rainbow.endColor();
@@ -41,10 +41,10 @@ pub const TraceWriter = struct {
         .rebase = rebase,
     };
 
-    pub fn init(w: *std.Io.Writer, label: []const u8) @This() {
+    pub fn init(buffer: []u8, w: *std.Io.Writer, label: []const u8) @This() {
         logWithoutParent(w, @src().fn_name ++ " ({s})", .{label});
         return .{
-            .writer = .{ .vtable = &vtable, .buffer = w.buffer },
+            .writer = .{ .vtable = &vtable, .buffer = buffer },
             .wrapped = w,
             .label = label,
         };
@@ -57,7 +57,17 @@ pub const TraceWriter = struct {
     fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
         log(w, @src().fn_name ++ " (data.len={}, data[0].len={}, splat={})", .{ data.len, data[0].len, splat });
         const parent = getParent(w);
-        return parent.wrapped.vtable.drain(parent.wrapped, data, splat);
+        const buffer_written = try parent.wrapped.writeSplat(&.{w.buffered()}, 1);
+        w.end -= buffer_written;
+
+        var written: usize = 0;
+
+        if (w.end == 0) {
+            written = try parent.wrapped.writeSplat(data, splat);
+        }
+
+        try parent.wrapped.flush();
+        return written;
     }
 
     fn sendFile(
@@ -67,18 +77,16 @@ pub const TraceWriter = struct {
     ) std.Io.Writer.FileError!usize {
         log(w, @src().fn_name ++ " ({*}, limit={})", .{ &file_reader.interface, limit });
         const parent = getParent(w);
-        return parent.wrapped.vtable.sendFile(parent.wrapped, file_reader, limit);
+        return parent.wrapped.sendFile(file_reader, limit);
     }
 
     fn flush(w: *std.Io.Writer) std.Io.Writer.Error!void {
         log(w, @src().fn_name, .{});
-        const parent = getParent(w);
-        return parent.wrapped.vtable.flush(parent.wrapped);
+        return w.defaultFlush();
     }
 
     fn rebase(w: *std.Io.Writer, preserve: usize, capacity: usize) std.Io.Writer.Error!void {
         log(w, @src().fn_name ++ " (preserve={}, capacity={})", .{ preserve, capacity });
-        const parent = getParent(w);
-        return parent.wrapped.vtable.rebase(parent.wrapped, preserve, capacity);
+        return w.defaultRebase(preserve, capacity);
     }
 };
