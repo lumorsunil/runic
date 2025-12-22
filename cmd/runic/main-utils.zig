@@ -16,6 +16,7 @@ pub const CliConfig = struct {
     print_tokens: bool = false,
     type_check_only: bool = false,
     skip_type_check: bool = false,
+    enable_ir: bool = false,
 
     const Mode = union(enum) {
         script: ScriptInvocation,
@@ -587,6 +588,7 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
     var print_tokens = false;
     var type_check_only = false;
     var skip_type_check = false;
+    var enable_ir = false;
     var parsing_options = true;
     var idx: usize = 1;
 
@@ -621,6 +623,10 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
             }
             if (argEqual(arg, "--skip-type-check")) {
                 skip_type_check = true;
+                continue;
+            }
+            if (argEqual(arg, "--enable-ir")) {
+                enable_ir = true;
                 continue;
             }
             if (std.mem.startsWith(u8, arg, trace_prefix)) {
@@ -717,6 +723,12 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
     if (skip_type_check and script_path == null) {
         return usageError(allocator, "--skip-type-check requires a script path.", .{});
     }
+    if (enable_ir and repl_requested) {
+        return usageError(allocator, "--enable-ir requires a script path.", .{});
+    }
+    if (enable_ir and script_path == null) {
+        return usageError(allocator, "--enable-ir requires a script path.", .{});
+    }
 
     const trace_slice = try finalizeList([]const u8, &trace_topics, &trace_cleanup);
     const module_slice = try finalizeList([]const u8, &module_paths, &module_cleanup);
@@ -734,6 +746,7 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
                 .print_tokens = print_tokens,
                 .type_check_only = type_check_only,
                 .skip_type_check = skip_type_check,
+                .enable_ir = enable_ir,
             },
         };
     }
@@ -749,6 +762,7 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
             .print_tokens = print_tokens,
             .type_check_only = type_check_only,
             .skip_type_check = skip_type_check,
+            .enable_ir = enable_ir,
         },
     };
 }

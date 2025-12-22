@@ -2,10 +2,10 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ir = @import("ir.zig");
 const ast = @import("../frontend/ast.zig");
-const Value = @import("../interpreter/value.zig").Value;
 
 pub const Error =
     Allocator.Error ||
+    std.Io.Writer.Error ||
     error{
         UnsupportedExpression,
         UnsupportedBindingPattern,
@@ -14,10 +14,13 @@ pub const Error =
     };
 
 pub const Result = union(enum) {
-    location: ir.Location,
-    value: Value,
+    value: ir.Value,
 
-    pub fn fromValue(value: Value) @This() {
+    pub fn fromLocation(location: ir.Location) @This() {
+        return .fromValue(.fromLocation(location));
+    }
+
+    pub fn fromValue(value: ir.Value) @This() {
         return .{ .value = value };
     }
 };
@@ -31,6 +34,14 @@ pub const IRData = struct {
 
     pub fn init() @This() {
         return .{};
+    }
+
+    pub fn deinit(self: *IRData, allocator: Allocator) void {
+        for (self.data.items) |*item| {
+            item.end = 0;
+            allocator.free(item.buffer);
+        }
+        self.data.deinit(allocator);
     }
 
     fn addPage(self: *IRData, allocator: Allocator) Error!usize {
@@ -67,6 +78,16 @@ pub const IRData = struct {
         try page_writer.writeAll(data);
         return .{ .data = .init(page, addr) };
     }
+
+    pub fn toOwnedSlice(self: *IRData, allocator: Allocator) ![]const []const u8 {
+        const owned = try allocator.alloc([]const u8, self.data.items.len);
+        for (owned, self.data.items) |*o, item| o.* = try allocator.dupe(
+            u8,
+            item.buffered(),
+        );
+        self.deinit(allocator);
+        return owned;
+    }
 };
 
 const Scope = struct {
@@ -85,6 +106,14 @@ const Scope = struct {
         return .{};
     }
 
+    pub fn pushBindings(self: *Scope, allocator: Allocator) !void {
+        return self.frames.append(allocator, .{ .bindings = .empty });
+    }
+
+    pub fn popFrame(self: *Scope) void {
+        _ = self.frames.pop();
+    }
+
     pub fn getCurrentFrame(self: *Scope, tag: std.meta.Tag(Frame)) *Frame {
         for (0..self.frames.items.len) |i| {
             const index = self.frames.items.len - 1 - i;
@@ -94,6 +123,8 @@ const Scope = struct {
                 return frame;
             }
         }
+
+        @panic("shouldn't happen <|:)-|--<");
     }
 
     pub fn declare(self: *Scope, allocator: Allocator, name: []const u8, result: Result, is_mutable: bool) Error!void {
@@ -106,7 +137,7 @@ pub const IRCompiler = struct {
     allocator: Allocator,
     script: *ast.Script,
     scopes: Scope = .init(),
-    data: IRData,
+    data: IRData = .init(),
     instructions: std.ArrayList(ir.Instruction) = .empty,
 
     pub fn init(allocator: Allocator, script: *ast.Script) @This() {
@@ -116,8 +147,8 @@ pub const IRCompiler = struct {
         };
     }
 
-    pub fn addData(self: *IRCompiler, data: []const u8) Error!ir.Location {
-        return self.data.addData(self.allocator, data);
+    pub fn addData(self: *IRCompiler, data: []const u8) Error!ir.Value {
+        return .fromLocation(try self.data.addData(self.allocator, data));
     }
 
     pub fn addInstruction(self: *IRCompiler, instruction: ir.Instruction) Error!void {
@@ -130,12 +161,16 @@ pub const IRCompiler = struct {
                 .data = try self.data.toOwnedSlice(self.allocator),
                 .instructions = try self.instructions.toOwnedSlice(self.allocator),
             },
+            .registers = .{},
         };
     }
 
     pub fn compile(self: *IRCompiler) Error!ir.IRContext {
+        try self.scopes.pushBindings(self.allocator);
+        defer self.scopes.popFrame();
+
         for (self.script.statements) |stmt| {
-            try self.compileStatement(stmt);
+            _ = try self.compileStatement(stmt);
         }
 
         return self.toIRContext();
@@ -143,18 +178,33 @@ pub const IRCompiler = struct {
 
     fn compileStatement(self: *IRCompiler, stmt: *ast.Statement) Error!Result {
         return switch (stmt.*) {
-            .type_binding_decl => {},
-            .binding_decl => |b| self.compileBindingDecl(b),
-            .expression => |expr| self.compileExpression(expr),
+            .type_binding_decl => .fromValue(.void),
+            .binding_decl => |*b| self.compileBindingDecl(.{ .stmt = stmt }, b),
+            .expression => |expr| self.compileExpression(expr.expression),
             else => Error.UnsupportedExpression,
         };
     }
 
-    fn compileBindingDecl(self: *IRCompiler, binding_decl: *ast.BindingDecl) Error!Result {
-        return self.compileBinding(binding_decl.pattern, binding_decl.initializer, binding_decl.is_mutable);
+    fn compileBindingDecl(
+        self: *IRCompiler,
+        source: ir.Instruction.Source,
+        binding_decl: *ast.BindingDecl,
+    ) Error!Result {
+        return self.compileBinding(
+            source,
+            binding_decl.pattern,
+            binding_decl.initializer,
+            binding_decl.is_mutable,
+        );
     }
 
-    fn compileBinding(self: *IRCompiler, pattern: *ast.BindingPattern, expr: *ast.Expression, is_mutable: bool) Error!Result {
+    fn compileBinding(
+        self: *IRCompiler,
+        source: ir.Instruction.Source,
+        pattern: *ast.BindingPattern,
+        expr: *ast.Expression,
+        is_mutable: bool,
+    ) Error!Result {
         return switch (pattern.*) {
             .discard => {
                 _ = try self.compileExpression(expr);
@@ -162,8 +212,13 @@ pub const IRCompiler = struct {
             },
             .identifier => |identifier| {
                 const result = try self.compileExpression(expr);
-                self.scopes.declare(identifier.name, result, is_mutable);
-                self.addInstruction(.init());
+                try self.scopes.declare(
+                    self.allocator,
+                    identifier.name,
+                    result,
+                    is_mutable,
+                );
+                try self.addInstruction(.init(source, .{ .push = result.value }));
                 return .fromValue(.void);
             },
             else => Error.UnsupportedBindingPattern,
@@ -179,9 +234,9 @@ pub const IRCompiler = struct {
 
     fn compileLiteral(self: *IRCompiler, literal: ast.Literal) Error!Result {
         return switch (literal) {
-            .integer => |integer| self.addData(integer.text),
-            .float => |float| self.addData(float.text),
-            .bool => |boolean| .fromValue(.{ .boolean = boolean }),
+            .integer => |integer| .fromValue(try self.addData(integer.text)),
+            .float => |float| .fromValue(try self.addData(float.text)),
+            .bool => |boolean| .fromValue(.{ .boolean = boolean.value }),
             .string => Error.UnsupportedLiteral,
             else => Error.UnsupportedLiteral,
         };

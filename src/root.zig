@@ -22,3 +22,4 @@ pub const semantic = @import("semantic/root.zig");
 pub const stream = @import("stream.zig");
 pub const closeable = @import("closeable.zig");
 pub const TraceWriter = @import("trace-writer.zig").TraceWriter;
+pub const ir = @import("ir.zig");

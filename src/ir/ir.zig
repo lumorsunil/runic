@@ -1,8 +1,26 @@
 const std = @import("std");
 const ast = @import("../frontend/ast.zig");
-const Value = @import("../interpreter/value.zig").Value;
+const ExitCode = @import("../runtime/command_runner.zig").ExitCode;
 
 pub const Register = enum { a, b, c, d };
+
+pub const Value = union(enum) {
+    void,
+    location: Location,
+    boolean: bool,
+
+    pub fn fromLocation(location: Location) @This() {
+        return .{ .location = location };
+    }
+
+    pub fn format(self: @This(), w: *std.Io.Writer) !void {
+        switch (self) {
+            .void => try w.writeAll("void"),
+            .location => |location| try w.print("{f}", .{location}),
+            inline else => |t| try w.print("{}", .{t}),
+        }
+    }
+};
 
 pub const ScopeLocation = []const u8;
 
@@ -22,6 +40,14 @@ pub const Location = union(enum) {
             return data[self.page][self.addr..end];
         }
     },
+
+    pub fn format(self: @This(), w: *std.Io.Writer) !void {
+        switch (self) {
+            .register => |r| try w.print("%{t}", .{r}),
+            .scope => |s| try w.print("@{s}", .{s}),
+            .data => |d| try w.print("#{}:{}", .{ d.page, d.addr }),
+        }
+    }
 };
 
 pub const IRReadOnly = struct {
@@ -31,7 +57,7 @@ pub const IRReadOnly = struct {
 
 pub const IRContext = struct {
     read_only: IRReadOnly,
-    registers: std.enums.EnumFieldStruct(Register, Value, null),
+    registers: std.enums.EnumFieldStruct(Register, Value, .void),
 };
 
 pub const Instruction = struct {
@@ -51,8 +77,12 @@ pub const Instruction = struct {
 
     pub const Type = union(enum) {
         /// pushes a new scope
-        push: Push,
+        push_scope: Push,
         /// pops a scope
+        pop_scope,
+        /// push a Value to the stack
+        push: Value,
+        /// pop a Value from the stack
         pop,
         /// performs arithmetic operation with a and b and stores the result into result
         ath: Ath,
@@ -64,6 +94,15 @@ pub const Instruction = struct {
         set: Set,
         /// spawns a process using argv, env map and cwd from scope
         call,
+        /// exits the process
+        exit: ExitCode,
+
+        pub fn format(self: @This(), w: *std.Io.Writer) !void {
+            switch (self) {
+                .push => |t| try w.print("{t} {f}", .{ self, t }),
+                else => try w.print("{t}", .{self}),
+            }
+        }
     };
 
     pub fn init(source: Source, type_: Type) @This() {
@@ -102,4 +141,8 @@ pub const Instruction = struct {
     pub const Cmp = BinaryOperation(CmpOp);
     pub const LogOp = enum { nd, r, n };
     pub const Log = BinaryOperation(LogOp);
+
+    pub fn format(self: @This(), w: *std.Io.Writer) !void {
+        try w.print("{f}", .{self.type});
+    }
 };
