@@ -1,0 +1,12 @@
+var s = "hello"
+s += "something else"
+inspect s
+var x = 4.54
+var y = 2.456
+inspect x
+x *= y
+inspect x
+x /= y
+inspect x
+x %= 2
+inspect x

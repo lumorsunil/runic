@@ -7,6 +7,7 @@ const RCInitOptions = @import("../mem/root.zig").RCInitOptions;
 const rainbow = @import("../rainbow.zig");
 const ReaderWriterStream = @import("../stream.zig").ReaderWriterStream;
 const CloseableProcessIo = @import("../process.zig").CloseableProcessIo;
+const ExitCode = @import("../runtime/command_runner.zig").ExitCode;
 
 const prefix_color = rainbow.beginColor(.violet);
 const end_color = rainbow.endColor();
@@ -182,9 +183,9 @@ pub const ScopeStack = struct {
                 .forward_context => {},
                 .blocking => {},
                 .cwd => |string| try writer.print("cwd: {f}\n", .{string}),
-                .env_map => try writer.print("<env_map>", .{}),
-                .allocating => |allocating| try writer.print("<allocating: {} pointers>", .{allocating.pointers.items.len}),
-                .processes => |processes| try writer.print("<processes: {} children>", .{processes.processes.count()}),
+                .env_map => try writer.print("<env_map>\n", .{}),
+                .allocating => |allocating| try writer.print("<allocating: {} pointers>\n", .{allocating.pointers.items.len}),
+                .processes => |processes| try writer.print("<processes: {} children>\n", .{processes.processes.count()}),
             }
         }
 
@@ -201,6 +202,29 @@ pub const ScopeStack = struct {
             }
 
             return env_map;
+        }
+    };
+
+    pub const DeallocationUnit = union(enum) {
+        pipeline: Pipeline,
+
+        pub const Pipeline = struct {
+            pipes: []*ReaderWriterStream,
+
+            pub fn init(pipes: []*ReaderWriterStream) Pipeline {
+                return .{ .pipes = pipes };
+            }
+
+            pub fn deinit(self: Pipeline, allocator: std.mem.Allocator) void {
+                for (self.pipes) |pipe| pipe.stream.deinit();
+                allocator.free(self.pipes);
+            }
+        };
+
+        pub fn deinit(self: *DeallocationUnit, allocator: std.mem.Allocator) void {
+            switch (self.*) {
+                inline else => |*d| d.deinit(allocator),
+            }
         }
     };
 
@@ -279,6 +303,7 @@ pub const ScopeStack = struct {
     pub const Allocating = struct {
         allocator: std.mem.Allocator,
         pointers: std.ArrayList([]u8) = .empty,
+        deallocations: std.ArrayList(DeallocationUnit) = .empty,
 
         pub fn init(allocator: std.mem.Allocator) @This() {
             return .{ .allocator = allocator };
@@ -287,6 +312,7 @@ pub const ScopeStack = struct {
         pub fn deinit(self: *@This()) void {
             for (self.pointers.items) |ptr| self.allocator.free(ptr);
             self.pointers.deinit(self.allocator);
+            for (self.deallocations.items) |*dealloc| dealloc.deinit(self.allocator);
         }
     };
 
@@ -342,10 +368,9 @@ pub const ScopeStack = struct {
             return process_io;
         }
 
-        pub fn getTerm(self: *@This(), id: std.process.Child.Id) ?std.process.Child.Term {
+        pub fn getExitCode(self: *@This(), id: std.process.Child.Id) ?ExitCode {
             const child = self.processes.get(id) orelse return null;
-            const term = child.term orelse return null;
-            return if (term) |t| t else |_| null;
+            return child.process_closeable.closeable.getResult();
         }
     };
 
@@ -565,6 +590,10 @@ pub const ScopeStack = struct {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.log("{s}:{s}({}) : {s}", .{ label, @src().fn_name, self.frames.items.len, @tagName(frame) });
         try self.frames.append(self.allocator, frame);
+    }
+
+    pub fn pushBlocking(self: *ScopeStack, label: []const u8) Error!void {
+        try self.pushFrame(label, .blocking);
     }
 
     pub fn pushFrameForwarding(
@@ -792,7 +821,7 @@ pub const ScopeStack = struct {
         try writer.writeAll(" = ");
 
         switch (value.*) {
-            .integer, .float, .boolean, .range, .void, .array, .scope, .stream, .process, .execution, .exit_code => try writer.print("{f}", .{value.*}),
+            .integer, .float, .boolean, .range, .void, .array, .scope, .stream, .process, .execution, .exit_code, .pipeline => try writer.print("{f}", .{value.*}),
             .string => |string_ref| {
                 const string = try string_ref.get();
                 try writer.print("\"{s}{s}\"", .{
@@ -1040,6 +1069,16 @@ pub const ScopeStack = struct {
         const frame = try self.currentFrameByTag(.processes);
         try frame.processes.wait();
         return &frame.processes;
+    }
+
+    pub fn addDeallocation(self: *ScopeStack, deallocation: DeallocationUnit) !void {
+        const frame = try self.currentFrameByTag(.allocating);
+        try frame.allocating.deallocations.append(self.allocator, deallocation);
+    }
+
+    pub fn getChildExitCode(self: *ScopeStack, pid: std.process.Child.Id) !?ExitCode {
+        const frame = try self.currentFrameByTag(.processes);
+        return frame.processes.getExitCode(pid);
     }
 };
 

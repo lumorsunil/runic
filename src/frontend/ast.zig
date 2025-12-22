@@ -28,7 +28,7 @@ pub const Identifier = struct {
         _: std.mem.Allocator,
         scope: *semantic.Scope,
     ) ?*const TypeExpr {
-        const binding = scope.lookup(self.name) orelse return null;
+        const binding = scope.lookup(self.name) orelse return &TypeExpr.executableType;
         return binding.type_expr;
     }
 };
@@ -137,6 +137,7 @@ pub const TypeExpr = union(enum) {
     float: PrimitiveType,
     boolean: PrimitiveType,
     byte: PrimitiveType,
+    execution: PrimitiveType,
     failed: FailedType,
     // lazy: LazyType,
 
@@ -271,6 +272,7 @@ pub const TypeExpr = union(enum) {
 
     pub const FunctionType = struct {
         params: Parameters,
+        stdin_type: ?*const TypeExpr,
         return_type: ?*const TypeExpr,
         span: Span,
 
@@ -403,9 +405,32 @@ pub const TypeExpr = union(enum) {
             .byte => {
                 try writer.writeAll("Byte");
             },
+            .execution => {
+                try writer.writeAll("Execution");
+            },
             inline else => |s| try s.format(writer),
         }
     }
+
+    const globalByteType = TypeExpr{
+        .byte = .{ .span = .global },
+    };
+    const globalStringType = TypeExpr{
+        .array = .{ .element = &globalByteType, .span = .global },
+    };
+    const executableParameterType = globalStringType;
+    const executableReturnType = TypeExpr{
+        .execution = .{ .span = .global },
+    };
+    pub const executableType = TypeExpr{
+        .function = .{
+            .params = .variadic(&executableParameterType),
+            // TODO: implement
+            .stdin_type = null,
+            .return_type = &executableReturnType,
+            .span = .global,
+        },
+    };
 };
 
 /// StringLiteral supports interpolation segments so command arguments and
@@ -554,6 +579,17 @@ pub const Expression = union(enum) {
     ) semantic.Scope.Error!?*const TypeExpr {
         return switch (self.*) {
             inline else => |*expr| expr.resolveType(allocator, scope),
+        };
+    }
+
+    pub fn isReference(self: *@This()) bool {
+        return switch (self.*) {
+            .identifier, .member => true,
+            .binary => |binary| switch (binary.op) {
+                .member => true,
+                else => false,
+            },
+            else => false,
         };
     }
 };
@@ -705,6 +741,12 @@ pub const BinaryOp = enum {
     pipe,
     apply,
     member,
+    assign,
+    add_assign,
+    minus_assign,
+    mul_assign,
+    div_assign,
+    rem_assign,
 
     pub fn precedence(self: BinaryOp) usize {
         return switch (self) {
@@ -724,6 +766,12 @@ pub const BinaryOp = enum {
             .pipe => 50,
             .apply => 70,
             .member => 90,
+            .assign => 0,
+            .add_assign => 0,
+            .minus_assign => 0,
+            .mul_assign => 0,
+            .div_assign => 0,
+            .rem_assign => 0,
         };
     }
 
@@ -744,6 +792,12 @@ pub const BinaryOp = enum {
             .equal_equal => .equal,
             .pipe => .pipe,
             .dot => .member,
+            .assign => .assign,
+            .plus_assign => .add_assign,
+            .minus_assign => .minus_assign,
+            .mul_assign => .mul_assign,
+            .div_assign => .div_assign,
+            .rem_assign => .rem_assign,
             else => null,
         };
     }
@@ -752,6 +806,24 @@ pub const BinaryOp = enum {
         return switch (self) {
             .pipe => true,
             else => false,
+        };
+    }
+
+    pub fn isAssignment(self: @This()) bool {
+        return switch (self) {
+            .assign, .add_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign => true,
+            else => false,
+        };
+    }
+
+    pub fn unwrapAssign(self: @This()) @This() {
+        return switch (self) {
+            .add_assign => .add,
+            .minus_assign => .subtract,
+            .mul_assign => .multiply,
+            .div_assign => .divide,
+            .rem_assign => .remainder,
+            else => @panic("shouldn't happen <|:)-|--<"),
         };
     }
 };
@@ -1182,6 +1254,7 @@ pub const FunctionDecl = struct {
 
         fn_type.* = .{ .function = .{
             .params = params_types,
+            .stdin_type = self.stdin_type,
             .return_type = self.return_type,
             .span = self.span,
         } };
@@ -1262,7 +1335,7 @@ pub const ReturnStmt = struct {
 pub const ForExpr = struct {
     sources: []const *Expression,
     capture: CaptureClause,
-    body: Block,
+    body: *Expression,
     span: Span,
 
     pub fn resolveType(

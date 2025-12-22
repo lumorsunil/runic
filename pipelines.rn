@@ -1,0 +1,6 @@
+echo "only one process"
+const s = printf "binding to one process"
+echo "s = ${s}"
+const s2 = printf "binding to pipeline" | cat
+echo "s2 = ${s2}"
+echo "pipeline without binding" | cat

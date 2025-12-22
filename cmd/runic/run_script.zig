@@ -11,6 +11,14 @@ const ast = runic.ast;
 const Stream = runic.stream.Stream;
 const closeable = runic.closeable;
 const ExitCode = runic.command_runner.ExitCode;
+const TraceWriter = runic.TraceWriter;
+
+const log_enabled = false;
+
+fn log(comptime fmt: []const u8, args: anytype) void {
+    if (!log_enabled) return;
+    std.log.debug(fmt, args);
+}
 
 pub fn runScript(
     allocator: Allocator,
@@ -92,28 +100,33 @@ pub fn runScript(
     const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(cwd);
 
-    const stdout_stream = try Stream(u8).initReaderWriter(allocator, "<<<stdout>>>");
+    const stdout_stream = try Stream(u8).initReaderWriter(allocator, "<<<stdout_pipe>>>");
     defer stdout_stream.stream.deinit();
-    const stderr_stream = try Stream(u8).initReaderWriter(allocator, "<<<stderr>>>");
+    const stderr_stream = try Stream(u8).initReaderWriter(allocator, "<<<stderr_pipe>>>");
     defer stderr_stream.stream.deinit();
 
-    var stdout_closeable = closeable.NeverCloses(ExitCode){};
-    var stderr_closeable = closeable.NeverCloses(ExitCode){};
+    var stdout_closeable = closeable.NeverCloses(ExitCode){ .label = "<<<stdout>>>" };
+    var stderr_closeable = closeable.NeverCloses(ExitCode){ .label = "<<<stderr>>>" };
+
+    var wrapped_stdout_buffer: [1024]u8 = undefined;
+    var wrapped_stderr_buffer: [1024]u8 = undefined;
+    var wrapped_stdout = TraceWriter.init(&wrapped_stdout_buffer, stdout, "<<<t_stdout>>>");
+    var wrapped_stderr = TraceWriter.init(&wrapped_stderr_buffer, stderr, "<<<t_stderr>>>");
 
     const stdout_closeable_writer = closeable.CloseableWriter(ExitCode).init(
-        stdout,
+        &wrapped_stdout.writer,
         &stdout_closeable.closeable,
     );
     const stderr_closeable_writer = closeable.CloseableWriter(ExitCode).init(
-        stderr,
+        &wrapped_stderr.writer,
         &stderr_closeable.closeable,
     );
 
     try stdout_stream.connectDestination(stdout_closeable_writer);
     try stderr_stream.connectDestination(stderr_closeable_writer);
 
-    // std.log.debug("stdout >>> {*}", .{stdout});
-    // std.log.debug("stderr >>> {*}", .{stderr});
+    log("stdout >>> {*}", .{&wrapped_stdout.writer});
+    log("stderr >>> {*}", .{&wrapped_stderr.writer});
 
     const executeOptions = ScriptExecutor.ExecuteOptions.init(
         script.path,
@@ -321,7 +334,7 @@ const StatementExpressionIterator = struct {
             },
             .assignment => |assignment| try cursor.appendExpr(assignment.expr),
             .for_expr => |for_expr| {
-                try self.cursor.appendStatements(for_expr.body.statements);
+                try cursor.appendExpr(for_expr.body);
                 try self.cursor.appendExpressions(for_expr.sources);
             },
             .executable => {},
