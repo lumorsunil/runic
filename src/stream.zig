@@ -529,6 +529,10 @@ pub const ReaderWriterStream = struct {
 
         return .not_done;
     }
+
+    pub fn disconnectSource(self: *ReaderWriterStream) void {
+        self.source = null;
+    }
 };
 
 // fn ByteTransformerStream(comptime T: type) type {

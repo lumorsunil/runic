@@ -186,11 +186,13 @@ pub const ScriptExecutor = struct {
         span: ast.Span,
         err: anyerror,
     ) !void {
-        _ = self;
         try stderr.print(
             "{s}:{d}:{d}: script execution error: {s}\n",
             .{ script_path, span.start.line, span.start.column, @errorName(err) },
         );
+        self.evaluator.logging_enabled = true;
+        defer self.evaluator.logging_enabled = false;
+        try self.evaluator.logEvaluateSpan(span);
     }
 
     fn renderExitCodeError(

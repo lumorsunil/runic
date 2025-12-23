@@ -470,6 +470,8 @@ pub const Evaluator = struct {
             for (done) |d| if (!d) continue :outer;
             break;
         }
+
+        for (pipes) |pipe| if (pipe) |p| p.disconnectSource();
     }
 
     fn forwardPipe(self: *Evaluator, pipe: ?*ReaderWriterStream) Error!void {
@@ -554,8 +556,6 @@ pub const Evaluator = struct {
 
         errdefer value.deinit();
 
-        // TODO: if the value is a function ref, add it to the closure of the function?
-
         try bindPattern(scopes, decl.pattern.*, decl.is_mutable, &value);
     }
 
@@ -609,6 +609,12 @@ pub const Evaluator = struct {
                 const processes = try scopes.wait();
                 const exit_code = processes.getExitCode(process);
                 (try execution_result.getPtr()).exit_code = exit_code;
+                value.* = .{ .execution = execution_result };
+            },
+            .scope => |scope_ref| {
+                const execution_result = try self.captureOutput(scopes, .dontForwardPipes());
+                (try execution_result.getPtr()).scope = scope_ref;
+                // TODO: what about the exit code
                 value.* = .{ .execution = execution_result };
             },
             else => return,
@@ -703,7 +709,7 @@ pub const Evaluator = struct {
         try self.logEvaluateSpan(expr.span());
     }
 
-    fn logEvaluateSpan(self: *Evaluator, span: ast.Span) !void {
+    pub fn logEvaluateSpan(self: *Evaluator, span: ast.Span) !void {
         if (@hasField(@This(), "logging_enabled")) {
             if (!self.logging_enabled) return;
         }
@@ -885,12 +891,9 @@ pub const Evaluator = struct {
             }
         }
 
-        try scopes.popFrame(
-            @src().fn_name,
-        );
+        const scope_ref = try scopes.detach(1);
 
-        // TODO: change this to be an execution result
-        return .void;
+        return .{ .scope = scope_ref };
     }
 
     // TODO: change this to run the module as a function?
@@ -1229,13 +1232,33 @@ pub const Evaluator = struct {
             },
             .logical_and => {
                 var left = try self.evaluateExpression(scopes, binary.left);
-                var right = try self.evaluateExpression(scopes, binary.right);
 
                 defer left.deinit();
-                defer right.deinit();
 
-                if (left == .boolean and right == .boolean) {
-                    return .{ .boolean = left.boolean and right.boolean };
+                if (left == .boolean) {
+                    if (!left.boolean) {
+                        return .{ .boolean = false };
+                    } else {
+                        return try self.evaluateExpression(scopes, binary.right);
+                    }
+                } else if (left == .pipeline) {
+                    // TODO: find out why we get UnsupportedBinaryExpr from and_or.rn
+                    const exit_code = try self.consumePipeline(left.pipeline) orelse return error.UnsupportedBinaryExpr;
+
+                    if (exit_code == .success) {
+                        return try self.evaluateExpression(scopes, binary.right);
+                    } else {
+                        return .{ .exit_code = exit_code };
+                    }
+                } else if (left == .process) {
+                    try self.forwardOutput(scopes);
+                    const exit_code = (try scopes.waitChild(left.process)).?;
+
+                    if (exit_code == .success) {
+                        return try self.evaluateExpression(scopes, binary.right);
+                    } else {
+                        return .{ .exit_code = exit_code };
+                    }
                 }
             },
             .logical_or => {
@@ -1463,6 +1486,10 @@ pub const Evaluator = struct {
             }
 
             break;
+        }
+
+        for (pipeline.stdout_pipes) |pipe| {
+            pipe.disconnectSource();
         }
 
         return self.getPipelineExitCode(pipeline_ref);
@@ -2178,7 +2205,7 @@ pub const Evaluator = struct {
     fn materializeString(self: *Evaluator, value: Value) Error!Value.String {
         return switch (value) {
             .string => |ref| try ref.ref(.{}),
-            .boolean => |flag| try .dupe(self.allocator, if (flag) "1" else "0", .{}),
+            .boolean => |flag| try .dupe(self.allocator, if (flag) "0" else "1", .{}),
             .integer => |int| try .print(self.allocator, "{}", .{int}, .{}),
             .float => |flt| try .print(self.allocator, "{}", .{flt}, .{}),
             .stream => |s| {

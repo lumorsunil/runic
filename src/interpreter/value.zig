@@ -88,10 +88,14 @@ pub const Value = union(enum) {
         stdout: Value.String,
         stderr: Value.String,
         exit_code: ?ExitCode,
+        scope: ?ScopeRef = null,
 
         pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
             self.stdout.deinit(.{});
             self.stderr.deinit(.{});
+            if (self.scope) |*scope_ref| scope_ref.deinit(.{
+                .deinit_child_fn = .withoutAllocator(ScopeStack.deinit),
+            });
             allocator.destroy(self);
         }
     };
@@ -177,6 +181,7 @@ pub const Value = union(enum) {
                 const inner = try clone_.getPtr();
                 inner.stdout = try inner.stdout.ref(options);
                 inner.stderr = try inner.stderr.ref(options);
+                if (inner.scope) |scope_ref| inner.scope = try scope_ref.ref(options);
                 break :brk clone_;
             } },
             // TODO: implement error values

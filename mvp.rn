@@ -1,6 +1,6 @@
 // basic echo and pipeline
 echo "hello, world!"
-"without newline..."
+printf "without newline..."
 echo "hello cat!" | cat
 
 // if blocks
@@ -60,6 +60,23 @@ my_var_int /= 2
 echo "my_var_int /= 2 = ${my_var_int}"
 my_var_int %= 2
 echo "my_var_int %= 2 = ${my_var_int}"
+
+// booleans
+printf "\nbooleans\n\n"
+const and_table = {
+  echo "and table | true | false"
+  echo "true | ${true and true} | ${true and false}"
+  echo "false | ${false and true} | ${false and false}"
+}
+echo "${and_table}" | column "-t" "-s" "|"
+echo ""
+const or_table = {
+  echo "or table | true | false"
+  echo "true | ${true or true} | ${true or false}"
+  echo "false | ${false or true} | ${false or false}"
+}
+echo "${or_table}" | column "-t" "-s" "|"
+echo ""
 
 // arrays
 const my_array = .{ "one", "two", "three" }

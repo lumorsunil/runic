@@ -109,7 +109,6 @@ pub const ScopeStack = struct {
                 .allocating => |*allocating| allocating.deinit(),
                 .processes => |*processes| processes.deinit(),
             }
-            self.* = undefined;
         }
 
         fn deinitMain(
@@ -372,6 +371,11 @@ pub const ScopeStack = struct {
             const child = self.processes.get(id) orelse return null;
             return child.process_closeable.closeable.getResult();
         }
+
+        pub fn waitChild(self: *@This(), id: std.process.Child.Id) !?ExitCode {
+            const child = self.processes.get(id) orelse return null;
+            return child.process_closeable.closeable.getResult() orelse .fromTerm(try child.process.wait());
+        }
     };
 
     const Binding = union(enum) {
@@ -540,7 +544,6 @@ pub const ScopeStack = struct {
     pub fn deinitChild(self: *ScopeStack) void {
         self.deinitChildNoDestroySelf();
         self.allocator.destroy(self);
-        self.* = undefined;
     }
 
     pub fn deinitChildNoDestroySelf(self: *ScopeStack) void {
@@ -1079,6 +1082,11 @@ pub const ScopeStack = struct {
     pub fn getChildExitCode(self: *ScopeStack, pid: std.process.Child.Id) !?ExitCode {
         const frame = try self.currentFrameByTag(.processes);
         return frame.processes.getExitCode(pid);
+    }
+
+    pub fn waitChild(self: *ScopeStack, pid: std.process.Child.Id) !?ExitCode {
+        const frame = try self.currentFrameByTag(.processes);
+        return frame.processes.waitChild(pid);
     }
 };
 

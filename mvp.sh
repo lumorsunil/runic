@@ -4,14 +4,14 @@ printf "without newline..."
 echo "hello cat!" | cat
 
 # if blocks
-if [ -n "1" ]; then
+if true; then
   echo "true"
 else
   echo "false"
 fi
 
 # if inline
-if [ -n "1" ]; then echo "true"; else echo "false"; fi
+if true; then echo "true"; else echo "false"; fi
 
 # for loop
 for i in {0..9}; do
@@ -30,7 +30,8 @@ hello "I'm runic."
 
 # bindings
 declare -r string_ex="this is an example string"
-declare -r echo_result="$(echo "$string_ex")"
+# shellcheck disable=SC2155
+declare -r echo_result="$(printf "%s" "$string_ex")"
 echo "$echo_result"
 
 # integers
@@ -59,13 +60,37 @@ echo "my_var_int /= 2 = $my_var_int"
 ((my_var_int%=2))
 echo "my_var_int %= 2 = $my_var_int"
 
+# booleans
+printf "\nbooleans\n\n"
+
+bool_to_str() {
+    echo $?
+}
+
+and_table=$(cat << EOF
+and table | true | false
+true | $(true && true; echo $?) | $(true && false; echo $?)
+false | $(false && true; echo $?) | $(false && false; echo $?)
+EOF
+)
+echo "$and_table" | column "-t" "-s" "|"
+echo ""
+or_table=$(cat << EOF
+or table | true | false
+true | $(true || true; echo $?) | $(true || false; echo $?)
+false | $(false || true; echo $?) | $(false || false; echo $?)
+EOF
+)
+echo "${or_table}" | column "-t" "-s" "|"
+echo ""
+
 # arrays
 my_array=("one" "two" "three")
-for item in ${my_array[@]}; do
+for item in "${my_array[@]}"; do
     echo "$item"
 done
 
-for i in ${!my_array[@]}; do
+for i in "${!my_array[@]}"; do
     echo "$i: ${my_array[$i]}"
 done
 

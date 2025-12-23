@@ -42,7 +42,17 @@
 
 - [x] (re-)assignment
 - [x] arithmetic
-- [ ] assignment modifiers (+=, -=, \*=, /=)
+- [x] assignment modifiers (+=, -=, \*=, /=, %=)
+- [ ] more assignment modifiers (||=, &&=)
+- [ ] more binary operators
+  - [ ] \*\* (exponentation)
+  - [ ] << (bit shift left)
+  - [ ] \>> (bit shift right)
+  - [ ] & (bitwise and)
+  - [ ] | (bitwise or)
+  - [ ] ^ (bitwise xor)
+- [ ] unary operators
+  - [ ] ~ (bitwise negation)
 - [x] boolean algebra
 - [x] comparisons (numeric)
 - [x] string concatenation
