@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const runic = @import("runic");
 const ir = runic.ir;
 const ast = runic.ast;
+const ExitCode = runic.command_runner.ExitCode;
 
 pub const IRRunner = struct {
     allocator: Allocator,
@@ -19,14 +20,25 @@ pub const IRRunner = struct {
         var compiler = ir.compiler.IRCompiler.init(self.allocator, self.script);
         return compiler.compile();
     }
+
+    pub fn run(self: *IRRunner, context: *ir.IR.IRContext) !ExitCode {
+        var evaluator = ir.evaluator.IREvaluator.init(self.allocator, context);
+
+        while (try evaluator.step()) |result| switch (result) {
+            .cont => continue,
+            .exit => |exit_code| return exit_code,
+        };
+
+        return .success;
+    }
 };
 
-pub fn runIR(allocator: Allocator, script: *ast.Script) !void {
+pub fn runIR(allocator: Allocator, script: *ast.Script) !ExitCode {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const arena_allocator = arena.allocator();
     var runner = IRRunner.init(arena_allocator, script);
-    const context = try runner.compile();
+    var context = try runner.compile();
 
     std.log.debug("IR Compilation Results", .{});
 
@@ -40,4 +52,8 @@ pub fn runIR(allocator: Allocator, script: *ast.Script) !void {
     for (context.read_only.instructions, 0..) |instr, i| {
         std.log.debug("{}: {f}", .{ i, instr });
     }
+
+    std.log.debug("Running...", .{});
+
+    return runner.run(&context);
 }

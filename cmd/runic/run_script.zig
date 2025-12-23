@@ -83,8 +83,7 @@ pub fn runScript(
     }
 
     if (config.enable_ir) {
-        try ir.runner.runIR(allocator, &entryDocument.ast.?);
-        return .success;
+        return ir.runner.runIR(allocator, &entryDocument.ast.?);
     }
 
     if (!config.skip_type_check) {

@@ -1526,6 +1526,11 @@ pub const Parser = struct {
             return stmt;
         }
 
+        if (try self.parseMaybeReturn()) |return_stmt| {
+            stmt.* = .{ .return_stmt = return_stmt };
+            return stmt;
+        }
+
         const expr = try self.parseExpression();
         const expr_span = expr.span();
         stmt.* = .{
@@ -1878,6 +1883,39 @@ pub const Parser = struct {
             .annotation = annotation,
             .initializer = initializer,
             .pattern = pattern,
+        };
+    }
+
+    fn parseMaybeReturn(self: *Self) Error!?ast.ReturnStmt {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const next = try self.peekToken();
+        return switch (next.tag) {
+            .kw_return => try self.parseReturn(),
+            else => null,
+        };
+    }
+
+    fn parseReturn(self: *Self) Error!ast.ReturnStmt {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const start = try self.expectTokenTag(.kw_return);
+        const next = try self.peekToken();
+
+        if (isExprTerminator(next.tag)) {
+            return .{
+                .value = null,
+                .span = start.span,
+            };
+        }
+
+        const value = try self.parseExpression();
+
+        return .{
+            .value = value,
+            .span = start.span.endAt(value.span()),
         };
     }
 

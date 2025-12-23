@@ -1,1 +1,3 @@
 const s = 5
+echo "hello"
+return 0
