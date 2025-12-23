@@ -6,8 +6,6 @@ const rainbow = @import("../rainbow.zig");
 const mem = @import("../mem/root.zig");
 const DocumentStore = @import("../document_store.zig").DocumentStore;
 
-pub const module_parser = @import("module_parser_deprecated.zig");
-
 pub const Error = error{
     UnexpectedToken,
     UnexpectedEOF,
@@ -586,14 +584,17 @@ pub const Parser = struct {
         literal: BinaryComponentLiteral,
         expr: *ast.Expression,
 
+        pub const Chirality = enum { left, right };
+
         pub fn toExpression(
             self: BinaryComponent,
             parser: *Self,
             op: ?ast.BinaryOp,
+            chirality: Chirality,
         ) Error!*ast.Expression {
             return try switch (self) {
                 .expr => |expr| expr,
-                .identifier => |identifier| self.toIdentifierExpression(parser, identifier, op),
+                .identifier => |identifier| self.toIdentifierExpression(parser, identifier, op, chirality),
                 .literal => |literal| literal.toExpression(parser),
                 .op => @panic("shouldn't happen :)"),
             };
@@ -604,8 +605,11 @@ pub const Parser = struct {
             parser: *Self,
             identifier: ast.Identifier,
             op: ?ast.BinaryOp,
+            chirality: Chirality,
         ) Error!*ast.Expression {
             if (op == .member) {
+                return parser.allocExpression(.{ .identifier = identifier });
+            } else if (op != null and op.?.isAssignment() and chirality == .left) {
                 return parser.allocExpression(.{ .identifier = identifier });
             } else {
                 return parser.allocExpression(.{
@@ -710,6 +714,21 @@ pub const Parser = struct {
         }
     };
 
+    // a + b * 2 + 4
+    //
+    // components = [a, +, b, *, 2, +, 4]
+    //
+    // for each binary operator (+, *):
+    //   1. find lowest precedence operator (LPO)
+    //   2. group components between the LPO
+    //         [(a), +, (b, *, 2), +, (4)]
+    //   3. define mutable LHS: BinaryExpression
+    //   parse binary expression:
+    //     1. is length == 1 ? then return component
+    //     2. is length == 3 ? then return binary expr
+    //     3. take 3, store in LHS
+    //         [((a), +, (b, *, 2)), +, (4)]
+
     fn parseMaybeBinaryExpression(self: *Self) Error!?*ast.Expression {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
@@ -772,7 +791,7 @@ pub const Parser = struct {
                 },
                 .op => {
                     switch (next.tag) {
-                        .equal_equal, .bang_equal, .greater, .greater_equal, .less, .less_equal, .plus, .minus, .star, .slash, .percent, .kw_and, .kw_or, .pipe, .dot => {
+                        .equal_equal, .bang_equal, .greater, .greater_equal, .less, .less_equal, .plus, .minus, .star, .slash, .percent, .kw_and, .kw_or, .pipe_pipe, .amp_amp, .pipe, .dot, .assign, .plus_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign => {
                             const breadcrumbInner = try self.createBreadcrumb("PBE:op");
                             defer breadcrumbInner.end();
                             try components.append(self.allocator, .{
@@ -816,7 +835,7 @@ pub const Parser = struct {
         //     }
         // }
 
-        return self.parseBinaryExpression(components.items);
+        return self.parseBinaryExpression(components.items, null, .left);
     }
 
     // f a b c ==> (((f a) b) c) ==> (f a b c)
@@ -874,21 +893,23 @@ pub const Parser = struct {
     fn parseBinaryExpression(
         self: *Self,
         components: []const BinaryComponent,
+        op: ?ast.BinaryOp,
+        chirality: BinaryComponent.Chirality,
     ) Error!*ast.Expression {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
-        if (components.len == 1) return try components[0].toExpression(self, null);
+        if (components.len == 1) return try components[0].toExpression(self, op, chirality);
 
         if (components.len == 3) {
-            const op = components[1].op.payload;
+            const op_ = components[1].op.payload;
 
             return try self.allocExpression(
                 try self.flattenBinaryExpression(
                     try self.initBinaryExpression(
-                        try components[0].toExpression(self, op),
-                        op,
-                        try components[2].toExpression(self, op),
+                        try components[0].toExpression(self, op_, .left),
+                        op_,
+                        try components[2].toExpression(self, op_, .right),
                         components[0].span().endAt(components[2].span()),
                     ),
                 ),
@@ -898,8 +919,8 @@ pub const Parser = struct {
         var lowest_precedence: usize = std.math.maxInt(usize);
         for (components) |item| {
             switch (item) {
-                .op => |op| lowest_precedence = @min(
-                    op.payload.precedence(),
+                .op => |op_| lowest_precedence = @min(
+                    op_.payload.precedence(),
                     lowest_precedence,
                 ),
                 else => continue,
@@ -911,7 +932,7 @@ pub const Parser = struct {
 
             pub fn isDelimiter(ctx: @This(), component: BinaryComponent) bool {
                 return switch (component) {
-                    .op => |op| op.payload.precedence() == ctx.lowest_precedence,
+                    .op => |op_| op_.payload.precedence() == ctx.lowest_precedence,
                     else => false,
                 };
             }
@@ -926,18 +947,18 @@ pub const Parser = struct {
             DelimiterFn.isDelimiter,
         );
         const first_components = it.next().?;
-        var lhs: *ast.Expression = try self.parseBinaryExpression(first_components);
         var i: usize = first_components.len + 1;
+        const op_ = components[i - 1].op.payload;
+        var lhs: *ast.Expression = try self.parseBinaryExpression(first_components, op_, .left);
 
         while (it.next()) |sub_components| {
-            const right = try self.parseBinaryExpression(sub_components);
-            const op = components[i - 1].op.payload;
+            const right = try self.parseBinaryExpression(sub_components, op_, .right);
 
             lhs = try self.allocExpression(
                 try self.flattenBinaryExpression(
                     try self.initBinaryExpression(
                         lhs,
-                        op,
+                        op_,
                         right,
                         lhs.span().endAt(right.span()),
                     ),
@@ -986,6 +1007,13 @@ pub const Parser = struct {
                 right.span(),
                 "expected identifier after member access operator",
                 .{},
+            );
+        } else if (op.isAssignment() and !left.isReference()) {
+            try self.reportParseError(
+                Error.UnexpectedToken,
+                left.span(),
+                "expected reference before assignment operator, actual: {t}",
+                .{left.*},
             );
         }
 
@@ -1126,9 +1154,9 @@ pub const Parser = struct {
         defer breadcrumb.end();
 
         const if_tok = try self.expect(.kw_if);
-        // _ = try self.expect(.l_paren);
+        _ = try self.expect(.l_paren);
         const condition = try self.parseExpression();
-        // _ = try self.expect(.r_paren);
+        _ = try self.expect(.r_paren);
         const capture = try self.parseOptionalCaptureClause();
         // const then_block = try self.parseBlock();
         const then_expr = try self.parseExpression();
@@ -1180,14 +1208,14 @@ pub const Parser = struct {
 
         if (capture.bindings.len != sources.len) return Error.ForCapturesMustMatchSources;
 
-        const body = try self.parseBlock();
+        const body = try self.parseExpression();
 
         return self.allocExpression(.{
             .for_expr = .{
                 .sources = sources,
                 .capture = capture,
                 .body = body,
-                .span = for_tok.span.endAt(body.span),
+                .span = for_tok.span.endAt(body.span()),
             },
         });
     }
@@ -1754,7 +1782,10 @@ pub const Parser = struct {
                     try self.log("appending string text: \"{s}\"", .{tok.lexeme});
                     try segments.append(
                         self.allocator,
-                        .{ .text = .{ .payload = tok.lexeme, .span = tok.span } },
+                        .{ .text = .{
+                            .payload = try self.decodeString(tok.lexeme),
+                            .span = tok.span,
+                        } },
                     );
                 },
                 .string_interp_start => {
@@ -1774,6 +1805,10 @@ pub const Parser = struct {
             .segments = try self.copyToArena(ast.StringLiteral.Segment, segments.items),
             .span = start_token.span.endAt(end.span),
         };
+    }
+
+    fn decodeString(self: *Self, string: []const u8) Error![]const u8 {
+        return std.mem.replaceOwned(u8, self.arena.allocator(), string, "\\$", "$");
     }
 
     fn parseStringLiteralExpr(self: *Self) Error!*ast.Expression {

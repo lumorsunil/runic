@@ -9,6 +9,7 @@ pub fn Closeable(comptime T: type) type {
         pub const VTable = struct {
             close: *const fn (*Self) T,
             getResult: *const fn (*Self) ?T,
+            getLabel: *const fn (*Self) []const u8,
         };
 
         pub fn close(self: *@This()) T {
@@ -17,6 +18,10 @@ pub fn Closeable(comptime T: type) type {
 
         pub fn getResult(self: *@This()) ?T {
             return self.vtable.getResult(self);
+        }
+
+        pub fn getLabel(self: *@This()) []const u8 {
+            return self.vtable.getLabel(self);
         }
 
         pub fn isClosed(self: *@This()) bool {
@@ -33,6 +38,7 @@ pub fn ManualCloseable(comptime T: type) type {
         const vtable = Closeable(T).VTable{
             .close = close,
             .getResult = getResult,
+            .getLabel = getLabel,
         };
 
         fn close(self: *Closeable(T)) T {
@@ -49,6 +55,11 @@ pub fn ManualCloseable(comptime T: type) type {
         pub fn setResult(self: *@This(), result: T) void {
             self.result = result;
             _ = self.closeable.close();
+        }
+
+        pub fn getLabel(self: *Closeable(T)) []const u8 {
+            const parent: *@This() = @fieldParentPtr("closeable", self);
+            return parent.label;
         }
     };
 }
@@ -76,6 +87,10 @@ pub fn CloseableReader(comptime T: type) type {
         pub fn getResult(self: @This()) ?T {
             return self.closeable.getResult();
         }
+
+        pub fn getLabel(self: @This()) []const u8 {
+            return self.closeable.getLabel();
+        }
     };
 }
 
@@ -98,16 +113,22 @@ pub fn CloseableWriter(comptime T: type) type {
         pub fn isClosed(self: @This()) bool {
             return self.closeable.isClosed();
         }
+
+        pub fn getLabel(self: @This()) []const u8 {
+            return self.closeable.getLabel();
+        }
     };
 }
 
 pub fn NeverCloses(comptime T: type) type {
     return struct {
         closeable: Closeable(T) = .{ .vtable = &vtable },
+        label: []const u8,
 
-        const vtable = Closeable(T).VTable{
+        pub const vtable = Closeable(T).VTable{
             .close = close,
             .getResult = getResult,
+            .getLabel = getLabel,
         };
 
         pub fn close(_: *Closeable(T)) T {
@@ -116,6 +137,11 @@ pub fn NeverCloses(comptime T: type) type {
 
         pub fn getResult(_: *Closeable(T)) ?T {
             return null;
+        }
+
+        pub fn getLabel(self: *Closeable(T)) []const u8 {
+            const parent: *@This() = @fieldParentPtr("closeable", self);
+            return parent.label;
         }
     };
 }

@@ -6,6 +6,7 @@ const TypeExpr = @import("../frontend/ast.zig").TypeExpr;
 const ScopeStack = @import("../interpreter/scope.zig").ScopeStack;
 const mem = @import("../mem/root.zig");
 const Stream = @import("../stream.zig").Stream;
+const ReaderWriterStream = @import("../stream.zig").ReaderWriterStream;
 
 const ast = @import("../frontend/ast.zig");
 const ExitCode = command_runner.ExitCode;
@@ -27,6 +28,7 @@ pub const Value = union(enum) {
     process: std.process.Child.Id,
     execution: ExecutionRef,
     exit_code: ?ExitCode,
+    pipeline: PipelineExecution,
 
     pub const FunctionRef = mem.RC(FunctionRefInner).Ref;
 
@@ -86,10 +88,30 @@ pub const Value = union(enum) {
         stdout: Value.String,
         stderr: Value.String,
         exit_code: ?ExitCode,
+        scope: ?ScopeRef = null,
 
         pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
             self.stdout.deinit(.{});
             self.stderr.deinit(.{});
+            if (self.scope) |*scope_ref| scope_ref.deinit(.{
+                .deinit_child_fn = .withoutAllocator(ScopeStack.deinit),
+            });
+            allocator.destroy(self);
+        }
+    };
+
+    pub const PipelineExecution = mem.RC(PipelineExecutionInner).Ref;
+
+    const PipelineExecutionInner = struct {
+        is_consumed: bool = false,
+        stdout_pipes: []*ReaderWriterStream,
+        stderr_pipes: []*ReaderWriterStream,
+
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            for (self.stdout_pipes) |pipe| pipe.stream.deinit();
+            for (self.stderr_pipes) |pipe| pipe.stream.deinit();
+            allocator.free(self.stdout_pipes);
+            allocator.free(self.stderr_pipes);
             allocator.destroy(self);
         }
     };
@@ -110,6 +132,9 @@ pub const Value = union(enum) {
             .stream => |stream| stream.deinit(),
             .execution => |*execution| execution.deinit(
                 .{ .deinit_child_fn = .withAllocator(ExecutionRefInner.deinit) },
+            ),
+            .pipeline => |*pipeline| pipeline.deinit(
+                .{ .deinit_child_fn = .withAllocator(PipelineExecutionInner.deinit) },
             ),
             else => {},
         }
@@ -144,7 +169,7 @@ pub const Value = union(enum) {
     /// Clones the value into a fresh allocation owned by `allocator`.
     pub fn clone(self: Value, _: std.mem.Allocator, options: mem.RCInitOptions) !Value {
         return switch (self) {
-            .void, .boolean, .integer, .float, .range, .process => self,
+            .void, .boolean, .integer, .float, .range, .process, .pipeline => self,
             .function => |ref| .{ .function = try ref.ref(options) },
             .string => |ref| .{ .string = try ref.ref(options) },
             .array => |ref| .{ .array = try ref.ref(options) },
@@ -156,6 +181,7 @@ pub const Value = union(enum) {
                 const inner = try clone_.getPtr();
                 inner.stdout = try inner.stdout.ref(options);
                 inner.stderr = try inner.stderr.ref(options);
+                if (inner.scope) |scope_ref| inner.scope = try scope_ref.ref(options);
                 break :brk clone_;
             } },
             // TODO: implement error values
@@ -203,6 +229,7 @@ pub const Value = union(enum) {
             .process => |pid| try writer.print("<process:{any}>", .{pid}),
             .execution => try writer.print("<execution>", .{}),
             .exit_code => |exit_code| try writer.print("<exit_code:{?f}>", .{exit_code}),
+            .pipeline => try writer.writeAll("<pipeline>"),
         }
     }
 };

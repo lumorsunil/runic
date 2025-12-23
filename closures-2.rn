@@ -1,0 +1,27 @@
+var s = 5
+
+fn Void hello() String {
+  var i = 0
+
+  echo "i = ${i}"
+  echo "s = ${s}"
+
+  inspect(i)
+  inspect(s)
+
+  const _ = i = i + 1
+  const _ = s = s + 1
+}
+
+fn Void hello2() String {
+  echo "s = ${s}"
+
+  inspect(s)
+
+  const _ = s = s + 1
+}
+
+hello
+hello
+
+hello2

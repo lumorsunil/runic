@@ -1,0 +1,5 @@
+echo "hello"
+echo "hello"
+jq "asdgfasegaewr" "test.json"
+echo "hello"
+echo "hello"

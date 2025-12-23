@@ -1,0 +1,12 @@
+echo "only one process"
+const s = printf "binding to one process"
+echo "s = ${s}"
+const s2 = printf "binding to pipeline" | cat
+echo "s2 = ${s2}"
+echo "pipeline without binding" | cat
+echo "pipeline without binding and interpolation: \"${s2}\"" | cat
+const b = {
+  printf "output from block"
+}
+echo "echo binding of block: ${b}"
+echo "echo binding of block with pipeline: ${b}" | cat

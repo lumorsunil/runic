@@ -1,0 +1,12 @@
+console.error("from stderr!!!!");
+console.error("from stderr!!!!");
+console.error("from stderr!!!!");
+console.error("from stderr!!!!");
+console.log("from stdout!!!!");
+console.log("from stdout!!!!");
+console.log("from stdout!!!!");
+console.error("from stderr!!!!");
+console.log("from stdout!!!!");
+console.log("from stdout!!!!");
+console.error("from stderr!!!!");
+console.log("from stdout!!!!");

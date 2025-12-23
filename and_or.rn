@@ -1,0 +1,3 @@
+echo "this will succeed" && echo "this succeeded"
+jq "aergaewrg" "test.json" && echo "this succeeded"
+jq "aergaewrg" "test.json" | cat && echo "this succeeded"

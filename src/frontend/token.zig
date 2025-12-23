@@ -179,6 +179,11 @@ pub const Tag = enum {
     slash,
     dollar,
     percent,
+    plus_assign,
+    minus_assign,
+    mul_assign,
+    div_assign,
+    rem_assign,
     /// Promise prefix "^".
     caret,
     amp,

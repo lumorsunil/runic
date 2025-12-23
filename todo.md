@@ -7,7 +7,7 @@
 - [x] execute statements in module when imported
 - [ ] use output of module execution
 - [x] member access on modules
-- [ ] pub keyword for accessible bindings
+- [ ] pub keyword for accessible bindings (maybe?)
 - [ ] define a function signature for the runic file `fn String @() String`
 
 ## executables
@@ -18,7 +18,7 @@
   - `const !echo // shorthand syntax for above statement`
 - [ ] trying to call a command as an identifier that is not bound will result in unknown identifier error
 - [ ] all executables can be thought of as runic functions with the signature:
-      `fn String <exec-name>(...[]String) String`
+      `fn Stream(String) <exec-name>(...[]String) Stream(String)`
 
 ## functions
 
@@ -28,20 +28,31 @@
 - [x] executor
 - [x] bug: cannot call functions more than one (thanks ai)
 - [x] calling a function using member access from imported module results in FileNotFound
-- [ ] function signature
-  - [ ] stdin type
-  - [ ] parameters
+- [x] function signature
+  - [x] stdin type
+  - [x] parameters
 - [ ] stdin special bindings
   - `@stdin`
   - `@stdin | cat`
 - [ ] typed pipes
+- [ ] exit code
 - [ ] a lot of things missing (stdin, stdout/stderr capturing and piping, return statements, etc.)
 
 ## expressions
 
 - [x] (re-)assignment
 - [x] arithmetic
-- [ ] assignment modifiers (+=, -=, \*=, /=)
+- [x] assignment modifiers (+=, -=, \*=, /=, %=)
+- [ ] more assignment modifiers (||=, &&=)
+- [ ] more binary operators
+  - [ ] \*\* (exponentation)
+  - [ ] << (bit shift left)
+  - [ ] \>> (bit shift right)
+  - [ ] & (bitwise and)
+  - [ ] | (bitwise or)
+  - [ ] ^ (bitwise xor)
+- [ ] unary operators
+  - [ ] ~ (bitwise negation)
 - [x] boolean algebra
 - [x] comparisons (numeric)
 - [x] string concatenation
@@ -92,17 +103,21 @@
 ## pipelines
 
 - [x] find out why we get FileNotFound when trying to interpolate a ProcessHandle, it works when the expression itself is a pipeline, but not when you have bound it to a variable first and then try to interpolate the variable: `echo "${echo "hello"}" // Works`, `const a = echo "hello"; echo "${a}" // Doesn't work`
-- [ ] streaming input and output
+- [x] streaming input and output
   - [x] streaming output (only for one-stage pipelines)
-  - [ ] streaming input
-  - [ ] streaming output between pipeline stages
-    - [ ] maybe add a stream construct that can push data
+  - [x] streaming input
+  - [x] streaming output between pipeline stages
+    - [x] maybe add a stream construct that can push data
     - [x] able to forward output into outer context from inside the executor/evaluator
     - [x] create a new context when binding identifiers
     - [x] explore idea of creating a context stack that we can push/pop same as the scope stack
       - [x] OR we could modify scope to have the evaluator context in it
+  - [ ] block streaming into a pipeline (only needed if we want to pipe functions or blocks into other things)
 - [ ] expressions as pipeline stages
-  - [ ] auto-coerce non-strings into strings? (or force interpolation? lsp hint?)
+  - [x] auto-coerce non-strings into strings? (or force interpolation? lsp hint?)
+- [x] exit code in execution result
+- [x] bug: when binding to a pipeline, runic hangs
+- [x] figure out what to do with stderr
 
 ## lsp
 

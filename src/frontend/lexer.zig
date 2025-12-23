@@ -228,10 +228,10 @@ pub const Lexer = struct {
             ',' => self.singleCharToken(.comma),
             ':' => self.singleCharToken(.colon),
             ';' => self.singleCharToken(.semicolon),
-            '+' => self.singleCharToken(.plus),
+            '+' => self.lexPlus(),
             '-' => self.lexMinus(),
-            '*' => self.singleCharToken(.star),
-            '%' => self.singleCharToken(.percent),
+            '*' => self.lexStar(),
+            '%' => self.lexPercent(),
             '^' => self.singleCharToken(.caret),
             '?' => self.singleCharToken(.question),
             '!' => self.lexBang(),
@@ -242,7 +242,7 @@ pub const Lexer = struct {
             '|' => self.lexPipe(),
             '&' => self.lexAmp(),
             '$' => self.singleCharToken(.dollar),
-            '/' => self.singleCharToken(.slash),
+            '/' => self.lexSlash(),
             else => Error.UnexpectedCharacter,
         };
     }
@@ -412,13 +412,52 @@ pub const Lexer = struct {
         };
     }
 
+    fn lexPlus(self: *Lexer) token.Token {
+        const start = self.mark();
+        _ = self.advance();
+        if (self.match('=')) {
+            return self.finish(.startAt(start), .plus_assign);
+        }
+        return self.finish(.startAt(start), .plus);
+    }
+
     fn lexMinus(self: *Lexer) token.Token {
         const start = self.mark();
         _ = self.advance();
         if (self.match('>')) {
             return self.finish(.startAt(start), .arrow);
         }
+        if (self.match('=')) {
+            return self.finish(.startAt(start), .minus_assign);
+        }
         return self.finish(.startAt(start), .minus);
+    }
+
+    fn lexStar(self: *Lexer) token.Token {
+        const start = self.mark();
+        _ = self.advance();
+        if (self.match('=')) {
+            return self.finish(.startAt(start), .mul_assign);
+        }
+        return self.finish(.startAt(start), .star);
+    }
+
+    fn lexSlash(self: *Lexer) token.Token {
+        const start = self.mark();
+        _ = self.advance();
+        if (self.match('=')) {
+            return self.finish(.startAt(start), .div_assign);
+        }
+        return self.finish(.startAt(start), .slash);
+    }
+
+    fn lexPercent(self: *Lexer) token.Token {
+        const start = self.mark();
+        _ = self.advance();
+        if (self.match('=')) {
+            return self.finish(.startAt(start), .rem_assign);
+        }
+        return self.finish(.startAt(start), .slash);
     }
 
     fn lexBang(self: *Lexer) token.Token {
