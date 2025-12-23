@@ -12,6 +12,7 @@ const Stream = runic.stream.Stream;
 const closeable = runic.closeable;
 const ExitCode = runic.command_runner.ExitCode;
 const TraceWriter = runic.TraceWriter;
+const ir = runic.ir;
 
 const log_enabled = false;
 
@@ -79,6 +80,10 @@ pub fn runScript(
         }
 
         return .success;
+    }
+
+    if (config.enable_ir) {
+        return ir.runner.runIR(allocator, &entryDocument.ast.?);
     }
 
     if (!config.skip_type_check) {
