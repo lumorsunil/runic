@@ -226,7 +226,10 @@ pub const Instruction = struct {
         to: Location,
     };
 
-    pub const Set = FromToLocation;
+    pub const Set = struct {
+        location: Location,
+        value: Value,
+    };
     pub const AthOp = enum { add, sub, mul, div, mod };
     pub const Ath = BinaryOperation(AthOp);
     pub const CmpOp = enum { gt, gte, lt, lte, eq, ne };
@@ -235,12 +238,20 @@ pub const Instruction = struct {
     pub const Log = BinaryOperation(LogOp);
 
     pub const Jump = struct {
-        cond: Value,
+        cond: ?Value,
         jump_if: bool = false,
         dest: Value.Addr,
 
         pub fn format(self: @This(), w: *std.Io.Writer) !void {
-            try w.print("({s}{f}) {f}", .{ if (self.jump_if) "" else "!", self.cond, self.dest });
+            if (self.cond) |cond| {
+                try w.print("({s}{f}) {f}", .{
+                    if (self.jump_if) "" else "!",
+                    cond,
+                    self.dest,
+                });
+            } else {
+                try w.print("(true) {f}", .{self.dest});
+            }
         }
     };
 

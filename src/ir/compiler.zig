@@ -293,6 +293,10 @@ pub const IRCompiler = struct {
         return self.labels.set(self.allocator, label, label_addr);
     }
 
+    pub fn newRef(self: *@This()) ir.Location {
+        return .{ .ref = self.refs.new() };
+    }
+
     pub fn declare(
         self: *IRCompiler,
         name: []const u8,
@@ -319,6 +323,20 @@ pub const IRCompiler = struct {
         source: anytype,
     ) Error!void {
         return self.addInstruction(.init(.from(source), .pop));
+    }
+
+    pub fn set(
+        self: *IRCompiler,
+        source: anytype,
+        location: ir.Location,
+        value: ir.Value,
+    ) Error!void {
+        return self.addInstruction(.init(.from(source), .{
+            .set = .{ 
+                .location = location,
+                .value = value,
+            },
+        }));
     }
 
     pub fn jmp(
@@ -509,17 +527,21 @@ pub const IRCompiler = struct {
         source: *ast.Expression,
         if_expr: ast.IfExpr,
     ) Error!Result {
+        const result = self.newRef();
         const condition = try self.compileExpression(if_expr.condition);
         const after_addr = try self.newLabel("if_after", .unknown);
         const else_addr = try self.newLabel("if_then", .unknown);
         try self.jmp(source, condition, false, else_addr);
         const then = try self.compileExpression(if_expr.then_expr);
+        try self.set(source, result, then.value);
         try self.jmp(source, condition, false, after_addr);
         try self.setLabel(else_addr.label, .abs);
-        const else_ = try if (if_expr.else_branch) |e| switch (e) {
-            .expr => |expr_| self.compileExpression(expr_),
-            .if_expr => |if_expr_| self.compileIf(source, if_expr_.*),
-        };
+        if (if_expr.else_branch) |e| {
+            const else_ = try switch (e) {
+                .expr => |expr_| self.compileExpression(expr_),
+                .if_expr => |if_expr_| self.compileIf(source, if_expr_.*),
+            };
+        }
         try self.setLabel(after_addr.label, .abs);
     }
 };
