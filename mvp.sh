@@ -63,10 +63,6 @@ echo "my_var_int %= 2 = $my_var_int"
 # booleans
 printf "\nbooleans\n\n"
 
-bool_to_str() {
-    echo $?
-}
-
 and_table=$(cat << EOF
 and table | true | false
 true | $(true && true; echo $?) | $(true && false; echo $?)
@@ -92,6 +88,11 @@ done
 
 for i in "${!my_array[@]}"; do
     echo "$i: ${my_array[$i]}"
+done
+
+my_array_2=("four" "five" "six")
+for i in "${!my_array[@]}"; do
+    echo "$i: ${my_array[$i]},${my_array_2[$i]}"
 done
 
 # functions with pipelines

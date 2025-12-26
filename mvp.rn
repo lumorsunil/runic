@@ -86,6 +86,11 @@ for (my_array, 0..) |item, i| {
   echo "${i}: ${item}"
 }
 
+const my_array_2 = .{ "four", "five", "six" }
+for (my_array, my_array_2, 0..) |a, b, i| {
+  echo "${i}: ${a},${b}"
+}
+
 // functions with pipelines
 // TO BE SUPPORTED (maybe?)
 // hello "I'm runic with a pipeline." | cat

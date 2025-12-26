@@ -1,0 +1,4 @@
+hello
+n = n is really equal to: 1;
+yes
+it is true

@@ -17,6 +17,7 @@ pub const CliConfig = struct {
     type_check_only: bool = false,
     skip_type_check: bool = false,
     enable_ir: bool = false,
+    verbose: bool = false,
 
     const Mode = union(enum) {
         script: ScriptInvocation,
@@ -589,6 +590,7 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
     var type_check_only = false;
     var skip_type_check = false;
     var enable_ir = false;
+    var verbose = false;
     var parsing_options = true;
     var idx: usize = 1;
 
@@ -627,6 +629,10 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
             }
             if (argEqual(arg, "--enable-ir")) {
                 enable_ir = true;
+                continue;
+            }
+            if (argEqual(arg, "--verbose")) {
+                verbose = true;
                 continue;
             }
             if (std.mem.startsWith(u8, arg, trace_prefix)) {
@@ -747,6 +753,7 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
                 .type_check_only = type_check_only,
                 .skip_type_check = skip_type_check,
                 .enable_ir = enable_ir,
+                .verbose = verbose,
             },
         };
     }
@@ -763,6 +770,7 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
             .type_check_only = type_check_only,
             .skip_type_check = skip_type_check,
             .enable_ir = enable_ir,
+            .verbose = verbose,
         },
     };
 }
@@ -772,17 +780,15 @@ pub fn printUsage(writer: *std.Io.Writer) !void {
         \\Runic CLI
         \\Usage:
         \\  runic [options] path/to/script.rn [-- <script args>...]
-        \\  runic --repl
         \\
         \\Options:
         \\  --help, -h           Display this help text.
-        \\  --repl               Start the interactive REPL (history + multiline editing).
-        \\  --trace <topic>      Enable detailed tracing of interpreter subsystems.
-        \\  --module-path <dir>  Append an additional module lookup directory.
+        \\  --verbose            Enable verbose logging.
         \\  --env KEY=VALUE      Override an environment variable during execution.
         \\  --print-ast          Parse the script and emit its AST instead of executing.
         \\  --print-tokens       Dump the raw lexer tokens for the provided script path.
         \\  --type-check-only    Dry run with only type checking.
+        \\  --enable-ir          Enable experimental IR compiler.
         \\
         \\Additional arguments after -- are forwarded to the script unchanged.
         \\Scripts honor the same tracing, module-path, and env override flags as the REPL.

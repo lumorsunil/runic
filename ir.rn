@@ -1,3 +1,10 @@
 const s = 5
 echo "hello"
-return 0
+const n = if (true) 1 else 0
+echo "n = ${"n is really equal to: ${n}"};"
+
+if (true) echo "yes"
+if (false) echo "no"
+
+if (if (true) true else false) echo "it is true" else echo "it is false"
+

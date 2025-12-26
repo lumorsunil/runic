@@ -9,14 +9,19 @@ pub const Error =
     std.Io.Writer.Error ||
     std.fmt.ParseIntError ||
     GetFrameError ||
+    ir.Location.Error ||
+    ir.Value.ToStreamError ||
     error{
         UnsupportedExpression,
         UnsupportedBindingPattern,
         UnsupportedLiteral,
         UnsupportedCalleeExpression,
         UnsupportedExitCodeExpression,
+        UnsupportedAddrType,
         DataTooLargeToFitInPage,
         ScopeNotFound,
+        LabelAddrNotSet,
+        StructTypeNotFound,
     };
 
 pub const GetFrameError = error{
@@ -26,8 +31,8 @@ pub const GetFrameError = error{
 pub const Result = union(enum) {
     value: ir.Value,
 
-    pub fn fromLocation(location: ir.Location) @This() {
-        return .fromValue(.fromLocation(location));
+    pub fn fromLocation(location: ir.Location) ir.Location.Error!@This() {
+        return .fromValue(.fromAddr(try location.toAddr()));
     }
 
     pub fn fromValue(value: ir.Value) @This() {
@@ -35,11 +40,9 @@ pub const Result = union(enum) {
     }
 
     pub fn executable(name: []const u8) @This() {
-        return .fromValue(.{ .executable = name });
+        return .fromValue(.{ .slice = name });
     }
 };
-
-const page_size = 1024 * 4;
 
 pub const IRData = struct {
     data: std.ArrayList(Page) = .empty,
@@ -59,12 +62,14 @@ pub const IRData = struct {
     }
 
     fn addPage(self: *IRData, allocator: Allocator) Error!usize {
-        try self.data.append(allocator, .fixed(try allocator.alloc(u8, page_size)));
+        try self.data.append(allocator, .fixed(
+            try allocator.alloc(u8, ir.IRReadOnly.page_size),
+        ));
         return self.data.items.len - 1;
     }
 
     fn ensureDataCapacity(self: *IRData, allocator: Allocator, len: usize) Error!usize {
-        if (len > page_size) {
+        if (len > ir.IRReadOnly.page_size) {
             return Error.DataTooLargeToFitInPage;
         }
 
@@ -199,45 +204,35 @@ const InstructionSet = struct {
 };
 
 const Refs = struct {
-    current_ref: usize = 0,
+    current_ref: usize = ir.IRContext.stack_start - 1,
 
     pub fn init() @This() {
         return .{};
     }
 
-    pub fn new(self: *Refs) ir.Ref {
-        defer self.current_ref += 1;
-        return self.current_ref;
+    pub fn new(self: *Refs, name: []const u8) ir.Ref {
+        defer self.current_ref -= 1;
+        return .{ .addr = self.current_ref, .name = name };
     }
 };
 
-const Labels = struct {
-    map: std.AutoArrayHashMapUnmanaged(ir.Value.Addr.LabelKey, ?ir.Value.Addr) = .empty,
+fn internalStructTypes(
+    allocator: Allocator,
+) Allocator.Error![]ir.Value.Struct.Type {
+    const executableCallContext = ir.Value.Struct.Type{
+        .name = "ExecutableCallContext",
+        .fields = try .init(
+            allocator,
+            &.{"argv"},
+            &.{.{ .slice = ir.Value.Slice.size() }},
+        ),
+        .decls = .empty,
+    };
 
-    pub fn init() @This() {
-        return .{};
-    }
-
-    pub fn new(
-        self: *Labels,
-        allocator: Allocator,
-        name: []const u8,
-        addr: ?ir.Value.Addr,
-    ) Allocator.Error!ir.Value.Addr.LabelKey {
-        const label: ir.Value.Addr.LabelKey = .{ self.map.count(), name };
-        try self.set(allocator, label, addr);
-        return label;
-    }
-
-    pub fn set(
-        self: *Labels,
-        allocator: Allocator,
-        label: ir.Value.Addr.LabelKey,
-        addr: ?ir.Value.Addr,
-    ) Allocator.Error!void {
-        try self.map.put(allocator, label, addr);
-    }
-};
+    return allocator.dupe(ir.Value.Struct.Type, &.{
+        executableCallContext,
+    });
+}
 
 pub const IRCompiler = struct {
     allocator: Allocator,
@@ -246,55 +241,98 @@ pub const IRCompiler = struct {
     data: IRData = .init(),
     instructions: InstructionSet = .init(),
     refs: Refs = .init(),
-    labels: Labels = .init(),
+    labels: ir.Labels = .init(),
+    struct_types: std.ArrayList(ir.Value.Struct.Type) = .empty,
 
-    pub fn init(allocator: Allocator, script: *ast.Script) @This() {
+    pub fn init(
+        allocator: Allocator,
+        script: *ast.Script,
+    ) Allocator.Error!@This() {
         return .{
             .allocator = allocator,
             .script = script,
+            .struct_types = .fromOwnedSlice(try internalStructTypes(allocator)),
         };
+    }
+
+    fn getStructType(self: IRCompiler, name: []const u8) Error!usize {
+        for (self.struct_types.items, 0..) |st, i| {
+            if (std.mem.eql(u8, st.name, name)) {
+                return i;
+            }
+        }
+
+        return Error.StructTypeNotFound;
     }
 
     pub fn addData(self: *IRCompiler, data: []const u8) Error!ir.Location {
         return try self.data.addData(self.allocator, data);
     }
 
-    pub fn addSlice(self: *IRCompiler, data: []const u8) Error!ir.Value {
+    pub fn addDataValue(self: *IRCompiler, value: ir.Value) Error!ir.Location {
+        var buffer: [1024]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        try writer.print("{f}", .{value});
+        return self.addData(writer.buffered());
+    }
+
+    pub fn addSlice(
+        self: *IRCompiler,
+        element_size: usize,
+        data: []const u8,
+    ) Error!ir.Value {
         const loc = try self.addData(data);
-        return .{ .slice = .{ .location = loc, .len = data.len } };
+        return .{ .slice = .{
+            .addr = try loc.toAddr(),
+            .element_size = element_size,
+            .len = @divExact(data.len, element_size),
+        } };
     }
 
     pub fn addInstruction(self: *@This(), instruction: ir.Instruction) Allocator.Error!void {
         try self.instructions.add(self.allocator, instruction);
     }
 
-    pub fn currentAddr(self: @This()) ir.Value.Addr {
+    pub fn currentAddr(self: @This()) ir.InstructionAddr {
         const abs = self.instructions.instructions.items.len;
         return .{ .abs = abs };
     }
 
-    const SetLabelAddr = union(enum) { unknown, abs, rel: isize };
+    const SetLabelAddr = union(enum) { unknown, abs };
 
-    fn getAddr(self: @This(), addr: SetLabelAddr) ?ir.Value.Addr {
+    fn getAddr(self: @This(), addr: SetLabelAddr) ?usize {
         return switch (addr) {
             .unknown => null,
-            .abs => self.currentAddr(),
-            .rel => |rel| .{ .rel = rel },
+            .abs => self.currentAddr().abs,
         };
     }
 
-    pub fn newLabel(self: *@This(), name: []const u8, addr: SetLabelAddr,) Allocator.Error!ir.Value.Addr {
+    pub fn newLabel(
+        self: *@This(),
+        name: []const u8,
+        addr: SetLabelAddr,
+    ) Allocator.Error!ir.InstructionAddr {
         const label_addr = self.getAddr(addr);
         return .{ .label = try self.labels.new(self.allocator, name, label_addr) };
     }
 
-    pub fn setLabel(self: *@This(), label: ir.Value.Addr.LabelKey, addr: SetLabelAddr,) Allocator.Error!void {
+    pub fn setLabel(
+        self: *@This(),
+        label: ir.InstructionAddr.LabelKey,
+        addr: SetLabelAddr,
+    ) Allocator.Error!void {
         const label_addr = self.getAddr(addr);
         return self.labels.set(self.allocator, label, label_addr);
     }
 
-    pub fn newRef(self: *@This()) ir.Location {
-        return .{ .ref = self.refs.new() };
+    pub fn newRef(
+        self: *@This(),
+        source: anytype,
+        name: []const u8,
+    ) Allocator.Error!ir.Location {
+        const ref: ir.Location = .{ .ref = self.refs.new(name) };
+        try self.addInstruction(.init(.from(source), .{ .ref = ref.ref }));
+        return ref;
     }
 
     pub fn declare(
@@ -318,6 +356,17 @@ pub const IRCompiler = struct {
         return self.addInstruction(.init(.from(source), .push_(value)));
     }
 
+    pub fn pushLocation(
+        self: *IRCompiler,
+        source: anytype,
+        location: ir.Location,
+    ) Error!void {
+        return self.addInstruction(.init(
+            .from(source),
+            .push_(.fromAddr(try location.toAddr())),
+        ));
+    }
+
     pub fn pop(
         self: *IRCompiler,
         source: anytype,
@@ -332,7 +381,7 @@ pub const IRCompiler = struct {
         value: ir.Value,
     ) Error!void {
         return self.addInstruction(.init(.from(source), .{
-            .set = .{ 
+            .set = .{
                 .location = location,
                 .value = value,
             },
@@ -342,13 +391,13 @@ pub const IRCompiler = struct {
     pub fn jmp(
         self: *IRCompiler,
         source: anytype,
-        condition: Result,
+        condition: ?Result,
         jump_if: bool,
-        destination: ir.Value.Addr,
+        destination: ir.InstructionAddr,
     ) Error!void {
         return self.addInstruction(.init(.from(source), .{
             .jmp = .{
-                .cond = condition.value,
+                .cond = if (condition) |cond| cond.value else null,
                 .jump_if = jump_if,
                 .dest = destination,
             },
@@ -375,13 +424,27 @@ pub const IRCompiler = struct {
         return self.addInstruction(.init(.from(source), .exit_(exit_code)));
     }
 
+    fn labelLessThan(_: *IRCompiler, a: ir.Label, b: ir.Label) bool {
+        return a.addr < b.addr;
+    }
+
+    fn validateNoUnknownLabels(self: *IRCompiler) Error!void {
+        for (self.labels.map.values()) |value| {
+            if (value == null) return Error.LabelAddrNotSet;
+        }
+    }
+
     pub fn toIRContext(self: *IRCompiler) Error!ir.IRContext {
+        try self.validateNoUnknownLabels();
+        self.labels.sort();
+
         return .{
             .read_only = .{
                 .data = try self.data.toOwnedSlice(self.allocator),
                 .instructions = try self.instructions.toOwnedSlice(self.allocator),
             },
-            .registers = .{},
+            .labels = .{ .map = self.labels.map.move() },
+            .struct_types = try self.struct_types.toOwnedSlice(self.allocator),
         };
     }
 
@@ -460,26 +523,51 @@ pub const IRCompiler = struct {
         };
     }
 
-    fn compileLiteral(self: *IRCompiler, literal: ast.Literal) Error!Result {
+    fn compileLiteral(
+        self: *IRCompiler,
+        literal: ast.Literal,
+    ) Error!Result {
         return switch (literal) {
             // .integer => |integer| .fromValue(try self.addSlice(integer.text)),
             .integer => |integer| .fromValue(try parseInt(integer.text)),
-            .float => |float| .fromValue(try self.addSlice(float.text)),
-            .bool => |boolean| .fromValue(.{ .boolean = boolean.value }),
-            .string => |string| {
-                if (string.segments.len != 1) return Error.UnsupportedLiteral;
-                return .fromValue(try self.addSlice(string.segments[0].text.payload));
-            },
+            .float => |float| .fromValue(try self.addSlice(1, float.text)),
+            .bool => |boolean| .fromValue(.{ .exit_code = .fromBoolean(boolean.value) }),
+            .string => |string| self.compileStringLiteral(string),
             else => Error.UnsupportedLiteral,
         };
+    }
+
+    fn compileStringLiteral(
+        self: *IRCompiler,
+        string_literal: ast.StringLiteral,
+    ) Error!Result {
+        if (string_literal.segments.len == 1) {
+            return .fromValue(try self.addSlice(1, string_literal.segments[0].text.payload));
+        }
+
+        const stream = try self.allocator.alloc(ir.Value, string_literal.segments.len);
+
+        for (string_literal.segments, 0..) |segment, i| switch (segment) {
+            .text => |text| {
+                stream[i] = try self.addSlice(1, text.payload);
+            },
+            .interpolation => |interp| {
+                stream[i] = (try self.compileExpression(interp)).value;
+            },
+        };
+
+        return .fromValue(.{ .stream = stream });
     }
 
     fn parseInt(text: []const u8) std.fmt.ParseIntError!ir.Value {
         return .{ .uinteger = try std.fmt.parseInt(usize, text, 10) };
     }
 
-    fn compileIdentifier(self: *IRCompiler, identifier: ast.Identifier) Result {
-        const binding = self.lookup(identifier.name) orelse return .executable(identifier.name);
+    fn compileIdentifier(self: *IRCompiler, identifier: ast.Identifier) Error!Result {
+        const binding = self.lookup(identifier.name) orelse {
+            const executable = try self.addSlice(1, identifier.name);
+            return .fromValue(executable);
+        };
         return binding.result;
     }
 
@@ -490,58 +578,116 @@ pub const IRCompiler = struct {
     ) Error!Result {
         const callee = try self.compileExpression(call.callee);
 
-        switch (callee.value) {
-            .executable => |executable| return self.compileExecutableCall(
+        return switch (callee.value) {
+            .slice => self.compileExecutableCall(
                 source,
-                executable,
+                callee.value,
                 call.arguments,
             ),
-            else => return Error.UnsupportedCalleeExpression,
+            .stream, .addr, .void, .uinteger, .strct, .exit_code => .fromValue(callee.value),
+        };
+    }
+
+    fn compileExpressions(
+        self: *IRCompiler,
+        exprs: []const *ast.Expression,
+    ) Error![]ir.Value {
+        const values = try self.allocator.alloc(ir.Value, exprs.len);
+        errdefer self.allocator.free(values);
+
+        for (exprs, values) |expr, *value| {
+            const result = try self.compileExpression(expr);
+            value.* = result.value;
         }
+
+        return values;
+    }
+
+    fn allocExecutableCallContextFields(
+        self: *IRCompiler,
+        executable: ir.Value,
+        args: []const ir.Value,
+    ) Error![]ir.Value {
+        var buffer: [1024]u8 = undefined;
+        var buffer_w = std.Io.Writer.fixed(&buffer);
+        try (try executable.toStream(self.allocator)).serialize(&buffer_w);
+        for (args) |arg| try (try arg.toStream(self.allocator)).serialize(&buffer_w);
+        const argv = try self.addSlice(@sizeOf([]ir.Value), buffer_w.buffered());
+        return self.allocator.dupe(ir.Value, &.{argv});
     }
 
     fn compileExecutableCall(
         self: *IRCompiler,
         source: *ast.Expression,
-        executable: []const u8,
+        executable: ir.Value,
         arguments: []const *ast.Expression,
     ) Error!Result {
-        var it = std.mem.reverseIterator(arguments);
-        while (it.next()) |arg| {
-            const result = try self.compileExpression(arg);
-            try self.push(source, result.value);
-        }
-        const executable_loc = try self.addSlice(executable);
-        try self.push(source, executable_loc);
-        try self.push(source, .{ .uinteger = arguments.len });
+        const context = try self.newRef(source, "executable_call_context");
+
+        const args_temp = try self.compileExpressions(arguments);
+        defer self.allocator.free(args_temp);
+        const fields = try self.allocExecutableCallContextFields(executable, args_temp);
+        errdefer self.allocator.free(fields);
+
+        try self.set(source, context, .{ .strct = .{
+            .type = try self.getStructType("ExecutableCallContext"),
+            .fields = fields,
+        } });
+        try self.pushLocation(source, context);
         try self.call_(source);
-        // for (0..arguments.len + 2) |_| {
-        //     try self.pop(source);
-        // }
+
         return .fromValue(.void);
     }
 
-    // TODO: figure out how to be able to pass the result of a if expression to a result location
     fn compileIf(
         self: *IRCompiler,
         source: *ast.Expression,
         if_expr: ast.IfExpr,
     ) Error!Result {
-        const result = self.newRef();
+        if (if_expr.else_branch) |else_branch| {
+            return try self.compileIfElse(source, if_expr, else_branch);
+        } else {
+            return try self.compileIfNoElse(source, if_expr);
+        }
+    }
+
+    fn compileIfElse(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        if_expr: ast.IfExpr,
+        else_branch: ast.IfExpr.ElseBranch,
+    ) Error!Result {
+        const result = try self.newRef(source, "if_result");
         const condition = try self.compileExpression(if_expr.condition);
         const after_addr = try self.newLabel("if_after", .unknown);
-        const else_addr = try self.newLabel("if_then", .unknown);
+        const else_addr = try self.newLabel("if_else", .unknown);
         try self.jmp(source, condition, false, else_addr);
         const then = try self.compileExpression(if_expr.then_expr);
         try self.set(source, result, then.value);
-        try self.jmp(source, condition, false, after_addr);
+        try self.jmp(source, null, false, after_addr);
         try self.setLabel(else_addr.label, .abs);
-        if (if_expr.else_branch) |e| {
-            const else_ = try switch (e) {
-                .expr => |expr_| self.compileExpression(expr_),
-                .if_expr => |if_expr_| self.compileIf(source, if_expr_.*),
-            };
-        }
+        const else_ = try switch (else_branch) {
+            .expr => |expr_| self.compileExpression(expr_),
+            .if_expr => |if_expr_| self.compileIf(source, if_expr_.*),
+        };
+        try self.set(source, result, else_.value);
         try self.setLabel(after_addr.label, .abs);
+        return .fromLocation(result);
+    }
+
+    fn compileIfNoElse(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        if_expr: ast.IfExpr,
+    ) Error!Result {
+        const result = try self.newRef(source, "if_result");
+        try self.set(source, result, .void);
+        const condition = try self.compileExpression(if_expr.condition);
+        const after_addr = try self.newLabel("if_after", .unknown);
+        try self.jmp(source, condition, false, after_addr);
+        const then = try self.compileExpression(if_expr.then_expr);
+        try self.set(source, result, then.value);
+        try self.setLabel(after_addr.label, .abs);
+        return .fromLocation(result);
     }
 };
