@@ -17,6 +17,7 @@ pub const CliConfig = struct {
     type_check_only: bool = false,
     skip_type_check: bool = false,
     enable_ir: bool = false,
+    debug_ir: bool = false,
     verbose: bool = false,
 
     const Mode = union(enum) {
@@ -590,6 +591,7 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
     var type_check_only = false;
     var skip_type_check = false;
     var enable_ir = false;
+    var debug_ir = false;
     var verbose = false;
     var parsing_options = true;
     var idx: usize = 1;
@@ -629,6 +631,10 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
             }
             if (argEqual(arg, "--enable-ir")) {
                 enable_ir = true;
+                continue;
+            }
+            if (argEqual(arg, "--debug-ir")) {
+                debug_ir = true;
                 continue;
             }
             if (argEqual(arg, "--verbose")) {
@@ -735,6 +741,15 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
     if (enable_ir and script_path == null) {
         return usageError(allocator, "--enable-ir requires a script path.", .{});
     }
+    if (debug_ir and repl_requested) {
+        return usageError(allocator, "--debug-ir requires a script path.", .{});
+    }
+    if (debug_ir and script_path == null) {
+        return usageError(allocator, "--debug-ir requires a script path.", .{});
+    }
+    if (debug_ir and !enable_ir) {
+        return usageError(allocator, "--debug-ir requires --enable-ir", .{});
+    }
 
     const trace_slice = try finalizeList([]const u8, &trace_topics, &trace_cleanup);
     const module_slice = try finalizeList([]const u8, &module_paths, &module_cleanup);
@@ -753,6 +768,7 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
                 .type_check_only = type_check_only,
                 .skip_type_check = skip_type_check,
                 .enable_ir = enable_ir,
+                .debug_ir = debug_ir,
                 .verbose = verbose,
             },
         };
@@ -770,6 +786,7 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
             .type_check_only = type_check_only,
             .skip_type_check = skip_type_check,
             .enable_ir = enable_ir,
+            .debug_ir = debug_ir,
             .verbose = verbose,
         },
     };
@@ -789,6 +806,7 @@ pub fn printUsage(writer: *std.Io.Writer) !void {
         \\  --print-tokens       Dump the raw lexer tokens for the provided script path.
         \\  --type-check-only    Dry run with only type checking.
         \\  --enable-ir          Enable experimental IR compiler.
+        \\  --debug-ir           Enable experimental IR debug mode.
         \\
         \\Additional arguments after -- are forwarded to the script unchanged.
         \\Scripts honor the same tracing, module-path, and env override flags as the REPL.

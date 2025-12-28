@@ -133,7 +133,6 @@ pub const IREvaluator = struct {
                     const arg_stream = try ir.Value.deserialize(.stream, &reader);
                     var arg_writer = std.Io.Writer.Allocating.init(self.allocator);
                     try self.materializeString(arg_stream, &arg_writer.writer);
-                    std.log.debug("arg {}: {s}", .{ i, arg_writer.written() });
                     argv.appendAssumeCapacity(try arg_writer.toOwnedSlice());
                 }
 
@@ -209,9 +208,7 @@ pub const IREvaluator = struct {
         value: ir.Value,
         w: *std.Io.Writer,
     ) MaterializeStringError!void {
-        std.log.debug("materializeString (before resolve): <{t}> {f}", .{ value, value });
         const resolvedValue = try self.resolveValue(value);
-        std.log.debug("materializeString (after resolve): <{t}> {f}", .{ resolvedValue, resolvedValue });
 
         switch (resolvedValue) {
             .stream => |stream| for (stream) |s| try self.materializeString(s, w),

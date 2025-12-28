@@ -22,6 +22,8 @@ fn mainImpl() !runic.command_runner.ExitCode {
 
     const allocator = gpa.allocator();
 
+    try enableRawMode();
+
     // var stdin_buffer: [1024]u8 = undefined;
     var stdout_buffer: [1024]u8 = undefined;
     var stderr_buffer: [1024]u8 = undefined;
@@ -66,4 +68,30 @@ fn mainImpl() !runic.command_runner.ExitCode {
     }
 
     return .success;
+}
+
+fn enableRawMode() !void {
+    const stdin = std.fs.File.stdin();
+    const is_tty = stdin.isTty();
+    if (!is_tty) return;
+    if (@import("builtin").os.tag != .linux) return;
+    var raw = try std.posix.tcgetattr(stdin.handle);
+    raw.iflag.BRKINT = true;
+    raw.iflag.ICRNL = true;
+    raw.iflag.INPCK = false;
+    raw.iflag.ISTRIP = false;
+    raw.iflag.IXON = false;
+    raw.oflag.OPOST = true;
+    raw.oflag.ONLCR = true;
+    raw.oflag.OCRNL = false;
+    raw.oflag.ONLRET = false;
+    raw.cflag.CSIZE = .CS8;
+    raw.cflag.CREAD = true;
+    raw.cflag.CLOCAL = true;
+    raw.lflag.ECHO = false;
+    raw.lflag.ECHONL = false;
+    raw.lflag.ICANON = false;
+    raw.lflag.IEXTEN = false;
+    raw.lflag.ISIG = true;
+    try std.posix.tcsetattr(stdin.handle, .FLUSH, raw);
 }

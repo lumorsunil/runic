@@ -16,7 +16,7 @@ function kill()
 end
 
 vim.api.nvim_create_user_command(
-    'RunDebug',
+    'RunDebugLogging',
     function()
         if vim.fn.expand("%:e") ~= "rn" then return end
         vim.cmd [[rightbelow vnew]]
@@ -52,7 +52,18 @@ vim.api.nvim_create_user_command(
     end,
     {}
 )
+vim.api.nvim_create_user_command(
+    'RunDebug',
+    function()
+        if vim.fn.expand("%:e") ~= "rn" then return end
+        vim.cmd [[tabnew]]
+        vim.bo.buftype = "nofile"
+        vim.cmd [[term runic --enable-ir --debug-ir #]]
+    end,
+    {}
+)
 EOF
 
-nmap <F5> <Cmd>RunDebug<CR>
-nmap <F6> <Cmd>Run<CR>
+nmap <F5> <Cmd>Run<CR>
+nmap <F6> <Cmd>RunDebugLogging<CR>
+nmap <F7> <Cmd>RunDebug<CR>

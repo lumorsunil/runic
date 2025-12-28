@@ -83,11 +83,19 @@ pub fn runScript(
     }
 
     if (config.enable_ir) {
-        return ir.runner.runIR(
-            allocator,
-            .{ .verbose = config.verbose },
-            &entryDocument.ast.?,
-        );
+        if (config.debug_ir) {
+            return ir.runner.debugIR(
+                allocator,
+                &entryDocument.ast.?,
+                &document_store.document_store,
+            );
+        } else {
+            return ir.runner.runIR(
+                allocator,
+                .{ .verbose = config.verbose },
+                &entryDocument.ast.?,
+            );
+        }
     }
 
     if (!config.skip_type_check) {

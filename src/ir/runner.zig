@@ -4,6 +4,7 @@ const runic = @import("runic");
 const ir = runic.ir;
 const ast = runic.ast;
 const ExitCode = runic.command_runner.ExitCode;
+const DocumentStore = runic.DocumentStore;
 
 pub const IRConfig = struct {
     verbose: bool,
@@ -86,6 +87,21 @@ pub fn runIR(allocator: Allocator, config: IRConfig, script: *ast.Script) !ExitC
     runner.log("\nRunning...\n", .{});
 
     return runner.run(&context);
+}
+
+pub fn debugIR(allocator: Allocator, script: *ast.Script, document_store: *DocumentStore) !ExitCode {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+    var compiler = try ir.compiler.IRCompiler.init(arena_allocator, script);
+    var context = try compiler.compile();
+    var debugger = try ir.debugger.IRDebugger.init(
+        arena_allocator,
+        .{ .verbose = false },
+        document_store,
+        &context,
+    );
+    return debugger.run();
 }
 
 fn logInstruction(

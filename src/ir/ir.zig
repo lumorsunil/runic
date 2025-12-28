@@ -537,8 +537,9 @@ pub const Instruction = struct {
         return .{ .source = source, .type = type_ };
     }
 
-    pub fn span(self: @This()) ast.Span {
-        return self.source.span();
+    pub fn span(self: @This()) ?ast.Span {
+        const source = self.source orelse return null;
+        return source.span();
     }
 
     pub const Push = union(enum) {
