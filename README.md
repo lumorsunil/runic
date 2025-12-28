@@ -15,17 +15,17 @@ echo "hello ${name}"
 
 // capture stdout and status from a pipeline
 const recent = (ls ./src | head -n 5)
-if recent.status.ok {
+if (recent.status.ok) {
   echo "first few entries:"
-  echo recent.stdout
+  echo recent
 }
 
 // simple function that reuses existing tools
 fn check_git() void {
   const summary = git status --short
-  if summary.stdout != "" {
+  if (summary.stdout != "") {
     echo "working tree changes:"
-    echo summary.stdout
+    echo summary
   }
 }
 

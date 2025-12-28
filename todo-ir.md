@@ -71,3 +71,12 @@
   - [x] dereference addr
   - [x] exit code
   - [ ] execution result
+
+## debugger
+
+- [x] commands
+  - [x] step
+  - [x] quit
+- [x] command history per session
+- [x] stdin processing
+  - [x] up/down arrow -> move command history cursor

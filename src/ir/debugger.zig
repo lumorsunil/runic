@@ -12,9 +12,14 @@ const span_color = rainbow.beginBgColor(.yellow) ++ rainbow.beginColor(.black);
 const end_color = rainbow.endColor();
 
 pub const Error =
-    IRDebugger.GetCommandError ||
     IREvaluatorError ||
     DocumentStore.Error ||
+    Allocator.Error ||
+    IRDebugger.StdinHandler.TestStdinError ||
+    std.Io.Writer.Error ||
+    std.Io.Reader.Error ||
+    std.Io.Reader.DelimiterError ||
+    std.fmt.ParseIntError ||
     error{};
 
 pub const IRDebugger = struct {
@@ -55,18 +60,18 @@ pub const IRDebugger = struct {
     }
 
     pub fn run(self: *IRDebugger) Error!ExitCode {
-        while (true) {
-            const command = try self.getCommand() orelse continue;
-
-            try self.command_history.append(self.allocator, command);
-            self.command_history_cursor = null;
-
-            switch (command) {
-                .quit => break,
-                .step => try self.step(),
-            }
-        }
+        while (true) switch (try self.loop()) {
+            .quit => break,
+            .cont => continue,
+        };
         return .success;
+    }
+
+    fn printDebugCommandStuff(self: *IRDebugger) !void {
+        var prpos = try self.getCursorPosition();
+        prpos.row += 1;
+        prpos.col = 1;
+        try self.printToPos(prpos, "command: \"{any}\"{s}", .{ self.commandWriter().buffered(), clear_line_to_end });
     }
 
     fn stdoutWriter(self: *IRDebugger) *std.Io.Writer {
@@ -91,13 +96,12 @@ pub const IRDebugger = struct {
         return self.stdoutWriter().writeAll(string);
     }
 
-    const GetCommandError = std.Io.Reader.DelimiterError || ProcessStdinError;
-
     const command_delimiters: []const []const u8 = &.{"\n"};
 
-    fn getCommand(self: *IRDebugger) GetCommandError!?Command {
+    fn loop(self: *IRDebugger) Error!RunningEvent {
+        try self.printDebugCommandStuff();
+
         const stdin_reader = self.stdinReader();
-        const cw = self.commandWriter();
 
         var stdin_allocating_writer = AllocatingWriter.init(self.allocator);
         defer stdin_allocating_writer.deinit();
@@ -105,20 +109,30 @@ pub const IRDebugger = struct {
 
         _ = try stdin_reader.stream(&stdin_writer.writer, .unlimited);
 
-        try self.processStdin(stdin_writer);
-        try self.writeAll(stdin_writer.written());
-        try self.commandWriter().writeAll(stdin_writer.written());
-
-        // TODO: iterate through all commands possibly generated from the slice
-        for (command_delimiters) |delimiter| {
-            if (std.mem.indexOf(u8, cw.buffered(), delimiter)) |index| {
-                defer _ = cw.consume(index + delimiter.len);
-                const command = cw.buffered()[0..index];
-                return self.parseCommand(command);
-            }
+        switch (try self.processStdin(stdin_writer)) {
+            .quit => return .quit,
+            .cont => {},
         }
+        try self.updateCommand(stdin_writer.written());
 
-        return null;
+        return .cont;
+    }
+
+    fn updateCommand(self: *IRDebugger, stdin_slice: []const u8) !void {
+        const pos_before = try self.getCursorPosition();
+        const end_index = pos_before.col - 1;
+        const after_slice = try self.allocator.dupe(
+            u8,
+            self.commandWriter().buffered()[end_index..],
+        );
+        try self.printToPos(pos_before.add(2, 0), "\rafter_slice: \"{s}\"", .{after_slice});
+        self.commandWriter().end = end_index;
+        try self.writeAll(stdin_slice);
+        const pos_after = try self.getCursorPosition();
+        try self.writeAll(after_slice);
+        try self.commandWriter().writeAll(stdin_slice);
+        try self.commandWriter().writeAll(after_slice);
+        try self.setCursorPosition(pos_after);
     }
 
     const AllocatingWriter = struct {
@@ -157,7 +171,16 @@ pub const IRDebugger = struct {
                 };
             }
         },
+        write: []const u8,
+        delete,
+        write_and_delete: []const u8,
+        horizontal_move: isize,
+        run_command,
         none,
+
+        pub fn clear() @This() {
+            return .{ .replace_all = .{ .text = "" } };
+        }
     };
 
     const StdinHandlerMatcher = union(enum) {
@@ -169,14 +192,14 @@ pub const IRDebugger = struct {
 
     const StdinHandlerFn = *const fn (*IRDebugger, match: []const u8) StdinHandlerEvent;
 
+    const Range = struct {
+        start: usize,
+        end: usize,
+    };
+
     const StdinHandler = struct {
         matcher: StdinHandlerMatcher,
         handler: StdinHandlerFn,
-
-        const Range = struct {
-            start: usize,
-            end: usize,
-        };
 
         const TestStdinError = error{UnsupportedMatcher};
 
@@ -191,17 +214,41 @@ pub const IRDebugger = struct {
         }
 
         fn up(self: *IRDebugger, _: []const u8) StdinHandlerEvent {
-            const command = self.commandHistoryUp(1) orelse return .{
-                .replace_all = .{ .text = "" },
-            };
+            const command = self.commandHistoryUp(1) orelse return .clear();
             return .{ .replace_all = .{ .command = command } };
         }
 
         fn down(self: *IRDebugger, _: []const u8) StdinHandlerEvent {
-            const command = self.commandHistoryDown(1) orelse return .{
-                .replace_all = .{ .text = "" },
-            };
+            const command = self.commandHistoryDown(1) orelse return .clear();
             return .{ .replace_all = .{ .command = command } };
+        }
+
+        fn forward(_: *IRDebugger, _: []const u8) StdinHandlerEvent {
+            return .{ .horizontal_move = 1 };
+        }
+
+        fn back(_: *IRDebugger, _: []const u8) StdinHandlerEvent {
+            return .{ .horizontal_move = -1 };
+        }
+
+        fn backspace(_: *IRDebugger, _: []const u8) StdinHandlerEvent {
+            return .{ .write_and_delete = &.{8} };
+        }
+
+        fn delete(_: *IRDebugger, _: []const u8) StdinHandlerEvent {
+            return .delete;
+        }
+
+        fn home(_: *IRDebugger, _: []const u8) StdinHandlerEvent {
+            return .{ .horizontal_move = -std.math.maxInt(isize) };
+        }
+
+        fn end(_: *IRDebugger, _: []const u8) StdinHandlerEvent {
+            return .{ .horizontal_move = std.math.maxInt(isize) };
+        }
+
+        fn enter(_: *IRDebugger, _: []const u8) StdinHandlerEvent {
+            return .run_command;
         }
     };
 
@@ -214,47 +261,211 @@ pub const IRDebugger = struct {
             .matcher = .{ .exact = &.{ 27, 91, 66 } },
             .handler = StdinHandler.down,
         },
+        .{
+            .matcher = .{ .exact = &.{ 27, 91, 67 } },
+            .handler = StdinHandler.forward,
+        },
+        .{
+            .matcher = .{ .exact = &.{ 27, 91, 68 } },
+            .handler = StdinHandler.back,
+        },
+        .{
+            .matcher = .{ .exact = &.{127} },
+            .handler = StdinHandler.backspace,
+        },
+        .{
+            .matcher = .{ .exact = &.{ 27, 91, 51, 126 } },
+            .handler = StdinHandler.delete,
+        },
+        .{
+            .matcher = .{ .exact = &.{ 27, 91, 72 } },
+            .handler = StdinHandler.home,
+        },
+        .{
+            .matcher = .{ .exact = &.{ 27, 91, 70 } },
+            .handler = StdinHandler.end,
+        },
+        .{
+            .matcher = .{ .exact = &.{10} },
+            .handler = StdinHandler.enter,
+        },
+        // { 27, 91, 53, 126 } page up
+        // { 27, 91, 54, 126 } page down
+        // { 9 } tab
     };
 
-    const ProcessStdinError =
-        std.Io.Writer.Error ||
-        Allocator.Error ||
-        StdinHandler.TestStdinError;
+    const RunningEvent = enum { cont, quit };
 
     fn processStdin(
         self: *IRDebugger,
         stdin_writer: *std.Io.Writer.Allocating,
-    ) ProcessStdinError!void {
+    ) Error!RunningEvent {
         // std.log.debug("stdin: {any}", .{stdin_writer.written()});
 
         while (try matchHandler(stdin_writer.written())) |handler| {
             const before_slice = stdin_writer.written()[0..handler.range.start];
             const match = stdin_writer.written()[handler.range.start..handler.range.end];
             const event = handler.handler.handler(self, match);
-            try self.handleStdinHandlerEvent(event, before_slice);
+            switch (try self.handleStdinHandlerEvent(event, before_slice)) {
+                .quit => return .quit,
+                .cont => {},
+            }
             _ = stdin_writer.writer.consume(handler.range.end);
         }
+
+        var alloc_writer = AllocatingWriter.init(self.allocator);
+        const writer = alloc_writer.get();
+        for (0..stdin_writer.written().len) |i| {
+            const ch = stdin_writer.written()[i];
+            if (std.ascii.isPrint(ch)) {
+                try writer.writer.writeByte(ch);
+            }
+        }
+
+        _ = stdin_writer.writer.consumeAll();
+        try stdin_writer.writer.writeAll(try writer.toOwnedSlice());
+
+        return .cont;
     }
+
+    const csi = "\x1B[";
+    const clear_line = csi ++ "2K";
+    const clear_line_to_end = csi ++ "0K";
+    const request_position = csi ++ "6n";
 
     fn handleStdinHandlerEvent(
         self: *IRDebugger,
         event: StdinHandlerEvent,
         before_slice: []const u8,
-    ) std.Io.Writer.Error!void {
+    ) Error!RunningEvent {
         switch (event) {
             .replace_all => |replace_all| {
                 _ = self.commandWriter().consumeAll();
                 try self.commandWriter().print("{f}", .{replace_all});
-                try self.print("\x1B[2K\r{f}", .{replace_all});
+                try self.print("{s}\r{f}", .{ clear_line, replace_all });
+            },
+            .write => |text| {
+                try self.commandWriter().writeAll(before_slice);
+                try self.writeAll(before_slice);
+                // try self.commandWriter().writeAll(text);
+                try self.writeAll(text);
+            },
+            .delete => {
+                try self.commandWriter().writeAll(before_slice);
+                try self.writeAll(before_slice);
+                const pos = try self.getCursorPosition();
+
+                if (pos.col > self.commandWriter().buffered().len) return .cont;
+
+                var fallback_allocator = std.heap.stackFallback(128, self.allocator);
+                const allocator = fallback_allocator.get();
+                const after_start = @min(self.commandWriter().buffered().len, pos.col);
+                const after_slice = try allocator.dupe(
+                    u8,
+                    self.commandWriter().buffered()[after_start..],
+                );
+                defer allocator.free(after_slice);
+                self.commandWriter().undo(after_slice.len + 1);
+                try self.commandWriter().writeAll(after_slice);
+                try self.print("{s}{s}", .{ clear_line_to_end, after_slice });
+                try self.setCursorPosition(pos);
+            },
+            .write_and_delete => |text| {
+                try self.commandWriter().writeAll(before_slice);
+                try self.writeAll(before_slice);
+
+                _ = try self.handleStdinHandlerEvent(.{ .write = text }, "");
+                _ = try self.handleStdinHandlerEvent(.delete, "");
+            },
+            .horizontal_move => |delta| {
+                try self.commandWriter().writeAll(before_slice);
+                try self.writeAll(before_slice);
+
+                const pos = try self.getCursorPosition();
+                var npos = pos.add(0, delta);
+                npos.col = @min(npos.col, self.commandWriter().buffered().len + 1);
+
+                try self.setCursorPosition(npos);
+            },
+            .run_command => {
+                try self.commandWriter().writeAll(before_slice);
+                try self.writeAll(before_slice);
+
+                const command_string = self.commandWriter().buffered();
+                const command = try self.parseCommand(command_string) orelse return .cont;
+
+                defer _ = self.commandWriter().consumeAll();
+                return self.handleCommand(command);
             },
             .none => {
                 try self.commandWriter().writeAll(before_slice);
+                try self.writeAll(before_slice);
             },
         }
+
+        return .cont;
+    }
+
+    fn handleCommand(self: *IRDebugger, command: Command) Error!RunningEvent {
+        try self.command_history.append(self.allocator, command);
+        self.command_history_cursor = null;
+
+        switch (command) {
+            .quit => return .quit,
+            .step => try self.step(),
+        }
+
+        return .cont;
+    }
+
+    const CursorPosition = struct {
+        row: usize,
+        col: usize,
+
+        pub fn add(self: CursorPosition, row: isize, col: isize) CursorPosition {
+            return .{
+                .row = @intCast(@max(1, @as(isize, @intCast(self.row)) +| row)),
+                .col = @intCast(@max(1, @as(isize, @intCast(self.col)) +| col)),
+            };
+        }
+    };
+
+    fn setCursorPosition(
+        self: *IRDebugger,
+        position: CursorPosition,
+    ) std.Io.Writer.Error!void {
+        try self.print(csi ++ "{};{}H", .{ position.row, position.col });
+    }
+
+    fn getCursorPosition(
+        self: *IRDebugger,
+    ) Error!CursorPosition {
+        // response: ESC[n;mR
+        // { 27, 91, 49, 59, 51, 82 }
+        try self.writeAll(request_position);
+        const response = try self.stdinReader().takeDelimiterInclusive('R');
+        var it = std.mem.tokenizeAny(u8, response[2..], ";R");
+        const row_s = it.next().?;
+        const col_s = it.next().?;
+        const row = try std.fmt.parseUnsigned(usize, row_s, 10);
+        const col = try std.fmt.parseUnsigned(usize, col_s, 10);
+        return .{ .row = row, .col = col };
+    }
+
+    fn printToPos(
+        self: *IRDebugger,
+        pos: CursorPosition,
+        comptime fmt: []const u8,
+        args: anytype,
+    ) !void {
+        const current_pos = try self.getCursorPosition();
+        try self.setCursorPosition(pos);
+        try self.print(fmt, args);
+        try self.setCursorPosition(current_pos);
     }
 
     const MatchHandler = struct {
-        range: StdinHandler.Range,
+        range: Range,
         handler: StdinHandler,
     };
 
