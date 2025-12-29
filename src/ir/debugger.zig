@@ -2,7 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const IREvaluator = @import("evaluator.zig").IREvaluator;
 const IREvaluatorError = @import("evaluator.zig").Error;
-const ir = @import("ir.zig");
+const ir = @import("../ir.zig");
 const ExitCode = @import("../runtime/command_runner.zig").ExitCode;
 const DocumentStore = @import("../document_store.zig").DocumentStore;
 const ast = @import("../frontend/ast.zig");
@@ -36,7 +36,7 @@ pub const IRDebugger = struct {
         allocator: Allocator,
         config: IREvaluator.Config,
         document_store: *DocumentStore,
-        context: *ir.IRContext,
+        context: *ir.context.IRProgramContext,
     ) Allocator.Error!@This() {
         return .{
             .allocator = allocator,
@@ -48,15 +48,27 @@ pub const IRDebugger = struct {
         };
     }
 
-    pub fn step(self: *IRDebugger) Error!void {
-        const ic = self.evaluator.context.instruction_counter;
-        const instruction = self.evaluator.context.read_only.instructions[ic];
+    pub fn step(self: *IRDebugger) Error!RunningEvent {
+        try self.writeAll("\n");
+
+        const thread = self.evaluator.context.getCurrentThread();
+        const ic = thread.private.instruction_counter;
+        const instruction = thread.shared.instructions[ic];
         const maybe_span = instruction.span();
         if (maybe_span) |span| {
             try self.logEvaluateSpan(span);
         }
         try self.print("{}: {f}\n", .{ ic, instruction });
-        _ = try self.evaluator.step();
+
+        const event = try self.evaluator.step() orelse return .quit;
+
+        switch (event) {
+            .cont => return .cont,
+            .exit => |exit_code| {
+                try self.print("Program exited with code: {f}", .{exit_code});
+                return .quit;
+            },
+        }
     }
 
     pub fn run(self: *IRDebugger) Error!ExitCode {
@@ -99,7 +111,7 @@ pub const IRDebugger = struct {
     const command_delimiters: []const []const u8 = &.{"\n"};
 
     fn loop(self: *IRDebugger) Error!RunningEvent {
-        try self.printDebugCommandStuff();
+        // try self.printDebugCommandStuff();
 
         const stdin_reader = self.stdinReader();
 
@@ -125,7 +137,7 @@ pub const IRDebugger = struct {
             u8,
             self.commandWriter().buffered()[end_index..],
         );
-        try self.printToPos(pos_before.add(2, 0), "\rafter_slice: \"{s}\"", .{after_slice});
+        // try self.printToPos(pos_before.add(2, 0), "\rafter_slice: \"{s}\"", .{after_slice});
         self.commandWriter().end = end_index;
         try self.writeAll(stdin_slice);
         const pos_after = try self.getCursorPosition();
@@ -391,10 +403,11 @@ pub const IRDebugger = struct {
                 try self.commandWriter().writeAll(before_slice);
                 try self.writeAll(before_slice);
 
+                defer _ = self.commandWriter().consumeAll();
+
                 const command_string = self.commandWriter().buffered();
                 const command = try self.parseCommand(command_string) orelse return .cont;
 
-                defer _ = self.commandWriter().consumeAll();
                 return self.handleCommand(command);
             },
             .none => {
@@ -412,10 +425,8 @@ pub const IRDebugger = struct {
 
         switch (command) {
             .quit => return .quit,
-            .step => try self.step(),
+            .step => return self.step(),
         }
-
-        return .cont;
     }
 
     const CursorPosition = struct {

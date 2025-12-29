@@ -10,6 +10,11 @@
 - [x] addr
 - [x] struct
 - [ ] pipe
+  - [ ] generic sources/destinations
+    - [ ] executable (file handle)
+    - [ ]
+- [ ] blocks
+- [ ] blocks as pipes
 
 ## instructions
 
@@ -30,15 +35,38 @@
 
 ## compiler
 
-- [ ] address mapping
+- [x] address mapping
+- [x] basic executable calls
+- [x] if else
+- [x] read-only data
+- [x] instructions
+- [x] labels
+- [x] refs
+- [x] structs
+  - [ ] user-land structs
+- [x] struct types
+  - [ ] used defined struct types
 - [ ] arithmetic
 - [ ] boolean algebra
-- [ ] basic executable calls
 - [ ] pipelines
 
 ## execution context
 
-- [ ] threads
+- [ ] (virtual) threads
+
+- One execution step:
+  - Main Thread
+    1. If thread is asleep, check wake up condition
+    2. Otherwise, execute next instructions
+    3. When exits, store the exit code so we can return it at the end of the program
+  - Background Threads
+    1. If thread is asleep, check wake up condition
+    2. Otherwise, execute next instructions
+  - Pipe Threads
+    1. If data is available on source, then consume that data and forward it to destination
+    2. Otherwise, return
+    3. If stream ended, remove pipe thread
+- When all threads have exited, exit the program with the exit code from the Main thread
 
 ### shared between threads
 
@@ -80,3 +108,8 @@
 - [x] command history per session
 - [x] stdin processing
   - [x] up/down arrow -> move command history cursor
+- [ ] memory view
+- [ ] IR instructions view
+- [ ] source code view
+- [ ] output view (stdout/stderr/combined)
+- [ ] tui lib?

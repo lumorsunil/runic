@@ -1,5 +1,13 @@
-pub const IR = @import("ir/ir.zig");
 pub const compiler = @import("ir/compiler.zig");
 pub const evaluator = @import("ir/evaluator.zig");
 pub const runner = @import("ir/runner.zig");
 pub const debugger = @import("ir/debugger.zig");
+pub const Label = @import("ir/labels.zig").Label;
+pub const Labels = @import("ir/labels.zig").Labels;
+pub const context = @import("ir/context.zig");
+pub const InstructionAddr = @import("ir/instruction-addr.zig").InstructionAddr;
+pub const Ref = @import("ir/ref.zig").Ref;
+pub const Instruction = @import("ir/instruction.zig").Instruction;
+pub const Value = @import("ir/value.zig").Value;
+pub const Location = @import("ir/location.zig").Location;
+pub const TypeAddr = @import("ir/type-addr.zig").TypeAddr;

@@ -1,8 +1,10 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const ir = @import("ir.zig");
+const ir = @import("../ir.zig");
 const ast = @import("../frontend/ast.zig");
 const ExitCode = @import("../runtime/command_runner.zig").ExitCode;
+const page_size = ir.context.page_size;
+const stack_start = ir.context.stack_start;
 
 pub const Error =
     Allocator.Error ||
@@ -63,13 +65,13 @@ pub const IRData = struct {
 
     fn addPage(self: *IRData, allocator: Allocator) Error!usize {
         try self.data.append(allocator, .fixed(
-            try allocator.alloc(u8, ir.IRReadOnly.page_size),
+            try allocator.alloc(u8, page_size),
         ));
         return self.data.items.len - 1;
     }
 
     fn ensureDataCapacity(self: *IRData, allocator: Allocator, len: usize) Error!usize {
-        if (len > ir.IRReadOnly.page_size) {
+        if (len > page_size) {
             return Error.DataTooLargeToFitInPage;
         }
 
@@ -204,7 +206,7 @@ const InstructionSet = struct {
 };
 
 const Refs = struct {
-    current_ref: usize = ir.IRContext.stack_start - 1,
+    current_ref: usize = stack_start - 1,
 
     pub fn init() @This() {
         return .{};
@@ -434,21 +436,19 @@ pub const IRCompiler = struct {
         }
     }
 
-    pub fn toIRContext(self: *IRCompiler) Error!ir.IRContext {
+    pub fn toIRContext(self: *IRCompiler) Error!ir.context.IRSharedContext {
         try self.validateNoUnknownLabels();
         self.labels.sort();
 
         return .{
-            .read_only = .{
-                .data = try self.data.toOwnedSlice(self.allocator),
-                .instructions = try self.instructions.toOwnedSlice(self.allocator),
-            },
+            .data = try self.data.toOwnedSlice(self.allocator),
+            .instructions = try self.instructions.toOwnedSlice(self.allocator),
             .labels = .{ .map = self.labels.map.move() },
             .struct_types = try self.struct_types.toOwnedSlice(self.allocator),
         };
     }
 
-    pub fn compile(self: *IRCompiler) Error!ir.IRContext {
+    pub fn compile(self: *IRCompiler) Error!ir.context.IRSharedContext {
         try self.scopes.pushBindings(self.allocator);
         defer self.scopes.popFrame();
 

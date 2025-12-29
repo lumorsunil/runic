@@ -32,12 +32,14 @@ pub const IRRunner = struct {
         std.log.debug(fmt, args);
     }
 
-    pub fn compile(self: *IRRunner) !ir.IR.IRContext {
+    pub fn compile(self: *IRRunner) !ir.context.IRProgramContext {
         var compiler = try ir.compiler.IRCompiler.init(self.allocator, self.script);
-        return compiler.compile();
+        const shared = try compiler.compile();
+
+        return .init(self.allocator, shared);
     }
 
-    pub fn run(self: *IRRunner, context: *ir.IR.IRContext) !ExitCode {
+    pub fn run(self: *IRRunner, context: *ir.context.IRProgramContext) !ExitCode {
         var evaluator = ir.evaluator.IREvaluator.init(
             self.allocator,
             .{ .verbose = self.config.verbose },
@@ -59,17 +61,18 @@ pub fn runIR(allocator: Allocator, config: IRConfig, script: *ast.Script) !ExitC
     const arena_allocator = arena.allocator();
     var runner = IRRunner.init(arena_allocator, config, script);
     var context = try runner.compile();
+    try context.addMainThread();
 
     runner.log("IR Compilation Results", .{});
 
-    runner.log("\nRead-only Data ({} bytes):", .{context.read_only.dataSize()});
-    for (context.read_only.data, 0..) |page, i| {
+    runner.log("\nRead-only Data ({} bytes):", .{context.dataSize()});
+    for (context.readonlyData(), 0..) |page, i| {
         runner.log("Page {}:", .{i});
         runner.log("{s}", .{page});
     }
 
     runner.log("\nStruct Types:", .{});
-    for (context.struct_types) |struct_type| {
+    for (context.structTypes()) |struct_type| {
         runner.log("struct {s}:", .{struct_type.name});
 
         var it = struct_type.fields.iterator();
@@ -80,7 +83,7 @@ pub fn runIR(allocator: Allocator, config: IRConfig, script: *ast.Script) !ExitC
 
     runner.log("\nInstructions:", .{});
     var label_counter: usize = 0;
-    for (context.read_only.instructions, 0..) |instr, i| {
+    for (context.instructions(), 0..) |instr, i| {
         try logInstruction(&runner, &context, instr, i, &label_counter);
     }
 
@@ -89,12 +92,18 @@ pub fn runIR(allocator: Allocator, config: IRConfig, script: *ast.Script) !ExitC
     return runner.run(&context);
 }
 
-pub fn debugIR(allocator: Allocator, script: *ast.Script, document_store: *DocumentStore) !ExitCode {
+pub fn debugIR(
+    allocator: Allocator,
+    script: *ast.Script,
+    document_store: *DocumentStore,
+) !ExitCode {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const arena_allocator = arena.allocator();
     var compiler = try ir.compiler.IRCompiler.init(arena_allocator, script);
-    var context = try compiler.compile();
+    const shared = try compiler.compile();
+    var context = ir.context.IRProgramContext.init(arena_allocator, shared);
+    try context.addMainThread();
     var debugger = try ir.debugger.IRDebugger.init(
         arena_allocator,
         .{ .verbose = false },
@@ -106,8 +115,8 @@ pub fn debugIR(allocator: Allocator, script: *ast.Script, document_store: *Docum
 
 fn logInstruction(
     runner: *IRRunner,
-    context: *ir.IR.IRContext,
-    instr: ir.IR.Instruction,
+    context: *ir.context.IRProgramContext,
+    instr: ir.Instruction,
     i: usize,
     label_counter: *usize,
 ) !void {
@@ -115,10 +124,10 @@ fn logInstruction(
     var writer = std.Io.Writer.fixed(&message_buffer);
     try writer.print("{}: ", .{i});
 
-    while (label_counter.* < context.labels.map.count()) {
-        const key = context.labels.map.keys()[label_counter.*];
-        const addr = context.labels.map.values()[label_counter.*];
-        const label = ir.IR.Label{ .key = key, .addr = addr.? };
+    while (label_counter.* < context.labels().map.count()) {
+        const key = context.labels().map.keys()[label_counter.*];
+        const addr = context.labels().map.values()[label_counter.*];
+        const label = ir.Label{ .key = key, .addr = addr.? };
         if (addr.? == i) {
             try writer.print("{f} ", .{label});
             label_counter.* += 1;
