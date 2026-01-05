@@ -1,5 +1,95 @@
+// ref 0
+// ref 1
+// ref 2
+// set @@0 ReaderWriterStream
+// set @@1 ReaderWriterStream
+// set @@2 ReaderWriterStream
+//
+// ref 3
+// set @@3 ReaderWriterStream
+// fwd @@3 @@1
+// fwd @@0 @@3
+// ref 4
+// set @@4 ReaderWriterStream
+// fwd @@4 @@1
+// fwd @@0 @@4
+// wait @@3
+//
+// const r = getline
+
+echo "hello" | cat | cat
+
+// <<set:0>>
+// push ReaderWriterStream # S0 = stdin
+// push ReaderWriterStream # S1 = stdout
+// push ReaderWriterStream # S2 = stderr
+// fork <<set:1>> S0 S1 S2
+// fork <<set:2>> S0 S1 S2
+// fork <<set:3>> S0 S1 S2
+// ref 0
+// set @@0 ReaderWriterStream
+// ref 1
+// set @@1 ReaderWriterStream
+// fork <<set:4>> S0 @@0 S2
+// fork <<set:5>> @@0 @@1 S2
+// ref 2
+// fork @@2 <<set:6>> @@1 S1 S2
+// wait @@2
+
+// <<set:1>>
+// stream S0
+// <<set:2>>
+// stream S1
+// <<set:3>>
+// stream S2
+
+// <<set:4>>
+// push .{ .argv = &.{ "echo", "hello" } }
+// exec
+// stream S1
+
+// <<set:5>>
+// push .{ .argv = &.{ "cat" } }
+// exec
+// stream S1
+
+// <<set:6>>
+// push .{ .argv = &.{ "cat" } }
+// exec sync
+
+echo "hello"
+
+// <<set:0>>
+// push ReaderWriterStream # S0 = stdin
+// push ReaderWriterStream # S1 = stdout
+// push ReaderWriterStream # S2 = stderr
+// fork <<set:1>> S0 S1 S2
+// fork <<set:2>> S0 S1 S2
+// fork <<set:3>> S0 S1 S2
+// ref 0
+// fork @@0 <<set:4>> S0 S1 S2
+// wait @@0
+
+// <<set:1>>
+// stream S0
+// <<set:2>>
+// stream S1
+// <<set:3>>
+// stream S2
+
+// <<set:4>>
+// push .{ .argv = &.{ "echo", "hello" } }
+// exec
+
+
+
+
+
+
+
 const s = 5
 echo "hello"
+const h = echo "hello"
 const n = if (true) 1 else 0
 echo "n = ${"n is really equal to: ${n}"};"
 

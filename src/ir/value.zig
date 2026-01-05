@@ -4,6 +4,8 @@ const ExitCode = @import("../runtime/command_runner.zig").ExitCode;
 const endian = @import("constants.zig").endian;
 const TypeAddr = @import("type-addr.zig").TypeAddr;
 const Location = @import("location.zig").Location;
+const ReaderWriterStream = @import("../stream.zig").ReaderWriterStream;
+const Closeable = @import("../closeable.zig").Closeable;
 
 pub const Value = union(enum) {
     void,
@@ -11,12 +13,15 @@ pub const Value = union(enum) {
     slice: Slice,
     strct: Struct,
     exit_code: ExitCode,
+    pipe: *ReaderWriterStream,
+    closeable: *Closeable(ExitCode),
     addr: usize,
     stream: []const Value,
+    thread: usize,
 
     pub fn deinit(self: *@This(), allocator: Allocator) void {
         switch (self.*) {
-            .void, .location, .uinteger, .slice, .exit_code, .addr => {},
+            .void, .location, .uinteger, .slice, .exit_code, .addr, .thread => {},
             .strct => |strct| strct.deinit(allocator),
             .stream => |stream| allocator.free(stream),
         }
@@ -182,11 +187,12 @@ pub const Value = union(enum) {
             .void => .void,
             .uinteger => .{ .uinteger = try r.takeInt(usize, endian) },
             .addr => .{ .addr = try r.takeInt(usize, endian) },
+            .thread => .{ .thread = try r.takeInt(usize, endian) },
             .stream => .{ .stream = std.mem.bytesAsValue(
                 []Value,
                 try r.takeArray(@sizeOf([]Value)),
             ).* },
-            .slice, .strct => DeserializeError.UnsupportedDeserialize,
+            .slice, .strct, .pipe, .closeable => DeserializeError.UnsupportedDeserialize,
             .exit_code => .{ .exit_code = try ExitCode.deserialize(r) },
         };
     }
@@ -211,6 +217,9 @@ pub const Value = union(enum) {
             .void => try w.writeAll("void"),
             .addr => |addr| try w.print("{x}", .{addr}),
             .stream => try w.writeAll("<stream>"),
+            .pipe => try w.writeAll("<pipe>"),
+            .closeable => |closeable| try w.print("<closeable:{s}>", .{closeable.getLabel()}),
+            .thread => |id| try w.print("<thread:{}>", .{id}),
             inline .slice, .exit_code => |s| try w.print("{f}", .{s}),
             inline else => |t| try w.print("{}", .{t}),
         }

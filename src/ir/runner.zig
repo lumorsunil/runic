@@ -5,25 +5,33 @@ const ir = runic.ir;
 const ast = runic.ast;
 const ExitCode = runic.command_runner.ExitCode;
 const DocumentStore = runic.DocumentStore;
+const CloseableReader = runic.closeable.CloseableReader;
+const CloseableWriter = runic.closeable.CloseableWriter;
 
 pub const IRConfig = struct {
     verbose: bool,
+    stdin: CloseableReader(ExitCode),
+    stdout: CloseableWriter(ExitCode),
+    stderr: CloseableWriter(ExitCode),
 };
 
 pub const IRRunner = struct {
     allocator: Allocator,
+    document_store: *DocumentStore,
     script: *ast.Script,
     config: IRConfig,
 
     pub fn init(
         allocator: Allocator,
-        config: IRConfig,
+        document_store: *DocumentStore,
         script: *ast.Script,
+        config: IRConfig,
     ) @This() {
         return .{
             .allocator = allocator,
-            .config = config,
+            .document_store = document_store,
             .script = script,
+            .config = config,
         };
     }
 
@@ -33,7 +41,11 @@ pub const IRRunner = struct {
     }
 
     pub fn compile(self: *IRRunner) !ir.context.IRProgramContext {
-        var compiler = try ir.compiler.IRCompiler.init(self.allocator, self.script);
+        var compiler = try ir.compiler.IRCompiler.init(
+            self.allocator,
+            self.document_store,
+            self.script,
+        );
         const shared = try compiler.compile();
 
         return .init(self.allocator, shared);
@@ -42,12 +54,39 @@ pub const IRRunner = struct {
     pub fn run(self: *IRRunner, context: *ir.context.IRProgramContext) !ExitCode {
         var evaluator = ir.evaluator.IREvaluator.init(
             self.allocator,
-            .{ .verbose = self.config.verbose },
+            .{
+                .verbose = self.config.verbose,
+                .stdin = self.config.stdin,
+                .stdout = self.config.stdout,
+                .stderr = self.config.stderr,
+            },
             context,
         );
 
-        while (try evaluator.step()) |result| switch (result) {
-            .cont => continue,
+        while (evaluator.step() catch |err| {
+            const current_instr = evaluator.context.getCurrentThread().currentInstruction();
+
+            if (current_instr) |ci| {
+                if (ci.source) |source| {
+                    const span = source.span();
+                    const file_name = span.start.file;
+                    const line = span.start.line;
+                    const column = span.start.column;
+                    std.log.err("Error evaluating {s}:{}:{}: {}", .{
+                        file_name,
+                        line,
+                        column,
+                        err,
+                    });
+                } else {
+                    const addr = evaluator.context.getCurrentThread().getCurrentInstructionAddr();
+                    std.log.err("Error evaluating instruction {f}: {}", .{ addr, err });
+                }
+            }
+
+            return err;
+        }) |result| switch (result) {
+            .cont, .cont_no_instr_counter_inc => continue,
             .exit => |exit_code| return exit_code,
         };
 
@@ -55,11 +94,16 @@ pub const IRRunner = struct {
     }
 };
 
-pub fn runIR(allocator: Allocator, config: IRConfig, script: *ast.Script) !ExitCode {
+pub fn runIR(
+    allocator: Allocator,
+    document_store: *DocumentStore,
+    script: *ast.Script,
+    config: IRConfig,
+) !ExitCode {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const arena_allocator = arena.allocator();
-    var runner = IRRunner.init(arena_allocator, config, script);
+    var runner = IRRunner.init(arena_allocator, document_store, script, config);
     var context = try runner.compile();
     try context.addMainThread();
 
@@ -83,8 +127,11 @@ pub fn runIR(allocator: Allocator, config: IRConfig, script: *ast.Script) !ExitC
 
     runner.log("\nInstructions:", .{});
     var label_counter: usize = 0;
-    for (context.instructions(), 0..) |instr, i| {
-        try logInstruction(&runner, &context, instr, i, &label_counter);
+    for (context.instructions(), 0..) |is, instr_set| {
+        runner.log("\nSet {}:", .{instr_set});
+        for (is, 0..) |instr, i| {
+            try logInstruction(&runner, &context, instr, i, &label_counter);
+        }
     }
 
     runner.log("\nRunning...\n", .{});
@@ -96,17 +143,20 @@ pub fn debugIR(
     allocator: Allocator,
     script: *ast.Script,
     document_store: *DocumentStore,
+    stdin: CloseableReader(ExitCode),
+    stdout: CloseableWriter(ExitCode),
+    stderr: CloseableWriter(ExitCode),
 ) !ExitCode {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const arena_allocator = arena.allocator();
-    var compiler = try ir.compiler.IRCompiler.init(arena_allocator, script);
+    var compiler = try ir.compiler.IRCompiler.init(arena_allocator, document_store, script);
     const shared = try compiler.compile();
     var context = ir.context.IRProgramContext.init(arena_allocator, shared);
     try context.addMainThread();
     var debugger = try ir.debugger.IRDebugger.init(
         arena_allocator,
-        .{ .verbose = false },
+        .{ .verbose = false, .stdin = stdin, .stdout = stdout, .stderr = stderr },
         document_store,
         &context,
     );

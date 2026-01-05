@@ -8,7 +8,7 @@ const runic = @import("runic");
 pub fn dispatch(
     allocator: Allocator,
     config: utils.CliConfig,
-    // stdin: *std.Io.Reader,
+    stdin: *std.Io.Reader,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
 ) !runic.command_runner.ExitCode {
@@ -17,7 +17,7 @@ pub fn dispatch(
             allocator,
             script,
             config,
-            // stdin,
+            stdin,
             stdout,
             stderr,
         ),

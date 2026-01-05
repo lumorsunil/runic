@@ -11,8 +11,8 @@ const ExitCode = @import("runtime/command_runner.zig").ExitCode;
 const rainbow = @import("rainbow.zig");
 const TraceWriter = @import("trace-writer.zig").TraceWriter;
 
-const log_enabled = false;
-const log_writer_enabled = true;
+const log_enabled = true;
+const log_writer_enabled = false;
 
 const prefix_color = rainbow.beginColor(.indigo);
 const source_color = rainbow.beginColor(.green);
@@ -506,12 +506,27 @@ pub const ReaderWriterStream = struct {
             return .closed;
         }
 
+        std.log.debug("DO WE GET HERE?", .{});
+
+        if (self.destination) |destination| {
+            if (destination.isClosed()) {
+                _ = source.close();
+                return .closed;
+            }
+        }
+
         const bytes_forwarded = source.reader.stream(
             &self.writer,
             limit,
         ) catch |err| switch (err) {
             error.EndOfStream => {
-                log(self, "ended stream", .{});
+                log(self, "source ended stream", .{});
+                _ = self.source.?.close();
+                if (self.destination) |d| _ = d.close();
+                return .closed;
+            },
+            error.WriteFailed => {
+                log(self, "destination closed", .{});
                 _ = self.source.?.close();
                 if (self.destination) |d| _ = d.close();
                 return .closed;

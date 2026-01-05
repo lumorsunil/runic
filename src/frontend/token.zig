@@ -68,6 +68,10 @@ pub const Span = struct {
         return self.start.line <= line and self.end.line >= line;
     }
 
+    pub fn containsLine(self: Span, line: usize) bool {
+        return self.start.line <= line and self.end.line >= line;
+    }
+
     pub fn sliceFrom(self: Span, source: []const u8) []const u8 {
         return source[self.start.offset..self.end.offset];
     }

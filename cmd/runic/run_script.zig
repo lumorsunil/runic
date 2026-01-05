@@ -25,7 +25,7 @@ pub fn runScript(
     allocator: Allocator,
     script: utils.CliConfig.ScriptInvocation,
     config: utils.CliConfig,
-    // stdin: *std.Io.Reader,
+    stdin: *std.Io.Reader,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
 ) !ExitCode {
@@ -82,22 +82,6 @@ pub fn runScript(
         return .success;
     }
 
-    if (config.enable_ir) {
-        if (config.debug_ir) {
-            return ir.runner.debugIR(
-                allocator,
-                &entryDocument.ast.?,
-                &document_store.document_store,
-            );
-        } else {
-            return ir.runner.runIR(
-                allocator,
-                .{ .verbose = config.verbose },
-                &entryDocument.ast.?,
-            );
-        }
-    }
-
     if (!config.skip_type_check) {
         var type_checker = TypeChecker.init(allocator, &document_store.document_store);
         defer type_checker.deinit();
@@ -117,11 +101,14 @@ pub fn runScript(
     const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(cwd);
 
+    // var stub_stdin_reader = std.Io.Reader.fixed(&.{});
+
     const stdout_stream = try Stream(u8).initReaderWriter(allocator, "<<<stdout_pipe>>>");
     defer stdout_stream.stream.deinit();
     const stderr_stream = try Stream(u8).initReaderWriter(allocator, "<<<stderr_pipe>>>");
     defer stderr_stream.stream.deinit();
 
+    var stdin_closeable = closeable.NeverCloses(ExitCode){ .label = "<<<stdin>>>" };
     var stdout_closeable = closeable.NeverCloses(ExitCode){ .label = "<<<stdout>>>" };
     var stderr_closeable = closeable.NeverCloses(ExitCode){ .label = "<<<stderr>>>" };
 
@@ -130,6 +117,10 @@ pub fn runScript(
     var wrapped_stdout = TraceWriter.init(&wrapped_stdout_buffer, stdout, "<<<t_stdout>>>");
     var wrapped_stderr = TraceWriter.init(&wrapped_stderr_buffer, stderr, "<<<t_stderr>>>");
 
+    const stdin_closeable_reader = closeable.CloseableReader(ExitCode).init(
+        stdin,
+        &stdin_closeable.closeable,
+    );
     const stdout_closeable_writer = closeable.CloseableWriter(ExitCode).init(
         &wrapped_stdout.writer,
         &stdout_closeable.closeable,
@@ -144,6 +135,31 @@ pub fn runScript(
 
     log("stdout >>> {*}", .{&wrapped_stdout.writer});
     log("stderr >>> {*}", .{&wrapped_stderr.writer});
+
+    if (config.enable_ir) {
+        if (config.debug_ir) {
+            return ir.runner.debugIR(
+                allocator,
+                &entryDocument.ast.?,
+                &document_store.document_store,
+                stdin_closeable_reader,
+                stdout_closeable_writer,
+                stderr_closeable_writer,
+            );
+        } else {
+            return ir.runner.runIR(
+                allocator,
+                &document_store.document_store,
+                &entryDocument.ast.?,
+                .{
+                    .verbose = config.verbose,
+                    .stdin = stdin_closeable_reader,
+                    .stdout = stdout_closeable_writer,
+                    .stderr = stderr_closeable_writer,
+                },
+            );
+        }
+    }
 
     const executeOptions = ScriptExecutor.ExecuteOptions.init(
         script.path,

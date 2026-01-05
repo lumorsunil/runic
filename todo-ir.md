@@ -12,7 +12,9 @@
 - [ ] pipe
   - [ ] generic sources/destinations
     - [ ] executable (file handle)
-    - [ ]
+    - [ ] blocks
+    - [ ] function calls
+    - [ ] values
 - [ ] blocks
 - [ ] blocks as pipes
 

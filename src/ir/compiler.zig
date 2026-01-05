@@ -3,8 +3,17 @@ const Allocator = std.mem.Allocator;
 const ir = @import("../ir.zig");
 const ast = @import("../frontend/ast.zig");
 const ExitCode = @import("../runtime/command_runner.zig").ExitCode;
+const rainbow = @import("../rainbow.zig");
+const DocumentStore = @import("../document_store.zig").DocumentStore;
+const Stream = @import("../stream.zig").Stream;
+const RCError = @import("../mem/rc.zig").RCError;
 const page_size = ir.context.page_size;
 const stack_start = ir.context.stack_start;
+
+const logging_name = "COMPILER";
+const prefix_color = rainbow.beginColor(.blue);
+const span_color = rainbow.beginBgColor(.green) ++ rainbow.beginColor(.black);
+const end_color = rainbow.endColor();
 
 pub const Error =
     Allocator.Error ||
@@ -13,6 +22,8 @@ pub const Error =
     GetFrameError ||
     ir.Location.Error ||
     ir.Value.ToStreamError ||
+    DocumentStore.Error ||
+    RCError ||
     error{
         UnsupportedExpression,
         UnsupportedBindingPattern,
@@ -20,6 +31,7 @@ pub const Error =
         UnsupportedCalleeExpression,
         UnsupportedExitCodeExpression,
         UnsupportedAddrType,
+        UnsupportedBinaryOperation,
         DataTooLargeToFitInPage,
         ScopeNotFound,
         LabelAddrNotSet,
@@ -241,19 +253,28 @@ pub const IRCompiler = struct {
     script: *ast.Script,
     scopes: Scope = .init(),
     data: IRData = .init(),
-    instructions: InstructionSet = .init(),
+    instruction_sets: std.ArrayList(InstructionSet) = .empty,
+    current_instruction_set: usize = 0,
     refs: Refs = .init(),
     labels: ir.Labels = .init(),
     struct_types: std.ArrayList(ir.Value.Struct.Type) = .empty,
+    document_store: *DocumentStore,
+    logging_enabled: bool,
 
     pub fn init(
         allocator: Allocator,
+        document_store: *DocumentStore,
         script: *ast.Script,
     ) Allocator.Error!@This() {
+        const logging_enabled_s = std.process.getEnvVarOwned(allocator, "RUNIC_LOG_" ++ logging_name) catch null;
+        const logging_enabled = if (logging_enabled_s) |le| std.mem.eql(u8, le, "1") else false;
+
         return .{
             .allocator = allocator,
             .script = script,
             .struct_types = .fromOwnedSlice(try internalStructTypes(allocator)),
+            .document_store = document_store,
+            .logging_enabled = logging_enabled,
         };
     }
 
@@ -291,22 +312,38 @@ pub const IRCompiler = struct {
         } };
     }
 
-    pub fn addInstruction(self: *@This(), instruction: ir.Instruction) Allocator.Error!void {
-        try self.instructions.add(self.allocator, instruction);
+    pub fn addInstructionSet(self: *@This()) Allocator.Error!usize {
+        try self.instruction_sets.append(self.allocator, .init());
+        return self.instruction_sets.items.len - 1;
     }
 
-    pub fn currentAddr(self: @This()) ir.InstructionAddr {
-        const abs = self.instructions.instructions.items.len;
-        return .{ .abs = abs };
+    pub fn addInstruction(
+        self: *@This(),
+        instruction: ir.Instruction,
+    ) Allocator.Error!void {
+        try self.instruction_sets.items[self.current_instruction_set].add(
+            self.allocator,
+            instruction,
+        );
+    }
+
+    pub fn currentAddr(self: @This()) ir.ResolvedInstructionAddr {
+        const abs = self.instruction_sets.items[self.current_instruction_set].instructions.items.len;
+        return .init(self.current_instruction_set, abs);
     }
 
     const SetLabelAddr = union(enum) { unknown, abs };
 
-    fn getAddr(self: @This(), addr: SetLabelAddr) ?usize {
+    fn getAddr(self: @This(), addr: SetLabelAddr) ?ir.ResolvedInstructionAddr {
         return switch (addr) {
             .unknown => null,
-            .abs => self.currentAddr().abs,
+            .abs => self.currentAddr(),
         };
+    }
+
+    fn getLocalAddr(self: @This(), addr: SetLabelAddr) ?usize {
+        const addr_ = self.getAddr(addr) orelse return null;
+        return addr_.local_addr;
     }
 
     pub fn newLabel(
@@ -314,8 +351,11 @@ pub const IRCompiler = struct {
         name: []const u8,
         addr: SetLabelAddr,
     ) Allocator.Error!ir.InstructionAddr {
-        const label_addr = self.getAddr(addr);
-        return .{ .label = try self.labels.new(self.allocator, name, label_addr) };
+        const label_addr = self.getLocalAddr(addr);
+        return .initLabel(
+            self.current_instruction_set,
+            try self.labels.new(self.allocator, name, label_addr),
+        );
     }
 
     pub fn setLabel(
@@ -323,7 +363,7 @@ pub const IRCompiler = struct {
         label: ir.InstructionAddr.LabelKey,
         addr: SetLabelAddr,
     ) Allocator.Error!void {
-        const label_addr = self.getAddr(addr);
+        const label_addr = self.getLocalAddr(addr);
         return self.labels.set(self.allocator, label, label_addr);
     }
 
@@ -406,11 +446,42 @@ pub const IRCompiler = struct {
         }));
     }
 
-    pub fn call_(
+    pub fn exec_(
         self: *IRCompiler,
         source: anytype,
+        result: ?ir.Location,
+        sync: bool,
     ) Error!void {
-        return self.addInstruction(.init(.from(source), .call));
+        return self.addInstruction(.init(.from(source), .{ .exec = .{
+            .result = result,
+            .sync = sync,
+        } }));
+    }
+
+    pub fn fork(
+        self: *IRCompiler,
+        source: anytype,
+        result: ?ir.Location,
+        dest: ir.InstructionAddr,
+        stdin: ir.Location,
+        stdout: ir.Location,
+        stderr: ir.Location,
+    ) Error!void {
+        return self.addInstruction(.init(.from(source), .fork_(
+            result,
+            dest,
+            stdin,
+            stdout,
+            stderr,
+        )));
+    }
+
+    pub fn wait(self: *IRCompiler, source: anytype, waitee: ir.Location) Error!void {
+        return self.addInstruction(.init(.from(source), .wait_(waitee)));
+    }
+
+    pub fn stream(self: *IRCompiler, source: anytype, streamee: ir.Location) Error!void {
+        return self.addInstruction(.init(.from(source), .stream_(streamee)));
     }
 
     pub fn exit_(
@@ -440,17 +511,26 @@ pub const IRCompiler = struct {
         try self.validateNoUnknownLabels();
         self.labels.sort();
 
+        const instructions = try self.allocator.alloc([]const ir.Instruction, self.instruction_sets.items.len);
+        for (instructions, self.instruction_sets.items) |*dest, *src| {
+            dest.* = try src.toOwnedSlice(self.allocator);
+        }
+
         return .{
             .data = try self.data.toOwnedSlice(self.allocator),
-            .instructions = try self.instructions.toOwnedSlice(self.allocator),
+            .instructions = instructions,
             .labels = .{ .map = self.labels.map.move() },
             .struct_types = try self.struct_types.toOwnedSlice(self.allocator),
         };
     }
 
     pub fn compile(self: *IRCompiler) Error!ir.context.IRSharedContext {
+        self.current_instruction_set = try self.addInstructionSet();
+
         try self.scopes.pushBindings(self.allocator);
         defer self.scopes.popFrame();
+
+        try self.compileInitial();
 
         for (self.script.statements) |stmt| {
             _ = try self.compileStatement(stmt);
@@ -461,17 +541,85 @@ pub const IRCompiler = struct {
         return self.toIRContext();
     }
 
-    fn compileStatement(self: *IRCompiler, stmt: *ast.Statement) Error!Result {
-        return switch (stmt.*) {
-            .type_binding_decl => .fromValue(.void),
+    fn compileInitial(self: *@This()) Error!void {
+        const stdin = try Stream(u8).initReaderWriter(
+            self.allocator,
+            "@stdin",
+        );
+        const stdout = try Stream(u8).initReaderWriter(
+            self.allocator,
+            "@stdout",
+        );
+        const stderr = try Stream(u8).initReaderWriter(
+            self.allocator,
+            "stderr",
+        );
+
+        try self.push(null, .{
+            .pipe = stdin,
+        });
+        try self.push(null, .{
+            .pipe = stdout,
+        });
+        try self.push(null, .{
+            .pipe = stderr,
+        });
+
+        const stdin_set = try self.addInstructionSet();
+        const stdout_set = try self.addInstructionSet();
+        const stderr_set = try self.addInstructionSet();
+
+        const prev_instr_set = self.current_instruction_set;
+
+        self.current_instruction_set = stdin_set;
+        try self.stream(null, self.threadStdin());
+
+        self.current_instruction_set = stdout_set;
+        try self.stream(null, self.threadStdout());
+
+        self.current_instruction_set = stderr_set;
+        try self.stream(null, self.threadStderr());
+
+        self.current_instruction_set = prev_instr_set;
+
+        try self.addInstruction(.init(null, .fwd_stdio));
+
+        try self.fork(null, null, .initAbs(stdin_set, 0), self.threadStdin(), self.threadStdout(), self.threadStderr());
+        try self.fork(null, null, .initAbs(stdout_set, 0), self.threadStdin(), self.threadStdout(), self.threadStderr());
+        try self.fork(null, null, .initAbs(stderr_set, 0), self.threadStdin(), self.threadStdout(), self.threadStderr());
+    }
+
+    fn compileStatement(
+        self: *IRCompiler,
+        stmt: *ast.Statement,
+    ) Error!Result {
+        const result: Result = try switch (stmt.*) {
+            .type_binding_decl => Result.fromValue(.void),
             .binding_decl => |*b| self.compileBindingDecl(b),
             .return_stmt => |r| self.compileReturn(stmt, r),
             .expression => |expr| self.compileExpression(expr.expression),
             else => Error.UnsupportedExpression,
         };
+
+        if (isWaitable(result)) {
+            try self.wait(stmt, .{ .ref = .{ .addr = result.value.addr, .name = "<unknown_thread>" } });
+        }
+
+        return result;
     }
 
-    fn compileReturn(self: *IRCompiler, source: *ast.Statement, r: ast.ReturnStmt) Error!Result {
+    fn isWaitable(result: Result) bool {
+        return switch (result.value) {
+            .addr => true,
+            else => false,
+        };
+    }
+
+    fn compileReturn(
+        self: *IRCompiler,
+        source: *ast.Statement,
+        r: ast.ReturnStmt,
+    ) Error!Result {
         const result: Result = if (r.value) |value| try self.compileExpression(value) else .fromValue(.{ .exit_code = .success });
         try self.exit_(source, result);
         return .fromValue(.void);
@@ -513,12 +661,17 @@ pub const IRCompiler = struct {
         };
     }
 
-    fn compileExpression(self: *IRCompiler, expr: *ast.Expression) Error!Result {
+    fn compileExpression(
+        self: *IRCompiler,
+        expr: *ast.Expression,
+    ) Error!Result {
         return switch (expr.*) {
             .literal => |literal| self.compileLiteral(literal),
             .identifier => |identifier| self.compileIdentifier(identifier),
             .call => |call| self.compileCall(expr, call),
             .if_expr => |if_expr| self.compileIf(expr, if_expr),
+            .pipeline => |pipeline| self.compilePipeline(expr, pipeline),
+            // .binary => |binary| self.compileBinary(expr, binary),
             else => Error.UnsupportedExpression,
         };
     }
@@ -545,25 +698,28 @@ pub const IRCompiler = struct {
             return .fromValue(try self.addSlice(1, string_literal.segments[0].text.payload));
         }
 
-        const stream = try self.allocator.alloc(ir.Value, string_literal.segments.len);
+        const s_tream = try self.allocator.alloc(ir.Value, string_literal.segments.len);
 
         for (string_literal.segments, 0..) |segment, i| switch (segment) {
             .text => |text| {
-                stream[i] = try self.addSlice(1, text.payload);
+                s_tream[i] = try self.addSlice(1, text.payload);
             },
             .interpolation => |interp| {
-                stream[i] = (try self.compileExpression(interp)).value;
+                s_tream[i] = (try self.compileExpression(interp)).value;
             },
         };
 
-        return .fromValue(.{ .stream = stream });
+        return .fromValue(.{ .stream = s_tream });
     }
 
     fn parseInt(text: []const u8) std.fmt.ParseIntError!ir.Value {
         return .{ .uinteger = try std.fmt.parseInt(usize, text, 10) };
     }
 
-    fn compileIdentifier(self: *IRCompiler, identifier: ast.Identifier) Error!Result {
+    fn compileIdentifier(
+        self: *IRCompiler,
+        identifier: ast.Identifier,
+    ) Error!Result {
         const binding = self.lookup(identifier.name) orelse {
             const executable = try self.addSlice(1, identifier.name);
             return .fromValue(executable);
@@ -584,7 +740,7 @@ pub const IRCompiler = struct {
                 callee.value,
                 call.arguments,
             ),
-            .stream, .addr, .void, .uinteger, .strct, .exit_code => .fromValue(callee.value),
+            .stream, .addr, .void, .uinteger, .strct, .exit_code, .pipe, .thread, .closeable => .fromValue(callee.value),
         };
     }
 
@@ -616,27 +772,56 @@ pub const IRCompiler = struct {
         return self.allocator.dupe(ir.Value, &.{argv});
     }
 
+    fn threadStdin(_: *IRCompiler) ir.Location {
+        return .{ .stack = 0 };
+    }
+
+    fn threadStdout(_: *IRCompiler) ir.Location {
+        return .{ .stack = 1 };
+    }
+
+    fn threadStderr(_: *IRCompiler) ir.Location {
+        return .{ .stack = 2 };
+    }
+
     fn compileExecutableCall(
         self: *IRCompiler,
         source: *ast.Expression,
         executable: ir.Value,
         arguments: []const *ast.Expression,
     ) Error!Result {
-        const context = try self.newRef(source, "executable_call_context");
+        const thread_ref = try self.newRef(source, "exec_thread");
 
         const args_temp = try self.compileExpressions(arguments);
         defer self.allocator.free(args_temp);
         const fields = try self.allocExecutableCallContextFields(executable, args_temp);
         errdefer self.allocator.free(fields);
 
-        try self.set(source, context, .{ .strct = .{
+        const exec_instr_set = try self.addInstructionSet();
+
+        try self.fork(
+            source,
+            thread_ref,
+            .initAbs(exec_instr_set, 0),
+            self.threadStdin(),
+            self.threadStdout(),
+            self.threadStderr(),
+        );
+
+        const prev_instr_set = self.current_instruction_set;
+        self.current_instruction_set = exec_instr_set;
+
+        const ref = try self.newRef(source, "closeable_process");
+        try self.push(source, .{ .strct = .{
             .type = try self.getStructType("ExecutableCallContext"),
             .fields = fields,
         } });
-        try self.pushLocation(source, context);
-        try self.call_(source);
+        try self.exec_(source, ref, false);
+        try self.wait(source, ref);
 
-        return .fromValue(.void);
+        self.current_instruction_set = prev_instr_set;
+
+        return .fromLocation(thread_ref);
     }
 
     fn compileIf(
@@ -665,13 +850,13 @@ pub const IRCompiler = struct {
         const then = try self.compileExpression(if_expr.then_expr);
         try self.set(source, result, then.value);
         try self.jmp(source, null, false, after_addr);
-        try self.setLabel(else_addr.label, .abs);
+        try self.setLabel(else_addr.local_addr.label, .abs);
         const else_ = try switch (else_branch) {
             .expr => |expr_| self.compileExpression(expr_),
             .if_expr => |if_expr_| self.compileIf(source, if_expr_.*),
         };
         try self.set(source, result, else_.value);
-        try self.setLabel(after_addr.label, .abs);
+        try self.setLabel(after_addr.local_addr.label, .abs);
         return .fromLocation(result);
     }
 
@@ -687,7 +872,116 @@ pub const IRCompiler = struct {
         try self.jmp(source, condition, false, after_addr);
         const then = try self.compileExpression(if_expr.then_expr);
         try self.set(source, result, then.value);
-        try self.setLabel(after_addr.label, .abs);
+        try self.setLabel(after_addr.local_addr.label, .abs);
         return .fromLocation(result);
+    }
+
+    fn compilePipeline(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        pipeline: ast.Pipeline,
+    ) Error!Result {
+        _ = self; // autofix
+        _ = source; // autofix
+        _ = pipeline; // autofix
+        return .fromValue(.void);
+    }
+
+    // fn compileBinary(
+    //     self: *IRCompiler,
+    //     source: *ast.Expression,
+    //     binary: ast.BinaryExpr,
+    // ) Error!Result {
+    //     switch (binary.op) {
+    //         .apply, .pipe => {
+    //             try self.log(@src().fn_name ++ ": error, encountered {t} binary expression", .{binary.op});
+    //             try self.logEvaluateSpan(binary.span);
+    //         },
+    //         else => {},
+    //     }
+    //
+    //     return Error.UnsupportedBinaryOperation;
+    // }
+
+    pub fn log(self: *@This(), comptime fmt: []const u8, args: anytype) !void {
+        if (@hasField(@This(), "logging_enabled")) {
+            if (!self.logging_enabled) return;
+        }
+
+        var stderr = std.fs.File.stderr().writer(&.{});
+        const writer = &stderr.interface;
+
+        try writer.print("[{s}{*}{s}]\n", .{ prefix_color, self, end_color });
+        // try writer.print("{s}:\n", .{self.path});
+        try writer.print(fmt ++ "\n", args);
+    }
+
+    pub fn logWithoutPrefix(self: *@This(), comptime fmt: []const u8, args: anytype) !void {
+        if (@hasField(@This(), "logging_enabled")) {
+            if (!self.logging_enabled) return;
+        }
+
+        var stderr = std.fs.File.stderr().writer(&.{});
+        const writer = &stderr.interface;
+
+        try writer.print(fmt, args);
+    }
+
+    pub fn logEvaluationTrace(self: *@This(), label: []const u8) !void {
+        try self.log("{s}", .{label});
+    }
+
+    pub fn logEvaluateSpan(self: *@This(), span: ast.Span) !void {
+        if (@hasField(@This(), "logging_enabled")) {
+            if (!self.logging_enabled) return;
+        }
+
+        if (span.isGlobal()) {
+            try self.logWithoutPrefix("{s}\n", .{span.start.file});
+            return;
+        }
+
+        const source = try self.document_store.getSource(span.start.file);
+        var lineIt = std.mem.splitScalar(u8, source, '\n');
+        var i: usize = 0;
+        while (lineIt.next()) |line| : (i += 1) {
+            if (i >= span.start.line -| 3 and i <= span.end.line +| 3) {
+                if (span.start.line == i + 1 and span.end.line == i + 1) {
+                    try self.logWithoutPrefix("{:>4}:{s}{s}{s}{s}{s}\n", .{
+                        i + 1,
+                        line[0 .. span.start.column - 1],
+                        span_color,
+                        line[span.start.column - 1 .. span.end.column - 1],
+                        end_color,
+                        line[span.end.column - 1 ..],
+                    });
+                } else if (span.start.line == i + 1) {
+                    try self.logWithoutPrefix("{:>4}:{s}{s}{s}{s}\n", .{
+                        i + 1,
+                        line[0 .. span.start.column - 1],
+                        span_color,
+                        line[span.start.column - 1 ..],
+                        end_color,
+                    });
+                } else if (span.end.line == i + 1) {
+                    try self.logWithoutPrefix("{:>4}:{s}{s}{s}{s}\n", .{
+                        i + 1,
+                        span_color,
+                        line[0 .. span.end.column - 1],
+                        end_color,
+                        line[span.end.column - 1 ..],
+                    });
+                } else if (span.start.line - 1 <= i and i <= span.end.line - 1) {
+                    try self.logWithoutPrefix("{:>4}:{s}{s}{s}\n", .{
+                        i + 1,
+                        span_color,
+                        line,
+                        end_color,
+                    });
+                } else {
+                    try self.logWithoutPrefix("{:>4}:{s}\n", .{ i + 1, line });
+                }
+            }
+        }
     }
 };

@@ -2,6 +2,7 @@ const std = @import("std");
 const utils = @import("main-utils.zig");
 const dispatch = @import("dispatch.zig").dispatch;
 const runic = @import("runic");
+const PipeReader = runic.process.PipeReader;
 
 pub fn main() !void {
     const exit_code = mainImpl() catch |err| {
@@ -22,18 +23,22 @@ fn mainImpl() !runic.command_runner.ExitCode {
 
     const allocator = gpa.allocator();
 
-    try enableRawMode();
+    const orig_termios = try enableRawMode();
+    defer if (orig_termios) |t| restoreTermios(t) catch |err| {
+        std.log.err("Couldn't restore terminal attributes: {}", .{err});
+    };
 
-    // var stdin_buffer: [1024]u8 = undefined;
+    var stdin_buffer: [1024]u8 = undefined;
     var stdout_buffer: [1024]u8 = undefined;
     var stderr_buffer: [1024]u8 = undefined;
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
 
-    // var stdin_reader = std.fs.File.stdin().readerStreaming(&stdin_buffer);
+    // var stdin_reader = std.fs.File.stdin().reader(&stdin_buffer);
+    var stdin_reader = PipeReader.init(std.fs.File.stdin(), &stdin_buffer);
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
-    // const stdin = &stdin_reader.interface;
+    const stdin = &stdin_reader.reader;
     const stdout = &stdout_writer.interface;
     const stderr = &stderr_writer.interface;
     defer stdout.flush() catch {};
@@ -60,7 +65,7 @@ fn mainImpl() !runic.command_runner.ExitCode {
             return try dispatch(
                 allocator,
                 config,
-                // stdin,
+                stdin,
                 stdout,
                 stderr,
             );
@@ -70,12 +75,13 @@ fn mainImpl() !runic.command_runner.ExitCode {
     return .success;
 }
 
-fn enableRawMode() !void {
+fn enableRawMode() !?std.posix.termios {
     const stdin = std.fs.File.stdin();
     const is_tty = stdin.isTty();
-    if (!is_tty) return;
+    if (!is_tty) return null;
     if (@import("builtin").os.tag != .linux) return;
     var raw = try std.posix.tcgetattr(stdin.handle);
+    const orig = raw;
     raw.iflag.BRKINT = true;
     raw.iflag.ICRNL = true;
     raw.iflag.INPCK = false;
@@ -94,4 +100,13 @@ fn enableRawMode() !void {
     raw.lflag.IEXTEN = false;
     raw.lflag.ISIG = true;
     try std.posix.tcsetattr(stdin.handle, .FLUSH, raw);
+    return orig;
+}
+
+fn restoreTermios(termios: std.posix.termios) !void {
+    const stdin = std.fs.File.stdin();
+    const is_tty = stdin.isTty();
+    if (!is_tty) return;
+    if (@import("builtin").os.tag != .linux) return;
+    try std.posix.tcsetattr(stdin.handle, .FLUSH, termios);
 }

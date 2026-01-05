@@ -10,13 +10,85 @@ pub const Instruction = struct {
     source: ?Source,
     type: Type,
 
+    pub const Type = union(enum) {
+        /// forward program stdin, stdout and stderr
+        fwd_stdio,
+        /// push a Value to the stack
+        push: Value,
+        /// pop a Value from the stack
+        pop,
+        /// performs arithmetic operation with a and b and stores the result into result
+        ath: Ath,
+        /// compares a with b and stores the result into result
+        cmp: Cmp,
+        /// performs logical operator with a and b and stores the result into result
+        log: Log,
+        /// declares a new ref
+        ref: Ref,
+        /// sets a Location to a Value from a Location
+        set: Set,
+        /// sets the instruction counter if condition is true
+        jmp: Jump,
+        /// spawns a process using argv, env map and cwd from scope
+        exec: Exec,
+        /// spawns a new thread at the given instruction addr
+        fork: Fork,
+        /// forwards a pipe to another pipe
+        fwd: Forward,
+        /// waits for a thread or process to be closed
+        wait: Wait,
+        /// streams a pipe until it is closed, blocking
+        stream: Location,
+        /// exits the process
+        exit: ExitCode,
+
+        pub fn push_(value: Value) @This() {
+            return .{ .push = value };
+        }
+
+        pub fn exit_(exit_code: ExitCode) @This() {
+            return .{ .exit = exit_code };
+        }
+
+        pub fn fork_(
+            result: ?Location,
+            dest: InstructionAddr,
+            stdin: Location,
+            stdout: Location,
+            stderr: Location,
+        ) @This() {
+            return .{ .fork = .{
+                .result = result,
+                .dest = dest,
+                .stdin = stdin,
+                .stdout = stdout,
+                .stderr = stderr,
+            } };
+        }
+
+        pub fn wait_(waitee: Location) @This() {
+            return .{ .wait = .{ .waitee = waitee } };
+        }
+
+        pub fn stream_(streamee: Location) @This() {
+            return .{ .stream = streamee };
+        }
+
+        pub fn format(self: @This(), w: *std.Io.Writer) !void {
+            switch (self) {
+                inline .push, .exit, .jmp, .fork, .set, .ref, .fwd, .wait => |t| try w.print("{t} {f}", .{ self, t }),
+                else => try w.print("{t}", .{self}),
+            }
+        }
+    };
+
     pub const Source = union(enum) {
         expr: *ast.Expression,
         stmt: *ast.Statement,
 
         pub fn from(a: anytype) ?@This() {
             const T = @TypeOf(a);
-            if (T == Source or T == ?Source) {
+            if (T == Source or T == ?Source or T == @TypeOf(null)) {
                 return a;
             } else if (T == *ast.Expression) {
                 return .fromExpr(a);
@@ -60,48 +132,6 @@ pub const Instruction = struct {
         }
     };
 
-    pub const Type = union(enum) {
-        /// pushes a new scope
-        push_scope: Push,
-        /// pops a scope
-        pop_scope,
-        /// push a Value to the stack
-        push: Value,
-        /// pop a Value from the stack
-        pop,
-        /// performs arithmetic operation with a and b and stores the result into result
-        ath: Ath,
-        /// compares a with b and stores the result into result
-        cmp: Cmp,
-        /// performs logical operator with a and b and stores the result into result
-        log: Log,
-        /// declares a new ref
-        ref: Ref,
-        /// sets a Location to a Value from a Location
-        set: Set,
-        /// sets the instruction counter if condition is true
-        jmp: Jump,
-        /// spawns a process using argv, env map and cwd from scope
-        call,
-        /// exits the process
-        exit: ExitCode,
-
-        pub fn push_(value: Value) @This() {
-            return .{ .push = value };
-        }
-
-        pub fn exit_(exit_code: ExitCode) @This() {
-            return .{ .exit = exit_code };
-        }
-
-        pub fn format(self: @This(), w: *std.Io.Writer) !void {
-            switch (self) {
-                inline .push, .exit, .jmp, .set, .ref => |t| try w.print("{t} {f}", .{ self, t }),
-                else => try w.print("{t}", .{self}),
-            }
-        }
-    };
-
     pub fn init(source: ?Source, type_: Type) @This() {
         return .{ .source = source, .type = type_ };
     }
@@ -110,13 +140,6 @@ pub const Instruction = struct {
         const source = self.source orelse return null;
         return source.span();
     }
-
-    pub const Push = union(enum) {
-        bindings,
-        blocking,
-        processes,
-        allocating,
-    };
 
     pub fn BinaryOperation(comptime OpType: type) type {
         return struct {
@@ -162,6 +185,51 @@ pub const Instruction = struct {
             } else {
                 try w.print("(true) {f}", .{self.dest});
             }
+        }
+    };
+
+    pub const Exec = struct {
+        result: ?Location,
+        sync: bool,
+
+        pub fn format(self: @This(), w: *std.Io.Writer) !void {
+            if (self.sync) try w.writeAll("sync");
+            if (!self.sync) try w.writeAll("async");
+        }
+    };
+
+    pub const Fork = struct {
+        result: ?Location,
+        dest: InstructionAddr,
+        stdin: Location,
+        stdout: Location,
+        stderr: Location,
+
+        pub fn format(self: @This(), w: *std.Io.Writer) !void {
+            try w.print("{f} {f} {f} {f}", .{ self.dest, self.stdin, self.stdout, self.stderr });
+        }
+    };
+
+    pub const Forward = struct {
+        source: Location,
+        destination: Location,
+
+        pub fn format(
+            self: @This(),
+            writer: *std.Io.Writer,
+        ) std.Io.Writer.Error!void {
+            try writer.print("{f} {f}", .{ self.source, self.destination });
+        }
+    };
+
+    pub const Wait = struct {
+        waitee: Location,
+
+        pub fn format(
+            self: @This(),
+            writer: *std.Io.Writer,
+        ) std.Io.Writer.Error!void {
+            try writer.print("{f}", .{self.waitee});
         }
     };
 

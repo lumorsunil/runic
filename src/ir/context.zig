@@ -4,6 +4,7 @@ const Value = @import("value.zig").Value;
 const Location = @import("location.zig").Location;
 const Labels = @import("labels.zig").Labels;
 const Instruction = @import("instruction.zig").Instruction;
+const ResolvedInstructionAddr = @import("instruction-addr.zig").ResolvedInstructionAddr;
 const ExitCode = @import("../runtime/command_runner.zig").ExitCode;
 
 pub const page_size = 1024 * 4;
@@ -42,7 +43,7 @@ pub const IRProgramContext = struct {
         return self.shared.struct_types;
     }
 
-    pub fn instructions(self: @This()) []const Instruction {
+    pub fn instructions(self: @This()) []const []const Instruction {
         return self.shared.instructions;
     }
 
@@ -98,22 +99,35 @@ pub const IRProgramContext = struct {
     pub const AdvanceEvent = enum { cont, quit };
 
     pub fn advanceThreadCounter(self: *@This()) AdvanceEvent {
-        while (true) {
-            self.thread_counter += 1;
-            if (self.thread_counter >= self.threads.items.len) break;
-            if (self.isThreadActive(self.getCurrentThread().id)) break;
+        self.thread_counter += 1;
+        if (self.getNextActiveThread()) |thread_counter| {
+            self.thread_counter = thread_counter;
+            return .cont;
         }
-        if (self.thread_counter < self.threads.items.len) return .cont;
 
-        self.removeThreads();
+        self.removeThreadsSlatedToBeRemoved();
+
         self.thread_counter = 0;
+        if (self.getNextActiveThread()) |thread_counter| {
+            self.thread_counter = thread_counter;
+            return .cont;
+        }
 
         if (self.threads.items.len > 0) return .cont;
 
         return .quit;
     }
 
-    fn isThreadActive(self: @This(), id: ThreadId) bool {
+    fn getNextActiveThread(self: @This()) ?usize {
+        var i = self.thread_counter;
+
+        while (true) : (i += 1) {
+            if (i >= self.threads.items.len) return null;
+            if (self.isThreadActive(self.threads.items[i].id)) return i;
+        }
+    }
+
+    pub fn isThreadActive(self: @This(), id: ThreadId) bool {
         const thread = self.getThreadContext(id) orelse return false;
         if (self.threads_to_remove.contains(thread.id)) return false;
         self.processWaitingFor(thread);
@@ -121,22 +135,19 @@ pub const IRProgramContext = struct {
         return true;
     }
 
+    pub fn isThreadClosed(self: @This(), id: ThreadId) bool {
+        return self.getThreadContext(id) == null or self.threads_to_remove.contains(id);
+    }
+
     fn processWaitingFor(self: @This(), thread: IRThreadContext) void {
         if (thread.private.waiting_for) |waiting_for| {
-            if (self.threads_to_remove.contains(waiting_for)) {
+            if (self.isThreadClosed(waiting_for)) {
                 thread.private.waiting_for = null;
-                return;
             }
-
-            for (self.threads.items) |t| if (t.id == waiting_for) {
-                return;
-            };
-
-            thread.private.waiting_for = null;
         }
     }
 
-    fn removeThreads(self: *@This()) void {
+    fn removeThreadsSlatedToBeRemoved(self: *@This()) void {
         defer self.threads_to_remove.clearRetainingCapacity();
         for (self.threads_to_remove.keys()) |id| {
             for (self.threads.items, 0..) |item, i| {
@@ -176,11 +187,35 @@ pub const IRThreadContext = struct {
         };
     }
 
+    pub fn getCurrentInstructionAddr(self: @This()) ResolvedInstructionAddr {
+        return self.private.instruction_counter;
+    }
+
+    fn getInstructionSet(self: @This(), addr: ResolvedInstructionAddr) []const Instruction {
+        return self.shared.instructions[addr.instr_set];
+    }
+
+    fn getCurrentInstructionSet(self: @This()) []const Instruction {
+        return self.getInstructionSet(self.getCurrentInstructionAddr());
+    }
+
+    pub fn getInstruction(self: @This(), addr: ResolvedInstructionAddr) Instruction {
+        return self.getInstructionSet(addr)[addr.local_addr];
+    }
+
     pub fn currentInstruction(self: @This()) ?Instruction {
-        if (self.shared.instructions.len <= self.private.instruction_counter) {
+        if (self.getCurrentInstructionSet().len <= self.getCurrentInstructionAddr().local_addr) {
             return null;
         }
-        return self.shared.instructions[self.private.instruction_counter];
+        return self.getInstruction(self.getCurrentInstructionAddr());
+    }
+
+    pub fn incInstructionCounter(self: @This()) void {
+        self.private.instruction_counter.inc();
+    }
+
+    pub fn setInstructionCounter(self: @This(), instr_counter: ResolvedInstructionAddr) void {
+        self.private.instruction_counter = instr_counter;
     }
 
     pub fn waitFor(self: @This(), id: ThreadId) void {
@@ -189,8 +224,17 @@ pub const IRThreadContext = struct {
 
     pub fn wait(self: @This()) std.process.Child.WaitError!ExitCode {
         defer self.private.process = null;
-        if (self.private.process) |*p| return .fromTerm(try p.wait());
+        // TODO: translate wait error to exit code
+        if (self.private.process) |p| return .fromTerm(try p.wait());
         return .success;
+    }
+
+    pub fn refs(self: @This()) *std.AutoArrayHashMapUnmanaged(usize, Value) {
+        return &self.shared.refs;
+    }
+
+    pub fn getRefValue(self: @This(), addr: usize) Value {
+        return self.shared.refs.get(addr).?;
     }
 };
 
@@ -203,9 +247,10 @@ pub const IRPipeThreadContext = struct {
 
 pub const IRSharedContext = struct {
     data: []const []const u8,
-    instructions: []const Instruction,
+    instructions: []const []const Instruction,
     labels: Labels,
     struct_types: []const Value.Struct.Type,
+    refs: std.AutoArrayHashMapUnmanaged(usize, Value) = .empty,
 
     pub fn dataSize(self: @This()) usize {
         if (self.data.len == 0) return 0;
@@ -218,7 +263,7 @@ pub const IRSharedContext = struct {
         if (addr < data_end) {
             return .{ .data = .fromAddr(addr) };
         } else if (addr >= stack_start) {
-            return .{ .stack = stack_start - addr };
+            return .{ .stack = addr - stack_start };
         } else {
             return .{ .ref = .{ .addr = addr } };
         }
@@ -226,10 +271,9 @@ pub const IRSharedContext = struct {
 };
 
 pub const IRPrivateContext = struct {
-    instruction_counter: usize = 0,
+    instruction_counter: ResolvedInstructionAddr = .init(0, 0),
     stack: std.ArrayList(Value) = .empty,
-    refs: std.AutoArrayHashMapUnmanaged(usize, Value) = .empty,
-    process: ?std.process.Child = null,
+    process: ?*std.process.Child = null,
     waiting_for: ?ThreadId = null,
 
     pub fn init() @This() {

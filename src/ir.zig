@@ -6,6 +6,7 @@ pub const Label = @import("ir/labels.zig").Label;
 pub const Labels = @import("ir/labels.zig").Labels;
 pub const context = @import("ir/context.zig");
 pub const InstructionAddr = @import("ir/instruction-addr.zig").InstructionAddr;
+pub const ResolvedInstructionAddr = @import("ir/instruction-addr.zig").ResolvedInstructionAddr;
 pub const Ref = @import("ir/ref.zig").Ref;
 pub const Instruction = @import("ir/instruction.zig").Instruction;
 pub const Value = @import("ir/value.zig").Value;

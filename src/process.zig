@@ -5,7 +5,7 @@ const CloseableWriter = @import("closeable.zig").CloseableWriter;
 const ReaderWriterStream = @import("stream.zig").ReaderWriterStream;
 const ExitCode = @import("runtime/command_runner.zig").ExitCode;
 
-const log_enabled = false;
+const log_enabled = true;
 
 fn log(comptime fmt: []const u8, args: anytype) void {
     if (!log_enabled) return;
@@ -94,7 +94,14 @@ pub const ProcessCloseable = struct {
     fn getResult(self: *Closeable(ExitCode)) ?ExitCode {
         const parent: *@This() = @fieldParentPtr("closeable", self);
         log(@typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{parent.process.argv[0]});
-        return if (parent.process.term) |term| .fromTerm(term) else null;
+        if (parent.process.term) |term| {
+            const exit_code: ExitCode = .fromTerm(term);
+            log("result: {f}", .{exit_code});
+            return exit_code;
+        } else {
+            log("result: null", .{});
+            return null;
+        }
     }
 
     pub fn getLabel(self: *Closeable(ExitCode)) []const u8 {
@@ -192,7 +199,65 @@ pub const ProcessCloseable = struct {
     }
 };
 
-const PipeReader = struct {
+const PipeWriter = struct {
+    file: ?std.fs.File,
+    file_writer: ?std.fs.File.Writer,
+    writer: std.Io.Writer = .{ .vtable = &vtable, .buffer = &.{}, .end = 0 },
+
+    const vtable = std.Io.Writer.VTable{
+        .drain = drain,
+    };
+
+    pub fn init(file: ?std.fs.File, buffer: []u8) PipeWriter {
+        return .{
+            .file = file,
+            .file_writer = if (file) |f| f.writer(buffer) else null,
+        };
+    }
+
+    fn getParent(w: *std.Io.Writer) *PipeWriter {
+        return @fieldParentPtr("writer", w);
+    }
+
+    pub fn drain(
+        w: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
+        const parent = getParent(w);
+        const file = parent.file orelse return 0;
+        const file_writer = if (parent.file_writer) |*fw| fw else return 0;
+
+        var poll_fds = [_]std.posix.pollfd{
+            .{
+                .fd = file.handle,
+                .events = std.posix.POLL.OUT,
+                .revents = 0,
+            },
+        };
+        const poll_fd = &poll_fds[0];
+
+        const result = std.posix.errno(std.posix.poll(&poll_fds, 0) catch return 0);
+        log("poll result: {}", .{result});
+        log("POLLOUT: {}", .{poll_fd.revents & std.posix.POLL.OUT});
+        log("POLLHUP: {}", .{poll_fd.revents & std.posix.POLL.HUP});
+        log("POLLNVAL: {}", .{poll_fd.revents & std.posix.POLL.NVAL});
+        switch (result) {
+            .SUCCESS => {
+                if (poll_fd.revents & std.posix.POLL.OUT > 0) {
+                    return try file_writer.interface.writeSplat(data, splat);
+                } else if (poll_fd.revents & (std.posix.POLL.HUP | std.posix.POLL.NVAL) > 0) {
+                    return error.WriteFailed;
+                }
+
+                return 0;
+            },
+            else => return error.WriteFailed,
+        }
+    }
+};
+
+pub const PipeReader = struct {
     file: ?std.fs.File,
     file_reader: ?std.fs.File.Reader,
     reader: std.Io.Reader = .{ .vtable = &vtable, .buffer = &.{}, .seek = 0, .end = 0 },
@@ -253,6 +318,7 @@ const PipeReader = struct {
 pub const CloseableProcessIo = struct {
     process: *std.process.Child,
     stdin_buffer: [1024]u8 = undefined,
+    // stdin_writer: ?PipeWriter = null,
     stdin_writer: ?std.fs.File.Writer = null,
     stdout_buffer: [1024]u8 = undefined,
     // stdout_reader: ?std.fs.File.Reader = null,
@@ -267,9 +333,8 @@ pub const CloseableProcessIo = struct {
     }
 
     pub fn connect(self: *@This()) void {
+        // if (self.process.stdin) |f| self.stdin_writer = .init(f, &self.stdin_buffer);
         if (self.process.stdin) |f| self.stdin_writer = f.writer(&self.stdin_buffer);
-        // if (self.process.stdout) |f| self.stdout_reader = f.reader(&self.stdout_buffer);
-        // if (self.process.stderr) |f| self.stderr_reader = f.reader(&self.stderr_buffer);
         if (self.process.stdout) |f| self.stdout_reader = .init(f, &self.stdout_buffer);
         if (self.process.stderr) |f| self.stderr_reader = .init(f, &self.stderr_buffer);
         self.process_closeable = .init(self.process);

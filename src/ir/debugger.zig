@@ -31,6 +31,8 @@ pub const IRDebugger = struct {
     command_history: std.ArrayList(Command) = .empty,
     command_history_cursor: ?usize = null,
     command_writer: std.Io.Writer.Allocating,
+    is_continuing: bool = false,
+    breakpoints: std.ArrayList(Breakpoint) = .empty,
 
     pub fn init(
         allocator: Allocator,
@@ -49,26 +51,35 @@ pub const IRDebugger = struct {
     }
 
     pub fn step(self: *IRDebugger) Error!RunningEvent {
-        try self.writeAll("\n");
-
-        const thread = self.evaluator.context.getCurrentThread();
-        const ic = thread.private.instruction_counter;
-        const instruction = thread.shared.instructions[ic];
-        const maybe_span = instruction.span();
-        if (maybe_span) |span| {
-            try self.logEvaluateSpan(span);
-        }
-        try self.print("{}: {f}\n", .{ ic, instruction });
+        try self.printInstruction();
 
         const event = try self.evaluator.step() orelse return .quit;
 
         switch (event) {
-            .cont => return .cont,
+            .cont, .cont_no_instr_counter_inc => return .cont,
             .exit => |exit_code| {
                 try self.print("Program exited with code: {f}", .{exit_code});
                 return .quit;
             },
         }
+    }
+
+    pub fn cont(self: *IRDebugger) Error!RunningEvent {
+        self.is_continuing = true;
+        return .cont;
+    }
+
+    fn printInstruction(self: *IRDebugger) !void {
+        const thread = self.evaluator.context.getCurrentThread();
+        const ic = thread.getCurrentInstructionAddr();
+        const instruction = thread.currentInstruction() orelse {
+            return self.print("{f}: <end>\n", .{ic});
+        };
+        const maybe_span = instruction.span();
+        if (maybe_span) |span| {
+            try self.logEvaluateSpan(span);
+        }
+        try self.print("{f}: {f}\n", .{ ic, instruction });
     }
 
     pub fn run(self: *IRDebugger) Error!ExitCode {
@@ -113,24 +124,34 @@ pub const IRDebugger = struct {
     fn loop(self: *IRDebugger) Error!RunningEvent {
         // try self.printDebugCommandStuff();
 
-        const stdin_reader = self.stdinReader();
+        if (self.is_continuing) {
+            const result = try self.step();
+            if (self.hasBreakpoint(self.evaluator.context.getCurrentThread().getCurrentInstructionAddr())) |bp| {
+                self.is_continuing = false;
+                try self.print("\nStopped at breakpoint: {f}\n\n", .{bp});
+            }
+            return result;
+        } else {
+            const stdin_reader = self.stdinReader();
 
-        var stdin_allocating_writer = AllocatingWriter.init(self.allocator);
-        defer stdin_allocating_writer.deinit();
-        const stdin_writer = stdin_allocating_writer.get();
+            var stdin_allocating_writer = AllocatingWriter.init(self.allocator);
+            defer stdin_allocating_writer.deinit();
+            const stdin_writer = stdin_allocating_writer.get();
 
-        _ = try stdin_reader.stream(&stdin_writer.writer, .unlimited);
+            _ = try stdin_reader.stream(&stdin_writer.writer, .unlimited);
 
-        switch (try self.processStdin(stdin_writer)) {
-            .quit => return .quit,
-            .cont => {},
+            switch (try self.processStdin(stdin_writer)) {
+                .quit => return .quit,
+                .cont => {},
+            }
+            try self.updateCommand(stdin_writer.written());
+
+            return .cont;
         }
-        try self.updateCommand(stdin_writer.written());
-
-        return .cont;
     }
 
     fn updateCommand(self: *IRDebugger, stdin_slice: []const u8) !void {
+        if (stdin_slice.len == 0) return;
         const pos_before = try self.getCursorPosition();
         const end_index = pos_before.col - 1;
         const after_slice = try self.allocator.dupe(
@@ -145,6 +166,37 @@ pub const IRDebugger = struct {
         try self.commandWriter().writeAll(stdin_slice);
         try self.commandWriter().writeAll(after_slice);
         try self.setCursorPosition(pos_after);
+    }
+
+    fn addBreakpoint(
+        self: *IRDebugger,
+        file: []const u8,
+        line: usize,
+        instr_addr: ir.ResolvedInstructionAddr,
+    ) !void {
+        if (self.hasBreakpoint(instr_addr)) |_| return;
+        try self.breakpoints.append(self.allocator, .{
+            .file = file,
+            .line = line,
+            .instr_addr = instr_addr,
+        });
+    }
+
+    fn removeBreakpoint(self: *IRDebugger, instr_addr: ir.ResolvedInstructionAddr) !void {
+        for (self.breakpoints.items, 0..) |bp, i| {
+            if (bp.instr_addr.equals(instr_addr)) {
+                _ = self.breakpoints.swapRemove(i);
+                return;
+            }
+        }
+    }
+
+    fn hasBreakpoint(
+        self: *IRDebugger,
+        instr_addr: ir.ResolvedInstructionAddr,
+    ) ?Breakpoint {
+        for (self.breakpoints.items) |bp| if (bp.instr_addr.equals(instr_addr)) return bp;
+        return null;
     }
 
     const AllocatingWriter = struct {
@@ -423,10 +475,68 @@ pub const IRDebugger = struct {
         try self.command_history.append(self.allocator, command);
         self.command_history_cursor = null;
 
+        try self.writeAll("\n");
+
         switch (command) {
             .quit => return .quit,
             .step => return self.step(),
+            .cont => return self.cont(),
+            .breakpoint => |bp| return self.handleBreakpointCommand(bp),
         }
+    }
+
+    fn handleBreakpointCommand(
+        self: *IRDebugger,
+        command: Command.BreakpointCommand,
+    ) Error!RunningEvent {
+        switch (command) {
+            .add => |bp| {
+                const instr_addr = self.fileAndLineToInstrAddr(bp.file, bp.line) orelse {
+                    try self.print("\nDid not find location to add breakpoint at {s}:{}.\n\n", .{
+                        bp.file,
+                        bp.line,
+                    });
+                    return .cont;
+                };
+                try self.addBreakpoint(bp.file, bp.line, instr_addr);
+                return .cont;
+            },
+            .remove => |bp| {
+                const instr_addr = self.fileAndLineToInstrAddr(bp.file, bp.line) orelse {
+                    try self.print("\nDid not find location to add breakpoint at {s}:{}.\n\n", .{
+                        bp.file,
+                        bp.line,
+                    });
+                    return .cont;
+                };
+                try self.removeBreakpoint(instr_addr);
+                return .cont;
+            },
+            .list => {
+                for (self.breakpoints.items) |bp| {
+                    try self.print("\n{s}:{} {f}", .{ bp.file, bp.line, bp.instr_addr });
+                }
+                try self.writeAll("\n\n");
+                return .cont;
+            },
+        }
+    }
+
+    fn fileAndLineToInstrAddr(
+        self: *IRDebugger,
+        file: []const u8,
+        line: usize,
+    ) ?ir.ResolvedInstructionAddr {
+        for (self.evaluator.context.instructions(), 0..) |inst_set, i| {
+            for (inst_set, 0..) |inst, j| {
+                const span = inst.span() orelse continue;
+                if (std.mem.endsWith(u8, span.start.file, file) and span.containsLine(line)) {
+                    return .init(i, j);
+                }
+            }
+        }
+
+        return null;
     }
 
     const CursorPosition = struct {
@@ -499,13 +609,62 @@ pub const IRDebugger = struct {
         return min_handler;
     }
 
-    fn parseCommand(self: *IRDebugger, source: []const u8) std.Io.Writer.Error!?Command {
+    fn parseCommand(self: *IRDebugger, source: []const u8) !?Command {
         if (std.mem.eql(u8, source, "quit")) {
             return .quit;
         }
 
         if (std.mem.eql(u8, source, "step")) {
             return .step;
+        }
+
+        if (std.mem.eql(u8, source, "continue")) {
+            return .cont;
+        }
+
+        if (std.mem.startsWith(u8, source, "breakpoint ")) {
+            var it = std.mem.tokenizeAny(u8, source, " :");
+            _ = it.next();
+            const sub_command = it.next() orelse {
+                try self.print("\n{s}\n\n", .{Command.usage(.breakpoint)});
+                return null;
+            };
+
+            if (std.mem.eql(u8, sub_command, "list")) {
+                return .{ .breakpoint = .list };
+            }
+
+            const valid_sub_commands: []const []const u8 = &.{ "add", "remove" };
+            for (valid_sub_commands) |sc| {
+                if (std.mem.eql(u8, sub_command, sc)) break;
+            } else {
+                try self.print("\n{s}\n\n", .{Command.usage(.breakpoint)});
+                return null;
+            }
+            const file = it.next() orelse {
+                try self.print("\n{s}\n\n", .{Command.usage(.breakpoint)});
+                return null;
+            };
+            const line_as_string = it.next() orelse {
+                try self.print("\n{s}\n\n", .{Command.usage(.breakpoint)});
+                return null;
+            };
+            const line = std.fmt.parseInt(usize, line_as_string, 10) catch {
+                try self.print("\nError: line needs to be an integer, actual: {s}", .{line_as_string});
+                return null;
+            };
+
+            if (std.mem.eql(u8, "add", sub_command)) {
+                return .{ .breakpoint = .{ .add = .{
+                    .file = try self.allocator.dupe(u8, file),
+                    .line = line,
+                } } };
+            } else if (std.mem.eql(u8, "remove", sub_command)) {
+                return .{ .breakpoint = .{ .remove = .{
+                    .file = try self.allocator.dupe(u8, file),
+                    .line = line,
+                } } };
+            }
         }
 
         try self.print("\nUnknown command \"{s}\".\n\n", .{source});
@@ -613,6 +772,36 @@ pub const IRDebugger = struct {
 const Command = union(enum) {
     quit,
     step,
+    cont,
+    breakpoint: BreakpointCommand,
+
+    pub const BreakpointCommand = union(enum) {
+        add: Add,
+        remove: Remove,
+        list,
+
+        pub const Add = struct {
+            file: []const u8,
+            line: usize,
+        };
+
+        pub const Remove = struct {
+            file: []const u8,
+            line: usize,
+        };
+    };
+
+    pub fn usage(
+        c_type: std.meta.Tag(Command),
+    ) []const u8 {
+        return switch (c_type) {
+            .quit, .step, .cont => "",
+            .breakpoint =>
+            \\breakpoint add <file>:<line>
+            \\breakpoint remove <file>:<line>
+            ,
+        };
+    }
 
     pub fn format(
         self: @This(),
@@ -657,3 +846,16 @@ pub fn peekDelimiterInclusive(
     }
     return error.StreamTooLong;
 }
+
+pub const Breakpoint = struct {
+    file: []const u8,
+    line: usize,
+    instr_addr: ir.ResolvedInstructionAddr,
+
+    pub fn format(
+        self: @This(),
+        writer: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        try writer.print("{s}:{} {f}", .{ self.file, self.line, self.instr_addr });
+    }
+};
