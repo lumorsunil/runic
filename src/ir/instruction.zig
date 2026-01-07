@@ -29,6 +29,8 @@ pub const Instruction = struct {
         set: Set,
         /// sets the instruction counter if condition is true
         jmp: Jump,
+        /// creates a pipe and stores it's handle in the given location
+        pipe: Pipe,
         /// spawns a process using argv, env map and cwd from scope
         exec: Exec,
         /// spawns a new thread at the given instruction addr
@@ -76,7 +78,7 @@ pub const Instruction = struct {
 
         pub fn format(self: @This(), w: *std.Io.Writer) !void {
             switch (self) {
-                inline .push, .exit, .jmp, .fork, .set, .ref, .fwd, .wait => |t| try w.print("{t} {f}", .{ self, t }),
+                inline .push, .exit, .jmp, .fork, .set, .ref, .fwd, .wait, .stream => |t| try w.print("{t} {f}", .{ self, t }),
                 else => try w.print("{t}", .{self}),
             }
         }
@@ -185,6 +187,14 @@ pub const Instruction = struct {
             } else {
                 try w.print("(true) {f}", .{self.dest});
             }
+        }
+    };
+
+    pub const Pipe = struct {
+        result: Location,
+
+        pub fn format(self: @This(), w: *std.Io.Writer) !void {
+            try w.print("{f}", .{self.result});
         }
     };
 

@@ -18,6 +18,7 @@ pub const CliConfig = struct {
     skip_type_check: bool = false,
     enable_ir: bool = false,
     debug_ir: bool = false,
+    dry_run: bool = false,
     verbose: bool = false,
 
     const Mode = union(enum) {
@@ -592,6 +593,7 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
     var skip_type_check = false;
     var enable_ir = false;
     var debug_ir = false;
+    var dry_run = false;
     var verbose = false;
     var parsing_options = true;
     var idx: usize = 1;
@@ -635,6 +637,10 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
             }
             if (argEqual(arg, "--debug-ir")) {
                 debug_ir = true;
+                continue;
+            }
+            if (argEqual(arg, "--dry-run")) {
+                dry_run = true;
                 continue;
             }
             if (argEqual(arg, "--verbose")) {
@@ -769,6 +775,7 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
                 .skip_type_check = skip_type_check,
                 .enable_ir = enable_ir,
                 .debug_ir = debug_ir,
+                .dry_run = dry_run,
                 .verbose = verbose,
             },
         };
@@ -787,6 +794,7 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
             .skip_type_check = skip_type_check,
             .enable_ir = enable_ir,
             .debug_ir = debug_ir,
+            .dry_run = dry_run,
             .verbose = verbose,
         },
     };

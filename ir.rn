@@ -30,10 +30,10 @@ echo "hello" | cat | cat
 // set @@0 ReaderWriterStream
 // ref 1
 // set @@1 ReaderWriterStream
-// fork <<set:4>> S0 @@0 S2
-// fork <<set:5>> @@0 @@1 S2
+// fork <<set:4>> S0 @@0 S2       # 0  p0 2
+// fork <<set:5>> @@0 @@1 S2      # p(n - 1) p(n) 2
 // ref 2
-// fork @@2 <<set:6>> @@1 S1 S2
+// fork @@2 <<set:6>> @@1 S1 S2   # p(n - 1) 1 2
 // wait @@2
 
 // <<set:1>>
@@ -45,17 +45,21 @@ echo "hello" | cat | cat
 
 // <<set:4>>
 // push .{ .argv = &.{ "echo", "hello" } }
-// exec
-// stream S1
+// ref _
+// exec @@_
+// wait @@_
 
 // <<set:5>>
 // push .{ .argv = &.{ "cat" } }
 // exec
-// stream S1
+// stream S0
 
 // <<set:6>>
 // push .{ .argv = &.{ "cat" } }
-// exec sync
+// ref 3
+// exec @@3
+// stream S0
+// wait @@3
 
 echo "hello"
 
@@ -79,7 +83,9 @@ echo "hello"
 
 // <<set:4>>
 // push .{ .argv = &.{ "echo", "hello" } }
-// exec
+// ref 1
+// exec @@1
+// wait @@1
 
 
 

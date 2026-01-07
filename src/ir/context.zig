@@ -6,11 +6,16 @@ const Labels = @import("labels.zig").Labels;
 const Instruction = @import("instruction.zig").Instruction;
 const ResolvedInstructionAddr = @import("instruction-addr.zig").ResolvedInstructionAddr;
 const ExitCode = @import("../runtime/command_runner.zig").ExitCode;
+const Stream = @import("../stream.zig").Stream;
+const ReaderWriterStream = @import("../stream.zig").ReaderWriterStream;
+const Closeable = @import("../closeable.zig").Closeable;
 
 pub const page_size = 1024 * 4;
 pub const stack_start: usize = std.math.maxInt(usize) - 1024 * 1024 * 10;
 
 pub const ThreadId = usize;
+pub const PipeHandle = usize;
+pub const CloseableHandle = usize;
 
 pub const IRProgramContext = struct {
     allocator: Allocator,
@@ -22,6 +27,11 @@ pub const IRProgramContext = struct {
     pipe_threads_to_remove: std.AutoArrayHashMapUnmanaged(ThreadId, void) = .empty,
     thread_exit_codes: std.AutoArrayHashMapUnmanaged(ThreadId, ExitCode) = .empty,
     thread_id_counter: ThreadId = 0,
+
+    pipes: std.AutoArrayHashMapUnmanaged(PipeHandle, *ReaderWriterStream) = .empty,
+    pipe_handle_counter: usize = 0,
+    closeables: std.AutoArrayHashMapUnmanaged(CloseableHandle, *Closeable(ExitCode)) = .empty,
+    closeable_handle_counter: usize = 0,
 
     pub fn init(allocator: Allocator, shared: IRSharedContext) @This() {
         return .{ .allocator = allocator, .shared = shared };
@@ -167,6 +177,34 @@ pub const IRProgramContext = struct {
                 }
             }
         }
+    }
+
+    pub fn addPipe(
+        self: *@This(),
+        pipe: *ReaderWriterStream,
+    ) !PipeHandle {
+        const handle = self.pipe_handle_counter;
+        self.pipe_handle_counter += 1;
+        try self.pipes.put(self.allocator, handle, pipe);
+        return handle;
+    }
+
+    pub fn getPipe(self: *@This(), handle: PipeHandle) *ReaderWriterStream {
+        return self.pipes.get(handle).?;
+    }
+
+    pub fn addCloseable(
+        self: *@This(),
+        closeable: *Closeable(ExitCode),
+    ) !CloseableHandle {
+        const handle = self.closeable_handle_counter;
+        self.closeable_handle_counter += 1;
+        try self.closeables.put(self.allocator, handle, closeable);
+        return handle;
+    }
+
+    pub fn getCloseable(self: *@This(), handle: CloseableHandle) *Closeable(ExitCode) {
+        return self.closeables.get(handle).?;
     }
 };
 

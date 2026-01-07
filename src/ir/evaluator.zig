@@ -2,10 +2,10 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ir = @import("../ir.zig");
 const runic = @import("runic");
-const CloseableReader = runic.closeable.CloseableReader;
-const CloseableWriter = runic.closeable.CloseableWriter;
 const CloseableProcessIo = runic.process.CloseableProcessIo;
+const ReaderWriterStream = runic.stream.ReaderWriterStream;
 const ExitCode = runic.command_runner.ExitCode;
+const Stream = runic.stream.Stream;
 
 pub const Error =
     Allocator.Error ||
@@ -40,9 +40,9 @@ pub const IREvaluator = struct {
 
     pub const Config = struct {
         verbose: bool,
-        stdin: CloseableReader(ExitCode),
-        stdout: CloseableWriter(ExitCode),
-        stderr: CloseableWriter(ExitCode),
+        stdin: *ReaderWriterStream,
+        stdout: *ReaderWriterStream,
+        stderr: *ReaderWriterStream,
     };
 
     pub fn init(
@@ -57,8 +57,8 @@ pub const IREvaluator = struct {
         };
     }
 
-    fn log(_: IREvaluator, comptime fmt: []const u8, args: anytype) void {
-        // if (!self.config.verbose) return;
+    fn log(self: IREvaluator, comptime fmt: []const u8, args: anytype) void {
+        if (!self.config.verbose) return;
         std.log.debug("[IREvaluator]: " ++ fmt, args);
     }
 
@@ -102,21 +102,23 @@ pub const IREvaluator = struct {
 
             if (self.context.getThreadContext(2)) |stdout_thread| {
                 const stdout_value = stdout_thread.private.stack.items[1];
-                const stdout_pipe = stdout_value.pipe;
-                if (stdout_pipe.source) |source| {
-                    if (source.isClosed()) {
-                        self.context.closeThread(2, .success) catch unreachable;
-                    }
+                const stdout_handle = stdout_value.pipe;
+                const stdout_pipe = self.context.getPipe(stdout_handle);
+                if (stdout_pipe.isSourcesClosed()) {
+                    self.context.closeThread(2, .success) catch unreachable;
+                } else {
+                    self.context.closeThread(2, .success) catch unreachable;
                 }
             }
 
             if (self.context.getThreadContext(3)) |stderr_thread| {
                 const stderr_value = stderr_thread.private.stack.items[2];
-                const stderr_pipe = stderr_value.pipe;
-                if (stderr_pipe.source) |source| {
-                    if (source.isClosed()) {
-                        self.context.closeThread(3, .success) catch unreachable;
-                    }
+                const stderr_handle = stderr_value.pipe;
+                const stderr_pipe = self.context.getPipe(stderr_handle);
+                if (stderr_pipe.isSourcesClosed()) {
+                    self.context.closeThread(3, .success) catch unreachable;
+                } else {
+                    self.context.closeThread(3, .success) catch unreachable;
                 }
             }
         }
@@ -185,29 +187,13 @@ pub const IREvaluator = struct {
 
         return switch (instruction.type) {
             .fwd_stdio => {
-                const stdin_addr = ir.Location{ .stack = 0 };
-                const stdout_addr = ir.Location{ .stack = 1 };
-                const stderr_addr = ir.Location{ .stack = 2 };
-                const stdin = try self.resolveValue(thread, .fromAddr(try stdin_addr.toAddr()));
-                const stdout = try self.resolveValue(thread, .fromAddr(try stdout_addr.toAddr()));
-                const stderr = try self.resolveValue(thread, .fromAddr(try stderr_addr.toAddr()));
+                const stdin = try self.context.addPipe(self.config.stdin);
+                const stdout = try self.context.addPipe(self.config.stdout);
+                const stderr = try self.context.addPipe(self.config.stderr);
 
-                self.log("stdin: {t}", .{stdin});
-                self.log("stdout: {t}", .{stdout});
-                self.log("stderr: {t}", .{stderr});
-
-                switch (stdin) {
-                    .pipe => |pipe| try pipe.connectSource(self.config.stdin),
-                    else => return Error.UnsupportedForward,
-                }
-                switch (stdout) {
-                    .pipe => |pipe| try pipe.connectDestination(self.config.stdout),
-                    else => return Error.UnsupportedForward,
-                }
-                switch (stderr) {
-                    .pipe => |pipe| try pipe.connectDestination(self.config.stderr),
-                    else => return Error.UnsupportedForward,
-                }
+                try thread.private.stack.append(self.allocator, .{ .pipe = stdin });
+                try thread.private.stack.append(self.allocator, .{ .pipe = stdout });
+                try thread.private.stack.append(self.allocator, .{ .pipe = stderr });
 
                 return .cont;
             },
@@ -259,30 +245,29 @@ pub const IREvaluator = struct {
                 try child.spawn();
                 thread.private.process = child;
 
-                const stdin_pipe = thread.private.stack.items[0].pipe;
-                const stdout_pipe = thread.private.stack.items[1].pipe;
-                const stderr_pipe = thread.private.stack.items[2].pipe;
+                const stdin_handle = thread.private.stack.items[0].pipe;
+                const stdout_handle = thread.private.stack.items[1].pipe;
+                const stderr_handle = thread.private.stack.items[2].pipe;
+
+                const stdin_pipe = self.context.getPipe(stdin_handle);
+                const stdout_pipe = self.context.getPipe(stdout_handle);
+                const stderr_pipe = self.context.getPipe(stderr_handle);
 
                 // TODO: memory management
                 const process_io = try self.allocator.create(CloseableProcessIo);
                 process_io.* = .init(child);
                 process_io.connect();
 
+                try child.waitForSpawn();
+
                 try stdin_pipe.connectDestination(process_io.closeableStdin());
                 try stdout_pipe.connectSource(process_io.closeableStdout());
                 try stderr_pipe.connectSource(process_io.closeableStderr());
 
-                try child.waitForSpawn();
-
-                // const child_thread_id = try self.context.spawnThread();
-                // const child_thread = self.context.getThreadContext(child_thread_id).?;
-                // child_thread.private.instruction_counter.local_addr = self.context.shared.instructions[child_thread.private.instruction_counter.instr_set].len;
-                // child_thread.private.process = child;
-                // thread.waitFor(child_thread_id);
-
                 if (exec.result) |loc| {
                     const ref_ptr = thread.refs().getPtr(loc.ref.addr) orelse return Error.RefNotFound;
-                    ref_ptr.* = .{ .closeable = process_io.closeable() };
+                    const handle = try self.context.addCloseable(process_io.closeable());
+                    ref_ptr.* = .{ .closeable = handle };
                 }
 
                 return .cont;
@@ -331,6 +316,15 @@ pub const IREvaluator = struct {
                     },
                 };
             },
+            .pipe => |instr_pipe| {
+                const pipe = try Stream(u8).initReaderWriter(self.allocator, "pipe", .{});
+                const pipe_handle = try self.context.addPipe(pipe);
+
+                const ref_ptr = thread.refs().getPtr(instr_pipe.result.ref.addr) orelse return Error.RefNotFound;
+                ref_ptr.* = .{ .pipe = pipe_handle };
+
+                return .cont;
+            },
             .fork => |fork| {
                 const new_thread_handle = try self.context.spawnThread();
                 const new_thread = self.context.getThreadContext(new_thread_handle).?;
@@ -364,7 +358,8 @@ pub const IREvaluator = struct {
                     .thread => |thread_handle| {
                         thread.waitFor(thread_handle);
                     },
-                    .closeable => |closeable| {
+                    .closeable => |closeable_handle| {
+                        const closeable = self.context.getCloseable(closeable_handle);
                         if (closeable.isClosed()) {
                             return .cont;
                         } else {
@@ -380,7 +375,7 @@ pub const IREvaluator = struct {
                 const streamee = try self.resolveValue(thread, .fromAddr(try stream.toAddr()));
 
                 return switch (streamee) {
-                    .pipe => |pipe| switch (try pipe.forward(.unlimited)) {
+                    .pipe => |pipe_handle| switch (try self.context.getPipe(pipe_handle).forward(.unlimited)) {
                         .no_source => .cont_no_instr_counter_inc,
                         .closed => .cont,
                         .not_done => .cont_no_instr_counter_inc,

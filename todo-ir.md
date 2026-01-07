@@ -9,9 +9,10 @@
 - [x] stream
 - [x] addr
 - [x] struct
-- [ ] pipe
-  - [ ] generic sources/destinations
-    - [ ] executable (file handle)
+- [x] closeable (handles) (processes/etc)
+- [x] pipe (handles)
+  - [x] generic sources/destinations
+    - [x] executable (file handle)
     - [ ] blocks
     - [ ] function calls
     - [ ] values
@@ -33,6 +34,8 @@
 - [x] conditional jump if true
 - [x] conditional jump if false
 - [x] call executable
+- [x] wait
+- [x] fork
 - [x] exit
 
 ## compiler
@@ -50,11 +53,14 @@
   - [ ] used defined struct types
 - [ ] arithmetic
 - [ ] boolean algebra
-- [ ] pipelines
+- [x] pipelines
+  - [x] multiple sources in streams ReaderWriterStream (stderr usually connects many sources)
+  - [ ] error handling?
+  - [ ] && / ||
 
 ## execution context
 
-- [ ] (virtual) threads
+- [x] (virtual) threads
 
 - One execution step:
   - Main Thread
@@ -85,15 +91,22 @@
 
 ## evaluator
 
-- [ ] threads
 - [x] instruction step
 - [x] new ref
 - [x] push
 - [x] pop
 - [x] set
 - [x] jump
-- [x] call executable
+- [x] executables
+  - [x] execute
+  - [x] wait for executable
 - [x] exit
+- [x] pipes
+  - [x] new pipe
+  - [x] stream pipe (blocking)
+- [x] threads
+  - [x] fork
+  - [x] wait for thread
 - [x] materialize string
   - [x] stream
   - [x] slice

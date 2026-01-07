@@ -368,8 +368,8 @@ pub const Evaluator = struct {
         try self.log(@src().fn_name, .{});
         defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
 
-        const stdout = try Stream(u8).initReaderWriter(self.allocator, @src().fn_name);
-        const stderr = try Stream(u8).initReaderWriter(self.allocator, @src().fn_name);
+        const stdout = try Stream(u8).initReaderWriter(self.allocator, @src().fn_name, .{});
+        const stderr = try Stream(u8).initReaderWriter(self.allocator, @src().fn_name, .{});
 
         try scopes.pushAllocating(@src().fn_name);
         try scopes.pushProcesses(@src().fn_name);
@@ -471,7 +471,7 @@ pub const Evaluator = struct {
             break;
         }
 
-        for (pipes) |pipe| if (pipe) |p| p.disconnectSource();
+        for (pipes) |pipe| if (pipe) |p| p.disconnectSourcesAll();
     }
 
     fn forwardPipe(self: *Evaluator, pipe: ?*ReaderWriterStream) Error!void {
@@ -1347,6 +1347,7 @@ pub const Evaluator = struct {
                         @src().fn_name ++ "<{s}:stdin_stdout>",
                         .{span.sliceFrom(source)},
                     ),
+                    .{},
                 ),
             );
         }
@@ -1362,6 +1363,7 @@ pub const Evaluator = struct {
                     @src().fn_name ++ "<{s}:stdout_context>",
                     .{span.sliceFrom(source)},
                 ),
+                .{},
             );
             stdout_pipes.appendAssumeCapacity(stdout_last_pipe);
             try stdout_last_pipe.connectDestination(
@@ -1392,6 +1394,7 @@ pub const Evaluator = struct {
                             @src().fn_name ++ "<{s}:stderr>",
                             .{span.sliceFrom(source)},
                         ),
+                        .{},
                     ),
                 );
                 try stderr_pipes.getLast().connectDestination(
@@ -1489,7 +1492,7 @@ pub const Evaluator = struct {
         }
 
         for (pipeline.stdout_pipes) |pipe| {
-            pipe.disconnectSource();
+            pipe.disconnectSourcesAll();
         }
 
         return self.getPipelineExitCode(pipeline_ref);
@@ -1499,29 +1502,32 @@ pub const Evaluator = struct {
         self: *Evaluator,
         pipeline_ref: Value.PipelineExecution,
     ) Error!?ExitCode {
-        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
-        try self.logEvaluationTrace(@src().fn_name);
-        defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
-
-        var exit_code: ?ExitCode = null;
-
-        const pipeline = try pipeline_ref.getPtr();
-
-        for (pipeline.stdout_pipes) |p| {
-            const source = p.source orelse continue;
-
-            if (source.getResult()) |source_exit_code| {
-                exit_code = source_exit_code;
-
-                if (source_exit_code == .success) {
-                    continue;
-                } else {
-                    break;
-                }
-            }
-        }
-
-        return exit_code;
+        _ = self;
+        _ = pipeline_ref;
+        return .success;
+        // errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        // try self.logEvaluationTrace(@src().fn_name);
+        // defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
+        //
+        // var exit_code: ?ExitCode = null;
+        //
+        // const pipeline = try pipeline_ref.getPtr();
+        //
+        // for (pipeline.stdout_pipes) |p| {
+        //     const source = p.source orelse continue;
+        //
+        //     if (source.getResult()) |source_exit_code| {
+        //         exit_code = source_exit_code;
+        //
+        //         if (source_exit_code == .success) {
+        //             continue;
+        //         } else {
+        //             break;
+        //         }
+        //     }
+        // }
+        //
+        // return exit_code;
     }
 
     fn isTermSuccess(term: std.process.Child.Term) bool {

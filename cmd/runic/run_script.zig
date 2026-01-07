@@ -101,11 +101,29 @@ pub fn runScript(
     const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(cwd);
 
-    // var stub_stdin_reader = std.Io.Reader.fixed(&.{});
-
-    const stdout_stream = try Stream(u8).initReaderWriter(allocator, "<<<stdout_pipe>>>");
+    const stdin_stream = try Stream(u8).initReaderWriter(allocator, "<<<stdin_pipe>>>", .{
+        .close_source = false,
+        .disconnect_source = false,
+        .close_destination = true,
+        .disconnect_destination = true,
+        .keep_open = true,
+    });
+    defer stdin_stream.stream.deinit();
+    const stdout_stream = try Stream(u8).initReaderWriter(allocator, "<<<stdout_pipe>>>", .{
+        .close_source = true,
+        .disconnect_source = true,
+        .close_destination = false,
+        .disconnect_destination = false,
+        .keep_open = true,
+    });
     defer stdout_stream.stream.deinit();
-    const stderr_stream = try Stream(u8).initReaderWriter(allocator, "<<<stderr_pipe>>>");
+    const stderr_stream = try Stream(u8).initReaderWriter(allocator, "<<<stderr_pipe>>>", .{
+        .close_source = true,
+        .disconnect_source = true,
+        .close_destination = false,
+        .disconnect_destination = false,
+        .keep_open = true,
+    });
     defer stderr_stream.stream.deinit();
 
     var stdin_closeable = closeable.NeverCloses(ExitCode){ .label = "<<<stdin>>>" };
@@ -130,6 +148,7 @@ pub fn runScript(
         &stderr_closeable.closeable,
     );
 
+    try stdin_stream.connectSource(stdin_closeable_reader);
     try stdout_stream.connectDestination(stdout_closeable_writer);
     try stderr_stream.connectDestination(stderr_closeable_writer);
 
@@ -142,9 +161,9 @@ pub fn runScript(
                 allocator,
                 &entryDocument.ast.?,
                 &document_store.document_store,
-                stdin_closeable_reader,
-                stdout_closeable_writer,
-                stderr_closeable_writer,
+                stdin_stream,
+                stdout_stream,
+                stderr_stream,
             );
         } else {
             return ir.runner.runIR(
@@ -153,9 +172,10 @@ pub fn runScript(
                 &entryDocument.ast.?,
                 .{
                     .verbose = config.verbose,
-                    .stdin = stdin_closeable_reader,
-                    .stdout = stdout_closeable_writer,
-                    .stderr = stderr_closeable_writer,
+                    .dry_run = config.dry_run,
+                    .stdin = stdin_stream,
+                    .stdout = stdout_stream,
+                    .stderr = stderr_stream,
                 },
             );
         }

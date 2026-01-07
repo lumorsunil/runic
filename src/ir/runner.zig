@@ -7,12 +7,17 @@ const ExitCode = runic.command_runner.ExitCode;
 const DocumentStore = runic.DocumentStore;
 const CloseableReader = runic.closeable.CloseableReader;
 const CloseableWriter = runic.closeable.CloseableWriter;
+const ReaderWriterStream = runic.stream.ReaderWriterStream;
 
 pub const IRConfig = struct {
     verbose: bool,
-    stdin: CloseableReader(ExitCode),
-    stdout: CloseableWriter(ExitCode),
-    stderr: CloseableWriter(ExitCode),
+    dry_run: bool,
+    stdin: *ReaderWriterStream,
+    stdout: *ReaderWriterStream,
+    stderr: *ReaderWriterStream,
+    // stdin: CloseableReader(ExitCode),
+    // stdout: CloseableWriter(ExitCode),
+    // stderr: CloseableWriter(ExitCode),
 };
 
 pub const IRRunner = struct {
@@ -134,8 +139,9 @@ pub fn runIR(
         }
     }
 
-    runner.log("\nRunning...\n", .{});
+    if (config.dry_run) return .success;
 
+    runner.log("\nRunning...\n", .{});
     return runner.run(&context);
 }
 
@@ -143,9 +149,12 @@ pub fn debugIR(
     allocator: Allocator,
     script: *ast.Script,
     document_store: *DocumentStore,
-    stdin: CloseableReader(ExitCode),
-    stdout: CloseableWriter(ExitCode),
-    stderr: CloseableWriter(ExitCode),
+    stdin: *ReaderWriterStream,
+    stdout: *ReaderWriterStream,
+    stderr: *ReaderWriterStream,
+    // stdin: CloseableReader(ExitCode),
+    // stdout: CloseableWriter(ExitCode),
+    // stderr: CloseableWriter(ExitCode),
 ) !ExitCode {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();

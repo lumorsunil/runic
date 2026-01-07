@@ -45,6 +45,17 @@ pub const GetFrameError = error{
 pub const Result = union(enum) {
     value: ir.Value,
 
+    pub fn from(v: anytype) !@This() {
+        if (@TypeOf(v) == ir.Location) {
+            return .fromLocation(v);
+        }
+        if (@TypeOf(v) == ir.Value) {
+            return .fromValue(v);
+        }
+
+        @compileError("Unsupported Result type: " ++ @typeName(@TypeOf(v)));
+    }
+
     pub fn fromLocation(location: ir.Location) ir.Location.Error!@This() {
         return .fromValue(.fromAddr(try location.toAddr()));
     }
@@ -430,6 +441,16 @@ pub const IRCompiler = struct {
         }));
     }
 
+    pub fn pipe(
+        self: *IRCompiler,
+        source: anytype,
+        location: ir.Location,
+    ) Error!void {
+        return self.addInstruction(.init(.from(source), .{
+            .pipe = .{ .result = location },
+        }));
+    }
+
     pub fn jmp(
         self: *IRCompiler,
         source: anytype,
@@ -542,28 +563,7 @@ pub const IRCompiler = struct {
     }
 
     fn compileInitial(self: *@This()) Error!void {
-        const stdin = try Stream(u8).initReaderWriter(
-            self.allocator,
-            "@stdin",
-        );
-        const stdout = try Stream(u8).initReaderWriter(
-            self.allocator,
-            "@stdout",
-        );
-        const stderr = try Stream(u8).initReaderWriter(
-            self.allocator,
-            "stderr",
-        );
-
-        try self.push(null, .{
-            .pipe = stdin,
-        });
-        try self.push(null, .{
-            .pipe = stdout,
-        });
-        try self.push(null, .{
-            .pipe = stderr,
-        });
+        try self.addInstruction(.init(null, .fwd_stdio));
 
         const stdin_set = try self.addInstructionSet();
         const stdout_set = try self.addInstructionSet();
@@ -581,8 +581,6 @@ pub const IRCompiler = struct {
         try self.stream(null, self.threadStderr());
 
         self.current_instruction_set = prev_instr_set;
-
-        try self.addInstruction(.init(null, .fwd_stdio));
 
         try self.fork(null, null, .initAbs(stdin_set, 0), self.threadStdin(), self.threadStdout(), self.threadStderr());
         try self.fork(null, null, .initAbs(stdout_set, 0), self.threadStdin(), self.threadStdout(), self.threadStderr());
@@ -682,8 +680,8 @@ pub const IRCompiler = struct {
     ) Error!Result {
         return switch (literal) {
             // .integer => |integer| .fromValue(try self.addSlice(integer.text)),
-            .integer => |integer| .fromValue(try parseInt(integer.text)),
-            .float => |float| .fromValue(try self.addSlice(1, float.text)),
+            .integer => |integer| .from(try parseInt(integer.text)),
+            .float => |float| .from(try self.addSlice(1, float.text)),
             .bool => |boolean| .fromValue(.{ .exit_code = .fromBoolean(boolean.value) }),
             .string => |string| self.compileStringLiteral(string),
             else => Error.UnsupportedLiteral,
@@ -695,7 +693,7 @@ pub const IRCompiler = struct {
         string_literal: ast.StringLiteral,
     ) Error!Result {
         if (string_literal.segments.len == 1) {
-            return .fromValue(try self.addSlice(1, string_literal.segments[0].text.payload));
+            return .from(try self.addSlice(1, string_literal.segments[0].text.payload));
         }
 
         const s_tream = try self.allocator.alloc(ir.Value, string_literal.segments.len);
@@ -722,7 +720,7 @@ pub const IRCompiler = struct {
     ) Error!Result {
         const binding = self.lookup(identifier.name) orelse {
             const executable = try self.addSlice(1, identifier.name);
-            return .fromValue(executable);
+            return .from(executable);
         };
         return binding.result;
     }
@@ -740,7 +738,7 @@ pub const IRCompiler = struct {
                 callee.value,
                 call.arguments,
             ),
-            .stream, .addr, .void, .uinteger, .strct, .exit_code, .pipe, .thread, .closeable => .fromValue(callee.value),
+            .stream, .addr, .void, .uinteger, .strct, .exit_code, .pipe, .thread, .closeable => .from(callee.value),
         };
     }
 
@@ -821,7 +819,7 @@ pub const IRCompiler = struct {
 
         self.current_instruction_set = prev_instr_set;
 
-        return .fromLocation(thread_ref);
+        return .from(thread_ref);
     }
 
     fn compileIf(
@@ -857,7 +855,7 @@ pub const IRCompiler = struct {
         };
         try self.set(source, result, else_.value);
         try self.setLabel(after_addr.local_addr.label, .abs);
-        return .fromLocation(result);
+        return .from(result);
     }
 
     fn compileIfNoElse(
@@ -873,7 +871,7 @@ pub const IRCompiler = struct {
         const then = try self.compileExpression(if_expr.then_expr);
         try self.set(source, result, then.value);
         try self.setLabel(after_addr.local_addr.label, .abs);
-        return .fromLocation(result);
+        return .from(result);
     }
 
     fn compilePipeline(
@@ -881,10 +879,47 @@ pub const IRCompiler = struct {
         source: *ast.Expression,
         pipeline: ast.Pipeline,
     ) Error!Result {
-        _ = self; // autofix
-        _ = source; // autofix
-        _ = pipeline; // autofix
-        return .fromValue(.void);
+        const refs = try self.allocator.alloc(ir.Location, pipeline.stages.len - 1);
+        defer self.allocator.free(refs);
+
+        for (refs) |*ref| {
+            ref.* = try self.newRef(source, "pipe");
+            try self.pipe(source, ref.*);
+        }
+
+        const orig_instr_set = self.current_instruction_set;
+        const stage_sets = try self.allocator.alloc(usize, pipeline.stages.len - 1);
+        defer self.allocator.free(stage_sets);
+        for (stage_sets, pipeline.stages[0 .. pipeline.stages.len - 1]) |*stage_set, stage_expr| {
+            stage_set.* = try self.addInstructionSet();
+            self.current_instruction_set = stage_set.*;
+            const result = try self.compileExpression(stage_expr);
+            try self.stream(source, self.threadStdout());
+            if (isWaitable(result)) {
+                try self.wait(source, .{ .ref = .{ .addr = result.value.addr, .name = "<pipeline_stage>" } });
+            }
+        }
+        self.current_instruction_set = orig_instr_set;
+
+        try self.fork(source, null, .initAbs(stage_sets[0], 0), self.threadStdin(), refs[0], self.threadStderr());
+
+        for (refs[0 .. refs.len - 1], refs[1..], stage_sets[1..]) |prev, curr, stage_set| {
+            try self.fork(source, null, .initAbs(stage_set, 0), prev, curr, self.threadStderr());
+        }
+
+        const last_set = try self.addInstructionSet();
+
+        self.current_instruction_set = last_set;
+        const result = try self.compileExpression(pipeline.stages[pipeline.stages.len - 1]);
+        if (isWaitable(result)) {
+            try self.wait(source, .{ .ref = .{ .addr = result.value.addr, .name = "<pipeline_last_stage>" } });
+        }
+        self.current_instruction_set = orig_instr_set;
+
+        const last_fork_ref = try self.newRef(source, "pipeline_last");
+        try self.fork(source, last_fork_ref, .initAbs(last_set, 0), refs[refs.len - 1], self.threadStdout(), self.threadStderr());
+
+        return .from(last_fork_ref);
     }
 
     // fn compileBinary(
