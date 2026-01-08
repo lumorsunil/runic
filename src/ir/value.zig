@@ -167,6 +167,12 @@ pub const Value = union(enum) {
         return std.mem.bytesToValue(@This(), bytes);
     }
 
+    pub fn fromBoolean(boolean: bool) @This() {
+        return .{
+            .exit_code = if (boolean) .success else .fromByte(1),
+        };
+    }
+
     pub const ToStreamError = Allocator.Error || error{UnsupportedStreamCast};
 
     pub fn toStream(self: @This(), allocator: Allocator) ToStreamError!@This() {

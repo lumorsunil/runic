@@ -707,6 +707,20 @@ pub const ReaderWriterStream = struct {
         }
         return true;
     }
+
+    pub fn format(
+        self: *@This(),
+        writer: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        try writer.print("{s}: ", .{self.label});
+        if (self.sources.items.len == 1) {
+            const source = self.sources.items[0];
+            try writer.print("source: {f}", .{source});
+        } else {
+            try writer.print("sources: {}", .{self.sources.items.len});
+        }
+        try writer.print(", destination: {?f}", .{self.destination});
+    }
 };
 
 // fn ByteTransformerStream(comptime T: type) type {

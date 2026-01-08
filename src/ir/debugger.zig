@@ -10,6 +10,7 @@ const rainbow = @import("../rainbow.zig");
 
 const span_color = rainbow.beginBgColor(.yellow) ++ rainbow.beginColor(.black);
 const current_instr_color = rainbow.beginBgColor(.yellow) ++ rainbow.beginColor(.black);
+const inactive_color = rainbow.beginColor(.yellow);
 const end_color = rainbow.endColor();
 
 const prompt = "> ";
@@ -37,6 +38,7 @@ pub const IRDebugger = struct {
     command_cursor: usize = 0,
     is_continuing: bool = false,
     breakpoints: std.ArrayList(Breakpoint) = .empty,
+    skip_stdio: bool = true,
 
     pub fn init(
         allocator: Allocator,
@@ -55,6 +57,14 @@ pub const IRDebugger = struct {
     }
 
     pub fn step(self: *IRDebugger) Error!RunningEvent {
+        if (self.skip_stdio) {
+            const stdio_ids: []const usize = &.{ 1, 2, 3 };
+            while (std.mem.indexOfScalar(usize, stdio_ids, self.evaluator.context.getCurrentThread().id)) |_| {
+                try self.printInstruction();
+                _ = try self.evaluator.step() orelse return .quit;
+            }
+        }
+
         try self.printInstruction();
 
         const event = try self.evaluator.step() orelse return .quit;
@@ -533,6 +543,8 @@ pub const IRDebugger = struct {
             .breakpoint => |bp| return self.handleBreakpointCommand(bp),
             .threads => return self.printThreads(),
             .instructions => return self.printInstructions(),
+            .pipes => return self.printPipes(),
+            .skip_stdio => return self.skipStdio(),
         }
     }
 
@@ -603,6 +615,12 @@ pub const IRDebugger = struct {
             } else {
                 try self.print("\n{}: {f}", .{ thread.id, thread.getCurrentInstructionAddr() });
             }
+
+            if (!self.evaluator.context.isThreadActive(thread.id)) {
+                try self.print(" ({s}inactive{s})", .{ inactive_color, end_color });
+            }
+
+            try self.print(": {?f}", .{thread.currentInstruction()});
         }
         try self.writeAll("\n\n");
 
@@ -636,6 +654,27 @@ pub const IRDebugger = struct {
         }
         try self.writeAll("\n\n");
 
+        return .cont;
+    }
+
+    fn printPipes(self: *IRDebugger) !RunningEvent {
+        var it = self.evaluator.context.pipes.iterator();
+        while (it.next()) |entry| {
+            try self.print("\n{}: {f}", .{ entry.key_ptr.*, entry.value_ptr.* });
+        }
+        try self.writeAll("\n\n");
+
+        return .cont;
+    }
+
+    fn skipStdio(self: *IRDebugger) !RunningEvent {
+        self.skip_stdio = !self.skip_stdio;
+        if (self.skip_stdio) {
+            try self.writeAll("stdio skip is on");
+        } else {
+            try self.writeAll("stdio skip is off");
+        }
+        try self.writeAll("\n\n");
         return .cont;
     }
 
@@ -741,6 +780,14 @@ pub const IRDebugger = struct {
 
         if (std.mem.eql(u8, source, "instructions")) {
             return .instructions;
+        }
+
+        if (std.mem.eql(u8, source, "pipes")) {
+            return .pipes;
+        }
+
+        if (std.mem.eql(u8, source, "stdio skip")) {
+            return .skip_stdio;
         }
 
         if (std.mem.startsWith(u8, source, "breakpoint ")) {
@@ -897,6 +944,8 @@ const Command = union(enum) {
     breakpoint: BreakpointCommand,
     threads,
     instructions,
+    pipes,
+    skip_stdio,
 
     pub const BreakpointCommand = union(enum) {
         add: Add,
@@ -943,7 +992,7 @@ const Command = union(enum) {
         c_type: std.meta.Tag(Command),
     ) []const u8 {
         return switch (c_type) {
-            .quit, .step, .cont, .instructions, .threads => "",
+            .quit, .step, .cont, .instructions, .threads, .pipes, .skip_stdio => "",
             .breakpoint =>
             \\breakpoint add <file>:<line>
             \\breakpoint remove <file>:<line>

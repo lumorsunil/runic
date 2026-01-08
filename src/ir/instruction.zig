@@ -31,12 +31,16 @@ pub const Instruction = struct {
         jmp: Jump,
         /// creates a pipe and stores it's handle in the given location
         pipe: Pipe,
+        /// changes a pipe option
+        pipe_opt: PipeOption,
+        /// forwards a pipe to another pipe
+        pipe_fwd: Forward,
+        /// executes an instruction atomically (all instructions executed at once)
+        atomic: usize,
         /// spawns a process using argv, env map and cwd from scope
         exec: Exec,
         /// spawns a new thread at the given instruction addr
         fork: Fork,
-        /// forwards a pipe to another pipe
-        fwd: Forward,
         /// waits for a thread or process to be closed
         wait: Wait,
         /// streams a pipe until it is closed, blocking
@@ -78,7 +82,7 @@ pub const Instruction = struct {
 
         pub fn format(self: @This(), w: *std.Io.Writer) !void {
             switch (self) {
-                inline .push, .exit, .jmp, .fork, .set, .ref, .fwd, .wait, .stream => |t| try w.print("{t} {f}", .{ self, t }),
+                inline .push, .exit, .jmp, .fork, .set, .ref, .pipe_fwd, .wait, .stream, .pipe, .pipe_opt => |t| try w.print("{t} {f}", .{ self, t }),
                 else => try w.print("{t}", .{self}),
             }
         }
@@ -195,6 +199,24 @@ pub const Instruction = struct {
 
         pub fn format(self: @This(), w: *std.Io.Writer) !void {
             try w.print("{f}", .{self.result});
+        }
+    };
+
+    pub const PipeOption = struct {
+        handle: Location,
+        option: OptionType,
+        value: Value,
+
+        pub const OptionType = enum {
+            keep_open,
+            close_destination,
+            disconnect_destination,
+            close_source,
+            disconnect_source,
+        };
+
+        pub fn format(self: @This(), w: *std.Io.Writer) !void {
+            try w.print("{f} {t} {f}", .{ self.handle, self.option, self.value });
         }
     };
 

@@ -25,6 +25,7 @@ pub const Error =
         SetInstructionLocation,
         RefNotFound,
         DuplicateRef,
+        ContNoInstrCounterIncInAtomic,
     };
 
 pub const Result = union(enum) {
@@ -178,6 +179,16 @@ pub const IREvaluator = struct {
         };
     }
 
+    pub const ResolveLocationError = ResolveValueError || ir.Location.Error;
+
+    fn resolveLocation(
+        self: IREvaluator,
+        thread: ir.context.IRThreadContext,
+        location: ir.Location,
+    ) ResolveLocationError!ir.Value {
+        return self.resolveValue(thread, .fromAddr(try location.toAddr()));
+    }
+
     fn runInstruction(
         self: *IREvaluator,
         thread: ir.context.IRThreadContext,
@@ -325,6 +336,43 @@ pub const IREvaluator = struct {
 
                 return .cont;
             },
+            .pipe_opt => |pipe_opt| {
+                const pipe_handle = (try self.resolveLocation(thread, pipe_opt.handle)).pipe;
+                const pipe = self.context.getPipe(pipe_handle);
+                const value = try self.resolveValue(thread, pipe_opt.value);
+
+                switch (pipe_opt.option) {
+                    inline else => |t| @field(
+                        pipe.config,
+                        @tagName(t),
+                    ) = value.exit_code.toBoolean(),
+                }
+
+                return .cont;
+            },
+            .pipe_fwd => |pipe_fwd| {
+                const source_handle = (try self.resolveLocation(thread, pipe_fwd.source)).pipe;
+                const destination_handle = (try self.resolveLocation(thread, pipe_fwd.destination)).pipe;
+                const source_pipe = self.context.getPipe(source_handle);
+                const destination_pipe = self.context.getPipe(destination_handle);
+
+                try source_pipe.connectDestination(destination_pipe.closeableWriter());
+
+                return .cont;
+            },
+            .atomic => |instr_set| {
+                const instructions = self.context.instructions()[instr_set];
+
+                for (instructions) |instr| {
+                    switch (try self.runInstruction(thread, instr)) {
+                        .cont => continue,
+                        .cont_no_instr_counter_inc => return Error.ContNoInstrCounterIncInAtomic,
+                        .exit => |exit_code| return .{ .exit = exit_code },
+                    }
+                }
+
+                return .cont;
+            },
             .fork => |fork| {
                 const new_thread_handle = try self.context.spawnThread();
                 const new_thread = self.context.getThreadContext(new_thread_handle).?;
@@ -338,15 +386,15 @@ pub const IREvaluator = struct {
 
                 try new_thread.private.stack.append(
                     self.allocator,
-                    try self.resolveValue(thread, .fromAddr(try fork.stdin.toAddr())),
+                    try self.resolveLocation(thread, fork.stdin),
                 );
                 try new_thread.private.stack.append(
                     self.allocator,
-                    try self.resolveValue(thread, .fromAddr(try fork.stdout.toAddr())),
+                    try self.resolveLocation(thread, fork.stdout),
                 );
                 try new_thread.private.stack.append(
                     self.allocator,
-                    try self.resolveValue(thread, .fromAddr(try fork.stderr.toAddr())),
+                    try self.resolveLocation(thread, fork.stderr),
                 );
 
                 return .cont;

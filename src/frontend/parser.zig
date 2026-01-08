@@ -786,7 +786,11 @@ pub const Parser = struct {
                             });
                             continue;
                         },
-                        else => return Error.UnexpectedToken,
+                        else => return {
+                            try self.reportParseError(Error.UnexpectedToken, next.span, "expected value, actual: {t}", .{next.tag});
+                            // TODO: how to keep parser going
+                            return Error.UnexpectedToken;
+                        },
                     }
                 },
                 .op => {

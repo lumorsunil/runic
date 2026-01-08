@@ -42,6 +42,44 @@ pub const GetFrameError = error{
     FrameStartDepthTooHigh,
 };
 
+pub const Diagnostic = struct {
+    err: Error,
+    _span: ?ast.Span,
+    message: []const u8,
+    _severity: Severity,
+
+    pub const Severity = enum {
+        @"error",
+        warning,
+        information,
+        hint,
+    };
+
+    pub fn span(self: Diagnostic) ?ast.Span {
+        return self._span;
+    }
+
+    pub fn severity(self: Diagnostic) []const u8 {
+        return @tagName(self._severity);
+    }
+
+    pub fn path(self: Diagnostic) ?[]const u8 {
+        const span_ = self.span() orelse return null;
+        return span_.start.file;
+    }
+};
+
+pub const CompilationResult = union(enum) {
+    err: struct {
+        _diagnostics: []Diagnostic,
+
+        pub fn diagnostics(self: @This()) []const Diagnostic {
+            return self._diagnostics;
+        }
+    },
+    success: ir.context.IRSharedContext,
+};
+
 pub const Result = union(enum) {
     value: ir.Value,
 
@@ -271,6 +309,7 @@ pub const IRCompiler = struct {
     struct_types: std.ArrayList(ir.Value.Struct.Type) = .empty,
     document_store: *DocumentStore,
     logging_enabled: bool,
+    diagnostics: std.ArrayList(Diagnostic) = .empty,
 
     pub fn init(
         allocator: Allocator,
@@ -287,6 +326,22 @@ pub const IRCompiler = struct {
             .document_store = document_store,
             .logging_enabled = logging_enabled,
         };
+    }
+
+    fn reportSourceError(
+        self: *@This(),
+        source: anytype,
+        err: Error,
+        severity: Diagnostic.Severity,
+        comptime fmt: []const u8,
+        args: anytype,
+    ) Error!void {
+        try self.diagnostics.append(self.allocator, .{
+            .err = err,
+            ._span = if (@typeInfo(@TypeOf(source)) == .optional) if (source) |s| s.span() else null else source.span(),
+            .message = try std.fmt.allocPrint(self.allocator, fmt, args),
+            ._severity = severity,
+        });
     }
 
     fn getStructType(self: IRCompiler, name: []const u8) Error!usize {
@@ -323,6 +378,7 @@ pub const IRCompiler = struct {
         } };
     }
 
+    // If you change this, make sure to fix the std...StreamSet functions as well
     pub fn addInstructionSet(self: *@This()) Allocator.Error!usize {
         try self.instruction_sets.append(self.allocator, .init());
         return self.instruction_sets.items.len - 1;
@@ -451,6 +507,36 @@ pub const IRCompiler = struct {
         }));
     }
 
+    pub fn pipeOpt(
+        self: *IRCompiler,
+        source: anytype,
+        handle: ir.Location,
+        option: ir.Instruction.PipeOption.OptionType,
+        value: ir.Value,
+    ) Error!void {
+        return self.addInstruction(.init(.from(source), .{
+            .pipe_opt = .{
+                .handle = handle,
+                .option = option,
+                .value = value,
+            },
+        }));
+    }
+
+    pub fn pipeFwd(
+        self: *IRCompiler,
+        source: anytype,
+        pipe_source: ir.Location,
+        pipe_destination: ir.Location,
+    ) Error!void {
+        return self.addInstruction(.init(.from(source), .{
+            .pipe_fwd = .{
+                .source = pipe_source,
+                .destination = pipe_destination,
+            },
+        }));
+    }
+
     pub fn jmp(
         self: *IRCompiler,
         source: anytype,
@@ -497,6 +583,22 @@ pub const IRCompiler = struct {
         )));
     }
 
+    pub fn forkInherit(
+        self: *IRCompiler,
+        source: anytype,
+        result: ?ir.Location,
+        dest: ir.InstructionAddr,
+    ) Error!void {
+        return try self.fork(
+            source,
+            result,
+            dest,
+            self.threadStdin(),
+            self.threadStdout(),
+            self.threadStderr(),
+        );
+    }
+
     pub fn wait(self: *IRCompiler, source: anytype, waitee: ir.Location) Error!void {
         return self.addInstruction(.init(.from(source), .wait_(waitee)));
     }
@@ -513,7 +615,9 @@ pub const IRCompiler = struct {
         const exit_code: ExitCode = switch (value.value) {
             .uinteger => |x| .fromByte(@intCast(@mod(x, 256))),
             .exit_code => |exit_code| exit_code,
-            else => return Error.UnsupportedExitCodeExpression,
+            else => {
+                return self.reportSourceError(source, Error.UnsupportedExitCodeExpression, .@"error", "value type \"{t}\" cannot be coerced into an exit code", .{value.value});
+            },
         };
         return self.addInstruction(.init(.from(source), .exit_(exit_code)));
     }
@@ -545,7 +649,7 @@ pub const IRCompiler = struct {
         };
     }
 
-    pub fn compile(self: *IRCompiler) Error!ir.context.IRSharedContext {
+    pub fn compile(self: *IRCompiler) Error!CompilationResult {
         self.current_instruction_set = try self.addInstructionSet();
 
         try self.scopes.pushBindings(self.allocator);
@@ -559,7 +663,11 @@ pub const IRCompiler = struct {
 
         try self.addInstruction(.init(null, .exit_(.success)));
 
-        return self.toIRContext();
+        if (self.diagnostics.items.len > 0) {
+            return .{ .err = .{ ._diagnostics = self.diagnostics.items } };
+        }
+
+        return .{ .success = try self.toIRContext() };
     }
 
     fn compileInitial(self: *@This()) Error!void {
@@ -593,10 +701,13 @@ pub const IRCompiler = struct {
     ) Error!Result {
         const result: Result = try switch (stmt.*) {
             .type_binding_decl => Result.fromValue(.void),
-            .binding_decl => |*b| self.compileBindingDecl(b),
+            .binding_decl => |*b| self.compileBindingDecl(stmt, b),
             .return_stmt => |r| self.compileReturn(stmt, r),
             .expression => |expr| self.compileExpression(expr.expression),
-            else => Error.UnsupportedExpression,
+            else => {
+                try self.reportSourceError(stmt, Error.UnsupportedExpression, .@"error", "statement type \"{t}\" not yet supported", .{stmt.*});
+                return .fromValue(.void);
+            },
         };
 
         if (isWaitable(result)) {
@@ -625,9 +736,11 @@ pub const IRCompiler = struct {
 
     fn compileBindingDecl(
         self: *IRCompiler,
+        source: *ast.Statement,
         binding_decl: *ast.BindingDecl,
     ) Error!Result {
         return self.compileBinding(
+            source,
             binding_decl.pattern,
             binding_decl.initializer,
             binding_decl.is_mutable,
@@ -636,6 +749,7 @@ pub const IRCompiler = struct {
 
     fn compileBinding(
         self: *IRCompiler,
+        source: anytype,
         pattern: *ast.BindingPattern,
         expr: *ast.Expression,
         is_mutable: bool,
@@ -655,7 +769,10 @@ pub const IRCompiler = struct {
                 );
                 return .fromValue(.void);
             },
-            else => Error.UnsupportedBindingPattern,
+            else => {
+                try self.reportSourceError(source, Error.UnsupportedBindingPattern, .@"error", "binding pattern type \"{t}\" not yet supported", .{pattern.*});
+                return .fromValue(.void);
+            },
         };
     }
 
@@ -664,18 +781,23 @@ pub const IRCompiler = struct {
         expr: *ast.Expression,
     ) Error!Result {
         return switch (expr.*) {
-            .literal => |literal| self.compileLiteral(literal),
+            .literal => |literal| self.compileLiteral(expr, literal),
             .identifier => |identifier| self.compileIdentifier(identifier),
             .call => |call| self.compileCall(expr, call),
             .if_expr => |if_expr| self.compileIf(expr, if_expr),
             .pipeline => |pipeline| self.compilePipeline(expr, pipeline),
+            .block => |block| self.compileBlock(expr, block),
             // .binary => |binary| self.compileBinary(expr, binary),
-            else => Error.UnsupportedExpression,
+            else => {
+                try self.reportSourceError(expr, Error.UnsupportedExpression, .@"error", "expression type \"{t}\" not yet supported", .{expr.*});
+                return .fromValue(.void);
+            },
         };
     }
 
     fn compileLiteral(
         self: *IRCompiler,
+        source: anytype,
         literal: ast.Literal,
     ) Error!Result {
         return switch (literal) {
@@ -684,7 +806,10 @@ pub const IRCompiler = struct {
             .float => |float| .from(try self.addSlice(1, float.text)),
             .bool => |boolean| .fromValue(.{ .exit_code = .fromBoolean(boolean.value) }),
             .string => |string| self.compileStringLiteral(string),
-            else => Error.UnsupportedLiteral,
+            else => {
+                try self.reportSourceError(source, Error.UnsupportedLiteral, .@"error", "literal type \"{t}\" not yet supported", .{literal});
+                return .fromValue(.void);
+            },
         };
     }
 
@@ -782,6 +907,18 @@ pub const IRCompiler = struct {
         return .{ .stack = 2 };
     }
 
+    fn stdinStreamSet(_: *IRCompiler) ir.InstructionAddr {
+        return .initAbs(1, 0);
+    }
+
+    fn stdoutStreamSet(_: *IRCompiler) ir.InstructionAddr {
+        return .initAbs(2, 0);
+    }
+
+    fn stderrStreamSet(_: *IRCompiler) ir.InstructionAddr {
+        return .initAbs(3, 0);
+    }
+
     fn compileExecutableCall(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -797,14 +934,7 @@ pub const IRCompiler = struct {
 
         const exec_instr_set = try self.addInstructionSet();
 
-        try self.fork(
-            source,
-            thread_ref,
-            .initAbs(exec_instr_set, 0),
-            self.threadStdin(),
-            self.threadStdout(),
-            self.threadStderr(),
-        );
+        try self.forkInherit(source, thread_ref, .initAbs(exec_instr_set, 0));
 
         const prev_instr_set = self.current_instruction_set;
         self.current_instruction_set = exec_instr_set;
@@ -885,6 +1015,7 @@ pub const IRCompiler = struct {
         for (refs) |*ref| {
             ref.* = try self.newRef(source, "pipe");
             try self.pipe(source, ref.*);
+            try self.pipeOpt(source, ref.*, .keep_open, .fromBoolean(true));
         }
 
         const orig_instr_set = self.current_instruction_set;
@@ -894,10 +1025,11 @@ pub const IRCompiler = struct {
             stage_set.* = try self.addInstructionSet();
             self.current_instruction_set = stage_set.*;
             const result = try self.compileExpression(stage_expr);
-            try self.stream(source, self.threadStdout());
+            try self.forkInherit(source, null, self.stdoutStreamSet());
             if (isWaitable(result)) {
                 try self.wait(source, .{ .ref = .{ .addr = result.value.addr, .name = "<pipeline_stage>" } });
             }
+            try self.pipeOpt(source, self.threadStdout(), .keep_open, .fromBoolean(false));
         }
         self.current_instruction_set = orig_instr_set;
 
@@ -920,6 +1052,62 @@ pub const IRCompiler = struct {
         try self.fork(source, last_fork_ref, .initAbs(last_set, 0), refs[refs.len - 1], self.threadStdout(), self.threadStderr());
 
         return .from(last_fork_ref);
+    }
+
+    fn compileBlock(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        block: ast.Block,
+    ) Error!Result {
+        const block_stdout = try self.newRef(source, "block_stdout_pipe");
+        try self.pipe(source, block_stdout);
+        try self.pipeOpt(
+            source,
+            block_stdout,
+            .disconnect_destination,
+            .fromBoolean(false),
+        );
+        try self.pipeOpt(
+            source,
+            block_stdout,
+            .close_destination,
+            .fromBoolean(false),
+        );
+        try self.pipeOpt(
+            source,
+            block_stdout,
+            .keep_open,
+            .fromBoolean(true),
+        );
+        try self.pipeFwd(
+            source,
+            block_stdout,
+            self.threadStdout(),
+        );
+        const block_set = try self.addInstructionSet();
+        const ref = try self.newRef(source, "block");
+        try self.fork(source, ref, .initAbs(block_set, 0), self.threadStdin(), block_stdout, self.threadStderr());
+        const orig_instr_set = self.current_instruction_set;
+        self.current_instruction_set = block_set;
+        const block_stdout_thread = try self.newRef(source, "block_stdout_thread");
+        try self.forkInherit(source, block_stdout_thread, self.stdoutStreamSet());
+        for (block.statements) |stmt| {
+            // TODO: figure out what to do with these results
+            _ = try self.compileStatement(stmt);
+        }
+        // const pipe_opts_set = try self.addInstructionSet();
+        // try self.atomic(source, pipe_opts_set);
+        // self.current_instruction_set = pipe_opts_set;
+        try self.pipeOpt(
+            source,
+            self.threadStdout(),
+            .keep_open,
+            .fromBoolean(false),
+        );
+        // try self.pipeOpt(source, self.threadStdout(), .disconnect_destination, true);
+        try self.wait(source, block_stdout_thread);
+        self.current_instruction_set = orig_instr_set;
+        return .from(ref);
     }
 
     // fn compileBinary(

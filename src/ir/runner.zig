@@ -8,6 +8,10 @@ const DocumentStore = runic.DocumentStore;
 const CloseableReader = runic.closeable.CloseableReader;
 const CloseableWriter = runic.closeable.CloseableWriter;
 const ReaderWriterStream = runic.stream.ReaderWriterStream;
+const rainbow = @import("../rainbow.zig");
+
+const span_color = rainbow.beginBgColor(.red) ++ rainbow.beginColor(.black);
+const end_color = rainbow.endColor();
 
 pub const IRConfig = struct {
     verbose: bool,
@@ -18,6 +22,21 @@ pub const IRConfig = struct {
     // stdin: CloseableReader(ExitCode),
     // stdout: CloseableWriter(ExitCode),
     // stderr: CloseableWriter(ExitCode),
+};
+
+pub const CompilationResult = union(enum) {
+    err: struct {
+        _diagnostics: []const ir.compiler.Diagnostic,
+
+        pub fn diagnostics(self: @This()) []const ir.compiler.Diagnostic {
+            return self._diagnostics;
+        }
+    },
+    success: ir.context.IRProgramContext,
+
+    pub fn err_(diagnostics: []const ir.compiler.Diagnostic) @This() {
+        return .{ .err = .{ ._diagnostics = diagnostics } };
+    }
 };
 
 pub const IRRunner = struct {
@@ -45,15 +64,18 @@ pub const IRRunner = struct {
         std.log.debug(fmt, args);
     }
 
-    pub fn compile(self: *IRRunner) !ir.context.IRProgramContext {
+    pub fn compile(self: *IRRunner) !CompilationResult {
         var compiler = try ir.compiler.IRCompiler.init(
             self.allocator,
             self.document_store,
             self.script,
         );
-        const shared = try compiler.compile();
+        const result = try compiler.compile();
 
-        return .init(self.allocator, shared);
+        return switch (result) {
+            .err => |err| .err_(err.diagnostics()),
+            .success => |shared| .{ .success = .init(self.allocator, shared) },
+        };
     }
 
     pub fn run(self: *IRRunner, context: *ir.context.IRProgramContext) !ExitCode {
@@ -99,17 +121,36 @@ pub const IRRunner = struct {
     }
 };
 
+pub const RunResult = union(enum) {
+    err: struct {
+        _diagnostics: []const ir.compiler.Diagnostic,
+
+        pub fn diagnostics(self: @This()) []const ir.compiler.Diagnostic {
+            return self._diagnostics;
+        }
+    },
+    success: ExitCode,
+
+    pub fn err_(diagnostics: []const ir.compiler.Diagnostic) @This() {
+        return .{ .err = .{ ._diagnostics = diagnostics } };
+    }
+};
+
 pub fn runIR(
     allocator: Allocator,
     document_store: *DocumentStore,
     script: *ast.Script,
     config: IRConfig,
-) !ExitCode {
+) !RunResult {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const arena_allocator = arena.allocator();
     var runner = IRRunner.init(arena_allocator, document_store, script, config);
-    var context = try runner.compile();
+    const result = try runner.compile();
+
+    if (result == .err) return .err_(result.err.diagnostics());
+    var context = result.success;
+
     try context.addMainThread();
 
     runner.log("IR Compilation Results", .{});
@@ -139,10 +180,10 @@ pub fn runIR(
         }
     }
 
-    if (config.dry_run) return .success;
+    if (config.dry_run) return .{ .success = .success };
 
     runner.log("\nRunning...\n", .{});
-    return runner.run(&context);
+    return .{ .success = try runner.run(&context) };
 }
 
 pub fn debugIR(
@@ -155,12 +196,16 @@ pub fn debugIR(
     // stdin: CloseableReader(ExitCode),
     // stdout: CloseableWriter(ExitCode),
     // stderr: CloseableWriter(ExitCode),
-) !ExitCode {
+) !RunResult {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const arena_allocator = arena.allocator();
     var compiler = try ir.compiler.IRCompiler.init(arena_allocator, document_store, script);
-    const shared = try compiler.compile();
+    const result = try compiler.compile();
+
+    if (result == .err) return .err_(result.err.diagnostics());
+    const shared = result.success;
+
     var context = ir.context.IRProgramContext.init(arena_allocator, shared);
     try context.addMainThread();
     var debugger = try ir.debugger.IRDebugger.init(
@@ -169,7 +214,7 @@ pub fn debugIR(
         document_store,
         &context,
     );
-    return debugger.run();
+    return .{ .success = try debugger.run() };
 }
 
 fn logInstruction(

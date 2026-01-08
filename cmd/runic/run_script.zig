@@ -156,8 +156,10 @@ pub fn runScript(
     log("stderr >>> {*}", .{&wrapped_stderr.writer});
 
     if (config.enable_ir) {
+        var result: ir.runner.RunResult = undefined;
+
         if (config.debug_ir) {
-            return ir.runner.debugIR(
+            result = try ir.runner.debugIR(
                 allocator,
                 &entryDocument.ast.?,
                 &document_store.document_store,
@@ -166,7 +168,7 @@ pub fn runScript(
                 stderr_stream,
             );
         } else {
-            return ir.runner.runIR(
+            result = try ir.runner.runIR(
                 allocator,
                 &document_store.document_store,
                 &entryDocument.ast.?,
@@ -179,6 +181,8 @@ pub fn runScript(
                 },
             );
         }
+
+        return try processResult(&document_store.document_store, stdout, result) orelse .fromByte(1);
     }
 
     const executeOptions = ScriptExecutor.ExecuteOptions.init(
@@ -418,17 +422,17 @@ fn processResult(
         .err => |err_info| {
             const diagnostics = err_info.diagnostics();
             for (diagnostics) |d| {
-                const span = d.span();
-                const source = document_store.getSource(span.start.file) catch |err| brk: {
+                const maybe_span: ?ast.Span = d.span();
+                const source = if (maybe_span) |span| document_store.getSource(span.start.file) catch |err| brk: {
                     try writer.print("<error getting document {s} : {}>", .{ span.start.file, err });
                     break :brk null;
-                };
+                } else null;
                 try writer.print("[{s}]: ", .{d.severity()});
-                logFileLineAndCol(writer, span) catch |err| {
+                if (maybe_span) |span| logFileLineAndCol(writer, span) catch |err| {
                     try writer.print("<error logging file path : {}>", .{err});
                 };
                 try writer.print(" {s}\n", .{d.message});
-                try if (source) |src| logSpan(writer, span, src) else writer.writeAll("<unable to get the source>\n\n");
+                try if (source) |src| if (maybe_span) |span| logSpan(writer, span, src) else writer.writeAll("<unable to get the source>\n\n");
                 try writer.flush();
             }
             return null;

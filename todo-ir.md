@@ -16,8 +16,8 @@
     - [ ] blocks
     - [ ] function calls
     - [ ] values
-- [ ] blocks
-- [ ] blocks as pipes
+- [x] blocks
+- [x] blocks as pipes
 
 ## instructions
 
@@ -36,6 +36,9 @@
 - [x] call executable
 - [x] wait
 - [x] fork
+- [x] new pipe
+- [x] set pipe option
+- [x] forward pipe
 - [x] exit
 
 ## compiler
@@ -57,6 +60,7 @@
   - [x] multiple sources in streams ReaderWriterStream (stderr usually connects many sources)
   - [ ] error handling?
   - [ ] && / ||
+  - [ ] redirections
 
 ## execution context
 
@@ -104,6 +108,8 @@
 - [x] pipes
   - [x] new pipe
   - [x] stream pipe (blocking)
+  - [x] set pipe option
+  - [x] forward pipe
 - [x] threads
   - [x] fork
   - [x] wait for thread
@@ -120,6 +126,13 @@
 - [x] commands
   - [x] step
   - [x] quit
+  - [x] threads
+  - [x] instructions
+  - [x] pipes
+  - [x] breakpoint
+    - [x] add
+    - [x] remove
+    - [x] list
 - [x] command history per session
 - [x] stdin processing
   - [x] up/down arrow -> move command history cursor
@@ -128,3 +141,7 @@
 - [ ] source code view
 - [ ] output view (stdout/stderr/combined)
 - [ ] tui lib?
+
+## bugs
+
+- [ ] grep is not outputting anything, see ir-blocks.rn
