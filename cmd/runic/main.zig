@@ -28,6 +28,9 @@ fn mainImpl() !runic.command_runner.ExitCode {
         std.log.err("Couldn't restore terminal attributes: {}", .{err});
     };
 
+    var tracer = runic.trace.Tracer.init(allocator, .{ .echo_to_stdout = false });
+    defer tracer.deinit();
+
     var stdin_buffer: [1024]u8 = undefined;
     var stdout_buffer: [1024]u8 = undefined;
     var stderr_buffer: [1024]u8 = undefined;
@@ -35,7 +38,7 @@ fn mainImpl() !runic.command_runner.ExitCode {
     defer std.process.argsFree(allocator, argv);
 
     // var stdin_reader = std.fs.File.stdin().reader(&stdin_buffer);
-    var stdin_reader = PipeReader.init(std.fs.File.stdin(), &stdin_buffer);
+    var stdin_reader = PipeReader.init(std.fs.File.stdin(), &stdin_buffer, &tracer);
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
     const stdin = &stdin_reader.reader;
@@ -68,6 +71,7 @@ fn mainImpl() !runic.command_runner.ExitCode {
                 stdin,
                 stdout,
                 stderr,
+                &tracer,
             );
         },
     }

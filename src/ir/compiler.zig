@@ -787,6 +787,7 @@ pub const IRCompiler = struct {
             .if_expr => |if_expr| self.compileIf(expr, if_expr),
             .pipeline => |pipeline| self.compilePipeline(expr, pipeline),
             .block => |block| self.compileBlock(expr, block),
+            .fn_decl => |fn_decl| self.compileFnDecl(expr, fn_decl),
             // .binary => |binary| self.compileBinary(expr, binary),
             else => {
                 try self.reportSourceError(expr, Error.UnsupportedExpression, .@"error", "expression type \"{t}\" not yet supported", .{expr.*});
@@ -863,6 +864,7 @@ pub const IRCompiler = struct {
                 callee.value,
                 call.arguments,
             ),
+            .fn_ref => self.compileFunctionCall(source, callee.value, call.arguments),
             .stream, .addr, .void, .uinteger, .strct, .exit_code, .pipe, .thread, .closeable => .from(callee.value),
         };
     }
@@ -950,6 +952,22 @@ pub const IRCompiler = struct {
         self.current_instruction_set = prev_instr_set;
 
         return .from(thread_ref);
+    }
+
+    fn compileFunctionCall(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        fn_ref_value: ir.Value,
+        arguments: []const *ast.Expression,
+    ) Error!Result {
+        _ = arguments;
+        const fn_ref = fn_ref_value.fn_ref;
+        const fn_addr = fn_ref.fn_addr;
+
+        const fn_call_ref = try self.newRef(source, "fn_call");
+        try self.forkInherit(source, fn_call_ref, fn_addr);
+
+        return .fromLocation(fn_call_ref);
     }
 
     fn compileIf(
@@ -1108,6 +1126,31 @@ pub const IRCompiler = struct {
         try self.wait(source, block_stdout_thread);
         self.current_instruction_set = orig_instr_set;
         return .from(ref);
+    }
+
+    fn compileFnDecl(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        fn_decl: ast.FunctionDecl,
+    ) Error!Result {
+        const instr_set = try self.addInstructionSet();
+        const orig_instr_set = self.current_instruction_set;
+        self.current_instruction_set = instr_set;
+        // TODO: figure out how to be able to call async functions multiple times and have the result not be overwritten in a ref
+        const result = try self.compileExpression(fn_decl.body);
+        // TODO: figure out how to make this async
+        if (isWaitable(result)) {
+            try self.wait(source, .{ .ref = .{ .addr = result.value.addr, .name = "<function_body>" } });
+        }
+        self.current_instruction_set = orig_instr_set;
+        const fn_ref = ir.Value{
+            .fn_ref = .{ .fn_addr = ir.InstructionAddr.initAbs(instr_set, 0) },
+        };
+        if (fn_decl.name) |name| {
+            try self.scopes.declare(self.allocator, name.name, try .from(fn_ref), false);
+        }
+
+        return .from(fn_ref);
     }
 
     // fn compileBinary(

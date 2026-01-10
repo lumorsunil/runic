@@ -9,6 +9,7 @@ const CloseableReader = runic.closeable.CloseableReader;
 const CloseableWriter = runic.closeable.CloseableWriter;
 const ReaderWriterStream = runic.stream.ReaderWriterStream;
 const rainbow = @import("../rainbow.zig");
+const Tracer = runic.trace.Tracer;
 
 const span_color = rainbow.beginBgColor(.red) ++ rainbow.beginColor(.black);
 const end_color = rainbow.endColor();
@@ -19,6 +20,7 @@ pub const IRConfig = struct {
     stdin: *ReaderWriterStream,
     stdout: *ReaderWriterStream,
     stderr: *ReaderWriterStream,
+    tracer: *Tracer,
     // stdin: CloseableReader(ExitCode),
     // stdout: CloseableWriter(ExitCode),
     // stderr: CloseableWriter(ExitCode),
@@ -86,6 +88,7 @@ pub const IRRunner = struct {
                 .stdin = self.config.stdin,
                 .stdout = self.config.stdout,
                 .stderr = self.config.stderr,
+                .tracer = self.config.tracer,
             },
             context,
         );
@@ -193,6 +196,7 @@ pub fn debugIR(
     stdin: *ReaderWriterStream,
     stdout: *ReaderWriterStream,
     stderr: *ReaderWriterStream,
+    tracer: *Tracer,
     // stdin: CloseableReader(ExitCode),
     // stdout: CloseableWriter(ExitCode),
     // stderr: CloseableWriter(ExitCode),
@@ -203,6 +207,8 @@ pub fn debugIR(
     var compiler = try ir.compiler.IRCompiler.init(arena_allocator, document_store, script);
     const result = try compiler.compile();
 
+    tracer.config.echo_to_stdout = true;
+
     if (result == .err) return .err_(result.err.diagnostics());
     const shared = result.success;
 
@@ -210,7 +216,13 @@ pub fn debugIR(
     try context.addMainThread();
     var debugger = try ir.debugger.IRDebugger.init(
         arena_allocator,
-        .{ .verbose = false, .stdin = stdin, .stdout = stdout, .stderr = stderr },
+        .{
+            .verbose = false,
+            .stdin = stdin,
+            .stdout = stdout,
+            .stderr = stderr,
+            .tracer = tracer,
+        },
         document_store,
         &context,
     );

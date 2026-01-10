@@ -2,6 +2,8 @@
 
 Runic is an experiment in designing a modern bash-compatible scripting language. Its goal is to keep the terseness and command-focused workflow of traditional shell scripts while removing long-standing ergonomics issues around quoting, data safety, and program structure.
 
+Runic is still in an experimental phase, and major breaking changes may occur at any time as the design and implementation evolve.
+
 ## Quick examples
 
 Runic scripts keep the familiar "just run commands" flow you get in bash, but with clearer data handling and explicit types:

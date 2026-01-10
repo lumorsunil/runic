@@ -1,0 +1,32 @@
+fn Void hello() Void {
+  echo "something"
+  echo "hello"
+  echo "something"
+  echo "hello"
+}
+
+hello | grep "hello"
+
+// main
+// 
+// # function call hello
+// ref 0
+// fork @@0 hello inherit
+// wait @@0
+// exit 0
+
+// hello
+//
+// ...compiled fn body...
+
+// hello &
+
+// main
+// 
+// # function call hello
+// fork hello inherit
+// exit 0
+
+// hello
+//
+// ...compiled fn body...

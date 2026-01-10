@@ -8,6 +8,7 @@ const rainbow = @import("../rainbow.zig");
 const ReaderWriterStream = @import("../stream.zig").ReaderWriterStream;
 const CloseableProcessIo = @import("../process.zig").CloseableProcessIo;
 const ExitCode = @import("../runtime/command_runner.zig").ExitCode;
+const Tracer = @import("../trace.zig").Tracer;
 
 const prefix_color = rainbow.beginColor(.violet);
 const end_color = rainbow.endColor();
@@ -21,6 +22,7 @@ pub const ScopeStack = struct {
     frames: std.ArrayList(Frame) = .empty,
     scope_type: ScopeType,
     logging_enabled: bool = false,
+    tracer: *Tracer,
 
     pub const Error = Allocator.Error || RCError || std.Io.Writer.Error || error{
         ScopeUnderflow,
@@ -351,6 +353,7 @@ pub const ScopeStack = struct {
         pub fn register(
             self: *@This(),
             spawned_child: std.process.Child,
+            tracer: *Tracer,
         ) !*CloseableProcessIo {
             const entry = try self.processes.getOrPut(self.allocator, spawned_child.id);
             const process_io = try self.allocator.create(CloseableProcessIo);
@@ -361,7 +364,7 @@ pub const ScopeStack = struct {
             const duped_argv = try self.allocator.dupe([]const u8, spawned_child.argv);
             stable_child.argv = duped_argv;
             for (duped_argv) |*arg| arg.* = try self.allocator.dupe(u8, arg.*);
-            process_io.* = .init(stable_child);
+            process_io.* = .init(stable_child, tracer);
             process_io.connect();
 
             return process_io;
@@ -498,7 +501,7 @@ pub const ScopeStack = struct {
         is_mutable: bool,
     };
 
-    pub fn init(allocator: Allocator, scope_type: ScopeType) ScopeStack {
+    pub fn init(allocator: Allocator, scope_type: ScopeType, tracer: *Tracer) ScopeStack {
         const logging_enabled_s = std.process.getEnvVarOwned(allocator, "RUNIC_LOG_EXECUTOR") catch null;
         defer if (logging_enabled_s) |le| allocator.free(le);
 
@@ -506,6 +509,7 @@ pub const ScopeStack = struct {
             .allocator = allocator,
             .scope_type = scope_type,
             .logging_enabled = if (logging_enabled_s) |le| std.mem.eql(u8, le, "1") else false,
+            .tracer = tracer,
         };
     }
 
@@ -558,7 +562,7 @@ pub const ScopeStack = struct {
 
         const detached_ref: Value.ScopeRef = try .init(
             self.allocator,
-            .init(self.allocator, .child),
+            .init(self.allocator, .child, self.tracer),
             .{},
         );
         const detached = try detached_ref.getPtr();
@@ -889,7 +893,7 @@ pub const ScopeStack = struct {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.log("{s}({})", .{ @src().fn_name, self.frames.items.len });
         const scope = try self.allocator.create(ScopeStack);
-        scope.* = .init(self.allocator, .child);
+        scope.* = .init(self.allocator, .child, self.tracer);
         try scope.log(@src().fn_name ++ " from {*}", .{self});
 
         for (self.frames.items) |frame| {
@@ -1065,7 +1069,7 @@ pub const ScopeStack = struct {
     pub fn spawn(self: *ScopeStack, child: *std.process.Child) !*CloseableProcessIo {
         const frame = try self.currentFrameByTag(.processes);
         try child.spawn();
-        return frame.processes.register(child.*);
+        return frame.processes.register(child.*, self.tracer);
     }
 
     pub fn wait(self: *ScopeStack) (Error || std.process.Child.WaitError)!*ChildProcessContext {

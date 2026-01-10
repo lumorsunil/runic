@@ -7,6 +7,7 @@ const ExitCode = @import("../runtime/command_runner.zig").ExitCode;
 const DocumentStore = @import("../document_store.zig").DocumentStore;
 const ast = @import("../frontend/ast.zig");
 const rainbow = @import("../rainbow.zig");
+const TraceFilter = @import("../trace.zig").TraceFilter;
 
 const span_color = rainbow.beginBgColor(.yellow) ++ rainbow.beginColor(.black);
 const current_instr_color = rainbow.beginBgColor(.yellow) ++ rainbow.beginColor(.black);
@@ -39,6 +40,7 @@ pub const IRDebugger = struct {
     is_continuing: bool = false,
     breakpoints: std.ArrayList(Breakpoint) = .empty,
     skip_stdio: bool = true,
+    trace_filter: ?TraceFilter = null,
 
     pub fn init(
         allocator: Allocator,
@@ -545,6 +547,7 @@ pub const IRDebugger = struct {
             .instructions => return self.printInstructions(),
             .pipes => return self.printPipes(),
             .skip_stdio => return self.skipStdio(),
+            .trace => |trace| return self.handleTraceCommand(trace),
         }
     }
 
@@ -678,6 +681,16 @@ pub const IRDebugger = struct {
         return .cont;
     }
 
+    fn handleTraceCommand(self: *IRDebugger, trace: Command.TraceCommand) !RunningEvent {
+        switch (trace) {
+            .on => self.evaluator.config.tracer.config.echo_to_stdout = true,
+            .off => self.evaluator.config.tracer.config.echo_to_stdout = false,
+            .filter => |filter| self.trace_filter = filter,
+        }
+
+        return .cont;
+    }
+
     const TermVector = struct {
         row: usize,
         col: usize,
@@ -793,10 +806,7 @@ pub const IRDebugger = struct {
         if (std.mem.startsWith(u8, source, "breakpoint ")) {
             var it = std.mem.tokenizeAny(u8, source, " :");
             _ = it.next();
-            const sub_command = it.next() orelse {
-                try self.print("\n{s}\n\n", .{Command.usage(.breakpoint)});
-                return null;
-            };
+            const sub_command = it.next() orelse return self.commandUsage(.breakpoint);
 
             if (std.mem.eql(u8, sub_command, "list")) {
                 return .{ .breakpoint = .list };
@@ -805,20 +815,16 @@ pub const IRDebugger = struct {
             const valid_sub_commands: []const []const u8 = &.{ "add", "remove" };
             for (valid_sub_commands) |sc| {
                 if (std.mem.eql(u8, sub_command, sc)) break;
-            } else {
-                try self.print("\n{s}\n\n", .{Command.usage(.breakpoint)});
-                return null;
-            }
-            const file = it.next() orelse {
-                try self.print("\n{s}\n\n", .{Command.usage(.breakpoint)});
-                return null;
-            };
-            const line_as_string = it.next() orelse {
-                try self.print("\n{s}\n\n", .{Command.usage(.breakpoint)});
-                return null;
-            };
+            } else return self.commandUsage(.breakpoint);
+
+            const file = it.next() orelse return self.commandUsage(.breakpoint);
+            const line_as_string = it.next() orelse return self.commandUsage(.breakpoint);
+
             const line = std.fmt.parseInt(usize, line_as_string, 10) catch {
-                try self.print("\nError: line needs to be an integer, actual: {s}", .{line_as_string});
+                try self.print(
+                    "\nError: line needs to be an integer, actual: {s}",
+                    .{line_as_string},
+                );
                 return null;
             };
 
@@ -835,8 +841,56 @@ pub const IRDebugger = struct {
             }
         }
 
+        if (std.mem.startsWith(u8, source, "trace ")) {
+            var it = std.mem.tokenizeAny(u8, source, " ,");
+            _ = it.next();
+            const sub_command = it.next() orelse return self.commandUsage(.trace);
+
+            if (std.mem.eql(u8, sub_command, "on")) {
+                return .{ .trace = .on };
+            }
+            if (std.mem.eql(u8, sub_command, "off")) {
+                return .{ .trace = .off };
+            }
+
+            const valid_sub_commands: []const []const u8 = &.{"filter"};
+            for (valid_sub_commands) |sc| {
+                if (std.mem.eql(u8, sub_command, sc)) break;
+            } else return self.commandUsage(.trace);
+
+            const filter_type = it.next() orelse return self.commandUsage(.trace);
+
+            if (std.mem.eql(u8, filter_type, "any")) {
+                if (it.next() != null) return self.commandUsage(.trace);
+                return .{ .trace = .{ .filter = .all } };
+            }
+
+            var tags = std.ArrayList([]const u8).empty;
+            while (it.next()) |tag| try tags.append(
+                self.allocator,
+                try self.allocator.dupe(u8, tag),
+            );
+
+            if (std.mem.eql(u8, "and", sub_command)) {
+                return .{ .trace = .{ .filter = .{
+                    .tags_and = try tags.toOwnedSlice(self.allocator),
+                } } };
+            } else if (std.mem.eql(u8, "or", sub_command)) {
+                return .{ .trace = .{ .filter = .{
+                    .tags_or = try tags.toOwnedSlice(self.allocator),
+                } } };
+            }
+
+            return self.commandUsage(.trace);
+        }
+
         try self.print("\nUnknown command \"{s}\".\n\n", .{source});
 
+        return null;
+    }
+
+    fn commandUsage(self: *IRDebugger, command_type: std.meta.Tag(Command)) !?Command {
+        try self.print("\n{s}\n\n", .{Command.usage(command_type)});
         return null;
     }
 
@@ -946,6 +1000,7 @@ const Command = union(enum) {
     instructions,
     pipes,
     skip_stdio,
+    trace: TraceCommand,
 
     pub const BreakpointCommand = union(enum) {
         add: Add,
@@ -968,6 +1023,22 @@ const Command = union(enum) {
         ) std.Io.Writer.Error!void {
             switch (self) {
                 inline .add, .remove => |s, t| try writer.print("{t} {s}:{}", .{ t, s.file, s.line }),
+                else => try writer.print("{t}", .{self}),
+            }
+        }
+    };
+
+    pub const TraceCommand = union(enum) {
+        on,
+        off,
+        filter: TraceFilter,
+
+        pub fn format(
+            self: @This(),
+            writer: *std.Io.Writer,
+        ) std.Io.Writer.Error!void {
+            switch (self) {
+                inline .filter => |s, t| try writer.print("{t} {f}", .{ t, s }),
                 else => try writer.print("{t}", .{self}),
             }
         }
@@ -996,6 +1067,13 @@ const Command = union(enum) {
             .breakpoint =>
             \\breakpoint add <file>:<line>
             \\breakpoint remove <file>:<line>
+            ,
+            .trace =>
+            \\trace on
+            \\trace off
+            \\trace filter any
+            \\trace filter and <tags>
+            \\trace filter or <tags>
             ,
         };
     }

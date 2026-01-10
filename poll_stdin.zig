@@ -1,7 +1,7 @@
 const std = @import("std");
 
 pub fn main() !void {
-    var child = std.process.Child.init(&.{"cat"}, std.heap.page_allocator);
+    var child = std.process.Child.init(&.{ "grep", "hello" }, std.heap.page_allocator);
     child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;

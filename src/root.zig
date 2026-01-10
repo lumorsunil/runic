@@ -24,3 +24,4 @@ pub const closeable = @import("closeable.zig");
 pub const process = @import("process.zig");
 pub const TraceWriter = @import("trace-writer.zig").TraceWriter;
 pub const ir = @import("ir.zig");
+pub const trace = @import("trace.zig");

@@ -6,6 +6,7 @@ const TypeAddr = @import("type-addr.zig").TypeAddr;
 const Location = @import("location.zig").Location;
 const ReaderWriterStream = @import("../stream.zig").ReaderWriterStream;
 const Closeable = @import("../closeable.zig").Closeable;
+const InstructionAddr = @import("instruction-addr.zig").InstructionAddr;
 
 pub const Value = union(enum) {
     void,
@@ -18,6 +19,7 @@ pub const Value = union(enum) {
     addr: usize,
     stream: []const Value,
     thread: usize,
+    fn_ref: FunctionRef,
 
     pub fn deinit(self: *@This(), allocator: Allocator) void {
         switch (self.*) {
@@ -153,6 +155,17 @@ pub const Value = union(enum) {
         };
     };
 
+    pub const FunctionRef = struct {
+        fn_addr: InstructionAddr,
+
+        pub fn format(
+            self: @This(),
+            writer: *std.Io.Writer,
+        ) std.Io.Writer.Error!void {
+            try writer.print("{f}", .{self.fn_addr});
+        }
+    };
+
     pub const refSize: usize = @sizeOf(Location);
 
     pub fn fromAddr(addr: usize) @This() {
@@ -198,7 +211,7 @@ pub const Value = union(enum) {
                 []Value,
                 try r.takeArray(@sizeOf([]Value)),
             ).* },
-            .slice, .strct, .pipe, .closeable => DeserializeError.UnsupportedDeserialize,
+            .slice, .strct, .pipe, .closeable, .fn_ref => DeserializeError.UnsupportedDeserialize,
             .exit_code => .{ .exit_code = try ExitCode.deserialize(r) },
         };
     }
@@ -226,7 +239,7 @@ pub const Value = union(enum) {
             .pipe => |handle| try w.print("<pipe:{}>", .{handle}),
             .closeable => |handle| try w.print("<closeable:{}>", .{handle}),
             .thread => |id| try w.print("<thread:{}>", .{id}),
-            inline .slice, .exit_code => |s| try w.print("{f}", .{s}),
+            inline .slice, .exit_code, .fn_ref => |s| try w.print("{f}", .{s}),
             inline else => |t| try w.print("{}", .{t}),
         }
     }

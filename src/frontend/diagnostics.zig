@@ -1,5 +1,22 @@
 const std = @import("std");
 const token = @import("token.zig");
+const rainbow = @import("../rainbow.zig");
+
+pub const Severity = enum {
+    @"error",
+    warning,
+    information,
+    hint,
+
+    pub fn color(self: @This()) rainbow.RainbowColor {
+        return switch (self) {
+            .@"error" => .red,
+            .warning => .yellow,
+            .information => .blue,
+            .hint => .violet,
+        };
+    }
+};
 
 /// Options that control how syntax errors get rendered.
 pub const RenderOptions = struct {

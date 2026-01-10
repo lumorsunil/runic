@@ -61,6 +61,12 @@
   - [ ] error handling?
   - [ ] && / ||
   - [ ] redirections
+- [x] function declarations
+  - [ ] arguments
+- [x] functions calls
+  - [ ] arguments
+  - [ ] fix ref bug (calling same function multiple times to trigger)
+- [ ] bindings
 
 ## execution context
 
@@ -144,4 +150,7 @@
 
 ## bugs
 
-- [ ] grep is not outputting anything, see ir-blocks.rn
+- [x] grep is not outputting anything, see ir-blocks.rn
+- [ ] `cat | grep "hello"` does not react on stdin
+- [ ] cannot call function multiple times
+  - possible solution: make refs thread-local? how to identify refs?

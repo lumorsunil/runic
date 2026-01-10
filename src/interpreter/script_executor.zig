@@ -10,6 +10,7 @@ const RuntimeValue = interpreter.Value;
 const command_runner = @import("../runtime/command_runner.zig");
 const rainbow = @import("../rainbow.zig");
 const DocumentStore = @import("../document_store.zig").DocumentStore;
+const Tracer = @import("../trace.zig").Tracer;
 
 const span_color = rainbow.beginBgColor(.red) ++ rainbow.beginColor(.black);
 const end_color = rainbow.endColor();
@@ -60,6 +61,7 @@ pub const ScriptExecutor = struct {
         env_map: ?*std.process.EnvMap,
         executeOptions: ExecuteOptions,
         documentStore: *DocumentStore,
+        tracer: *Tracer,
     ) !ScriptExecutor {
         const bridge = try allocator.create(CommandBridge);
         bridge.* = .{
@@ -70,7 +72,7 @@ pub const ScriptExecutor = struct {
         };
 
         var scopes = try allocator.create(ScopeStack);
-        scopes.* = .init(allocator, .main);
+        scopes.* = .init(allocator, .main, tracer);
         try scopes.log(@src().fn_name ++ ": init", .{});
         errdefer {
             scopes.deinit();
@@ -84,7 +86,7 @@ pub const ScriptExecutor = struct {
         );
         try scopes.pushFrame(@src().fn_name, try .initSingleNew(allocator));
 
-        const evaluator = Evaluator.init(allocator, path, executeOptions, documentStore);
+        const evaluator = Evaluator.init(allocator, path, executeOptions, documentStore, tracer);
 
         return .{
             .allocator = allocator,

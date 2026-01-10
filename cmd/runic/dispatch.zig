@@ -11,6 +11,7 @@ pub fn dispatch(
     stdin: *std.Io.Reader,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
+    tracer: *runic.trace.Tracer,
 ) !runic.command_runner.ExitCode {
     switch (config.mode) {
         .script => |script| return try runScript(
@@ -20,6 +21,7 @@ pub fn dispatch(
             stdin,
             stdout,
             stderr,
+            tracer,
         ),
         .repl => {
             try stderr.print("repl not yet supported\n", .{});

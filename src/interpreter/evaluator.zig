@@ -19,6 +19,7 @@ const RC = mem.RC;
 const CloseableProcessIo = @import("../process.zig").CloseableProcessIo;
 const CloseableReader = @import("../closeable.zig").CloseableReader;
 const ExitCode = command_runner.ExitCode;
+const Tracer = @import("../trace.zig").Tracer;
 
 const logging_name = "EXECUTOR";
 const prefix_color = rainbow.beginColor(.blue);
@@ -38,6 +39,7 @@ pub const Evaluator = struct {
     path: []const u8,
     executeOptions: ScriptExecutor.ExecuteOptions,
     document_store: *DocumentStore,
+    tracer: *Tracer,
     logging_enabled: bool,
 
     pub const Error = std.mem.Allocator.Error ||
@@ -89,6 +91,7 @@ pub const Evaluator = struct {
         path: []const u8,
         executeOptions: ScriptExecutor.ExecuteOptions,
         documentStore: *DocumentStore,
+        tracer: *Tracer,
     ) Evaluator {
         const logging_enabled_s = std.process.getEnvVarOwned(allocator, "RUNIC_LOG_" ++ logging_name) catch null;
         defer if (logging_enabled_s) |le| allocator.free(le);
@@ -101,6 +104,7 @@ pub const Evaluator = struct {
             .executeOptions = executeOptions,
             .document_store = documentStore,
             .logging_enabled = logging_enabled,
+            .tracer = tracer,
         };
     }
 
@@ -368,8 +372,8 @@ pub const Evaluator = struct {
         try self.log(@src().fn_name, .{});
         defer self.log(@src().fn_name ++ ": returned", .{}) catch {};
 
-        const stdout = try Stream(u8).initReaderWriter(self.allocator, @src().fn_name, .{});
-        const stderr = try Stream(u8).initReaderWriter(self.allocator, @src().fn_name, .{});
+        const stdout = try Stream(u8).initReaderWriter(self.allocator, @src().fn_name, .{}, self.tracer);
+        const stderr = try Stream(u8).initReaderWriter(self.allocator, @src().fn_name, .{}, self.tracer);
 
         try scopes.pushAllocating(@src().fn_name);
         try scopes.pushProcesses(@src().fn_name);
@@ -1348,6 +1352,7 @@ pub const Evaluator = struct {
                         .{span.sliceFrom(source)},
                     ),
                     .{},
+                    self.tracer,
                 ),
             );
         }
@@ -1364,6 +1369,7 @@ pub const Evaluator = struct {
                     .{span.sliceFrom(source)},
                 ),
                 .{},
+                self.tracer,
             );
             stdout_pipes.appendAssumeCapacity(stdout_last_pipe);
             try stdout_last_pipe.connectDestination(
@@ -1395,6 +1401,7 @@ pub const Evaluator = struct {
                             .{span.sliceFrom(source)},
                         ),
                         .{},
+                        self.tracer,
                     ),
                 );
                 try stderr_pipes.getLast().connectDestination(

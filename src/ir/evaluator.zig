@@ -6,6 +6,7 @@ const CloseableProcessIo = runic.process.CloseableProcessIo;
 const ReaderWriterStream = runic.stream.ReaderWriterStream;
 const ExitCode = runic.command_runner.ExitCode;
 const Stream = runic.stream.Stream;
+const Tracer = runic.trace.Tracer;
 
 pub const Error =
     Allocator.Error ||
@@ -44,6 +45,7 @@ pub const IREvaluator = struct {
         stdin: *ReaderWriterStream,
         stdout: *ReaderWriterStream,
         stderr: *ReaderWriterStream,
+        tracer: *Tracer,
     };
 
     pub fn init(
@@ -226,9 +228,12 @@ pub const IREvaluator = struct {
                 // TODO: memory management
                 var argv = try std.ArrayList([]const u8).initCapacity(
                     self.allocator,
-                    argv_value.slice.len,
+                    argv_value.slice.len + 2,
                 );
                 defer argv.deinit(self.allocator);
+
+                // TODO: figure out how to do this ourselves
+                argv.appendSliceAssumeCapacity(&.{ "stdbuf", "-oL" });
 
                 const element_size = argv_value.slice.element_size;
                 for (0..argv_value.slice.len) |i| {
@@ -266,7 +271,7 @@ pub const IREvaluator = struct {
 
                 // TODO: memory management
                 const process_io = try self.allocator.create(CloseableProcessIo);
-                process_io.* = .init(child);
+                process_io.* = .init(child, self.config.tracer);
                 process_io.connect();
 
                 try child.waitForSpawn();
@@ -328,7 +333,7 @@ pub const IREvaluator = struct {
                 };
             },
             .pipe => |instr_pipe| {
-                const pipe = try Stream(u8).initReaderWriter(self.allocator, "pipe", .{});
+                const pipe = try Stream(u8).initReaderWriter(self.allocator, "pipe", .{}, self.config.tracer);
                 const pipe_handle = try self.context.addPipe(pipe);
 
                 const ref_ptr = thread.refs().getPtr(instr_pipe.result.ref.addr) orelse return Error.RefNotFound;
@@ -461,7 +466,7 @@ pub const IREvaluator = struct {
             inline .uinteger => |t| try w.print("{}", .{t}),
             inline .addr => |t| try w.print("0x{x}", .{t}),
             inline .exit_code => |t| try w.print("{f}", .{t}),
-            .void, .strct, .pipe, .thread, .closeable => {},
+            .void, .strct, .pipe, .thread, .closeable, .fn_ref => {},
         }
     }
 };

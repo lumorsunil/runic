@@ -1,7 +1,7 @@
 const std = @import("std");
 
 pub fn main() !void {
-    var child = std.process.Child.init(&.{"cat"}, std.heap.page_allocator);
+    var child = std.process.Child.init(&.{ "grep", "hello" }, std.heap.page_allocator);
     child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
@@ -18,9 +18,9 @@ pub fn main() !void {
     var stderr_buffer: [1024]u8 = undefined;
     var child_stderr_reader = child_stderr.reader(&stderr_buffer);
 
-    try child_stdin_writer.interface.writeAll("hello\n");
-    try child_stdin_writer.interface.flush();
-    child_stdin.close();
+    // try child_stdin_writer.interface.writeAll("hello\n");
+    // try child_stdin_writer.interface.flush();
+    // child_stdin.close();
 
     var stdout = std.Io.Writer.Allocating.init(std.heap.page_allocator);
     var stderr = std.Io.Writer.Allocating.init(std.heap.page_allocator);

@@ -12,6 +12,7 @@ const Stream = runic.stream.Stream;
 const closeable = runic.closeable;
 const ExitCode = runic.command_runner.ExitCode;
 const TraceWriter = runic.TraceWriter;
+const Tracer = runic.trace.Tracer;
 const ir = runic.ir;
 
 const log_enabled = false;
@@ -28,6 +29,7 @@ pub fn runScript(
     stdin: *std.Io.Reader,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
+    tracer: *Tracer,
 ) !ExitCode {
     var env_map = std.process.getEnvMap(allocator) catch |err| {
         try stderr.print("error: unable to capture environment: {s}\n", .{@errorName(err)});
@@ -107,7 +109,7 @@ pub fn runScript(
         .close_destination = true,
         .disconnect_destination = true,
         .keep_open = true,
-    });
+    }, tracer);
     defer stdin_stream.stream.deinit();
     const stdout_stream = try Stream(u8).initReaderWriter(allocator, "<<<stdout_pipe>>>", .{
         .close_source = true,
@@ -115,7 +117,7 @@ pub fn runScript(
         .close_destination = false,
         .disconnect_destination = false,
         .keep_open = true,
-    });
+    }, tracer);
     defer stdout_stream.stream.deinit();
     const stderr_stream = try Stream(u8).initReaderWriter(allocator, "<<<stderr_pipe>>>", .{
         .close_source = true,
@@ -123,7 +125,7 @@ pub fn runScript(
         .close_destination = false,
         .disconnect_destination = false,
         .keep_open = true,
-    });
+    }, tracer);
     defer stderr_stream.stream.deinit();
 
     var stdin_closeable = closeable.NeverCloses(ExitCode){ .label = "<<<stdin>>>" };
@@ -166,6 +168,7 @@ pub fn runScript(
                 stdin_stream,
                 stdout_stream,
                 stderr_stream,
+                tracer,
             );
         } else {
             result = try ir.runner.runIR(
@@ -178,6 +181,7 @@ pub fn runScript(
                     .stdin = stdin_stream,
                     .stdout = stdout_stream,
                     .stderr = stderr_stream,
+                    .tracer = tracer,
                 },
             );
         }
@@ -204,6 +208,7 @@ pub fn runScript(
         &env_map,
         executeOptions,
         &document_store.document_store,
+        tracer,
     ) catch |err| {
         try stderr.print(
             "error: failed to initialize script executor: {s}\n",
