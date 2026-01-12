@@ -19,6 +19,7 @@ pub const Error =
     Allocator.Error ||
     std.Io.Writer.Error ||
     std.fmt.ParseIntError ||
+    std.fmt.ParseFloatError ||
     GetFrameError ||
     ir.Location.Error ||
     ir.Value.ToStreamError ||
@@ -788,7 +789,7 @@ pub const IRCompiler = struct {
             .pipeline => |pipeline| self.compilePipeline(expr, pipeline),
             .block => |block| self.compileBlock(expr, block),
             .fn_decl => |fn_decl| self.compileFnDecl(expr, fn_decl),
-            // .binary => |binary| self.compileBinary(expr, binary),
+            .binary => |binary| self.compileBinary(expr, binary),
             else => {
                 try self.reportSourceError(expr, Error.UnsupportedExpression, .@"error", "expression type \"{t}\" not yet supported", .{expr.*});
                 return .fromValue(.void);
@@ -804,7 +805,7 @@ pub const IRCompiler = struct {
         return switch (literal) {
             // .integer => |integer| .fromValue(try self.addSlice(integer.text)),
             .integer => |integer| .from(try parseInt(integer.text)),
-            .float => |float| .from(try self.addSlice(1, float.text)),
+            .float => |float| .from(try parseFloat(float.text)),
             .bool => |boolean| .fromValue(.{ .exit_code = .fromBoolean(boolean.value) }),
             .string => |string| self.compileStringLiteral(string),
             else => {
@@ -840,6 +841,10 @@ pub const IRCompiler = struct {
         return .{ .uinteger = try std.fmt.parseInt(usize, text, 10) };
     }
 
+    fn parseFloat(text: []const u8) std.fmt.ParseFloatError!ir.Value {
+        return .{ .float = try std.fmt.parseFloat(f64, text) };
+    }
+
     fn compileIdentifier(
         self: *IRCompiler,
         identifier: ast.Identifier,
@@ -865,7 +870,7 @@ pub const IRCompiler = struct {
                 call.arguments,
             ),
             .fn_ref => self.compileFunctionCall(source, callee.value, call.arguments),
-            .stream, .addr, .void, .uinteger, .strct, .exit_code, .pipe, .thread, .closeable => .from(callee.value),
+            .stream, .addr, .void, .uinteger, .float, .strct, .exit_code, .pipe, .thread, .closeable => .from(callee.value),
         };
     }
 
@@ -1153,21 +1158,51 @@ pub const IRCompiler = struct {
         return .from(fn_ref);
     }
 
-    // fn compileBinary(
-    //     self: *IRCompiler,
-    //     source: *ast.Expression,
-    //     binary: ast.BinaryExpr,
-    // ) Error!Result {
-    //     switch (binary.op) {
-    //         .apply, .pipe => {
-    //             try self.log(@src().fn_name ++ ": error, encountered {t} binary expression", .{binary.op});
-    //             try self.logEvaluateSpan(binary.span);
-    //         },
-    //         else => {},
-    //     }
-    //
-    //     return Error.UnsupportedBinaryOperation;
-    // }
+    fn compileBinary(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        binary: ast.BinaryExpr,
+    ) Error!Result {
+        switch (binary.op) {
+            .add => {
+                const left = try self.compileExpression(binary.left);
+                const right = try self.compileExpression(binary.right);
+
+                if (left.value == .uinteger and right.value == .uinteger) {
+                    return .fromValue(.{
+                        .uinteger = left.value.uinteger +| right.value.uinteger,
+                    });
+                } else if (left.value == .float and right.value == .float) {
+                    return .fromValue(.{ .float = left.value.float + right.value.float });
+                } else if (left.value == .uinteger and right.value == .float) {
+                    const float_left: f64 = @floatFromInt(left.value.uinteger);
+                    return .fromValue(.{ .float = float_left + right.value.float });
+                } else if (left.value == .float and right.value == .uinteger) {
+                    const float_right: f64 = @floatFromInt(right.value.uinteger);
+                    return .fromValue(.{ .float = left.value.float + float_right });
+                }
+
+                const ref = try self.newRef(source, "add_result");
+
+                try self.addInstruction(.init(.from(source), .{ .ath = .{
+                    .op = .add,
+                    .a = left.value,
+                    .b = right.value,
+                    .result = ref,
+                } }));
+
+                return .from(ref);
+            },
+            .apply, .pipe => {
+                try self.log(@src().fn_name ++ ": error, encountered {t} binary expression", .{binary.op});
+                try self.logEvaluateSpan(binary.span);
+            },
+            else => {},
+        }
+
+        try self.reportSourceError(source, Error.UnsupportedBinaryOperation, .@"error", "binary operator \"{t}\" not yet supported", .{binary.op});
+        return .fromValue(.void);
+    }
 
     pub fn log(self: *@This(), comptime fmt: []const u8, args: anytype) !void {
         if (@hasField(@This(), "logging_enabled")) {

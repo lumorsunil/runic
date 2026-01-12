@@ -22,6 +22,8 @@ pub const Error =
         UnsupportedWaitee,
         UnsupportedStreamee,
         UnsupportedForward,
+        UnsupportedBinaryOperator,
+        UnsupportedBinaryExpression,
         SetImmutableLocation,
         SetInstructionLocation,
         RefNotFound,
@@ -436,7 +438,31 @@ pub const IREvaluator = struct {
                     else => Error.UnsupportedStreamee,
                 };
             },
-            .exit => |exit_code| return .{ .exit = exit_code },
+            .ath => |ath| switch (ath.op) {
+                .add => {
+                    const left = try self.resolveValue(thread, ath.a);
+                    const right = try self.resolveValue(thread, ath.b);
+                    const ref_ptr = thread.refs().getPtr(ath.result.ref.addr) orelse return Error.RefNotFound;
+
+                    if (left == .uinteger and right == .uinteger) {
+                        ref_ptr.* = .{ .uinteger = left.uinteger +| right.uinteger };
+                    } else if (left == .float and right == .float) {
+                        ref_ptr.* = .{ .float = left.float + right.float };
+                    } else if (left == .uinteger and right == .float) {
+                        const float_left: f64 = @floatFromInt(left.uinteger);
+                        ref_ptr.* = .{ .float = float_left + right.float };
+                    } else if (left == .float and right == .uinteger) {
+                        const float_right: f64 = @floatFromInt(right.uinteger);
+                        ref_ptr.* = .{ .float = left.float + float_right };
+                    } else {
+                        return Error.UnsupportedBinaryExpression;
+                    }
+
+                    return .cont;
+                },
+                else => Error.UnsupportedBinaryOperator,
+            },
+            .exit => |exit_code| .{ .exit = exit_code },
             else => Error.UnsupportedInstruction,
         };
     }
@@ -463,7 +489,7 @@ pub const IREvaluator = struct {
                 const string = try self.getSlice(slice);
                 try w.writeAll(string);
             },
-            inline .uinteger => |t| try w.print("{}", .{t}),
+            inline .uinteger, .float => |t| try w.print("{}", .{t}),
             inline .addr => |t| try w.print("0x{x}", .{t}),
             inline .exit_code => |t| try w.print("{f}", .{t}),
             .void, .strct, .pipe, .thread, .closeable, .fn_ref => {},

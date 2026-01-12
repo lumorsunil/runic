@@ -11,6 +11,8 @@ const InstructionAddr = @import("instruction-addr.zig").InstructionAddr;
 pub const Value = union(enum) {
     void,
     uinteger: usize,
+    // TODO: decide on f32 or f64?
+    float: f64,
     slice: Slice,
     strct: Struct,
     exit_code: ExitCode,
@@ -205,6 +207,7 @@ pub const Value = union(enum) {
         return switch (tag) {
             .void => .void,
             .uinteger => .{ .uinteger = try r.takeInt(usize, endian) },
+            .float => .{ .float = std.mem.bytesAsValue(f64, try r.takeArray(8)).* },
             .addr => .{ .addr = try r.takeInt(usize, endian) },
             .thread => .{ .thread = try r.takeInt(usize, endian) },
             .stream => .{ .stream = std.mem.bytesAsValue(

@@ -136,13 +136,18 @@ pub const TraceFilter = union(enum) {
         writer: *std.Io.Writer,
     ) std.Io.Writer.Error!void {
         try switch (self) {
-            .any => writer.writeAll("any"),
-            .tags_and => |tags_and| {
-                try writer.writeAll("and [");
-                for (tags_and, 0..) |tag, i| {
+            .all => writer.writeAll("any"),
+            inline .tags_and, .tags_or => |tags| {
+                switch (self) {
+                    .tags_and => try writer.writeAll("and"),
+                    .tags_or => try writer.writeAll("or"),
+                    else => unreachable,
+                }
+                try writer.writeAll(" [");
+                for (tags, 0..) |tag, i| {
                     try writer.writeAll(tag);
 
-                    if (i == tags_and.len - 1) {
+                    if (i == tags.len - 1) {
                         try writer.writeAll(", ");
                     }
                 }

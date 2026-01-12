@@ -13,8 +13,8 @@
 - [x] pipe (handles)
   - [x] generic sources/destinations
     - [x] executable (file handle)
-    - [ ] blocks
-    - [ ] function calls
+    - [x] blocks
+    - [x] function calls
     - [ ] values
 - [x] blocks
 - [x] blocks as pipes
@@ -25,7 +25,7 @@
 - [x] labels
 - [x] stack push
 - [x] stack pop
-- [ ] arithmetic
+- [x] arithmetic
 - [ ] compare
 - [ ] logical
 - [x] new ref
@@ -54,7 +54,12 @@
   - [ ] user-land structs
 - [x] struct types
   - [ ] used defined struct types
-- [ ] arithmetic
+- [x] arithmetic
+  - [x] add
+  - [ ] sub
+  - [ ] mul
+  - [ ] div
+  - [ ] remainder
 - [ ] boolean algebra
 - [x] pipelines
   - [x] multiple sources in streams ReaderWriterStream (stderr usually connects many sources)
@@ -126,6 +131,12 @@
   - [x] dereference addr
   - [x] exit code
   - [ ] execution result
+- [x] arithmetic
+  - [x] add
+  - [ ] sub
+  - [ ] mul
+  - [ ] div
+  - [ ] remainder
 
 ## debugger
 
@@ -142,6 +153,11 @@
 - [x] command history per session
 - [x] stdin processing
   - [x] up/down arrow -> move command history cursor
+  - [x] autocomplete
+    - [x] main commands (only first part of the command is autocompleted right now)
+    - [ ] sub-commands
+    - [ ] arguments
+  - [x] undo word/line
 - [ ] memory view
 - [ ] IR instructions view
 - [ ] source code view
@@ -154,3 +170,4 @@
 - [ ] `cat | grep "hello"` does not react on stdin
 - [ ] cannot call function multiple times
   - possible solution: make refs thread-local? how to identify refs?
+- [ ] debugger: cannot paste to stdin

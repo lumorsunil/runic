@@ -269,11 +269,14 @@ pub const IRDebugger = struct {
             }
         },
         write: []const u8,
-        delete,
+        delete: usize,
         write_and_delete: []const u8,
         horizontal_move: isize,
         horizontal_move_and_delete: isize,
         run_command,
+        autocomplete,
+        undo_word,
+        undo_line,
         none,
 
         pub fn clear() @This() {
@@ -334,7 +337,7 @@ pub const IRDebugger = struct {
         }
 
         fn delete(_: *IRDebugger, _: []const u8) StdinHandlerEvent {
-            return .delete;
+            return .{ .delete = 1 };
         }
 
         fn home(_: *IRDebugger, _: []const u8) StdinHandlerEvent {
@@ -347,6 +350,18 @@ pub const IRDebugger = struct {
 
         fn enter(_: *IRDebugger, _: []const u8) StdinHandlerEvent {
             return .run_command;
+        }
+
+        fn tab(_: *IRDebugger, _: []const u8) StdinHandlerEvent {
+            return .autocomplete;
+        }
+
+        fn c_w(_: *IRDebugger, _: []const u8) StdinHandlerEvent {
+            return .undo_word;
+        }
+
+        fn c_u(_: *IRDebugger, _: []const u8) StdinHandlerEvent {
+            return .undo_line;
         }
     };
 
@@ -387,9 +402,22 @@ pub const IRDebugger = struct {
             .matcher = .{ .exact = &.{10} },
             .handler = StdinHandler.enter,
         },
+        .{
+            .matcher = .{ .exact = &.{9} },
+            .handler = StdinHandler.tab,
+        },
+        .{
+            .matcher = .{ .exact = &.{23} },
+            .handler = StdinHandler.c_w,
+        },
+        .{
+            .matcher = .{ .exact = &.{21} },
+            .handler = StdinHandler.c_u,
+        },
         // { 27, 91, 53, 126 } page up
         // { 27, 91, 54, 126 } page down
-        // { 9 } tab
+        // { 23 } ctrl w
+        // { 21 } ctrl u
     };
 
     const RunningEvent = enum { cont, quit };
@@ -449,7 +477,7 @@ pub const IRDebugger = struct {
                 // try self.commandWriter().writeAll(text);
                 try self.writeAll(text);
             },
-            .delete => {
+            .delete => |n| {
                 try self.updateCommand(before_slice);
 
                 // const pos = try self.getCursorPosition();
@@ -461,14 +489,14 @@ pub const IRDebugger = struct {
                 const allocator = fallback_allocator.get();
                 const after_start = @min(
                     self.commandWriter().buffered().len,
-                    self.command_cursor + 1,
+                    self.command_cursor + n,
                 );
                 const after_slice = try allocator.dupe(
                     u8,
                     self.commandWriter().buffered()[after_start..],
                 );
                 defer allocator.free(after_slice);
-                self.commandWriter().undo(after_slice.len + 1);
+                self.commandWriter().undo(after_slice.len + n);
                 try self.commandWriter().writeAll(after_slice);
                 try self.updateCommand("");
                 // try self.print("{s}{s}", .{ clear_line_to_end, after_slice });
@@ -478,7 +506,7 @@ pub const IRDebugger = struct {
                 try self.updateCommand(before_slice);
 
                 _ = try self.handleStdinHandlerEvent(.{ .write = text }, "");
-                _ = try self.handleStdinHandlerEvent(.delete, "");
+                _ = try self.handleStdinHandlerEvent(.{ .delete = 1 }, "");
             },
             .horizontal_move => |delta| {
                 try self.updateCommand(before_slice);
@@ -503,7 +531,7 @@ pub const IRDebugger = struct {
                 try self.updateCommand(before_slice);
 
                 _ = try self.handleStdinHandlerEvent(.{ .horizontal_move = delta }, "");
-                _ = try self.handleStdinHandlerEvent(.delete, "");
+                _ = try self.handleStdinHandlerEvent(.{ .delete = 1 }, "");
             },
             .run_command => {
                 try self.updateCommand(before_slice);
@@ -517,6 +545,58 @@ pub const IRDebugger = struct {
                 try self.print("{f}", .{command});
 
                 return self.handleCommand(command);
+            },
+            .autocomplete => {
+                try self.updateCommand(before_slice);
+
+                const command_before_cursor = self.commandWriter().buffered()[0..self.command_cursor];
+                var result = autocomplete(command_before_cursor);
+                switch (result) {
+                    .none => {},
+                    .complete => |s| try self.updateCommand(s),
+                    .matches => |*ms| {
+                        try self.writeAll("\n");
+                        while (ms.next()) |m| try self.print("{s}\n", .{m});
+                        try self.writeAll("\n");
+                    },
+                }
+            },
+            .undo_word => {
+                try self.updateCommand(before_slice);
+
+                const Mode = enum { found_word, finding_word };
+                var mode = Mode.finding_word;
+
+                var cursor = self.command_cursor -| 1;
+                while (cursor > 0) : (cursor -= 1) {
+                    const ch = self.commandWriter().buffered()[cursor];
+                    const is_whitespace = std.ascii.isWhitespace(ch);
+
+                    switch (mode) {
+                        .finding_word => if (is_whitespace) continue else {
+                            mode = .found_word;
+                            continue;
+                        },
+                        .found_word => if (!is_whitespace) continue else {
+                            cursor += 1;
+                            break;
+                        },
+                    }
+                }
+
+                if (mode == .found_word) {
+                    const end = self.command_cursor;
+                    const start = cursor;
+                    self.command_cursor = start;
+                    _ = try self.handleStdinHandlerEvent(.{ .delete = end - start }, "");
+                }
+            },
+            .undo_line => {
+                try self.updateCommand(before_slice);
+
+                const n = self.command_cursor;
+                self.command_cursor = 0;
+                _ = try self.handleStdinHandlerEvent(.{ .delete = n }, "");
             },
             .none => {
                 try self.updateCommand(before_slice);
@@ -1083,7 +1163,8 @@ const Command = union(enum) {
         writer: *std.Io.Writer,
     ) std.Io.Writer.Error!void {
         switch (self) {
-            inline .breakpoint => |s, t| try writer.print("{t} {f}", .{ t, s }),
+            .skip_stdio => try writer.writeAll("skip stdio"),
+            inline .breakpoint, .trace => |s, t| try writer.print("{t} {f}", .{ t, s }),
             else => try writer.print("{t}", .{self}),
         }
     }
@@ -1136,4 +1217,80 @@ pub const Breakpoint = struct {
     ) std.Io.Writer.Error!void {
         try writer.print("{s}:{} {f}", .{ self.file, self.line, self.instr_addr });
     }
+};
+
+const main_commands: []const []const u8 = &.{
+    "quit",
+    "step",
+    "cont",
+    "breakpoint",
+    "threads",
+    "instructions",
+    "pipes",
+    "skip_stdio",
+    "trace",
+};
+
+fn autocomplete(
+    command: []const u8,
+) AutocompleteEvent {
+    var it = std.mem.tokenizeAny(u8, command, " ,:");
+
+    const main_command = it.next() orelse return .{
+        .matches = matchIterator(main_commands, ""),
+    };
+    const after_command = it.next();
+    var main_command_matches = matchIterator(main_commands, main_command);
+
+    if (after_command == null) {
+        if (main_command_matches.count() == 1) {
+            const match = main_command_matches.next().?;
+            return .{ .complete = match[main_command.len..] };
+        } else {
+            return .{ .matches = main_command_matches };
+        }
+    }
+
+    return .none;
+}
+
+const MatchIterator = struct {
+    available: []const []const u8,
+    s: []const u8,
+    index: usize = 0,
+
+    pub fn next(self: *@This()) ?[]const u8 {
+        while (true) : (self.index += 1) {
+            if (self.index >= self.available.len) return null;
+            if (std.mem.startsWith(u8, self.available[self.index], self.s)) {
+                defer self.index += 1;
+                return self.available[self.index];
+            }
+        }
+    }
+
+    pub fn reset(self: *@This()) void {
+        self.index = 0;
+    }
+
+    pub fn count(self: @This()) usize {
+        var copy = self;
+        copy.reset();
+        var sum: usize = 0;
+        while (copy.next()) |_| sum += 1;
+        return sum;
+    }
+};
+
+fn matchIterator(
+    available: []const []const u8,
+    s: []const u8,
+) MatchIterator {
+    return .{ .available = available, .s = s };
+}
+
+pub const AutocompleteEvent = union(enum) {
+    complete: []const u8,
+    matches: MatchIterator,
+    none,
 };

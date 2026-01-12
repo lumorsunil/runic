@@ -82,7 +82,7 @@ pub const Instruction = struct {
 
         pub fn format(self: @This(), w: *std.Io.Writer) !void {
             switch (self) {
-                inline .push, .exit, .jmp, .fork, .set, .ref, .pipe_fwd, .wait, .stream, .pipe, .pipe_opt => |t| try w.print("{t} {f}", .{ self, t }),
+                inline .push, .exit, .jmp, .fork, .set, .ref, .pipe_fwd, .wait, .stream, .pipe, .pipe_opt, .ath => |t| try w.print("{t} {f}", .{ self, t }),
                 else => try w.print("{t}", .{self}),
             }
         }
@@ -150,9 +150,16 @@ pub const Instruction = struct {
     pub fn BinaryOperation(comptime OpType: type) type {
         return struct {
             op: OpType,
-            a: Location,
-            b: Location,
+            a: Value,
+            b: Value,
             result: Location,
+
+            pub fn format(
+                self: @This(),
+                writer: *std.Io.Writer,
+            ) std.Io.Writer.Error!void {
+                try writer.print("{f} = {f}{f}{f}", .{ self.result, self.a, self.op, self.b });
+            }
         };
     }
 
@@ -169,7 +176,25 @@ pub const Instruction = struct {
             try w.print("{f}={f}", .{ self.location, self.value });
         }
     };
-    pub const AthOp = enum { add, sub, mul, div, mod };
+    pub const AthOp = enum {
+        add,
+        sub,
+        mul,
+        div,
+        mod,
+        pub fn format(
+            self: @This(),
+            writer: *std.Io.Writer,
+        ) std.Io.Writer.Error!void {
+            try writer.writeAll(switch (self) {
+                .add => "+",
+                .sub => "-",
+                .mul => "*",
+                .div => "/",
+                .mod => "%",
+            });
+        }
+    };
     pub const Ath = BinaryOperation(AthOp);
     pub const CmpOp = enum { gt, gte, lt, lte, eq, ne };
     pub const Cmp = BinaryOperation(CmpOp);
