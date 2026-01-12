@@ -82,7 +82,7 @@ pub const Instruction = struct {
 
         pub fn format(self: @This(), w: *std.Io.Writer) !void {
             switch (self) {
-                inline .push, .exit, .jmp, .fork, .set, .ref, .pipe_fwd, .wait, .stream, .pipe, .pipe_opt, .ath => |t| try w.print("{t} {f}", .{ self, t }),
+                inline .push, .exit, .jmp, .fork, .set, .ref, .pipe_fwd, .wait, .stream, .pipe, .pipe_opt, .ath, .log => |t| try w.print("{t} {f}", .{ self, t }),
                 else => try w.print("{t}", .{self}),
             }
         }
@@ -158,7 +158,7 @@ pub const Instruction = struct {
                 self: @This(),
                 writer: *std.Io.Writer,
             ) std.Io.Writer.Error!void {
-                try writer.print("{f} = {f}{f}{f}", .{ self.result, self.a, self.op, self.b });
+                try writer.print("{f} = {f} {f} {f}", .{ self.result, self.a, self.op, self.b });
             }
         };
     }
@@ -183,7 +183,7 @@ pub const Instruction = struct {
         div,
         mod,
 
-        pub fn from(binary_op: ast.BinaryOp) AthOp {
+        pub fn from(binary_op: ast.BinaryOp) @This() {
             return switch (binary_op) {
                 .add => .add,
                 .subtract => .sub,
@@ -208,9 +208,63 @@ pub const Instruction = struct {
         }
     };
     pub const Ath = BinaryOperation(AthOp);
-    pub const CmpOp = enum { gt, gte, lt, lte, eq, ne };
+    pub const CmpOp = enum {
+        gt,
+        gte,
+        lt,
+        lte,
+        eq,
+        ne,
+
+        pub fn from(binary_op: ast.BinaryOp) @This() {
+            return switch (binary_op) {
+                .greater => .gt,
+                .greater_equal => .gte,
+                .less => .lt,
+                .less_equal => .lte,
+                .equal => .eq,
+                .not_equal => .ne,
+                else => unreachable,
+            };
+        }
+
+        pub fn format(
+            self: @This(),
+            writer: *std.Io.Writer,
+        ) std.Io.Writer.Error!void {
+            try writer.writeAll(switch (self) {
+                .gt => ">",
+                .gte => ">=",
+                .lt => "<",
+                .lte => "<=",
+                .eq => "==",
+                .ne => "!=",
+            });
+        }
+    };
     pub const Cmp = BinaryOperation(CmpOp);
-    pub const LogOp = enum { nd, r, n };
+    pub const LogOp = enum {
+        nd,
+        r,
+
+        pub fn from(binary_op: ast.BinaryOp) @This() {
+            return switch (binary_op) {
+                .logical_and => .nd,
+                .logical_or => .r,
+                else => unreachable,
+            };
+        }
+
+        pub fn format(
+            self: @This(),
+            writer: *std.Io.Writer,
+        ) std.Io.Writer.Error!void {
+            try writer.writeAll(switch (self) {
+                .nd => "&&",
+                .r => "||",
+            });
+        }
+    };
     pub const Log = BinaryOperation(LogOp);
 
     pub const Jump = struct {

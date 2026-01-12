@@ -8,6 +8,7 @@ const DocumentStore = @import("../document_store.zig").DocumentStore;
 const Stream = @import("../stream.zig").Stream;
 const RCError = @import("../mem/rc.zig").RCError;
 const evaluateArithmetic = ir.evaluator.IREvaluator.evaluateArithmetic;
+const evaluateLogical = ir.evaluator.IREvaluator.evaluateLogical;
 const page_size = ir.context.page_size;
 const stack_start = ir.context.stack_start;
 
@@ -1173,10 +1174,32 @@ pub const IRCompiler = struct {
                     return .from(comptime_result);
                 }
 
-                const ref = try self.newRef(source, "add_result");
+                const ref = try self.newRef(source, "ath_result");
 
                 try self.addInstruction(.init(.from(source), .{ .ath = .{
-                    .op = .add,
+                    .op = .from(binary.op),
+                    .a = left.value,
+                    .b = right.value,
+                    .result = ref,
+                } }));
+
+                return .from(ref);
+            },
+            .logical_and, .logical_or => {
+                const left = try self.compileExpression(binary.left);
+
+                if (evaluateLogical(.from(binary.op), left.value)) |comptime_result| {
+                    switch (comptime_result) {
+                        .left => return left,
+                        .right => return self.compileExpression(binary.right),
+                    }
+                }
+
+                const right = try self.compileExpression(binary.right);
+                const ref = try self.newRef(source, "logical_result");
+
+                try self.addInstruction(.init(.from(source), .{ .log = .{
+                    .op = .from(binary.op),
                     .a = left.value,
                     .b = right.value,
                     .result = ref,

@@ -449,12 +449,24 @@ pub const IREvaluator = struct {
 
                 return .cont;
             },
+            .log => |log_expr| {
+                const left = try self.resolveValue(thread, log_expr.a);
+                const right = try self.resolveValue(thread, log_expr.b);
+
+                if (evaluateLogical(log_expr.op, left)) |result| {
+                    const ref_ptr = thread.refs().getPtr(log_expr.result.ref.addr) orelse return Error.RefNotFound;
+                    ref_ptr.* = switch (result) {
+                        .left => left,
+                        .right => right,
+                    };
+                }
+
+                return .cont;
+            },
             .exit => |exit_code| .{ .exit = exit_code },
             else => Error.UnsupportedInstruction,
         };
     }
-
-    pub const EvaluateAddResult = enum { success, failure };
 
     pub fn evaluateArithmetic(
         op: ir.Instruction.AthOp,
@@ -512,6 +524,30 @@ pub const IREvaluator = struct {
                 const float_right: f64 = if (right == .uinteger) @floatFromInt(right.uinteger) else if (right == .float) right.float else return null;
 
                 return .{ .float = @mod(float_left, float_right) };
+            },
+        }
+
+        return null;
+    }
+
+    pub const EvaluateLogicalResult = enum { left, right };
+
+    pub fn evaluateLogical(
+        op: ir.Instruction.LogOp,
+        left: ir.Value,
+    ) ?EvaluateLogicalResult {
+        switch (op) {
+            .nd => {
+                if (left == .exit_code) {
+                    if (left.exit_code == .success) return .right;
+                    return .left;
+                }
+            },
+            .r => {
+                if (left == .exit_code) {
+                    if (left.exit_code == .success) return .left;
+                    return .right;
+                }
             },
         }
 
