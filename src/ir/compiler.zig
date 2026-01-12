@@ -7,6 +7,7 @@ const rainbow = @import("../rainbow.zig");
 const DocumentStore = @import("../document_store.zig").DocumentStore;
 const Stream = @import("../stream.zig").Stream;
 const RCError = @import("../mem/rc.zig").RCError;
+const evaluateArithmetic = ir.evaluator.IREvaluator.evaluateArithmetic;
 const page_size = ir.context.page_size;
 const stack_start = ir.context.stack_start;
 
@@ -1164,22 +1165,12 @@ pub const IRCompiler = struct {
         binary: ast.BinaryExpr,
     ) Error!Result {
         switch (binary.op) {
-            .add => {
+            .add, .subtract, .multiply, .divide, .remainder => {
                 const left = try self.compileExpression(binary.left);
                 const right = try self.compileExpression(binary.right);
 
-                if (left.value == .uinteger and right.value == .uinteger) {
-                    return .fromValue(.{
-                        .uinteger = left.value.uinteger +| right.value.uinteger,
-                    });
-                } else if (left.value == .float and right.value == .float) {
-                    return .fromValue(.{ .float = left.value.float + right.value.float });
-                } else if (left.value == .uinteger and right.value == .float) {
-                    const float_left: f64 = @floatFromInt(left.value.uinteger);
-                    return .fromValue(.{ .float = float_left + right.value.float });
-                } else if (left.value == .float and right.value == .uinteger) {
-                    const float_right: f64 = @floatFromInt(right.value.uinteger);
-                    return .fromValue(.{ .float = left.value.float + float_right });
+                if (evaluateArithmetic(.from(binary.op), left.value, right.value)) |comptime_result| {
+                    return .from(comptime_result);
                 }
 
                 const ref = try self.newRef(source, "add_result");

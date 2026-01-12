@@ -182,6 +182,18 @@ pub const Instruction = struct {
         mul,
         div,
         mod,
+
+        pub fn from(binary_op: ast.BinaryOp) AthOp {
+            return switch (binary_op) {
+                .add => .add,
+                .subtract => .sub,
+                .multiply => .mul,
+                .divide => .div,
+                .remainder => .mod,
+                else => unreachable,
+            };
+        }
+
         pub fn format(
             self: @This(),
             writer: *std.Io.Writer,

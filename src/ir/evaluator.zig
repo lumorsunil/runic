@@ -438,33 +438,84 @@ pub const IREvaluator = struct {
                     else => Error.UnsupportedStreamee,
                 };
             },
-            .ath => |ath| switch (ath.op) {
-                .add => {
-                    const left = try self.resolveValue(thread, ath.a);
-                    const right = try self.resolveValue(thread, ath.b);
+            .ath => |ath| {
+                const left = try self.resolveValue(thread, ath.a);
+                const right = try self.resolveValue(thread, ath.b);
+
+                if (evaluateArithmetic(ath.op, left, right)) |result| {
                     const ref_ptr = thread.refs().getPtr(ath.result.ref.addr) orelse return Error.RefNotFound;
+                    ref_ptr.* = result;
+                }
 
-                    if (left == .uinteger and right == .uinteger) {
-                        ref_ptr.* = .{ .uinteger = left.uinteger +| right.uinteger };
-                    } else if (left == .float and right == .float) {
-                        ref_ptr.* = .{ .float = left.float + right.float };
-                    } else if (left == .uinteger and right == .float) {
-                        const float_left: f64 = @floatFromInt(left.uinteger);
-                        ref_ptr.* = .{ .float = float_left + right.float };
-                    } else if (left == .float and right == .uinteger) {
-                        const float_right: f64 = @floatFromInt(right.uinteger);
-                        ref_ptr.* = .{ .float = left.float + float_right };
-                    } else {
-                        return Error.UnsupportedBinaryExpression;
-                    }
-
-                    return .cont;
-                },
-                else => Error.UnsupportedBinaryOperator,
+                return .cont;
             },
             .exit => |exit_code| .{ .exit = exit_code },
             else => Error.UnsupportedInstruction,
         };
+    }
+
+    pub const EvaluateAddResult = enum { success, failure };
+
+    pub fn evaluateArithmetic(
+        op: ir.Instruction.AthOp,
+        left: ir.Value,
+        right: ir.Value,
+    ) ?ir.Value {
+        switch (op) {
+            .add => {
+                if (left == .uinteger and right == .uinteger) {
+                    return .{ .uinteger = left.uinteger +| right.uinteger };
+                } else if (left == .float and right == .float) {
+                    return .{ .float = left.float + right.float };
+                } else if (left == .uinteger and right == .float) {
+                    const float_left: f64 = @floatFromInt(left.uinteger);
+                    return .{ .float = float_left + right.float };
+                } else if (left == .float and right == .uinteger) {
+                    const float_right: f64 = @floatFromInt(right.uinteger);
+                    return .{ .float = left.float + float_right };
+                }
+            },
+            .sub => {
+                if (left == .uinteger and right == .uinteger) {
+                    return .{ .uinteger = left.uinteger -| right.uinteger };
+                } else if (left == .float and right == .float) {
+                    return .{ .float = left.float - right.float };
+                } else if (left == .uinteger and right == .float) {
+                    const float_left: f64 = @floatFromInt(left.uinteger);
+                    return .{ .float = float_left - right.float };
+                } else if (left == .float and right == .uinteger) {
+                    const float_right: f64 = @floatFromInt(right.uinteger);
+                    return .{ .float = left.float - float_right };
+                }
+            },
+            .mul => {
+                if (left == .uinteger and right == .uinteger) {
+                    return .{ .uinteger = left.uinteger *| right.uinteger };
+                } else if (left == .float and right == .float) {
+                    return .{ .float = left.float * right.float };
+                } else if (left == .uinteger and right == .float) {
+                    const float_left: f64 = @floatFromInt(left.uinteger);
+                    return .{ .float = float_left * right.float };
+                } else if (left == .float and right == .uinteger) {
+                    const float_right: f64 = @floatFromInt(right.uinteger);
+                    return .{ .float = left.float * float_right };
+                }
+            },
+            .div => {
+                const float_left: f64 = if (left == .uinteger) @floatFromInt(left.uinteger) else if (left == .float) left.float else return null;
+                const float_right: f64 = if (right == .uinteger) @floatFromInt(right.uinteger) else if (right == .float) right.float else return null;
+
+                return .{ .float = float_left / float_right };
+            },
+            .mod => {
+                const float_left: f64 = if (left == .uinteger) @floatFromInt(left.uinteger) else if (left == .float) left.float else return null;
+                const float_right: f64 = if (right == .uinteger) @floatFromInt(right.uinteger) else if (right == .float) right.float else return null;
+
+                return .{ .float = @mod(float_left, float_right) };
+            },
+        }
+
+        return null;
     }
 
     pub const MaterializeStringError =
