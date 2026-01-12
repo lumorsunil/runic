@@ -27,7 +27,7 @@
 - [x] stack pop
 - [x] arithmetic
 - [ ] compare
-- [ ] logical
+- [x] logical
 - [x] new ref
 - [x] set addr to value
 - [x] unconditional jump
@@ -55,12 +55,7 @@
 - [x] struct types
   - [ ] used defined struct types
 - [x] arithmetic
-  - [x] add
-  - [x] sub
-  - [x] mul
-  - [x] div
-  - [x] remainder
-- [ ] boolean algebra
+- [x] boolean algebra
 - [x] pipelines
   - [x] multiple sources in streams ReaderWriterStream (stderr usually connects many sources)
   - [ ] error handling?
