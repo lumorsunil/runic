@@ -56,10 +56,10 @@
   - [ ] used defined struct types
 - [x] arithmetic
   - [x] add
-  - [ ] sub
-  - [ ] mul
-  - [ ] div
-  - [ ] remainder
+  - [x] sub
+  - [x] mul
+  - [x] div
+  - [x] remainder
 - [ ] boolean algebra
 - [x] pipelines
   - [x] multiple sources in streams ReaderWriterStream (stderr usually connects many sources)
@@ -133,10 +133,10 @@
   - [ ] execution result
 - [x] arithmetic
   - [x] add
-  - [ ] sub
-  - [ ] mul
-  - [ ] div
-  - [ ] remainder
+  - [x] sub
+  - [x] mul
+  - [x] div
+  - [x] remainder
 
 ## debugger
 
