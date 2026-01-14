@@ -4,6 +4,7 @@ const ExitCode = @import("../runtime/command_runner.zig").ExitCode;
 const endian = @import("constants.zig").endian;
 const TypeAddr = @import("type-addr.zig").TypeAddr;
 const Location = @import("location.zig").Location;
+const Register = @import("location.zig").Register;
 const ReaderWriterStream = @import("../stream.zig").ReaderWriterStream;
 const Closeable = @import("../closeable.zig").Closeable;
 const InstructionAddr = @import("instruction-addr.zig").InstructionAddr;
@@ -22,6 +23,8 @@ pub const Value = union(enum) {
     stream: []const Value,
     thread: usize,
     fn_ref: FunctionRef,
+    register: Register,
+    dereference: union(enum) { addr: usize, register: Register },
 
     pub fn deinit(self: *@This(), allocator: Allocator) void {
         switch (self.*) {
@@ -29,6 +32,22 @@ pub const Value = union(enum) {
             .strct => |strct| strct.deinit(allocator),
             .stream => |stream| allocator.free(stream),
         }
+    }
+
+    pub fn isNumber(self: @This()) bool {
+        return switch (self) {
+            .uinteger => true,
+            .float => true,
+            else => false,
+        };
+    }
+
+    pub fn toFloat(self: @This()) ?f64 {
+        return switch (self) {
+            .uinteger => |uinteger| @floatFromInt(uinteger),
+            .float => |float| float,
+            else => null,
+        };
     }
 
     pub const Slice = struct {
@@ -198,7 +217,10 @@ pub const Value = union(enum) {
         };
     }
 
-    pub const DeserializeError = std.Io.Reader.Error || error{UnsupportedDeserialize};
+    pub const DeserializeError =
+        std.Io.Reader.Error ||
+        std.Io.Reader.TakeEnumError ||
+        error{UnsupportedDeserialize};
 
     pub fn deserialize(
         tag: std.meta.Tag(@This()),
@@ -216,6 +238,7 @@ pub const Value = union(enum) {
             ).* },
             .slice, .strct, .pipe, .closeable, .fn_ref => DeserializeError.UnsupportedDeserialize,
             .exit_code => .{ .exit_code = try ExitCode.deserialize(r) },
+            .register, .dereference => unreachable,
         };
     }
 
@@ -223,6 +246,7 @@ pub const Value = union(enum) {
         switch (self) {
             .void => {},
             .stream => |stream| try w.writeAll(&std.mem.toBytes(stream)),
+            .register, .dereference => unreachable,
             inline .uinteger => |t| try w.writeInt(@TypeOf(t), t, endian),
             inline else => |t| {
                 if (std.meta.hasMethod(@TypeOf(t), "serialize")) {
@@ -242,7 +266,7 @@ pub const Value = union(enum) {
             .pipe => |handle| try w.print("<pipe:{}>", .{handle}),
             .closeable => |handle| try w.print("<closeable:{}>", .{handle}),
             .thread => |id| try w.print("<thread:{}>", .{id}),
-            inline .slice, .exit_code, .fn_ref => |s| try w.print("{f}", .{s}),
+            inline .slice, .exit_code, .fn_ref, .register => |s| try w.print("{f}", .{s}),
             inline else => |t| try w.print("{}", .{t}),
         }
     }

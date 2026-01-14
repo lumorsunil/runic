@@ -26,7 +26,7 @@
 - [x] stack push
 - [x] stack pop
 - [x] arithmetic
-- [ ] compare
+- [x] compare
 - [x] logical
 - [x] new ref
 - [x] set addr to value
@@ -127,11 +127,8 @@
   - [x] exit code
   - [ ] execution result
 - [x] arithmetic
-  - [x] add
-  - [x] sub
-  - [x] mul
-  - [x] div
-  - [x] remainder
+- [x] logical
+- [x] compare
 
 ## debugger
 
@@ -166,3 +163,4 @@
 - [ ] cannot call function multiple times
   - possible solution: make refs thread-local? how to identify refs?
 - [ ] debugger: cannot paste to stdin
+- [ ] look into the pipe instruction to see why some of the examples are not outputting anything

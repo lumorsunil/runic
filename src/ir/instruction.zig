@@ -23,8 +23,8 @@ pub const Instruction = struct {
         cmp: Cmp,
         /// performs logical operator with a and b and stores the result into result
         log: Log,
-        /// declares a new ref
-        ref: Ref,
+        /// declares a new ref (basically a labeled push)
+        ref: []const u8,
         /// sets a Location to a Value from a Location
         set: Set,
         /// sets the instruction counter if condition is true
@@ -57,14 +57,12 @@ pub const Instruction = struct {
         }
 
         pub fn fork_(
-            result: ?Location,
             dest: InstructionAddr,
             stdin: Location,
             stdout: Location,
             stderr: Location,
         ) @This() {
             return .{ .fork = .{
-                .result = result,
                 .dest = dest,
                 .stdin = stdin,
                 .stdout = stdout,
@@ -82,7 +80,8 @@ pub const Instruction = struct {
 
         pub fn format(self: @This(), w: *std.Io.Writer) !void {
             switch (self) {
-                inline .push, .exit, .jmp, .fork, .set, .ref, .pipe_fwd, .wait, .stream, .pipe, .pipe_opt, .ath, .log => |t| try w.print("{t} {f}", .{ self, t }),
+                inline .push, .exit, .jmp, .fork, .set, .pipe_fwd, .wait, .stream, .pipe, .pipe_opt, .ath, .log, .cmp => |t| try w.print("{t} {f}", .{ self, t }),
+                inline .ref => |t| try w.print("{t} {s}", .{ self, t }),
                 else => try w.print("{t}", .{self}),
             }
         }
@@ -312,7 +311,6 @@ pub const Instruction = struct {
     };
 
     pub const Exec = struct {
-        result: ?Location,
         sync: bool,
 
         pub fn format(self: @This(), w: *std.Io.Writer) !void {
@@ -322,7 +320,6 @@ pub const Instruction = struct {
     };
 
     pub const Fork = struct {
-        result: ?Location,
         dest: InstructionAddr,
         stdin: Location,
         stdout: Location,

@@ -9,6 +9,7 @@ const ExitCode = @import("../runtime/command_runner.zig").ExitCode;
 const Stream = @import("../stream.zig").Stream;
 const ReaderWriterStream = @import("../stream.zig").ReaderWriterStream;
 const Closeable = @import("../closeable.zig").Closeable;
+const Ref = @import("ref.zig").Ref;
 
 pub const page_size = 1024 * 4;
 pub const stack_start: usize = std.math.maxInt(usize) - 1024 * 1024 * 10;
@@ -110,7 +111,7 @@ pub const IRProgramContext = struct {
 
     pub fn advanceThreadCounter(self: *@This()) AdvanceEvent {
         self.thread_counter += 1;
-        if (self.getNextActiveThread()) |thread_counter| {
+        if (self.getNextActiveThread(null)) |thread_counter| {
             self.thread_counter = thread_counter;
             return .cont;
         }
@@ -118,7 +119,7 @@ pub const IRProgramContext = struct {
         self.removeThreadsSlatedToBeRemoved();
 
         self.thread_counter = 0;
-        if (self.getNextActiveThread()) |thread_counter| {
+        if (self.getNextActiveThread(null)) |thread_counter| {
             self.thread_counter = thread_counter;
             return .cont;
         }
@@ -128,12 +129,12 @@ pub const IRProgramContext = struct {
         return .quit;
     }
 
-    fn getNextActiveThread(self: @This()) ?usize {
-        var i = self.thread_counter;
+    pub fn getNextActiveThread(self: @This(), i: ?usize) ?usize {
+        var i_ = i orelse self.thread_counter;
 
-        while (true) : (i += 1) {
-            if (i >= self.threads.items.len) return null;
-            if (self.isThreadActive(self.threads.items[i].id)) return i;
+        while (true) : (i_ += 1) {
+            if (i_ >= self.threads.items.len) return null;
+            if (self.isThreadActive(self.threads.items[i_].id)) return i_;
         }
     }
 
@@ -267,6 +268,14 @@ pub const IRThreadContext = struct {
         return .success;
     }
 
+    pub fn getRefPtr(self: @This(), ref: Ref) *Value {
+        return &self.private.stack.items[self.private.stack_frame + ref.rel_stack_addr];
+    }
+
+    pub fn setRef(self: @This(), ref: Ref, value: Value) void {
+        self.getRefPtr(ref).* = value;
+    }
+
     pub fn refs(self: @This()) *std.AutoArrayHashMapUnmanaged(usize, Value) {
         return &self.shared.refs;
     }
@@ -288,7 +297,6 @@ pub const IRSharedContext = struct {
     instructions: []const []const Instruction,
     labels: Labels,
     struct_types: []const Value.Struct.Type,
-    refs: std.AutoArrayHashMapUnmanaged(usize, Value) = .empty,
 
     pub fn dataSize(self: @This()) usize {
         if (self.data.len == 0) return 0;
@@ -299,11 +307,11 @@ pub const IRSharedContext = struct {
         const data_end = self.dataSize();
 
         if (addr < data_end) {
-            return .{ .data = .fromAddr(addr) };
+            return .initAbs(.{ .data = .fromAddr(addr) });
         } else if (addr >= stack_start) {
-            return .{ .stack = addr - stack_start };
+            return .initAbs(.{ .stack = addr - stack_start });
         } else {
-            return .{ .ref = .{ .addr = addr } };
+            @panic("shouldn't happen :)");
         }
     }
 };
@@ -311,6 +319,8 @@ pub const IRSharedContext = struct {
 pub const IRPrivateContext = struct {
     instruction_counter: ResolvedInstructionAddr = .init(0, 0),
     stack: std.ArrayList(Value) = .empty,
+    stack_frame: usize = 0,
+    result_register: Value = .void,
     process: ?*std.process.Child = null,
     waiting_for: ?ThreadId = null,
 

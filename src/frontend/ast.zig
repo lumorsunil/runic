@@ -852,6 +852,7 @@ pub const IfExpr = struct {
     else_branch: ?ElseBranch,
     span: Span,
 
+    // TODO: check if we really need this to be a union, and not just an expression since if expressions are also an expression
     pub const ElseBranch = union(enum) {
         expr: *Expression,
         if_expr: *IfExpr,

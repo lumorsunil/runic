@@ -1,0 +1,20 @@
+echo "hello"
+
+
+// main
+//
+// ref exec_thread ==> push allocated address   S4
+// ref exec_thread_2 ==> push allocated address S5
+// fork @@exec_thread exec_echo_hello inherit
+// fork @@exec_thread_2 exec_echo_hello inherit
+// wait @@exec_thread
+// wait @@exec_thread_2
+// pop
+// pop
+
+// exec "echo hello"
+//
+// ref closeable_process
+// push exec_context
+// exec @@closeable_process
+// wait @@closeable_process

@@ -140,7 +140,8 @@ pub const IREvaluator = struct {
 
     fn getSlice(self: IREvaluator, slice: ir.Value.Slice) GetSliceError![]const u8 {
         self.log("getSlice: {any}", .{slice});
-        return switch (self.context.mapAddr(slice.addr)) {
+        // TODO: support addr mod?
+        return switch (self.context.mapAddr(slice.addr).abs) {
             .data => |data| data.get(
                 slice.len * slice.element_size,
                 self.context.readonlyData(),
@@ -165,7 +166,7 @@ pub const IREvaluator = struct {
         return .init(addr.instr_set, abs);
     }
 
-    pub const ResolveValueError = error{UnsupportedResolveValueType};
+    pub const ResolveValueError = ir.Location.Error || error{UnsupportedResolveValueType};
 
     fn resolveValue(
         self: IREvaluator,
@@ -173,12 +174,24 @@ pub const IREvaluator = struct {
         value: ir.Value,
     ) ResolveValueError!ir.Value {
         return switch (value) {
-            .addr => |addr| switch (self.context.mapAddr(addr)) {
-                .data, .scope => ResolveValueError.UnsupportedResolveValueType,
-                .ref => |ref| thread.refs().get(ref.addr).?,
-                .stack => |stack| thread.private.stack.items[stack],
-                .instruction => value,
+            .addr => |addr| {
+                const loc = self.context.mapAddr(addr);
+                return switch (loc.abs) {
+                    .data, .scope, .register, .ref => ResolveValueError.UnsupportedResolveValueType,
+                    .stack => |stack| thread.private.stack.items[stack],
+                    .instruction => value,
+                };
             },
+            .register => |reg| switch (reg.abs) {
+                .ic => ResolveValueError.UnsupportedResolveValueType,
+                .sf => .{ .uinteger = reg.applyMod(thread.private.stack_frame) },
+                .sc => .{ .uinteger = reg.applyMod(thread.private.stack.items.len) },
+                .r => thread.private.result_register,
+            },
+            .dereference => |der| self.resolveLocation(thread, .init(
+                .{ .register = der.register.abs },
+                der.register.mod,
+            )),
             else => value,
         };
     }
@@ -190,7 +203,16 @@ pub const IREvaluator = struct {
         thread: ir.context.IRThreadContext,
         location: ir.Location,
     ) ResolveLocationError!ir.Value {
-        return self.resolveValue(thread, .fromAddr(try location.toAddr()));
+        return switch (location.abs) {
+            .ref => |ref| thread.getRefPtr(ref).*,
+            .register => |reg| switch (reg) {
+                .ic => ResolveValueError.UnsupportedResolveValueType,
+                .sf => .fromAddr(location.applyMod(thread.private.stack_frame)),
+                .sc => .fromAddr(location.applyMod(thread.private.stack.items.len)),
+                .r => thread.private.result_register,
+            },
+            else => self.resolveValue(thread, .fromAddr(try location.toAddr())),
+        };
     }
 
     fn runInstruction(
@@ -213,7 +235,10 @@ pub const IREvaluator = struct {
                 return .cont;
             },
             .push => |push| {
-                try thread.private.stack.append(self.allocator, push);
+                try thread.private.stack.append(
+                    self.allocator,
+                    try self.resolveValue(thread, push),
+                );
                 return .cont;
             },
             .pop => {
@@ -221,39 +246,42 @@ pub const IREvaluator = struct {
                 return .cont;
             },
             .exec => |exec| {
-                // const argv_len = self.context.stack.pop().?.uinteger + 1;
-                const context_loc = thread.private.stack.pop().?;
-                const context = (try self.resolveValue(thread, context_loc)).strct;
-                const argv_value = context.fields[0];
-                const argv_value_slice = try self.getSlice(argv_value.slice);
+                _ = exec;
+
+                const argv_len = thread.private.stack.pop().?.uinteger + 1;
+                // const context_loc = thread.private.stack.pop().?;
+                // const context = (try self.resolveValue(thread, context_loc)).strct;
+                // const argv_value = context.fields[0];
+                // const argv_value_slice = try self.getSlice(argv_value.slice);
 
                 // TODO: memory management
                 var argv = try std.ArrayList([]const u8).initCapacity(
                     self.allocator,
-                    argv_value.slice.len + 2,
+                    // argv_value.slice.len + 2,
+                    argv_len + 2,
                 );
                 defer argv.deinit(self.allocator);
 
                 // TODO: figure out how to do this ourselves
                 argv.appendSliceAssumeCapacity(&.{ "stdbuf", "-oL" });
 
-                const element_size = argv_value.slice.element_size;
-                for (0..argv_value.slice.len) |i| {
-                    const start = i * element_size;
-                    const end = start + element_size;
-                    const slice_as_bytes = argv_value_slice[start..end];
-                    var reader = std.Io.Reader.fixed(slice_as_bytes);
-                    const arg_stream = try ir.Value.deserialize(.stream, &reader);
-                    var arg_writer = std.Io.Writer.Allocating.init(self.allocator);
-                    try self.materializeString(thread, arg_stream, &arg_writer.writer);
-                    argv.appendAssumeCapacity(try arg_writer.toOwnedSlice());
-                }
-
-                // for (0..argv_len) |_| {
-                //     const arg = self.context.stack.pop().?;
-                //     const slice = try self.getSlice(arg.slice);
-                //     argv.appendAssumeCapacity(slice);
+                // const element_size = argv_value.slice.element_size;
+                // for (0..argv_value.slice.len) |i| {
+                //     const start = i * element_size;
+                //     const end = start + element_size;
+                //     const slice_as_bytes = argv_value_slice[start..end];
+                //     var reader = std.Io.Reader.fixed(slice_as_bytes);
+                //     const arg_stream = try ir.Value.deserialize(.stream, &reader);
+                //     var arg_writer = std.Io.Writer.Allocating.init(self.allocator);
+                //     try self.materializeString(thread, arg_stream, &arg_writer.writer);
+                //     argv.appendAssumeCapacity(try arg_writer.toOwnedSlice());
                 // }
+
+                for (0..argv_len) |_| {
+                    const arg = thread.private.stack.pop().?;
+                    const slice = try self.getSlice(arg.slice);
+                    argv.appendAssumeCapacity(slice);
+                }
 
                 const child = try self.allocator.create(std.process.Child);
                 child.* = std.process.Child.init(try argv.toOwnedSlice(self.allocator), self.allocator);
@@ -282,11 +310,14 @@ pub const IREvaluator = struct {
                 try stdout_pipe.connectSource(process_io.closeableStdout());
                 try stderr_pipe.connectSource(process_io.closeableStderr());
 
-                if (exec.result) |loc| {
-                    const ref_ptr = thread.refs().getPtr(loc.ref.addr) orelse return Error.RefNotFound;
-                    const handle = try self.context.addCloseable(process_io.closeable());
-                    ref_ptr.* = .{ .closeable = handle };
-                }
+                const handle = try self.context.addCloseable(process_io.closeable());
+                thread.private.result_register = .{ .closeable = handle };
+
+                // if (exec.result) |loc| {
+                //     const ref_ptr = thread.refs().getPtr(loc.ref.addr) orelse return Error.RefNotFound;
+                //     const handle = try self.context.addCloseable(process_io.closeable());
+                //     ref_ptr.* = .{ .closeable = handle };
+                // }
 
                 return .cont;
             },
@@ -307,29 +338,49 @@ pub const IREvaluator = struct {
                 return .cont;
             },
             .ref => |ref| {
-                const entry = try thread.refs().getOrPut(self.allocator, ref.addr);
+                // const entry = try thread.refs().getOrPut(self.allocator, ref.addr);
 
-                if (entry.found_existing) {
-                    return Error.DuplicateRef;
-                }
+                // if (entry.found_existing) {
+                //     return Error.DuplicateRef;
+                // }
 
-                entry.value_ptr.* = .void;
+                // entry.value_ptr.* = .void;
+
+                _ = ref;
+                try thread.private.stack.append(self.allocator, .void);
 
                 return .cont;
             },
             .set => |set| {
-                return switch (set.location) {
+                return switch (set.location.abs) {
                     .data => Error.SetImmutableLocation,
                     .scope => Error.UnsupportedInstruction,
                     .instruction => Error.SetInstructionLocation,
                     .ref => |ref| {
-                        const ref_ptr = thread.refs().getPtr(ref.addr) orelse return Error.RefNotFound;
-                        ref_ptr.* = set.value;
+                        // const ref_ptr = thread.refs().getPtr(ref.addr) orelse return Error.RefNotFound;
+                        // ref_ptr.* = set.value;
+
+                        thread.setRef(ref, set.value);
 
                         return .cont;
                     },
                     .stack => |stack| {
                         thread.private.stack.items[stack] = set.value;
+                        return .cont;
+                    },
+                    .register => |reg| {
+                        try switch (reg) {
+                            .ic => Error.UnsupportedInstruction,
+                            .sf => thread.private.stack_frame = set.location.applyMod(
+                                (try self.resolveValue(thread, set.value)).uinteger,
+                            ),
+                            .sc => thread.private.stack.resize(
+                                self.allocator,
+                                set.value.uinteger,
+                            ),
+                            .r => thread.private.result_register = set.value,
+                        };
+
                         return .cont;
                     },
                 };
@@ -338,8 +389,7 @@ pub const IREvaluator = struct {
                 const pipe = try Stream(u8).initReaderWriter(self.allocator, "pipe", .{}, self.config.tracer);
                 const pipe_handle = try self.context.addPipe(pipe);
 
-                const ref_ptr = thread.refs().getPtr(instr_pipe.result.ref.addr) orelse return Error.RefNotFound;
-                ref_ptr.* = .{ .pipe = pipe_handle };
+                thread.setRef(instr_pipe.result.abs.ref, .{ .pipe = pipe_handle });
 
                 return .cont;
             },
@@ -386,10 +436,7 @@ pub const IREvaluator = struct {
 
                 new_thread.setInstructionCounter(self.resolveAddr(thread, fork.dest));
 
-                if (fork.result) |loc| {
-                    const ref_ptr = thread.refs().getPtr(loc.ref.addr) orelse return Error.RefNotFound;
-                    ref_ptr.* = .{ .thread = new_thread_handle };
-                }
+                thread.private.result_register = .{ .thread = new_thread_handle };
 
                 try new_thread.private.stack.append(
                     self.allocator,
@@ -407,7 +454,7 @@ pub const IREvaluator = struct {
                 return .cont;
             },
             .wait => |wait| {
-                const waitee = try self.resolveValue(thread, .fromAddr(try wait.waitee.toAddr()));
+                const waitee = try self.resolveLocation(thread, wait.waitee);
 
                 switch (waitee) {
                     .thread => |thread_handle| {
@@ -427,7 +474,8 @@ pub const IREvaluator = struct {
                 return .cont;
             },
             .stream => |stream| {
-                const streamee = try self.resolveValue(thread, .fromAddr(try stream.toAddr()));
+                // const streamee = try self.resolveValue(thread, .fromAddr(try stream.toAddr()));
+                const streamee = try self.resolveLocation(thread, stream);
 
                 return switch (streamee) {
                     .pipe => |pipe_handle| switch (try self.context.getPipe(pipe_handle).forward(.unlimited)) {
@@ -435,7 +483,10 @@ pub const IREvaluator = struct {
                         .closed => .cont,
                         .not_done => .cont_no_instr_counter_inc,
                     },
-                    else => Error.UnsupportedStreamee,
+                    else => {
+                        std.log.err("streamee: {t}", .{streamee});
+                        return Error.UnsupportedStreamee;
+                    },
                 };
             },
             .ath => |ath| {
@@ -443,29 +494,56 @@ pub const IREvaluator = struct {
                 const right = try self.resolveValue(thread, ath.b);
 
                 if (evaluateArithmetic(ath.op, left, right)) |result| {
-                    const ref_ptr = thread.refs().getPtr(ath.result.ref.addr) orelse return Error.RefNotFound;
-                    ref_ptr.* = result;
+                    try self.setLocation(thread, ath.result, result);
+                } else {
+                    return Error.UnsupportedBinaryExpression;
                 }
 
                 return .cont;
             },
             .log => |log_expr| {
                 const left = try self.resolveValue(thread, log_expr.a);
-                const right = try self.resolveValue(thread, log_expr.b);
 
                 if (evaluateLogical(log_expr.op, left)) |result| {
-                    const ref_ptr = thread.refs().getPtr(log_expr.result.ref.addr) orelse return Error.RefNotFound;
-                    ref_ptr.* = switch (result) {
+                    try self.setLocation(thread, log_expr.result, switch (result) {
                         .left => left,
-                        .right => right,
-                    };
+                        .right => try self.resolveValue(thread, log_expr.b),
+                    });
+                } else {
+                    return Error.UnsupportedBinaryExpression;
+                }
+
+                return .cont;
+            },
+            .cmp => |cmp| {
+                const left = try self.resolveValue(thread, cmp.a);
+                const right = try self.resolveValue(thread, cmp.b);
+
+                if (evaluateCompare(cmp.op, left, right)) |result| {
+                    try self.setLocation(thread, cmp.result, result);
+                } else {
+                    return Error.UnsupportedBinaryExpression;
                 }
 
                 return .cont;
             },
             .exit => |exit_code| .{ .exit = exit_code },
-            else => Error.UnsupportedInstruction,
+            // else => Error.UnsupportedInstruction,
         };
+    }
+
+    fn setLocation(
+        self: *IREvaluator,
+        thread: ir.context.IRThreadContext,
+        loc: ir.Location,
+        value: ir.Value,
+    ) Error!void {
+        _ = self;
+
+        switch (loc.abs) {
+            .ref => |ref| thread.setRef(ref, value),
+            else => return Error.UnsupportedInstruction,
+        }
     }
 
     pub fn evaluateArithmetic(
@@ -554,6 +632,51 @@ pub const IREvaluator = struct {
         return null;
     }
 
+    pub fn evaluateCompare(
+        op: ir.Instruction.CmpOp,
+        left: ir.Value,
+        right: ir.Value,
+    ) ?ir.Value {
+        return switch (op) {
+            .gt => {
+                if (left.toFloat()) |l| if (right.toFloat()) |r| {
+                    return .fromBoolean(l > r);
+                };
+                return null;
+            },
+            .gte => {
+                if (left.toFloat()) |l| if (right.toFloat()) |r| {
+                    return .fromBoolean(l >= r);
+                };
+                return null;
+            },
+            .lt => {
+                if (left.toFloat()) |l| if (right.toFloat()) |r| {
+                    return .fromBoolean(l < r);
+                };
+                return null;
+            },
+            .lte => {
+                if (left.toFloat()) |l| if (right.toFloat()) |r| {
+                    return .fromBoolean(l <= r);
+                };
+                return null;
+            },
+            .eq => {
+                if (left.toFloat()) |l| if (right.toFloat()) |r| {
+                    return .fromBoolean(l == r);
+                };
+                return null;
+            },
+            .ne => {
+                if (left.toFloat()) |l| if (right.toFloat()) |r| {
+                    return .fromBoolean(l != r);
+                };
+                return null;
+            },
+        };
+    }
+
     pub const MaterializeStringError =
         Allocator.Error ||
         GetSliceError ||
@@ -579,7 +702,7 @@ pub const IREvaluator = struct {
             inline .uinteger, .float => |t| try w.print("{}", .{t}),
             inline .addr => |t| try w.print("0x{x}", .{t}),
             inline .exit_code => |t| try w.print("{f}", .{t}),
-            .void, .strct, .pipe, .thread, .closeable, .fn_ref => {},
+            .void, .strct, .pipe, .thread, .closeable, .fn_ref, .register => {},
         }
     }
 };

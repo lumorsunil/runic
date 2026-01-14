@@ -41,6 +41,7 @@ pub const IRDebugger = struct {
     breakpoints: std.ArrayList(Breakpoint) = .empty,
     skip_stdio: bool = true,
     trace_filter: ?TraceFilter = null,
+    show_info_window: bool = true,
 
     pub fn init(
         allocator: Allocator,
@@ -126,19 +127,29 @@ pub const IRDebugger = struct {
     }
 
     fn print(self: *IRDebugger, comptime fmt: []const u8, args: anytype) !void {
-        defer self.stdoutWriter().flush() catch {};
-        return self.stdoutWriter().print(fmt, args);
+        try self.stdoutWriter().print(fmt, args);
+        try self.stdoutWriter().flush();
     }
 
     fn writeAll(self: *IRDebugger, string: []const u8) !void {
-        defer self.stdoutWriter().flush() catch {};
-        return self.stdoutWriter().writeAll(string);
+        try self.stdoutWriter().writeAll(string);
+        try self.stdoutWriter().flush();
     }
 
     const command_delimiters: []const []const u8 = &.{"\n"};
 
     fn loop(self: *IRDebugger) Error!RunningEvent {
         // try self.printDebugCommandStuff();
+        const event = try self.readCommandInput();
+
+        if (self.show_info_window) {
+            try self.printInfoWindow();
+        }
+
+        return event;
+    }
+
+    fn readCommandInput(self: *IRDebugger) Error!RunningEvent {
         try self.updateCommand("");
 
         if (self.is_continuing) {
@@ -625,9 +636,13 @@ pub const IRDebugger = struct {
             .breakpoint => |bp| return self.handleBreakpointCommand(bp),
             .threads => return self.printThreads(),
             .instructions => return self.printInstructions(),
+            .instructions_all => return self.printInstructionsAll(),
+            .registers => return self.printRegisters(),
             .pipes => return self.printPipes(),
             .skip_stdio => return self.skipStdio(),
             .trace => |trace| return self.handleTraceCommand(trace),
+            .stack => return self.printStack(),
+            .toggle_info_window => return self.toggleInfoWindow(),
         }
     }
 
@@ -710,8 +725,14 @@ pub const IRDebugger = struct {
         return .cont;
     }
 
+    fn getCurrentExecutingThread(self: *IRDebugger) ir.context.IRThreadContext {
+        const current_thread_i: ?usize = if (self.skip_stdio) if (self.evaluator.context.thread_counter >= 1 and self.evaluator.context.thread_counter <= 3) 4 else null else null;
+        const thread_i = self.evaluator.context.getNextActiveThread(current_thread_i) orelse 0;
+        return self.evaluator.context.threads.items[thread_i];
+    }
+
     fn printInstructions(self: *IRDebugger) !RunningEvent {
-        const thread = self.evaluator.context.getCurrentThread();
+        const thread = self.getCurrentExecutingThread();
         const instr_addr = thread.getCurrentInstructionAddr();
         const instr_set = self.evaluator.context.instructions()[instr_addr.instr_set];
 
@@ -740,6 +761,45 @@ pub const IRDebugger = struct {
         return .cont;
     }
 
+    fn printInstructionsAll(self: *IRDebugger) !RunningEvent {
+        const thread = self.evaluator.context.getCurrentThread();
+        const instr_addr = thread.getCurrentInstructionAddr();
+
+        for (self.evaluator.context.instructions(), 0..) |instr_set, i| {
+            try self.print("\nSet: {}\n", .{i});
+
+            for (instr_set, 0..) |instr, j| {
+                const addr = ir.ResolvedInstructionAddr.init(i, j);
+                if (instr_addr.equals(addr)) {
+                    try self.print("\n{s}{f}: {f}{s}", .{
+                        current_instr_color,
+                        addr,
+                        instr,
+                        end_color,
+                    });
+                } else {
+                    try self.print("\n{f}: {f}", .{ addr, instr });
+                }
+            }
+        }
+
+        return .cont;
+    }
+
+    fn printRegisters(self: *IRDebugger) !RunningEvent {
+        for (self.evaluator.context.threads.items) |thread| {
+            try self.print("\n\nthread: {}\n", .{thread.id});
+            try self.print("\nic: {f}", .{thread.private.instruction_counter});
+            try self.print("\nsf: {}", .{thread.private.stack_frame});
+            try self.print("\nsc: {}", .{thread.private.stack.items.len});
+            try self.print("\nr: {f}", .{thread.private.result_register});
+        }
+
+        try self.writeAll("\n\n");
+
+        return .cont;
+    }
+
     fn printPipes(self: *IRDebugger) !RunningEvent {
         var it = self.evaluator.context.pipes.iterator();
         while (it.next()) |entry| {
@@ -748,6 +808,79 @@ pub const IRDebugger = struct {
         try self.writeAll("\n\n");
 
         return .cont;
+    }
+
+    fn printWrappedAt(
+        self: *IRDebugger,
+        pos: TermVector,
+        width: usize,
+        comptime fmt: []const u8,
+        args: anytype,
+    ) !void {
+        var fallback_allocator = std.heap.stackFallback(1024, self.allocator);
+        const allocator = fallback_allocator.get();
+        const tw = try textWrapper(allocator, self.stdinReader(), width, fmt, args);
+        defer tw.deinit(self.allocator);
+        try self.printAt(pos, "{f}", .{tw});
+    }
+
+    fn printAt(
+        self: *IRDebugger,
+        position: TermVector,
+        comptime fmt: []const u8,
+        args: anytype,
+    ) !void {
+        try self.setCursorPosition(position);
+        try self.print(fmt, args);
+    }
+
+    const TextWrappingFormatter = struct {
+        width: usize,
+        s: []const u8,
+        reader: *std.Io.Reader,
+
+        pub fn deinit(self: @This(), allocator: Allocator) void {
+            allocator.free(self.s);
+        }
+
+        pub fn format(
+            self: @This(),
+            writer: *std.Io.Writer,
+        ) std.Io.Writer.Error!void {
+            const pos: TermVector = getCursorPositionGen(writer, self.reader) catch return;
+
+            var it = std.mem.tokenizeScalar(u8, self.s, ' ');
+            var i: usize = 0;
+            var j: usize = 0;
+
+            while (it.next()) |word| {
+                if (word.len + i > self.width) {
+                    j += 1;
+                    i = 0;
+                    try setCursorPositionGen(writer, pos.add(@intCast(j), 0));
+                }
+
+                try writer.writeAll(word);
+
+                i += word.len;
+
+                if (i + 1 <= self.width) {
+                    try writer.writeByte(' ');
+                    i += 1;
+                }
+            }
+        }
+    };
+
+    fn textWrapper(
+        allocator: Allocator,
+        reader: *std.Io.Reader,
+        width: usize,
+        comptime fmt: []const u8,
+        args: anytype,
+    ) !TextWrappingFormatter {
+        const s = try std.fmt.allocPrint(allocator, fmt, args);
+        return .{ .s = s, .width = width, .reader = reader };
     }
 
     fn skipStdio(self: *IRDebugger) !RunningEvent {
@@ -771,6 +904,98 @@ pub const IRDebugger = struct {
         return .cont;
     }
 
+    fn printStack(self: *IRDebugger) !RunningEvent {
+        for (self.evaluator.context.threads.items, 0..) |thread, i| {
+            try self.print("\nthread {}:\n\n", .{i});
+
+            for (thread.private.stack.items, 0..) |s, j| {
+                try self.print("\n{}: {f}", .{ j, s });
+            }
+            try self.writeAll("\n\n");
+        }
+
+        return .cont;
+    }
+
+    fn toggleInfoWindow(self: *IRDebugger) RunningEvent {
+        self.show_info_window = !self.show_info_window;
+        return .cont;
+    }
+
+    fn clearArea(self: *IRDebugger, pos: TermVector, area: TermVector) !void {
+        for (pos.row..pos.row + area.row) |row| {
+            try self.setCursorPosition(.{ .row = row, .col = pos.col });
+            _ = try self.stdoutWriter().writeSplat(&.{" "}, area.col);
+            try self.stdoutWriter().flush();
+        }
+    }
+
+    fn drawVerticalBorder(self: *IRDebugger, pos: TermVector, height: usize) !void {
+        for (pos.row..height) |i| {
+            try self.setCursorPosition(.{ .row = i, .col = pos.col });
+            try self.writeAll("|");
+        }
+    }
+
+    fn printInfoWindow(self: *IRDebugger) !void {
+        const curr_thread = self.getCurrentExecutingThread();
+        const original_pos = try self.getCursorPosition();
+        const size = try self.getTerminalSize();
+        const info_window_size = TermVector{ .row = size.row, .col = 40 };
+        const info_window_pos: TermVector = .{ .row = 1, .col = size.col -| info_window_size.col };
+        var cur_pos: TermVector = info_window_pos;
+
+        try self.clearArea(info_window_pos, info_window_size);
+        try self.drawVerticalBorder(info_window_pos.add(0, -1), info_window_size.row);
+
+        for (self.evaluator.context.threads.items) |thread| {
+            if (self.skip_stdio and thread.id >= 1 and thread.id <= 3) continue;
+
+            const is_active = self.evaluator.context.isThreadActive(thread.id);
+            var thread_suffix_buffer: [1024]u8 = undefined;
+            const thread_suffix = if (thread.private.waiting_for) |waiting_for| std.fmt.bufPrint(&thread_suffix_buffer, " (waiting for {})", .{waiting_for}) catch unreachable else if (is_active) "" else " (inactive)";
+
+            try self.printWrappedAt(
+                cur_pos,
+                info_window_size.col,
+                "thread {}{s}{s}",
+                .{
+                    thread.id,
+                    if (thread.id == curr_thread.id) " (executing)" else "",
+                    thread_suffix,
+                },
+            );
+            cur_pos = try self.getCursorPosition();
+            cur_pos.row += 1;
+            cur_pos.col = info_window_pos.col;
+            try self.printWrappedAt(
+                cur_pos,
+                info_window_size.col,
+                "%ic:{f} %sf:{} %sc:{} %r:{f}",
+                .{
+                    thread.private.instruction_counter,
+                    thread.private.stack_frame,
+                    thread.private.stack.items.len,
+                    thread.private.result_register,
+                },
+            );
+            cur_pos = try self.getCursorPosition();
+            cur_pos.row += 1;
+            cur_pos.col = info_window_pos.col;
+            try self.printWrappedAt(
+                cur_pos,
+                info_window_size.col,
+                "{?f}",
+                .{thread.currentInstruction()},
+            );
+            cur_pos = try self.getCursorPosition();
+            cur_pos.row += 2;
+            cur_pos.col = info_window_pos.col;
+        }
+
+        try self.setCursorPosition(original_pos);
+    }
+
     const TermVector = struct {
         row: usize,
         col: usize,
@@ -791,16 +1016,40 @@ pub const IRDebugger = struct {
         self: *IRDebugger,
         position: TermVector,
     ) std.Io.Writer.Error!void {
-        try self.print(csi ++ "{};{}H", .{ position.row, position.col });
+        return setCursorPositionGen(self.stdoutWriter(), position);
+    }
+
+    fn setCursorPositionGen(
+        writer: *std.Io.Writer,
+        position: TermVector,
+    ) std.Io.Writer.Error!void {
+        try writer.print(csi ++ "{};{}H", .{ position.row, position.col });
+        try writer.flush();
+    }
+
+    fn setCursorColumnGen(
+        writer: *std.Io.Writer,
+        col: usize,
+    ) std.Io.Writer.Error!void {
+        try writer.print(csi ++ ";{}H", .{col});
+        try writer.flush();
     }
 
     fn getCursorPosition(
         self: *IRDebugger,
     ) Error!TermVector {
+        return getCursorPositionGen(self.stdoutWriter(), self.stdinReader());
+    }
+
+    fn getCursorPositionGen(
+        writer: *std.Io.Writer,
+        reader: *std.Io.Reader,
+    ) Error!TermVector {
         // response: ESC[n;mR
         // { 27, 91, 49, 59, 51, 82 }
-        try self.writeAll(request_position);
-        const response = try self.stdinReader().takeDelimiterInclusive('R');
+        try writer.writeAll(request_position);
+        try writer.flush();
+        const response = try reader.takeDelimiterInclusive('R');
         var it = std.mem.tokenizeAny(u8, response[2..], ";R");
         const row_s = it.next().?;
         const col_s = it.next().?;
@@ -875,12 +1124,28 @@ pub const IRDebugger = struct {
             return .instructions;
         }
 
+        if (std.mem.eql(u8, source, "instructions all")) {
+            return .instructions_all;
+        }
+
+        if (std.mem.eql(u8, source, "registers")) {
+            return .registers;
+        }
+
         if (std.mem.eql(u8, source, "pipes")) {
             return .pipes;
         }
 
         if (std.mem.eql(u8, source, "stdio skip")) {
             return .skip_stdio;
+        }
+
+        if (std.mem.eql(u8, source, "stack")) {
+            return .stack;
+        }
+
+        if (std.mem.eql(u8, source, "info")) {
+            return .toggle_info_window;
         }
 
         if (std.mem.startsWith(u8, source, "breakpoint ")) {
@@ -1078,9 +1343,13 @@ const Command = union(enum) {
     breakpoint: BreakpointCommand,
     threads,
     instructions,
+    instructions_all,
+    registers,
     pipes,
     skip_stdio,
     trace: TraceCommand,
+    stack,
+    toggle_info_window,
 
     pub const BreakpointCommand = union(enum) {
         add: Add,
@@ -1143,7 +1412,7 @@ const Command = union(enum) {
         c_type: std.meta.Tag(Command),
     ) []const u8 {
         return switch (c_type) {
-            .quit, .step, .cont, .instructions, .threads, .pipes, .skip_stdio => "",
+            .quit, .step, .cont, .instructions, .instructions_all, .registers, .threads, .pipes, .skip_stdio, .stack, .toggle_info_window => "",
             .breakpoint =>
             \\breakpoint add <file>:<line>
             \\breakpoint remove <file>:<line>
@@ -1226,9 +1495,11 @@ const main_commands: []const []const u8 = &.{
     "breakpoint",
     "threads",
     "instructions",
+    "registers",
     "pipes",
     "skip_stdio",
     "trace",
+    "stack",
 };
 
 fn autocomplete(

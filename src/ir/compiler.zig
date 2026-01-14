@@ -9,6 +9,7 @@ const Stream = @import("../stream.zig").Stream;
 const RCError = @import("../mem/rc.zig").RCError;
 const evaluateArithmetic = ir.evaluator.IREvaluator.evaluateArithmetic;
 const evaluateLogical = ir.evaluator.IREvaluator.evaluateLogical;
+const evaluateCompare = ir.evaluator.IREvaluator.evaluateCompare;
 const page_size = ir.context.page_size;
 const stack_start = ir.context.stack_start;
 
@@ -98,7 +99,10 @@ pub const Result = union(enum) {
     }
 
     pub fn fromLocation(location: ir.Location) ir.Location.Error!@This() {
-        return .fromValue(.fromAddr(try location.toAddr()));
+        return switch (location.abs) {
+            .register => |reg| .fromValue(.{ .dereference = .{ .register = .init(reg, location.mod) } }),
+            else => .fromValue(.fromAddr(try location.toAddr())),
+        };
     }
 
     pub fn fromValue(value: ir.Value) @This() {
@@ -158,7 +162,7 @@ pub const IRData = struct {
 
     pub fn addData(self: *IRData, allocator: Allocator, data: []const u8) Error!ir.Location {
         const loc = try self.allocData(allocator, data.len);
-        const page_writer = self.getPageWriter(loc.data.page);
+        const page_writer = self.getPageWriter(loc.abs.data.page);
         try page_writer.writeAll(data);
         return loc;
     }
@@ -167,7 +171,7 @@ pub const IRData = struct {
         const page = try self.ensureDataCapacity(allocator, len);
         const page_writer = self.getPageWriter(page);
         const addr = page_writer.end;
-        return .{ .data = .init(page, addr) };
+        return .initAbs(.{ .data = .init(page, addr) });
     }
 
     pub fn toOwnedSlice(self: *IRData, allocator: Allocator) ![]const []const u8 {
@@ -251,6 +255,7 @@ const Scope = struct {
 
 const InstructionSet = struct {
     instructions: std.ArrayList(ir.Instruction) = .empty,
+    frames: std.ArrayList(StackFrame) = .empty,
 
     pub fn init() @This() {
         return .{};
@@ -269,16 +274,11 @@ const InstructionSet = struct {
     }
 };
 
-const Refs = struct {
-    current_ref: usize = stack_start - 1,
+const StackFrame = struct {
+    rel_stack_counter: usize = 0,
 
     pub fn init() @This() {
         return .{};
-    }
-
-    pub fn new(self: *Refs, name: []const u8) ir.Ref {
-        defer self.current_ref -= 1;
-        return .{ .addr = self.current_ref, .name = name };
     }
 };
 
@@ -307,7 +307,6 @@ pub const IRCompiler = struct {
     data: IRData = .init(),
     instruction_sets: std.ArrayList(InstructionSet) = .empty,
     current_instruction_set: usize = 0,
-    refs: Refs = .init(),
     labels: ir.Labels = .init(),
     struct_types: std.ArrayList(ir.Value.Struct.Type) = .empty,
     document_store: *DocumentStore,
@@ -381,8 +380,56 @@ pub const IRCompiler = struct {
         } };
     }
 
+    fn currentInstrSet(self: *@This()) *InstructionSet {
+        return &self.instruction_sets.items[self.current_instruction_set];
+    }
+
+    fn pushFrame(self: *@This(), source: anytype) Error!void {
+        try self.addInstruction(.init(.from(source), .{ .push = .{
+            .register = .initAbs(.sf),
+        } }));
+        try self.set(source, .initAbs(.{ .register = .sf }), .{ .register = .initAbs(.sc) });
+        return self.currentInstrSet().frames.append(self.allocator, .init());
+    }
+
+    fn popFrame(self: *@This(), source: anytype) !void {
+        try self.push(source, .{ .register = .initAbs(.sf) });
+        try self.addInstruction(.init(.from(source), .{ .set = .{
+            .location = .initAbs(.{ .register = .sf }),
+            .value = .{ .dereference = .{ .register = .initSub(.sf, 1) } },
+        } }));
+        try self.addInstruction(.init(.from(source), .{ .set = .{
+            .location = .initAbs(.{ .register = .sc }),
+            .value = .{ .dereference = .{ .register = .initSub(.sc, 1) } },
+        } }));
+        try self.addInstruction(.init(.from(source), .{ .set = .{
+            .location = .initAbs(.{ .register = .sc }),
+            .value = .{ .register = .initSub(.sc, 1) },
+        } }));
+        const instr_set = self.currentInstrSet();
+        const popped = instr_set.frames.pop() orelse return;
+        if (instr_set.frames.items.len > 0) {
+            const frame = &instr_set.frames.items[instr_set.frames.items.len - 1];
+            frame.rel_stack_counter += popped.rel_stack_counter;
+        }
+    }
+
+    fn currentFrame(self: *@This()) *StackFrame {
+        const instr_set = self.currentInstrSet();
+        return &instr_set.frames.items[instr_set.frames.items.len - 1];
+    }
+
     // If you change this, make sure to fix the std...StreamSet functions as well
-    pub fn addInstructionSet(self: *@This()) Allocator.Error!usize {
+    pub fn addInstructionSet(self: *@This(), source: anytype) Error!usize {
+        const new_instr_set = try self.addInstructionSetNoPushFrame();
+        const orig_instr_set = self.current_instruction_set;
+        self.current_instruction_set = new_instr_set;
+        try self.pushFrame(source);
+        self.current_instruction_set = orig_instr_set;
+        return new_instr_set;
+    }
+
+    pub fn addInstructionSetNoPushFrame(self: *@This()) Allocator.Error!usize {
         try self.instruction_sets.append(self.allocator, .init());
         return self.instruction_sets.items.len - 1;
     }
@@ -442,9 +489,13 @@ pub const IRCompiler = struct {
         source: anytype,
         name: []const u8,
     ) Allocator.Error!ir.Location {
-        const ref: ir.Location = .{ .ref = self.refs.new(name) };
-        try self.addInstruction(.init(.from(source), .{ .ref = ref.ref }));
-        return ref;
+        defer self.currentFrame().rel_stack_counter += 1;
+        try self.addInstruction(.init(.from(source), .{ .ref = name }));
+
+        return .initAbs(.{ .ref = .{
+            .name = name,
+            .rel_stack_addr = self.currentFrame().rel_stack_counter,
+        } });
     }
 
     pub fn declare(
@@ -465,25 +516,17 @@ pub const IRCompiler = struct {
         source: anytype,
         value: ir.Value,
     ) Error!void {
+        self.currentFrame().rel_stack_counter += 1;
         return self.addInstruction(.init(.from(source), .push_(value)));
-    }
-
-    pub fn pushLocation(
-        self: *IRCompiler,
-        source: anytype,
-        location: ir.Location,
-    ) Error!void {
-        return self.addInstruction(.init(
-            .from(source),
-            .push_(.fromAddr(try location.toAddr())),
-        ));
     }
 
     pub fn pop(
         self: *IRCompiler,
         source: anytype,
-    ) Error!void {
-        return self.addInstruction(.init(.from(source), .pop));
+    ) Error!ir.Location {
+        self.currentFrame().rel_stack_counter -= 1;
+        try self.addInstruction(.init(.from(source), .pop));
+        return .initAbs(.{ .register = .r });
     }
 
     pub fn set(
@@ -559,42 +602,47 @@ pub const IRCompiler = struct {
     pub fn exec_(
         self: *IRCompiler,
         source: anytype,
-        result: ?ir.Location,
         sync: bool,
-    ) Error!void {
-        return self.addInstruction(.init(.from(source), .{ .exec = .{
-            .result = result,
+    ) Error!ir.Location {
+        self.currentFrame().rel_stack_counter -= 1;
+        try self.addInstruction(.init(.from(source), .{ .exec = .{
             .sync = sync,
         } }));
+        return .initAbs(.{ .register = .r });
     }
 
     pub fn fork(
         self: *IRCompiler,
         source: anytype,
-        result: ?ir.Location,
         dest: ir.InstructionAddr,
         stdin: ir.Location,
         stdout: ir.Location,
         stderr: ir.Location,
-    ) Error!void {
-        return self.addInstruction(.init(.from(source), .fork_(
-            result,
+    ) Error!ir.Location {
+        try self.addInstruction(.init(.from(source), .fork_(
             dest,
             stdin,
             stdout,
             stderr,
         )));
+
+        const orig_instr_set = self.current_instruction_set;
+        self.current_instruction_set = dest.instr_set;
+
+        self.currentFrame().rel_stack_counter += 3;
+
+        self.current_instruction_set = orig_instr_set;
+
+        return .initAbs(.{ .register = .r });
     }
 
     pub fn forkInherit(
         self: *IRCompiler,
         source: anytype,
-        result: ?ir.Location,
         dest: ir.InstructionAddr,
-    ) Error!void {
+    ) Error!ir.Location {
         return try self.fork(
             source,
-            result,
             dest,
             self.threadStdin(),
             self.threadStdout(),
@@ -653,7 +701,7 @@ pub const IRCompiler = struct {
     }
 
     pub fn compile(self: *IRCompiler) Error!CompilationResult {
-        self.current_instruction_set = try self.addInstructionSet();
+        self.current_instruction_set = try self.addInstructionSetNoPushFrame();
 
         try self.scopes.pushBindings(self.allocator);
         defer self.scopes.popFrame();
@@ -675,10 +723,11 @@ pub const IRCompiler = struct {
 
     fn compileInitial(self: *@This()) Error!void {
         try self.addInstruction(.init(null, .fwd_stdio));
+        try self.pushFrame(null);
 
-        const stdin_set = try self.addInstructionSet();
-        const stdout_set = try self.addInstructionSet();
-        const stderr_set = try self.addInstructionSet();
+        const stdin_set = try self.addInstructionSet(null);
+        const stdout_set = try self.addInstructionSet(null);
+        const stderr_set = try self.addInstructionSet(null);
 
         const prev_instr_set = self.current_instruction_set;
 
@@ -693,9 +742,9 @@ pub const IRCompiler = struct {
 
         self.current_instruction_set = prev_instr_set;
 
-        try self.fork(null, null, .initAbs(stdin_set, 0), self.threadStdin(), self.threadStdout(), self.threadStderr());
-        try self.fork(null, null, .initAbs(stdout_set, 0), self.threadStdin(), self.threadStdout(), self.threadStderr());
-        try self.fork(null, null, .initAbs(stderr_set, 0), self.threadStdin(), self.threadStdout(), self.threadStderr());
+        _ = try self.fork(null, .initAbs(stdin_set, 0), self.threadStdin(), self.threadStdout(), self.threadStderr());
+        _ = try self.fork(null, .initAbs(stdout_set, 0), self.threadStdin(), self.threadStdout(), self.threadStderr());
+        _ = try self.fork(null, .initAbs(stderr_set, 0), self.threadStdin(), self.threadStdout(), self.threadStderr());
     }
 
     fn compileStatement(
@@ -713,17 +762,21 @@ pub const IRCompiler = struct {
             },
         };
 
-        if (isWaitable(result)) {
-            try self.wait(stmt, .{ .ref = .{ .addr = result.value.addr, .name = "<unknown_thread>" } });
+        if (isWaitable(result)) |loc| {
+            try self.wait(stmt, loc);
         }
 
         return result;
     }
 
-    fn isWaitable(result: Result) bool {
+    fn isWaitable(result: Result) ?ir.Location {
         return switch (result.value) {
-            .addr => true,
-            else => false,
+            .register => |r| .init(.{ .register = r.abs }, r.mod),
+            .dereference => |d| switch (d) {
+                .addr => null,
+                .register => |r| .init(.{ .register = r.abs }, r.mod),
+            },
+            else => null,
         };
     }
 
@@ -827,6 +880,8 @@ pub const IRCompiler = struct {
 
         const s_tream = try self.allocator.alloc(ir.Value, string_literal.segments.len);
 
+        // TODO: find a way to make this instruction-based instead because of volatile result register, compileExpression in a loop won't cut it
+
         for (string_literal.segments, 0..) |segment, i| switch (segment) {
             .text => |text| {
                 s_tream[i] = try self.addSlice(1, text.payload);
@@ -872,7 +927,7 @@ pub const IRCompiler = struct {
                 call.arguments,
             ),
             .fn_ref => self.compileFunctionCall(source, callee.value, call.arguments),
-            .stream, .addr, .void, .uinteger, .float, .strct, .exit_code, .pipe, .thread, .closeable => .from(callee.value),
+            .stream, .addr, .void, .uinteger, .float, .strct, .exit_code, .pipe, .thread, .closeable, .register, .dereference => .from(callee.value),
         };
     }
 
@@ -905,15 +960,15 @@ pub const IRCompiler = struct {
     }
 
     fn threadStdin(_: *IRCompiler) ir.Location {
-        return .{ .stack = 0 };
+        return .initAbs(.{ .stack = 0 });
     }
 
     fn threadStdout(_: *IRCompiler) ir.Location {
-        return .{ .stack = 1 };
+        return .initAbs(.{ .stack = 1 });
     }
 
     fn threadStderr(_: *IRCompiler) ir.Location {
-        return .{ .stack = 2 };
+        return .initAbs(.{ .stack = 2 });
     }
 
     fn stdinStreamSet(_: *IRCompiler) ir.InstructionAddr {
@@ -934,31 +989,36 @@ pub const IRCompiler = struct {
         executable: ir.Value,
         arguments: []const *ast.Expression,
     ) Error!Result {
-        const thread_ref = try self.newRef(source, "exec_thread");
+        // const args_temp = try self.compileExpressions(arguments);
+        // defer self.allocator.free(args_temp);
+        // const fields = try self.allocExecutableCallContextFields(executable, args_temp);
+        // errdefer self.allocator.free(fields);
 
-        const args_temp = try self.compileExpressions(arguments);
-        defer self.allocator.free(args_temp);
-        const fields = try self.allocExecutableCallContextFields(executable, args_temp);
-        errdefer self.allocator.free(fields);
-
-        const exec_instr_set = try self.addInstructionSet();
-
-        try self.forkInherit(source, thread_ref, .initAbs(exec_instr_set, 0));
+        const exec_instr_set = try self.addInstructionSet(source);
 
         const prev_instr_set = self.current_instruction_set;
         self.current_instruction_set = exec_instr_set;
 
-        const ref = try self.newRef(source, "closeable_process");
-        try self.push(source, .{ .strct = .{
-            .type = try self.getStructType("ExecutableCallContext"),
-            .fields = fields,
-        } });
-        try self.exec_(source, ref, false);
-        try self.wait(source, ref);
+        var it = std.mem.reverseIterator(arguments);
+        while (it.next()) |arg_expr| {
+            const arg = try self.compileExpression(arg_expr);
+            try self.push(source, arg.value);
+        }
+        try self.push(source, executable);
+        try self.push(source, .{ .uinteger = arguments.len });
+
+        // try self.push(source, .{ .strct = .{
+        //     .type = try self.getStructType("ExecutableCallContext"),
+        //     .fields = fields,
+        // } });
+        const exec_handle = try self.exec_(source, false);
+        try self.wait(source, exec_handle);
 
         self.current_instruction_set = prev_instr_set;
 
-        return .from(thread_ref);
+        const thread_handle = try self.forkInherit(source, .initAbs(exec_instr_set, 0));
+
+        return .from(thread_handle);
     }
 
     fn compileFunctionCall(
@@ -971,10 +1031,9 @@ pub const IRCompiler = struct {
         const fn_ref = fn_ref_value.fn_ref;
         const fn_addr = fn_ref.fn_addr;
 
-        const fn_call_ref = try self.newRef(source, "fn_call");
-        try self.forkInherit(source, fn_call_ref, fn_addr);
+        const handle = try self.forkInherit(source, fn_addr);
 
-        return .fromLocation(fn_call_ref);
+        return .fromLocation(handle);
     }
 
     fn compileIf(
@@ -995,10 +1054,21 @@ pub const IRCompiler = struct {
         if_expr: ast.IfExpr,
         else_branch: ast.IfExpr.ElseBranch,
     ) Error!Result {
-        const result = try self.newRef(source, "if_result");
         const condition = try self.compileExpression(if_expr.condition);
+        if (condition.value == .exit_code) {
+            const c = condition.value.exit_code.toBoolean();
+
+            if (c) return self.compileExpression(if_expr.then_expr);
+            return switch (else_branch) {
+                .expr => |expr_| self.compileExpression(expr_),
+                .if_expr => |if_expr_| self.compileIf(source, if_expr_.*),
+            };
+        }
+
+        const result = try self.newRef(source, "if_result");
         const after_addr = try self.newLabel("if_after", .unknown);
         const else_addr = try self.newLabel("if_else", .unknown);
+
         try self.jmp(source, condition, false, else_addr);
         const then = try self.compileExpression(if_expr.then_expr);
         try self.set(source, result, then.value);
@@ -1010,7 +1080,10 @@ pub const IRCompiler = struct {
         };
         try self.set(source, result, else_.value);
         try self.setLabel(after_addr.local_addr.label, .abs);
-        return .from(result);
+
+        const result_loc = try self.pop(source);
+
+        return .from(result_loc);
     }
 
     fn compileIfNoElse(
@@ -1018,15 +1091,39 @@ pub const IRCompiler = struct {
         source: *ast.Expression,
         if_expr: ast.IfExpr,
     ) Error!Result {
-        const result = try self.newRef(source, "if_result");
-        try self.set(source, result, .void);
+        try self.pushFrame(source);
+
         const condition = try self.compileExpression(if_expr.condition);
+        if (condition.value == .exit_code) {
+            const c = condition.value.exit_code.toBoolean();
+
+            if (c) return self.compileExpression(if_expr.then_expr);
+            return .fromValue(.void);
+        }
+
+        const result = try self.newRef(source, "if_result");
+
         const after_addr = try self.newLabel("if_after", .unknown);
+
         try self.jmp(source, condition, false, after_addr);
+
         const then = try self.compileExpression(if_expr.then_expr);
         try self.set(source, result, then.value);
+
         try self.setLabel(after_addr.local_addr.label, .abs);
-        return .from(result);
+
+        const result_loc = try self.pop(source);
+
+        try self.popFrame(source);
+
+        return .from(result_loc);
+    }
+
+    fn refLocation(self: *IRCompiler, ref_def: RefDef) ir.Location {
+        return .fromRef(
+            ref_def.name,
+            self.currentFrame().rel_stack_counter - ref_def.rel_stack_addr,
+        );
     }
 
     fn compilePipeline(
@@ -1047,36 +1144,46 @@ pub const IRCompiler = struct {
         const stage_sets = try self.allocator.alloc(usize, pipeline.stages.len - 1);
         defer self.allocator.free(stage_sets);
         for (stage_sets, pipeline.stages[0 .. pipeline.stages.len - 1]) |*stage_set, stage_expr| {
-            stage_set.* = try self.addInstructionSet();
+            stage_set.* = try self.addInstructionSet(source);
             self.current_instruction_set = stage_set.*;
             const result = try self.compileExpression(stage_expr);
-            try self.forkInherit(source, null, self.stdoutStreamSet());
-            if (isWaitable(result)) {
-                try self.wait(source, .{ .ref = .{ .addr = result.value.addr, .name = "<pipeline_stage>" } });
+
+            if (isWaitable(result)) |_| {
+                try self.push(source, result.value);
+                _ = try self.forkInherit(source, self.stdoutStreamSet());
+                const result_stack = try self.pop(source);
+                try self.wait(source, result_stack);
+                try self.pipeOpt(source, self.threadStdout(), .keep_open, .fromBoolean(false));
+            } else {
+                return Error.UnsupportedExpression;
             }
-            try self.pipeOpt(source, self.threadStdout(), .keep_open, .fromBoolean(false));
         }
         self.current_instruction_set = orig_instr_set;
 
-        try self.fork(source, null, .initAbs(stage_sets[0], 0), self.threadStdin(), refs[0], self.threadStderr());
+        _ = try self.fork(source, .initAbs(stage_sets[0], 0), self.threadStdin(), refs[0], self.threadStderr());
 
         for (refs[0 .. refs.len - 1], refs[1..], stage_sets[1..]) |prev, curr, stage_set| {
-            try self.fork(source, null, .initAbs(stage_set, 0), prev, curr, self.threadStderr());
+            _ = try self.fork(source, .initAbs(stage_set, 0), prev, curr, self.threadStderr());
         }
 
-        const last_set = try self.addInstructionSet();
+        const last_set = try self.addInstructionSet(source);
 
         self.current_instruction_set = last_set;
         const result = try self.compileExpression(pipeline.stages[pipeline.stages.len - 1]);
-        if (isWaitable(result)) {
-            try self.wait(source, .{ .ref = .{ .addr = result.value.addr, .name = "<pipeline_last_stage>" } });
+        if (isWaitable(result)) |loc| {
+            try self.wait(source, loc);
         }
         self.current_instruction_set = orig_instr_set;
 
-        const last_fork_ref = try self.newRef(source, "pipeline_last");
-        try self.fork(source, last_fork_ref, .initAbs(last_set, 0), refs[refs.len - 1], self.threadStdout(), self.threadStderr());
+        const last_fork_handle = try self.fork(
+            source,
+            .initAbs(last_set, 0),
+            refs[refs.len - 1],
+            self.threadStdout(),
+            self.threadStderr(),
+        );
 
-        return .from(last_fork_ref);
+        return .from(last_fork_handle);
     }
 
     fn compileBlock(
@@ -1085,6 +1192,7 @@ pub const IRCompiler = struct {
         block: ast.Block,
     ) Error!Result {
         const block_stdout = try self.newRef(source, "block_stdout_pipe");
+
         try self.pipe(source, block_stdout);
         try self.pipeOpt(
             source,
@@ -1109,18 +1217,19 @@ pub const IRCompiler = struct {
             block_stdout,
             self.threadStdout(),
         );
-        const block_set = try self.addInstructionSet();
-        const ref = try self.newRef(source, "block");
-        try self.fork(source, ref, .initAbs(block_set, 0), self.threadStdin(), block_stdout, self.threadStderr());
+        const block_set = try self.addInstructionSet(source);
+
         const orig_instr_set = self.current_instruction_set;
         self.current_instruction_set = block_set;
-        const block_stdout_thread = try self.newRef(source, "block_stdout_thread");
-        try self.forkInherit(source, block_stdout_thread, self.stdoutStreamSet());
+
+        const block_stdout_thread = try self.forkInherit(source, self.stdoutStreamSet());
+        try self.push(source, .{ .register = .init(block_stdout_thread.abs.register, block_stdout_thread.mod) });
+
         for (block.statements) |stmt| {
             // TODO: figure out what to do with these results
             _ = try self.compileStatement(stmt);
         }
-        // const pipe_opts_set = try self.addInstructionSet();
+        // const pipe_opts_set = try self.addInstructionSet(source);
         // try self.atomic(source, pipe_opts_set);
         // self.current_instruction_set = pipe_opts_set;
         try self.pipeOpt(
@@ -1130,9 +1239,20 @@ pub const IRCompiler = struct {
             .fromBoolean(false),
         );
         // try self.pipeOpt(source, self.threadStdout(), .disconnect_destination, true);
+        _ = try self.pop(source);
         try self.wait(source, block_stdout_thread);
+
         self.current_instruction_set = orig_instr_set;
-        return .from(ref);
+
+        const block_result = try self.fork(
+            source,
+            .initAbs(block_set, 0),
+            self.threadStdin(),
+            block_stdout,
+            self.threadStderr(),
+        );
+
+        return .from(block_result);
     }
 
     fn compileFnDecl(
@@ -1140,15 +1260,17 @@ pub const IRCompiler = struct {
         source: *ast.Expression,
         fn_decl: ast.FunctionDecl,
     ) Error!Result {
-        const instr_set = try self.addInstructionSet();
+        const instr_set = try self.addInstructionSet(source);
         const orig_instr_set = self.current_instruction_set;
         self.current_instruction_set = instr_set;
+
         // TODO: figure out how to be able to call async functions multiple times and have the result not be overwritten in a ref
         const result = try self.compileExpression(fn_decl.body);
         // TODO: figure out how to make this async
-        if (isWaitable(result)) {
-            try self.wait(source, .{ .ref = .{ .addr = result.value.addr, .name = "<function_body>" } });
+        if (isWaitable(result)) |loc| {
+            try self.wait(source, loc);
         }
+
         self.current_instruction_set = orig_instr_set;
         const fn_ref = ir.Value{
             .fn_ref = .{ .fn_addr = ir.InstructionAddr.initAbs(instr_set, 0) },
@@ -1199,6 +1321,25 @@ pub const IRCompiler = struct {
                 const ref = try self.newRef(source, "logical_result");
 
                 try self.addInstruction(.init(.from(source), .{ .log = .{
+                    .op = .from(binary.op),
+                    .a = left.value,
+                    .b = right.value,
+                    .result = ref,
+                } }));
+
+                return .from(ref);
+            },
+            .greater, .greater_equal, .less, .less_equal, .equal, .not_equal => {
+                const left = try self.compileExpression(binary.left);
+                const right = try self.compileExpression(binary.right);
+
+                if (evaluateCompare(.from(binary.op), left.value, right.value)) |comptime_result| {
+                    return .from(comptime_result);
+                }
+
+                const ref = try self.newRef(source, "cmp_result");
+
+                try self.addInstruction(.init(.from(source), .{ .cmp = .{
                     .op = .from(binary.op),
                     .a = left.value,
                     .b = right.value,
@@ -1299,4 +1440,9 @@ pub const IRCompiler = struct {
             }
         }
     }
+};
+
+const RefDef = struct {
+    name: []const u8,
+    rel_stack_addr: usize,
 };
