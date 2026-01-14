@@ -3,8 +3,10 @@ const utils = @import("main-utils.zig");
 const dispatch = @import("dispatch.zig").dispatch;
 const runic = @import("runic");
 const PipeReader = runic.process.PipeReader;
+const signals = runic.signals;
 
 pub fn main() !void {
+    signals.init(std.heap.page_allocator);
     const exit_code = mainImpl() catch |err| {
         std.log.err("runic exited with error: {t}", .{err});
         std.process.exit(1);

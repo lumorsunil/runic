@@ -8,6 +8,7 @@ const DocumentStore = @import("../document_store.zig").DocumentStore;
 const ast = @import("../frontend/ast.zig");
 const rainbow = @import("../rainbow.zig");
 const TraceFilter = @import("../trace.zig").TraceFilter;
+const signals = @import("../signals.zig");
 
 const span_color = rainbow.beginBgColor(.yellow) ++ rainbow.beginColor(.black);
 const current_instr_color = rainbow.beginBgColor(.yellow) ++ rainbow.beginColor(.black);
@@ -41,7 +42,7 @@ pub const IRDebugger = struct {
     breakpoints: std.ArrayList(Breakpoint) = .empty,
     skip_stdio: bool = true,
     trace_filter: ?TraceFilter = null,
-    show_info_window: bool = true,
+    info_window_layout: ?InfoLayout = .initial,
 
     pub fn init(
         allocator: Allocator,
@@ -82,6 +83,7 @@ pub const IRDebugger = struct {
     }
 
     pub fn cont(self: *IRDebugger) Error!RunningEvent {
+        signals.trap(std.posix.SIG.INT);
         self.is_continuing = true;
         return .cont;
     }
@@ -100,6 +102,8 @@ pub const IRDebugger = struct {
     }
 
     pub fn run(self: *IRDebugger) Error!ExitCode {
+        try self.printInfoWindow();
+
         while (true) switch (try self.loop()) {
             .quit => break,
             .cont => continue,
@@ -142,9 +146,7 @@ pub const IRDebugger = struct {
         // try self.printDebugCommandStuff();
         const event = try self.readCommandInput();
 
-        if (self.show_info_window) {
-            try self.printInfoWindow();
-        }
+        try self.printInfoWindow();
 
         return event;
     }
@@ -153,6 +155,12 @@ pub const IRDebugger = struct {
         try self.updateCommand("");
 
         if (self.is_continuing) {
+            if (signals.consume(std.posix.SIG.INT)) {
+                try self.writeAll("\nReceived interrupt signal.\n\n");
+                signals.untrap(std.posix.SIG.INT);
+                self.is_continuing = false;
+                return .cont;
+            }
             const result = try self.step();
             if (self.hasBreakpoint(self.evaluator.context.getCurrentThread().getCurrentInstructionAddr())) |bp| {
                 self.is_continuing = false;
@@ -917,8 +925,18 @@ pub const IRDebugger = struct {
         return .cont;
     }
 
-    fn toggleInfoWindow(self: *IRDebugger) RunningEvent {
-        self.show_info_window = !self.show_info_window;
+    fn toggleInfoWindow(self: *IRDebugger) !RunningEvent {
+        if (self.info_window_layout) |w| {
+            self.info_window_layout = w.next();
+        } else {
+            self.info_window_layout = .initial;
+        }
+
+        if (self.info_window_layout == null) {
+            const info_window = try self.getInfoWindow();
+            try info_window.clear(self);
+        }
+
         return .cont;
     }
 
@@ -937,63 +955,170 @@ pub const IRDebugger = struct {
         }
     }
 
-    fn printInfoWindow(self: *IRDebugger) !void {
-        const curr_thread = self.getCurrentExecutingThread();
-        const original_pos = try self.getCursorPosition();
-        const size = try self.getTerminalSize();
-        const info_window_size = TermVector{ .row = size.row, .col = 40 };
-        const info_window_pos: TermVector = .{ .row = 1, .col = size.col -| info_window_size.col };
-        var cur_pos: TermVector = info_window_pos;
+    const Window = struct {
+        pos: TermVector,
+        size: TermVector,
+        render_cursor: ?TermVector = null,
 
-        try self.clearArea(info_window_pos, info_window_size);
-        try self.drawVerticalBorder(info_window_pos.add(0, -1), info_window_size.row);
-
-        for (self.evaluator.context.threads.items) |thread| {
-            if (self.skip_stdio and thread.id >= 1 and thread.id <= 3) continue;
-
-            const is_active = self.evaluator.context.isThreadActive(thread.id);
-            var thread_suffix_buffer: [1024]u8 = undefined;
-            const thread_suffix = if (thread.private.waiting_for) |waiting_for| std.fmt.bufPrint(&thread_suffix_buffer, " (waiting for {})", .{waiting_for}) catch unreachable else if (is_active) "" else " (inactive)";
-
-            try self.printWrappedAt(
-                cur_pos,
-                info_window_size.col,
-                "thread {}{s}{s}",
-                .{
-                    thread.id,
-                    if (thread.id == curr_thread.id) " (executing)" else "",
-                    thread_suffix,
-                },
-            );
-            cur_pos = try self.getCursorPosition();
-            cur_pos.row += 1;
-            cur_pos.col = info_window_pos.col;
-            try self.printWrappedAt(
-                cur_pos,
-                info_window_size.col,
-                "%ic:{f} %sf:{} %sc:{} %r:{f}",
-                .{
-                    thread.private.instruction_counter,
-                    thread.private.stack_frame,
-                    thread.private.stack.items.len,
-                    thread.private.result_register,
-                },
-            );
-            cur_pos = try self.getCursorPosition();
-            cur_pos.row += 1;
-            cur_pos.col = info_window_pos.col;
-            try self.printWrappedAt(
-                cur_pos,
-                info_window_size.col,
-                "{?f}",
-                .{thread.currentInstruction()},
-            );
-            cur_pos = try self.getCursorPosition();
-            cur_pos.row += 2;
-            cur_pos.col = info_window_pos.col;
+        pub fn init(pos: TermVector, size: TermVector) @This() {
+            return .{ .pos = pos, .size = size };
         }
 
+        pub fn innerPos(self: Window) TermVector {
+            return self.pos.add(0, 1);
+        }
+
+        pub fn innerSize(self: Window) TermVector {
+            return self.size.add(0, -1);
+        }
+
+        pub fn clear(self: Window, ctx: *IRDebugger) !void {
+            try ctx.clearArea(self.pos, self.size);
+        }
+
+        pub fn printLeftBorder(self: Window, ctx: *IRDebugger) !void {
+            try ctx.drawVerticalBorder(self.pos, self.size.row);
+        }
+
+        pub fn text(
+            self: *Window,
+            ctx: *IRDebugger,
+            comptime fmt: []const u8,
+            args: anytype,
+        ) !void {
+            if (self.render_cursor == null) self.render_cursor = self.innerPos();
+            try ctx.printWrappedAt(self.render_cursor.?, self.innerSize().col, fmt, args);
+            self.render_cursor = try ctx.getCursorPosition();
+            self.render_cursor.?.row += 1;
+            self.render_cursor.?.col = self.innerPos().col;
+        }
+
+        pub fn modifyCursor(self: *Window, row: isize, col: isize) void {
+            if (self.render_cursor) |*cursor| {
+                cursor.* = cursor.add(row, col);
+            } else {
+                self.render_cursor = self.innerPos().add(row, col);
+            }
+        }
+    };
+
+    fn getInfoWindow(self: *IRDebugger) !Window {
+        const size = try self.getTerminalSize();
+        const info_window_width = 40;
+        return Window{
+            .pos = .{ .row = 1, .col = size.col -| info_window_width },
+            .size = .{ .row = size.row, .col = info_window_width },
+        };
+    }
+
+    fn printInfoWindow(self: *IRDebugger) !void {
+        const layout = self.info_window_layout orelse return;
+        const original_pos = try self.getCursorPosition();
+        var info_window = try self.getInfoWindow();
+
+        try info_window.clear(self);
+        try info_window.printLeftBorder(self);
+
+        try switch (layout) {
+            .threads => self.printInfoThreads(&info_window),
+            .current_thread => {
+                const curr_thread = self.getCurrentExecutingThread();
+                try self.printInfoThread(&info_window, curr_thread);
+            },
+        };
+
         try self.setCursorPosition(original_pos);
+    }
+
+    fn printThreadInfoHeader(
+        self: *IRDebugger,
+        window: *Window,
+        thread: ir.context.IRThreadContext,
+    ) !void {
+        const curr_thread = self.getCurrentExecutingThread();
+        const is_active = self.evaluator.context.isThreadActive(thread.id);
+        var thread_suffix_buffer: [1024]u8 = undefined;
+        const thread_suffix = if (thread.private.waiting_for) |waiting_for| std.fmt.bufPrint(&thread_suffix_buffer, " (waiting for {})", .{waiting_for}) catch unreachable else if (is_active) "" else " (inactive)";
+
+        try window.text(
+            self,
+            "thread {}{s}{s}",
+            .{
+                thread.id,
+                if (thread.id == curr_thread.id) " (executing)" else "",
+                thread_suffix,
+            },
+        );
+        try window.text(
+            self,
+            "%ic:{f} %sf:{} %sc:{} %r:{f}",
+            .{
+                thread.private.instruction_counter,
+                thread.private.stack_frame,
+                thread.private.stack.items.len,
+                thread.private.result_register,
+            },
+        );
+    }
+
+    fn printThreadInfoCurrentInstruction(
+        self: *IRDebugger,
+        window: *Window,
+        thread: ir.context.IRThreadContext,
+        around: usize,
+    ) !void {
+        if (around == 0) {
+            const instr = thread.currentInstruction();
+            return window.text(self, "{?f}", .{instr});
+        }
+
+        const curr_addr = thread.getCurrentInstructionAddr();
+        const instr_set = self.evaluator.context.instructions()[curr_addr.instr_set];
+        const start = curr_addr.local_addr -| around;
+        const end = @min(instr_set.len, curr_addr.local_addr +| around + 1);
+
+        var addr = ir.ResolvedInstructionAddr.init(curr_addr.instr_set, start);
+        for (start..end) |i| {
+            const instr = instr_set[i];
+            const prefix = if (i == curr_addr.local_addr) ">" else "|";
+            try window.text(self, "{s} {f} {f}", .{ prefix, addr, instr });
+            addr.inc();
+        }
+    }
+
+    fn printThreadInfoStack(
+        self: *IRDebugger,
+        window: *Window,
+        thread: ir.context.IRThreadContext,
+    ) !void {
+        try window.text(self, "stack:", .{});
+        for (thread.private.stack.items, 0..) |s, i| {
+            try window.text(self, "{}: {f}", .{ i, s });
+        }
+    }
+
+    fn printInfoThreads(
+        self: *IRDebugger,
+        window: *Window,
+    ) !void {
+        for (self.evaluator.context.threads.items) |thread| {
+            if (self.skip_stdio and thread.id >= 1 and thread.id <= 3) continue;
+            try self.printThreadInfoHeader(window, thread);
+            try self.printThreadInfoCurrentInstruction(window, thread, 0);
+            window.modifyCursor(1, 0);
+        }
+    }
+
+    fn printInfoThread(
+        self: *IRDebugger,
+        window: *Window,
+        thread: ir.context.IRThreadContext,
+    ) !void {
+        try self.printThreadInfoHeader(window, thread);
+        window.modifyCursor(1, 0);
+        try self.printThreadInfoCurrentInstruction(window, thread, 2);
+        window.modifyCursor(1, 0);
+        try self.printThreadInfoStack(window, thread);
     }
 
     const TermVector = struct {
@@ -1433,6 +1558,8 @@ const Command = union(enum) {
     ) std.Io.Writer.Error!void {
         switch (self) {
             .skip_stdio => try writer.writeAll("skip stdio"),
+            .toggle_info_window => try writer.writeAll("info"),
+            .instructions_all => try writer.writeAll("instructions all"),
             inline .breakpoint, .trace => |s, t| try writer.print("{t} {f}", .{ t, s }),
             else => try writer.print("{t}", .{self}),
         }
@@ -1491,15 +1618,16 @@ pub const Breakpoint = struct {
 const main_commands: []const []const u8 = &.{
     "quit",
     "step",
-    "cont",
+    "continue",
     "breakpoint",
     "threads",
     "instructions",
     "registers",
     "pipes",
-    "skip_stdio",
+    "stdio",
     "trace",
     "stack",
+    "info",
 };
 
 fn autocomplete(
@@ -1564,4 +1692,17 @@ pub const AutocompleteEvent = union(enum) {
     complete: []const u8,
     matches: MatchIterator,
     none,
+};
+
+const InfoLayout = enum {
+    threads,
+    current_thread,
+    pub const initial = .current_thread;
+
+    pub fn next(self: @This()) ?InfoLayout {
+        return switch (self) {
+            .threads => null,
+            .current_thread => .threads,
+        };
+    }
 };
