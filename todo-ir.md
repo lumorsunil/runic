@@ -160,7 +160,5 @@
 
 - [x] grep is not outputting anything, see ir-blocks.rn
 - [ ] `cat | grep "hello"` does not react on stdin
-- [ ] cannot call function multiple times
-  - possible solution: make refs thread-local? how to identify refs?
-- [ ] debugger: cannot paste to stdin
-- [ ] look into the pipe instruction to see why some of the examples are not outputting anything
+- [x] cannot call function multiple times
+- [x] debugger: cannot paste to stdin

@@ -826,7 +826,13 @@ pub const IRCompiler = struct {
                 return .fromValue(.void);
             },
             else => {
-                try self.reportSourceError(source, Error.UnsupportedBindingPattern, .@"error", "binding pattern type \"{t}\" not yet supported", .{pattern.*});
+                try self.reportSourceError(
+                    source,
+                    Error.UnsupportedBindingPattern,
+                    .@"error",
+                    "binding pattern type \"{t}\" not yet supported",
+                    .{pattern.*},
+                );
                 return .fromValue(.void);
             },
         };
