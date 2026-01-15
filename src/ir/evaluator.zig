@@ -242,7 +242,8 @@ pub const IREvaluator = struct {
                 return .cont;
             },
             .pop => {
-                _ = thread.private.stack.pop();
+                const value = thread.private.stack.pop().?;
+                thread.private.result_register = value;
                 return .cont;
             },
             .exec => |exec| {

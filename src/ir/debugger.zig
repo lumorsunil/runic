@@ -43,6 +43,7 @@ pub const IRDebugger = struct {
     skip_stdio: bool = true,
     trace_filter: ?TraceFilter = null,
     info_window_layout: ?InfoLayout = .initial,
+    pending_input: std.ArrayList(u8) = .empty,
 
     pub fn init(
         allocator: Allocator,
@@ -173,6 +174,11 @@ pub const IRDebugger = struct {
             var stdin_allocating_writer = AllocatingWriter.init(self.allocator);
             defer stdin_allocating_writer.deinit();
             const stdin_writer = stdin_allocating_writer.get();
+
+            if (self.pending_input.items.len > 0) {
+                try stdin_writer.writer.writeAll(self.pending_input.items);
+                self.pending_input.clearRetainingCapacity();
+            }
 
             _ = try stdin_reader.stream(&stdin_writer.writer, .unlimited);
 
@@ -435,8 +441,6 @@ pub const IRDebugger = struct {
         },
         // { 27, 91, 53, 126 } page up
         // { 27, 91, 54, 126 } page down
-        // { 23 } ctrl w
-        // { 21 } ctrl u
     };
 
     const RunningEvent = enum { cont, quit };
@@ -827,7 +831,14 @@ pub const IRDebugger = struct {
     ) !void {
         var fallback_allocator = std.heap.stackFallback(1024, self.allocator);
         const allocator = fallback_allocator.get();
-        const tw = try textWrapper(allocator, self.stdinReader(), width, fmt, args);
+        const tw = try textWrapper(
+            allocator,
+            self.stdinReader(),
+            &self.pending_input,
+            width,
+            fmt,
+            args,
+        );
         defer tw.deinit(self.allocator);
         try self.printAt(pos, "{f}", .{tw});
     }
@@ -846,6 +857,8 @@ pub const IRDebugger = struct {
         width: usize,
         s: []const u8,
         reader: *std.Io.Reader,
+        allocator: Allocator,
+        pending_input: ?*std.ArrayList(u8),
 
         pub fn deinit(self: @This(), allocator: Allocator) void {
             allocator.free(self.s);
@@ -855,7 +868,12 @@ pub const IRDebugger = struct {
             self: @This(),
             writer: *std.Io.Writer,
         ) std.Io.Writer.Error!void {
-            const pos: TermVector = getCursorPositionGen(writer, self.reader) catch return;
+            const pos: TermVector = getCursorPositionGen(
+                writer,
+                self.reader,
+                self.allocator,
+                self.pending_input,
+            ) catch return;
 
             var it = std.mem.tokenizeScalar(u8, self.s, ' ');
             var i: usize = 0;
@@ -883,12 +901,19 @@ pub const IRDebugger = struct {
     fn textWrapper(
         allocator: Allocator,
         reader: *std.Io.Reader,
+        pending_input: ?*std.ArrayList(u8),
         width: usize,
         comptime fmt: []const u8,
         args: anytype,
     ) !TextWrappingFormatter {
         const s = try std.fmt.allocPrint(allocator, fmt, args);
-        return .{ .s = s, .width = width, .reader = reader };
+        return .{
+            .s = s,
+            .width = width,
+            .reader = reader,
+            .allocator = allocator,
+            .pending_input = pending_input,
+        };
     }
 
     fn skipStdio(self: *IRDebugger) !RunningEvent {
@@ -1163,24 +1188,107 @@ pub const IRDebugger = struct {
     fn getCursorPosition(
         self: *IRDebugger,
     ) Error!TermVector {
-        return getCursorPositionGen(self.stdoutWriter(), self.stdinReader());
+        return getCursorPositionGen(
+            self.stdoutWriter(),
+            self.stdinReader(),
+            self.allocator,
+            &self.pending_input,
+        );
     }
 
     fn getCursorPositionGen(
         writer: *std.Io.Writer,
         reader: *std.Io.Reader,
+        allocator: Allocator,
+        pending_input: ?*std.ArrayList(u8),
     ) Error!TermVector {
         // response: ESC[n;mR
         // { 27, 91, 49, 59, 51, 82 }
         try writer.writeAll(request_position);
         try writer.flush();
-        const response = try reader.takeDelimiterInclusive('R');
-        var it = std.mem.tokenizeAny(u8, response[2..], ";R");
-        const row_s = it.next().?;
-        const col_s = it.next().?;
-        const row = try std.fmt.parseUnsigned(usize, row_s, 10);
-        const col = try std.fmt.parseUnsigned(usize, col_s, 10);
-        return .{ .row = row, .col = col };
+
+        var scratch: [32]u8 = undefined;
+        var scratch_len: usize = 0;
+
+        var row_buf: [16]u8 = undefined;
+        var row_len: usize = 0;
+        var col_buf: [16]u8 = undefined;
+        var col_len: usize = 0;
+
+        const State = enum { seeking_esc, seeking_bracket, row, col };
+        var state: State = .seeking_esc;
+
+        while (true) {
+            const byte = try reader.takeByte();
+            switch (state) {
+                .seeking_esc => {
+                    if (byte == 0x1B) {
+                        scratch_len = 0;
+                        scratch[scratch_len] = byte;
+                        scratch_len += 1;
+                        state = .seeking_bracket;
+                    } else if (pending_input) |pending| {
+                        try pending.append(allocator, byte);
+                    }
+                },
+                .seeking_bracket => {
+                    scratch[scratch_len] = byte;
+                    scratch_len += 1;
+                    if (byte == '[') {
+                        state = .row;
+                        row_len = 0;
+                        col_len = 0;
+                    } else {
+                        if (pending_input) |pending| {
+                            try pending.appendSlice(allocator, scratch[0..scratch_len]);
+                        }
+                        scratch_len = 0;
+                        state = .seeking_esc;
+                    }
+                },
+                .row => {
+                    scratch[scratch_len] = byte;
+                    scratch_len += 1;
+                    if (std.ascii.isDigit(byte)) {
+                        if (row_len < row_buf.len) {
+                            row_buf[row_len] = byte;
+                            row_len += 1;
+                        }
+                        continue;
+                    }
+                    if (byte == ';' and row_len > 0) {
+                        state = .col;
+                        continue;
+                    }
+                    if (pending_input) |pending| {
+                        try pending.appendSlice(allocator, scratch[0..scratch_len]);
+                    }
+                    scratch_len = 0;
+                    state = .seeking_esc;
+                },
+                .col => {
+                    scratch[scratch_len] = byte;
+                    scratch_len += 1;
+                    if (std.ascii.isDigit(byte)) {
+                        if (col_len < col_buf.len) {
+                            col_buf[col_len] = byte;
+                            col_len += 1;
+                        }
+                        continue;
+                    }
+                    if (byte == 'R' and row_len > 0 and col_len > 0) {
+                        const row = try std.fmt.parseUnsigned(usize, row_buf[0..row_len], 10);
+                        const col = try std.fmt.parseUnsigned(usize, col_buf[0..col_len], 10);
+                        return .{ .row = row, .col = col };
+                    }
+                    if (pending_input) |pending| {
+                        try pending.appendSlice(allocator, scratch[0..scratch_len]);
+                    }
+                    scratch_len = 0;
+                    state = .seeking_esc;
+                },
+            }
+        }
     }
 
     fn getTerminalSize(self: *IRDebugger) Error!TermVector {
