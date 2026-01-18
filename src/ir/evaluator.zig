@@ -179,6 +179,7 @@ pub const IREvaluator = struct {
                 return switch (loc.abs) {
                     .data, .scope, .register, .ref => ResolveValueError.UnsupportedResolveValueType,
                     .stack => |stack| thread.private.stack.items[stack],
+                    .heap => |heap| thread.shared.heap.get(heap).?,
                     .instruction => value,
                 };
             },
@@ -205,6 +206,7 @@ pub const IREvaluator = struct {
     ) ResolveLocationError!ir.Value {
         return switch (location.abs) {
             .ref => |ref| thread.getRefPtr(ref).*,
+            .heap => thread.shared.heap.get(try location.toAddr()).?,
             .register => |reg| switch (reg) {
                 .ic => ResolveValueError.UnsupportedResolveValueType,
                 .sf => .fromAddr(location.applyMod(thread.private.stack_frame)),
@@ -280,8 +282,18 @@ pub const IREvaluator = struct {
 
                 for (0..argv_len) |_| {
                     const arg = thread.private.stack.pop().?;
-                    const slice = try self.getSlice(arg.slice);
-                    argv.appendAssumeCapacity(slice);
+                    // const slice = try self.getSlice(arg.slice);
+                    // argv.appendAssumeCapacity(slice);
+
+                    // const start = i * element_size;
+                    // const end = start + element_size;
+                    // const slice_as_bytes = argv_value_slice[start..end];
+                    // var reader = std.Io.Reader.fixed(slice_as_bytes);
+                    // const arg_stream = try ir.Value.deserialize(.stream, &reader);
+                    var arg_writer = std.Io.Writer.Allocating.init(self.allocator);
+                    // try self.materializeString(thread, arg_stream, &arg_writer.writer);
+                    try self.materializeString(thread, arg, &arg_writer.writer);
+                    argv.appendAssumeCapacity(try arg_writer.toOwnedSlice());
                 }
 
                 const child = try self.allocator.create(std.process.Child);
@@ -339,14 +351,6 @@ pub const IREvaluator = struct {
                 return .cont;
             },
             .ref => |ref| {
-                // const entry = try thread.refs().getOrPut(self.allocator, ref.addr);
-
-                // if (entry.found_existing) {
-                //     return Error.DuplicateRef;
-                // }
-
-                // entry.value_ptr.* = .void;
-
                 _ = ref;
                 try thread.private.stack.append(self.allocator, .void);
 
@@ -358,15 +362,16 @@ pub const IREvaluator = struct {
                     .scope => Error.UnsupportedInstruction,
                     .instruction => Error.SetInstructionLocation,
                     .ref => |ref| {
-                        // const ref_ptr = thread.refs().getPtr(ref.addr) orelse return Error.RefNotFound;
-                        // ref_ptr.* = set.value;
-
                         thread.setRef(ref, set.value);
-
                         return .cont;
                     },
                     .stack => |stack| {
                         thread.private.stack.items[stack] = set.value;
+                        return .cont;
+                    },
+                    .heap => |heap| {
+                        const value = thread.shared.heap.getPtr(heap).?;
+                        value.* = set.value;
                         return .cont;
                     },
                     .register => |reg| {
@@ -489,6 +494,10 @@ pub const IREvaluator = struct {
                         return Error.UnsupportedStreamee;
                     },
                 };
+            },
+            .alloc => |size| {
+                thread.private.result_register = thread.shared.alloc(size);
+                return .cont;
             },
             .ath => |ath| {
                 const left = try self.resolveValue(thread, ath.a);
@@ -694,7 +703,10 @@ pub const IREvaluator = struct {
         const resolvedValue = try self.resolveValue(thread, value);
 
         switch (resolvedValue) {
-            .stream => |stream| for (stream) |s| try self.materializeString(thread, s, w),
+            .stream => |stream| for (0..stream.len) |i| {
+                const stream_value = thread.shared.heap.get(i + stream.addr).?;
+                try self.materializeString(thread, stream_value, w);
+            },
             .slice => |slice| {
                 if (slice.element_size != 1) return MaterializeStringError.UnsupportedType;
                 const string = try self.getSlice(slice);
@@ -703,7 +715,7 @@ pub const IREvaluator = struct {
             inline .uinteger, .float => |t| try w.print("{}", .{t}),
             inline .addr => |t| try w.print("0x{x}", .{t}),
             inline .exit_code => |t| try w.print("{f}", .{t}),
-            .void, .strct, .pipe, .thread, .closeable, .fn_ref, .register => {},
+            .void, .strct, .pipe, .thread, .closeable, .fn_ref, .register, .dereference => {},
         }
     }
 };

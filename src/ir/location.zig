@@ -116,6 +116,7 @@ pub const LocationAbs = union(enum) {
     ref: Ref,
     scope: ScopeLocation,
     stack: usize,
+    heap: usize,
     register: RegisterAbs,
     instruction: InstructionAddr,
     data: struct {
@@ -143,6 +144,7 @@ pub const LocationAbs = union(enum) {
         return switch (self) {
             .data => |data| data.page * page_size + data.addr,
             .stack => |stack| stack_start + stack,
+            .heap => |heap| heap,
             .ref, .instruction, .scope, .register => Location.Error.UnsupportedAddrType,
         };
     }
@@ -157,6 +159,7 @@ pub const LocationAbs = union(enum) {
             .scope => |s| try w.print("@{s}", .{s}),
             .data => |d| try w.print("#{}:{}", .{ d.page, d.addr }),
             .stack => |s| try w.print("S{}", .{s}),
+            .heap => |s| try w.print("H{}", .{s}),
             .instruction => |i| try w.print("I{f}", .{i}),
             .register => |r| try w.print("%{t}", .{r}),
         }

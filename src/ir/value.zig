@@ -20,7 +20,7 @@ pub const Value = union(enum) {
     pipe: usize,
     closeable: usize,
     addr: usize,
-    stream: []const Value,
+    stream: ValueSlice,
     thread: usize,
     fn_ref: FunctionRef,
     register: Register,
@@ -88,6 +88,37 @@ pub const Value = union(enum) {
 
         pub fn format(self: @This(), w: *std.Io.Writer) !void {
             try w.print("[{x}..+{}]u8", .{
+                self.addr,
+                self.len,
+            });
+        }
+    };
+
+    pub const ValueSlice = struct {
+        addr: usize,
+        len: usize,
+
+        pub const empty = @This(){ .addr = 0, .len = 0 };
+
+        pub fn serialize(self: @This(), w: *std.Io.Writer) !void {
+            try w.writeInt(usize, self.addr, endian);
+            try w.writeInt(usize, self.len, endian);
+        }
+
+        pub fn deserialize(
+            r: *std.Io.Reader,
+        ) std.Io.Reader.Error!@This() {
+            const addr = try r.takeInt(usize, endian);
+            const len = try r.takeInt(usize, endian);
+
+            return .{
+                .addr = addr,
+                .len = len,
+            };
+        }
+
+        pub fn format(self: @This(), w: *std.Io.Writer) !void {
+            try w.print("H[{x}..+{}]u8", .{
                 self.addr,
                 self.len,
             });
@@ -262,11 +293,10 @@ pub const Value = union(enum) {
         switch (self) {
             .void => try w.writeAll("void"),
             .addr => |addr| try w.print("{x}", .{addr}),
-            .stream => try w.writeAll("<stream>"),
             .pipe => |handle| try w.print("<pipe:{}>", .{handle}),
             .closeable => |handle| try w.print("<closeable:{}>", .{handle}),
             .thread => |id| try w.print("<thread:{}>", .{id}),
-            inline .slice, .exit_code, .fn_ref, .register => |s| try w.print("{f}", .{s}),
+            inline .slice, .exit_code, .fn_ref, .register, .stream => |s| try w.print("{f}", .{s}),
             inline else => |t| try w.print("{}", .{t}),
         }
     }

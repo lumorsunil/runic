@@ -389,6 +389,10 @@ pub const IRCompiler = struct {
             .register = .initAbs(.sf),
         } }));
         try self.set(source, .initAbs(.{ .register = .sf }), .{ .register = .initAbs(.sc) });
+        return self.pushFrameNoInstructions();
+    }
+
+    fn pushFrameNoInstructions(self: *@This()) Error!void {
         return self.currentInstrSet().frames.append(self.allocator, .init());
     }
 
@@ -420,11 +424,11 @@ pub const IRCompiler = struct {
     }
 
     // If you change this, make sure to fix the std...StreamSet functions as well
-    pub fn addInstructionSet(self: *@This(), source: anytype) Error!usize {
+    pub fn addInstructionSet(self: *@This()) Error!usize {
         const new_instr_set = try self.addInstructionSetNoPushFrame();
         const orig_instr_set = self.current_instruction_set;
         self.current_instruction_set = new_instr_set;
-        try self.pushFrame(source);
+        try self.pushFrameNoInstructions();
         self.current_instruction_set = orig_instr_set;
         return new_instr_set;
     }
@@ -658,6 +662,10 @@ pub const IRCompiler = struct {
         return self.addInstruction(.init(.from(source), .stream_(streamee)));
     }
 
+    pub fn alloc(self: *IRCompiler, source: anytype, size: usize) Error!void {
+        return self.addInstruction(.init(.from(source), .{ .alloc = size }));
+    }
+
     pub fn exit_(
         self: *IRCompiler,
         source: anytype,
@@ -722,12 +730,12 @@ pub const IRCompiler = struct {
     }
 
     fn compileInitial(self: *@This()) Error!void {
+        try self.pushFrameNoInstructions();
         try self.addInstruction(.init(null, .fwd_stdio));
-        try self.pushFrame(null);
 
-        const stdin_set = try self.addInstructionSet(null);
-        const stdout_set = try self.addInstructionSet(null);
-        const stderr_set = try self.addInstructionSet(null);
+        const stdin_set = try self.addInstructionSet();
+        const stdout_set = try self.addInstructionSet();
+        const stderr_set = try self.addInstructionSet();
 
         const prev_instr_set = self.current_instruction_set;
 
@@ -868,7 +876,7 @@ pub const IRCompiler = struct {
             .integer => |integer| .from(try parseInt(integer.text)),
             .float => |float| .from(try parseFloat(float.text)),
             .bool => |boolean| .fromValue(.{ .exit_code = .fromBoolean(boolean.value) }),
-            .string => |string| self.compileStringLiteral(string),
+            .string => |string| self.compileStringLiteral(source, string),
             else => {
                 try self.reportSourceError(source, Error.UnsupportedLiteral, .@"error", "literal type \"{t}\" not yet supported", .{literal});
                 return .fromValue(.void);
@@ -876,20 +884,31 @@ pub const IRCompiler = struct {
         };
     }
 
+    fn field(
+        addr: usize,
+        struct_type: ir.Value.Struct.Type,
+        field_name: []const u8,
+    ) ir.Location {
+        return .initAdd(.{ .heap = addr }, struct_type.fields.getIndex(field_name).?);
+    }
+
     fn compileStringLiteral(
         self: *IRCompiler,
+        source: anytype,
         string_literal: ast.StringLiteral,
     ) Error!Result {
         if (string_literal.segments.len == 1) {
             return .from(try self.addSlice(1, string_literal.segments[0].text.payload));
         }
 
-        const s_tream = try self.allocator.alloc(ir.Value, string_literal.segments.len);
-
-        // TODO: find a way to make this instruction-based instead because of volatile result register, compileExpression in a loop won't cut it
+        const ref = try self.newRef(source, "string_literal");
+        try self.alloc(source, string_literal.segments.len);
+        try self.set(source, ref, .{ .register = .initAbs(.r) });
 
         for (string_literal.segments, 0..) |segment, i| switch (segment) {
             .text => |text| {
+                // TODO: Figure out how to deal with the pointer in ref now...
+                try self.set(source, field())
                 s_tream[i] = try self.addSlice(1, text.payload);
             },
             .interpolation => |interp| {
@@ -1000,7 +1019,7 @@ pub const IRCompiler = struct {
         // const fields = try self.allocExecutableCallContextFields(executable, args_temp);
         // errdefer self.allocator.free(fields);
 
-        const exec_instr_set = try self.addInstructionSet(source);
+        const exec_instr_set = try self.addInstructionSet();
 
         const prev_instr_set = self.current_instruction_set;
         self.current_instruction_set = exec_instr_set;
@@ -1150,7 +1169,7 @@ pub const IRCompiler = struct {
         const stage_sets = try self.allocator.alloc(usize, pipeline.stages.len - 1);
         defer self.allocator.free(stage_sets);
         for (stage_sets, pipeline.stages[0 .. pipeline.stages.len - 1]) |*stage_set, stage_expr| {
-            stage_set.* = try self.addInstructionSet(source);
+            stage_set.* = try self.addInstructionSet();
             self.current_instruction_set = stage_set.*;
             const result = try self.compileExpression(stage_expr);
 
@@ -1172,7 +1191,7 @@ pub const IRCompiler = struct {
             _ = try self.fork(source, .initAbs(stage_set, 0), prev, curr, self.threadStderr());
         }
 
-        const last_set = try self.addInstructionSet(source);
+        const last_set = try self.addInstructionSet();
 
         self.current_instruction_set = last_set;
         const result = try self.compileExpression(pipeline.stages[pipeline.stages.len - 1]);
@@ -1223,7 +1242,7 @@ pub const IRCompiler = struct {
             block_stdout,
             self.threadStdout(),
         );
-        const block_set = try self.addInstructionSet(source);
+        const block_set = try self.addInstructionSet();
 
         const orig_instr_set = self.current_instruction_set;
         self.current_instruction_set = block_set;
@@ -1235,7 +1254,7 @@ pub const IRCompiler = struct {
             // TODO: figure out what to do with these results
             _ = try self.compileStatement(stmt);
         }
-        // const pipe_opts_set = try self.addInstructionSet(source);
+        // const pipe_opts_set = try self.addInstructionSet();
         // try self.atomic(source, pipe_opts_set);
         // self.current_instruction_set = pipe_opts_set;
         try self.pipeOpt(
@@ -1266,7 +1285,7 @@ pub const IRCompiler = struct {
         source: *ast.Expression,
         fn_decl: ast.FunctionDecl,
     ) Error!Result {
-        const instr_set = try self.addInstructionSet(source);
+        const instr_set = try self.addInstructionSet();
         const orig_instr_set = self.current_instruction_set;
         self.current_instruction_set = instr_set;
 

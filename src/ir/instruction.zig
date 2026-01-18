@@ -45,6 +45,8 @@ pub const Instruction = struct {
         wait: Wait,
         /// streams a pipe until it is closed, blocking
         stream: Location,
+        /// allocates n number of values on the heap, stores address in %r
+        alloc: usize,
         /// exits the process
         exit: ExitCode,
 
@@ -82,6 +84,7 @@ pub const Instruction = struct {
             switch (self) {
                 inline .push, .exit, .jmp, .fork, .set, .pipe_fwd, .wait, .stream, .pipe, .pipe_opt, .ath, .log, .cmp => |t| try w.print("{t} {f}", .{ self, t }),
                 inline .ref => |t| try w.print("{t} {s}", .{ self, t }),
+                inline .alloc => |t| try w.print("{t} {}", .{ self, t }),
                 else => try w.print("{t}", .{self}),
             }
         }

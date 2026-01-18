@@ -297,6 +297,7 @@ pub const IRSharedContext = struct {
     instructions: []const []const Instruction,
     labels: Labels,
     struct_types: []const Value.Struct.Type,
+    heap: std.AutoArrayHashMapUnmanaged(usize, Value) = .empty,
 
     pub fn dataSize(self: @This()) usize {
         if (self.data.len == 0) return 0;
@@ -311,8 +312,14 @@ pub const IRSharedContext = struct {
         } else if (addr >= stack_start) {
             return .initAbs(.{ .stack = addr - stack_start });
         } else {
-            @panic("shouldn't happen :)");
+            return .initAbs(.{ .heap = addr });
         }
+    }
+
+    pub fn alloc(self: *@This(), size: usize) Value {
+        _ = self;
+        _ = size;
+        return .void;
     }
 };
 
