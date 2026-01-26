@@ -66,7 +66,7 @@
 - [x] functions calls
   - [ ] arguments
   - [ ] fix ref bug (calling same function multiple times to trigger)
-- [ ] bindings
+- [x] bindings
 
 ## execution context
 
@@ -162,3 +162,4 @@
 - [ ] `cat | grep "hello"` does not react on stdin
 - [x] cannot call function multiple times
 - [x] debugger: cannot paste to stdin
+- [ ] `cat` on it's own does not echo back

@@ -85,7 +85,7 @@ pub const CompilationResult = union(enum) {
 };
 
 pub const Result = union(enum) {
-    value: ir.Value,
+    source: ir.ValueSource,
 
     pub fn from(v: anytype) !@This() {
         if (@TypeOf(v) == ir.Location) {
@@ -99,14 +99,11 @@ pub const Result = union(enum) {
     }
 
     pub fn fromLocation(location: ir.Location) ir.Location.Error!@This() {
-        return switch (location.abs) {
-            .register => |reg| .fromValue(.{ .dereference = .{ .register = .init(reg, location.mod) } }),
-            else => .fromValue(.fromAddr(try location.toAddr())),
-        };
+        return .{ .source = .{ .location = location } };
     }
 
     pub fn fromValue(value: ir.Value) @This() {
-        return .{ .value = value };
+        return .{ .source = .{ .value = value } };
     }
 
     pub fn executable(name: []const u8) @This() {
@@ -171,7 +168,7 @@ pub const IRData = struct {
         const page = try self.ensureDataCapacity(allocator, len);
         const page_writer = self.getPageWriter(page);
         const addr = page_writer.end;
-        return .initAbs(.{ .data = .init(page, addr) });
+        return .initAbs(.{ .data = .init(page, addr) }, .{});
     }
 
     pub fn toOwnedSlice(self: *IRData, allocator: Allocator) ![]const []const u8 {
@@ -182,6 +179,11 @@ pub const IRData = struct {
         );
         self.deinit(allocator);
         return owned;
+    }
+
+    pub fn size(self: IRData) usize {
+        if (self.data.items.len == 0) return 0;
+        return (self.data.items.len - 1) * page_size + self.data.getLast().buffered().len;
     }
 };
 
@@ -385,10 +387,11 @@ pub const IRCompiler = struct {
     }
 
     fn pushFrame(self: *@This(), source: anytype) Error!void {
-        try self.addInstruction(.init(.from(source), .{ .push = .{
-            .register = .initAbs(.sf),
-        } }));
-        try self.set(source, .initAbs(.{ .register = .sf }), .{ .register = .initAbs(.sc) });
+        try self.addInstruction(.init(
+            .from(source),
+            .push_(.fromLocation(.initRegister(.sf))),
+        ));
+        try self.set(source, .initRegister(.sf), .fromLocation(.initRegister(.sc)));
         return self.pushFrameNoInstructions();
     }
 
@@ -397,18 +400,18 @@ pub const IRCompiler = struct {
     }
 
     fn popFrame(self: *@This(), source: anytype) !void {
-        try self.push(source, .{ .register = .initAbs(.sf) });
+        try self.push(source, .fromLocation(.initRegister(.sf)));
         try self.addInstruction(.init(.from(source), .{ .set = .{
-            .location = .initAbs(.{ .register = .sf }),
-            .value = .{ .dereference = .{ .register = .initSub(.sf, 1) } },
+            .destination = .initRegister(.sf),
+            .source = .fromLocation(.initSub(.{ .register = .sf }, 1, .{ .dereference = true })),
         } }));
         try self.addInstruction(.init(.from(source), .{ .set = .{
-            .location = .initAbs(.{ .register = .sc }),
-            .value = .{ .dereference = .{ .register = .initSub(.sc, 1) } },
+            .destination = .initRegister(.sc),
+            .source = .fromLocation(.initSub(.{ .register = .sc }, 1, .{ .dereference = true })),
         } }));
         try self.addInstruction(.init(.from(source), .{ .set = .{
-            .location = .initAbs(.{ .register = .sc }),
-            .value = .{ .register = .initSub(.sc, 1) },
+            .destination = .initRegister(.sc),
+            .source = .fromLocation(.initSub(.{ .register = .sc }, 1, .{})),
         } }));
         const instr_set = self.currentInstrSet();
         const popped = instr_set.frames.pop() orelse return;
@@ -499,7 +502,7 @@ pub const IRCompiler = struct {
         return .initAbs(.{ .ref = .{
             .name = name,
             .rel_stack_addr = self.currentFrame().rel_stack_counter,
-        } });
+        } }, .{});
     }
 
     pub fn declare(
@@ -518,10 +521,10 @@ pub const IRCompiler = struct {
     pub fn push(
         self: *IRCompiler,
         source: anytype,
-        value: ir.Value,
+        value_source: ir.ValueSource,
     ) Error!void {
         self.currentFrame().rel_stack_counter += 1;
-        return self.addInstruction(.init(.from(source), .push_(value)));
+        return self.addInstruction(.init(.from(source), .push_(value_source)));
     }
 
     pub fn pop(
@@ -530,19 +533,19 @@ pub const IRCompiler = struct {
     ) Error!ir.Location {
         self.currentFrame().rel_stack_counter -= 1;
         try self.addInstruction(.init(.from(source), .pop));
-        return .initAbs(.{ .register = .r });
+        return .initAbs(.{ .register = .r }, .{});
     }
 
     pub fn set(
         self: *IRCompiler,
         source: anytype,
         location: ir.Location,
-        value: ir.Value,
+        value_source: ir.ValueSource,
     ) Error!void {
         return self.addInstruction(.init(.from(source), .{
             .set = .{
-                .location = location,
-                .value = value,
+                .destination = location,
+                .source = value_source,
             },
         }));
     }
@@ -562,13 +565,13 @@ pub const IRCompiler = struct {
         source: anytype,
         handle: ir.Location,
         option: ir.Instruction.PipeOption.OptionType,
-        value: ir.Value,
+        value_source: ir.ValueSource,
     ) Error!void {
         return self.addInstruction(.init(.from(source), .{
             .pipe_opt = .{
                 .handle = handle,
                 .option = option,
-                .value = value,
+                .source = value_source,
             },
         }));
     }
@@ -596,7 +599,7 @@ pub const IRCompiler = struct {
     ) Error!void {
         return self.addInstruction(.init(.from(source), .{
             .jmp = .{
-                .cond = if (condition) |cond| cond.value else null,
+                .cond = if (condition) |cond| cond.source else null,
                 .jump_if = jump_if,
                 .dest = destination,
             },
@@ -612,7 +615,7 @@ pub const IRCompiler = struct {
         try self.addInstruction(.init(.from(source), .{ .exec = .{
             .sync = sync,
         } }));
-        return .initAbs(.{ .register = .r });
+        return .initAbs(.{ .register = .r }, .{});
     }
 
     pub fn fork(
@@ -633,11 +636,12 @@ pub const IRCompiler = struct {
         const orig_instr_set = self.current_instruction_set;
         self.current_instruction_set = dest.instr_set;
 
+        // TODO: issue here when we are forking multiple times to the same set since the frame is connected to the set and not the thread, the rel_stack_counter will point to the wrong place in the stack
         self.currentFrame().rel_stack_counter += 3;
 
         self.current_instruction_set = orig_instr_set;
 
-        return .initAbs(.{ .register = .r });
+        return .initAbs(.{ .register = .r }, .{});
     }
 
     pub fn forkInherit(
@@ -671,12 +675,15 @@ pub const IRCompiler = struct {
         source: anytype,
         value: Result,
     ) Error!void {
-        const exit_code: ExitCode = switch (value.value) {
-            .uinteger => |x| .fromByte(@intCast(@mod(x, 256))),
-            .exit_code => |exit_code| exit_code,
-            else => {
-                return self.reportSourceError(source, Error.UnsupportedExitCodeExpression, .@"error", "value type \"{t}\" cannot be coerced into an exit code", .{value.value});
+        const exit_code: ExitCode = @as(?ExitCode, switch (value.source) {
+            .value => |v| switch (v) {
+                .uinteger => |x| .fromByte(@intCast(@mod(x, 256))),
+                .exit_code => |exit_code| exit_code,
+                else => null,
             },
+            else => null,
+        }) orelse {
+            return self.reportSourceError(source, Error.UnsupportedExitCodeExpression, .@"error", "value type \"{t}\" cannot be coerced into an exit code", .{value.source});
         };
         return self.addInstruction(.init(.from(source), .exit_(exit_code)));
     }
@@ -700,11 +707,14 @@ pub const IRCompiler = struct {
             dest.* = try src.toOwnedSlice(self.allocator);
         }
 
+        const data_size = self.data.size();
+
         return .{
             .data = try self.data.toOwnedSlice(self.allocator),
             .instructions = instructions,
             .labels = .{ .map = self.labels.map.move() },
             .struct_types = try self.struct_types.toOwnedSlice(self.allocator),
+            .current_heap_addr = data_size,
         };
     }
 
@@ -732,6 +742,7 @@ pub const IRCompiler = struct {
     fn compileInitial(self: *@This()) Error!void {
         try self.pushFrameNoInstructions();
         try self.addInstruction(.init(null, .fwd_stdio));
+        self.currentFrame().rel_stack_counter += 3;
 
         const stdin_set = try self.addInstructionSet();
         const stdout_set = try self.addInstructionSet();
@@ -778,11 +789,10 @@ pub const IRCompiler = struct {
     }
 
     fn isWaitable(result: Result) ?ir.Location {
-        return switch (result.value) {
-            .register => |r| .init(.{ .register = r.abs }, r.mod),
-            .dereference => |d| switch (d) {
-                .addr => null,
-                .register => |r| .init(.{ .register = r.abs }, r.mod),
+        return switch (result.source) {
+            .location => |loc| switch (loc.abs) {
+                .register => loc,
+                else => null,
             },
             else => null,
         };
@@ -902,21 +912,51 @@ pub const IRCompiler = struct {
         }
 
         const ref = try self.newRef(source, "string_literal");
-        try self.alloc(source, string_literal.segments.len);
-        try self.set(source, ref, .{ .register = .initAbs(.r) });
+        try self.alloc(source, string_literal.segments.len + 1);
+        try self.set(
+            source,
+            .initAbs(.{ .register = .r }, .{ .dereference = true }),
+            .fromValue(.{ .uinteger = string_literal.segments.len }),
+        );
+        try self.set(source, ref, .fromLocation(.initRegister(.r)));
+        // const s_tream = try self.allocator.alloc(ir.Value, string_literal.segments.len);
 
         for (string_literal.segments, 0..) |segment, i| switch (segment) {
             .text => |text| {
-                // TODO: Figure out how to deal with the pointer in ref now...
-                try self.set(source, field())
-                s_tream[i] = try self.addSlice(1, text.payload);
+                const result = try self.addSlice(1, text.payload);
+                try self.set(source, .initRegister(.r), .from(ref.dereference()));
+                try self.set(
+                    source,
+                    .initAdd(.{ .register = .r }, i + 1, .{ .dereference = true }),
+                    .from(result),
+                );
+                // s_tream[i] = try self.addSlice(1, text.payload);
             },
             .interpolation => |interp| {
-                s_tream[i] = (try self.compileExpression(interp)).value;
+                var result = (try self.compileExpression(interp)).source;
+                const is_result_reg_r = result.isRegister(.r);
+                if (is_result_reg_r) {
+                    const segment_ref = try self.newRef(source, "segment");
+                    try self.set(source, segment_ref, result);
+                    result = .from(segment_ref.dereference());
+                }
+                try self.set(source, .initRegister(.r), .from(ref.dereference()));
+                try self.set(
+                    source,
+                    .initAdd(.{ .register = .r }, i + 1, .{ .dereference = true }),
+                    result,
+                );
+                if (is_result_reg_r) {
+                    _ = try self.pop(source);
+                }
+                // s_tream[i] = (try self.compileExpression(interp)).source;
             },
         };
 
-        return .fromValue(.{ .stream = s_tream });
+        // return .fromValue(.{ .stream = s_tream });
+        // return .fromValue(.{ .stream = undefined });
+        const result = try self.pop(source);
+        return .from(result);
     }
 
     fn parseInt(text: []const u8) std.fmt.ParseIntError!ir.Value {
@@ -933,7 +973,7 @@ pub const IRCompiler = struct {
     ) Error!Result {
         const binding = self.lookup(identifier.name) orelse {
             const executable = try self.addSlice(1, identifier.name);
-            return .from(executable);
+            return .fromValue(.{ .executable = executable.slice });
         };
         return binding.result;
     }
@@ -945,14 +985,13 @@ pub const IRCompiler = struct {
     ) Error!Result {
         const callee = try self.compileExpression(call.callee);
 
-        return switch (callee.value) {
-            .slice => self.compileExecutableCall(
-                source,
-                callee.value,
-                call.arguments,
-            ),
-            .fn_ref => self.compileFunctionCall(source, callee.value, call.arguments),
-            .stream, .addr, .void, .uinteger, .float, .strct, .exit_code, .pipe, .thread, .closeable, .register, .dereference => .from(callee.value),
+        return switch (callee.source) {
+            .value => |v| switch (v) {
+                .executable => self.compileExecutableCall(source, v, call.arguments),
+                .fn_ref => self.compileFunctionCall(source, v, call.arguments),
+                .slice, .stream, .addr, .void, .uinteger, .float, .strct, .exit_code, .pipe, .thread, .closeable => .from(v),
+            },
+            .location => |loc| .from(loc),
         };
     }
 
@@ -965,7 +1004,7 @@ pub const IRCompiler = struct {
 
         for (exprs, values) |expr, *value| {
             const result = try self.compileExpression(expr);
-            value.* = result.value;
+            value.* = result.source;
         }
 
         return values;
@@ -985,15 +1024,15 @@ pub const IRCompiler = struct {
     }
 
     fn threadStdin(_: *IRCompiler) ir.Location {
-        return .initAbs(.{ .stack = 0 });
+        return .initAbs(.{ .stack = 0 }, .{ .dereference = true });
     }
 
     fn threadStdout(_: *IRCompiler) ir.Location {
-        return .initAbs(.{ .stack = 1 });
+        return .initAbs(.{ .stack = 1 }, .{ .dereference = true });
     }
 
     fn threadStderr(_: *IRCompiler) ir.Location {
-        return .initAbs(.{ .stack = 2 });
+        return .initAbs(.{ .stack = 2 }, .{ .dereference = true });
     }
 
     fn stdinStreamSet(_: *IRCompiler) ir.InstructionAddr {
@@ -1021,16 +1060,18 @@ pub const IRCompiler = struct {
 
         const exec_instr_set = try self.addInstructionSet();
 
+        const thread_handle = try self.forkInherit(source, .initAbs(exec_instr_set, 0));
+
         const prev_instr_set = self.current_instruction_set;
         self.current_instruction_set = exec_instr_set;
 
         var it = std.mem.reverseIterator(arguments);
         while (it.next()) |arg_expr| {
             const arg = try self.compileExpression(arg_expr);
-            try self.push(source, arg.value);
+            try self.push(source, arg.source);
         }
-        try self.push(source, executable);
-        try self.push(source, .{ .uinteger = arguments.len });
+        try self.push(source, .from(executable));
+        try self.push(source, .fromValue(.{ .uinteger = arguments.len }));
 
         // try self.push(source, .{ .strct = .{
         //     .type = try self.getStructType("ExecutableCallContext"),
@@ -1040,8 +1081,6 @@ pub const IRCompiler = struct {
         try self.wait(source, exec_handle);
 
         self.current_instruction_set = prev_instr_set;
-
-        const thread_handle = try self.forkInherit(source, .initAbs(exec_instr_set, 0));
 
         return .from(thread_handle);
     }
@@ -1080,8 +1119,8 @@ pub const IRCompiler = struct {
         else_branch: ast.IfExpr.ElseBranch,
     ) Error!Result {
         const condition = try self.compileExpression(if_expr.condition);
-        if (condition.value == .exit_code) {
-            const c = condition.value.exit_code.toBoolean();
+        if (condition.source.isValueTag(.exit_code)) {
+            const c = condition.source.value.exit_code.toBoolean();
 
             if (c) return self.compileExpression(if_expr.then_expr);
             return switch (else_branch) {
@@ -1096,14 +1135,14 @@ pub const IRCompiler = struct {
 
         try self.jmp(source, condition, false, else_addr);
         const then = try self.compileExpression(if_expr.then_expr);
-        try self.set(source, result, then.value);
+        try self.set(source, result, then.source);
         try self.jmp(source, null, false, after_addr);
         try self.setLabel(else_addr.local_addr.label, .abs);
         const else_ = try switch (else_branch) {
             .expr => |expr_| self.compileExpression(expr_),
             .if_expr => |if_expr_| self.compileIf(source, if_expr_.*),
         };
-        try self.set(source, result, else_.value);
+        try self.set(source, result, else_.source);
         try self.setLabel(after_addr.local_addr.label, .abs);
 
         const result_loc = try self.pop(source);
@@ -1119,8 +1158,8 @@ pub const IRCompiler = struct {
         try self.pushFrame(source);
 
         const condition = try self.compileExpression(if_expr.condition);
-        if (condition.value == .exit_code) {
-            const c = condition.value.exit_code.toBoolean();
+        if (condition.source.isValueTag(.exit_code)) {
+            const c = condition.source.value.exit_code.toBoolean();
 
             if (c) return self.compileExpression(if_expr.then_expr);
             return .fromValue(.void);
@@ -1133,7 +1172,7 @@ pub const IRCompiler = struct {
         try self.jmp(source, condition, false, after_addr);
 
         const then = try self.compileExpression(if_expr.then_expr);
-        try self.set(source, result, then.value);
+        try self.set(source, result, then.source);
 
         try self.setLabel(after_addr.local_addr.label, .abs);
 
@@ -1161,37 +1200,64 @@ pub const IRCompiler = struct {
 
         for (refs) |*ref| {
             ref.* = try self.newRef(source, "pipe");
-            try self.pipe(source, ref.*);
-            try self.pipeOpt(source, ref.*, .keep_open, .fromBoolean(true));
+            try self.pipe(source, ref.dereference());
+            try self.pipeOpt(source, ref.dereference(), .keep_open, .fromValue(.fromBoolean(true)));
         }
 
         const orig_instr_set = self.current_instruction_set;
         const stage_sets = try self.allocator.alloc(usize, pipeline.stages.len - 1);
         defer self.allocator.free(stage_sets);
-        for (stage_sets, pipeline.stages[0 .. pipeline.stages.len - 1]) |*stage_set, stage_expr| {
+        for (stage_sets) |*stage_set| {
             stage_set.* = try self.addInstructionSet();
+        }
+        const last_set = try self.addInstructionSet();
+
+        _ = try self.fork(
+            source,
+            .initAbs(stage_sets[0], 0),
+            self.threadStdin(),
+            refs[0].dereference(),
+            self.threadStderr(),
+        );
+
+        for (refs[0 .. refs.len - 1], refs[1..], stage_sets[1..]) |prev, curr, stage_set| {
+            _ = try self.fork(
+                source,
+                .initAbs(stage_set, 0),
+                prev.dereference(),
+                curr.dereference(),
+                self.threadStderr(),
+            );
+        }
+
+        const last_fork_handle = try self.fork(
+            source,
+            .initAbs(last_set, 0),
+            refs[refs.len - 1].dereference(),
+            self.threadStdout(),
+            self.threadStderr(),
+        );
+
+        for (stage_sets, pipeline.stages[0 .. pipeline.stages.len - 1]) |*stage_set, stage_expr| {
             self.current_instruction_set = stage_set.*;
             const result = try self.compileExpression(stage_expr);
 
             if (isWaitable(result)) |_| {
-                try self.push(source, result.value);
+                try self.push(source, result.source);
                 _ = try self.forkInherit(source, self.stdoutStreamSet());
                 const result_stack = try self.pop(source);
                 try self.wait(source, result_stack);
-                try self.pipeOpt(source, self.threadStdout(), .keep_open, .fromBoolean(false));
+                try self.pipeOpt(
+                    source,
+                    self.threadStdout(),
+                    .keep_open,
+                    .fromValue(.fromBoolean(false)),
+                );
             } else {
                 return Error.UnsupportedExpression;
             }
         }
         self.current_instruction_set = orig_instr_set;
-
-        _ = try self.fork(source, .initAbs(stage_sets[0], 0), self.threadStdin(), refs[0], self.threadStderr());
-
-        for (refs[0 .. refs.len - 1], refs[1..], stage_sets[1..]) |prev, curr, stage_set| {
-            _ = try self.fork(source, .initAbs(stage_set, 0), prev, curr, self.threadStderr());
-        }
-
-        const last_set = try self.addInstructionSet();
 
         self.current_instruction_set = last_set;
         const result = try self.compileExpression(pipeline.stages[pipeline.stages.len - 1]);
@@ -1199,14 +1265,6 @@ pub const IRCompiler = struct {
             try self.wait(source, loc);
         }
         self.current_instruction_set = orig_instr_set;
-
-        const last_fork_handle = try self.fork(
-            source,
-            .initAbs(last_set, 0),
-            refs[refs.len - 1],
-            self.threadStdout(),
-            self.threadStderr(),
-        );
 
         return .from(last_fork_handle);
     }
@@ -1218,28 +1276,28 @@ pub const IRCompiler = struct {
     ) Error!Result {
         const block_stdout = try self.newRef(source, "block_stdout_pipe");
 
-        try self.pipe(source, block_stdout);
+        try self.pipe(source, block_stdout.dereference());
         try self.pipeOpt(
             source,
-            block_stdout,
+            block_stdout.dereference(),
             .disconnect_destination,
-            .fromBoolean(false),
+            .fromValue(.fromBoolean(false)),
         );
         try self.pipeOpt(
             source,
-            block_stdout,
+            block_stdout.dereference(),
             .close_destination,
-            .fromBoolean(false),
+            .fromValue(.fromBoolean(false)),
         );
         try self.pipeOpt(
             source,
-            block_stdout,
+            block_stdout.dereference(),
             .keep_open,
-            .fromBoolean(true),
+            .fromValue(.fromBoolean(true)),
         );
         try self.pipeFwd(
             source,
-            block_stdout,
+            block_stdout.dereference(),
             self.threadStdout(),
         );
         const block_set = try self.addInstructionSet();
@@ -1248,7 +1306,7 @@ pub const IRCompiler = struct {
         self.current_instruction_set = block_set;
 
         const block_stdout_thread = try self.forkInherit(source, self.stdoutStreamSet());
-        try self.push(source, .{ .register = .init(block_stdout_thread.abs.register, block_stdout_thread.mod) });
+        try self.push(source, .from(block_stdout_thread));
 
         for (block.statements) |stmt| {
             // TODO: figure out what to do with these results
@@ -1261,7 +1319,7 @@ pub const IRCompiler = struct {
             source,
             self.threadStdout(),
             .keep_open,
-            .fromBoolean(false),
+            .fromValue(.fromBoolean(false)),
         );
         // try self.pipeOpt(source, self.threadStdout(), .disconnect_destination, true);
         _ = try self.pop(source);
@@ -1273,7 +1331,7 @@ pub const IRCompiler = struct {
             source,
             .initAbs(block_set, 0),
             self.threadStdin(),
-            block_stdout,
+            block_stdout.dereference(),
             self.threadStderr(),
         );
 
@@ -1317,7 +1375,7 @@ pub const IRCompiler = struct {
                 const left = try self.compileExpression(binary.left);
                 const right = try self.compileExpression(binary.right);
 
-                if (evaluateArithmetic(.from(binary.op), left.value, right.value)) |comptime_result| {
+                if (evaluateArithmetic(.from(binary.op), left.source, right.source)) |comptime_result| {
                     return .from(comptime_result);
                 }
 
@@ -1325,8 +1383,8 @@ pub const IRCompiler = struct {
 
                 try self.addInstruction(.init(.from(source), .{ .ath = .{
                     .op = .from(binary.op),
-                    .a = left.value,
-                    .b = right.value,
+                    .a = left.source,
+                    .b = right.source,
                     .result = ref,
                 } }));
 
@@ -1335,7 +1393,7 @@ pub const IRCompiler = struct {
             .logical_and, .logical_or => {
                 const left = try self.compileExpression(binary.left);
 
-                if (evaluateLogical(.from(binary.op), left.value)) |comptime_result| {
+                if (evaluateLogical(.from(binary.op), left.source)) |comptime_result| {
                     switch (comptime_result) {
                         .left => return left,
                         .right => return self.compileExpression(binary.right),
@@ -1347,8 +1405,8 @@ pub const IRCompiler = struct {
 
                 try self.addInstruction(.init(.from(source), .{ .log = .{
                     .op = .from(binary.op),
-                    .a = left.value,
-                    .b = right.value,
+                    .a = left.source,
+                    .b = right.source,
                     .result = ref,
                 } }));
 
@@ -1358,7 +1416,7 @@ pub const IRCompiler = struct {
                 const left = try self.compileExpression(binary.left);
                 const right = try self.compileExpression(binary.right);
 
-                if (evaluateCompare(.from(binary.op), left.value, right.value)) |comptime_result| {
+                if (evaluateCompare(.from(binary.op), left.source, right.source)) |comptime_result| {
                     return .from(comptime_result);
                 }
 
@@ -1366,8 +1424,8 @@ pub const IRCompiler = struct {
 
                 try self.addInstruction(.init(.from(source), .{ .cmp = .{
                     .op = .from(binary.op),
-                    .a = left.value,
-                    .b = right.value,
+                    .a = left.source,
+                    .b = right.source,
                     .result = ref,
                 } }));
 

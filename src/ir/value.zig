@@ -4,6 +4,7 @@ const ExitCode = @import("../runtime/command_runner.zig").ExitCode;
 const endian = @import("constants.zig").endian;
 const TypeAddr = @import("type-addr.zig").TypeAddr;
 const Location = @import("location.zig").Location;
+const LocationMod = @import("location.zig").LocationMod;
 const Register = @import("location.zig").Register;
 const ReaderWriterStream = @import("../stream.zig").ReaderWriterStream;
 const Closeable = @import("../closeable.zig").Closeable;
@@ -15,6 +16,7 @@ pub const Value = union(enum) {
     // TODO: decide on f32 or f64?
     float: f64,
     slice: Slice,
+    executable: Slice,
     strct: Struct,
     exit_code: ExitCode,
     pipe: usize,
@@ -23,12 +25,25 @@ pub const Value = union(enum) {
     stream: ValueSlice,
     thread: usize,
     fn_ref: FunctionRef,
-    register: Register,
-    dereference: union(enum) { addr: usize, register: Register },
+    // register: Register,
+    // dereference: union(enum) {
+    //     addr: usize,
+    //     register: Register,
+    //
+    //     pub fn applyMod(self: @This(), mod: LocationMod) @This() {
+    //         return switch (self) {
+    //             .addr => |addr| .{ .addr = mod.apply(addr) },
+    //             .register => |reg| .{ .register = .{
+    //                 .abs = reg.abs,
+    //                 .mod = mod.merge(reg.mod),
+    //             } },
+    //         };
+    //     }
+    // },
 
     pub fn deinit(self: *@This(), allocator: Allocator) void {
         switch (self.*) {
-            .void, .location, .uinteger, .slice, .exit_code, .addr, .thread => {},
+            .void, .location, .uinteger, .slice, .executable, .exit_code, .addr, .thread => {},
             .strct => |strct| strct.deinit(allocator),
             .stream => |stream| allocator.free(stream),
         }
@@ -243,7 +258,7 @@ pub const Value = union(enum) {
     pub fn toStream(self: @This(), allocator: Allocator) ToStreamError!@This() {
         return switch (self) {
             .stream => self,
-            .slice => .{ .stream = try allocator.dupe(Value, &.{self}) },
+            .slice, .executable => .{ .stream = try allocator.dupe(Value, &.{self}) },
             else => ToStreamError.UnsupportedStreamCast,
         };
     }
@@ -267,7 +282,7 @@ pub const Value = union(enum) {
                 []Value,
                 try r.takeArray(@sizeOf([]Value)),
             ).* },
-            .slice, .strct, .pipe, .closeable, .fn_ref => DeserializeError.UnsupportedDeserialize,
+            .slice, .executable, .strct, .pipe, .closeable, .fn_ref => DeserializeError.UnsupportedDeserialize,
             .exit_code => .{ .exit_code = try ExitCode.deserialize(r) },
             .register, .dereference => unreachable,
         };
@@ -292,11 +307,11 @@ pub const Value = union(enum) {
     pub fn format(self: @This(), w: *std.Io.Writer) !void {
         switch (self) {
             .void => try w.writeAll("void"),
-            .addr => |addr| try w.print("{x}", .{addr}),
+            .addr => |addr| try w.print("<0x{x}>", .{addr}),
             .pipe => |handle| try w.print("<pipe:{}>", .{handle}),
             .closeable => |handle| try w.print("<closeable:{}>", .{handle}),
             .thread => |id| try w.print("<thread:{}>", .{id}),
-            inline .slice, .exit_code, .fn_ref, .register, .stream => |s| try w.print("{f}", .{s}),
+            inline .slice, .executable, .exit_code, .fn_ref, .stream => |s| try w.print("{f}", .{s}),
             inline else => |t| try w.print("{}", .{t}),
         }
     }

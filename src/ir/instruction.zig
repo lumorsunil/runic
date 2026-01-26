@@ -4,7 +4,57 @@ const Value = @import("value.zig").Value;
 const Ref = @import("ref.zig").Ref;
 const ExitCode = @import("../runtime/command_runner.zig").ExitCode;
 const Location = @import("location.zig").Location;
+const RegisterAbs = @import("location.zig").RegisterAbs;
 const InstructionAddr = @import("instruction-addr.zig").InstructionAddr;
+
+pub const ValueSource = union(enum) {
+    location: Location,
+    value: Value,
+
+    pub fn from(source: anytype) @This() {
+        const T = @TypeOf(source);
+
+        if (T == Location) {
+            return .fromLocation(source);
+        } else if (T == Value) {
+            return .fromValue(source);
+        }
+
+        @compileError(@typeName(T) ++ " is not a valid ValueSource");
+    }
+
+    pub fn fromLocation(location: Location) @This() {
+        return .{ .location = location };
+    }
+
+    pub fn fromValue(value: Value) @This() {
+        return .{ .value = value };
+    }
+
+    pub fn isValueTag(self: @This(), tag: std.meta.Tag(Value)) bool {
+        return self == .value and self.value == tag;
+    }
+
+    pub fn isRegister(self: @This(), tag: RegisterAbs) bool {
+        return self == .location and self.location.abs == .register and self.location.abs.register == tag;
+    }
+
+    pub fn toFloat(self: @This()) ?f64 {
+        return switch (self) {
+            .value => |v| v.toFloat(),
+            .location => null,
+        };
+    }
+
+    pub fn format(
+        self: @This(),
+        writer: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        switch (self) {
+            inline else => |t| try writer.print("{f}", .{t}),
+        }
+    }
+};
 
 pub const Instruction = struct {
     source: ?Source,
@@ -14,7 +64,7 @@ pub const Instruction = struct {
         /// forward program stdin, stdout and stderr
         fwd_stdio,
         /// push a Value to the stack
-        push: Value,
+        push: ValueSource,
         /// pop a Value from the stack
         pop,
         /// performs arithmetic operation with a and b and stores the result into result
@@ -50,7 +100,7 @@ pub const Instruction = struct {
         /// exits the process
         exit: ExitCode,
 
-        pub fn push_(value: Value) @This() {
+        pub fn push_(value: ValueSource) @This() {
             return .{ .push = value };
         }
 
@@ -152,8 +202,8 @@ pub const Instruction = struct {
     pub fn BinaryOperation(comptime OpType: type) type {
         return struct {
             op: OpType,
-            a: Value,
-            b: Value,
+            a: ValueSource,
+            b: ValueSource,
             result: Location,
 
             pub fn format(
@@ -171,11 +221,11 @@ pub const Instruction = struct {
     };
 
     pub const Set = struct {
-        location: Location,
-        value: Value,
+        destination: Location,
+        source: ValueSource,
 
         pub fn format(self: @This(), w: *std.Io.Writer) !void {
-            try w.print("{f}={f}", .{ self.location, self.value });
+            try w.print("{f}={f}", .{ self.destination, self.source });
         }
     };
     pub const AthOp = enum {
@@ -270,7 +320,7 @@ pub const Instruction = struct {
     pub const Log = BinaryOperation(LogOp);
 
     pub const Jump = struct {
-        cond: ?Value,
+        cond: ?ValueSource,
         jump_if: bool = false,
         dest: InstructionAddr,
 
@@ -298,7 +348,7 @@ pub const Instruction = struct {
     pub const PipeOption = struct {
         handle: Location,
         option: OptionType,
-        value: Value,
+        source: ValueSource,
 
         pub const OptionType = enum {
             keep_open,
@@ -309,7 +359,7 @@ pub const Instruction = struct {
         };
 
         pub fn format(self: @This(), w: *std.Io.Writer) !void {
-            try w.print("{f} {t} {f}", .{ self.handle, self.option, self.value });
+            try w.print("{f} {t} {f}", .{ self.handle, self.option, self.source });
         }
     };
 

@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Value = @import("value.zig").Value;
 const Location = @import("location.zig").Location;
+const LocationMod = @import("location.zig").LocationMod;
 const Labels = @import("labels.zig").Labels;
 const Instruction = @import("instruction.zig").Instruction;
 const ResolvedInstructionAddr = @import("instruction-addr.zig").ResolvedInstructionAddr;
@@ -268,12 +269,17 @@ pub const IRThreadContext = struct {
         return .success;
     }
 
-    pub fn getRefPtr(self: @This(), ref: Ref) *Value {
-        return &self.private.stack.items[self.private.stack_frame + ref.rel_stack_addr];
+    pub fn getRefPtr(
+        self: @This(),
+        ref: Ref,
+        mod: ?LocationMod,
+    ) *Value {
+        const mod_: LocationMod = mod orelse .empty;
+        return &self.private.stack.items[self.private.stack_frame + mod_.apply(ref.rel_stack_addr)];
     }
 
-    pub fn setRef(self: @This(), ref: Ref, value: Value) void {
-        self.getRefPtr(ref).* = value;
+    pub fn setRef(self: @This(), ref: Ref, mod: ?LocationMod, value: Value) void {
+        self.getRefPtr(ref, mod).* = value;
     }
 
     pub fn refs(self: @This()) *std.AutoArrayHashMapUnmanaged(usize, Value) {
@@ -298,6 +304,7 @@ pub const IRSharedContext = struct {
     labels: Labels,
     struct_types: []const Value.Struct.Type,
     heap: std.AutoArrayHashMapUnmanaged(usize, Value) = .empty,
+    current_heap_addr: usize,
 
     pub fn dataSize(self: @This()) usize {
         if (self.data.len == 0) return 0;
@@ -308,18 +315,20 @@ pub const IRSharedContext = struct {
         const data_end = self.dataSize();
 
         if (addr < data_end) {
-            return .initAbs(.{ .data = .fromAddr(addr) });
+            return .initAbs(.{ .data = .fromAddr(addr) }, .{});
         } else if (addr >= stack_start) {
-            return .initAbs(.{ .stack = addr - stack_start });
+            return .initAbs(.{ .stack = addr - stack_start }, .{});
         } else {
-            return .initAbs(.{ .heap = addr });
+            return .initAbs(.{ .heap = addr }, .{});
         }
     }
 
-    pub fn alloc(self: *@This(), size: usize) Value {
-        _ = self;
-        _ = size;
-        return .void;
+    pub fn alloc(self: *@This(), allocator: Allocator, size: usize) !Value {
+        defer self.current_heap_addr += size;
+        for (self.current_heap_addr..self.current_heap_addr + size) |addr| {
+            try self.heap.put(allocator, addr, .void);
+        }
+        return .fromAddr(self.current_heap_addr);
     }
 };
 

@@ -654,6 +654,7 @@ pub const IRDebugger = struct {
             .skip_stdio => return self.skipStdio(),
             .trace => |trace| return self.handleTraceCommand(trace),
             .stack => return self.printStack(),
+            .heap => |heap| return self.printHeap(heap.addr, heap.len),
             .toggle_info_window => return self.toggleInfoWindow(),
         }
     }
@@ -1146,6 +1147,21 @@ pub const IRDebugger = struct {
         try self.printThreadInfoStack(window, thread);
     }
 
+    fn printHeap(
+        self: *IRDebugger,
+        addr: usize,
+        len: usize,
+    ) !RunningEvent {
+        try self.print("heap at 0x{x}+{}:\n", .{ addr, len });
+        for (0..len) |i| {
+            const a = i + addr;
+            const value = self.evaluator.context.shared.heap.get(a);
+            try self.print("\n0x{x}: {?f}", .{ a, value });
+        }
+        try self.writeAll("\n\n");
+        return .cont;
+    }
+
     const TermVector = struct {
         row: usize,
         col: usize,
@@ -1462,6 +1478,17 @@ pub const IRDebugger = struct {
             return self.commandUsage(.trace);
         }
 
+        if (std.mem.startsWith(u8, source, "heap ")) {
+            var it = std.mem.tokenizeAny(u8, source, " ,");
+            _ = it.next();
+            const addr_s = it.next() orelse return self.commandUsage(.heap);
+            const len_s = it.next() orelse return self.commandUsage(.heap);
+            const addr = std.fmt.parseInt(usize, addr_s, 16) catch return self.commandUsage(.heap);
+            const len = std.fmt.parseInt(usize, len_s, 10) catch return self.commandUsage(.heap);
+
+            return .{ .heap = .{ .addr = addr, .len = len } };
+        }
+
         try self.print("\nUnknown command \"{s}\".\n\n", .{source});
 
         return null;
@@ -1582,6 +1609,7 @@ const Command = union(enum) {
     skip_stdio,
     trace: TraceCommand,
     stack,
+    heap: HeapCommand,
     toggle_info_window,
 
     pub const BreakpointCommand = union(enum) {
@@ -1626,6 +1654,18 @@ const Command = union(enum) {
         }
     };
 
+    pub const HeapCommand = struct {
+        addr: usize,
+        len: usize,
+
+        pub fn format(
+            self: @This(),
+            writer: *std.Io.Writer,
+        ) std.Io.Writer.Error!void {
+            try writer.print("{} {}", .{ self.addr, self.len });
+        }
+    };
+
     pub fn equals(self: @This(), other: @This()) bool {
         return std.meta.activeTag(self) == std.meta.activeTag(other) and switch (self) {
             .breakpoint => |bp| std.meta.activeTag(bp) == std.meta.activeTag(other.breakpoint) and switch (bp) {
@@ -1657,6 +1697,7 @@ const Command = union(enum) {
             \\trace filter and <tags>
             \\trace filter or <tags>
             ,
+            .heap => "heap <addr> <len>",
         };
     }
 

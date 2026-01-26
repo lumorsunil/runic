@@ -8,23 +8,36 @@ const stack_start = ir.context.stack_start;
 pub const Location = struct {
     abs: LocationAbs,
     mod: ?LocationMod = null,
+    options: Options,
+
+    pub const Options = struct {
+        dereference: bool = false,
+    };
 
     pub const Error = error{UnsupportedAddrType};
 
-    pub fn init(abs: LocationAbs, mod: ?LocationMod) @This() {
-        return .{ .abs = abs, .mod = mod };
+    pub fn init(abs: LocationAbs, mod: ?LocationMod, options: Options) @This() {
+        return .{
+            .abs = abs,
+            .mod = mod,
+            .options = options,
+        };
     }
 
-    pub fn initAbs(abs: LocationAbs) @This() {
-        return .init(abs, null);
+    pub fn initRegister(reg: RegisterAbs) @This() {
+        return .init(.{ .register = reg }, null, .{});
     }
 
-    pub fn initAdd(abs: LocationAbs, x: usize) @This() {
-        return .init(abs, .{ .add = x });
+    pub fn initAbs(abs: LocationAbs, options: Options) @This() {
+        return .init(abs, null, options);
     }
 
-    pub fn initSub(abs: LocationAbs, x: usize) @This() {
-        return .init(abs, .{ .sub = x });
+    pub fn initAdd(abs: LocationAbs, x: usize, options: Options) @This() {
+        return .init(abs, .{ .add = x }, options);
+    }
+
+    pub fn initSub(abs: LocationAbs, x: usize, options: Options) @This() {
+        return .init(abs, .{ .sub = x }, options);
     }
 
     pub fn size() usize {
@@ -36,25 +49,40 @@ pub const Location = struct {
         return self.applyMod(abs);
     }
 
+    pub fn toAddrWithContext(self: @This(), stack_frame: usize) Error!usize {
+        const abs = try self.abs.toAddrWithContext(stack_frame);
+        return self.applyMod(abs);
+    }
+
     pub fn applyMod(self: @This(), x: usize) usize {
         return if (self.mod) |mod| mod.apply(x) else x;
+    }
+
+    pub fn dereference(self: @This()) @This() {
+        var clone = self;
+        clone.options.dereference = true;
+        return clone;
     }
 
     pub fn format(
         self: @This(),
         writer: *std.Io.Writer,
     ) std.Io.Writer.Error!void {
+        if (self.options.dereference) try writer.writeByte('[');
         if (self.mod) |mod| {
-            try writer.print("[{f} {f}]", .{ self.abs, mod });
+            try writer.print("{f}{f}", .{ self.abs, mod });
         } else {
             try writer.print("{f}", .{self.abs});
         }
+        if (self.options.dereference) try writer.writeByte(']');
     }
 };
 
 pub const LocationMod = union(enum) {
     add: usize,
     sub: usize,
+
+    pub const empty = LocationMod{ .add = 0 };
 
     pub fn apply(self: @This(), x: usize) usize {
         return switch (self) {
@@ -63,13 +91,33 @@ pub const LocationMod = union(enum) {
         };
     }
 
+    pub fn applyMaybe(self: ?@This(), x: usize) usize {
+        const mod = self orelse return x;
+        return mod.apply(x);
+    }
+
+    pub fn merge(self: ?@This(), other: ?@This()) @This() {
+        const o = other orelse return self;
+
+        return switch (self) {
+            .add => |x| switch (o) {
+                .add => |y| .{ .add = x + y },
+                .sub => |y| if (x > y) .{ .add = x - y } else .{ .sub = y - x },
+            },
+            .sub => |x| switch (o) {
+                .sub => |y| .{ .sub = x + y },
+                .add => |y| if (x < y) .{ .add = y - x } else .{ .sub = x - y },
+            },
+        };
+    }
+
     pub fn format(
         self: @This(),
         writer: *std.Io.Writer,
     ) std.Io.Writer.Error!void {
         switch (self) {
-            .add => |x| try writer.print("+ {}", .{x}),
-            .sub => |x| try writer.print("- {}", .{x}),
+            .add => |x| try writer.print("+{}", .{x}),
+            .sub => |x| try writer.print("-{}", .{x}),
         }
     }
 };
@@ -114,7 +162,6 @@ pub const Register = struct {
 
 pub const LocationAbs = union(enum) {
     ref: Ref,
-    scope: ScopeLocation,
     stack: usize,
     heap: usize,
     register: RegisterAbs,
@@ -145,7 +192,14 @@ pub const LocationAbs = union(enum) {
             .data => |data| data.page * page_size + data.addr,
             .stack => |stack| stack_start + stack,
             .heap => |heap| heap,
-            .ref, .instruction, .scope, .register => Location.Error.UnsupportedAddrType,
+            .ref, .instruction, .register => Location.Error.UnsupportedAddrType,
+        };
+    }
+
+    pub fn toAddrWithContext(self: @This(), stack_frame: usize) Location.Error!usize {
+        return switch (self) {
+            .ref => |ref| ref.rel_stack_addr + stack_frame,
+            else => self.toAddr(),
         };
     }
 
@@ -156,7 +210,6 @@ pub const LocationAbs = union(enum) {
     pub fn format(self: @This(), w: *std.Io.Writer) !void {
         switch (self) {
             .ref => |r| try w.print("{f}", .{r}),
-            .scope => |s| try w.print("@{s}", .{s}),
             .data => |d| try w.print("#{}:{}", .{ d.page, d.addr }),
             .stack => |s| try w.print("S{}", .{s}),
             .heap => |s| try w.print("H{}", .{s}),

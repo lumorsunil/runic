@@ -166,54 +166,103 @@ pub const IREvaluator = struct {
         return .init(addr.instr_set, abs);
     }
 
-    pub const ResolveValueError = ir.Location.Error || error{UnsupportedResolveValueType};
+    pub const DereferenceValueError = ir.Location.Error || error{UnsupportedDereferenceValueType};
 
-    fn resolveValue(
+    fn dereferenceValue(
         self: IREvaluator,
         thread: ir.context.IRThreadContext,
         value: ir.Value,
-    ) ResolveValueError!ir.Value {
+        mod: ?ir.LocationMod,
+    ) DereferenceValueError!*ir.Value {
         return switch (value) {
             .addr => |addr| {
                 const loc = self.context.mapAddr(addr);
                 return switch (loc.abs) {
-                    .data, .scope, .register, .ref => ResolveValueError.UnsupportedResolveValueType,
-                    .stack => |stack| thread.private.stack.items[stack],
-                    .heap => |heap| thread.shared.heap.get(heap).?,
-                    .instruction => value,
+                    .data, .register, .instruction, .ref => {
+                        std.log.err("Could not dereference location of type {t}", .{loc.abs});
+                        return DereferenceValueError.UnsupportedDereferenceValueType;
+                    },
+                    .stack => |stack| &thread.private.stack.items[ir.LocationMod.applyMaybe(mod, stack)],
+                    .heap => |heap| thread.shared.heap.getPtr(ir.LocationMod.applyMaybe(mod, heap)).?,
                 };
             },
-            .register => |reg| switch (reg.abs) {
-                .ic => ResolveValueError.UnsupportedResolveValueType,
-                .sf => .{ .uinteger = reg.applyMod(thread.private.stack_frame) },
-                .sc => .{ .uinteger = reg.applyMod(thread.private.stack.items.len) },
-                .r => thread.private.result_register,
+            // .register => |reg| switch (reg.abs) {
+            //     .ic => DereferenceValueError.UnsupportedDereferenceValueType,
+            //     .sf => .{ .uinteger = reg.applyMod(thread.private.stack_frame) },
+            //     .sc => .{ .uinteger = reg.applyMod(thread.private.stack.items.len) },
+            //     .r => thread.private.result_register,
+            // },
+            // .dereference => |der| self.resolveLocation(thread, .init(
+            //     .{ .register = der.register.abs },
+            //     der.register.mod,
+            // )),
+            else => {
+                std.log.err("Could not dereference value of type {t}", .{value});
+                return DereferenceValueError.UnsupportedDereferenceValueType;
             },
-            .dereference => |der| self.resolveLocation(thread, .init(
-                .{ .register = der.register.abs },
-                der.register.mod,
-            )),
-            else => value,
         };
     }
 
-    pub const ResolveLocationError = ResolveValueError || ir.Location.Error;
+    fn resolveValueSource(
+        self: IREvaluator,
+        thread: ir.context.IRThreadContext,
+        value_source: ir.ValueSource,
+    ) ResolveLocationError!ir.Value {
+        return switch (value_source) {
+            .location => |loc| self.resolveLocation(thread, loc),
+            .value => |value| value,
+        };
+    }
+
+    pub const ResolveLocationError = DereferenceValueError || ir.Location.Error;
 
     fn resolveLocation(
         self: IREvaluator,
         thread: ir.context.IRThreadContext,
         location: ir.Location,
     ) ResolveLocationError!ir.Value {
+        if (location.options.dereference) {
+            return (try self.dereferenceLocation(thread, location)).*;
+        } else {
+            switch (location.abs) {
+                .register => |r| switch (r) {
+                    .r => return thread.private.result_register,
+                    else => {},
+                },
+                else => {},
+            }
+
+            return .fromAddr(try location.toAddrWithContext(thread.private.stack_frame));
+        }
+    }
+
+    fn dereferenceLocation(
+        self: IREvaluator,
+        thread: ir.context.IRThreadContext,
+        location: ir.Location,
+    ) ResolveLocationError!*ir.Value {
         return switch (location.abs) {
-            .ref => |ref| thread.getRefPtr(ref).*,
-            .heap => thread.shared.heap.get(try location.toAddr()).?,
+            .ref => |ref| thread.getRefPtr(ref, location.mod),
             .register => |reg| switch (reg) {
-                .ic => ResolveValueError.UnsupportedResolveValueType,
-                .sf => .fromAddr(location.applyMod(thread.private.stack_frame)),
-                .sc => .fromAddr(location.applyMod(thread.private.stack.items.len)),
-                .r => thread.private.result_register,
+                .ic => DereferenceValueError.UnsupportedDereferenceValueType,
+                .sf => self.dereferenceValue(thread, .fromAddr(location.applyMod(thread.private.stack_frame)), null),
+                .sc => self.dereferenceValue(thread, .fromAddr(location.applyMod(thread.private.stack.items.len)), null),
+                .r => self.dereferenceValue(thread, thread.private.result_register, location.mod),
+                // .r => switch (thread.private.result_register) {
+                //     .dereference => |deref| .{ .dereference = deref.applyMod(
+                //         location.mod,
+                //     ) },
+                //     .register => |r| .{ .register = .{
+                //         .abs = r.abs,
+                //         .mod = ir.LocationMod.merge(
+                //             location.mod,
+                //             r.mod,
+                //         ),
+                //     } },
+                //     else => thread.private.result_register,
+                // },
             },
-            else => self.resolveValue(thread, .fromAddr(try location.toAddr())),
+            else => self.dereferenceValue(thread, .fromAddr(try location.toAddr()), null),
         };
     }
 
@@ -239,7 +288,7 @@ pub const IREvaluator = struct {
             .push => |push| {
                 try thread.private.stack.append(
                     self.allocator,
-                    try self.resolveValue(thread, push),
+                    try self.resolveValueSource(thread, push),
                 );
                 return .cont;
             },
@@ -341,7 +390,7 @@ pub const IREvaluator = struct {
                     return .cont_no_instr_counter_inc;
                 };
 
-                const cond_value = try self.resolveValue(thread, cond);
+                const cond_value = try self.resolveValueSource(thread, cond);
 
                 if (cond_value.exit_code.toBoolean() == jmp.jump_if) {
                     thread.setInstructionCounter(dest);
@@ -357,34 +406,77 @@ pub const IREvaluator = struct {
                 return .cont;
             },
             .set => |set| {
-                return switch (set.location.abs) {
+                const source = try self.resolveValueSource(thread, set.source);
+
+                return switch (set.destination.abs) {
                     .data => Error.SetImmutableLocation,
-                    .scope => Error.UnsupportedInstruction,
                     .instruction => Error.SetInstructionLocation,
                     .ref => |ref| {
-                        thread.setRef(ref, set.value);
+                        var dest = thread.getRefPtr(ref, set.destination.mod);
+                        if (set.destination.options.dereference) {
+                            dest = try self.dereferenceValue(thread, dest.*, null);
+                        }
+                        dest.* = source;
                         return .cont;
                     },
                     .stack => |stack| {
-                        thread.private.stack.items[stack] = set.value;
+                        const addr = set.destination.applyMod(stack);
+                        var dest = &thread.private.stack.items[addr];
+                        if (set.destination.options.dereference) {
+                            dest = try self.dereferenceValue(thread, dest.*, null);
+                        }
+                        dest.* = source;
                         return .cont;
                     },
                     .heap => |heap| {
-                        const value = thread.shared.heap.getPtr(heap).?;
-                        value.* = set.value;
+                        const addr = set.destination.applyMod(heap);
+                        var dest = thread.shared.heap.getPtr(addr).?;
+                        if (set.destination.options.dereference) {
+                            dest = try self.dereferenceValue(thread, dest.*, null);
+                        }
+                        dest.* = source;
                         return .cont;
                     },
                     .register => |reg| {
                         try switch (reg) {
                             .ic => Error.UnsupportedInstruction,
-                            .sf => thread.private.stack_frame = set.location.applyMod(
-                                (try self.resolveValue(thread, set.value)).uinteger,
-                            ),
-                            .sc => thread.private.stack.resize(
-                                self.allocator,
-                                set.value.uinteger,
-                            ),
-                            .r => thread.private.result_register = set.value,
+                            .sf => {
+                                if (set.destination.options.dereference) {
+                                    const addr = set.destination.applyMod(thread.private.stack_frame);
+                                    var dest = &thread.private.stack.items[addr];
+                                    if (set.destination.options.dereference) {
+                                        dest = try self.dereferenceValue(thread, dest.*, null);
+                                    }
+                                    dest.* = source;
+                                } else {
+                                    thread.private.stack_frame = source.addr;
+                                }
+                            },
+                            .sc => {
+                                if (set.destination.options.dereference) {
+                                    const addr = set.destination.applyMod(thread.private.stack.items.len);
+                                    var dest = &thread.private.stack.items[addr];
+                                    if (set.destination.options.dereference) {
+                                        dest = try self.dereferenceValue(thread, dest.*, null);
+                                    }
+                                    dest.* = source;
+                                } else {
+                                    try thread.private.stack.resize(
+                                        self.allocator,
+                                        source.addr,
+                                    );
+                                }
+                            },
+                            .r => {
+                                var dest = &thread.private.result_register;
+                                if (set.destination.options.dereference) {
+                                    dest = try self.dereferenceValue(thread, dest.*, set.destination.mod);
+                                }
+                                dest.* = source;
+                            },
+                            // .r => if (set.location.mod) |mod| break: brk {
+                            //     const loc = try self.resolveLocation(thread, .init(.{ .register = .r }, mod),);
+                            // } else thread.private.result_register = set.value,
                         };
 
                         return .cont;
@@ -395,14 +487,14 @@ pub const IREvaluator = struct {
                 const pipe = try Stream(u8).initReaderWriter(self.allocator, "pipe", .{}, self.config.tracer);
                 const pipe_handle = try self.context.addPipe(pipe);
 
-                thread.setRef(instr_pipe.result.abs.ref, .{ .pipe = pipe_handle });
+                try self.setLocation(thread, instr_pipe.result, .{ .pipe = pipe_handle });
 
                 return .cont;
             },
             .pipe_opt => |pipe_opt| {
                 const pipe_handle = (try self.resolveLocation(thread, pipe_opt.handle)).pipe;
                 const pipe = self.context.getPipe(pipe_handle);
-                const value = try self.resolveValue(thread, pipe_opt.value);
+                const value = try self.resolveValueSource(thread, pipe_opt.source);
 
                 switch (pipe_opt.option) {
                     inline else => |t| @field(
@@ -496,14 +588,14 @@ pub const IREvaluator = struct {
                 };
             },
             .alloc => |size| {
-                thread.private.result_register = thread.shared.alloc(size);
+                thread.private.result_register = try thread.shared.alloc(self.allocator, size);
                 return .cont;
             },
             .ath => |ath| {
-                const left = try self.resolveValue(thread, ath.a);
-                const right = try self.resolveValue(thread, ath.b);
+                const left = try self.resolveValueSource(thread, ath.a);
+                const right = try self.resolveValueSource(thread, ath.b);
 
-                if (evaluateArithmetic(ath.op, left, right)) |result| {
+                if (evaluateArithmetic(ath.op, .from(left), .from(right))) |result| {
                     try self.setLocation(thread, ath.result, result);
                 } else {
                     return Error.UnsupportedBinaryExpression;
@@ -512,12 +604,12 @@ pub const IREvaluator = struct {
                 return .cont;
             },
             .log => |log_expr| {
-                const left = try self.resolveValue(thread, log_expr.a);
+                const left = try self.resolveValueSource(thread, log_expr.a);
 
-                if (evaluateLogical(log_expr.op, left)) |result| {
+                if (evaluateLogical(log_expr.op, .from(left))) |result| {
                     try self.setLocation(thread, log_expr.result, switch (result) {
                         .left => left,
-                        .right => try self.resolveValue(thread, log_expr.b),
+                        .right => try self.resolveValueSource(thread, log_expr.b),
                     });
                 } else {
                     return Error.UnsupportedBinaryExpression;
@@ -526,10 +618,10 @@ pub const IREvaluator = struct {
                 return .cont;
             },
             .cmp => |cmp| {
-                const left = try self.resolveValue(thread, cmp.a);
-                const right = try self.resolveValue(thread, cmp.b);
+                const left = try self.resolveValueSource(thread, cmp.a);
+                const right = try self.resolveValueSource(thread, cmp.b);
 
-                if (evaluateCompare(cmp.op, left, right)) |result| {
+                if (evaluateCompare(cmp.op, .from(left), .from(right))) |result| {
                     try self.setLocation(thread, cmp.result, result);
                 } else {
                     return Error.UnsupportedBinaryExpression;
@@ -551,65 +643,65 @@ pub const IREvaluator = struct {
         _ = self;
 
         switch (loc.abs) {
-            .ref => |ref| thread.setRef(ref, value),
+            .ref => |ref| thread.setRef(ref, loc.mod, value),
             else => return Error.UnsupportedInstruction,
         }
     }
 
     pub fn evaluateArithmetic(
         op: ir.Instruction.AthOp,
-        left: ir.Value,
-        right: ir.Value,
+        left: ir.ValueSource,
+        right: ir.ValueSource,
     ) ?ir.Value {
         switch (op) {
             .add => {
-                if (left == .uinteger and right == .uinteger) {
-                    return .{ .uinteger = left.uinteger +| right.uinteger };
-                } else if (left == .float and right == .float) {
-                    return .{ .float = left.float + right.float };
-                } else if (left == .uinteger and right == .float) {
-                    const float_left: f64 = @floatFromInt(left.uinteger);
-                    return .{ .float = float_left + right.float };
-                } else if (left == .float and right == .uinteger) {
-                    const float_right: f64 = @floatFromInt(right.uinteger);
-                    return .{ .float = left.float + float_right };
+                if (left.isValueTag(.uinteger) and right.isValueTag(.uinteger)) {
+                    return .{ .uinteger = left.value.uinteger +| right.value.uinteger };
+                } else if (left.isValueTag(.float) and right.isValueTag(.float)) {
+                    return .{ .float = left.value.float + right.value.float };
+                } else if (left.isValueTag(.uinteger) and right.isValueTag(.float)) {
+                    const float_left: f64 = @floatFromInt(left.value.uinteger);
+                    return .{ .float = float_left + right.value.float };
+                } else if (left.isValueTag(.float) and right.isValueTag(.uinteger)) {
+                    const float_right: f64 = @floatFromInt(right.value.uinteger);
+                    return .{ .float = left.value.float + float_right };
                 }
             },
             .sub => {
-                if (left == .uinteger and right == .uinteger) {
-                    return .{ .uinteger = left.uinteger -| right.uinteger };
-                } else if (left == .float and right == .float) {
-                    return .{ .float = left.float - right.float };
-                } else if (left == .uinteger and right == .float) {
-                    const float_left: f64 = @floatFromInt(left.uinteger);
-                    return .{ .float = float_left - right.float };
-                } else if (left == .float and right == .uinteger) {
-                    const float_right: f64 = @floatFromInt(right.uinteger);
-                    return .{ .float = left.float - float_right };
+                if (left.isValueTag(.uinteger) and right.isValueTag(.uinteger)) {
+                    return .{ .uinteger = left.value.uinteger -| right.value.uinteger };
+                } else if (left.isValueTag(.float) and right.isValueTag(.float)) {
+                    return .{ .float = left.value.float - right.value.float };
+                } else if (left.isValueTag(.uinteger) and right.isValueTag(.float)) {
+                    const float_left: f64 = @floatFromInt(left.value.uinteger);
+                    return .{ .float = float_left - right.value.float };
+                } else if (left.isValueTag(.float) and right.isValueTag(.uinteger)) {
+                    const float_right: f64 = @floatFromInt(right.value.uinteger);
+                    return .{ .float = left.value.float - float_right };
                 }
             },
             .mul => {
-                if (left == .uinteger and right == .uinteger) {
-                    return .{ .uinteger = left.uinteger *| right.uinteger };
-                } else if (left == .float and right == .float) {
-                    return .{ .float = left.float * right.float };
-                } else if (left == .uinteger and right == .float) {
-                    const float_left: f64 = @floatFromInt(left.uinteger);
-                    return .{ .float = float_left * right.float };
-                } else if (left == .float and right == .uinteger) {
-                    const float_right: f64 = @floatFromInt(right.uinteger);
-                    return .{ .float = left.float * float_right };
+                if (left.isValueTag(.uinteger) and right.isValueTag(.uinteger)) {
+                    return .{ .uinteger = left.value.uinteger *| right.value.uinteger };
+                } else if (left.isValueTag(.float) and right.isValueTag(.float)) {
+                    return .{ .float = left.value.float * right.value.float };
+                } else if (left.isValueTag(.uinteger) and right.isValueTag(.float)) {
+                    const float_left: f64 = @floatFromInt(left.value.uinteger);
+                    return .{ .float = float_left * right.value.float };
+                } else if (left.isValueTag(.float) and right.isValueTag(.uinteger)) {
+                    const float_right: f64 = @floatFromInt(right.value.uinteger);
+                    return .{ .float = left.value.float * float_right };
                 }
             },
             .div => {
-                const float_left: f64 = if (left == .uinteger) @floatFromInt(left.uinteger) else if (left == .float) left.float else return null;
-                const float_right: f64 = if (right == .uinteger) @floatFromInt(right.uinteger) else if (right == .float) right.float else return null;
+                const float_left: f64 = if (left.isValueTag(.uinteger)) @floatFromInt(left.value.uinteger) else if (left.isValueTag(.float)) left.value.float else return null;
+                const float_right: f64 = if (right.isValueTag(.uinteger)) @floatFromInt(right.value.uinteger) else if (right.isValueTag(.float)) right.value.float else return null;
 
                 return .{ .float = float_left / float_right };
             },
             .mod => {
-                const float_left: f64 = if (left == .uinteger) @floatFromInt(left.uinteger) else if (left == .float) left.float else return null;
-                const float_right: f64 = if (right == .uinteger) @floatFromInt(right.uinteger) else if (right == .float) right.float else return null;
+                const float_left: f64 = if (left.isValueTag(.uinteger)) @floatFromInt(left.value.uinteger) else if (left.isValueTag(.float)) left.value.float else return null;
+                const float_right: f64 = if (right.isValueTag(.uinteger)) @floatFromInt(right.value.uinteger) else if (right.isValueTag(.float)) right.value.float else return null;
 
                 return .{ .float = @mod(float_left, float_right) };
             },
@@ -622,18 +714,18 @@ pub const IREvaluator = struct {
 
     pub fn evaluateLogical(
         op: ir.Instruction.LogOp,
-        left: ir.Value,
+        left: ir.ValueSource,
     ) ?EvaluateLogicalResult {
         switch (op) {
             .nd => {
-                if (left == .exit_code) {
-                    if (left.exit_code == .success) return .right;
+                if (left.isValueTag(.exit_code)) {
+                    if (left.value.exit_code == .success) return .right;
                     return .left;
                 }
             },
             .r => {
-                if (left == .exit_code) {
-                    if (left.exit_code == .success) return .left;
+                if (left.isValueTag(.exit_code)) {
+                    if (left.value.exit_code == .success) return .left;
                     return .right;
                 }
             },
@@ -644,8 +736,8 @@ pub const IREvaluator = struct {
 
     pub fn evaluateCompare(
         op: ir.Instruction.CmpOp,
-        left: ir.Value,
-        right: ir.Value,
+        left: ir.ValueSource,
+        right: ir.ValueSource,
     ) ?ir.Value {
         return switch (op) {
             .gt => {
@@ -690,7 +782,7 @@ pub const IREvaluator = struct {
     pub const MaterializeStringError =
         Allocator.Error ||
         GetSliceError ||
-        ResolveValueError ||
+        DereferenceValueError ||
         std.Io.Writer.Error ||
         error{UnsupportedType};
 
@@ -700,12 +792,17 @@ pub const IREvaluator = struct {
         value: ir.Value,
         w: *std.Io.Writer,
     ) MaterializeStringError!void {
-        const resolvedValue = try self.resolveValue(thread, value);
+        // const resolvedValue = try self.dereferenceValue(thread, value);
 
-        switch (resolvedValue) {
+        switch (value) {
             .stream => |stream| for (0..stream.len) |i| {
                 const stream_value = thread.shared.heap.get(i + stream.addr).?;
                 try self.materializeString(thread, stream_value, w);
+            },
+            .executable => |executable| {
+                if (executable.element_size != 1) return MaterializeStringError.UnsupportedType;
+                const string = try self.getSlice(executable);
+                try w.writeAll(string);
             },
             .slice => |slice| {
                 if (slice.element_size != 1) return MaterializeStringError.UnsupportedType;
@@ -713,9 +810,22 @@ pub const IREvaluator = struct {
                 try w.writeAll(string);
             },
             inline .uinteger, .float => |t| try w.print("{}", .{t}),
-            inline .addr => |t| try w.print("0x{x}", .{t}),
+            inline .addr => |addr| {
+                const loc = self.context.mapAddr(addr);
+                switch (loc.abs) {
+                    .heap => |heap_addr| {
+                        // assume this is pointing to a slice on the heap
+                        const len = thread.shared.heap.get(heap_addr).?.uinteger;
+                        for (0..len) |i| {
+                            const slice_element = thread.shared.heap.get(heap_addr + i + 1).?;
+                            try self.materializeString(thread, slice_element, w);
+                        }
+                    },
+                    else => try w.print("{f}", .{loc}),
+                }
+            },
             inline .exit_code => |t| try w.print("{f}", .{t}),
-            .void, .strct, .pipe, .thread, .closeable, .fn_ref, .register, .dereference => {},
+            .void, .strct, .pipe, .thread, .closeable, .fn_ref => {},
         }
     }
 };
