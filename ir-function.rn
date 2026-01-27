@@ -5,4 +5,5 @@ fn Void hello() Void {
   echo "hello"
 }
 
-hello | grep "hello"
+hello
+// hello | grep "hello"

@@ -140,6 +140,7 @@ pub const IREvaluator = struct {
 
     fn getSlice(self: IREvaluator, slice: ir.Value.Slice) GetSliceError![]const u8 {
         self.log("getSlice: {any}", .{slice});
+        if (slice.len == 0) return "";
         // TODO: support addr mod?
         return switch (self.context.mapAddr(slice.addr).abs) {
             .data => |data| data.get(

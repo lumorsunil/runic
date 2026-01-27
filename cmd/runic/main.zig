@@ -5,6 +5,10 @@ const runic = @import("runic");
 const PipeReader = runic.process.PipeReader;
 const signals = runic.signals;
 
+pub const std_options = std.Options{
+    .logFn = log,
+};
+
 pub fn main() !void {
     signals.init(std.heap.page_allocator);
     const exit_code = mainImpl() catch |err| {
@@ -115,4 +119,16 @@ fn restoreTermios(termios: std.posix.termios) !void {
     if (!is_tty) return;
     if (@import("builtin").os.tag != .linux) return;
     try std.posix.tcsetattr(stdin.handle, .FLUSH, termios);
+}
+
+pub fn log(
+    comptime _: std.log.Level,
+    comptime _: @Type(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    var buffer: [64]u8 = undefined;
+    const stderr = std.debug.lockStderrWriter(&buffer);
+    defer std.debug.unlockStderrWriter();
+    nosuspend stderr.print(format ++ "\n", args) catch return;
 }

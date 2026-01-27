@@ -427,11 +427,13 @@ pub const IRCompiler = struct {
     }
 
     // If you change this, make sure to fix the std...StreamSet functions as well
+    /// assumes that we always have stdin, stdout and stderr as the first three things on the stack
     pub fn addInstructionSet(self: *@This()) Error!usize {
         const new_instr_set = try self.addInstructionSetNoPushFrame();
         const orig_instr_set = self.current_instruction_set;
         self.current_instruction_set = new_instr_set;
         try self.pushFrameNoInstructions();
+        self.currentFrame().rel_stack_counter += 3;
         self.current_instruction_set = orig_instr_set;
         return new_instr_set;
     }
@@ -633,13 +635,15 @@ pub const IRCompiler = struct {
             stderr,
         )));
 
-        const orig_instr_set = self.current_instruction_set;
-        self.current_instruction_set = dest.instr_set;
-
-        // TODO: issue here when we are forking multiple times to the same set since the frame is connected to the set and not the thread, the rel_stack_counter will point to the wrong place in the stack
-        self.currentFrame().rel_stack_counter += 3;
-
-        self.current_instruction_set = orig_instr_set;
+        // Moved this logic to addInstructionSet, all sets now are assumed to be called using forks
+        //
+        // const orig_instr_set = self.current_instruction_set;
+        // self.current_instruction_set = dest.instr_set;
+        //
+        // // TODO: issue here when we are forking multiple times to the same set since the frame is connected to the set and not the thread, the rel_stack_counter will point to the wrong place in the stack
+        // self.currentFrame().rel_stack_counter += 3;
+        //
+        // self.current_instruction_set = orig_instr_set;
 
         return .initAbs(.{ .register = .r }, .{});
     }

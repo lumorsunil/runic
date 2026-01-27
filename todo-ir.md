@@ -46,6 +46,7 @@
 - [x] address mapping
 - [x] basic executable calls
 - [x] if else
+- [ ] for loops
 - [x] read-only data
 - [x] instructions
 - [x] labels

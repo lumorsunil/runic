@@ -1,6 +1,11 @@
 const s = "hello"
 echo "${s}, world!"
 
+const p = ", world!"
+echo "${s}${p}"
+
+echo "${s}${", world!"}"
+
 // Readonly
 // helloecho, world!
 
