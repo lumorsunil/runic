@@ -1,45 +1,10 @@
-const s = "hello"
-echo "${s}, world!"
+const s = "w${"o"}rld!"
+const x = "hello, ${s}"
+echo "${x}"
 
-const p = ", world!"
-echo "${s}${p}"
+{
+  const y = "from block ${"thread"}"
 
-echo "${s}${", world!"}"
-
-// Readonly
-// helloecho, world!
-
-
-// stack_frame
-// ref "string_literal"
-// alloc 2
-// set [@@string_literal] %r       # string_literal = slice.addr
-// push 2        # slice.len
-//
-// result = compile 1st element ->
-//   if (result == %r)
-//     ref "segment_result"
-//     set [@@segment_result] %r
-//     result = [@@segment_result]
-//
-// set %r [@@string_literal] # %r = slice.addr
-// set [%r+0] result                 # %r.* = result OR slice.addr.* = result
-// if (result was originally %r)
-//   pop
-//
-// result = compile 2nd element ->
-//   if (result == %r)
-//     ref "segment_result"
-//     set [@@segment_result] %r
-//     result = [@@segment_result]
-//
-// set %r [@@string_literal] # %r = slice.addr
-// set [%r+1] result         # %r[1] = result
-// if (result was originally %r)
-//   pop
-//
-// push @@string_literal   # push &string_literal
-// push "echo"
-// push 1
-// exec
-// pop frame
+  // echo "${"${x}"} (from block): ${y}"
+  echo "${x} (${y})"
+}

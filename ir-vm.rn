@@ -1,0 +1,27 @@
+// program
+//   shared
+//     read-only memory (literal strings/comptime known stuff etc)
+//     heap
+//     instructions
+
+// thread
+//   private
+//     registers
+//     stack
+
+
+// set 0xFFFF0000 1
+//   mapAddr(0xFFFF0000) -> Stack(0)
+
+
+// Memory Layout
+// 0x00000000-0x000000FF read-only memory
+// 0x00000100-0xFFFEFFFF heap
+// 0xFFFF0000-0xFFFFFFFF stack
+
+fn Void hello() Void {
+  sleep "2"
+  echo "hello"
+}
+
+hello &

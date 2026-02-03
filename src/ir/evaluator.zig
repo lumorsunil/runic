@@ -179,7 +179,7 @@ pub const IREvaluator = struct {
             .addr => |addr| {
                 const loc = self.context.mapAddr(addr);
                 return switch (loc.abs) {
-                    .data, .register, .instruction, .ref => {
+                    .data, .register, .instruction, .ref, .closure => {
                         std.log.err("Could not dereference location of type {t}", .{loc.abs});
                         return DereferenceValueError.UnsupportedDereferenceValueType;
                     },
@@ -222,7 +222,9 @@ pub const IREvaluator = struct {
         thread: ir.context.IRThreadContext,
         location: ir.Location,
     ) ResolveLocationError!ir.Value {
-        if (location.options.dereference) {
+        if (location.isNoll()) {
+            return .fromAddr(0);
+        } else if (location.options.dereference) {
             return (try self.dereferenceLocation(thread, location)).*;
         } else {
             switch (location.abs) {
@@ -233,7 +235,10 @@ pub const IREvaluator = struct {
                 else => {},
             }
 
-            return .fromAddr(try location.toAddrWithContext(thread.private.stack_frame));
+            return .fromAddr(try location.toAddrWithContext(
+                thread.private.stack_frame,
+                thread.private.stack.items[3].addr,
+            ));
         }
     }
 
@@ -263,7 +268,10 @@ pub const IREvaluator = struct {
                 //     else => thread.private.result_register,
                 // },
             },
-            else => self.dereferenceValue(thread, .fromAddr(try location.toAddr()), null),
+            else => self.dereferenceValue(thread, .fromAddr(try location.toAddrWithContext(
+                thread.private.stack_frame,
+                thread.private.stack.items[3].addr,
+            )), null),
         };
     }
 
@@ -283,6 +291,7 @@ pub const IREvaluator = struct {
                 try thread.private.stack.append(self.allocator, .{ .pipe = stdin });
                 try thread.private.stack.append(self.allocator, .{ .pipe = stdout });
                 try thread.private.stack.append(self.allocator, .{ .pipe = stderr });
+                try thread.private.stack.append(self.allocator, .{ .addr = 0 }); // not used, here for compatibility reasons
 
                 return .cont;
             },
@@ -438,6 +447,15 @@ pub const IREvaluator = struct {
                         dest.* = source;
                         return .cont;
                     },
+                    .closure => {
+                        const addr = set.destination.applyMod(thread.private.stack.items[3].addr);
+                        var dest = thread.shared.heap.getPtr(addr).?;
+                        if (set.destination.options.dereference) {
+                            dest = try self.dereferenceValue(thread, dest.*, null);
+                        }
+                        dest.* = source;
+                        return .cont;
+                    },
                     .register => |reg| {
                         try switch (reg) {
                             .ic => Error.UnsupportedInstruction,
@@ -548,6 +566,10 @@ pub const IREvaluator = struct {
                 try new_thread.private.stack.append(
                     self.allocator,
                     try self.resolveLocation(thread, fork.stderr),
+                );
+                try new_thread.private.stack.append(
+                    self.allocator,
+                    try self.resolveLocation(thread, fork.closure),
                 );
 
                 return .cont;

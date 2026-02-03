@@ -113,12 +113,14 @@ pub const Instruction = struct {
             stdin: Location,
             stdout: Location,
             stderr: Location,
+            closure: Location,
         ) @This() {
             return .{ .fork = .{
                 .dest = dest,
                 .stdin = stdin,
                 .stdout = stdout,
                 .stderr = stderr,
+                .closure = closure,
             } };
         }
 
@@ -377,9 +379,10 @@ pub const Instruction = struct {
         stdin: Location,
         stdout: Location,
         stderr: Location,
+        closure: Location,
 
         pub fn format(self: @This(), w: *std.Io.Writer) !void {
-            try w.print("{f} {f} {f} {f}", .{ self.dest, self.stdin, self.stdout, self.stderr });
+            try w.print("{f} {f} {f} {f} {f}", .{ self.dest, self.stdin, self.stdout, self.stderr, self.closure });
         }
     };
 

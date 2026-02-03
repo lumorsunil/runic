@@ -43,6 +43,11 @@
 
 ## compiler
 
+- [x] sharing bindings between scopes/threads
+  - [x] each thread has it's own closure
+  - [x] closure-relative addresses
+  - [x] shared binding for deeply nested closures
+  - [ ] mutable variables
 - [x] address mapping
 - [x] basic executable calls
 - [x] if else

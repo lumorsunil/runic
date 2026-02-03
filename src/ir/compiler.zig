@@ -190,8 +190,22 @@ pub const IRData = struct {
 const Scope = struct {
     frames: std.ArrayList(Frame) = .empty,
 
-    pub const Frame = union(enum) {
-        bindings: std.StringArrayHashMapUnmanaged(Binding),
+    pub const Frame = struct {
+        bindings: std.StringArrayHashMapUnmanaged(Binding) = .empty,
+        closure: std.ArrayList(ast.Identifier) = .empty,
+
+        pub fn declare(
+            self: *Frame,
+            allocator: Allocator,
+            name: []const u8,
+            result: Result,
+            is_mutable: bool,
+        ) Error!void {
+            return self.bindings.put(allocator, name, .{
+                .is_mutable = is_mutable,
+                .result = result,
+            });
+        }
     };
 
     pub const Binding = struct {
@@ -203,30 +217,22 @@ const Scope = struct {
         return .{};
     }
 
-    pub fn pushBindings(self: *Scope, allocator: Allocator) !void {
-        return self.frames.append(allocator, .{ .bindings = .empty });
+    pub fn push(self: *Scope, allocator: Allocator) !void {
+        return self.frames.append(allocator, .{});
     }
 
-    pub fn popFrame(self: *Scope) void {
+    pub fn pop(self: *Scope) void {
         _ = self.frames.pop();
     }
 
-    pub fn getFrameByTag(
+    pub fn getFrame(
         self: *Scope,
-        tag: std.meta.Tag(Frame),
-        start_depth: usize,
-    ) GetFrameError!?struct { usize, *Frame } {
-        if (start_depth >= self.frames.items.len) return Error.FrameStartDepthTooHigh;
-        for (start_depth..self.frames.items.len) |i| {
-            const index = self.frames.items.len - 1 - i;
-            const frame = &self.frames.items[index];
-
-            if (frame.* == tag) {
-                return .{ i, frame };
-            }
-        }
-
-        return null;
+        depth: usize,
+    ) GetFrameError!*Frame {
+        if (depth >= self.frames.items.len) return Error.FrameStartDepthTooHigh;
+        const index = self.frames.items.len - 1 - depth;
+        const frame = &self.frames.items[index];
+        return frame;
     }
 
     pub fn declare(
@@ -236,21 +242,29 @@ const Scope = struct {
         result: Result,
         is_mutable: bool,
     ) Error!void {
-        _, const frame = try self.getFrameByTag(.bindings, 0) orelse return Error.ScopeNotFound;
-        return frame.bindings.put(allocator, name, .{ .is_mutable = is_mutable, .result = result });
+        const frame = try self.getFrame(0);
+        return frame.declare(allocator, name, result, is_mutable);
     }
 
-    pub fn lookup(self: *Scope, name: []const u8) ?*Binding {
-        var depth: usize = 0;
+    pub const LookupOptions = struct {
+        shallow: bool = false,
+        initial_depth: usize = 0,
+    };
+
+    pub fn lookup(self: *Scope, name: []const u8, options: LookupOptions) ?*Binding {
+        var depth: usize = options.initial_depth;
         while (true) {
-            const new_depth, const frame = self.getFrameByTag(
-                .bindings,
-                depth,
-            ) catch |err| switch (err) {
+            const frame = self.getFrame(depth) catch |err| switch (err) {
                 GetFrameError.FrameStartDepthTooHigh => return null,
-            } orelse return null;
-            depth = new_depth + 1;
-            return frame.bindings.getPtr(name) orelse continue;
+            };
+            depth += 1;
+            return frame.bindings.getPtr(name) orelse {
+                if (options.shallow) {
+                    return null;
+                } else {
+                    continue;
+                }
+            };
         }
     }
 };
@@ -269,6 +283,10 @@ const InstructionSet = struct {
 
     pub fn add(self: *@This(), allocator: Allocator, instruction: ir.Instruction) Allocator.Error!void {
         try self.instructions.append(allocator, instruction);
+    }
+
+    pub fn insertSlice(self: *@This(), allocator: Allocator, index: usize, instructions: []ir.Instruction) Allocator.Error!void {
+        try self.instructions.insertSlice(allocator, index, instructions);
     }
 
     pub fn toOwnedSlice(self: *@This(), allocator: Allocator) Allocator.Error![]ir.Instruction {
@@ -433,7 +451,7 @@ pub const IRCompiler = struct {
         const orig_instr_set = self.current_instruction_set;
         self.current_instruction_set = new_instr_set;
         try self.pushFrameNoInstructions();
-        self.currentFrame().rel_stack_counter += 3;
+        self.currentFrame().rel_stack_counter += 4;
         self.current_instruction_set = orig_instr_set;
         return new_instr_set;
     }
@@ -516,8 +534,12 @@ pub const IRCompiler = struct {
         return self.scopes.declare(self.allocator, name, result, is_mutable);
     }
 
-    pub fn lookup(self: *IRCompiler, name: []const u8) ?*Scope.Binding {
-        return self.scopes.lookup(name);
+    pub fn lookup(
+        self: *IRCompiler,
+        name: []const u8,
+        options: Scope.LookupOptions,
+    ) ?*Scope.Binding {
+        return self.scopes.lookup(name, options);
     }
 
     pub fn push(
@@ -627,12 +649,14 @@ pub const IRCompiler = struct {
         stdin: ir.Location,
         stdout: ir.Location,
         stderr: ir.Location,
+        closure: ir.Location,
     ) Error!ir.Location {
         try self.addInstruction(.init(.from(source), .fork_(
             dest,
             stdin,
             stdout,
             stderr,
+            closure,
         )));
 
         // Moved this logic to addInstructionSet, all sets now are assumed to be called using forks
@@ -652,6 +676,7 @@ pub const IRCompiler = struct {
         self: *IRCompiler,
         source: anytype,
         dest: ir.InstructionAddr,
+        closure: ir.Location,
     ) Error!ir.Location {
         return try self.fork(
             source,
@@ -659,6 +684,7 @@ pub const IRCompiler = struct {
             self.threadStdin(),
             self.threadStdout(),
             self.threadStderr(),
+            closure,
         );
     }
 
@@ -725,8 +751,8 @@ pub const IRCompiler = struct {
     pub fn compile(self: *IRCompiler) Error!CompilationResult {
         self.current_instruction_set = try self.addInstructionSetNoPushFrame();
 
-        try self.scopes.pushBindings(self.allocator);
-        defer self.scopes.popFrame();
+        try self.scopes.push(self.allocator);
+        defer self.scopes.pop();
 
         try self.compileInitial();
 
@@ -746,7 +772,7 @@ pub const IRCompiler = struct {
     fn compileInitial(self: *@This()) Error!void {
         try self.pushFrameNoInstructions();
         try self.addInstruction(.init(null, .fwd_stdio));
-        self.currentFrame().rel_stack_counter += 3;
+        self.currentFrame().rel_stack_counter += 4;
 
         const stdin_set = try self.addInstructionSet();
         const stdout_set = try self.addInstructionSet();
@@ -765,9 +791,9 @@ pub const IRCompiler = struct {
 
         self.current_instruction_set = prev_instr_set;
 
-        _ = try self.fork(null, .initAbs(stdin_set, 0), self.threadStdin(), self.threadStdout(), self.threadStderr());
-        _ = try self.fork(null, .initAbs(stdout_set, 0), self.threadStdin(), self.threadStdout(), self.threadStderr());
-        _ = try self.fork(null, .initAbs(stderr_set, 0), self.threadStdin(), self.threadStdout(), self.threadStderr());
+        _ = try self.fork(null, .initAbs(stdin_set, 0), self.threadStdin(), self.threadStdout(), self.threadStderr(), .noll);
+        _ = try self.fork(null, .initAbs(stdout_set, 0), self.threadStdin(), self.threadStdout(), self.threadStderr(), .noll);
+        _ = try self.fork(null, .initAbs(stderr_set, 0), self.threadStdin(), self.threadStdout(), self.threadStderr(), .noll);
     }
 
     fn compileStatement(
@@ -838,7 +864,13 @@ pub const IRCompiler = struct {
                 return .fromValue(.void);
             },
             .identifier => |identifier| {
-                const result = try self.compileExpression(expr);
+                var result = try self.compileExpression(expr);
+                // TODO: mutability
+                if (result.source.isRegister(.r)) {
+                    const result_ref = try self.newRef(source, "identifier_ref");
+                    try self.set(source, result_ref, .fromLocation(.initRegister(.r)));
+                    result = try .from(result_ref.dereference());
+                }
                 try self.scopes.declare(
                     self.allocator,
                     identifier.name,
@@ -971,15 +1003,47 @@ pub const IRCompiler = struct {
         return .{ .float = try std.fmt.parseFloat(f64, text) };
     }
 
+    fn declareClosureValue(
+        self: *IRCompiler,
+        identifier: ast.Identifier,
+        depth: usize,
+    ) Error!ir.Location {
+        const frame = try self.scopes.getFrame(depth);
+        const index = frame.closure.items.len;
+        try frame.closure.append(self.allocator, identifier);
+        // TODO: issue here when referencing binding in inner scope, it refers to the heap location of the closure, but we can't then index into it or dereference it without extension to the location mechanism
+        const location: ir.Location = .initAdd(.closure, index, .{ .dereference = true });
+        try frame.declare(
+            self.allocator,
+            identifier.name,
+            try .from(location),
+            true,
+        );
+
+        return location;
+    }
+
     fn compileIdentifier(
         self: *IRCompiler,
         identifier: ast.Identifier,
     ) Error!Result {
-        const binding = self.lookup(identifier.name) orelse {
+        _ = self.lookup(identifier.name, .{ .shallow = false }) orelse {
             const executable = try self.addSlice(1, identifier.name);
             return .fromValue(.{ .executable = executable.slice });
         };
-        return binding.result;
+
+        if (self.lookup(identifier.name, .{ .shallow = true })) |local_binding| {
+            return local_binding.result;
+        }
+
+        const closure_value_location = try self.declareClosureValue(identifier, 0);
+
+        var i: usize = 1;
+        while (self.lookup(identifier.name, .{ .shallow = true, .initial_depth = i }) == null) : (i += 1) {
+            _ = try self.declareClosureValue(identifier, i);
+        }
+
+        return .from(closure_value_location);
     }
 
     fn compileCall(
@@ -1051,6 +1115,24 @@ pub const IRCompiler = struct {
         return .initAbs(3, 0);
     }
 
+    const ClosureContext = struct {
+        saved_r: ir.Location,
+        closure_ref: ir.Location,
+        index: usize,
+    };
+
+    fn compileCreateClosure(self: *IRCompiler, source: *ast.Expression) Error!ClosureContext {
+        const saved_r = try self.newRef(source, "closure_saved_r");
+        const closure_ref = try self.newRef(source, "closure");
+        const index = self.currentInstrSet().instructions.items.len;
+
+        return .{
+            .saved_r = saved_r,
+            .closure_ref = closure_ref,
+            .index = index,
+        };
+    }
+
     fn compileExecutableCall(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -1064,10 +1146,16 @@ pub const IRCompiler = struct {
 
         const exec_instr_set = try self.addInstructionSet();
 
-        const thread_handle = try self.forkInherit(source, .initAbs(exec_instr_set, 0));
+        const closure = try self.compileCreateClosure(source);
+        const thread_handle = try self.forkInherit(
+            source,
+            .initAbs(exec_instr_set, 0),
+            closure.closure_ref.dereference(),
+        );
 
         const prev_instr_set = self.current_instruction_set;
         self.current_instruction_set = exec_instr_set;
+        try self.scopes.push(self.allocator);
 
         var it = std.mem.reverseIterator(arguments);
         while (it.next()) |arg_expr| {
@@ -1085,8 +1173,63 @@ pub const IRCompiler = struct {
         try self.wait(source, exec_handle);
 
         self.current_instruction_set = prev_instr_set;
+        try self.compileClosureInitialization(source, closure);
+        self.scopes.pop();
 
         return .from(thread_handle);
+    }
+
+    fn compileClosureInitialization(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        closure: ClosureContext,
+    ) Error!void {
+        const frame = try self.scopes.getFrame(0);
+        const cl = frame.closure.items.len;
+        var pre_instructions: std.ArrayList(ir.Instruction) = try .initCapacity(self.allocator, 4 + cl);
+
+        // set @@saved_r = %r
+        pre_instructions.appendAssumeCapacity(.init(.from(source), .{ .set = .{
+            .destination = closure.saved_r,
+            .source = .fromLocation(.initRegister(.r)),
+        } }));
+        // alloc 2
+        pre_instructions.appendAssumeCapacity(.init(.from(source), .{ .alloc = cl }));
+        // set @@closure = %r
+        pre_instructions.appendAssumeCapacity(.init(.from(source), .{ .set = .{
+            .destination = closure.closure_ref,
+            .source = .fromLocation(.initRegister(.r)),
+        } }));
+        // set [%r+0] = x
+        // set [%r+1] = y
+        for (0..cl) |i| pre_instructions.appendAssumeCapacity(.init(.from(source), .{ .set = .{
+            .destination = .initAdd(.{ .register = .r }, i, .{ .dereference = true }),
+            .source = self.lookup(frame.closure.items[i].name, .{
+                .shallow = true,
+                .initial_depth = 1,
+            }).?.result.source,
+        } }));
+        // set %r = @@saved_r
+        pre_instructions.appendAssumeCapacity(.init(.from(source), .{ .set = .{
+            .destination = .initRegister(.r),
+            .source = .fromLocation(closure.saved_r.dereference()),
+        } }));
+        // fork <5:0> [S0] [S1] [S2] @@closure
+        var post_instructions: std.ArrayList(ir.Instruction) = try .initCapacity(self.allocator, 3);
+        // set @@saved_r = %r
+        post_instructions.appendAssumeCapacity(.init(.from(source), .{ .set = .{
+            .destination = closure.saved_r,
+            .source = .fromLocation(.initRegister(.r)),
+        } }));
+        // pop
+        self.currentFrame().rel_stack_counter -= 1;
+        post_instructions.appendAssumeCapacity(.init(.from(source), .pop));
+        // pop
+        self.currentFrame().rel_stack_counter -= 1;
+        post_instructions.appendAssumeCapacity(.init(.from(source), .pop));
+
+        try self.currentInstrSet().insertSlice(self.allocator, closure.index + 1, try post_instructions.toOwnedSlice(self.allocator));
+        try self.currentInstrSet().insertSlice(self.allocator, closure.index, try pre_instructions.toOwnedSlice(self.allocator));
     }
 
     fn compileFunctionCall(
@@ -1099,7 +1242,8 @@ pub const IRCompiler = struct {
         const fn_ref = fn_ref_value.fn_ref;
         const fn_addr = fn_ref.fn_addr;
 
-        const handle = try self.forkInherit(source, fn_addr);
+        // TODO: how to implement closures here?
+        const handle = try self.forkInherit(source, fn_addr, .noll);
 
         return .fromLocation(handle);
     }
@@ -1210,45 +1354,54 @@ pub const IRCompiler = struct {
 
         const orig_instr_set = self.current_instruction_set;
         const stage_sets = try self.allocator.alloc(usize, pipeline.stages.len - 1);
+        const stage_closures = try self.allocator.alloc(ClosureContext, pipeline.stages.len - 1);
         defer self.allocator.free(stage_sets);
+        defer self.allocator.free(stage_closures);
         for (stage_sets) |*stage_set| {
             stage_set.* = try self.addInstructionSet();
         }
         const last_set = try self.addInstructionSet();
 
+        stage_closures[0] = try self.compileCreateClosure(source);
         _ = try self.fork(
             source,
             .initAbs(stage_sets[0], 0),
             self.threadStdin(),
             refs[0].dereference(),
             self.threadStderr(),
+            stage_closures[0].closure_ref.dereference(),
         );
 
-        for (refs[0 .. refs.len - 1], refs[1..], stage_sets[1..]) |prev, curr, stage_set| {
+        for (refs[0 .. refs.len - 1], refs[1..], stage_sets[1..], 0..) |prev, curr, stage_set, i| {
+            stage_closures[i] = try self.compileCreateClosure(source);
             _ = try self.fork(
                 source,
                 .initAbs(stage_set, 0),
                 prev.dereference(),
                 curr.dereference(),
                 self.threadStderr(),
+                stage_closures[i].closure_ref.dereference(),
             );
         }
 
+        const last_closure = try self.compileCreateClosure(source);
         const last_fork_handle = try self.fork(
             source,
             .initAbs(last_set, 0),
             refs[refs.len - 1].dereference(),
             self.threadStdout(),
             self.threadStderr(),
+            last_closure.closure_ref.dereference(),
         );
 
-        for (stage_sets, pipeline.stages[0 .. pipeline.stages.len - 1]) |*stage_set, stage_expr| {
+        for (stage_sets, stage_closures, pipeline.stages[0 .. pipeline.stages.len - 1]) |*stage_set, stage_closure, stage_expr| {
             self.current_instruction_set = stage_set.*;
+            try self.scopes.push(self.allocator);
             const result = try self.compileExpression(stage_expr);
 
             if (isWaitable(result)) |_| {
                 try self.push(source, result.source);
-                _ = try self.forkInherit(source, self.stdoutStreamSet());
+                _ = try self.forkInherit(source, self.stdoutStreamSet(), .noll);
                 const result_stack = try self.pop(source);
                 try self.wait(source, result_stack);
                 try self.pipeOpt(
@@ -1260,15 +1413,22 @@ pub const IRCompiler = struct {
             } else {
                 return Error.UnsupportedExpression;
             }
+
+            self.current_instruction_set = orig_instr_set;
+            try self.compileClosureInitialization(source, stage_closure);
+            self.scopes.pop();
         }
         self.current_instruction_set = orig_instr_set;
 
         self.current_instruction_set = last_set;
+        try self.scopes.push(self.allocator);
         const result = try self.compileExpression(pipeline.stages[pipeline.stages.len - 1]);
         if (isWaitable(result)) |loc| {
             try self.wait(source, loc);
         }
         self.current_instruction_set = orig_instr_set;
+        try self.compileClosureInitialization(source, last_closure);
+        self.scopes.pop();
 
         return .from(last_fork_handle);
     }
@@ -1306,11 +1466,24 @@ pub const IRCompiler = struct {
         );
         const block_set = try self.addInstructionSet();
 
+        const closure = try self.compileCreateClosure(source);
+        const block_result = try self.fork(
+            source,
+            .initAbs(block_set, 0),
+            self.threadStdin(),
+            block_stdout.dereference(),
+            self.threadStderr(),
+            closure.closure_ref.dereference(),
+        );
+
         const orig_instr_set = self.current_instruction_set;
         self.current_instruction_set = block_set;
+        try self.scopes.push(self.allocator);
 
-        const block_stdout_thread = try self.forkInherit(source, self.stdoutStreamSet());
-        try self.push(source, .from(block_stdout_thread));
+        const block_stdout_thread = try self.forkInherit(source, self.stdoutStreamSet(), .noll);
+        const block_stdout_thread_ref = try self.newRef(source, "block_stdout_thread");
+        try self.set(source, block_stdout_thread_ref, .from(block_stdout_thread));
+        // try self.push(source, .from(block_stdout_thread));
 
         for (block.statements) |stmt| {
             // TODO: figure out what to do with these results
@@ -1326,18 +1499,12 @@ pub const IRCompiler = struct {
             .fromValue(.fromBoolean(false)),
         );
         // try self.pipeOpt(source, self.threadStdout(), .disconnect_destination, true);
-        _ = try self.pop(source);
-        try self.wait(source, block_stdout_thread);
+        // _ = try self.pop(source);
+        try self.wait(source, block_stdout_thread_ref.dereference());
 
         self.current_instruction_set = orig_instr_set;
-
-        const block_result = try self.fork(
-            source,
-            .initAbs(block_set, 0),
-            self.threadStdin(),
-            block_stdout.dereference(),
-            self.threadStderr(),
-        );
+        try self.compileClosureInitialization(source, closure);
+        self.scopes.pop();
 
         return .from(block_result);
     }
@@ -1350,6 +1517,7 @@ pub const IRCompiler = struct {
         const instr_set = try self.addInstructionSet();
         const orig_instr_set = self.current_instruction_set;
         self.current_instruction_set = instr_set;
+        try self.scopes.push(self.allocator);
 
         // TODO: figure out how to be able to call async functions multiple times and have the result not be overwritten in a ref
         const result = try self.compileExpression(fn_decl.body);
@@ -1359,6 +1527,7 @@ pub const IRCompiler = struct {
         }
 
         self.current_instruction_set = orig_instr_set;
+        self.scopes.pop();
         const fn_ref = ir.Value{
             .fn_ref = .{ .fn_addr = ir.InstructionAddr.initAbs(instr_set, 0) },
         };

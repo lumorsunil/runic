@@ -16,6 +16,8 @@ pub const Location = struct {
 
     pub const Error = error{UnsupportedAddrType};
 
+    pub const noll: @This() = .initAbs(.{ .heap = 0 }, .{});
+
     pub fn init(abs: LocationAbs, mod: ?LocationMod, options: Options) @This() {
         return .{
             .abs = abs,
@@ -44,13 +46,21 @@ pub const Location = struct {
         return @sizeOf(@This());
     }
 
+    pub fn isNoll(self: @This()) bool {
+        return self.abs == .heap and (self.toAddr() catch unreachable) == 0;
+    }
+
     pub fn toAddr(self: @This()) Error!usize {
         const abs = try self.abs.toAddr();
         return self.applyMod(abs);
     }
 
-    pub fn toAddrWithContext(self: @This(), stack_frame: usize) Error!usize {
-        const abs = try self.abs.toAddrWithContext(stack_frame);
+    pub fn toAddrWithContext(
+        self: @This(),
+        stack_frame: usize,
+        closure_addr: usize,
+    ) Error!usize {
+        const abs = try self.abs.toAddrWithContext(stack_frame, closure_addr);
         return self.applyMod(abs);
     }
 
@@ -164,6 +174,7 @@ pub const LocationAbs = union(enum) {
     ref: Ref,
     stack: usize,
     heap: usize,
+    closure,
     register: RegisterAbs,
     instruction: InstructionAddr,
     data: struct {
@@ -192,13 +203,18 @@ pub const LocationAbs = union(enum) {
             .data => |data| data.page * page_size + data.addr,
             .stack => |stack| stack_start + stack,
             .heap => |heap| heap,
-            .ref, .instruction, .register => Location.Error.UnsupportedAddrType,
+            .ref, .instruction, .register, .closure => Location.Error.UnsupportedAddrType,
         };
     }
 
-    pub fn toAddrWithContext(self: @This(), stack_frame: usize) Location.Error!usize {
+    pub fn toAddrWithContext(
+        self: @This(),
+        stack_frame: usize,
+        closure_addr: usize,
+    ) Location.Error!usize {
         return switch (self) {
             .ref => |ref| ref.rel_stack_addr + stack_frame,
+            .closure => closure_addr,
             else => self.toAddr(),
         };
     }
@@ -215,6 +231,7 @@ pub const LocationAbs = union(enum) {
             .heap => |s| try w.print("H{}", .{s}),
             .instruction => |i| try w.print("I{f}", .{i}),
             .register => |r| try w.print("%{t}", .{r}),
+            .closure => try w.print("C", .{}),
         }
     }
 };

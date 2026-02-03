@@ -1,0 +1,4 @@
+{
+  const y = "hello, ${"world!"}"
+  echo "${y}"
+}
