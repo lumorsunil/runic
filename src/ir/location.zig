@@ -2,6 +2,7 @@ const std = @import("std");
 const Ref = @import("ref.zig").Ref;
 const InstructionAddr = @import("instruction-addr.zig").InstructionAddr;
 const ir = @import("../ir.zig");
+const ast = @import("../frontend/ast.zig");
 const page_size = ir.context.page_size;
 const stack_start = ir.context.stack_start;
 
@@ -12,6 +13,7 @@ pub const Location = struct {
 
     pub const Options = struct {
         dereference: bool = false,
+        type_expr: ast.TypeExpr = .{ .void = .{ .span = .global } },
     };
 
     pub const Error = error{UnsupportedAddrType};
@@ -50,6 +52,10 @@ pub const Location = struct {
         return self.abs == .heap and (self.toAddr() catch unreachable) == 0;
     }
 
+    pub fn isType(self: @This(), type_expr: ast.TypeExpr) bool {
+        return std.meta.eql(self.options.type_expr, type_expr);
+    }
+
     pub fn toAddr(self: @This()) Error!usize {
         const abs = try self.abs.toAddr();
         return self.applyMod(abs);
@@ -71,6 +77,19 @@ pub const Location = struct {
     pub fn dereference(self: @This()) @This() {
         var clone = self;
         clone.options.dereference = true;
+        return clone;
+    }
+
+    pub fn undereference(self: @This()) @This() {
+        var clone = self;
+        clone.options.dereference = false;
+        return clone;
+    }
+
+    pub fn typed(self: @This(), maybe_type_expr: ?ast.TypeExpr) @This() {
+        const type_expr = maybe_type_expr orelse return self;
+        var clone = self;
+        clone.options.type_expr = type_expr;
         return clone;
     }
 
@@ -132,7 +151,7 @@ pub const LocationMod = union(enum) {
     }
 };
 
-pub const RegisterAbs = enum { r, ic, sf, sc };
+pub const RegisterAbs = enum { r, r2, ic, sf, sc };
 
 pub const Register = struct {
     abs: RegisterAbs,

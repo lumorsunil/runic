@@ -25,6 +25,7 @@ pub const Value = union(enum) {
     stream: ValueSlice,
     thread: usize,
     fn_ref: FunctionRef,
+    zig_string: []const u8,
     // register: Register,
     // dereference: union(enum) {
     //     addr: usize,
@@ -312,6 +313,7 @@ pub const Value = union(enum) {
             .closeable => |handle| try w.print("<closeable:{}>", .{handle}),
             .thread => |id| try w.print("<thread:{}>", .{id}),
             inline .slice, .executable, .exit_code, .fn_ref, .stream => |s| try w.print("{f}", .{s}),
+            inline .zig_string => |s| try w.print("\"{s}{s}\"", .{ s[0..10], if (s.len > 10) "..." else "" }),
             inline else => |t| try w.print("{}", .{t}),
         }
     }

@@ -23,6 +23,10 @@ pub const Identifier = struct {
         return if (self.name.len == 0) false else std.ascii.isUpper(self.name[0]);
     }
 
+    pub fn global(name: []const u8) Identifier {
+        return .{ .name = name, .span = .global };
+    }
+
     pub fn resolveType(
         self: *@This(),
         _: std.mem.Allocator,
@@ -138,8 +142,13 @@ pub const TypeExpr = union(enum) {
     boolean: PrimitiveType,
     byte: PrimitiveType,
     execution: PrimitiveType,
+    thread: PrimitiveType,
     failed: FailedType,
     // lazy: LazyType,
+
+    pub fn global(comptime tag: std.meta.Tag(@This())) @This() {
+        return @unionInit(@This(), @tagName(tag), .{ .span = .global });
+    }
 
     pub const NamedType = struct {
         path: Path,
@@ -310,6 +319,13 @@ pub const TypeExpr = union(enum) {
 
     pub const PrimitiveType = struct {
         span: Span,
+
+        pub fn format(
+            _: @This(),
+            writer: *std.Io.Writer,
+        ) std.Io.Writer.Error!void {
+            try writer.writeAll("<primitive>");
+        }
     };
 
     pub const LazyType = struct {

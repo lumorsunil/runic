@@ -72,7 +72,8 @@ pub const IRProgramContext = struct {
         return self.thread_id_counter;
     }
 
-    pub fn getCurrentThread(self: @This()) IRThreadContext {
+    pub fn getCurrentThread(self: @This()) ?IRThreadContext {
+        if (self.threads.items.len <= self.thread_counter) return null;
         return self.threads.items[self.thread_counter];
     }
 
@@ -337,6 +338,7 @@ pub const IRPrivateContext = struct {
     stack: std.ArrayList(Value) = .empty,
     stack_frame: usize = 0,
     result_register: Value = .void,
+    result_register_2: Value = .void,
     process: ?*std.process.Child = null,
     waiting_for: ?ThreadId = null,
 

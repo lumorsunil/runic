@@ -1,0 +1,5 @@
+fn Void hello(greeting: String) Void {
+  echo "Hello, ${greeting}."
+}
+
+hello "I'm runic" | cat

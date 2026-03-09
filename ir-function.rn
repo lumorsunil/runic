@@ -1,9 +1,3 @@
-fn Void hello() Void {
-  echo "something"
-  echo "hello"
-  echo "something"
-  echo "hello"
-}
+fn Void hello(a: String) Void echo "${a}"
 
-hello
-// hello | grep "hello"
+hello "world"

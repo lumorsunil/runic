@@ -286,7 +286,7 @@ pub const ReaderWriterStream = struct {
     // source: ?CloseableReader(ExitCode) = null,
     sources: std.ArrayList(CloseableReader(ExitCode)) = .empty,
     destination: ?CloseableWriter(ExitCode) = null,
-    is_completed: bool = false,
+    has_been_connected: bool = false,
     config: Config,
     label: []const u8,
     tracer: *Tracer,
@@ -296,7 +296,15 @@ pub const ReaderWriterStream = struct {
         close_destination: bool = true,
         disconnect_source: bool = true,
         disconnect_destination: bool = true,
+        complete_after_source_closed: bool = false,
         keep_open: bool = false,
+
+        pub fn format(
+            self: @This(),
+            writer: *std.Io.Writer,
+        ) std.Io.Writer.Error!void {
+            try writer.print("{f}", .{std.json.fmt(self, .{})});
+        }
     };
 
     const vtable = Stream(u8).VTable{
@@ -366,6 +374,7 @@ pub const ReaderWriterStream = struct {
             .{ destination.getLabel(), destination.writer, destination.closeable },
         );
 
+        self.has_been_connected = true;
         try self.writer.flush();
         self.destination = destination;
         self.trace_writer = .init(
@@ -528,7 +537,7 @@ pub const ReaderWriterStream = struct {
 
     /// Returns true if source is completed.
     pub fn forward(self: *@This(), limit: std.Io.Limit) StreamError!ForwardEvent {
-        log(self, @src().fn_name, .{});
+        self.tracer.trace(.information, &.{ "stream", @src().fn_name }, null, @src().fn_name, .{});
 
         if (self.destination) |destination| {
             if (destination.isClosed()) {
@@ -563,12 +572,17 @@ pub const ReaderWriterStream = struct {
 
                 return .not_done;
             }
+        } else if (self.has_been_connected and !self.config.keep_open) {
+            self.closeSources();
+            self.disconnectSourcesAll();
+            self.tracer.trace(.information, &.{ "stream", @src().fn_name, "closed" }, null, "stream closed", .{});
+            return .closed;
         }
 
         if (self.sources.items.len == 0) {
-            log(self, "no source connected", .{});
+            self.tracer.trace(.information, &.{ "stream", @src().fn_name }, null, "no source connected", .{});
 
-            if (self.destination) |_| {
+            if (self.destination != null or self.has_been_connected) {
                 if (self.config.keep_open) {
                     return .no_source;
                 } else {
@@ -592,8 +606,13 @@ pub const ReaderWriterStream = struct {
 
             if (source_result) |_| {
                 self.tracer.trace(.information, &.{ "stream", @src().fn_name, "source" }, null, "source closed, removing source", .{});
-                try sources_to_remove.append(allocator, i);
-                continue;
+                if (self.processCloseEnds()) |event| switch (event) {
+                    .not_done => return .not_done,
+                    .closed => return .closed,
+                    else => unreachable,
+                } else {
+                    try sources_to_remove.append(allocator, i);
+                }
             }
 
             const bytes_forwarded = source.reader.stream(
@@ -647,7 +666,11 @@ pub const ReaderWriterStream = struct {
                 return .closed;
             }
 
-            return .not_done;
+            if (self.config.complete_after_source_closed) {
+                return .closed;
+            } else {
+                return .not_done;
+            }
         }
 
         return null;

@@ -32,8 +32,12 @@ pub const Error =
     };
 
 pub const Result = union(enum) {
+    /// Advances instruction counter and thread counter
     cont,
+    /// Advances thread counter, retains instruction counter
     cont_no_instr_counter_inc,
+    /// Advances instruction counter, retains thread counter (used for comments)
+    skip,
     exit: runic.command_runner.ExitCode,
 };
 
@@ -77,7 +81,7 @@ pub const IREvaluator = struct {
     pub fn step(self: *IREvaluator) Error!?Result {
         // self.logTrace(@src().fn_name);
 
-        const thread = self.context.getCurrentThread();
+        const thread = self.context.getCurrentThread() orelse unreachable;
 
         const instruction = thread.currentInstruction() orelse {
             self.log("{}: no more instructions", .{thread.id});
@@ -91,6 +95,10 @@ pub const IREvaluator = struct {
             .exit => |exit_code| try self.context.closeThread(thread.id, exit_code),
             .cont => thread.incInstructionCounter(),
             .cont_no_instr_counter_inc => {},
+            .skip => {
+                thread.incInstructionCounter();
+                return .skip;
+            },
         }
 
         self.tempCloseStdIoCheck();
@@ -224,14 +232,24 @@ pub const IREvaluator = struct {
     ) ResolveLocationError!ir.Value {
         if (location.isNoll()) {
             return .fromAddr(0);
+        } else if (location.abs == .closure) {
+            const dereferenced = try self.dereferenceLocation(thread, location);
+            if (location.options.dereference) {
+                return (try self.dereferenceValue(thread, dereferenced.*, null)).*;
+            } else {
+                return dereferenced.*;
+            }
         } else if (location.options.dereference) {
             return (try self.dereferenceLocation(thread, location)).*;
         } else {
             switch (location.abs) {
                 .register => |r| switch (r) {
                     .r => return thread.private.result_register,
+                    .r2 => return thread.private.result_register_2,
                     else => {},
                 },
+                // TODO: always deference closure (you're not supposed to change where closure entries point to)
+                .closure => return self.resolveLocation(thread, location.dereference()),
                 else => {},
             }
 
@@ -254,6 +272,7 @@ pub const IREvaluator = struct {
                 .sf => self.dereferenceValue(thread, .fromAddr(location.applyMod(thread.private.stack_frame)), null),
                 .sc => self.dereferenceValue(thread, .fromAddr(location.applyMod(thread.private.stack.items.len)), null),
                 .r => self.dereferenceValue(thread, thread.private.result_register, location.mod),
+                .r2 => self.dereferenceValue(thread, thread.private.result_register_2, location.mod),
                 // .r => switch (thread.private.result_register) {
                 //     .dereference => |deref| .{ .dereference = deref.applyMod(
                 //         location.mod,
@@ -283,6 +302,7 @@ pub const IREvaluator = struct {
         self.log("[{f}] {f}", .{ thread.private.instruction_counter, instruction });
 
         return switch (instruction.type) {
+            .comment => return .skip,
             .fwd_stdio => {
                 const stdin = try self.context.addPipe(self.config.stdin);
                 const stdout = try self.context.addPipe(self.config.stdout);
@@ -291,7 +311,7 @@ pub const IREvaluator = struct {
                 try thread.private.stack.append(self.allocator, .{ .pipe = stdin });
                 try thread.private.stack.append(self.allocator, .{ .pipe = stdout });
                 try thread.private.stack.append(self.allocator, .{ .pipe = stderr });
-                try thread.private.stack.append(self.allocator, .{ .addr = 0 }); // not used, here for compatibility reasons
+                try thread.private.stack.append(self.allocator, .{ .addr = 0 });
 
                 return .cont;
             },
@@ -493,6 +513,13 @@ pub const IREvaluator = struct {
                                 }
                                 dest.* = source;
                             },
+                            .r2 => {
+                                var dest = &thread.private.result_register_2;
+                                if (set.destination.options.dereference) {
+                                    dest = try self.dereferenceValue(thread, dest.*, set.destination.mod);
+                                }
+                                dest.* = source;
+                            },
                             // .r => if (set.location.mod) |mod| break: brk {
                             //     const loc = try self.resolveLocation(thread, .init(.{ .register = .r }, mod),);
                             // } else thread.private.result_register = set.value,
@@ -539,7 +566,7 @@ pub const IREvaluator = struct {
 
                 for (instructions) |instr| {
                     switch (try self.runInstruction(thread, instr)) {
-                        .cont => continue,
+                        .cont, .skip => continue,
                         .cont_no_instr_counter_inc => return Error.ContNoInstrCounterIncInAtomic,
                         .exit => |exit_code| return .{ .exit = exit_code },
                     }
@@ -833,7 +860,7 @@ pub const IREvaluator = struct {
                 try w.writeAll(string);
             },
             inline .uinteger, .float => |t| try w.print("{}", .{t}),
-            inline .addr => |addr| {
+            .addr => |addr| {
                 const loc = self.context.mapAddr(addr);
                 switch (loc.abs) {
                     .heap => |heap_addr| {
@@ -848,7 +875,12 @@ pub const IREvaluator = struct {
                 }
             },
             inline .exit_code => |t| try w.print("{f}", .{t}),
-            .void, .strct, .pipe, .thread, .closeable, .fn_ref => {},
+            .zig_string => |z| try w.writeAll(z),
+            .pipe => |p| {
+                const pipe = self.context.getPipe(p);
+                try w.writeAll(pipe.buffer_writer.written());
+            },
+            .void, .strct, .thread, .closeable, .fn_ref => {},
         }
     }
 };

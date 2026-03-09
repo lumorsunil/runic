@@ -1,5 +1,12 @@
 # todo-ir
 
+## misc
+
+- [ ] support ctrl+d for closing stdin
+- [ ] coercion of execution result to a string needs to have both stdout and stderr merged (at least when binding or coercing directly in a string interpolation)
+- [ ] type checker?
+- [ ] lsp?
+
 ## data
 
 - [x] void
@@ -15,9 +22,10 @@
     - [x] executable (file handle)
     - [x] blocks
     - [x] function calls
-    - [ ] values
+    - [ ] values (not mvp)
 - [x] blocks
 - [x] blocks as pipes
+- [ ] arrays
 
 ## instructions
 
@@ -47,32 +55,44 @@
   - [x] each thread has it's own closure
   - [x] closure-relative addresses
   - [x] shared binding for deeply nested closures
-  - [ ] mutable variables
+  - [x] mutable variables
+- [x] mutable variables
+- [x] binding to executable calls
+  - [x] executable call result struct
+  - [x] create a context when binding to blocks/calls that is stored in memory
 - [x] address mapping
 - [x] basic executable calls
 - [x] if else
 - [ ] for loops
+  - [ ] array iterator
+  - [ ] range iterator
 - [x] read-only data
 - [x] instructions
 - [x] labels
 - [x] refs
 - [x] structs
-  - [ ] user-land structs
+  - [ ] user-land structs (not mvp)
 - [x] struct types
-  - [ ] used defined struct types
+  - [ ] used defined struct types (not mvp)
 - [x] arithmetic
 - [x] boolean algebra
 - [x] pipelines
   - [x] multiple sources in streams ReaderWriterStream (stderr usually connects many sources)
-  - [ ] error handling?
+  - [ ] error handling? (not mvp)
   - [ ] && / ||
   - [ ] redirections
 - [x] function declarations
-  - [ ] arguments
+  - [x] arguments
 - [x] functions calls
-  - [ ] arguments
-  - [ ] fix ref bug (calling same function multiple times to trigger)
+  - [x] arguments
+  - [x] fix ref bug (calling same function multiple times to trigger)
+  - [x] closures
 - [x] bindings
+- [x] compound assignment operators
+- [ ] member access (not mvp)
+  - [ ] execution result (not mvp)
+- [ ] arrays
+  - [ ] element access
 
 ## execution context
 
@@ -131,12 +151,12 @@
   - [x] unsigned integer
   - [x] dereference addr
   - [x] exit code
-  - [ ] execution result
+  - [x] execution result
 - [x] arithmetic
 - [x] logical
 - [x] compare
 
-## debugger
+## debugger (not mvp)
 
 - [x] commands
   - [x] step
@@ -161,11 +181,10 @@
 - [ ] source code view
 - [ ] output view (stdout/stderr/combined)
 - [ ] tui lib?
+- [ ] mark thread as skip
 
 ## bugs
 
 - [x] grep is not outputting anything, see ir-blocks.rn
-- [ ] `cat | grep "hello"` does not react on stdin
 - [x] cannot call function multiple times
 - [x] debugger: cannot paste to stdin
-- [ ] `cat` on it's own does not echo back

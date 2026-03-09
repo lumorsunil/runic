@@ -158,7 +158,8 @@ pub fn runScript(
     log("stderr >>> {*}", .{&wrapped_stderr.writer});
 
     if (config.enable_ir) {
-        var result: ir.runner.RunResult = undefined;
+        var result: ir.runner.RunResult = .{ .success = .success };
+        defer result.deinit();
 
         if (config.debug_ir) {
             result = try ir.runner.debugIR(

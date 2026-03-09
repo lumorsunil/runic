@@ -29,11 +29,6 @@ fn mainImpl() !runic.command_runner.ExitCode {
 
     const allocator = gpa.allocator();
 
-    const orig_termios = try enableRawMode();
-    defer if (orig_termios) |t| restoreTermios(t) catch |err| {
-        std.log.err("Couldn't restore terminal attributes: {}", .{err});
-    };
-
     var tracer = runic.trace.Tracer.init(allocator, .{ .echo_to_stdout = false });
     defer tracer.deinit();
 
@@ -71,6 +66,12 @@ fn mainImpl() !runic.command_runner.ExitCode {
                 var cfg = config;
                 cfg.deinit(allocator);
             }
+
+            const orig_termios = if (config.debug_ir) try enableRawMode() else null;
+            defer if (orig_termios) |t| restoreTermios(t) catch |err| {
+                std.log.err("Couldn't restore terminal attributes: {}", .{err});
+            };
+
             return try dispatch(
                 allocator,
                 config,

@@ -1,2 +1,9 @@
 const s = "hello, world!"
 echo "${s}"
+
+// TODO: This does not work yet, check compiler.zig at compileBinding
+// const x = if (false) echo "this is from then" else "nothing is happening here, this is just a literal"
+// echo "${x}"
+
+// TODO: Same as above
+// const x = {}

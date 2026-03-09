@@ -62,8 +62,20 @@ vim.api.nvim_create_user_command(
     end,
     {}
 )
+vim.api.nvim_create_user_command(
+    'RunDryVerbose',
+    function()
+        if vim.fn.expand("%:e") ~= "rn" then return end
+        vim.cmd [[vnew]]
+        vim.cmd [[%!runic --enable-ir --dry-run --verbose #]]
+        vim.cmd [[set filetype=runic | set buftype=nofile]]
+        vim.cmd [[nnoremap q :bd!<CR>]]
+    end,
+    {}
+)
 EOF
 
 nmap <F5> <Cmd>Run<CR>
 nmap <F6> <Cmd>RunDebugLogging<CR>
 nmap <F7> <Cmd>RunDebug<CR>
+nmap <F4> <Cmd>RunDryVerbose<CR>

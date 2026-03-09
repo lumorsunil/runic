@@ -39,11 +39,35 @@ pub const ValueSource = union(enum) {
         return self == .location and self.location.abs == .register and self.location.abs.register == tag;
     }
 
+    pub fn isStackLocation(self: @This()) bool {
+        return self == .location and (self.location.abs == .stack or self.location.abs == .ref);
+    }
+
     pub fn toFloat(self: @This()) ?f64 {
         return switch (self) {
             .value => |v| v.toFloat(),
             .location => null,
         };
+    }
+
+    pub fn dereference(self: @This()) @This() {
+        var copy = self;
+        copy.location = copy.location.dereference();
+        return copy;
+    }
+
+    pub fn undereference(self: @This()) @This() {
+        var copy = self;
+        copy.location = copy.location.undereference();
+        return copy;
+    }
+
+    pub fn typeExpr(self: @This()) ?ast.TypeExpr {
+        if (self == .location) {
+            return self.location.options.type_expr;
+        }
+
+        return null;
     }
 
     pub fn format(
@@ -57,11 +81,13 @@ pub const ValueSource = union(enum) {
 };
 
 pub const Instruction = struct {
-    source: ?Source,
+    source: ?Source = null,
     type: Type,
 
     pub const Type = union(enum) {
-        /// forward program stdin, stdout and stderr
+        /// this instruction type is skipped, only used to add comments to the ir for debugging purposes
+        comment: []const u8,
+        /// forward program stdin, stdout and stderr, receives pointer to closure
         fwd_stdio,
         /// push a Value to the stack
         push: ValueSource,
@@ -135,7 +161,7 @@ pub const Instruction = struct {
         pub fn format(self: @This(), w: *std.Io.Writer) !void {
             switch (self) {
                 inline .push, .exit, .jmp, .fork, .set, .pipe_fwd, .wait, .stream, .pipe, .pipe_opt, .ath, .log, .cmp => |t| try w.print("{t} {f}", .{ self, t }),
-                inline .ref => |t| try w.print("{t} {s}", .{ self, t }),
+                inline .ref, .comment => |t| try w.print("{t} {s}", .{ self, t }),
                 inline .alloc => |t| try w.print("{t} {}", .{ self, t }),
                 else => try w.print("{t}", .{self}),
             }
@@ -358,6 +384,7 @@ pub const Instruction = struct {
             disconnect_destination,
             close_source,
             disconnect_source,
+            complete_after_source_closed,
         };
 
         pub fn format(self: @This(), w: *std.Io.Writer) !void {

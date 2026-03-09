@@ -94,7 +94,7 @@ pub const IRRunner = struct {
         );
 
         while (evaluator.step() catch |err| {
-            const current_instr = evaluator.context.getCurrentThread().currentInstruction();
+            const current_instr = (evaluator.context.getCurrentThread() orelse unreachable).currentInstruction();
 
             if (current_instr) |ci| {
                 if (ci.source) |source| {
@@ -109,14 +109,14 @@ pub const IRRunner = struct {
                         err,
                     });
                 } else {
-                    const addr = evaluator.context.getCurrentThread().getCurrentInstructionAddr();
+                    const addr = (evaluator.context.getCurrentThread() orelse unreachable).getCurrentInstructionAddr();
                     std.log.err("Error evaluating instruction {f}: {}", .{ addr, err });
                 }
             }
 
             return err;
         }) |result| switch (result) {
-            .cont, .cont_no_instr_counter_inc => continue,
+            .cont, .cont_no_instr_counter_inc, .skip => continue,
             .exit => |exit_code| return exit_code,
         };
 
@@ -127,6 +127,7 @@ pub const IRRunner = struct {
 pub const RunResult = union(enum) {
     err: struct {
         _diagnostics: []const ir.compiler.Diagnostic,
+        arena: std.heap.ArenaAllocator,
 
         pub fn diagnostics(self: @This()) []const ir.compiler.Diagnostic {
             return self._diagnostics;
@@ -134,8 +135,18 @@ pub const RunResult = union(enum) {
     },
     success: ExitCode,
 
-    pub fn err_(diagnostics: []const ir.compiler.Diagnostic) @This() {
-        return .{ .err = .{ ._diagnostics = diagnostics } };
+    pub fn deinit(self: *@This()) void {
+        switch (self.*) {
+            .err => |err| err.arena.deinit(),
+            .success => {},
+        }
+    }
+
+    pub fn err_(
+        arena: std.heap.ArenaAllocator,
+        diagnostics: []const ir.compiler.Diagnostic,
+    ) @This() {
+        return .{ .err = .{ ._diagnostics = diagnostics, .arena = arena } };
     }
 };
 
@@ -146,12 +157,12 @@ pub fn runIR(
     config: IRConfig,
 ) !RunResult {
     var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
     const arena_allocator = arena.allocator();
     var runner = IRRunner.init(arena_allocator, document_store, script, config);
     const result = try runner.compile();
 
-    if (result == .err) return .err_(result.err.diagnostics());
+    if (result == .err) return .err_(arena, result.err.diagnostics());
+    defer arena.deinit();
     var context = result.success;
 
     try context.addMainThread();
@@ -202,14 +213,14 @@ pub fn debugIR(
     // stderr: CloseableWriter(ExitCode),
 ) !RunResult {
     var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
     const arena_allocator = arena.allocator();
     var compiler = try ir.compiler.IRCompiler.init(arena_allocator, document_store, script);
     const result = try compiler.compile();
 
     tracer.config.echo_to_stdout = true;
 
-    if (result == .err) return .err_(result.err.diagnostics());
+    if (result == .err) return .err_(arena, result.err.diagnostics());
+    defer arena.deinit();
     const shared = result.success;
 
     var context = ir.context.IRProgramContext.init(arena_allocator, shared);
@@ -238,7 +249,7 @@ fn logInstruction(
 ) !void {
     var message_buffer: [1024]u8 = undefined;
     var writer = std.Io.Writer.fixed(&message_buffer);
-    try writer.print("{}: ", .{i});
+    try writer.print("{x}: ", .{i});
 
     while (label_counter.* < context.labels().map.count()) {
         const key = context.labels().map.keys()[label_counter.*];

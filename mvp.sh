@@ -34,6 +34,12 @@ declare -r string_ex="this is an example string"
 declare -r echo_result="$(printf "%s" "$string_ex")"
 echo "$echo_result"
 
+# function closures
+hello_using_string_ex() {
+  echo "Hello! $1. $string_ex."
+}
+hello_using_string_ex "Closures are greate"
+
 # integers
 my_integer_a=4
 my_integer_b=3

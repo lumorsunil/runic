@@ -9,6 +9,8 @@ const ast = @import("../frontend/ast.zig");
 const rainbow = @import("../rainbow.zig");
 const TraceFilter = @import("../trace.zig").TraceFilter;
 const signals = @import("../signals.zig");
+const ThreadId = @import("context.zig").ThreadId;
+const PipeHandle = @import("context.zig").PipeHandle;
 
 const span_color = rainbow.beginBgColor(.yellow) ++ rainbow.beginColor(.black);
 const current_instr_color = rainbow.beginBgColor(.yellow) ++ rainbow.beginColor(.black);
@@ -41,9 +43,11 @@ pub const IRDebugger = struct {
     is_continuing: bool = false,
     breakpoints: std.ArrayList(Breakpoint) = .empty,
     skip_stdio: bool = true,
+    skip_threads: std.AutoArrayHashMapUnmanaged(ThreadId, void) = .empty,
     trace_filter: ?TraceFilter = null,
     info_window_layout: ?InfoLayout = .initial,
     pending_input: std.ArrayList(u8) = .empty,
+    reusable_allocating_writer: std.Io.Writer.Allocating,
 
     pub fn init(
         allocator: Allocator,
@@ -58,28 +62,41 @@ pub const IRDebugger = struct {
             .stdin_file_reader = std.fs.File.stdin().reader(try allocator.alloc(u8, 1024)),
             .document_store = document_store,
             .command_writer = .init(allocator),
+            .reusable_allocating_writer = .init(allocator),
         };
     }
 
     pub fn step(self: *IRDebugger) Error!RunningEvent {
-        if (self.skip_stdio) {
-            const stdio_ids: []const usize = &.{ 1, 2, 3 };
-            while (std.mem.indexOfScalar(usize, stdio_ids, self.evaluator.context.getCurrentThread().id)) |_| {
-                try self.printInstruction();
-                _ = try self.evaluator.step() orelse return .quit;
-            }
+        try self.printInstruction(self.stdoutWriter());
+        var event = try self.evaluator.step() orelse return .quit;
+
+        if (event == .exit) {
+            try self.print("Program exited with code: {f}", .{event.exit});
+            return .quit;
         }
 
-        try self.printInstruction();
+        const stdio_ids: []const usize = &.{ 1, 2, 3 };
 
-        const event = try self.evaluator.step() orelse return .quit;
+        while (true) {
+            const is_stdio_and_skipped = self.skip_stdio and std.mem.indexOfScalar(usize, stdio_ids, (self.evaluator.context.getCurrentThread() orelse unreachable).id) != null;
+            const is_thread_skipped = std.mem.indexOfScalar(usize, self.skip_threads.keys(), (self.evaluator.context.getCurrentThread() orelse unreachable).id) != null;
+
+            if (is_stdio_and_skipped or is_thread_skipped) {
+                try self.printInstruction(self.stdoutWriter());
+                _ = try self.evaluator.step() orelse return .quit;
+                continue;
+            }
+
+            if (event != .skip) break;
+
+            event = try self.evaluator.step() orelse return .quit;
+
+            if (event != .skip) break;
+        }
 
         switch (event) {
-            .cont, .cont_no_instr_counter_inc => return .cont,
-            .exit => |exit_code| {
-                try self.print("Program exited with code: {f}", .{exit_code});
-                return .quit;
-            },
+            .cont, .cont_no_instr_counter_inc, .skip => return .cont,
+            .exit => unreachable,
         }
     }
 
@@ -89,17 +106,17 @@ pub const IRDebugger = struct {
         return .cont;
     }
 
-    fn printInstruction(self: *IRDebugger) !void {
-        const thread = self.evaluator.context.getCurrentThread();
+    fn printInstruction(self: *IRDebugger, writer: *std.Io.Writer) !void {
+        const thread = self.evaluator.context.getCurrentThread() orelse return;
         const ic = thread.getCurrentInstructionAddr();
         const instruction = thread.currentInstruction() orelse {
-            return self.print("{f}: <end>\n", .{ic});
+            return writer.print("{}:{f}: <end>\n", .{ thread.id, ic });
         };
         const maybe_span = instruction.span();
         if (maybe_span) |span| {
-            try self.logEvaluateSpan(span);
+            try self.logEvaluateSpan(writer, span);
         }
-        try self.print("{f}: {f}\n", .{ ic, instruction });
+        try writer.print("{}:{f}: {f}\n", .{ thread.id, ic, instruction });
     }
 
     pub fn run(self: *IRDebugger) Error!ExitCode {
@@ -163,9 +180,12 @@ pub const IRDebugger = struct {
                 return .cont;
             }
             const result = try self.step();
-            if (self.hasBreakpoint(self.evaluator.context.getCurrentThread().getCurrentInstructionAddr())) |bp| {
-                self.is_continuing = false;
-                try self.print("\nStopped at breakpoint: {f}\n\n", .{bp});
+            const thread = self.evaluator.context.getCurrentThread();
+            if (thread) |current_thread| {
+                if (self.hasBreakpoint(current_thread.getCurrentInstructionAddr())) |bp| {
+                    self.is_continuing = false;
+                    try self.print("\nStopped at breakpoint: {f}\n\n", .{bp});
+                }
             }
             return result;
         } else {
@@ -651,7 +671,11 @@ pub const IRDebugger = struct {
             .instructions_all => return self.printInstructionsAll(),
             .registers => return self.printRegisters(),
             .pipes => return self.printPipes(),
+            .processes => return self.printProcesses(),
+            .pipe_data => |handle| return self.printPipeData(handle),
             .skip_stdio => return self.skipStdio(),
+            .skip_thread => |handle| return self.skipThread(handle),
+            .skip_thread_list => return self.skipThreadList(),
             .trace => |trace| return self.handleTraceCommand(trace),
             .stack => return self.printStack(),
             .heap => |heap| return self.printHeap(heap.addr, heap.len),
@@ -673,6 +697,10 @@ pub const IRDebugger = struct {
                     return .cont;
                 };
                 try self.addBreakpoint(bp.file, bp.line, instr_addr);
+                return .cont;
+            },
+            .add_ir => |bp| {
+                try self.addBreakpoint("<ir-breakpoint>", 1, bp.instr_addr);
                 return .cont;
             },
             .remove => |bp| {
@@ -738,14 +766,15 @@ pub const IRDebugger = struct {
         return .cont;
     }
 
-    fn getCurrentExecutingThread(self: *IRDebugger) ir.context.IRThreadContext {
+    fn getCurrentExecutingThread(self: *IRDebugger) ?ir.context.IRThreadContext {
+        if (self.evaluator.context.threads.items.len == 0) return null;
         const current_thread_i: ?usize = if (self.skip_stdio) if (self.evaluator.context.thread_counter >= 1 and self.evaluator.context.thread_counter <= 3) 4 else null else null;
         const thread_i = self.evaluator.context.getNextActiveThread(current_thread_i) orelse 0;
         return self.evaluator.context.threads.items[thread_i];
     }
 
     fn printInstructions(self: *IRDebugger) !RunningEvent {
-        const thread = self.getCurrentExecutingThread();
+        const thread = self.getCurrentExecutingThread() orelse unreachable;
         const instr_addr = thread.getCurrentInstructionAddr();
         const instr_set = self.evaluator.context.instructions()[instr_addr.instr_set];
 
@@ -775,7 +804,7 @@ pub const IRDebugger = struct {
     }
 
     fn printInstructionsAll(self: *IRDebugger) !RunningEvent {
-        const thread = self.evaluator.context.getCurrentThread();
+        const thread = self.evaluator.context.getCurrentThread() orelse unreachable;
         const instr_addr = thread.getCurrentInstructionAddr();
 
         for (self.evaluator.context.instructions(), 0..) |instr_set, i| {
@@ -816,9 +845,29 @@ pub const IRDebugger = struct {
     fn printPipes(self: *IRDebugger) !RunningEvent {
         var it = self.evaluator.context.pipes.iterator();
         while (it.next()) |entry| {
-            try self.print("\n{}: {f}", .{ entry.key_ptr.*, entry.value_ptr.* });
+            try self.print("\n{}: {f} {f} has_been_connected: {}", .{ entry.key_ptr.*, entry.value_ptr.*, entry.value_ptr.*.config, entry.value_ptr.*.has_been_connected });
         }
         try self.writeAll("\n\n");
+
+        return .cont;
+    }
+
+    fn printProcesses(self: *IRDebugger) !RunningEvent {
+        var it = self.evaluator.context.closeables.iterator();
+        while (it.next()) |entry| {
+            try self.print("\n{}: {s} is closed: {?f}", .{ entry.key_ptr.*, entry.value_ptr.*.getLabel(), entry.value_ptr.*.getResult() });
+        }
+        try self.writeAll("\n\n");
+
+        return .cont;
+    }
+
+    fn printPipeData(self: *IRDebugger, handle: PipeHandle) !RunningEvent {
+        const pipe = self.evaluator.context.pipes.get(handle) orelse {
+            try self.print("\npipe {} does not exist\n\n", .{handle});
+            return .cont;
+        };
+        try self.print("\ndata for pipe {}:\n{s}\n\n", .{ handle, pipe.buffer_writer.written() });
 
         return .cont;
     }
@@ -928,6 +977,31 @@ pub const IRDebugger = struct {
         return .cont;
     }
 
+    fn skipThread(self: *IRDebugger, handle: ThreadId) !RunningEvent {
+        const was_removed = self.skip_threads.swapRemove(handle);
+        if (was_removed) {
+            try self.print("thread {} is now not skipped anymore", .{handle});
+        } else {
+            try self.skip_threads.put(self.allocator, handle, {});
+            try self.print("thread {} is now skipped", .{handle});
+        }
+        try self.writeAll("\n\n");
+        return .cont;
+    }
+
+    fn skipThreadList(self: *IRDebugger) !RunningEvent {
+        if (self.skip_threads.count() == 0) {
+            try self.writeAll("no skipped threads");
+        } else {
+            try self.writeAll("skipped threads:\n");
+            for (self.skip_threads.keys()) |handle| {
+                try self.print("{}\n", .{handle});
+            }
+        }
+        try self.writeAll("\n\n");
+        return .cont;
+    }
+
     fn handleTraceCommand(self: *IRDebugger, trace: Command.TraceCommand) !RunningEvent {
         switch (trace) {
             .on => self.evaluator.config.tracer.config.echo_to_stdout = true,
@@ -939,14 +1013,15 @@ pub const IRDebugger = struct {
     }
 
     fn printStack(self: *IRDebugger) !RunningEvent {
-        for (self.evaluator.context.threads.items, 0..) |thread, i| {
-            try self.print("\nthread {}:\n\n", .{i});
+        for (self.evaluator.context.threads.items) |thread| {
+            try self.print("\nthread {}:\n", .{thread.id});
 
             for (thread.private.stack.items, 0..) |s, j| {
                 try self.print("\n{}: {f}", .{ j, s });
             }
-            try self.writeAll("\n\n");
+            try self.writeAll("\n");
         }
+        try self.writeAll("\n");
 
         return .cont;
     }
@@ -1047,8 +1122,7 @@ pub const IRDebugger = struct {
 
         try switch (layout) {
             .threads => self.printInfoThreads(&info_window),
-            .current_thread => {
-                const curr_thread = self.getCurrentExecutingThread();
+            .current_thread => if (self.getCurrentExecutingThread()) |curr_thread| {
                 try self.printInfoThread(&info_window, curr_thread);
             },
         };
@@ -1061,7 +1135,7 @@ pub const IRDebugger = struct {
         window: *Window,
         thread: ir.context.IRThreadContext,
     ) !void {
-        const curr_thread = self.getCurrentExecutingThread();
+        const curr_thread = self.getCurrentExecutingThread() orelse return;
         const is_active = self.evaluator.context.isThreadActive(thread.id);
         var thread_suffix_buffer: [1024]u8 = undefined;
         const thread_suffix = if (thread.private.waiting_for) |waiting_for| std.fmt.bufPrint(&thread_suffix_buffer, " (waiting for {})", .{waiting_for}) catch unreachable else if (is_active) "" else " (inactive)";
@@ -1077,12 +1151,13 @@ pub const IRDebugger = struct {
         );
         try window.text(
             self,
-            "%ic:{f} %sf:{} %sc:{} %r:{f}",
+            "%ic:{f} %sf:{} %sc:{} %r:{f} %r2:{f}",
             .{
                 thread.private.instruction_counter,
                 thread.private.stack_frame,
                 thread.private.stack.items.len,
                 thread.private.result_register,
+                thread.private.result_register_2,
             },
         );
     }
@@ -1385,8 +1460,30 @@ pub const IRDebugger = struct {
             return .pipes;
         }
 
+        if (std.mem.eql(u8, source, "processes")) {
+            return .processes;
+        }
+
+        if (std.mem.startsWith(u8, source, "pipe data ")) {
+            var it = std.mem.tokenizeAny(u8, source[10..], " :");
+            const handle_as_string = it.next() orelse return self.commandUsage(.pipe_data);
+            const handle = std.fmt.parseInt(PipeHandle, handle_as_string, 10) catch return self.commandUsage(.pipe_data);
+            return .{ .pipe_data = handle };
+        }
+
         if (std.mem.eql(u8, source, "stdio skip")) {
             return .skip_stdio;
+        }
+
+        if (std.mem.eql(u8, source, "skip thread")) {
+            return .skip_thread_list;
+        }
+
+        if (std.mem.startsWith(u8, source, "skip thread ")) {
+            var it = std.mem.tokenizeAny(u8, source[12..], " :");
+            const handle_as_string = it.next() orelse return self.commandUsage(.skip_thread);
+            const handle = std.fmt.parseInt(ThreadId, handle_as_string, 10) catch return self.commandUsage(.skip_thread);
+            return .{ .skip_thread = handle };
         }
 
         if (std.mem.eql(u8, source, "stack")) {
@@ -1406,32 +1503,42 @@ pub const IRDebugger = struct {
                 return .{ .breakpoint = .list };
             }
 
-            const valid_sub_commands: []const []const u8 = &.{ "add", "remove" };
+            const valid_sub_commands: []const []const u8 = &.{ "add", "add-ir", "remove" };
             for (valid_sub_commands) |sc| {
                 if (std.mem.eql(u8, sub_command, sc)) break;
             } else return self.commandUsage(.breakpoint);
 
-            const file = it.next() orelse return self.commandUsage(.breakpoint);
-            const line_as_string = it.next() orelse return self.commandUsage(.breakpoint);
+            if (std.mem.eql(u8, sub_command, "add") or std.mem.eql(u8, sub_command, "remove")) {
+                const file = it.next() orelse return self.commandUsage(.breakpoint);
+                const line_as_string = it.next() orelse return self.commandUsage(.breakpoint);
 
-            const line = std.fmt.parseInt(usize, line_as_string, 10) catch {
-                try self.print(
-                    "\nError: line needs to be an integer, actual: {s}",
-                    .{line_as_string},
-                );
-                return null;
-            };
+                const line = std.fmt.parseInt(usize, line_as_string, 10) catch {
+                    try self.print(
+                        "\nError: line needs to be an integer, actual: {s}",
+                        .{line_as_string},
+                    );
+                    return null;
+                };
 
-            if (std.mem.eql(u8, "add", sub_command)) {
-                return .{ .breakpoint = .{ .add = .{
-                    .file = try self.allocator.dupe(u8, file),
-                    .line = line,
-                } } };
-            } else if (std.mem.eql(u8, "remove", sub_command)) {
-                return .{ .breakpoint = .{ .remove = .{
-                    .file = try self.allocator.dupe(u8, file),
-                    .line = line,
-                } } };
+                if (std.mem.eql(u8, "add", sub_command)) {
+                    return .{ .breakpoint = .{ .add = .{
+                        .file = try self.allocator.dupe(u8, file),
+                        .line = line,
+                    } } };
+                } else if (std.mem.eql(u8, "remove", sub_command)) {
+                    return .{ .breakpoint = .{ .remove = .{
+                        .file = try self.allocator.dupe(u8, file),
+                        .line = line,
+                    } } };
+                }
+            }
+
+            if (std.mem.eql(u8, sub_command, "add-ir")) {
+                const set_as_string = it.next() orelse return self.commandUsage(.breakpoint);
+                const addr_as_string = it.next() orelse return self.commandUsage(.breakpoint);
+                const set = std.fmt.parseInt(usize, set_as_string, 10) catch return self.commandUsage(.breakpoint);
+                const addr = std.fmt.parseInt(usize, addr_as_string, 16) catch return self.commandUsage(.breakpoint);
+                return .{ .breakpoint = .{ .add_ir = .{ .instr_addr = .init(set, addr) } } };
             }
         }
 
@@ -1545,9 +1652,13 @@ pub const IRDebugger = struct {
         return null;
     }
 
-    fn logEvaluateSpan(self: *IRDebugger, span: ast.Span) Error!void {
+    fn logEvaluateSpan(
+        self: *IRDebugger,
+        writer: *std.Io.Writer,
+        span: ast.Span,
+    ) Error!void {
         if (span.isGlobal()) {
-            try self.print("{s}\n", .{span.start.file});
+            try writer.print("{s}\n", .{span.start.file});
             return;
         }
 
@@ -1557,7 +1668,7 @@ pub const IRDebugger = struct {
         while (lineIt.next()) |line| : (i += 1) {
             if (i >= span.start.line -| 3 and i <= span.end.line +| 3) {
                 if (span.start.line == i + 1 and span.end.line == i + 1) {
-                    try self.print("{:>4}:{s}{s}{s}{s}{s}\n", .{
+                    try writer.print("{:>4}:{s}{s}{s}{s}{s}\n", .{
                         i + 1,
                         line[0 .. span.start.column - 1],
                         span_color,
@@ -1566,7 +1677,7 @@ pub const IRDebugger = struct {
                         line[span.end.column - 1 ..],
                     });
                 } else if (span.start.line == i + 1) {
-                    try self.print("{:>4}:{s}{s}{s}{s}\n", .{
+                    try writer.print("{:>4}:{s}{s}{s}{s}\n", .{
                         i + 1,
                         line[0 .. span.start.column - 1],
                         span_color,
@@ -1574,7 +1685,7 @@ pub const IRDebugger = struct {
                         end_color,
                     });
                 } else if (span.end.line == i + 1) {
-                    try self.print("{:>4}:{s}{s}{s}{s}\n", .{
+                    try writer.print("{:>4}:{s}{s}{s}{s}\n", .{
                         i + 1,
                         span_color,
                         line[0 .. span.end.column - 1],
@@ -1582,14 +1693,14 @@ pub const IRDebugger = struct {
                         line[span.end.column - 1 ..],
                     });
                 } else if (span.start.line - 1 <= i and i <= span.end.line - 1) {
-                    try self.print("{:>4}:{s}{s}{s}\n", .{
+                    try writer.print("{:>4}:{s}{s}{s}\n", .{
                         i + 1,
                         span_color,
                         line,
                         end_color,
                     });
                 } else {
-                    try self.print("{:>4}:{s}\n", .{ i + 1, line });
+                    try writer.print("{:>4}:{s}\n", .{ i + 1, line });
                 }
             }
         }
@@ -1606,7 +1717,11 @@ const Command = union(enum) {
     instructions_all,
     registers,
     pipes,
+    pipe_data: PipeDataCommand,
+    processes,
     skip_stdio,
+    skip_thread: SkipThreadCommand,
+    skip_thread_list,
     trace: TraceCommand,
     stack,
     heap: HeapCommand,
@@ -1614,12 +1729,17 @@ const Command = union(enum) {
 
     pub const BreakpointCommand = union(enum) {
         add: Add,
+        add_ir: AddIr,
         remove: Remove,
         list,
 
         pub const Add = struct {
             file: []const u8,
             line: usize,
+        };
+
+        pub const AddIr = struct {
+            instr_addr: ir.ResolvedInstructionAddr,
         };
 
         pub const Remove = struct {
@@ -1633,10 +1753,15 @@ const Command = union(enum) {
         ) std.Io.Writer.Error!void {
             switch (self) {
                 inline .add, .remove => |s, t| try writer.print("{t} {s}:{}", .{ t, s.file, s.line }),
+                inline .add_ir => |s, t| try writer.print("{t} {f}", .{ t, s.instr_addr }),
                 else => try writer.print("{t}", .{self}),
             }
         }
     };
+
+    pub const PipeDataCommand = PipeHandle;
+
+    pub const SkipThreadCommand = ThreadId;
 
     pub const TraceCommand = union(enum) {
         on,
@@ -1685,9 +1810,10 @@ const Command = union(enum) {
         c_type: std.meta.Tag(Command),
     ) []const u8 {
         return switch (c_type) {
-            .quit, .step, .cont, .instructions, .instructions_all, .registers, .threads, .pipes, .skip_stdio, .stack, .toggle_info_window => "",
+            .quit, .step, .cont, .instructions, .instructions_all, .registers, .threads, .pipes, .processes, .skip_stdio, .stack, .toggle_info_window, .skip_thread_list => "",
             .breakpoint =>
             \\breakpoint add <file>:<line>
+            \\breakpoint add-ir <set>:<addr>
             \\breakpoint remove <file>:<line>
             ,
             .trace =>
@@ -1698,6 +1824,8 @@ const Command = union(enum) {
             \\trace filter or <tags>
             ,
             .heap => "heap <addr> <len>",
+            .skip_thread => "skip thread <handle>",
+            .pipe_data => "pipe data <handle>",
         };
     }
 
@@ -1707,8 +1835,12 @@ const Command = union(enum) {
     ) std.Io.Writer.Error!void {
         switch (self) {
             .skip_stdio => try writer.writeAll("skip stdio"),
+            .skip_thread => |handle| try writer.print("skip thread {}", .{handle}),
+            .skip_thread_list => try writer.writeAll("skip thread"),
+            .pipe_data => |handle| try writer.print("pipe data {}", .{handle}),
             .toggle_info_window => try writer.writeAll("info"),
             .instructions_all => try writer.writeAll("instructions all"),
+            .heap => |heap| try writer.print("heap {x} {}", .{ heap.addr, heap.len }),
             inline .breakpoint, .trace => |s, t| try writer.print("{t} {f}", .{ t, s }),
             else => try writer.print("{t}", .{self}),
         }
@@ -1773,7 +1905,10 @@ const main_commands: []const []const u8 = &.{
     "instructions",
     "registers",
     "pipes",
+    "pipe",
+    "processes",
     "stdio",
+    "skip",
     "trace",
     "stack",
     "info",
