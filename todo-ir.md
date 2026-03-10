@@ -91,8 +91,10 @@
 - [x] compound assignment operators
 - [ ] member access (not mvp)
   - [ ] execution result (not mvp)
-- [ ] arrays
-  - [ ] element access
+- [x] arrays
+  - [x] arrays that do not require stdio context
+  - [x] arrays that do require stdio context
+  - [x] element access
 
 ## execution context
 

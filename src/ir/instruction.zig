@@ -93,6 +93,10 @@ pub const Instruction = struct {
         push: ValueSource,
         /// pop a Value from the stack
         pop,
+        /// increases %r2 by 1
+        inc,
+        /// decreases %r2 by 1
+        dec,
         /// performs arithmetic operation with a and b and stores the result into result
         ath: Ath,
         /// compares a with b and stores the result into result

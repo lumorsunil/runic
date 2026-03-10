@@ -1300,6 +1300,7 @@ pub const Evaluator = struct {
 
                 return value.clone(self.allocator, .{});
             },
+            else => unreachable,
         }
 
         try self.logWithoutPrefix(

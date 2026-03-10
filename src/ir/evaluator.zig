@@ -327,6 +327,14 @@ pub const IREvaluator = struct {
                 thread.private.result_register = value;
                 return .cont;
             },
+            .inc => {
+                thread.private.result_register_2 = evaluateArithmetic(.add, .fromValue(thread.private.result_register_2), .fromValue(.{ .uinteger = 1 })).?;
+                return .cont;
+            },
+            .dec => {
+                thread.private.result_register_2 = evaluateArithmetic(.sub, .fromValue(thread.private.result_register_2), .fromValue(.{ .uinteger = 1 })).?;
+                return .cont;
+            },
             .exec => |exec| {
                 _ = exec;
 
@@ -476,55 +484,8 @@ pub const IREvaluator = struct {
                         dest.* = source;
                         return .cont;
                     },
-                    .register => |reg| {
-                        try switch (reg) {
-                            .ic => Error.UnsupportedInstruction,
-                            .sf => {
-                                if (set.destination.options.dereference) {
-                                    const addr = set.destination.applyMod(thread.private.stack_frame);
-                                    var dest = &thread.private.stack.items[addr];
-                                    if (set.destination.options.dereference) {
-                                        dest = try self.dereferenceValue(thread, dest.*, null);
-                                    }
-                                    dest.* = source;
-                                } else {
-                                    thread.private.stack_frame = source.addr;
-                                }
-                            },
-                            .sc => {
-                                if (set.destination.options.dereference) {
-                                    const addr = set.destination.applyMod(thread.private.stack.items.len);
-                                    var dest = &thread.private.stack.items[addr];
-                                    if (set.destination.options.dereference) {
-                                        dest = try self.dereferenceValue(thread, dest.*, null);
-                                    }
-                                    dest.* = source;
-                                } else {
-                                    try thread.private.stack.resize(
-                                        self.allocator,
-                                        source.addr,
-                                    );
-                                }
-                            },
-                            .r => {
-                                var dest = &thread.private.result_register;
-                                if (set.destination.options.dereference) {
-                                    dest = try self.dereferenceValue(thread, dest.*, set.destination.mod);
-                                }
-                                dest.* = source;
-                            },
-                            .r2 => {
-                                var dest = &thread.private.result_register_2;
-                                if (set.destination.options.dereference) {
-                                    dest = try self.dereferenceValue(thread, dest.*, set.destination.mod);
-                                }
-                                dest.* = source;
-                            },
-                            // .r => if (set.location.mod) |mod| break: brk {
-                            //     const loc = try self.resolveLocation(thread, .init(.{ .register = .r }, mod),);
-                            // } else thread.private.result_register = set.value,
-                        };
-
+                    .register => {
+                        try self.setLocation(thread, set.destination, source);
                         return .cont;
                     },
                 };
@@ -688,12 +649,59 @@ pub const IREvaluator = struct {
         self: *IREvaluator,
         thread: ir.context.IRThreadContext,
         loc: ir.Location,
-        value: ir.Value,
+        source: ir.Value,
     ) Error!void {
-        _ = self;
-
         switch (loc.abs) {
-            .ref => |ref| thread.setRef(ref, loc.mod, value),
+            .ref => |ref| thread.setRef(ref, loc.mod, source),
+            .register => |reg| {
+                try switch (reg) {
+                    .ic => Error.UnsupportedInstruction,
+                    .sf => {
+                        if (loc.options.dereference) {
+                            const addr = loc.applyMod(thread.private.stack_frame);
+                            var dest = &thread.private.stack.items[addr];
+                            if (loc.options.dereference) {
+                                dest = try self.dereferenceValue(thread, dest.*, null);
+                            }
+                            dest.* = source;
+                        } else {
+                            thread.private.stack_frame = source.addr;
+                        }
+                    },
+                    .sc => {
+                        if (loc.options.dereference) {
+                            const addr = loc.applyMod(thread.private.stack.items.len);
+                            var dest = &thread.private.stack.items[addr];
+                            if (loc.options.dereference) {
+                                dest = try self.dereferenceValue(thread, dest.*, null);
+                            }
+                            dest.* = source;
+                        } else {
+                            try thread.private.stack.resize(
+                                self.allocator,
+                                source.addr,
+                            );
+                        }
+                    },
+                    .r => {
+                        var dest = &thread.private.result_register;
+                        if (loc.options.dereference) {
+                            dest = try self.dereferenceValue(thread, dest.*, loc.mod);
+                        }
+                        dest.* = source;
+                    },
+                    .r2 => {
+                        var dest = &thread.private.result_register_2;
+                        if (loc.options.dereference) {
+                            dest = try self.dereferenceValue(thread, dest.*, loc.mod);
+                        }
+                        dest.* = source;
+                    },
+                    // .r => if (set.location.mod) |mod| break: brk {
+                    //     const loc = try self.resolveLocation(thread, .init(.{ .register = .r }, mod),);
+                    // } else thread.private.result_register = set.value,
+                };
+            },
             else => return Error.UnsupportedInstruction,
         }
     }
@@ -715,6 +723,8 @@ pub const IREvaluator = struct {
                 } else if (left.isValueTag(.float) and right.isValueTag(.uinteger)) {
                     const float_right: f64 = @floatFromInt(right.value.uinteger);
                     return .{ .float = left.value.float + float_right };
+                } else if (left.isValueTag(.addr) and right.isValueTag(.uinteger)) {
+                    return .{ .addr = left.value.addr +| right.value.uinteger };
                 }
             },
             .sub => {

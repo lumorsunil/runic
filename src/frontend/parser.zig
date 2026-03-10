@@ -533,48 +533,16 @@ pub const Parser = struct {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
-        // TODO: Add member access and assign as binary expressions
         if (try self.parseMaybeBinaryExpression()) |expr| return expr;
 
         const p = try self.peekSlice(2);
-        const identifier = p[0];
-        const next_token = p[1];
+        const next = p[1];
 
-        // if (isExprTerminator(next_token.tag)) {
-        //     return try self.parsePipeline();
-        // }
-
-        switch (next_token.tag) {
-            .dot => {
-                _ = try self.nextToken();
-                _ = try self.nextToken();
-                const accessor = try self.expectTokenTag(.identifier);
-                const object = try self.allocExpression(.{
-                    .identifier = .{ .name = identifier.lexeme, .span = identifier.span },
-                });
-
-                return try self.allocExpression(.{
-                    .member = .{
-                        .object = object,
-                        .member = .{ .name = accessor.lexeme, .span = accessor.span },
-                        .span = identifier.span.endAt(accessor.span),
-                    },
-                });
+        switch (next.tag) {
+            else => {
+                try self.reportParseError(Error.UnexpectedToken, next.span, "unexpected token {t}", .{next.tag});
+                return Error.UnexpectedToken;
             },
-            .assign => {
-                _ = try self.nextToken();
-                _ = try self.nextToken();
-                const expr = try self.parseExpression();
-
-                return try self.allocExpression(.{
-                    .assignment = .{
-                        .expr = expr,
-                        .identifier = .fromToken(identifier),
-                        .span = identifier.span.endAt(expr.span()),
-                    },
-                });
-            },
-            else => return try self.parsePipeline(),
         }
     }
 
@@ -651,6 +619,7 @@ pub const Parser = struct {
         float: ast.FloatLiteral,
         boolean: ast.BoolLiteral,
         string: ast.StringLiteral,
+        array: ast.ArrayLiteral,
 
         pub fn fromToken(tok: token.Token) BinaryComponentLiteral {
             return switch (tok.tag) {
@@ -675,6 +644,9 @@ pub const Parser = struct {
                 }),
                 .string => |string| parser.allocExpression(.{
                     .literal = .{ .string = string },
+                }),
+                .array => |array| parser.allocExpression(.{
+                    .array = array,
                 }),
             };
         }
@@ -743,12 +715,12 @@ pub const Parser = struct {
 
         var next = try self.peekToken();
 
-        const abort_initial_tokens = [_]token.Tag{
-            .l_brace,
-            .dot_l_brace,
-        };
-
-        for (abort_initial_tokens) |tag| if (next.tag == tag) return null;
+        // const abort_initial_tokens = [_]token.Tag{
+        //     .l_brace,
+        //     .dot_l_brace,
+        // };
+        //
+        // for (abort_initial_tokens) |tag| if (next.tag == tag) return null;
 
         while (true) : (state.advance()) {
             next = try self.peekToken();
@@ -778,6 +750,15 @@ pub const Parser = struct {
                                 .literal = .fromToken(next),
                             });
                         },
+                        .dot_l_brace => {
+                            // TODO: add support for structs/tuples?
+                            const breadcrumbInner = try self.createBreadcrumb("PBE:array");
+                            defer breadcrumbInner.end();
+                            try components.append(self.allocator, .{
+                                .literal = .{ .array = try self.parseArrayLiteral() },
+                            });
+                            continue;
+                        },
                         .string_start => {
                             const breadcrumbInner = try self.createBreadcrumb("PBE:string");
                             defer breadcrumbInner.end();
@@ -801,6 +782,18 @@ pub const Parser = struct {
                             try components.append(self.allocator, .{
                                 .op = token.Spanned(ast.BinaryOp).fromToken(next) orelse @panic("shouldn't happen :)"),
                             });
+                        },
+                        .l_bracket => {
+                            _ = try self.nextToken();
+                            try components.append(self.allocator, .{
+                                .op = token.Spanned(ast.BinaryOp).fromToken(next) orelse @panic("shouldn't happen <:)-|-<"),
+                            });
+                            state.advance();
+                            try components.append(self.allocator, .{
+                                .expr = try self.parseExpression(),
+                            });
+                            _ = try self.expectTokenTag(.r_bracket);
+                            continue;
                         },
                         else => {
                             if (next.tag == .range) break;
@@ -1293,23 +1286,29 @@ pub const Parser = struct {
         return .fromToken(integer);
     }
 
-    fn parseArrayLiteralExpression(self: *Self) Error!*ast.Expression {
+    fn parseArrayLiteral(self: *Self) Error!ast.ArrayLiteral {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
         _ = try self.expectTokenTag(.dot_l_brace);
 
         const elements = try self.parseList(.comma, parseExpression, .{ .skipNewLines = true });
-        const array = try self.allocExpression(.{
-            .array = .{
-                .elements = elements.payload,
-                .span = elements.span,
-            },
-        });
 
         _ = try self.expectTokenTag(.r_brace);
 
-        return array;
+        return .{
+            .elements = elements.payload,
+            .span = elements.span,
+        };
+    }
+
+    fn parseArrayLiteralExpression(self: *Self) Error!*ast.Expression {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        return try self.allocExpression(.{
+            .array = try self.parseArrayLiteral(),
+        });
     }
 
     fn parseCaptureClause(self: *Self) Error!ast.CaptureClause {
