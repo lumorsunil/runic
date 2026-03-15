@@ -25,7 +25,7 @@
     - [ ] values (not mvp)
 - [x] blocks
 - [x] blocks as pipes
-- [ ] arrays
+- [x] arrays
 
 ## instructions
 
@@ -63,10 +63,10 @@
 - [x] address mapping
 - [x] basic executable calls
 - [x] if else
-- [ ] labels have the wrong address if we have closures (since closures alter addresses after the fact by inserting instructions)
-- [ ] for loops
-  - [ ] array iterator
-  - [ ] range iterator
+- [x] labels have the wrong address if we have closures (since closures alter addresses after the fact by inserting instructions)
+- [x] for loops
+  - [x] array iterator
+  - [x] range iterator
 - [x] read-only data
 - [x] instructions
 - [x] labels
@@ -90,8 +90,8 @@
   - [x] closures
 - [x] bindings
 - [x] compound assignment operators
-- [ ] member access (not mvp)
-  - [ ] execution result (not mvp)
+- [x] member access
+  - [x] execution result
 - [x] arrays
   - [x] arrays that do not require stdio context
   - [x] arrays that do require stdio context
@@ -192,4 +192,4 @@
 - [x] cannot call function multiple times
 - [x] debugger: cannot paste to stdin
 - [ ] arrays will executable calls as elements cannot be accessed with element access operator
-- [ ] pipelines are broken again
+- [x] pipelines are broken again

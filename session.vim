@@ -25,7 +25,7 @@ vim.api.nvim_create_user_command(
         vim.bo.filetype = "c"
         vim.api.nvim_buf_set_keymap(0, "n", "q", "", { nowait = true, callback = kill })
         vim.api.nvim_buf_set_keymap(0, "n", "<Esc>", "", { nowait = true, callback = kill })
-        vim.cmd [[%!runic --enable-ir --verbose # > output.txt]]
+        vim.cmd [[%!runic --verbose # > output.txt]]
         vim.bo.modifiable = false
         vim.cmd [[belowright new]]
         buffers.output = vim.fn.bufnr()
@@ -47,7 +47,7 @@ vim.api.nvim_create_user_command(
         vim.bo.buftype = "nofile"
         vim.cmd [[nnoremap <buffer> q <Cmd>bd!<CR>]]
         vim.cmd [[nnoremap <buffer> <Esc> <Cmd>bd!<CR>]]
-        vim.cmd [[%!runic --enable-ir #]]
+        vim.cmd [[%!runic #]]
         vim.bo.modifiable = false
     end,
     {}
@@ -58,7 +58,7 @@ vim.api.nvim_create_user_command(
         if vim.fn.expand("%:e") ~= "rn" then return end
         vim.cmd [[tabnew]]
         vim.bo.buftype = "nofile"
-        vim.cmd [[term runic --enable-ir --debug-ir #]]
+        vim.cmd [[term runic --debug-ir #]]
     end,
     {}
 )
@@ -67,7 +67,7 @@ vim.api.nvim_create_user_command(
     function()
         if vim.fn.expand("%:e") ~= "rn" then return end
         vim.cmd [[vnew]]
-        vim.cmd [[%!runic --enable-ir --dry-run --verbose #]]
+        vim.cmd [[%!runic --dry-run --verbose #]]
         vim.cmd [[set filetype=runic | set buftype=nofile]]
         vim.cmd [[nnoremap q :bd!<CR>]]
     end,
