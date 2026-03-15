@@ -8,7 +8,7 @@ const LexerError = lexer_pkg.Error;
 const ManagedArrayList = std.array_list.Managed;
 
 pub const CliConfig = struct {
-    mode: Mode,
+    script: ScriptInvocation,
     trace_topics: [][]const u8,
     module_paths: [][]const u8,
     env_overrides: []EnvOverride,
@@ -16,15 +16,9 @@ pub const CliConfig = struct {
     print_tokens: bool = false,
     type_check_only: bool = false,
     skip_type_check: bool = false,
-    enable_ir: bool = false,
     debug_ir: bool = false,
     dry_run: bool = false,
     verbose: bool = false,
-
-    const Mode = union(enum) {
-        script: ScriptInvocation,
-        repl,
-    };
 
     pub const ScriptInvocation = struct {
         path: []const u8,
@@ -38,14 +32,9 @@ pub const CliConfig = struct {
     };
 
     pub fn deinit(self: *CliConfig, allocator: Allocator) void {
-        switch (self.mode) {
-            .script => |script| {
-                allocator.free(script.path);
-                freeStringList(allocator, script.args);
-                if (script.source) |source| allocator.free(source);
-            },
-            .repl => {},
-        }
+        allocator.free(self.script.path);
+        freeStringList(allocator, self.script.args);
+        if (self.script.source) |source| allocator.free(source);
 
         freeStringList(allocator, self.trace_topics);
         freeStringList(allocator, self.module_paths);
@@ -589,12 +578,10 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
 
     var script_path: ?[]const u8 = null;
     var script_source: ?[]const u8 = null;
-    var repl_requested = false;
     var print_ast = false;
     var print_tokens = false;
     var type_check_only = false;
     var skip_type_check = false;
-    var enable_ir = false;
     var debug_ir = false;
     var dry_run = false;
     var verbose = false;
@@ -614,10 +601,6 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
             if (argEqual(arg, "--help") or argEqual(arg, "-h")) {
                 return ParseResult.show_help;
             }
-            if (argEqual(arg, "--repl")) {
-                repl_requested = true;
-                continue;
-            }
             if (argEqual(arg, "--print-ast")) {
                 print_ast = true;
                 continue;
@@ -632,10 +615,6 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
             }
             if (argEqual(arg, "--skip-type-check")) {
                 skip_type_check = true;
-                continue;
-            }
-            if (argEqual(arg, "--enable-ir")) {
-                enable_ir = true;
                 continue;
             }
             if (argEqual(arg, "--eval") or argEqual(arg, "-c")) {
@@ -723,50 +702,20 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
         try script_args.append(try allocator.dupe(u8, arg));
     }
 
-    if (script_path != null and repl_requested) {
-        return usageError(allocator, "Cannot combine --repl with a script path.", .{});
-    }
-    if (script_path == null and !repl_requested) {
-        return usageError(allocator, "Provide a Runic script path or pass --repl for interactive mode.", .{});
-    }
-    if (print_ast and repl_requested) {
-        return usageError(allocator, "--print-ast requires a script path.", .{});
-    }
     if (print_ast and script_path == null) {
         return usageError(allocator, "--print-ast requires a script path.", .{});
-    }
-    if (print_tokens and repl_requested) {
-        return usageError(allocator, "--print-tokens requires a script path.", .{});
     }
     if (print_tokens and script_path == null) {
         return usageError(allocator, "--print-tokens requires a script path.", .{});
     }
-    if (type_check_only and repl_requested) {
-        return usageError(allocator, "--type-check-only requires a script path.", .{});
-    }
     if (type_check_only and script_path == null) {
         return usageError(allocator, "--type-check-only requires a script path.", .{});
-    }
-    if (skip_type_check and repl_requested) {
-        return usageError(allocator, "--skip-type-check requires a script path.", .{});
     }
     if (skip_type_check and script_path == null) {
         return usageError(allocator, "--skip-type-check requires a script path.", .{});
     }
-    if (enable_ir and repl_requested) {
-        return usageError(allocator, "--enable-ir requires a script path.", .{});
-    }
-    if (enable_ir and script_path == null) {
-        return usageError(allocator, "--enable-ir requires a script path.", .{});
-    }
-    if (debug_ir and repl_requested) {
-        return usageError(allocator, "--debug-ir requires a script path.", .{});
-    }
     if (debug_ir and script_path == null) {
         return usageError(allocator, "--debug-ir requires a script path.", .{});
-    }
-    if (debug_ir and !enable_ir) {
-        return usageError(allocator, "--debug-ir requires --enable-ir", .{});
     }
 
     const trace_slice = try finalizeList([]const u8, &trace_topics, &trace_cleanup);
@@ -774,29 +723,9 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
     const env_slice = try finalizeList(CliConfig.EnvOverride, &env_overrides, &env_cleanup);
     const args_slice = try finalizeList([]const u8, &script_args, &args_cleanup);
 
-    if (script_path) |path| {
-        return ParseResult{
-            .ready = .{
-                .mode = .{ .script = .{ .path = path, .args = args_slice, .source = script_source } },
-                .trace_topics = trace_slice,
-                .module_paths = module_slice,
-                .env_overrides = env_slice,
-                .print_ast = print_ast,
-                .print_tokens = print_tokens,
-                .type_check_only = type_check_only,
-                .skip_type_check = skip_type_check,
-                .enable_ir = enable_ir,
-                .debug_ir = debug_ir,
-                .dry_run = dry_run,
-                .verbose = verbose,
-            },
-        };
-    }
-
-    freeStringList(allocator, args_slice);
-    return ParseResult{
+    if (script_path) |path| return ParseResult{
         .ready = .{
-            .mode = .repl,
+            .script = .{ .path = path, .args = args_slice, .source = script_source },
             .trace_topics = trace_slice,
             .module_paths = module_slice,
             .env_overrides = env_slice,
@@ -804,12 +733,14 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
             .print_tokens = print_tokens,
             .type_check_only = type_check_only,
             .skip_type_check = skip_type_check,
-            .enable_ir = enable_ir,
             .debug_ir = debug_ir,
             .dry_run = dry_run,
             .verbose = verbose,
         },
     };
+
+    freeStringList(allocator, args_slice);
+    return usageError(allocator, "Provide a Runic script path or pass --eval SOURCE.", .{});
 }
 
 pub fn printUsage(writer: *std.Io.Writer) !void {
@@ -825,8 +756,7 @@ pub fn printUsage(writer: *std.Io.Writer) !void {
         \\  --print-ast          Parse the script and emit its AST instead of executing.
         \\  --print-tokens       Dump the raw lexer tokens for the provided script path.
         \\  --type-check-only    Dry run with only type checking.
-        \\  --enable-ir          Enable experimental IR compiler.
-        \\  --debug-ir           Enable experimental IR debug mode.
+        \\  --debug-ir           Enable IR debug mode.
         \\  --eval, -c SOURCE    Execute Runic source passed directly on the command line.
         \\
         \\Additional arguments after -- are forwarded to the script unchanged.

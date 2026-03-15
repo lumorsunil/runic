@@ -64,7 +64,7 @@ Runic keeps the "just type commands" workflow but layers in contemporary program
 ## Roadmap
 
 1. Draft language reference covering syntax, semantics, and compatibility guarantees.
-2. Build a parser and interpreter that can execute a useful subset of Runic scripts.
+2. Build a parser and IR runtime that can execute a useful subset of Runic scripts.
 3. Provide conversion guidelines and tooling for migrating bash scripts.
 4. Iterate on the design through real-world scripts, focusing on ergonomics and developer experience.
 
@@ -72,7 +72,7 @@ Runic aims to be familiar enough that a bash user can start using it immediately
 
 ## Implementation language & tooling
 
-The interpreter and CLI are implemented in Zig (tested with Zig 0.15.1). Zig's build system drives the project layout: `src/` hosts the reusable interpreter modules, while `cmd/runic/` exposes the CLI entry point that imports those modules.
+The runtime and CLI are implemented in Zig (tested with Zig 0.15.1). Zig's build system drives the project layout: `src/` hosts the reusable language/runtime modules, while `cmd/runic/` exposes the CLI entry point that imports those modules.
 
 ### Toolchain requirements
 
@@ -113,7 +113,7 @@ Run `./scripts/run_ci.sh` before pushing changes. The script enforces the format
 
 1. **Formatter** — runs `zig fmt` across `src/`, `cmd/`, and `tests/`.
 2. **Linter** — runs `zig fmt --check` on the same set of Zig sources so misformatted files fail the build.
-3. **Unit tests** — executes `zig build test` (without changing whatever `ZIG_GLOBAL_CACHE_DIR` is already exported), which compiles the interpreter as a module alongside the CLI and runs all `test` blocks.
+3. **Unit tests** — executes `zig build test` (without changing whatever `ZIG_GLOBAL_CACHE_DIR` is already exported), which compiles the runtime modules alongside the CLI and runs all `test` blocks.
 4. **CLI smoke tests** — executes every shell script that matches `tests/cli_*.sh` (a starter harness lives at `tests/cli_smoke.sh`). Extend these scripts with real CLI invocations as new scenarios land.
 
 Each stage stops the pipeline on failure so contributors get immediate feedback. Extend the stage scripts under `scripts/stages/` if a different toolchain or extra checks are required.
@@ -140,29 +140,28 @@ Runic keeps the familiar pipeline mindset while removing bash-specific hazards. 
 - Replace `source`-style helper files with modules plus manifests (described above) to surface typed APIs.
 - Handle failures with `try`/`catch` and typed status objects rather than `set -e` and `$?`.
 - Embed unported fragments inside `bash { ... }` blocks so you can gradually shrink the compatibility surface without blocking the rest of the script.
-- Exercise the in-progress interpreter via `zig build run -- path/to/script.rn --trace pipeline` and add CLI smoke tests to `tests/` as soon as a migration lands.
+- Exercise the CLI via `zig build run -- path/to/script.rn --trace pipeline` and add CLI smoke tests to `tests/` as soon as a migration lands.
 
 `docs/migrating-from-bash.md` includes a checklist that walks through the recommended workflow, highlights common traps, and links back to `features.md` entries that replace legacy bash behaviors.
 
 ## CLI usage
 
-The `cmd/runic` binary accepts either a script path or `--repl` and exposes switches for tracing, module lookup paths, and environment overrides. Script execution now parses `.rn` files directly, honors import/module lookups, `let` bindings, and pipelines, and forwards diagnostics/command output just like the REPL, which still provides a friendlier surface for quick experiments.
+The `cmd/runic` binary accepts either a script path or `--eval` and exposes switches for tracing, module lookup paths, and environment overrides. Script execution parses `.rn` files directly, honors import/module lookups, `let` bindings, and pipelines, and forwards diagnostics and command output through the IR runtime.
 
 A typical invocation looks like:
 
 ```bash
-# run a script with inline args, capturing CLI options for the interpreter
+# run a script with inline args
 zig build run -- path/to/script.rn --trace parser --module-path ./lib -- --flag value
 
-# request the REPL (syntax-aware history lands in plan task 28)
-zig build run -- --repl
+# evaluate inline source
+zig build run -- --eval 'echo "${1 + 2}"'
 ```
 
 Key flags:
 
 - `--help`, `-h` — show the usage summary (also the default when no arguments are provided).
-- `--repl` — enter REPL mode instead of executing a script. The REPL provides history, multiline editing (continue a command with a trailing `\`), and meta commands such as `:history`, `:help`, and `:quit`.
-- `--trace <topic>` — enable structured tracing for the given interpreter subsystem. Current topics are `pipeline` (per-stage spawn/exit), `process` (handle summaries, stage outcomes, and captured IO sizes), and `async` (scheduler + promise lifecycle). Repeat the flag to collect multiple targets (e.g. `--trace pipeline --trace process`).
+- `--trace <topic>` — enable structured tracing for the given runtime subsystem. Current topics are `pipeline` (per-stage spawn/exit), `process` (handle summaries, stage outcomes, and captured IO sizes), and `async` (scheduler + promise lifecycle). Repeat the flag to collect multiple targets (e.g. `--trace pipeline --trace process`).
 - `--module-path <dir>` — prepend an additional directory to the module loader search roots. This mirrors `let foo = import("custom/foo")` scenarios from `features.md`.
 - `--env KEY=VALUE` — override environment bindings that will be forwarded to script executions and background commands.
 
@@ -176,7 +175,7 @@ Tracing is the fastest way to inspect how Runic pipelines, async tasks, and proc
 - `process` — captures the resulting handle summary: PID, duration, failed stage (if any), and a per-stage status recap. This is useful when destructuring handles in scripts.
 - `async` — follows the scheduler lifecycle. Every background task logs its spawn, completion/error, promise wait events, and the resolved handle summary so you can see exactly when async work finishes.
 
-The REPL inherits these switches, so you can run `zig build run -- --repl --trace pipeline --trace async` to watch commands execute in real time while experimenting interactively.
+Use these switches with either a script path or `--eval` to watch commands execute in real time.
 
 ## Examples
 

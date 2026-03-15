@@ -3,7 +3,6 @@ const Allocator = std.mem.Allocator;
 const ast = @import("ast.zig");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
-const ScriptExecutor = @import("../interpreter/script_executor.zig").ScriptExecutor;
 const command_runner = @import("../runtime/command_runner.zig");
 const DocumentStore = @import("../document_store.zig").DocumentStore;
 
@@ -14,7 +13,6 @@ pub const Document = struct {
     source: []const u8,
     ast: ?ast.Script = null,
     parser: parser.Parser,
-    script_executor: ?ScriptExecutor = null,
     exitCode: ?command_runner.ExitCode = null,
 };
 
@@ -34,7 +32,6 @@ pub const FrontendDocumentStore = struct {
 
     pub fn deinit(self: *FrontendDocumentStore) void {
         for (self.map.values()) |document| {
-            if (document.script_executor) |*se| se.deinit();
             document.parser.deinit();
         }
         self.arena.deinit();

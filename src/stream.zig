@@ -1,6 +1,4 @@
 const std = @import("std");
-const Value = @import("interpreter/value.zig").Value;
-const Transformer = @import("transformer.zig").Transformer;
 const RC = @import("mem/root.zig").RC;
 const RCError = @import("mem/root.zig").RCError;
 const Closeable = @import("closeable.zig").Closeable;
@@ -1019,19 +1017,6 @@ pub fn Stream(comptime T: type) type {
             log(reader_writer_stream, "{*}", .{&reader_writer_stream.writer});
 
             return reader_writer_stream;
-        }
-
-        pub fn fromValue(allocator: std.mem.Allocator, value: Value) RCError!*Stream(T) {
-            return Transformer(*@This()).transform(
-                allocator,
-                value,
-            ) catch try @This().initFailed(
-                allocator,
-                StreamError.InitFailed,
-            ) orelse try @This().initFailed(
-                allocator,
-                StreamError.InvalidSource,
-            );
         }
 
         pub fn deinit(self: *@This()) void {
