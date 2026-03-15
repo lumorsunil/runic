@@ -190,7 +190,7 @@ pub fn runIR(
     for (context.instructions(), 0..) |is, instr_set| {
         runner.log("\nSet {}:", .{instr_set});
         for (is, 0..) |instr, i| {
-            try logInstruction(&runner, &context, instr, i, &label_counter);
+            try logInstruction(&runner, &context, instr, instr_set, i, &label_counter);
         }
     }
 
@@ -244,6 +244,7 @@ fn logInstruction(
     runner: *IRRunner,
     context: *ir.context.IRProgramContext,
     instr: ir.Instruction,
+    instr_set: usize,
     i: usize,
     label_counter: *usize,
 ) !void {
@@ -254,8 +255,8 @@ fn logInstruction(
     while (label_counter.* < context.labels().map.count()) {
         const key = context.labels().map.keys()[label_counter.*];
         const addr = context.labels().map.values()[label_counter.*];
-        const label = ir.Label{ .key = key, .addr = addr.? };
-        if (addr.? == i) {
+        const label = ir.Label{ .key = key, .addr = addr.?.local_addr };
+        if (addr.?.instr_set == instr_set and addr.?.local_addr == i) {
             try writer.print("{f} ", .{label});
             label_counter.* += 1;
         } else {

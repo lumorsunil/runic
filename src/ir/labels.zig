@@ -1,11 +1,12 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const InstructionAddr = @import("instruction-addr.zig").InstructionAddr;
+const ResolvedInstructionAddr = @import("instruction-addr.zig").ResolvedInstructionAddr;
 
 pub const Labels = struct {
     map: std.ArrayHashMapUnmanaged(
         InstructionAddr.LabelKey,
-        ?usize,
+        ?ResolvedInstructionAddr,
         HashContext,
         true,
     ) = .empty,
@@ -35,7 +36,7 @@ pub const Labels = struct {
         self: *Labels,
         allocator: Allocator,
         name: []const u8,
-        addr: ?usize,
+        addr: ?ResolvedInstructionAddr,
     ) Allocator.Error!InstructionAddr.LabelKey {
         const label: InstructionAddr.LabelKey = .{ .counter = self.map.count(), .name = name };
         try self.set(allocator, label, addr);
@@ -46,7 +47,7 @@ pub const Labels = struct {
         self: *Labels,
         allocator: Allocator,
         label: InstructionAddr.LabelKey,
-        addr: ?usize,
+        addr: ?ResolvedInstructionAddr,
     ) Allocator.Error!void {
         try self.map.put(allocator, label, addr);
     }
@@ -54,7 +55,7 @@ pub const Labels = struct {
     pub fn get(
         self: Labels,
         label: InstructionAddr.LabelKey,
-    ) ?usize {
+    ) ?ResolvedInstructionAddr {
         return self.map.get(label).?;
     }
 
@@ -65,7 +66,9 @@ pub const Labels = struct {
     }
 
     pub fn lessThan(ctx: *@This(), a_index: usize, b_index: usize) bool {
-        return ctx.map.values()[a_index].? < ctx.map.values()[b_index].?;
+        const left = ctx.map.values()[a_index].?;
+        const right = ctx.map.values()[b_index].?;
+        return left.instr_set < right.instr_set or (left.instr_set == right.instr_set and left.local_addr < right.local_addr);
     }
 };
 

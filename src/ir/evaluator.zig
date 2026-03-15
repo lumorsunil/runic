@@ -169,7 +169,7 @@ pub const IREvaluator = struct {
             .rel => |rel| @intCast(
                 @as(isize, @intCast(thread.getCurrentInstructionAddr().local_addr)) + rel,
             ),
-            .label => |label| self.context.labels().get(label).?,
+            .label => |label| return self.context.labels().get(label).?,
         };
 
         return .init(addr.instr_set, abs);

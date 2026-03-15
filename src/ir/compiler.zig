@@ -83,6 +83,7 @@ pub const Error =
         ScopeNotFound,
         LabelAddrNotSet,
         StructTypeNotFound,
+        NotImplemented,
     };
 
 pub const GetFrameError = error{
@@ -266,9 +267,15 @@ pub const IRData = struct {
 const Scope = struct {
     frames: std.ArrayList(Frame) = .empty,
 
+    pub const ScopeType = enum { lexical, closure };
+
     pub const Frame = struct {
         bindings: std.StringArrayHashMapUnmanaged(Binding) = .empty,
-        closure: std.ArrayList(ClosureBinding) = .empty,
+        closure_bindings: std.ArrayList(ClosureBinding) = .empty,
+        scope_type: ScopeType,
+
+        pub const lexical = Frame{ .scope_type = .lexical };
+        pub const closure = Frame{ .scope_type = .closure };
 
         pub fn declare(
             self: *Frame,
@@ -294,11 +301,11 @@ const Scope = struct {
         type: enum { outer, mutable },
         identifier: ast.Identifier,
 
-        pub fn outer(identifier: ast.Identifier) @This() {
+        pub fn outer(identifier: ast.Identifier, depth: usize) @This() {
             return .{
                 .type = .outer,
                 .identifier = identifier,
-                .depth = 1,
+                .depth = depth,
             };
         }
 
@@ -315,8 +322,8 @@ const Scope = struct {
         return .{};
     }
 
-    pub fn push(self: *Scope, allocator: Allocator) !void {
-        return self.frames.append(allocator, .{});
+    pub fn push(self: *Scope, allocator: Allocator, frame: Frame) !void {
+        return self.frames.append(allocator, frame);
     }
 
     pub fn pop(self: *Scope) void {
@@ -601,10 +608,10 @@ pub const IRCompiler = struct {
         name: []const u8,
         addr: SetLabelAddr,
     ) Allocator.Error!ir.InstructionAddr {
-        const label_addr = self.getLocalAddr(addr);
+        const local_addr = self.getLocalAddr(addr);
         return .initLabel(
             self.current_instruction_set,
-            try self.labels.new(self.allocator, name, label_addr),
+            try self.labels.new(self.allocator, name, if (local_addr) |a| .init(self.current_instruction_set, a) else null),
         );
     }
 
@@ -613,8 +620,8 @@ pub const IRCompiler = struct {
         label: ir.InstructionAddr.LabelKey,
         addr: SetLabelAddr,
     ) Allocator.Error!void {
-        const label_addr = self.getLocalAddr(addr);
-        return self.labels.set(self.allocator, label, label_addr);
+        const local_addr = self.getLocalAddr(addr);
+        return self.labels.set(self.allocator, label, if (local_addr) |a| .init(self.current_instruction_set, a) else null);
     }
 
     pub fn newRef(
@@ -750,6 +757,38 @@ pub const IRCompiler = struct {
         }));
     }
 
+    pub fn ath(
+        self: *IRCompiler,
+        source: anytype,
+        op: ast.BinaryOp,
+        left: ir.ValueSource,
+        right: ir.ValueSource,
+        result: ir.Location,
+    ) Error!void {
+        return self.addInstruction(.init(.from(source), .{ .ath = .{
+            .op = .from(op),
+            .a = left,
+            .b = right,
+            .result = result,
+        } }));
+    }
+
+    pub fn cmp(
+        self: *IRCompiler,
+        source: anytype,
+        op: ast.BinaryOp,
+        left: ir.ValueSource,
+        right: ir.ValueSource,
+        result: ir.Location,
+    ) Error!void {
+        return self.addInstruction(.init(.from(source), .{ .cmp = .{
+            .op = .from(op),
+            .a = left,
+            .b = right,
+            .result = result,
+        } }));
+    }
+
     pub fn exec_(
         self: *IRCompiler,
         source: anytype,
@@ -872,7 +911,7 @@ pub const IRCompiler = struct {
     pub fn compile(self: *IRCompiler) Error!CompilationResult {
         self.current_instruction_set = try self.addInstructionSetNoPushFrame();
 
-        try self.scopes.push(self.allocator);
+        try self.scopes.push(self.allocator, .closure);
         defer self.scopes.pop();
 
         const main_closure = try self.compileInitial();
@@ -896,11 +935,12 @@ pub const IRCompiler = struct {
         try self.pushFrameNoInstructions();
         try self.addInstruction(.init(null, .fwd_stdio));
         self.currentFrame().rel_stack_counter += 4;
-        const closure = try self.compileCreateMainClosure();
 
         const stdin_set = try self.addInstructionSet();
         const stdout_set = try self.addInstructionSet();
         const stderr_set = try self.addInstructionSet();
+
+        const closure = try self.compileCreateMainClosure();
 
         const prev_instr_set = self.current_instruction_set;
 
@@ -1116,12 +1156,14 @@ pub const IRCompiler = struct {
             .literal => |literal| self.compileLiteral(expr, literal),
             .identifier => |identifier| self.compileIdentifier(expr, identifier),
             .call => |call| self.compileCall(expr, call),
+            .member => |member| self.compileMember(expr, member),
             .if_expr => |if_expr| self.compileIf(expr, if_expr),
             .pipeline => |pipeline| self.compilePipeline(expr, pipeline),
             .block => |block| self.compileBlock(expr, block),
             .fn_decl => |fn_decl| self.compileFnDecl(expr, fn_decl),
             .binary => |binary| self.compileBinary(expr, binary),
             .array => |array| self.compileArray(expr, array),
+            .for_expr => |for_expr| self.compileForLoop(expr, for_expr),
             else => {
                 try self.reportSourceError(expr, Error.UnsupportedExpression, .@"error", "expression type \"{t}\" not yet supported", .{expr.*});
                 return .fromValue(.void);
@@ -1194,12 +1236,153 @@ pub const IRCompiler = struct {
         };
     }
 
-    fn field(
-        addr: usize,
-        struct_type: ir.Value.Struct.Type,
+    const InternalStructField = struct {
+        offset: usize,
+        type_expr: ast.TypeExpr,
+    };
+
+    fn internalStructTypeSize(type_expr: ast.TypeExpr) Error!usize {
+        return switch (type_expr) {
+            .void,
+            .integer,
+            .float,
+            .boolean,
+            .byte,
+            .execution,
+            .thread,
+            .module,
+            .function,
+            .tuple,
+            .array,
+            .optional,
+            .promise,
+            .error_union,
+            .error_set,
+            .err,
+            .alias,
+            .identifier,
+            .failed,
+            => 1,
+            .struct_type => |struct_type| {
+                var size: usize = 0;
+                for (struct_type.fields) |field_| {
+                    size += try internalStructTypeSize(field_.type_expr.*);
+                }
+                return size;
+            },
+        };
+    }
+
+    fn getInternalStructField(
+        self: *IRCompiler,
+        source: anytype,
+        struct_type: ast.TypeExpr.StructType,
         field_name: []const u8,
-    ) ir.Location {
-        return .initAdd(.{ .heap = addr }, struct_type.fields.getIndex(field_name).?);
+    ) Error!InternalStructField {
+        var offset: usize = 0;
+        for (struct_type.fields) |field_| {
+            if (std.mem.eql(u8, field_.name.name, field_name)) {
+                return .{
+                    .offset = offset,
+                    .type_expr = field_.type_expr.*,
+                };
+            }
+            offset += try internalStructTypeSize(field_.type_expr.*);
+        }
+
+        try self.reportSourceError(
+            source,
+            Error.NotImplemented,
+            .@"error",
+            "member \"{s}\" not found on internal struct",
+            .{field_name},
+        );
+        return Error.NotImplemented;
+    }
+
+    fn compileMember(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        member: ast.MemberExpr,
+    ) Error!Result {
+        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        const object = try self.compileExpression(member.object);
+        const object_type = object.typeExpr() orelse {
+            try self.reportSourceError(
+                source,
+                Error.NotImplemented,
+                .@"error",
+                "member access requires a typed internal struct object",
+                .{},
+            );
+            return .fromValue(.void);
+        };
+
+        const struct_type = switch (object_type) {
+            .struct_type => |struct_type| struct_type,
+            else => {
+                try self.reportSourceError(
+                    source,
+                    Error.NotImplemented,
+                    .@"error",
+                    "member access is only supported for internal struct types in IR",
+                    .{},
+                );
+                return .fromValue(.void);
+            },
+        };
+
+        if (object.source != .location) {
+            try self.reportSourceError(
+                source,
+                Error.NotImplemented,
+                .@"error",
+                "member access requires an address-backed struct value",
+                .{},
+            );
+            return .fromValue(.void);
+        }
+
+        const field_ = try self.getInternalStructField(source, struct_type, member.member.name);
+        const object_ref = try self.newRef(source, "member_object_ref");
+        try self.set(source, object_ref, object.source);
+        try self.set(source, .initRegister(.r2), .from(object_ref.dereference()));
+
+        return .fromLocation(.initAdd(
+            .{ .register = .r2 },
+            field_.offset,
+            .{
+                .dereference = true,
+                .type_expr = field_.type_expr,
+            },
+        ));
+    }
+
+    fn compileMemberBinary(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        binary: ast.BinaryExpr,
+    ) Error!Result {
+        const member_name = switch (binary.right.*) {
+            .identifier => |identifier| identifier,
+            else => {
+                try self.reportSourceError(
+                    source,
+                    Error.NotImplemented,
+                    .@"error",
+                    "member access expects an identifier on the right-hand side",
+                    .{},
+                );
+                return .fromValue(.void);
+            },
+        };
+
+        return self.compileMember(source, .{
+            .object = binary.left,
+            .member = member_name,
+            .span = binary.span,
+        });
     }
 
     fn compileStringLiteral(
@@ -1263,8 +1446,7 @@ pub const IRCompiler = struct {
 
         // return .fromValue(.{ .stream = s_tream });
         // return .fromValue(.{ .stream = undefined });
-        const result = try self.pop(source);
-        return .from(result);
+        return .from(ref.dereference());
     }
 
     fn parseInt(text: []const u8) std.fmt.ParseIntError!ir.Value {
@@ -1283,16 +1465,18 @@ pub const IRCompiler = struct {
         type_expr: ?ast.TypeExpr,
     ) Error!ir.Location {
         const frame = try self.scopes.getFrame(depth);
-        const index = frame.closure.items.len;
-        try frame.closure.append(self.allocator, binding);
+        const index = frame.closure_bindings.items.len;
+        try frame.closure_bindings.append(self.allocator, binding);
         var location: ir.Location = .initAdd(.closure, index, .{});
         if (type_expr) |te| location = location.typed(te);
-        try frame.declare(
-            self.allocator,
-            binding.identifier.name,
-            try .from(location),
-            is_mutable,
-        );
+        if (!frame.bindings.contains(binding.identifier.name)) {
+            try frame.declare(
+                self.allocator,
+                binding.identifier.name,
+                try .from(location),
+                is_mutable,
+            );
+        }
 
         return location;
     }
@@ -1320,27 +1504,67 @@ pub const IRCompiler = struct {
             return local_binding.result;
         }
 
-        const closure_value_location = try self.declareClosureValue(
-            .outer(identifier),
-            0,
-            source_binding.is_mutable,
-            source_binding.result.typeExpr(),
-        );
+        // Lexical scopes share the same runtime closure/frame. Only capture once we cross
+        // an actual closure boundary.
+        const current_frame = try self.scopes.getFrame(0);
+        var crossed_closure_boundary = current_frame.scope_type == .closure;
+        var depth: usize = 1;
+        while (true) : (depth += 1) {
+            const frame = self.scopes.getFrame(depth) catch break;
+            if (frame.bindings.getPtr(identifier.name)) |binding| {
+                if (!crossed_closure_boundary) {
+                    if (binding.is_mutable) {
+                        return binding.result.dereference();
+                    }
+                    return binding.result;
+                }
+                break;
+            }
+            if (frame.scope_type == .closure) {
+                crossed_closure_boundary = true;
+            }
+        }
 
-        var i: usize = 1;
-        while (self.lookup(identifier.name, .{ .shallow = true, .initial_depth = i }) == null) : (i += 1) {
-            _ = try self.declareClosureValue(
-                .outer(identifier),
-                i,
+        var binding_depth: ?usize = null;
+        depth = 1;
+        while (true) : (depth += 1) {
+            const frame = self.scopes.getFrame(depth) catch break;
+            if (frame.bindings.getPtr(identifier.name) != null) {
+                binding_depth = depth;
+                break;
+            }
+        }
+
+        const target_depth = binding_depth orelse unreachable;
+        var closure_depth = if (current_frame.scope_type == .closure) @as(usize, 0) else @as(usize, 1);
+        while ((try self.scopes.getFrame(closure_depth)).scope_type != .closure) : (closure_depth += 1) {}
+
+        var closure_value_location: ?ir.Location = null;
+        var source_depth = target_depth;
+        var depth_cursor = target_depth;
+        while (depth_cursor > closure_depth) : (depth_cursor -= 1) {
+            const frame = try self.scopes.getFrame(depth_cursor - 1);
+            if (frame.scope_type != .closure) continue;
+
+            const next_source_depth = source_depth - (depth_cursor - 1);
+            const location = try self.declareClosureValue(
+                .outer(identifier, next_source_depth),
+                depth_cursor - 1,
                 source_binding.is_mutable,
                 source_binding.result.typeExpr(),
             );
+            if (closure_value_location == null) {
+                closure_value_location = location;
+            }
+            source_depth = depth_cursor - 1;
         }
 
+        const closure_location = closure_value_location orelse unreachable;
+
         if (source_binding.is_mutable) {
-            return .from(closure_value_location.dereference());
+            return .from(closure_location.dereference());
         }
-        return .from(closure_value_location);
+        return .from(closure_location);
     }
 
     fn compileCall(
@@ -1416,35 +1640,41 @@ pub const IRCompiler = struct {
     }
 
     const MainClosureContext = struct {
-        index: usize,
+        instr_set: usize,
+        return_addr: ir.InstructionAddr,
     };
 
     const ClosureContext = struct {
-        saved_r: ir.Location,
         closure_ref: ir.Location,
-        index: usize,
+        instr_set: usize,
+        return_addr: ir.InstructionAddr,
     };
 
     fn compileCreateMainClosure(self: *IRCompiler) Error!MainClosureContext {
-        const index = self.currentInstrSet().instructions.items.len;
+        // const index = self.currentInstrSet().instructions.items.len;
+        const instr_set = try self.addInstructionSet();
+        try self.jmp(null, null, true, .initAbs(instr_set, 0));
+        const return_addr = try self.newLabel("main_closure_return", .abs);
 
         return .{
-            .index = index,
+            // .index = index,
+            .instr_set = instr_set,
+            .return_addr = return_addr,
         };
     }
 
     fn compileCreateClosure(self: *IRCompiler, source: anytype) Error!ClosureContext {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
-        const saved_r = try self.newRef(source, "closure_saved_r");
         const closure_ref = try self.newRef(source, "closure");
-        // self.currentFrame().rel_stack_counter -= 2;
-        const index = self.currentInstrSet().instructions.items.len;
+        const instr_set = try self.addInstructionSet();
+        try self.jmp(null, null, true, .initAbs(instr_set, 0));
+        const return_addr = try self.newLabel("closure_return", .abs);
 
         return .{
-            .saved_r = saved_r,
             .closure_ref = closure_ref,
-            .index = index,
+            .return_addr = return_addr,
+            .instr_set = instr_set,
         };
     }
 
@@ -1490,10 +1720,11 @@ pub const IRCompiler = struct {
             stderr,
             closure.closure_ref.dereference(),
         );
+        try self.compileClosurePostFork(source);
         // 4. switch to new instruction set
         const orig_instr_set = self.current_instruction_set;
         self.current_instruction_set = instr_set;
-        try self.scopes.push(self.allocator);
+        try self.scopes.push(self.allocator, .closure);
         //   5. compile expression into the new instruction set
         const result = try self.compileExpression(expr);
         //   6. set result binding to result of compilation
@@ -1514,16 +1745,16 @@ pub const IRCompiler = struct {
 
     fn setClosureIdentifiers(self: *IRCompiler) !void {
         const frame = try self.scopes.getFrame(0);
-        self.currentInstrSet().closure_slot_count = frame.closure.items.len;
+        self.currentInstrSet().closure_slot_count = frame.closure_bindings.items.len;
 
         var outer_count: usize = 0;
-        for (frame.closure.items) |binding| {
+        for (frame.closure_bindings.items) |binding| {
             if (binding.type == .outer) outer_count += 1;
         }
 
         const closure_captures = try self.allocator.alloc(ClosureCapture, outer_count);
         var i: usize = 0;
-        for (frame.closure.items, 0..) |binding, slot| {
+        for (frame.closure_bindings.items, 0..) |binding, slot| {
             if (binding.type != .outer) continue;
             closure_captures[i] = .{
                 .identifier = binding.identifier,
@@ -1558,10 +1789,11 @@ pub const IRCompiler = struct {
             .initAbs(exec_instr_set, 0),
             closure.closure_ref.dereference(),
         );
+        try self.compileClosurePostFork(source);
 
         const prev_instr_set = self.current_instruction_set;
         self.current_instruction_set = exec_instr_set;
-        try self.scopes.push(self.allocator);
+        try self.scopes.push(self.allocator, .closure);
 
         var it = std.mem.reverseIterator(arguments);
         while (it.next()) |arg_expr| {
@@ -1623,18 +1855,39 @@ pub const IRCompiler = struct {
         closure: MainClosureContext,
     ) Error!void {
         const frame = try self.scopes.getFrame(0);
-        const cl = frame.closure.items.len;
-        var instructions: std.ArrayList(ir.Instruction) = try .initCapacity(self.allocator, 4 + cl);
+        const cl = frame.closure_bindings.items.len;
 
-        // alloc 2
-        instructions.appendAssumeCapacity(.init(.from(source), .{ .alloc = cl }));
-        // set S3 = %r
-        instructions.appendAssumeCapacity(.init(.from(source), .{ .set = .{
-            .destination = .initAbs(.{ .stack = 3 }, .{}),
-            .source = .fromLocation(.initRegister(.r)),
-        } }));
+        const orig_instr_set = self.current_instruction_set;
+        self.current_instruction_set = closure.instr_set;
 
-        try self.currentInstrSet().insertSlice(self.allocator, closure.index, try instructions.toOwnedSlice(self.allocator));
+        try self.alloc(source, cl);
+        try self.set(source, .initAbs(.{ .stack = 3 }, .{}), .fromLocation(.initRegister(.r)));
+        try self.jmp(source, null, true, closure.return_addr);
+
+        self.current_instruction_set = orig_instr_set;
+
+        // var instructions: std.ArrayList(ir.Instruction) = try .initCapacity(self.allocator, 2);
+        //
+        // // alloc 2
+        // instructions.appendAssumeCapacity(.init(.from(source), .{ .alloc = cl }));
+        // // set S3 = %r
+        // instructions.appendAssumeCapacity(.init(.from(source), .{ .set = .{
+        //     .destination = .initAbs(.{ .stack = 3 }, .{}),
+        //     .source = .fromLocation(.initRegister(.r)),
+        // } }));
+        //
+        // try self.currentInstrSet().insertSlice(self.allocator, closure.index, try instructions.toOwnedSlice(self.allocator));
+    }
+
+    fn compileClosurePostFork(
+        self: *IRCompiler,
+        source: anytype,
+    ) Error!void {
+        const comment_message = try std.fmt.allocPrint(self.allocator, "{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+        try self.comment("{s}", .{comment_message});
+        try self.set(source, .initRegister(.r2), .fromLocation(.initRegister(.r)));
+        _ = try self.pop(source);
+        try self.set(source, .initRegister(.r), .fromLocation(.initRegister(.r2)));
     }
 
     fn compileClosureInitialization(
@@ -1643,54 +1896,33 @@ pub const IRCompiler = struct {
         closure: ClosureContext,
     ) Error!void {
         const frame = try self.scopes.getFrame(0);
-        const cl = frame.closure.items.len;
-        var pre_instructions: std.ArrayList(ir.Instruction) = try .initCapacity(self.allocator, 5 + cl);
+        const cl = frame.closure_bindings.items.len;
+
+        const orig_instr_set = self.current_instruction_set;
+        self.current_instruction_set = closure.instr_set;
 
         const comment_message = try std.fmt.allocPrint(self.allocator, "{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
-        pre_instructions.appendAssumeCapacity(.init(null, .{ .comment = comment_message }));
-        // set @@saved_r = %r
-        pre_instructions.appendAssumeCapacity(.init(.from(source), .{ .set = .{
-            .destination = closure.saved_r,
-            .source = .fromLocation(.initRegister(.r)),
-        } }));
-        // alloc 2
-        pre_instructions.appendAssumeCapacity(.init(.from(source), .{ .alloc = cl }));
-        // set @@closure = %r
-        pre_instructions.appendAssumeCapacity(.init(.from(source), .{ .set = .{
-            .destination = closure.closure_ref,
-            .source = .fromLocation(.initRegister(.r)),
-        } }));
-        // set [%r+0] = x
-        // set [%r+1] = y
-        for (0..cl) |i| pre_instructions.appendAssumeCapacity(.init(.from(source), .{ .set = .{
-            .destination = .initAdd(.{ .register = .r }, i, .{ .dereference = true }),
-            .source = self.lookup(frame.closure.items[i].identifier.name, .{
-                .shallow = true,
-                .initial_depth = frame.closure.items[i].depth,
-            }).?.result.source,
-        } }));
-        // set %r = @@saved_r
-        pre_instructions.appendAssumeCapacity(.init(.from(source), .{ .set = .{
-            .destination = .initRegister(.r),
-            .source = .fromLocation(closure.saved_r.dereference()),
-        } }));
-        // fork <5:0> [S0] [S1] [S2] @@closure
-        var post_instructions: std.ArrayList(ir.Instruction) = try .initCapacity(self.allocator, 4);
-        post_instructions.appendAssumeCapacity(.init(null, .{ .comment = comment_message }));
-        // set @@saved_r = %r
-        post_instructions.appendAssumeCapacity(.init(.from(source), .{ .set = .{
-            .destination = closure.saved_r,
-            .source = .fromLocation(.initRegister(.r)),
-        } }));
-        // pop
-        self.currentFrame().rel_stack_counter -= 1;
-        post_instructions.appendAssumeCapacity(.init(.from(source), .pop));
-        // pop
-        self.currentFrame().rel_stack_counter -= 1;
-        post_instructions.appendAssumeCapacity(.init(.from(source), .pop));
+        try self.comment("{s}", .{comment_message});
 
-        try self.currentInstrSet().insertSlice(self.allocator, closure.index + 1, try post_instructions.toOwnedSlice(self.allocator));
-        try self.currentInstrSet().insertSlice(self.allocator, closure.index, try pre_instructions.toOwnedSlice(self.allocator));
+        try self.set(source, .initRegister(.r2), .fromLocation(.initRegister(.r)));
+        try self.alloc(source, cl);
+        try self.set(source, closure.closure_ref, .fromLocation(.initRegister(.r)));
+
+        for (0..cl) |i| {
+            try self.set(
+                source,
+                .initAdd(.{ .register = .r }, i, .{ .dereference = true }),
+                self.lookup(frame.closure_bindings.items[i].identifier.name, .{
+                    .shallow = true,
+                    .initial_depth = frame.closure_bindings.items[i].depth,
+                }).?.result.source,
+            );
+        }
+
+        try self.set(source, .initRegister(.r), .fromLocation(.initRegister(.r2)));
+        try self.jmp(source, null, true, closure.return_addr);
+
+        self.current_instruction_set = orig_instr_set;
     }
 
     fn compileFunctionCall(
@@ -1914,8 +2146,9 @@ pub const IRCompiler = struct {
             self.threadStderr(),
             stage_closures[0].closure_ref.dereference(),
         );
+        try self.compileClosurePostFork(source);
         // TODO: Handle this more generically that also covers the other use cases for compiling closures. Right now this is handled in the compileClosureInitialization function. The following line (and the other lines following the same pattern in this function) is a special handling since we are compiling multiple closures at the same place consecutively.
-        self.currentFrame().rel_stack_counter -= 2;
+        // self.currentFrame().rel_stack_counter -= 2;
 
         for (refs[0 .. refs.len - 1], refs[1..], stage_sets[1..], 1..) |prev, curr, stage_set, i| {
             try self.comment("stage {}", .{i});
@@ -1928,8 +2161,9 @@ pub const IRCompiler = struct {
                 self.threadStderr(),
                 stage_closures[i].closure_ref.dereference(),
             );
+            try self.compileClosurePostFork(source);
             // TODO: As stated above, we need special handling here for the rel_stack_counter.
-            self.currentFrame().rel_stack_counter -= 2;
+            // self.currentFrame().rel_stack_counter -= 2;
         }
 
         try self.comment("last stage", .{});
@@ -1942,14 +2176,13 @@ pub const IRCompiler = struct {
             self.threadStderr(),
             last_closure.closure_ref.dereference(),
         );
+        try self.compileClosurePostFork(source);
         // TODO: As stated above, we need special handling here for the rel_stack_counter.
-        self.currentFrame().rel_stack_counter -= 2;
-
-        var n_instructions_diff: usize = 0;
+        // self.currentFrame().rel_stack_counter -= 2;
 
         for (stage_sets, stage_closures, pipeline.stages[0 .. pipeline.stages.len - 1], 0..) |*stage_set, *stage_closure, stage_expr, i| {
             self.current_instruction_set = stage_set.*;
-            try self.scopes.push(self.allocator);
+            try self.scopes.push(self.allocator, .closure);
             const result = try self.compileExpression(stage_expr);
 
             if (isWaitable(result)) |loc| {
@@ -1972,20 +2205,16 @@ pub const IRCompiler = struct {
 
             try self.setClosureIdentifiers();
             self.current_instruction_set = orig_instr_set;
-            stage_closure.index += n_instructions_diff;
-            const n_instructions_before = self.instruction_sets.items[self.current_instruction_set].instructions.items.len;
-            try self.comment("closure initialization stage {}: {}", .{ i, stage_closure.index });
+            try self.comment("closure initialization stage {}: {f}", .{ i, stage_closure.return_addr });
             try self.compileClosureInitialization(source, stage_closure.*);
-            const n_instructions_after = self.instruction_sets.items[self.current_instruction_set].instructions.items.len;
-            n_instructions_diff += n_instructions_after - n_instructions_before - 1;
             // TODO: As stated above, we need special handling here for the rel_stack_counter.
-            self.currentFrame().rel_stack_counter += 2;
+            // self.currentFrame().rel_stack_counter += 2;
             self.scopes.pop();
         }
         self.current_instruction_set = orig_instr_set;
 
         self.current_instruction_set = last_set;
-        try self.scopes.push(self.allocator);
+        try self.scopes.push(self.allocator, .closure);
         const result = try self.compileExpression(pipeline.stages[pipeline.stages.len - 1]);
         if (isWaitable(result)) |loc| {
             try self.comment("wait from {s} (last stage)", .{@src().fn_name});
@@ -1993,11 +2222,10 @@ pub const IRCompiler = struct {
         }
         try self.setClosureIdentifiers();
         self.current_instruction_set = orig_instr_set;
-        last_closure.index += n_instructions_diff;
-        try self.comment("closure initialization last stage: {}", .{last_closure.index});
+        try self.comment("closure initialization last stage: {f}", .{last_closure.return_addr});
         try self.compileClosureInitialization(source, last_closure);
         // TODO: As stated above, we need special handling here for the rel_stack_counter.
-        self.currentFrame().rel_stack_counter += 2;
+        // self.currentFrame().rel_stack_counter += 2;
         self.scopes.pop();
 
         return .from(last_fork_handle);
@@ -2047,10 +2275,11 @@ pub const IRCompiler = struct {
             self.threadStderr(),
             closure.closure_ref.dereference(),
         );
+        try self.compileClosurePostFork(source);
 
         const orig_instr_set = self.current_instruction_set;
         self.current_instruction_set = block_set;
-        try self.scopes.push(self.allocator);
+        try self.scopes.push(self.allocator, .closure);
 
         const block_stdout_thread = try self.forkInherit(source, self.stdoutStreamSet(), .noll);
         const block_stdout_thread_ref = try self.newRef(source, "block_stdout_thread");
@@ -2079,7 +2308,11 @@ pub const IRCompiler = struct {
         try self.compileClosureInitialization(source, closure);
         self.scopes.pop();
 
-        return .from(block_result);
+        try self.set(source, .initRegister(.r2), .from(block_result));
+        _ = try self.pop(source);
+        try self.set(source, .initRegister(.r), .fromLocation(.initRegister(.r2)));
+
+        return .fromLocation(.initRegister(.r));
     }
 
     fn compileFnDecl(
@@ -2092,7 +2325,7 @@ pub const IRCompiler = struct {
         const instr_set = try self.addInstructionSet();
         const orig_instr_set = self.current_instruction_set;
         self.current_instruction_set = instr_set;
-        try self.scopes.push(self.allocator);
+        try self.scopes.push(self.allocator, .closure);
 
         for (fn_decl.params._non_variadic) |param| {
             switch (param.pattern.*) {
@@ -2160,12 +2393,7 @@ pub const IRCompiler = struct {
 
                 const ref = try self.newRef(source, "ath_result");
 
-                try self.addInstruction(.init(.from(source), .{ .ath = .{
-                    .op = .from(binary.op),
-                    .a = left.source,
-                    .b = right.source,
-                    .result = ref,
-                } }));
+                try self.ath(source, binary.op, left.source, right.source, ref);
 
                 return .from(ref.dereference());
             },
@@ -2201,12 +2429,7 @@ pub const IRCompiler = struct {
 
                 const ref = try self.newRef(source, "cmp_result");
 
-                try self.addInstruction(.init(.from(source), .{ .cmp = .{
-                    .op = .from(binary.op),
-                    .a = left.source,
-                    .b = right.source,
-                    .result = ref,
-                } }));
+                try self.cmp(source, binary.op, left.source, right.source, ref);
 
                 return .from(ref.dereference());
             },
@@ -2242,7 +2465,7 @@ pub const IRCompiler = struct {
 
                 try self.addInstruction(.init(.from(source), .{ .ath = .{
                     .op = .add,
-                    .a = left.source,
+                    .a = .from(left_ref.dereference()),
                     .b = right.source,
                     .result = .initRegister(.r2),
                 } }));
@@ -2260,7 +2483,7 @@ pub const IRCompiler = struct {
                 try self.log(@src().fn_name ++ ": error, encountered {t} binary expression", .{binary.op});
                 try self.logEvaluateSpan(binary.span);
             },
-            .member => {},
+            .member => return self.compileMemberBinary(source, binary),
         }
 
         try self.reportSourceError(source, Error.UnsupportedBinaryOperation, .@"error", "binary operator \"{t}\" not yet supported", .{binary.op});
@@ -2287,6 +2510,239 @@ pub const IRCompiler = struct {
         resolved_element_type.* = element_type orelse .global(.void);
         const array_result = try self.pop(source);
         return .from(array_result.typed(array_type(resolved_element_type)));
+    }
+
+    const ForSource = struct {
+        kind: enum { array, range },
+        value_type: ?ast.TypeExpr,
+        base_ref: ?ir.Location = null,
+        start_ref: ?ir.Location = null,
+        len_ref: ?ir.Location = null,
+    };
+
+    fn compileForSource(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        for_source: *ast.Expression,
+        index: usize,
+    ) Error!ForSource {
+        switch (for_source.*) {
+            .range => |range| {
+                const start_result = try self.compileExpression(range.start);
+                const start_ref = try self.newRef(source, try std.fmt.allocPrint(self.allocator, "for_source_{}_range_start", .{index}));
+                try self.set(source, start_ref, start_result.source);
+
+                var len_ref: ?ir.Location = null;
+                if (range.end) |end_expr| {
+                    const end_result = try self.compileExpression(end_expr);
+                    const end_ref = try self.newRef(source, try std.fmt.allocPrint(self.allocator, "for_source_{}_range_end", .{index}));
+                    try self.set(source, end_ref, end_result.source);
+
+                    const range_len_ref = try self.newRef(source, try std.fmt.allocPrint(self.allocator, "for_source_{}_range_len", .{index}));
+                    try self.ath(
+                        source,
+                        .subtract,
+                        .from(end_ref.dereference()),
+                        .from(start_ref.dereference()),
+                        range_len_ref,
+                    );
+                    if (range.inclusive_end) {
+                        try self.set(source, .initRegister(.r2), .from(range_len_ref.dereference()));
+                        try self.inc(source);
+                        try self.set(source, range_len_ref, .fromLocation(.initRegister(.r2)));
+                    }
+                    len_ref = range_len_ref;
+                }
+
+                return .{
+                    .kind = .range,
+                    .start_ref = start_ref,
+                    .len_ref = len_ref,
+                    .value_type = ast.TypeExpr.global(.integer),
+                };
+            },
+            else => {
+                const source_result = try self.compileExpression(for_source);
+
+                if (source_result.source != .location or source_result.source.location.options.type_expr != .array) {
+                    try self.reportSourceError(source, Error.NotImplemented, .@"error", "for loops with source type \"{t}\" not yet implemented", .{for_source.*});
+                    return .{
+                        .kind = .array,
+                        .value_type = null,
+                    };
+                }
+
+                const source_ref = try self.newRef(source, try std.fmt.allocPrint(self.allocator, "for_source_{}", .{index}));
+                try self.set(source, source_ref, source_result.source);
+
+                const len_ref = try self.newRef(source, try std.fmt.allocPrint(self.allocator, "for_source_{}_len", .{index}));
+                try self.set(source, .initRegister(.r2), .fromLocation(source_ref.dereference()));
+                try self.set(source, len_ref, .fromLocation(.initAbs(.{ .register = .r2 }, .{ .dereference = true })));
+
+                return .{
+                    .kind = .array,
+                    .base_ref = source_ref,
+                    .len_ref = len_ref,
+                    .value_type = source_result.typeExpr().?.array.element.*,
+                };
+            },
+        }
+    }
+
+    fn compileForBindingValue(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        for_source: ForSource,
+        counter_ref: ir.Location,
+        binding: ast.Identifier,
+        capture_ref: ir.Location,
+    ) Error!void {
+        switch (for_source.kind) {
+            .array => {
+                const source_ref = for_source.base_ref.?;
+                try self.set(
+                    source,
+                    .initRegister(.r2),
+                    .fromLocation(source_ref.dereference()),
+                );
+                try self.ath(
+                    source,
+                    .add,
+                    .fromLocation(.initRegister(.r2)),
+                    .from(counter_ref.dereference()),
+                    .initRegister(.r2),
+                );
+                try self.inc(source);
+                try self.set(source, capture_ref, .fromLocation(.initAbs(.{ .register = .r2 }, .{ .dereference = true })));
+            },
+            .range => {
+                try self.ath(
+                    source,
+                    .add,
+                    .from(for_source.start_ref.?.dereference()),
+                    .from(counter_ref.dereference()),
+                    capture_ref,
+                );
+            },
+        }
+
+        try self.compileIdentifierBinding(
+            source,
+            binding,
+            .from(capture_ref.dereference().typed(for_source.value_type)),
+            false,
+        );
+    }
+
+    fn compileForIterationsRef(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        for_sources: []const ForSource,
+    ) Error!?ir.Location {
+        var iterations_ref: ?ir.Location = null;
+
+        for (for_sources, 0..) |for_source, i| {
+            const len_ref = for_source.len_ref orelse continue;
+            if (iterations_ref == null) {
+                iterations_ref = try self.newRef(source, "for_iterations");
+                try self.set(source, iterations_ref.?, .from(len_ref.dereference()));
+                continue;
+            }
+
+            try self.cmp(
+                source,
+                .less,
+                .from(len_ref.dereference()),
+                .from(iterations_ref.?.dereference()),
+                .initRegister(.r2),
+            );
+            const keep_iterations_label = try self.newLabel(
+                try std.fmt.allocPrint(self.allocator, "for_keep_iterations_{}", .{i}),
+                .unknown,
+            );
+            try self.jmp(source, .fromLocation(.initRegister(.r2)), false, keep_iterations_label);
+            try self.set(source, iterations_ref.?, .from(len_ref.dereference()));
+            try self.setLabel(keep_iterations_label.local_addr.label, .abs);
+        }
+
+        return iterations_ref;
+    }
+
+    fn compileForLoop(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        for_expr: ast.ForExpr,
+    ) Error!Result {
+        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+        const for_sources = try self.allocator.alloc(ForSource, for_expr.sources.len);
+        defer self.allocator.free(for_sources);
+        for (for_expr.sources, 0..) |for_source_expr, i| {
+            for_sources[i] = try self.compileForSource(source, for_source_expr, i);
+        }
+        const capture_refs = try self.allocator.alloc(?ir.Location, for_expr.capture.bindings.len);
+        defer self.allocator.free(capture_refs);
+        for (for_expr.capture.bindings, 0..) |capture, i| {
+            capture_refs[i] = switch (capture.*) {
+                .identifier => try self.newRef(source, try std.fmt.allocPrint(self.allocator, "for_capture_{}", .{i})),
+                .discard => null,
+                .tuple, .record => unreachable,
+            };
+        }
+
+        const counter_ref = try self.newRef(source, "for_counter");
+        try self.set(source, counter_ref, .fromValue(.{ .uinteger = 0 }));
+        const iterations_ref = try self.compileForIterationsRef(source, for_sources) orelse {
+            try self.reportSourceError(source, Error.NotImplemented, .@"error", "for loops require at least one finite source", .{});
+            return .fromValue(.void);
+        };
+
+        const after_label = try self.newLabel("for_after", .unknown);
+        const for_label = try self.newLabel("for", .abs);
+
+        try self.cmp(source, .less, .from(counter_ref.dereference()), .from(iterations_ref.dereference()), .initRegister(.r2));
+        try self.jmp(source, .fromLocation(.initRegister(.r2)), false, after_label);
+
+        // 1. Create new bindings scope for for body
+
+        try self.scopes.push(self.allocator, .lexical);
+
+        // 2. Declare bindings for source captures
+
+        for (for_expr.capture.bindings, for_sources, 0..) |capture, for_source, i| {
+            switch (capture.*) {
+                .discard => {},
+                .identifier => |identifier| try self.compileForBindingValue(
+                    source,
+                    for_source,
+                    counter_ref,
+                    identifier,
+                    capture_refs[i].?,
+                ),
+                .tuple, .record => unreachable,
+            }
+        }
+
+        // 4. Compile for body as statement
+
+        const for_body_result = try self.compileExpression(for_expr.body);
+
+        if (isWaitable(for_body_result)) |loc| {
+            try self.wait(source, loc);
+        }
+
+        // 5. Pop bindings scope
+
+        self.scopes.pop();
+
+        try self.set(source, .initRegister(.r2), .from(counter_ref.dereference()));
+        try self.inc(source);
+        try self.set(source, counter_ref, .fromLocation(.initRegister(.r2)));
+        try self.jmp(source, null, true, for_label);
+
+        try self.setLabel(after_label.local_addr.label, .abs);
+
+        // TODO: return something like the block compilation is doing
+        return .fromValue(.void);
     }
 
     fn analyzeExpressionEffects(
