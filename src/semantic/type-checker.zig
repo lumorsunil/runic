@@ -758,7 +758,7 @@ pub const TypeChecker = struct {
             .failed => {},
             .identifier => return error.UnresolvedTypeLiteral,
             .optional => return error.MemberAccessOnOptional,
-            .promise, .error_union, .error_set, .err, .array, .struct_type, .tuple, .function, .integer, .float, .boolean, .byte, .alias, .void => return error.UnsupportedMemberAccess,
+            .promise, .error_union, .error_set, .err, .array, .struct_type, .tuple, .function, .integer, .float, .boolean, .byte, .alias, .thread, .void => return error.UnsupportedMemberAccess,
             .module => |module| try self.runModuleMemberAccess(module, &member.member),
             .execution => |execution| try self.runExecutionMemberAccess(execution, &member.member),
             // .lazy => {
@@ -1056,6 +1056,7 @@ pub const TypeChecker = struct {
 
         try switch (binding_type.*) {
             .failed => {},
+            .thread => unreachable,
             .void => |*void_| self.validateTypeAssignmentVoid(
                 void_,
                 assignment_type,

@@ -2,9 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const utils = @import("main-utils.zig");
 const runic = @import("runic");
-const ScriptExecutor = runic.interpreter.ScriptExecutor;
 const FrontendDocumentStore = runic.document.FrontendDocumentStore;
-const Parser = runic.parser.Parser;
 const TypeChecker = runic.semantic.TypeChecker;
 const rainbow = runic.rainbow;
 const ast = runic.ast;
@@ -12,6 +10,8 @@ const Stream = runic.stream.Stream;
 const closeable = runic.closeable;
 const ExitCode = runic.command_runner.ExitCode;
 const TraceWriter = runic.TraceWriter;
+const Tracer = runic.trace.Tracer;
+const ir = runic.ir;
 
 const log_enabled = false;
 
@@ -24,9 +24,10 @@ pub fn runScript(
     allocator: Allocator,
     script: utils.CliConfig.ScriptInvocation,
     config: utils.CliConfig,
-    // stdin: *std.Io.Reader,
+    stdin: *std.Io.Reader,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
+    tracer: *Tracer,
 ) !ExitCode {
     var env_map = std.process.getEnvMap(allocator) catch |err| {
         try stderr.print("error: unable to capture environment: {s}\n", .{@errorName(err)});
@@ -45,13 +46,26 @@ pub fn runScript(
     defer allocator.free(script_dir);
 
     if (config.print_tokens) {
+        if (script.source) |source| {
+            utils.printScriptTokens(allocator, stdout, script.path, source) catch |err| {
+                try stderr.print(
+                    "error: failed to print tokens for inline script '{s}': {s}\n",
+                    .{ script.path, @errorName(err) },
+                );
+                return .fromByte(1);
+            };
+            return .success;
+        }
         return .fromByte(try printTokens(allocator, stdout, stderr, script.path));
     }
 
     var document_store = FrontendDocumentStore.init(allocator);
     defer document_store.deinit();
-    const entryDocument = try document_store.requestDocument(script.path);
-    const resolvedPath = try document_store.resolvePath(script.path);
+    const entryDocument = if (script.source) |source|
+        try document_store.putDocument(script.path, source)
+    else
+        try document_store.requestDocument(script.path);
+    const resolvedPath = entryDocument.path;
     const parser_result = entryDocument.parser.parseScript(resolvedPath);
     const script_ast = try processResult(&document_store.document_store, stderr, parser_result) orelse return .fromByte(1);
 
@@ -100,11 +114,32 @@ pub fn runScript(
     const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(cwd);
 
-    const stdout_stream = try Stream(u8).initReaderWriter(allocator, "<<<stdout_pipe>>>");
+    const stdin_stream = try Stream(u8).initReaderWriter(allocator, "<<<stdin_pipe>>>", .{
+        .close_source = false,
+        .disconnect_source = false,
+        .close_destination = true,
+        .disconnect_destination = true,
+        .keep_open = true,
+    }, tracer);
+    defer stdin_stream.stream.deinit();
+    const stdout_stream = try Stream(u8).initReaderWriter(allocator, "<<<stdout_pipe>>>", .{
+        .close_source = true,
+        .disconnect_source = true,
+        .close_destination = false,
+        .disconnect_destination = false,
+        .keep_open = true,
+    }, tracer);
     defer stdout_stream.stream.deinit();
-    const stderr_stream = try Stream(u8).initReaderWriter(allocator, "<<<stderr_pipe>>>");
+    const stderr_stream = try Stream(u8).initReaderWriter(allocator, "<<<stderr_pipe>>>", .{
+        .close_source = true,
+        .disconnect_source = true,
+        .close_destination = false,
+        .disconnect_destination = false,
+        .keep_open = true,
+    }, tracer);
     defer stderr_stream.stream.deinit();
 
+    var stdin_closeable = closeable.NeverCloses(ExitCode){ .label = "<<<stdin>>>" };
     var stdout_closeable = closeable.NeverCloses(ExitCode){ .label = "<<<stdout>>>" };
     var stderr_closeable = closeable.NeverCloses(ExitCode){ .label = "<<<stderr>>>" };
 
@@ -113,6 +148,10 @@ pub fn runScript(
     var wrapped_stdout = TraceWriter.init(&wrapped_stdout_buffer, stdout, "<<<t_stdout>>>");
     var wrapped_stderr = TraceWriter.init(&wrapped_stderr_buffer, stderr, "<<<t_stderr>>>");
 
+    const stdin_closeable_reader = closeable.CloseableReader(ExitCode).init(
+        stdin,
+        &stdin_closeable.closeable,
+    );
     const stdout_closeable_writer = closeable.CloseableWriter(ExitCode).init(
         &wrapped_stdout.writer,
         &stdout_closeable.closeable,
@@ -122,95 +161,43 @@ pub fn runScript(
         &stderr_closeable.closeable,
     );
 
+    try stdin_stream.connectSource(stdin_closeable_reader);
     try stdout_stream.connectDestination(stdout_closeable_writer);
     try stderr_stream.connectDestination(stderr_closeable_writer);
 
     log("stdout >>> {*}", .{&wrapped_stdout.writer});
     log("stderr >>> {*}", .{&wrapped_stderr.writer});
 
-    const executeOptions = ScriptExecutor.ExecuteOptions.init(
-        script.path,
-        cwd,
-        env_map,
-        .init(
-            // TODO: connect up stdin from parent process
-            // .init(stdin, .streaming),
-            .blocked(),
-            .init(stdout_stream, .streaming),
-            .init(stderr_stream, .streaming),
-        ),
-    );
+    var result: ir.runner.RunResult = .{ .success = .success };
+    defer result.deinit();
 
-    entryDocument.script_executor = ScriptExecutor.initWithRunner(
-        allocator,
-        entryDocument.path,
-        &env_map,
-        executeOptions,
-        &document_store.document_store,
-    ) catch |err| {
-        try stderr.print(
-            "error: failed to initialize script executor: {s}\n",
-            .{@errorName(err)},
+    if (config.debug_ir) {
+        result = try ir.runner.debugIR(
+            allocator,
+            &entryDocument.ast.?,
+            &document_store.document_store,
+            stdin_stream,
+            stdout_stream,
+            stderr_stream,
+            tracer,
         );
-        return .fromByte(1);
-    };
-    var executor: *ScriptExecutor = undefined;
-    if (entryDocument.script_executor) |*script_executor| executor = script_executor else return .{ .err = error.ExecutorNotDefined };
-
-    executor.wireCommandBridge(entryDocument.script_executor.?.scopes);
-    // try executor.reseedFromContext(&context);
-
-    var builtin_arena = std.heap.ArenaAllocator.init(allocator);
-    defer builtin_arena.deinit();
-    try addBuiltinFns(builtin_arena.allocator(), executor.scopes);
-
-    return try executor.execute(script_ast, executeOptions);
-}
-
-fn declareBuiltinFn(
-    allocator: std.mem.Allocator,
-    scopes: *runic.interpreter.ScopeStack,
-    name: []const u8,
-    params: []const []const u8,
-) !void {
-    const identifier: ast.Identifier = .{ .name = name, .span = .global };
-    const params_slice = try allocator.alloc(*ast.Parameter, params.len);
-    for (params, 0..) |param, i| {
-        params_slice[i] = try allocator.create(ast.Parameter);
-        const pattern = try allocator.create(ast.BindingPattern);
-        pattern.* = .{ .identifier = .{ .name = param, .span = .global } };
-        params_slice[i].* = .{
-            .span = .global,
-            .is_mutable = false,
-            .pattern = pattern,
-            .type_annotation = null,
-            .default_value = null,
-        };
+    } else {
+        result = try ir.runner.runIR(
+            allocator,
+            &document_store.document_store,
+            &entryDocument.ast.?,
+            .{
+                .verbose = config.verbose,
+                .dry_run = config.dry_run,
+                .stdin = stdin_stream,
+                .stdout = stdout_stream,
+                .stderr = stderr_stream,
+                .tracer = tracer,
+            },
+        );
     }
-    const inspect_params: ast.FunctionDecl.Parameters = .nonVariadic(params_slice);
-    const inspect_body = try allocator.create(runic.ast.Expression);
-    inspect_body.* = .{ .builtin = .{ .tag = std.meta.stringToEnum(ast.BuiltinExpr.Tag, name).?, .span = .global } };
-    const inspect_decl = try allocator.create(runic.ast.FunctionDecl);
-    inspect_decl.* = .{
-        .body = inspect_body,
-        .name = identifier,
-        .span = .global,
-        .params = inspect_params,
-        .return_type = null,
-        .stdin_type = null,
-    };
-    var inspect_value: runic.interpreter.Value = .{ .function = try .init(allocator, .{
-        .fn_decl = inspect_decl,
-        .closure = null,
-    }, .{}) };
-    try scopes.declare(identifier.name, &inspect_value, false);
-}
 
-fn addBuiltinFns(
-    allocator: std.mem.Allocator,
-    scopes: *runic.interpreter.ScopeStack,
-) !void {
-    try declareBuiltinFn(allocator, scopes, "inspect", &.{"value"});
+    return try processResult(&document_store.document_store, stdout, result) orelse .fromByte(1);
 }
 
 const StatementExpressionIterator = struct {
@@ -365,17 +352,17 @@ fn processResult(
         .err => |err_info| {
             const diagnostics = err_info.diagnostics();
             for (diagnostics) |d| {
-                const span = d.span();
-                const source = document_store.getSource(span.start.file) catch |err| brk: {
+                const maybe_span: ?ast.Span = d.span();
+                const source = if (maybe_span) |span| document_store.getSource(span.start.file) catch |err| brk: {
                     try writer.print("<error getting document {s} : {}>", .{ span.start.file, err });
                     break :brk null;
-                };
+                } else null;
                 try writer.print("[{s}]: ", .{d.severity()});
-                logFileLineAndCol(writer, span) catch |err| {
+                if (maybe_span) |span| logFileLineAndCol(writer, span) catch |err| {
                     try writer.print("<error logging file path : {}>", .{err});
                 };
                 try writer.print(" {s}\n", .{d.message});
-                try if (source) |src| logSpan(writer, span, src) else writer.writeAll("<unable to get the source>\n\n");
+                try if (source) |src| if (maybe_span) |span| logSpan(writer, span, src) else writer.writeAll("<unable to get the source>\n\n");
                 try writer.flush();
             }
             return null;
@@ -436,55 +423,6 @@ fn printTokens(allocator: Allocator, stdout: *std.Io.Writer, stderr: *std.Io.Wri
     };
 
     return 0;
-}
-
-fn handleParseScriptError(
-    parser: *const Parser,
-    stderr: *std.Io.Writer,
-    err: anyerror,
-) !void {
-    const lexer = parser.stream.lexer;
-    const line = lexer.line;
-    const column = lexer.column;
-    const contents = parser.source;
-
-    const source_line = blk: {
-        var current_line: usize = 1;
-        var start: usize = 0;
-        var i: usize = 0;
-        while (i < contents.len and current_line < line) : (i += 1) {
-            if (contents[i] == '\n') {
-                current_line += 1;
-                start = i + 1;
-            }
-        }
-        if (current_line != line or start >= contents.len) break :blk "";
-        var end = start;
-        while (end < contents.len and contents[end] != '\n' and contents[end] != '\r') : (end += 1) {}
-        break :blk contents[start..end];
-    };
-
-    try stderr.print(
-        "error: failed to parse script '{s}' at line {d}, column {d}: {s}",
-        .{ parser.path, line, column, @errorName(err) },
-    );
-    const expected = parser.expectedTokens();
-    if (expected.len > 0) {
-        try stderr.writeAll("\n       ");
-        _ = try parser.writeExpectedTokens(stderr);
-        try stderr.writeByte('\n');
-    }
-    try parser.writeBreadcrumbTrail(stderr);
-    try stderr.writeByte('\n');
-    if (source_line.len > 0) {
-        try stderr.print("   {s}\n   ", .{source_line});
-        var spaces: usize = if (column > 1) column - 2 else 0;
-        while (spaces > 0) : (spaces -= 1) {
-            try stderr.writeByte(' ');
-        }
-        try stderr.print("^\n", .{});
-    }
-    try stderr.flush();
 }
 
 const span_color = rainbow.beginBgColor(.red) ++ rainbow.beginColor(.black);

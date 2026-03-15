@@ -1,4 +1,11 @@
+echo "hello"
+
 const s = {
+  echo "hello"
+  echo "hello again"
+} | cat
+
+{
   echo "hello"
   echo "hello again"
 }

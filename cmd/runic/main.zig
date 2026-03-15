@@ -2,8 +2,15 @@ const std = @import("std");
 const utils = @import("main-utils.zig");
 const dispatch = @import("dispatch.zig").dispatch;
 const runic = @import("runic");
+const PipeReader = runic.process.PipeReader;
+const signals = runic.signals;
+
+pub const std_options = std.Options{
+    .logFn = log,
+};
 
 pub fn main() !void {
+    signals.init(std.heap.page_allocator);
     const exit_code = mainImpl() catch |err| {
         std.log.err("runic exited with error: {t}", .{err});
         std.process.exit(1);
@@ -22,16 +29,20 @@ fn mainImpl() !runic.command_runner.ExitCode {
 
     const allocator = gpa.allocator();
 
-    // var stdin_buffer: [1024]u8 = undefined;
+    var tracer = runic.trace.Tracer.init(allocator, .{ .echo_to_stdout = false });
+    defer tracer.deinit();
+
+    var stdin_buffer: [1024]u8 = undefined;
     var stdout_buffer: [1024]u8 = undefined;
     var stderr_buffer: [1024]u8 = undefined;
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
 
-    // var stdin_reader = std.fs.File.stdin().readerStreaming(&stdin_buffer);
+    // var stdin_reader = std.fs.File.stdin().reader(&stdin_buffer);
+    var stdin_reader = PipeReader.init(std.fs.File.stdin(), &stdin_buffer, &tracer);
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
-    // const stdin = &stdin_reader.interface;
+    const stdin = &stdin_reader.reader;
     const stdout = &stdout_writer.interface;
     const stderr = &stderr_writer.interface;
     defer stdout.flush() catch {};
@@ -55,15 +66,70 @@ fn mainImpl() !runic.command_runner.ExitCode {
                 var cfg = config;
                 cfg.deinit(allocator);
             }
+
+            const orig_termios = if (config.debug_ir) try enableRawMode() else null;
+            defer if (orig_termios) |t| restoreTermios(t) catch |err| {
+                std.log.err("Couldn't restore terminal attributes: {}", .{err});
+            };
+
             return try dispatch(
                 allocator,
                 config,
-                // stdin,
+                stdin,
                 stdout,
                 stderr,
+                &tracer,
             );
         },
     }
 
     return .success;
+}
+
+fn enableRawMode() !?std.posix.termios {
+    const stdin = std.fs.File.stdin();
+    const is_tty = stdin.isTty();
+    if (!is_tty) return null;
+    if (@import("builtin").os.tag != .linux) return;
+    var raw = try std.posix.tcgetattr(stdin.handle);
+    const orig = raw;
+    raw.iflag.BRKINT = true;
+    raw.iflag.ICRNL = true;
+    raw.iflag.INPCK = false;
+    raw.iflag.ISTRIP = false;
+    raw.iflag.IXON = false;
+    raw.oflag.OPOST = true;
+    raw.oflag.ONLCR = true;
+    raw.oflag.OCRNL = false;
+    raw.oflag.ONLRET = false;
+    raw.cflag.CSIZE = .CS8;
+    raw.cflag.CREAD = true;
+    raw.cflag.CLOCAL = true;
+    raw.lflag.ECHO = false;
+    raw.lflag.ECHONL = false;
+    raw.lflag.ICANON = false;
+    raw.lflag.IEXTEN = false;
+    raw.lflag.ISIG = true;
+    try std.posix.tcsetattr(stdin.handle, .FLUSH, raw);
+    return orig;
+}
+
+fn restoreTermios(termios: std.posix.termios) !void {
+    const stdin = std.fs.File.stdin();
+    const is_tty = stdin.isTty();
+    if (!is_tty) return;
+    if (@import("builtin").os.tag != .linux) return;
+    try std.posix.tcsetattr(stdin.handle, .FLUSH, termios);
+}
+
+pub fn log(
+    comptime _: std.log.Level,
+    comptime _: @Type(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    var buffer: [64]u8 = undefined;
+    const stderr = std.debug.lockStderrWriter(&buffer);
+    defer std.debug.unlockStderrWriter();
+    nosuspend stderr.print(format ++ "\n", args) catch return;
 }

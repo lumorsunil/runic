@@ -1,0 +1,10 @@
+{
+  cat
+  echo "something"
+  echo "something"
+  echo "hello"
+  echo "something"
+  echo "hello"
+  tail "-f" "server.log"
+  echo "something"
+} | grep "hello"

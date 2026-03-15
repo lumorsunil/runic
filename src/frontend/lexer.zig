@@ -457,7 +457,7 @@ pub const Lexer = struct {
         if (self.match('=')) {
             return self.finish(.startAt(start), .rem_assign);
         }
-        return self.finish(.startAt(start), .slash);
+        return self.finish(.startAt(start), .percent);
     }
 
     fn lexBang(self: *Lexer) token.Token {

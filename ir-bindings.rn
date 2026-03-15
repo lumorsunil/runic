@@ -1,0 +1,10 @@
+const s = "w${"o"}rld!"
+const x = "hello, ${s}"
+echo "${x}"
+
+{
+  const y = "from block ${"thread"}"
+
+  // echo "${"${x}"} (from block): ${y}"
+  echo "${x} (${y})"
+}

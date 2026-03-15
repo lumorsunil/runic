@@ -1,0 +1,9 @@
+var x: Int = 3
+
+fn Void modify_x() Void x = 1
+
+echo "x = ${x}"
+
+modify_x
+
+echo "x = ${x}"

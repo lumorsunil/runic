@@ -1,0 +1,1 @@
+tail "-F" "server.log" | grep "hello"

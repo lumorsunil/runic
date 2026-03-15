@@ -1,0 +1,17 @@
+const y = 3
+var x = 5
+x = x + 5 + y
+
+{
+  x = x + 2
+  echo "y = ${y}"
+  echo "x = ${x}"
+}
+
+echo "x = ${x}"
+
+// echo "${y}"
+// echo "${x}"
+
+//
+// echo "${x}"

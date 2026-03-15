@@ -9,6 +9,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    runtime.addImport("runic", runtime);
 
     const lsp = b.addModule("runic_lsp", .{
         .root_source_file = b.path("src/lsp/root.zig"),

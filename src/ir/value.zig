@@ -1,0 +1,320 @@
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const ExitCode = @import("../runtime/command_runner.zig").ExitCode;
+const endian = @import("constants.zig").endian;
+const TypeAddr = @import("type-addr.zig").TypeAddr;
+const Location = @import("location.zig").Location;
+const LocationMod = @import("location.zig").LocationMod;
+const Register = @import("location.zig").Register;
+const ReaderWriterStream = @import("../stream.zig").ReaderWriterStream;
+const Closeable = @import("../closeable.zig").Closeable;
+const InstructionAddr = @import("instruction-addr.zig").InstructionAddr;
+
+pub const Value = union(enum) {
+    void,
+    uinteger: usize,
+    // TODO: decide on f32 or f64?
+    float: f64,
+    slice: Slice,
+    executable: Slice,
+    strct: Struct,
+    exit_code: ExitCode,
+    pipe: usize,
+    closeable: usize,
+    addr: usize,
+    stream: ValueSlice,
+    thread: usize,
+    fn_ref: FunctionRef,
+    zig_string: []const u8,
+    // register: Register,
+    // dereference: union(enum) {
+    //     addr: usize,
+    //     register: Register,
+    //
+    //     pub fn applyMod(self: @This(), mod: LocationMod) @This() {
+    //         return switch (self) {
+    //             .addr => |addr| .{ .addr = mod.apply(addr) },
+    //             .register => |reg| .{ .register = .{
+    //                 .abs = reg.abs,
+    //                 .mod = mod.merge(reg.mod),
+    //             } },
+    //         };
+    //     }
+    // },
+
+    pub fn deinit(self: *@This(), allocator: Allocator) void {
+        switch (self.*) {
+            .void, .location, .uinteger, .slice, .executable, .exit_code, .addr, .thread => {},
+            .strct => |strct| strct.deinit(allocator),
+            .stream => |stream| allocator.free(stream),
+        }
+    }
+
+    pub fn isNumber(self: @This()) bool {
+        return switch (self) {
+            .uinteger => true,
+            .float => true,
+            else => false,
+        };
+    }
+
+    pub fn toFloat(self: @This()) ?f64 {
+        return switch (self) {
+            .uinteger => |uinteger| @floatFromInt(uinteger),
+            .float => |float| float,
+            else => null,
+        };
+    }
+
+    pub const Slice = struct {
+        addr: usize,
+        element_size: usize,
+        len: usize,
+
+        pub fn empty(element_size: usize) @This() {
+            return Slice{
+                .addr = 0,
+                .element_size = element_size,
+                .len = 0,
+            };
+        }
+
+        pub fn size() usize {
+            return @sizeOf(usize) + @sizeOf(usize);
+        }
+
+        pub fn serialize(self: @This(), w: *std.Io.Writer) !void {
+            try w.writeInt(usize, self.addr, endian);
+            try w.writeInt(usize, self.len, endian);
+        }
+
+        pub fn deserialize(
+            element_size: usize,
+            r: *std.Io.Reader,
+        ) std.Io.Reader.Error!@This() {
+            const addr = try r.takeInt(usize, endian);
+            const len = try r.takeInt(usize, endian);
+
+            return .{
+                .addr = addr,
+                .element_size = element_size,
+                .len = len,
+            };
+        }
+
+        pub fn format(self: @This(), w: *std.Io.Writer) !void {
+            try w.print("[{x}..+{}]u8", .{
+                self.addr,
+                self.len,
+            });
+        }
+    };
+
+    pub const ValueSlice = struct {
+        addr: usize,
+        len: usize,
+
+        pub const empty = @This(){ .addr = 0, .len = 0 };
+
+        pub fn serialize(self: @This(), w: *std.Io.Writer) !void {
+            try w.writeInt(usize, self.addr, endian);
+            try w.writeInt(usize, self.len, endian);
+        }
+
+        pub fn deserialize(
+            r: *std.Io.Reader,
+        ) std.Io.Reader.Error!@This() {
+            const addr = try r.takeInt(usize, endian);
+            const len = try r.takeInt(usize, endian);
+
+            return .{
+                .addr = addr,
+                .len = len,
+            };
+        }
+
+        pub fn format(self: @This(), w: *std.Io.Writer) !void {
+            try w.print("H[{x}..+{}]u8", .{
+                self.addr,
+                self.len,
+            });
+        }
+    };
+
+    pub const Struct = struct {
+        type: usize,
+        fields: []const Value,
+
+        pub fn deinit(self: @This(), allocator: Allocator) void {
+            for (self.fields) |*field| {
+                field.deinit(allocator);
+            }
+            allocator.free(self.fields);
+        }
+
+        pub fn size(self: Struct) usize {
+            return self.type.size();
+        }
+
+        pub fn serialize(self: Struct, w: *std.Io.Writer) std.Io.Writer.Error!void {
+            for (self.fields) |field| {
+                try field.serialize(w);
+            }
+        }
+
+        pub fn deserialize(
+            context: DeserializeStructContext,
+            struct_type: usize,
+            r: *std.Io.Reader,
+        ) !@This() {
+            const type_ = context.get(struct_type);
+            const fields = try context.allocFields(struct_type);
+
+            for (fields, type_.fields.values()) |*field, field_type_addr| {
+                field.* = try switch (field_type_addr) {
+                    .struct_type => |staddr| Struct.deserialize(context, staddr, r),
+                    .value => |t| Value.deserialize(t, r),
+                };
+            }
+
+            return .{
+                .type = type_,
+                .fields = fields,
+            };
+        }
+
+        pub const DeserializeStructContext = struct {
+            allocator: Allocator,
+            struct_types: []const Type,
+
+            pub fn get(self: @This(), struct_type: usize) Type {
+                return self.struct_types[struct_type];
+            }
+
+            pub fn allocFields(self: @This(), struct_type: usize) ![]Value {
+                const type_ = self.get(struct_type);
+                return self.allocator.alloc(Value, type_.fields.count());
+            }
+        };
+
+        pub const Type = struct {
+            name: []const u8,
+            decls: std.StringArrayHashMapUnmanaged(Decl) = .empty,
+            fields: std.StringArrayHashMapUnmanaged(TypeAddr) = .empty,
+
+            pub fn size(self: @This()) usize {
+                return @reduce(.Add, self.fields.values());
+            }
+
+            pub const Decl = union(enum) {
+                function: Function,
+
+                pub const Function = struct {
+                    signature: Signature,
+                    addr: usize,
+
+                    pub const Signature = struct {
+                        params: []const Param,
+
+                        pub const Param = struct { name: []const u8 };
+                    };
+                };
+            };
+        };
+    };
+
+    pub const FunctionRef = struct {
+        fn_addr: InstructionAddr,
+
+        pub fn format(
+            self: @This(),
+            writer: *std.Io.Writer,
+        ) std.Io.Writer.Error!void {
+            try writer.print("{f}", .{self.fn_addr});
+        }
+    };
+
+    pub const refSize: usize = @sizeOf(Location);
+
+    pub fn fromAddr(addr: usize) @This() {
+        return .{ .addr = addr };
+    }
+
+    pub fn toBytes(self: @This()) []const u8 {
+        return std.mem.toBytes(self);
+    }
+
+    pub fn fromBytes(bytes: []const u8) @This() {
+        return std.mem.bytesToValue(@This(), bytes);
+    }
+
+    pub fn fromBoolean(boolean: bool) @This() {
+        return .{
+            .exit_code = if (boolean) .success else .fromByte(1),
+        };
+    }
+
+    pub const ToStreamError = Allocator.Error || error{UnsupportedStreamCast};
+
+    pub fn toStream(self: @This(), allocator: Allocator) ToStreamError!@This() {
+        return switch (self) {
+            .stream => self,
+            .slice, .executable => .{ .stream = try allocator.dupe(Value, &.{self}) },
+            else => ToStreamError.UnsupportedStreamCast,
+        };
+    }
+
+    pub const DeserializeError =
+        std.Io.Reader.Error ||
+        std.Io.Reader.TakeEnumError ||
+        error{UnsupportedDeserialize};
+
+    pub fn deserialize(
+        tag: std.meta.Tag(@This()),
+        r: *std.Io.Reader,
+    ) DeserializeError!@This() {
+        return switch (tag) {
+            .void => .void,
+            .uinteger => .{ .uinteger = try r.takeInt(usize, endian) },
+            .float => .{ .float = std.mem.bytesAsValue(f64, try r.takeArray(8)).* },
+            .addr => .{ .addr = try r.takeInt(usize, endian) },
+            .thread => .{ .thread = try r.takeInt(usize, endian) },
+            .stream => .{ .stream = std.mem.bytesAsValue(
+                []Value,
+                try r.takeArray(@sizeOf([]Value)),
+            ).* },
+            .slice, .executable, .strct, .pipe, .closeable, .fn_ref => DeserializeError.UnsupportedDeserialize,
+            .exit_code => .{ .exit_code = try ExitCode.deserialize(r) },
+            .register, .dereference => unreachable,
+        };
+    }
+
+    pub fn serialize(self: @This(), w: *std.Io.Writer) !void {
+        switch (self) {
+            .void => {},
+            .stream => |stream| try w.writeAll(&std.mem.toBytes(stream)),
+            .register, .dereference => unreachable,
+            inline .uinteger => |t| try w.writeInt(@TypeOf(t), t, endian),
+            inline else => |t| {
+                if (std.meta.hasMethod(@TypeOf(t), "serialize")) {
+                    return t.serialize(w);
+                } else {
+                    return w.writeAll(&std.mem.toBytes(self));
+                }
+            },
+        }
+    }
+
+    pub fn format(self: @This(), w: *std.Io.Writer) !void {
+        switch (self) {
+            .void => try w.writeAll("void"),
+            .addr => |addr| try w.print("<0x{x}>", .{addr}),
+            .pipe => |handle| try w.print("<pipe:{}>", .{handle}),
+            .closeable => |handle| try w.print("<closeable:{}>", .{handle}),
+            .thread => |id| try w.print("<thread:{}>", .{id}),
+            inline .slice, .executable, .exit_code, .fn_ref, .stream => |s| try w.print("{f}", .{s}),
+            inline .zig_string => |s| try w.print("\"{s}{s}\"", .{ s[0..10], if (s.len > 10) "..." else "" }),
+            inline else => |t| try w.print("{}", .{t}),
+        }
+    }
+};

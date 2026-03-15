@@ -1,0 +1,6 @@
+const arr = .{ 3, 4 }
+
+for (arr) |el| echo "${arr[0]} <-> ${el}"
+for (0..10) |i| {
+  echo "${i}: for loop"
+}

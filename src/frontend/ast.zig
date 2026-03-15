@@ -23,6 +23,10 @@ pub const Identifier = struct {
         return if (self.name.len == 0) false else std.ascii.isUpper(self.name[0]);
     }
 
+    pub fn global(name: []const u8) Identifier {
+        return .{ .name = name, .span = .global };
+    }
+
     pub fn resolveType(
         self: *@This(),
         _: std.mem.Allocator,
@@ -138,8 +142,13 @@ pub const TypeExpr = union(enum) {
     boolean: PrimitiveType,
     byte: PrimitiveType,
     execution: PrimitiveType,
+    thread: PrimitiveType,
     failed: FailedType,
     // lazy: LazyType,
+
+    pub fn global(comptime tag: std.meta.Tag(@This())) @This() {
+        return @unionInit(@This(), @tagName(tag), .{ .span = .global });
+    }
 
     pub const NamedType = struct {
         path: Path,
@@ -310,6 +319,13 @@ pub const TypeExpr = union(enum) {
 
     pub const PrimitiveType = struct {
         span: Span,
+
+        pub fn format(
+            _: @This(),
+            writer: *std.Io.Writer,
+        ) std.Io.Writer.Error!void {
+            try writer.writeAll("<primitive>");
+        }
     };
 
     pub const LazyType = struct {
@@ -741,6 +757,7 @@ pub const BinaryOp = enum {
     pipe,
     apply,
     member,
+    array_access,
     assign,
     add_assign,
     minus_assign,
@@ -766,6 +783,7 @@ pub const BinaryOp = enum {
             .pipe => 50,
             .apply => 70,
             .member => 90,
+            .array_access => 90,
             .assign => 0,
             .add_assign => 0,
             .minus_assign => 0,
@@ -794,6 +812,7 @@ pub const BinaryOp = enum {
             .equal_equal => .equal,
             .pipe => .pipe,
             .dot => .member,
+            .l_bracket => .array_access,
             .assign => .assign,
             .plus_assign => .add_assign,
             .minus_assign => .minus_assign,
@@ -852,6 +871,7 @@ pub const IfExpr = struct {
     else_branch: ?ElseBranch,
     span: Span,
 
+    // TODO: check if we really need this to be a union, and not just an expression since if expressions are also an expression
     pub const ElseBranch = union(enum) {
         expr: *Expression,
         if_expr: *IfExpr,

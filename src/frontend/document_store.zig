@@ -3,7 +3,6 @@ const Allocator = std.mem.Allocator;
 const ast = @import("ast.zig");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
-const ScriptExecutor = @import("../interpreter/script_executor.zig").ScriptExecutor;
 const command_runner = @import("../runtime/command_runner.zig");
 const DocumentStore = @import("../document_store.zig").DocumentStore;
 
@@ -14,7 +13,6 @@ pub const Document = struct {
     source: []const u8,
     ast: ?ast.Script = null,
     parser: parser.Parser,
-    script_executor: ?ScriptExecutor = null,
     exitCode: ?command_runner.ExitCode = null,
 };
 
@@ -34,7 +32,6 @@ pub const FrontendDocumentStore = struct {
 
     pub fn deinit(self: *FrontendDocumentStore) void {
         for (self.map.values()) |document| {
-            if (document.script_executor) |*se| se.deinit();
             document.parser.deinit();
         }
         self.arena.deinit();
@@ -86,11 +83,33 @@ pub const FrontendDocumentStore = struct {
         self: *FrontendDocumentStore,
         path: []const u8,
     ) !*Document {
+        if (self.map.get(path)) |document| return document;
         const resolvedPath = try self.resolvePath(path);
         const entry = try self.map.getOrPut(self.arena.allocator(), resolvedPath);
 
         if (!entry.found_existing) {
             entry.value_ptr.* = try self.loadDocument(resolvedPath);
+        }
+
+        return entry.value_ptr.*;
+    }
+
+    pub fn putDocument(
+        self: *FrontendDocumentStore,
+        path: []const u8,
+        source: []const u8,
+    ) !*Document {
+        const owned_path = try self.arena.allocator().dupe(u8, path);
+        const entry = try self.map.getOrPut(self.arena.allocator(), owned_path);
+
+        if (!entry.found_existing) {
+            const document = try self.arena.allocator().create(Document);
+            document.* = .{
+                .path = owned_path,
+                .source = try self.arena.allocator().dupe(u8, source),
+                .parser = .init(self.allocator, &self.document_store),
+            };
+            entry.value_ptr.* = document;
         }
 
         return entry.value_ptr.*;
@@ -119,6 +138,7 @@ pub const FrontendDocumentStore = struct {
     }
 
     pub fn resolvePath(self: *FrontendDocumentStore, path: []const u8) ![]const u8 {
+        if (path.len > 0 and path[0] == ':') return self.arena.allocator().dupe(u8, path);
         if (std.fs.path.isAbsolute(path)) return self.arena.allocator().dupe(u8, path);
         return std.fs.cwd().realpathAlloc(self.arena.allocator(), path) catch |err| {
             switch (err) {

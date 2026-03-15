@@ -91,6 +91,13 @@ pub fn CloseableReader(comptime T: type) type {
         pub fn getLabel(self: @This()) []const u8 {
             return self.closeable.getLabel();
         }
+
+        pub fn format(
+            self: @This(),
+            writer: *std.Io.Writer,
+        ) std.Io.Writer.Error!void {
+            try writer.print("CloseableReader({s})", .{self.getLabel()});
+        }
     };
 }
 
@@ -116,6 +123,13 @@ pub fn CloseableWriter(comptime T: type) type {
 
         pub fn getLabel(self: @This()) []const u8 {
             return self.closeable.getLabel();
+        }
+
+        pub fn format(
+            self: @This(),
+            writer: *std.Io.Writer,
+        ) std.Io.Writer.Error!void {
+            try writer.print("CloseableWriter({s})", .{self.getLabel()});
         }
     };
 }

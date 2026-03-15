@@ -35,6 +35,12 @@ const string_ex = "this is an example string"
 const echo_result = printf "${string_ex}"
 echo "${echo_result.stdout}"
 
+// function closures
+fn Void hello_using_string_ex(greeting: String) String {
+  echo "Hello! ${greeting}. ${string_ex}."
+}
+hello_using_string_ex "Closures are great"
+
 // integers
 const my_integer_a = 4
 const my_integer_b = 3
@@ -84,6 +90,11 @@ for (my_array) |item| echo "${item}"
 
 for (my_array, 0..) |item, i| {
   echo "${i}: ${item}"
+}
+
+const my_array_2 = .{ "four", "five", "six" }
+for (my_array, my_array_2, 0..) |a, b, i| {
+  echo "${i}: ${a},${b}"
 }
 
 // functions with pipelines

@@ -1,6 +1,4 @@
 const std = @import("std");
-const Value = @import("interpreter/value.zig").Value;
-const Transformer = @import("transformer.zig").Transformer;
 const RC = @import("mem/root.zig").RC;
 const RCError = @import("mem/root.zig").RCError;
 const Closeable = @import("closeable.zig").Closeable;
@@ -10,9 +8,10 @@ const NeverCloses = @import("closeable.zig").NeverCloses;
 const ExitCode = @import("runtime/command_runner.zig").ExitCode;
 const rainbow = @import("rainbow.zig");
 const TraceWriter = @import("trace-writer.zig").TraceWriter;
+const Tracer = @import("trace.zig").Tracer;
 
 const log_enabled = false;
-const log_writer_enabled = true;
+const log_writer_enabled = false;
 
 const prefix_color = rainbow.beginColor(.indigo);
 const source_color = rainbow.beginColor(.green);
@@ -22,7 +21,7 @@ const end_color = rainbow.endColor();
 fn log(self: *ReaderWriterStream, comptime fmt: []const u8, args: anytype) void {
     if (!log_enabled) return;
     std.log.debug("[{s}{*}:\"{s}\"{s}]", .{ prefix_color, self, self.label, end_color });
-    if (self.source) |source| if (self.destination) |destination| {
+    for (self.sources.items) |source| if (self.destination) |destination| {
         std.log.debug("{s}{s}:{*}{s} >>> {s}{s}:{*}{s}", .{
             source_color,
             source.getLabel(),
@@ -282,10 +281,29 @@ pub const ReaderWriterStream = struct {
     trace_writer: TraceWriter = undefined,
     buffer_writer: std.Io.Writer.Allocating,
     closeable: Closeable(ExitCode) = .{ .vtable = &closeable_vtable },
-    source: ?CloseableReader(ExitCode) = null,
+    // source: ?CloseableReader(ExitCode) = null,
+    sources: std.ArrayList(CloseableReader(ExitCode)) = .empty,
     destination: ?CloseableWriter(ExitCode) = null,
-    is_completed: bool = false,
+    has_been_connected: bool = false,
+    config: Config,
     label: []const u8,
+    tracer: *Tracer,
+
+    pub const Config = struct {
+        close_source: bool = true,
+        close_destination: bool = true,
+        disconnect_source: bool = true,
+        disconnect_destination: bool = true,
+        complete_after_source_closed: bool = false,
+        keep_open: bool = false,
+
+        pub fn format(
+            self: @This(),
+            writer: *std.Io.Writer,
+        ) std.Io.Writer.Error!void {
+            try writer.print("{f}", .{std.json.fmt(self, .{})});
+        }
+    };
 
     const vtable = Stream(u8).VTable{
         .next = next,
@@ -310,10 +328,14 @@ pub const ReaderWriterStream = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         label: []const u8,
+        config: Config,
+        tracer: *Tracer,
     ) std.mem.Allocator.Error!@This() {
         return .{
             .buffer_writer = .init(allocator),
             .label = label,
+            .config = config,
+            .tracer = tracer,
             .writer = .{
                 .vtable = &writer_vtable,
                 .buffer = try allocator.alloc(u8, 1024),
@@ -336,7 +358,9 @@ pub const ReaderWriterStream = struct {
             .{ source.getLabel(), source.reader, source.closeable },
         );
 
-        self.source = source;
+        self.has_been_connected = true;
+        // self.source = source;
+        try self.sources.append(try self.stream.getAllocator(), source);
     }
 
     pub fn connectDestination(
@@ -349,21 +373,40 @@ pub const ReaderWriterStream = struct {
             .{ destination.getLabel(), destination.writer, destination.closeable },
         );
 
+        self.has_been_connected = true;
         try self.writer.flush();
+        if (self.destination != null and self.config.disconnect_destination) {
+            self.disconnectDestination();
+        }
         self.destination = destination;
         self.trace_writer = .init(
             try self.buffer_writer.allocator.alloc(u8, 1024),
             destination.writer,
             self.label,
         );
-        // self.writer.buffer = destination.writer.buffer;
-        const buffered = try self.buffer_writer.toOwnedSlice();
-        try self.writer.writeAll(buffered);
-        try self.writer.flush();
-        log(self, "bytes forwarded: {}", .{buffered.len});
-        if (self.source) |source| if (source.isClosed()) {
-            _ = destination.close();
-        };
+
+        const allocator = self.buffer_writer.allocator;
+        var sources_to_remove = std.ArrayList(usize).empty;
+        defer sources_to_remove.deinit(allocator);
+
+        for (self.sources.items, 0..) |source, i| {
+            if (source.isClosed()) {
+                try sources_to_remove.append(allocator, i);
+                if (self.config.close_destination) {
+                    _ = destination.close();
+                }
+                self.disconnectDestination();
+            }
+        }
+
+        if (sources_to_remove.items.len > 0) {
+            std.mem.sort(usize, sources_to_remove.items, self, lessThan);
+            self.disconnectSources(sources_to_remove.items);
+        }
+    }
+
+    fn lessThan(_: *@This(), lhs: usize, rhs: usize) bool {
+        return lhs < rhs;
     }
 
     pub fn newRef(self: *Stream(u8)) RCError!void {
@@ -388,8 +431,11 @@ pub const ReaderWriterStream = struct {
     pub fn deinitParent(self: *@This()) void {
         log(self, @src().fn_name, .{});
 
-        self.buffer_writer.allocator.free(self.writer.buffer);
-        if (self.destination) |_| self.buffer_writer.allocator.free(self.trace_writer.writer.buffer);
+        const allocator = self.buffer_writer.allocator;
+
+        allocator.free(self.writer.buffer);
+        self.sources.deinit(allocator);
+        if (self.destination) |_| allocator.free(self.trace_writer.writer.buffer);
         self.buffer_writer.deinit();
         self.ref.deinit(.{ .refresh_ref = true });
     }
@@ -492,46 +538,219 @@ pub const ReaderWriterStream = struct {
     pub const ForwardEvent = enum { no_source, closed, not_done };
 
     /// Returns true if source is completed.
-    pub fn forward(self: *@This(), limit: std.Io.Limit) std.Io.Reader.StreamError!ForwardEvent {
-        log(self, @src().fn_name, .{});
+    pub fn forward(self: *@This(), limit: std.Io.Limit) StreamError!ForwardEvent {
+        self.tracer.trace(.information, &.{ "stream", @src().fn_name }, null, @src().fn_name, .{});
 
-        const source = self.source orelse {
-            log(self, "no source connected", .{});
-            return .no_source;
-        };
-        // const destination_writer = self.getDestinationWriter();
+        if (self.destination) |destination| {
+            if (destination.isClosed()) {
+                self.disconnectDestination();
+                self.closeSources();
+                self.disconnectSourcesAll();
+                if (self.config.keep_open) {
+                    self.tracer.trace(.information, &.{ "stream", @src().fn_name, "not_done" }, null, "stream destination closed, keeping open", .{});
+                    return .not_done;
+                }
+                self.tracer.trace(.information, &.{ "stream", @src().fn_name, "closed" }, null, "stream closed", .{});
+                return .closed;
+            }
 
-        log(self, "checking isClosed: {?f}", .{source.getResult()});
-        if (source.isClosed()) {
-            return .closed;
+            const buffered = try self.buffer_writer.toOwnedSlice();
+
+            if (buffered.len > 0) {
+                try self.writer.writeAll(buffered);
+                try self.writer.flush();
+                self.tracer.trace(.information, &.{ "stream", @src().fn_name, "buffer", "data" }, null, "bytes forwarded from buffered data: {}", .{buffered.len});
+
+                // if (self.isSourcesClosed()) {
+                //     log(self, "all sources closed, closing destination", .{});
+                //     self.closeDestination();
+                //     self.disconnectDestination();
+                //
+                //     if (self.isDestinationClosed()) {
+                //         log(self, "both ends closed, closing stream", .{});
+                //         return .closed;
+                //     }
+                // }
+
+                return .not_done;
+            }
         }
 
-        const bytes_forwarded = source.reader.stream(
-            &self.writer,
-            limit,
-        ) catch |err| switch (err) {
-            error.EndOfStream => {
-                log(self, "ended stream", .{});
-                _ = self.source.?.close();
-                if (self.destination) |d| _ = d.close();
-                return .closed;
-            },
-            else => {
-                _ = self.source.?.close();
-                if (self.destination) |d| _ = d.close();
-                return .closed;
-            },
-        };
-        try self.writer.flush();
-        // try destination_writer.flush();
+        if (self.sources.items.len == 0) {
+            self.tracer.trace(.information, &.{ "stream", @src().fn_name }, null, "no source connected", .{});
 
-        log(self, "bytes forwarded: {}", .{bytes_forwarded});
+            if (self.destination != null or self.has_been_connected) {
+                if (self.config.keep_open) {
+                    return .no_source;
+                } else {
+                    self.closeDestination();
+                    self.disconnectDestination();
+                    self.tracer.trace(.information, &.{ "stream", @src().fn_name, "closed" }, null, "stream closed", .{});
+                    return .closed;
+                }
+            }
+
+            return .no_source;
+        }
+
+        const allocator = try self.stream.getAllocator();
+
+        var sources_to_remove = std.ArrayList(usize).empty;
+        defer sources_to_remove.deinit(allocator);
+
+        for (self.sources.items, 0..) |source, i| {
+            const source_result = source.getResult();
+
+            if (source_result) |_| {
+                self.tracer.trace(.information, &.{ "stream", @src().fn_name, "source" }, null, "source closed, removing source", .{});
+                if (self.processCloseEnds()) |event| switch (event) {
+                    .not_done => return .not_done,
+                    .closed => return .closed,
+                    else => unreachable,
+                } else {
+                    try sources_to_remove.append(allocator, i);
+                }
+            }
+
+            const bytes_forwarded = source.reader.stream(
+                &self.writer,
+                limit,
+            ) catch |err| switch (err) {
+                error.EndOfStream => {
+                    self.tracer.trace(.information, &.{ "stream", @src().fn_name, "source" }, null, "source ended", .{});
+                    _ = source.close();
+                    if (self.processCloseEnds()) |event| return event;
+                    continue;
+                },
+                error.WriteFailed => {
+                    self.tracer.trace(.information, &.{ "stream", @src().fn_name, "destination" }, null, "destination closed", .{});
+                    _ = source.close();
+                    if (self.processCloseEnds()) |event| return event;
+                    continue;
+                },
+                else => {
+                    self.tracer.trace(.@"error", &.{ "stream", @src().fn_name }, null, "stream error: {}", .{err});
+                    _ = source.close();
+                    if (self.processCloseEnds()) |event| return event;
+                    continue;
+                },
+            };
+            try self.writer.flush();
+
+            self.tracer.trace(.information, &.{ "stream", @src().fn_name, "data" }, null, "bytes forwarded: {}", .{bytes_forwarded});
+        }
+
+        std.mem.sort(usize, sources_to_remove.items, self, lessThan);
+        self.disconnectSources(sources_to_remove.items);
 
         return .not_done;
     }
 
-    pub fn disconnectSource(self: *ReaderWriterStream) void {
-        self.source = null;
+    fn processCloseEnds(self: *ReaderWriterStream) ?ForwardEvent {
+        if (self.isSourcesClosed()) {
+            self.tracer.trace(.information, &.{ "stream", @src().fn_name }, null, "sources closed, closing ends", .{});
+            const fully_connected = self.destination != null;
+
+            self.closeEnds();
+
+            if (self.config.keep_open) {
+                self.tracer.trace(.information, &.{ "stream", @src().fn_name }, null, "keeping open", .{});
+                return .not_done;
+            }
+
+            if (fully_connected) {
+                self.tracer.trace(.information, &.{ "stream", @src().fn_name, "closed" }, null, "closing stream", .{});
+                return .closed;
+            }
+
+            if (self.config.complete_after_source_closed) {
+                return .closed;
+            } else {
+                return .not_done;
+            }
+        }
+
+        return null;
+    }
+
+    fn closeEnds(self: *ReaderWriterStream) void {
+        self.closeSources();
+        self.closeDestination();
+        self.disconnectSourcesAll();
+        self.disconnectDestination();
+    }
+
+    fn closeSources(self: *ReaderWriterStream) void {
+        if (self.config.close_source) {
+            for (self.sources.items) |source| {
+                _ = source.close();
+            }
+        }
+    }
+
+    fn closeDestination(self: *ReaderWriterStream) void {
+        if (self.config.close_destination) {
+            if (self.destination) |d| _ = d.close();
+        }
+    }
+
+    pub fn disconnectSource(self: *ReaderWriterStream, index: usize) void {
+        if (self.config.disconnect_source) {
+            self.sources.swapRemove(index);
+            // self.source = null;
+            self.tracer.trace(.information, &.{ "stream", @src().fn_name, "disconnect", "source" }, null, "stream disconnected source: {}", .{index});
+        }
+    }
+
+    pub fn disconnectSources(self: *ReaderWriterStream, is: []const usize) void {
+        if (self.config.disconnect_source) {
+            self.sources.orderedRemoveMany(is);
+            // self.source = null;
+            self.tracer.trace(.information, &.{ "stream", @src().fn_name, "disconnect", "source" }, null, "stream disconnected sources: {any}", .{is});
+        }
+    }
+
+    pub fn disconnectSourcesAll(self: *ReaderWriterStream) void {
+        if (self.config.disconnect_source) {
+            self.sources.clearAndFree(self.buffer_writer.allocator);
+            self.tracer.trace(.information, &.{ "stream", @src().fn_name, "disconnect", "source" }, null, "stream disconnected all sources", .{});
+        }
+    }
+
+    pub fn disconnectDestination(self: *ReaderWriterStream) void {
+        if (self.config.disconnect_destination) {
+            if (self.destination) |_| self.buffer_writer.allocator.free(self.trace_writer.writer.buffer);
+            self.destination = null;
+            self.tracer.trace(.information, &.{ "stream", @src().fn_name, "disconnect", "destination" }, null, "stream disconnected destination", .{});
+        }
+    }
+
+    pub fn isSourcesClosed(self: *ReaderWriterStream) bool {
+        for (self.sources.items) |source| {
+            if (!source.isClosed()) return false;
+        }
+        return true;
+    }
+
+    pub fn isDestinationClosed(self: *ReaderWriterStream) bool {
+        if (self.destination) |destination| {
+            if (!destination.isClosed()) return false;
+        }
+        return true;
+    }
+
+    pub fn format(
+        self: *@This(),
+        writer: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        try writer.print("{s}: ", .{self.label});
+        if (self.sources.items.len == 1) {
+            const source = self.sources.items[0];
+            try writer.print("source: {f}", .{source});
+        } else {
+            try writer.print("sources: {}", .{self.sources.items.len});
+        }
+        try writer.print(", destination: {?f}", .{self.destination});
     }
 };
 
@@ -779,6 +998,8 @@ pub fn Stream(comptime T: type) type {
         pub fn initReaderWriter(
             allocator: std.mem.Allocator,
             label: []const u8,
+            config: ReaderWriterStream.Config,
+            tracer: *Tracer,
         ) RCError!*ReaderWriterStream {
             if (T != u8) @compileError(
                 @src().fn_name ++ " is only available on Stream(u8), actual: Stream(" ++ @typeName(T) ++ ")",
@@ -786,7 +1007,7 @@ pub fn Stream(comptime T: type) type {
 
             const reader_writer_stream_ref = try RC(ReaderWriterStream).Ref.init(
                 allocator,
-                try .init(allocator, label),
+                try .init(allocator, label, config, tracer),
                 .{},
             );
             var reader_writer_stream = try reader_writer_stream_ref.getPtr();
@@ -796,19 +1017,6 @@ pub fn Stream(comptime T: type) type {
             log(reader_writer_stream, "{*}", .{&reader_writer_stream.writer});
 
             return reader_writer_stream;
-        }
-
-        pub fn fromValue(allocator: std.mem.Allocator, value: Value) RCError!*Stream(T) {
-            return Transformer(*@This()).transform(
-                allocator,
-                value,
-            ) catch try @This().initFailed(
-                allocator,
-                StreamError.InitFailed,
-            ) orelse try @This().initFailed(
-                allocator,
-                StreamError.InvalidSource,
-            );
         }
 
         pub fn deinit(self: *@This()) void {

@@ -785,6 +785,14 @@ pub const ExitCode = union(enum) {
         }
     }
 
+    pub fn fromBoolean(boolean: bool) ExitCode {
+        return .fromByte(if (boolean) 0 else 1);
+    }
+
+    pub fn toBoolean(self: @This()) bool {
+        return self == .success;
+    }
+
     pub fn getErrorCode(self: ExitCode) u8 {
         return switch (self) {
             .success => 0,
@@ -794,6 +802,10 @@ pub const ExitCode = union(enum) {
             },
             .err => 1,
         };
+    }
+
+    pub fn deserialize(r: *std.Io.Reader) std.Io.Reader.Error!@This() {
+        return std.mem.bytesAsValue(@This(), try r.takeArray(@sizeOf(@This()))).*;
     }
 
     pub fn format(self: ExitCode, writer: *std.Io.Writer) !void {
