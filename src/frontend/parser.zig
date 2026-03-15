@@ -465,7 +465,7 @@ pub const Parser = struct {
             .kw_if => self.parseIfExpression(),
             .kw_for => self.parseForExpression(),
             else => {
-                if (try self.parseMaybeBinaryExpression()) |arith_expr| return arith_expr;
+                if (try self.parseMaybeBinaryExpression()) |binary_expr| return binary_expr;
                 return self.parsePrimaryExpression();
             },
         };
@@ -736,11 +736,21 @@ pub const Parser = struct {
                             });
                         },
                         .l_paren => {
+                            const breadcrumbInner = try self.createBreadcrumb("PBE:parenthesis");
+                            defer breadcrumbInner.end();
                             _ = try self.nextToken();
                             try components.append(self.allocator, .{
                                 .expr = try self.parseExpression(),
                             });
                             _ = try self.expectTokenTag(.r_paren);
+                            continue;
+                        },
+                        .l_brace => {
+                            const breadcrumbInner = try self.createBreadcrumb("PBE:block");
+                            defer breadcrumbInner.end();
+                            try components.append(self.allocator, .{
+                                .expr = try self.parseBlockExpression(),
+                            });
                             continue;
                         },
                         .int_literal, .float_literal, .kw_true, .kw_false => {

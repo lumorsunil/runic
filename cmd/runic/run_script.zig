@@ -48,13 +48,26 @@ pub fn runScript(
     defer allocator.free(script_dir);
 
     if (config.print_tokens) {
+        if (script.source) |source| {
+            utils.printScriptTokens(allocator, stdout, script.path, source) catch |err| {
+                try stderr.print(
+                    "error: failed to print tokens for inline script '{s}': {s}\n",
+                    .{ script.path, @errorName(err) },
+                );
+                return .fromByte(1);
+            };
+            return .success;
+        }
         return .fromByte(try printTokens(allocator, stdout, stderr, script.path));
     }
 
     var document_store = FrontendDocumentStore.init(allocator);
     defer document_store.deinit();
-    const entryDocument = try document_store.requestDocument(script.path);
-    const resolvedPath = try document_store.resolvePath(script.path);
+    const entryDocument = if (script.source) |source|
+        try document_store.putDocument(script.path, source)
+    else
+        try document_store.requestDocument(script.path);
+    const resolvedPath = entryDocument.path;
     const parser_result = entryDocument.parser.parseScript(resolvedPath);
     const script_ast = try processResult(&document_store.document_store, stderr, parser_result) orelse return .fromByte(1);
 

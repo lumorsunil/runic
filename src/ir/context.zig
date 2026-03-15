@@ -39,6 +39,40 @@ pub const IRProgramContext = struct {
         return .{ .allocator = allocator, .shared = shared };
     }
 
+    pub fn deinit(self: *@This()) void {
+        for (self.threads.items) |thread| {
+            thread.private.stack.deinit(self.allocator);
+            self.allocator.destroy(thread.private);
+        }
+        self.threads.deinit(self.allocator);
+
+        for (self.pipe_threads.items) |thread| {
+            thread.private.stack.deinit(self.allocator);
+            self.allocator.destroy(thread.private);
+        }
+        self.pipe_threads.deinit(self.allocator);
+
+        for (self.pipes.keys(), self.pipes.values()) |handle, pipe| {
+            if (handle < 3) {
+                pipe.disconnectSourcesAll();
+                pipe.disconnectDestination();
+                continue;
+            }
+            pipe.deinitParent();
+        }
+        self.pipes.deinit(self.allocator);
+
+        for (self.closeables.values()) |closeable| {
+            if (!closeable.isClosed()) _ = closeable.close();
+        }
+        self.closeables.deinit(self.allocator);
+
+        self.threads_to_remove.deinit(self.allocator);
+        self.pipe_threads_to_remove.deinit(self.allocator);
+        self.thread_exit_codes.deinit(self.allocator);
+        self.shared.heap.deinit(self.allocator);
+    }
+
     pub fn addMainThread(self: *@This()) Allocator.Error!void {
         _ = try self.spawnThread();
     }

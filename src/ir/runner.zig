@@ -164,6 +164,7 @@ pub fn runIR(
     if (result == .err) return .err_(arena, result.err.diagnostics());
     defer arena.deinit();
     var context = result.success;
+    defer context.deinit();
 
     try context.addMainThread();
 
@@ -224,6 +225,7 @@ pub fn debugIR(
     const shared = result.success;
 
     var context = ir.context.IRProgramContext.init(arena_allocator, shared);
+    defer context.deinit();
     try context.addMainThread();
     var debugger = try ir.debugger.IRDebugger.init(
         arena_allocator,

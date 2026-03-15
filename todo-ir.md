@@ -63,6 +63,7 @@
 - [x] address mapping
 - [x] basic executable calls
 - [x] if else
+- [ ] labels have the wrong address if we have closures (since closures alter addresses after the fact by inserting instructions)
 - [ ] for loops
   - [ ] array iterator
   - [ ] range iterator
@@ -190,3 +191,5 @@
 - [x] grep is not outputting anything, see ir-blocks.rn
 - [x] cannot call function multiple times
 - [x] debugger: cannot paste to stdin
+- [ ] arrays will executable calls as elements cannot be accessed with element access operator
+- [ ] pipelines are broken again

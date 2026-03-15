@@ -29,6 +29,7 @@ pub const CliConfig = struct {
     pub const ScriptInvocation = struct {
         path: []const u8,
         args: []const []const u8,
+        source: ?[]const u8 = null,
     };
 
     const EnvOverride = struct {
@@ -41,6 +42,7 @@ pub const CliConfig = struct {
             .script => |script| {
                 allocator.free(script.path);
                 freeStringList(allocator, script.args);
+                if (script.source) |source| allocator.free(source);
             },
             .repl => {},
         }
@@ -586,6 +588,7 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
     defer if (args_cleanup) script_args.deinit();
 
     var script_path: ?[]const u8 = null;
+    var script_source: ?[]const u8 = null;
     var repl_requested = false;
     var print_ast = false;
     var print_tokens = false;
@@ -633,6 +636,15 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
             }
             if (argEqual(arg, "--enable-ir")) {
                 enable_ir = true;
+                continue;
+            }
+            if (argEqual(arg, "--eval") or argEqual(arg, "-c")) {
+                if (idx >= argv.len) return usageError(allocator, "{s} requires source text", .{arg});
+                if (script_path != null) return usageError(allocator, "Cannot combine {s} with a script path.", .{arg});
+                script_path = try allocator.dupe(u8, ":inline");
+                script_source = try allocator.dupe(u8, argv[idx]);
+                idx += 1;
+                parsing_options = false;
                 continue;
             }
             if (argEqual(arg, "--debug-ir")) {
@@ -765,7 +777,7 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
     if (script_path) |path| {
         return ParseResult{
             .ready = .{
-                .mode = .{ .script = .{ .path = path, .args = args_slice } },
+                .mode = .{ .script = .{ .path = path, .args = args_slice, .source = script_source } },
                 .trace_topics = trace_slice,
                 .module_paths = module_slice,
                 .env_overrides = env_slice,
@@ -815,6 +827,7 @@ pub fn printUsage(writer: *std.Io.Writer) !void {
         \\  --type-check-only    Dry run with only type checking.
         \\  --enable-ir          Enable experimental IR compiler.
         \\  --debug-ir           Enable experimental IR debug mode.
+        \\  --eval, -c SOURCE    Execute Runic source passed directly on the command line.
         \\
         \\Additional arguments after -- are forwarded to the script unchanged.
         \\Scripts honor the same tracing, module-path, and env override flags as the REPL.

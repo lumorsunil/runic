@@ -109,30 +109,10 @@ pub const IREvaluator = struct {
     fn tempCloseStdIoCheck(self: *IREvaluator) void {
         const is_main_thread_done = self.context.isThreadClosed(0);
         if (is_main_thread_done) {
-            if (!self.context.isThreadClosed(1)) {
-                self.context.closeThread(1, .success) catch unreachable;
-            }
-
-            if (self.context.getThreadContext(2)) |stdout_thread| {
-                const stdout_value = stdout_thread.private.stack.items[1];
-                const stdout_handle = stdout_value.pipe;
-                const stdout_pipe = self.context.getPipe(stdout_handle);
-                if (stdout_pipe.isSourcesClosed()) {
-                    self.context.closeThread(2, .success) catch unreachable;
-                } else {
-                    self.context.closeThread(2, .success) catch unreachable;
-                }
-            }
-
-            if (self.context.getThreadContext(3)) |stderr_thread| {
-                const stderr_value = stderr_thread.private.stack.items[2];
-                const stderr_handle = stderr_value.pipe;
-                const stderr_pipe = self.context.getPipe(stderr_handle);
-                if (stderr_pipe.isSourcesClosed()) {
-                    self.context.closeThread(3, .success) catch unreachable;
-                } else {
-                    self.context.closeThread(3, .success) catch unreachable;
-                }
+            for (self.context.threads.items) |thread| {
+                if (thread.id == 0) continue;
+                if (self.context.isThreadClosed(thread.id)) continue;
+                self.context.closeThread(thread.id, .success) catch unreachable;
             }
         }
     }
@@ -235,7 +215,10 @@ pub const IREvaluator = struct {
         } else if (location.abs == .closure) {
             const dereferenced = try self.dereferenceLocation(thread, location);
             if (location.options.dereference) {
-                return (try self.dereferenceValue(thread, dereferenced.*, null)).*;
+                return switch (dereferenced.*) {
+                    .addr => (try self.dereferenceValue(thread, dereferenced.*, null)).*,
+                    else => dereferenced.*,
+                };
             } else {
                 return dereferenced.*;
             }
@@ -246,6 +229,8 @@ pub const IREvaluator = struct {
                 .register => |r| switch (r) {
                     .r => return thread.private.result_register,
                     .r2 => return thread.private.result_register_2,
+                    .sf => return .fromAddr(location.applyMod(thread.private.stack_frame)),
+                    .sc => return .fromAddr(location.applyMod(thread.private.stack.items.len)),
                     else => {},
                 },
                 // TODO: always deference closure (you're not supposed to change where closure entries point to)
@@ -634,6 +619,8 @@ pub const IREvaluator = struct {
 
                 if (evaluateCompare(cmp.op, .from(left), .from(right))) |result| {
                     try self.setLocation(thread, cmp.result, result);
+                } else if (try self.evaluateStringCompare(thread, cmp.op, left, right)) |result| {
+                    try self.setLocation(thread, cmp.result, result);
                 } else {
                     return Error.UnsupportedBinaryExpression;
                 }
@@ -839,6 +826,40 @@ pub const IREvaluator = struct {
         };
     }
 
+    fn evaluateStringCompare(
+        self: *IREvaluator,
+        thread: ir.context.IRThreadContext,
+        op: ir.Instruction.CmpOp,
+        left: ir.Value,
+        right: ir.Value,
+    ) !?ir.Value {
+        const left_text = self.materializeOwnedString(thread, left) catch return null;
+        defer self.allocator.free(left_text);
+        const right_text = self.materializeOwnedString(thread, right) catch return null;
+        defer self.allocator.free(right_text);
+
+        const order = std.mem.order(u8, left_text, right_text);
+        return switch (op) {
+            .eq => .fromBoolean(order == .eq),
+            .ne => .fromBoolean(order != .eq),
+            .gt => .fromBoolean(order == .gt),
+            .gte => .fromBoolean(order == .gt or order == .eq),
+            .lt => .fromBoolean(order == .lt),
+            .lte => .fromBoolean(order == .lt or order == .eq),
+        };
+    }
+
+    fn materializeOwnedString(
+        self: *IREvaluator,
+        thread: ir.context.IRThreadContext,
+        value: ir.Value,
+    ) ![]u8 {
+        var alloc_writer = std.Io.Writer.Allocating.init(self.allocator);
+        errdefer alloc_writer.deinit();
+        try self.materializeString(thread, value, &alloc_writer.writer);
+        return try alloc_writer.toOwnedSlice();
+    }
+
     pub const MaterializeStringError =
         Allocator.Error ||
         GetSliceError ||
@@ -874,8 +895,13 @@ pub const IREvaluator = struct {
                 const loc = self.context.mapAddr(addr);
                 switch (loc.abs) {
                     .heap => |heap_addr| {
-                        // assume this is pointing to a slice on the heap
-                        const len = thread.shared.heap.get(heap_addr).?.uinteger;
+                        const heap_value = thread.shared.heap.get(heap_addr).?;
+                        if (heap_value != .uinteger) {
+                            try self.materializeString(thread, heap_value, w);
+                            return;
+                        }
+
+                        const len = heap_value.uinteger;
                         for (0..len) |i| {
                             const slice_element = thread.shared.heap.get(heap_addr + i + 1).?;
                             try self.materializeString(thread, slice_element, w);

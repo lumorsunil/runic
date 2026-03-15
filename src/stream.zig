@@ -360,6 +360,7 @@ pub const ReaderWriterStream = struct {
             .{ source.getLabel(), source.reader, source.closeable },
         );
 
+        self.has_been_connected = true;
         // self.source = source;
         try self.sources.append(try self.stream.getAllocator(), source);
     }
@@ -376,6 +377,9 @@ pub const ReaderWriterStream = struct {
 
         self.has_been_connected = true;
         try self.writer.flush();
+        if (self.destination != null and self.config.disconnect_destination) {
+            self.disconnectDestination();
+        }
         self.destination = destination;
         self.trace_writer = .init(
             try self.buffer_writer.allocator.alloc(u8, 1024),
@@ -572,11 +576,6 @@ pub const ReaderWriterStream = struct {
 
                 return .not_done;
             }
-        } else if (self.has_been_connected and !self.config.keep_open) {
-            self.closeSources();
-            self.disconnectSourcesAll();
-            self.tracer.trace(.information, &.{ "stream", @src().fn_name, "closed" }, null, "stream closed", .{});
-            return .closed;
         }
 
         if (self.sources.items.len == 0) {

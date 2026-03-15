@@ -38,7 +38,7 @@ echo "$echo_result"
 hello_using_string_ex() {
   echo "Hello! $1. $string_ex."
 }
-hello_using_string_ex "Closures are greate"
+hello_using_string_ex "Closures are great"
 
 # integers
 my_integer_a=4

@@ -1102,12 +1102,29 @@ pub const IRCompiler = struct {
     ) Error!void {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
-        const closure_location = try self.declareClosureValue(
-            .mutable(identifier),
-            0,
-            true,
-            value.typeExpr(),
-        );
+        const current_frame = try self.scopes.getFrame(0);
+        const storage_depth = if (current_frame.scope_type == .closure) @as(usize, 0) else try self.nearestClosureDepth();
+        const closure_location = if (storage_depth == 0)
+            try self.declareClosureValue(
+                .mutable(identifier),
+                0,
+                true,
+                value.typeExpr(),
+            )
+        else blk: {
+            const location = try self.allocClosureValue(
+                .mutable(identifier),
+                storage_depth,
+                value.typeExpr(),
+            );
+            try self.scopes.declare(
+                self.allocator,
+                identifier.name,
+                try .from(location),
+                true,
+            );
+            break :blk location;
+        };
         try self.alloc(source, 1);
         try self.set(
             source,
@@ -1182,16 +1199,29 @@ pub const IRCompiler = struct {
             // Suggestion: Maybe we can have a nested variable structure for inner threads that will set to true when the thread is done processing. We can then continuously check that variable from the outermost scope (here), and whenever it is set to true, we would set the pipes to be closed.
             const stdout_pipe_ref = try self.newRef(source, "stdout_pipe");
             try self.pipe(source, stdout_pipe_ref);
-            try self.pipeOpt(source, stdout_pipe_ref.dereference(), .complete_after_source_closed, .fromValue(.fromBoolean(true)));
+            try self.pipeOpt(source, stdout_pipe_ref.dereference(), .keep_open, .fromValue(.fromBoolean(true)));
             const stderr_pipe_ref = try self.newRef(source, "stderr_pipe");
             try self.pipe(source, stderr_pipe_ref);
-            try self.pipeOpt(source, stderr_pipe_ref.dereference(), .complete_after_source_closed, .fromValue(.fromBoolean(true)));
-            _ = try self.fork(source, self.stdoutStreamSet(), self.threadStdin(), stdout_pipe_ref.dereference(), self.threadStderr(), .noll);
-            _ = try self.fork(source, self.stderrStreamSet(), self.threadStdin(), self.threadStdout(), stderr_pipe_ref.dereference(), .noll);
+            try self.pipeOpt(source, stderr_pipe_ref.dereference(), .keep_open, .fromValue(.fromBoolean(true)));
+            const stdout_stream_thread_ref = try self.newRef(source, "stdout_stream_thread");
+            try self.set(
+                source,
+                stdout_stream_thread_ref,
+                .from(try self.fork(source, self.stdoutStreamSet(), self.threadStdin(), stdout_pipe_ref.dereference(), self.threadStderr(), .noll)),
+            );
+            const stderr_stream_thread_ref = try self.newRef(source, "stderr_stream_thread");
+            try self.set(
+                source,
+                stderr_stream_thread_ref,
+                .from(try self.fork(source, self.stderrStreamSet(), self.threadStdin(), self.threadStdout(), stderr_pipe_ref.dereference(), .noll)),
+            );
             var result = try self.compileWithContext(source, .{
                 .out = stdout_pipe_ref.dereference(),
                 .err = stderr_pipe_ref.dereference(),
             }, expr);
+            try self.pipeOpt(source, stdout_pipe_ref.dereference(), .keep_open, .fromValue(.fromBoolean(false)));
+            try self.pipeOpt(source, stderr_pipe_ref.dereference(), .keep_open, .fromValue(.fromBoolean(false)));
+            try self.wait(source, stdout_stream_thread_ref.dereference());
 
             // if (isWaitable(result)) |waitable| {
             //     try self.wait(source, waitable);
@@ -1393,7 +1423,9 @@ pub const IRCompiler = struct {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
         if (string_literal.segments.len == 1) {
-            return .from(try self.addSlice(1, string_literal.segments[0].text.payload));
+            const decoded = try self.decodeStringLiteralText(string_literal.segments[0].text.payload);
+            defer self.allocator.free(decoded);
+            return .from(try self.addSlice(1, decoded));
         }
 
         const ref = try self.newRef(source, "string_literal");
@@ -1408,7 +1440,9 @@ pub const IRCompiler = struct {
 
         for (string_literal.segments, 0..) |segment, i| switch (segment) {
             .text => |text| {
-                const result = try self.addSlice(1, text.payload);
+                const decoded = try self.decodeStringLiteralText(text.payload);
+                defer self.allocator.free(decoded);
+                const result = try self.addSlice(1, decoded);
                 try self.set(source, .initRegister(.r), .from(ref.dereference()));
                 try self.set(
                     source,
@@ -1429,7 +1463,7 @@ pub const IRCompiler = struct {
                 try self.set(source, .initRegister(.r), .from(ref.dereference()));
                 // TODO: handle array coercion
                 if (result == .location and result.location.isType(execution_result_struct_type)) {
-                    try self.set(source, .initRegister(.r2), result.undereference());
+                    try self.set(source, .initRegister(.r2), result);
                     result = .fromLocation(.initAdd(.{ .register = .r2 }, 0, .{ .dereference = true }));
                 }
                 try self.set(
@@ -1449,6 +1483,61 @@ pub const IRCompiler = struct {
         return .from(ref.dereference());
     }
 
+    fn decodeStringLiteralText(self: *IRCompiler, encoded: []const u8) Allocator.Error![]u8 {
+        var decoded = std.ArrayList(u8).empty;
+        defer decoded.deinit(self.allocator);
+
+        var i: usize = 0;
+        while (i < encoded.len) : (i += 1) {
+            const rest = encoded[i..];
+            const ch = encoded[i];
+
+            if (rest.len >= 2) {
+                if (std.mem.eql(u8, rest[0..2], "\\n")) {
+                    try decoded.append(self.allocator, '\n');
+                    i += 1;
+                    continue;
+                }
+                if (std.mem.eql(u8, rest[0..2], "\\t")) {
+                    try decoded.append(self.allocator, '\t');
+                    i += 1;
+                    continue;
+                }
+                if (std.mem.eql(u8, rest[0..2], "\\r")) {
+                    try decoded.append(self.allocator, '\r');
+                    i += 1;
+                    continue;
+                }
+            }
+
+            try decoded.append(self.allocator, ch);
+        }
+
+        return try decoded.toOwnedSlice(self.allocator);
+    }
+
+    fn nearestClosureDepth(self: *IRCompiler) Error!usize {
+        var depth: usize = 0;
+        while (true) : (depth += 1) {
+            const frame = try self.scopes.getFrame(depth);
+            if (frame.scope_type == .closure) return depth;
+        }
+    }
+
+    fn allocClosureValue(
+        self: *IRCompiler,
+        binding: Scope.ClosureBinding,
+        depth: usize,
+        type_expr: ?ast.TypeExpr,
+    ) Error!ir.Location {
+        const frame = try self.scopes.getFrame(depth);
+        const index = frame.closure_bindings.items.len;
+        try frame.closure_bindings.append(self.allocator, binding);
+        var location: ir.Location = .initAdd(.closure, index, .{});
+        if (type_expr) |te| location = location.typed(te);
+        return location;
+    }
+
     fn parseInt(text: []const u8) std.fmt.ParseIntError!ir.Value {
         return .{ .uinteger = try std.fmt.parseInt(usize, text, 10) };
     }
@@ -1465,10 +1554,7 @@ pub const IRCompiler = struct {
         type_expr: ?ast.TypeExpr,
     ) Error!ir.Location {
         const frame = try self.scopes.getFrame(depth);
-        const index = frame.closure_bindings.items.len;
-        try frame.closure_bindings.append(self.allocator, binding);
-        var location: ir.Location = .initAdd(.closure, index, .{});
-        if (type_expr) |te| location = location.typed(te);
+        const location = try self.allocClosureValue(binding, depth, type_expr);
         if (!frame.bindings.contains(binding.identifier.name)) {
             try frame.declare(
                 self.allocator,
@@ -1553,9 +1639,7 @@ pub const IRCompiler = struct {
                 source_binding.is_mutable,
                 source_binding.result.typeExpr(),
             );
-            if (closure_value_location == null) {
-                closure_value_location = location;
-            }
+            closure_value_location = location;
             source_depth = depth_cursor - 1;
         }
 
@@ -1909,13 +1993,21 @@ pub const IRCompiler = struct {
         try self.set(source, closure.closure_ref, .fromLocation(.initRegister(.r)));
 
         for (0..cl) |i| {
+            const binding = frame.closure_bindings.items[i];
+            const slot_value: ir.ValueSource = switch (binding.type) {
+                .mutable => .fromValue(.void),
+                .outer => blk: {
+                    const source_binding = self.lookup(binding.identifier.name, .{
+                        .shallow = true,
+                        .initial_depth = binding.depth,
+                    }) orelse return Error.ScopeNotFound;
+                    break :blk source_binding.result.source;
+                },
+            };
             try self.set(
                 source,
                 .initAdd(.{ .register = .r }, i, .{ .dereference = true }),
-                self.lookup(frame.closure_bindings.items[i].identifier.name, .{
-                    .shallow = true,
-                    .initial_depth = frame.closure_bindings.items[i].depth,
-                }).?.result.source,
+                slot_value,
             );
         }
 
@@ -1944,24 +2036,18 @@ pub const IRCompiler = struct {
         const closure_ref = try self.newRef(source, "closure");
         try self.set(source, closure_ref, .fromLocation(.initRegister(.r)));
 
-        try self.alloc(source, closure_size);
-        const closure_dumb_ref = try self.newRef(source, "closure_dumb");
-        try self.set(source, closure_dumb_ref, .fromLocation(.initRegister(.r)));
-
         for (arguments, 0..) |arg, i| {
-            const arg_result = try self.compileExpression(arg);
-            const arg_ref = try self.newRef(source, "arg");
-            try self.set(source, arg_ref, arg_result.source);
-            try self.set(source, .initRegister(.r2), .from(closure_dumb_ref.dereference()));
-            try self.set(source, .initAdd(.{ .register = .r2 }, i, .{ .dereference = true }), arg_result.source);
+            const arg_result = try self.compileResultSaveR(source, try self.compileExpression(arg));
             try self.set(source, .initRegister(.r), .from(closure_ref.dereference()));
-            try self.set(source, .initAdd(.{ .register = .r }, i, .{ .dereference = true }), .fromLocation(.initAdd(.{ .register = .r2 }, i, .{})));
-            try self.set(source, .initRegister(.r2), .fromLocation(.initRegister(.r)));
-            try self.consume(source, try .from(arg_ref));
+            try self.set(
+                source,
+                .initAdd(.{ .register = .r }, i, .{ .dereference = true }),
+                arg_result.source,
+            );
+            try self.consume(source, arg_result);
         }
 
         try self.set(source, .initRegister(.r), .from(closure_ref.dereference()));
-        try self.set(source, .initRegister(.r2), .from(closure_dumb_ref.dereference()));
 
         for (closure_captures) |capture| {
             // NOTE: Guard against refering to internal identifiers
@@ -1972,13 +2058,8 @@ pub const IRCompiler = struct {
             if (identifier_result.source == .location and identifier_result.source.location.abs == .data) {
                 try self.set(
                     source,
-                    .initAdd(.{ .register = .r2 }, capture.slot, .{ .dereference = true }),
-                    identifier_result.source.undereference(),
-                );
-                try self.set(
-                    source,
                     .initAdd(.{ .register = .r }, capture.slot, .{ .dereference = true }),
-                    .fromLocation(.initAdd(.{ .register = .r2 }, capture.slot, .{ .dereference = true })),
+                    identifier_result.source.undereference(),
                 );
             } else if (identifier_result.source == .location) {
                 try self.set(
@@ -2070,8 +2151,6 @@ pub const IRCompiler = struct {
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
-        try self.pushFrame(source);
-
         const condition = try self.compileExpression(if_expr.condition);
         if (condition.source.isValueTag(.exit_code)) {
             const c = condition.source.value.exit_code.toBoolean();
@@ -2079,23 +2158,11 @@ pub const IRCompiler = struct {
             if (c) return self.compileExpression(if_expr.then_expr);
             return .fromValue(.void);
         }
-
-        const result = try self.newRef(source, "if_result");
-
         const after_addr = try self.newLabel("if_after", .unknown);
-
         try self.jmp(source, condition, false, after_addr);
-
-        const then = try self.compileExpression(if_expr.then_expr);
-        try self.set(source, result, then.source);
-
+        _ = try self.compileExpression(if_expr.then_expr);
         try self.setLabel(after_addr.local_addr.label, .abs);
-
-        const result_loc = try self.pop(source);
-
-        try self.popFrame(source);
-
-        return .from(result_loc);
+        return .fromValue(.void);
     }
 
     fn refLocation(self: *IRCompiler, ref_def: RefDef) ir.Location {
@@ -2237,82 +2304,15 @@ pub const IRCompiler = struct {
         block: ast.Block,
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+        try self.scopes.push(self.allocator, .lexical);
+        defer self.scopes.pop();
 
-        const block_stdout = try self.newRef(source, "block_stdout_pipe");
-
-        try self.pipe(source, block_stdout.dereference());
-        try self.pipeOpt(
-            source,
-            block_stdout.dereference(),
-            .disconnect_destination,
-            .fromValue(.fromBoolean(false)),
-        );
-        try self.pipeOpt(
-            source,
-            block_stdout.dereference(),
-            .close_destination,
-            .fromValue(.fromBoolean(false)),
-        );
-        try self.pipeOpt(
-            source,
-            block_stdout.dereference(),
-            .keep_open,
-            .fromValue(.fromBoolean(true)),
-        );
-        try self.pipeFwd(
-            source,
-            block_stdout.dereference(),
-            self.threadStdout(),
-        );
-        const block_set = try self.addInstructionSet();
-
-        const closure = try self.compileCreateClosure(source);
-        const block_result = try self.fork(
-            source,
-            .initAbs(block_set, 0),
-            self.threadStdin(),
-            block_stdout.dereference(),
-            self.threadStderr(),
-            closure.closure_ref.dereference(),
-        );
-        try self.compileClosurePostFork(source);
-
-        const orig_instr_set = self.current_instruction_set;
-        self.current_instruction_set = block_set;
-        try self.scopes.push(self.allocator, .closure);
-
-        const block_stdout_thread = try self.forkInherit(source, self.stdoutStreamSet(), .noll);
-        const block_stdout_thread_ref = try self.newRef(source, "block_stdout_thread");
-        try self.set(source, block_stdout_thread_ref, .from(block_stdout_thread));
-        // try self.push(source, .from(block_stdout_thread));
-
+        var result: Result = .fromValue(.void);
         for (block.statements) |stmt| {
-            // TODO: figure out what to do with these results
-            _ = try self.compileStatement(stmt);
+            result = try self.compileStatement(stmt);
         }
-        // const pipe_opts_set = try self.addInstructionSet();
-        // try self.atomic(source, pipe_opts_set);
-        // self.current_instruction_set = pipe_opts_set;
-        try self.pipeOpt(
-            source,
-            self.threadStdout(),
-            .keep_open,
-            .fromValue(.fromBoolean(false)),
-        );
-        // try self.pipeOpt(source, self.threadStdout(), .disconnect_destination, true);
-        // _ = try self.pop(source);
-        try self.wait(source, block_stdout_thread_ref.dereference());
 
-        try self.setClosureIdentifiers();
-        self.current_instruction_set = orig_instr_set;
-        try self.compileClosureInitialization(source, closure);
-        self.scopes.pop();
-
-        try self.set(source, .initRegister(.r2), .from(block_result));
-        _ = try self.pop(source);
-        try self.set(source, .initRegister(.r), .fromLocation(.initRegister(.r2)));
-
-        return .fromLocation(.initRegister(.r));
+        return result;
     }
 
     fn compileFnDecl(
@@ -2331,8 +2331,12 @@ pub const IRCompiler = struct {
             switch (param.pattern.*) {
                 .discard => {},
                 .identifier => |identifier| {
-                    // TODO: types?
-                    _ = try self.declareClosureValue(.mutable(identifier), 0, true, null);
+                    _ = try self.declareClosureValue(
+                        .mutable(identifier),
+                        0,
+                        false,
+                        if (param.type_annotation) |type_annotation| type_annotation.* else null,
+                    );
                 },
                 .tuple, .record => unreachable,
             }
@@ -2369,7 +2373,7 @@ pub const IRCompiler = struct {
         if (result.source.isRegister(.r)) {
             const ref = try self.newRef(source, "saved_r");
             try self.set(source, ref, .fromLocation(.initRegister(.r)));
-            return .from(ref);
+            return .from(ref.dereference().typed(result.source.typeExpr()));
         }
 
         return result;
