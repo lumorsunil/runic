@@ -93,6 +93,8 @@ The runtime and CLI are implemented in Zig (tested with Zig 0.15.1). Zig's build
 
 - `zig build test` — executes every Zig `test` block, covering lexer/parser/runtime modules along with module-loader fixtures. Run this command before sending any PR.
 - `./scripts/run_ci.sh` — enforces formatter → linter → `zig build test` → CLI smoke suites (`tests/cli_*.sh`). Use this script for a full pre-push verification.
+- `bash tests/cli_smoke.sh` — runs the positive end-to-end feature scripts under `tests/features/` through the CLI.
+- `bash tests/cli_diagnostics.sh` — runs the negative CLI diagnostic fixtures under `tests/diagnostics/` against the built `zig-out/bin/runic` binary, with ANSI stripped before diffing.
 - Stage-specific reruns: `./scripts/stages/unit_tests.sh`, `./scripts/stages/cli_smoke.sh`, etc., respect the same `RUNIC_REPO_ROOT`/`RUNIC_LANG` environment variables.
 - Add new CLI regression tests by dropping shell scripts under `tests/cli_*.sh`. They run inside `run_ci.sh` and should invoke `zig build run -- ...` to interact with the current binary.
 
@@ -114,7 +116,9 @@ Run `./scripts/run_ci.sh` before pushing changes. The script enforces the format
 1. **Formatter** — runs `zig fmt` across `src/`, `cmd/`, and `tests/`.
 2. **Linter** — runs `zig fmt --check` on the same set of Zig sources so misformatted files fail the build.
 3. **Unit tests** — executes `zig build test` (without changing whatever `ZIG_GLOBAL_CACHE_DIR` is already exported), which compiles the runtime modules alongside the CLI and runs all `test` blocks.
-4. **CLI smoke tests** — executes every shell script that matches `tests/cli_*.sh` (a starter harness lives at `tests/cli_smoke.sh`). Extend these scripts with real CLI invocations as new scenarios land.
+4. **CLI smoke tests** — executes every shell script that matches `tests/cli_*.sh`. Today that includes:
+   `tests/cli_smoke.sh` for successful end-to-end script execution and
+   `tests/cli_diagnostics.sh` for expected compiler/runtime diagnostics.
 
 Each stage stops the pipeline on failure so contributors get immediate feedback. Extend the stage scripts under `scripts/stages/` if a different toolchain or extra checks are required.
 

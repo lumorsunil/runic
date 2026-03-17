@@ -1,0 +1,4 @@
+[error]: tests/diagnostics/for_infinite_only.rn:1:1: for loops require at least one finite source
+   1:for (0..) |i| echo "${i}"
+   2:
+

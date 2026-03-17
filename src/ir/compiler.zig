@@ -7,6 +7,7 @@ const rainbow = @import("../rainbow.zig");
 const DocumentStore = @import("../document_store.zig").DocumentStore;
 const Stream = @import("../stream.zig").Stream;
 const RCError = @import("../mem/rc.zig").RCError;
+const FrontendDocumentStore = @import("../frontend/document_store.zig").FrontendDocumentStore;
 const evaluateArithmetic = ir.evaluator.IREvaluator.evaluateArithmetic;
 const evaluateLogical = ir.evaluator.IREvaluator.evaluateLogical;
 const evaluateCompare = ir.evaluator.IREvaluator.evaluateCompare;
@@ -61,6 +62,36 @@ pub const execution_result_struct_type = ast.TypeExpr{ .struct_type = .{
 
 pub const thread_type = ast.TypeExpr.global(.thread);
 
+pub const ExecutionHandlesField = enum {
+    thread,
+    closeable,
+};
+
+pub const ExecutionResultField = enum {
+    stdout,
+    stderr,
+    merged,
+    closeable,
+    completion_is_thread,
+};
+
+pub fn executionHandlesFieldOffset(field: ExecutionHandlesField) usize {
+    return switch (field) {
+        .thread => 0,
+        .closeable => 1,
+    };
+}
+
+pub fn executionResultFieldOffset(field: ExecutionResultField) usize {
+    return switch (field) {
+        .stdout => 0,
+        .stderr => 1,
+        .merged => 2,
+        .closeable => 3,
+        .completion_is_thread => 4,
+    };
+}
+
 pub fn array_type(element: *const ast.TypeExpr) ast.TypeExpr {
     return .{ .array = .{
         .element = element,
@@ -87,6 +118,7 @@ pub const Error =
         UnsupportedAddrType,
         UnsupportedBinaryOperation,
         UnsupportedValueType,
+        InternalInvariantViolation,
         DataTooLargeToFitInPage,
         ScopeNotFound,
         LabelAddrNotSet,
@@ -1446,7 +1478,14 @@ pub const IRCompiler = struct {
                 try self.wait(source, result.source.location);
             } else if (result.isType(execution_handles_struct_type)) {
                 try self.set(source, .initRegister(.r2), stableResultSource(result));
-                try self.wait(source, ir.Location.initAdd(.{ .register = .r2 }, 0, .{ .dereference = true }).typed(thread_type));
+                try self.wait(
+                    source,
+                    ir.Location.initAdd(
+                        .{ .register = .r2 },
+                        executionHandlesFieldOffset(.thread),
+                        .{ .dereference = true },
+                    ).typed(thread_type),
+                );
             }
             try self.pipeOpt(source, stdout_pipe_ref.dereference(), .keep_open, .fromValue(.fromBoolean(false)));
             try self.pipeOpt(source, stderr_pipe_ref.dereference(), .keep_open, .fromValue(.fromBoolean(false)));
@@ -1456,16 +1495,40 @@ pub const IRCompiler = struct {
                 // alloc 5 # create execution result
                 try self.alloc(source, 5);
                 // set [%r+0] = @@pipe_stdout
-                try self.set(source, .initAdd(.{ .register = .r }, 0, .{ .dereference = true }), .from(stdout_pipe_ref.dereference()));
+                try self.set(
+                    source,
+                    .initAdd(.{ .register = .r }, executionResultFieldOffset(.stdout), .{ .dereference = true }),
+                    .from(stdout_pipe_ref.dereference()),
+                );
                 // set [%r+1] = @@pipe_stderr
-                try self.set(source, .initAdd(.{ .register = .r }, 1, .{ .dereference = true }), .from(stderr_pipe_ref.dereference()));
+                try self.set(
+                    source,
+                    .initAdd(.{ .register = .r }, executionResultFieldOffset(.stderr), .{ .dereference = true }),
+                    .from(stderr_pipe_ref.dereference()),
+                );
                 // set [%r+2] = @@pipe_merged
-                try self.set(source, .initAdd(.{ .register = .r }, 2, .{ .dereference = true }), .from(merged_pipe_ref.dereference()));
+                try self.set(
+                    source,
+                    .initAdd(.{ .register = .r }, executionResultFieldOffset(.merged), .{ .dereference = true }),
+                    .from(merged_pipe_ref.dereference()),
+                );
                 // set [%r+3] = [@@execution_handles+0]
                 try self.set(source, .initRegister(.r2), stableResultSource(result));
-                try self.set(source, .initAdd(.{ .register = .r }, 3, .{ .dereference = true }), .fromLocation(.initAdd(.{ .register = .r2 }, 1, .{ .dereference = true })));
+                try self.set(
+                    source,
+                    .initAdd(.{ .register = .r }, executionResultFieldOffset(.closeable), .{ .dereference = true }),
+                    .fromLocation(.initAdd(
+                        .{ .register = .r2 },
+                        executionHandlesFieldOffset(.closeable),
+                        .{ .dereference = true },
+                    )),
+                );
                 // set [%r+4] = false
-                try self.set(source, .initAdd(.{ .register = .r }, 4, .{ .dereference = true }), .fromValue(.fromBoolean(false)));
+                try self.set(
+                    source,
+                    .initAdd(.{ .register = .r }, executionResultFieldOffset(.completion_is_thread), .{ .dereference = true }),
+                    .fromValue(.fromBoolean(false)),
+                );
                 // set [C+?] = %r
                 result = .fromLocation(.initRegister(.r));
                 result = result.typed(execution_result_struct_type);
@@ -1473,15 +1536,35 @@ pub const IRCompiler = struct {
                 // alloc 5 # create execution result for thread-backed capture
                 try self.alloc(source, 5);
                 // set [%r+0] = @@pipe_stdout
-                try self.set(source, .initAdd(.{ .register = .r }, 0, .{ .dereference = true }), .from(stdout_pipe_ref.dereference()));
+                try self.set(
+                    source,
+                    .initAdd(.{ .register = .r }, executionResultFieldOffset(.stdout), .{ .dereference = true }),
+                    .from(stdout_pipe_ref.dereference()),
+                );
                 // set [%r+1] = @@pipe_stderr
-                try self.set(source, .initAdd(.{ .register = .r }, 1, .{ .dereference = true }), .from(stderr_pipe_ref.dereference()));
+                try self.set(
+                    source,
+                    .initAdd(.{ .register = .r }, executionResultFieldOffset(.stderr), .{ .dereference = true }),
+                    .from(stderr_pipe_ref.dereference()),
+                );
                 // set [%r+2] = @@pipe_merged
-                try self.set(source, .initAdd(.{ .register = .r }, 2, .{ .dereference = true }), .from(merged_pipe_ref.dereference()));
+                try self.set(
+                    source,
+                    .initAdd(.{ .register = .r }, executionResultFieldOffset(.merged), .{ .dereference = true }),
+                    .from(merged_pipe_ref.dereference()),
+                );
                 // set [%r+3] = thread handle
-                try self.set(source, .initAdd(.{ .register = .r }, 3, .{ .dereference = true }), stableResultSource(result));
+                try self.set(
+                    source,
+                    .initAdd(.{ .register = .r }, executionResultFieldOffset(.closeable), .{ .dereference = true }),
+                    stableResultSource(result),
+                );
                 // set [%r+4] = true
-                try self.set(source, .initAdd(.{ .register = .r }, 4, .{ .dereference = true }), .fromValue(.fromBoolean(true)));
+                try self.set(
+                    source,
+                    .initAdd(.{ .register = .r }, executionResultFieldOffset(.completion_is_thread), .{ .dereference = true }),
+                    .fromValue(.fromBoolean(true)),
+                );
                 // set [C+?] = %r
                 result = .fromLocation(.initRegister(.r));
                 result = result.typed(execution_result_struct_type);
@@ -1584,70 +1667,6 @@ pub const IRCompiler = struct {
         };
     }
 
-    const InternalStructField = struct {
-        offset: usize,
-        type_expr: ast.TypeExpr,
-    };
-
-    fn internalStructTypeSize(type_expr: ast.TypeExpr) Error!usize {
-        return switch (type_expr) {
-            .void,
-            .integer,
-            .float,
-            .boolean,
-            .byte,
-            .execution,
-            .thread,
-            .module,
-            .function,
-            .tuple,
-            .array,
-            .optional,
-            .promise,
-            .error_union,
-            .error_set,
-            .err,
-            .alias,
-            .identifier,
-            .failed,
-            => 1,
-            .struct_type => |struct_type| {
-                var size: usize = 0;
-                for (struct_type.fields) |field_| {
-                    size += try internalStructTypeSize(field_.type_expr.*);
-                }
-                return size;
-            },
-        };
-    }
-
-    fn getInternalStructField(
-        self: *IRCompiler,
-        source: anytype,
-        struct_type: ast.TypeExpr.StructType,
-        field_name: []const u8,
-    ) Error!InternalStructField {
-        var offset: usize = 0;
-        for (struct_type.fields) |field_| {
-            if (std.mem.eql(u8, field_.name.name, field_name)) {
-                return .{
-                    .offset = offset,
-                    .type_expr = field_.type_expr.*,
-                };
-            }
-            offset += try internalStructTypeSize(field_.type_expr.*);
-        }
-
-        try self.reportSourceError(
-            source,
-            Error.NotImplemented,
-            .@"error",
-            "member \"{s}\" not found on internal struct",
-            .{field_name},
-        );
-        return Error.NotImplemented;
-    }
-
     fn compileMember(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -1727,7 +1746,28 @@ pub const IRCompiler = struct {
             return .fromValue(.void);
         }
 
-        const field_ = try self.getInternalStructField(source, struct_type, member.member.name);
+        const field_ = struct_type.fieldLayout(member.member.name) catch |err| switch (err) {
+            error.FieldNotFound => {
+                try self.reportSourceError(
+                    source,
+                    Error.NotImplemented,
+                    .@"error",
+                    "member \"{s}\" not found on internal struct",
+                    .{member.member.name},
+                );
+                return .fromValue(.void);
+            },
+            error.UnsupportedLayout => {
+                try self.reportSourceError(
+                    source,
+                    Error.NotImplemented,
+                    .@"error",
+                    "member access is not supported for this internal struct layout in IR",
+                    .{},
+                );
+                return .fromValue(.void);
+            },
+        };
         const object_ref = try self.newRef(source, "member_object_ref");
         try self.set(source, object_ref, object.source);
         try self.set(source, .initRegister(.r2), .from(object_ref.dereference()));
@@ -1816,7 +1856,11 @@ pub const IRCompiler = struct {
                 // TODO: handle array coercion
                 if (result == .location and result.location.isType(execution_result_struct_type)) {
                     try self.set(source, .initRegister(.r2), result);
-                    result = .fromLocation(.initAdd(.{ .register = .r2 }, 2, .{ .dereference = true }));
+                    result = .fromLocation(.initAdd(
+                        .{ .register = .r2 },
+                        executionResultFieldOffset(.merged),
+                        .{ .dereference = true },
+                    ));
                 }
                 try self.set(
                     source,
@@ -1973,7 +2017,16 @@ pub const IRCompiler = struct {
             }
         }
 
-        const target_depth = binding_depth orelse unreachable;
+        const target_depth = binding_depth orelse {
+            try self.reportSourceError(
+                source,
+                Error.InternalInvariantViolation,
+                .@"error",
+                "failed to resolve capture depth for identifier \"{s}\"",
+                .{identifier.name},
+            );
+            return .fromValue(.void);
+        };
         var closure_depth = if (current_frame.scope_type == .closure) @as(usize, 0) else @as(usize, 1);
         while ((try self.scopes.getFrame(closure_depth)).scope_type != .closure) : (closure_depth += 1) {}
 
@@ -1995,7 +2048,16 @@ pub const IRCompiler = struct {
             source_depth = depth_cursor - 1;
         }
 
-        const closure_location = closure_value_location orelse unreachable;
+        const closure_location = closure_value_location orelse {
+            try self.reportSourceError(
+                source,
+                Error.InternalInvariantViolation,
+                .@"error",
+                "failed to materialize closure capture for identifier \"{s}\"",
+                .{identifier.name},
+            );
+            return .fromValue(.void);
+        };
 
         if (source_binding.is_mutable) {
             return .from(closure_location.dereference());
@@ -2114,6 +2176,35 @@ pub const IRCompiler = struct {
         };
     }
 
+    const SpawnedClosure = struct {
+        closure: ClosureContext,
+        thread_handle: ir.Location,
+    };
+
+    fn spawnClosure(
+        self: *IRCompiler,
+        source: anytype,
+        dest: ir.InstructionAddr,
+        stdin: ir.Location,
+        stdout: ir.Location,
+        stderr: ir.Location,
+    ) Error!SpawnedClosure {
+        const closure = try self.compileCreateClosure(source);
+        const thread_handle = try self.fork(
+            source,
+            dest,
+            stdin,
+            stdout,
+            stderr,
+            closure.closure_ref.dereference(),
+        );
+        try self.compileClosurePostFork(source);
+        return .{
+            .closure = closure,
+            .thread_handle = thread_handle,
+        };
+    }
+
     fn consume(
         self: *IRCompiler,
         source: anytype,
@@ -2147,16 +2238,13 @@ pub const IRCompiler = struct {
         const stdout = stdio.out orelse self.threadStdout();
         const stderr = stdio.err orelse self.threadStderr();
         // 1. create a closure for a new fork
-        const closure = try self.compileCreateClosure(source);
-        const fork_handle = try self.fork(
+        const spawned = try self.spawnClosure(
             source,
             .initAbs(instr_set, 0),
             stdin,
             stdout,
             stderr,
-            closure.closure_ref.dereference(),
         );
-        try self.compileClosurePostFork(source);
         // 4. switch to new instruction set
         const orig_instr_set = self.current_instruction_set;
         self.current_instruction_set = instr_set;
@@ -2171,10 +2259,10 @@ pub const IRCompiler = struct {
         // 7. switch back to original instruction set
         try self.setClosureIdentifiers();
         self.current_instruction_set = orig_instr_set;
-        try self.compileClosureInitialization(source, closure);
+        try self.compileClosureInitialization(source, spawned.closure);
         self.scopes.pop();
         // 9. wait for fork
-        try self.wait(source, fork_handle);
+        try self.wait(source, spawned.thread_handle);
         // 10. return binding
         return self.compileIdentifier(source, result_identifier);
     }
@@ -2211,6 +2299,7 @@ pub const IRCompiler = struct {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
         const exec_instr_set = try self.addInstructionSet();
+        const redirected_stdout_slot = 2;
         var has_stdout_redirect = false;
         for (redirects) |redirect| {
             if (redirect.stream == .stdout) {
@@ -2227,7 +2316,6 @@ pub const IRCompiler = struct {
             .from(execution_handles.dereference()),
         );
 
-        const closure = try self.compileCreateClosure(source);
         var exec_stdout = self.threadStdout();
 
         for (redirects) |redirect| {
@@ -2245,26 +2333,32 @@ pub const IRCompiler = struct {
             try self.set(source, .initRegister(.r2), .from(execution_handles.dereference()));
             try self.set(
                 source,
-                .initAdd(.{ .register = .r2 }, 2, .{ .dereference = true }),
+                .initAdd(
+                    .{ .register = .r2 },
+                    redirected_stdout_slot,
+                    .{ .dereference = true },
+                ),
                 .from(redirect_pipe_ref.dereference()),
             );
             exec_stdout = redirect_pipe_ref.dereference();
         }
 
-        const thread_handle = try self.fork(
+        const spawned = try self.spawnClosure(
             source,
             .initAbs(exec_instr_set, 0),
             self.threadStdin(),
             exec_stdout,
             self.threadStderr(),
-            closure.closure_ref.dereference(),
         );
-        try self.compileClosurePostFork(source);
         try self.set(source, .initRegister(.r2), .from(execution_handles.dereference()));
         try self.set(
             source,
-            .initAdd(.{ .register = .r2 }, 0, .{ .dereference = true }),
-            .from(thread_handle),
+            .initAdd(
+                .{ .register = .r2 },
+                executionHandlesFieldOffset(.thread),
+                .{ .dereference = true },
+            ),
+            .from(spawned.thread_handle),
         );
 
         const prev_instr_set = self.current_instruction_set;
@@ -2286,7 +2380,11 @@ pub const IRCompiler = struct {
         try self.set(source, .initRegister(.r), result_variable.dereference().source);
         try self.set(
             source,
-            .initAdd(.{ .register = .r }, 1, .{ .dereference = true }),
+            .initAdd(
+                .{ .register = .r },
+                executionHandlesFieldOffset(.closeable),
+                .{ .dereference = true },
+            ),
             .from(exec_handle_ref.dereference()),
         );
         try self.comment("wait from {s}", .{@src().fn_name});
@@ -2294,7 +2392,7 @@ pub const IRCompiler = struct {
 
         try self.setClosureIdentifiers();
         self.current_instruction_set = prev_instr_set;
-        try self.compileClosureInitialization(source, closure);
+        try self.compileClosureInitialization(source, spawned.closure);
         self.scopes.pop();
 
         if (has_stdout_redirect) {
@@ -2303,7 +2401,11 @@ pub const IRCompiler = struct {
                 source,
                 self.stdoutStreamSet(),
                 self.threadStdin(),
-                .initAdd(.{ .register = .r2 }, 2, .{ .dereference = true }),
+                .initAdd(
+                    .{ .register = .r2 },
+                    redirected_stdout_slot,
+                    .{ .dereference = true },
+                ),
                 self.threadStderr(),
                 .noll,
             );
@@ -2314,11 +2416,15 @@ pub const IRCompiler = struct {
         }
 
         const thread_handle_ref = try self.newRef(source, "thread_handle");
-        try self.set(source, thread_handle_ref, .from(thread_handle));
+        try self.set(source, thread_handle_ref, .from(spawned.thread_handle));
         try self.set(source, .initRegister(.r), .from(execution_handles.dereference()));
         try self.set(
             source,
-            .initAdd(.{ .register = .r }, 0, .{ .dereference = true }),
+            .initAdd(
+                .{ .register = .r },
+                executionHandlesFieldOffset(.thread),
+                .{ .dereference = true },
+            ),
             .from(thread_handle_ref.dereference()),
         );
         _ = try self.pop(source);
@@ -2509,11 +2615,37 @@ pub const IRCompiler = struct {
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
+        if (self.hasMixedIfCaptureRequirements(if_expr)) {
+            try self.reportSourceError(
+                source,
+                Error.NotImplemented,
+                .@"error",
+                "if expressions with mixed stdio-capture branches are not yet supported in IR",
+                .{},
+            );
+            return .fromValue(.void);
+        }
+
         if (if_expr.else_branch) |else_branch| {
             return try self.compileIfElse(source, if_expr, else_branch);
         } else {
             return try self.compileIfNoElse(source, if_expr);
         }
+    }
+
+    fn hasMixedIfCaptureRequirements(
+        self: *IRCompiler,
+        if_expr: ast.IfExpr,
+    ) bool {
+        const else_branch = if_expr.else_branch orelse return false;
+        const then_capture = self.analyzeExpressionEffects(if_expr.then_expr).needs_stdio_capture;
+        const else_capture = switch (else_branch) {
+            .expr => |expr_| self.analyzeExpressionEffects(expr_).needs_stdio_capture,
+            .if_expr => |if_expr_| self.analyzeIfExpressionEffects(if_expr_.*).needs_stdio_capture,
+            .condition => false,
+        };
+
+        return then_capture != else_capture;
     }
 
     fn compileIfElse(
@@ -2628,53 +2760,45 @@ pub const IRCompiler = struct {
         const last_set = try self.addInstructionSet();
 
         try self.comment("first stage", .{});
-        stage_closures[0] = try self.compileCreateClosure(source);
-        _ = try self.fork(
+        const first_spawned = try self.spawnClosure(
             source,
             .initAbs(stage_sets[0], 0),
             self.threadStdin(),
             refs[0].dereference(),
             self.threadStderr(),
-            stage_closures[0].closure_ref.dereference(),
         );
-        try self.compileClosurePostFork(source);
-        // TODO: Handle this more generically that also covers the other use cases for compiling closures. Right now this is handled in the compileClosureInitialization function. The following line (and the other lines following the same pattern in this function) is a special handling since we are compiling multiple closures at the same place consecutively.
-        // self.currentFrame().rel_stack_counter -= 2;
+        stage_closures[0] = first_spawned.closure;
 
         for (refs[0 .. refs.len - 1], refs[1..], stage_sets[1..], 1..) |prev, curr, stage_set, i| {
             try self.comment("stage {}", .{i});
-            stage_closures[i] = try self.compileCreateClosure(source);
-            _ = try self.fork(
+            const spawned = try self.spawnClosure(
                 source,
                 .initAbs(stage_set, 0),
                 prev.dereference(),
                 curr.dereference(),
                 self.threadStderr(),
-                stage_closures[i].closure_ref.dereference(),
             );
-            try self.compileClosurePostFork(source);
-            // TODO: As stated above, we need special handling here for the rel_stack_counter.
-            // self.currentFrame().rel_stack_counter -= 2;
+            stage_closures[i] = spawned.closure;
         }
 
         try self.comment("last stage", .{});
-        var last_closure = try self.compileCreateClosure(source);
-        const last_fork_handle = try self.fork(
+        const last_spawned = try self.spawnClosure(
             source,
             .initAbs(last_set, 0),
             refs[refs.len - 1].dereference(),
             self.threadStdout(),
             self.threadStderr(),
-            last_closure.closure_ref.dereference(),
         );
-        try self.compileClosurePostFork(source);
-        // TODO: As stated above, we need special handling here for the rel_stack_counter.
-        // self.currentFrame().rel_stack_counter -= 2;
 
         for (stage_sets, stage_closures, pipeline.stages[0 .. pipeline.stages.len - 1], 0..) |*stage_set, *stage_closure, stage_expr, i| {
             self.current_instruction_set = stage_set.*;
             try self.scopes.push(self.allocator, .closure);
-            _ = try self.forkInherit(source, self.stdoutStreamSet(), .noll);
+            const stdout_stream_thread_ref = try self.newRef(source, "pipeline_stdout_stream_thread");
+            try self.set(
+                source,
+                stdout_stream_thread_ref,
+                .from(try self.forkInherit(source, self.stdoutStreamSet(), .noll)),
+            );
             const result = try self.compileExpression(stage_expr);
 
             if (isWaitable(result)) |loc| {
@@ -2696,12 +2820,12 @@ pub const IRCompiler = struct {
                 );
             }
 
+            try self.wait(source, stdout_stream_thread_ref.dereference());
+
             try self.setClosureIdentifiers();
             self.current_instruction_set = orig_instr_set;
             try self.comment("closure initialization stage {}: {f}", .{ i, stage_closure.return_addr });
             try self.compileClosureInitialization(source, stage_closure.*);
-            // TODO: As stated above, we need special handling here for the rel_stack_counter.
-            // self.currentFrame().rel_stack_counter += 2;
             self.scopes.pop();
         }
         self.current_instruction_set = orig_instr_set;
@@ -2716,13 +2840,11 @@ pub const IRCompiler = struct {
         try self.exitWith(source, result);
         try self.setClosureIdentifiers();
         self.current_instruction_set = orig_instr_set;
-        try self.comment("closure initialization last stage: {f}", .{last_closure.return_addr});
-        try self.compileClosureInitialization(source, last_closure);
-        // TODO: As stated above, we need special handling here for the rel_stack_counter.
-        // self.currentFrame().rel_stack_counter += 2;
+        try self.comment("closure initialization last stage: {f}", .{last_spawned.closure.return_addr});
+        try self.compileClosureInitialization(source, last_spawned.closure);
         self.scopes.pop();
 
-        return .from(last_fork_handle);
+        return .from(last_spawned.thread_handle);
     }
 
     fn compileBlock(
@@ -2781,7 +2903,16 @@ pub const IRCompiler = struct {
                         if (param.type_annotation) |type_annotation| type_annotation.* else null,
                     );
                 },
-                .tuple, .record => unreachable,
+                .tuple, .record => {
+                    try self.reportSourceError(
+                        source,
+                        Error.UnsupportedBindingPattern,
+                        .@"error",
+                        "function parameter destructuring is not yet supported in IR",
+                        .{},
+                    );
+                    return .fromValue(.void);
+                },
             }
         }
 
@@ -3066,7 +3197,16 @@ pub const IRCompiler = struct {
                 switch (binary.op) {
                     .logical_and => try self.jmp(source, left, false, after_addr),
                     .logical_or => try self.jmp(source, left, true, after_addr),
-                    else => unreachable,
+                    else => {
+                        try self.reportSourceError(
+                            source,
+                            Error.UnsupportedBinaryOperation,
+                            .@"error",
+                            "operator \"{t}\" is not supported in logical statement lowering",
+                            .{binary.op},
+                        );
+                        return .fromValue(.void);
+                    },
                 }
 
                 _ = try self.compileLogicalRightStatement(source, binary.right);
@@ -3092,7 +3232,16 @@ pub const IRCompiler = struct {
                     switch (binary.op) {
                         .logical_and => try self.jmp(source, left, false, after_addr),
                         .logical_or => try self.jmp(source, left, true, after_addr),
-                        else => unreachable,
+                        else => {
+                            try self.reportSourceError(
+                                source,
+                                Error.UnsupportedBinaryOperation,
+                                .@"error",
+                                "operator \"{t}\" is not supported in logical value lowering",
+                                .{binary.op},
+                            );
+                            return .fromValue(.void);
+                        },
                     }
 
                     const right = try self.compileStableExpressionIntoRef(source, binary.right, result);
@@ -3238,7 +3387,16 @@ pub const IRCompiler = struct {
             capture_refs[i] = switch (capture.*) {
                 .identifier => try self.newRef(source, try std.fmt.allocPrint(self.allocator, "for_capture_{}", .{i})),
                 .discard => null,
-                .tuple, .record => unreachable,
+                .tuple, .record => {
+                    try self.reportSourceError(
+                        source,
+                        Error.UnsupportedBindingPattern,
+                        .@"error",
+                        "for-loop destructuring captures are not yet supported in IR",
+                        .{},
+                    );
+                    return .fromValue(.void);
+                },
             };
         }
 
@@ -3271,7 +3429,16 @@ pub const IRCompiler = struct {
                     identifier,
                     capture_refs[i].?,
                 ),
-                .tuple, .record => unreachable,
+                .tuple, .record => {
+                    try self.reportSourceError(
+                        source,
+                        Error.UnsupportedBindingPattern,
+                        .@"error",
+                        "for-loop destructuring captures are not yet supported in IR",
+                        .{},
+                    );
+                    return .fromValue(.void);
+                },
             }
         }
 
@@ -3444,3 +3611,150 @@ const RefDef = struct {
     name: []const u8,
     rel_stack_addr: usize,
 };
+
+fn compileInlineForTest(
+    allocator: Allocator,
+    source: []const u8,
+    script_args: []const []const u8,
+) !CompilationResult {
+    var document_store = FrontendDocumentStore.init(allocator);
+    defer document_store.deinit();
+
+    const path = ":compiler-test";
+    const document = try document_store.putDocument(path, source);
+    const parse_result = document.parser.parseScript(path);
+    const script = switch (parse_result) {
+        .success => |script| script,
+        .err => |err| {
+            std.debug.print("unexpected parse failure in compiler test:\n", .{});
+            for (err.diagnostics()) |diag| {
+                std.debug.print("{s}\n", .{diag.message});
+            }
+            return error.UnexpectedToken;
+        },
+    };
+
+    document.ast = script;
+
+    var compiler = try IRCompiler.init(
+        allocator,
+        &document_store.document_store,
+        &document.ast.?,
+        script_args,
+    );
+    return try compiler.compile();
+}
+
+fn expectCompilerDiagnostic(
+    allocator: Allocator,
+    source: []const u8,
+    expected_err: Error,
+    message_substring: []const u8,
+) !void {
+    const result = try compileInlineForTest(allocator, source, &.{});
+    switch (result) {
+        .success => return error.TestUnexpectedSuccess,
+        .err => |err| {
+            try std.testing.expect(err.diagnostics().len > 0);
+            try std.testing.expectEqual(expected_err, err.diagnostics()[0].err);
+            try std.testing.expect(
+                std.mem.indexOf(u8, err.diagnostics()[0].message, message_substring) != null,
+            );
+        },
+    }
+}
+
+fn expectCompilerDiagnosticWithArgs(
+    allocator: Allocator,
+    source: []const u8,
+    script_args: []const []const u8,
+    expected_err: Error,
+    message_substring: []const u8,
+) !void {
+    const result = try compileInlineForTest(allocator, source, script_args);
+    switch (result) {
+        .success => return error.TestUnexpectedSuccess,
+        .err => |err| {
+            try std.testing.expect(err.diagnostics().len > 0);
+            try std.testing.expectEqual(expected_err, err.diagnostics()[0].err);
+            try std.testing.expect(
+                std.mem.indexOf(u8, err.diagnostics()[0].message, message_substring) != null,
+            );
+        },
+    }
+}
+
+test "compiler diagnoses mixed stdio-capture if else without panicking" {
+    const allocator = std.testing.allocator;
+    try expectCompilerDiagnostic(
+        allocator,
+        \\const verbose = false
+        \\if (verbose) {
+        \\  echo "captured"
+        \\} else {
+        \\  1
+        \\}
+    ,
+        Error.NotImplemented,
+        "mixed stdio-capture branches",
+    );
+}
+
+test "compiler diagnoses missing internal struct member without panicking" {
+    const allocator = std.testing.allocator;
+    try expectCompilerDiagnostic(
+        allocator,
+        \\const result = echo "hello"
+        \\echo "${result.nope}"
+    ,
+        Error.NotImplemented,
+        "member \"nope\" not found on internal struct",
+    );
+}
+
+test "compiler diagnoses unsupported array member without panicking" {
+    const allocator = std.testing.allocator;
+    try expectCompilerDiagnostic(
+        allocator,
+        \\const arr = .{ 1, 2 }
+        \\echo "${arr.nope}"
+    ,
+        Error.NotImplemented,
+        "member \"nope\" not found on array value",
+    );
+}
+
+test "compiler diagnoses unsupported for source type without panicking" {
+    const allocator = std.testing.allocator;
+    try expectCompilerDiagnostic(
+        allocator,
+        \\for ("hello") |c| echo "${c}"
+    ,
+        Error.NotImplemented,
+        "for loops with source type",
+    );
+}
+
+test "compiler diagnoses infinite-only for loop without panicking" {
+    const allocator = std.testing.allocator;
+    try expectCompilerDiagnostic(
+        allocator,
+        \\for (0..) |i| echo "${i}"
+    ,
+        Error.NotImplemented,
+        "for loops require at least one finite source",
+    );
+}
+
+test "compiler diagnoses script arg arity mismatch without panicking" {
+    const allocator = std.testing.allocator;
+    try expectCompilerDiagnosticWithArgs(
+        allocator,
+        \\fn Void @(file: String) String
+        \\echo "${file}"
+    ,
+        &.{},
+        Error.UnsupportedExpression,
+        "expected 1 script arguments, got 0",
+    );
+}

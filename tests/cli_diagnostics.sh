@@ -6,7 +6,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="${RUNIC_REPO_ROOT:-$(cd "$script_dir/.." && pwd)}"
 
 if ! command -v zig >/dev/null 2>&1; then
-  echo "zig is required for CLI smoke tests but was not found on PATH." >&2
+  echo "zig is required for CLI diagnostic tests but was not found on PATH." >&2
   exit 1
 fi
 
@@ -19,20 +19,35 @@ if [[ $# -gt 0 ]]; then
     elif [[ -f "$repo_root/$target" ]]; then
       runic_scripts+=("$target")
     else
-      echo "Unable to locate Runic script: $target" >&2
+      echo "Unable to locate Runic diagnostic script: $target" >&2
       exit 1
     fi
   done
 else
   mapfile -t runic_scripts < <(
     cd "$repo_root" >/dev/null
-    find tests/features -type f -name '*.rn' -print 2>/dev/null | LC_ALL=C sort
+    find tests/diagnostics -type f -name '*.rn' -print | LC_ALL=C sort
   )
 fi
 
 if [[ ${#runic_scripts[@]} -eq 0 ]]; then
-  echo "CLI smoke tests skipped: no Runic feature scripts found under tests/features/."
+  echo "CLI diagnostic tests skipped: no Runic scripts found under tests/diagnostics."
   exit 0
+fi
+
+strip_ansi() {
+  perl -pe 's/\e\[[0-9;]*m//g'
+}
+
+(
+  cd "$repo_root"
+  zig build >/dev/null
+)
+
+runic_bin="$repo_root/zig-out/bin/runic"
+if [[ ! -x "$runic_bin" ]]; then
+  echo "runic binary was not built at $runic_bin" >&2
+  exit 1
 fi
 
 count=0
@@ -51,50 +66,60 @@ for script in "${runic_scripts[@]}"; do
   stderr_fixture="${base_path}.stderr"
   status_fixture="${base_path}.status"
 
-  expected_status=0
+  expected_status=1
   if [[ -f "$status_fixture" ]]; then
     expected_status="$(tr -d '[:space:]' < "$status_fixture")"
   fi
 
   stdout_tmp="$(mktemp)"
   stderr_tmp="$(mktemp)"
+  stdout_norm_tmp="$(mktemp)"
+  stderr_norm_tmp="$(mktemp)"
   echo "-- running ${rel_path}"
 
   set +e
   if [[ -f "$stdin_fixture" ]]; then
-    (cd "$repo_root" && zig build run -- "$rel_path" < "$stdin_fixture") >"$stdout_tmp" 2>"$stderr_tmp"
+    (cd "$repo_root" && "$runic_bin" "$rel_path" < "$stdin_fixture") >"$stdout_tmp" 2>"$stderr_tmp"
   else
-    (cd "$repo_root" && zig build run -- "$rel_path") >"$stdout_tmp" 2>"$stderr_tmp"
+    (cd "$repo_root" && "$runic_bin" "$rel_path") >"$stdout_tmp" 2>"$stderr_tmp"
   fi
   status=$?
   set -e
 
+  strip_ansi <"$stdout_tmp" >"$stdout_norm_tmp"
+  strip_ansi <"$stderr_tmp" >"$stderr_norm_tmp"
+
   if [[ "$status" != "$expected_status" ]]; then
     echo "Unexpected exit status for ${rel_path}: got ${status}, expected ${expected_status}" >&2
-    cat "$stderr_tmp" >&2
+    cat "$stdout_norm_tmp" >&2
+    cat "$stderr_norm_tmp" >&2
     exit 1
   fi
 
   if [[ -f "$stdout_fixture" ]]; then
-    if ! diff -u "$stdout_fixture" "$stdout_tmp"; then
+    if ! diff -u "$stdout_fixture" "$stdout_norm_tmp"; then
       echo "Stdout mismatch for ${rel_path}" >&2
       exit 1
     fi
-  fi
-
-  if [[ -f "$stderr_fixture" ]]; then
-    if ! diff -u "$stderr_fixture" "$stderr_tmp"; then
-      echo "Stderr mismatch for ${rel_path}" >&2
-      exit 1
-    fi
-  elif [[ -s "$stderr_tmp" ]]; then
-    echo "Unexpected stderr for ${rel_path}" >&2
-    cat "$stderr_tmp" >&2
+  elif [[ -s "$stdout_norm_tmp" ]]; then
+    echo "Unexpected stdout for ${rel_path}" >&2
+    cat "$stdout_norm_tmp" >&2
     exit 1
   fi
 
-  rm -f "$stdout_tmp" "$stderr_tmp"
+  if [[ -f "$stderr_fixture" ]]; then
+    if ! diff -u "$stderr_fixture" "$stderr_norm_tmp"; then
+      echo "Stderr mismatch for ${rel_path}" >&2
+      exit 1
+    fi
+  elif [[ -s "$stderr_norm_tmp" ]]; then
+    echo "Unexpected stderr for ${rel_path}" >&2
+    cat "$stderr_norm_tmp" >&2
+    exit 1
+  fi
+
+  rm -f "$stdout_tmp" "$stderr_tmp" "$stdout_norm_tmp" "$stderr_norm_tmp"
   ((count += 1))
 done
 
-echo "CLI smoke tests passed (${count} scripts)."
+echo "CLI diagnostic tests passed (${count} scripts)."

@@ -232,6 +232,29 @@ pub const TypeExpr = union(enum) {
         decls: []const StructDecl,
         span: Span,
 
+        pub const FieldLayout = struct {
+            offset: usize,
+            type_expr: TypeExpr,
+        };
+
+        pub fn fieldLayout(
+            self: @This(),
+            field_name: []const u8,
+        ) LayoutError!FieldLayout {
+            var offset: usize = 0;
+            for (self.fields) |field| {
+                if (std.mem.eql(u8, field.name.name, field_name)) {
+                    return .{
+                        .offset = offset,
+                        .type_expr = field.type_expr.*,
+                    };
+                }
+                offset += try field.type_expr.slotSize();
+            }
+
+            return LayoutError.FieldNotFound;
+        }
+
         pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
             try writer.writeAll("<struct>{\n");
             for (self.fields) |field| {
@@ -397,6 +420,43 @@ pub const TypeExpr = union(enum) {
     pub fn span(self: TypeExpr) Span {
         return switch (self) {
             inline else => |s| s.span,
+        };
+    }
+
+    pub const LayoutError = error{
+        UnsupportedLayout,
+        FieldNotFound,
+    };
+
+    pub fn slotSize(self: *const TypeExpr) LayoutError!usize {
+        return switch (self.*) {
+            .void,
+            .integer,
+            .float,
+            .boolean,
+            .byte,
+            .execution,
+            .thread,
+            .module,
+            .function,
+            .tuple,
+            .array,
+            .optional,
+            .promise,
+            .error_union,
+            .error_set,
+            .err,
+            .alias,
+            .identifier,
+            .failed,
+            => 1,
+            .struct_type => |struct_type| blk: {
+                var size: usize = 0;
+                for (struct_type.fields) |field| {
+                    size += try field.type_expr.slotSize();
+                }
+                break :blk size;
+            },
         };
     }
 

@@ -21,19 +21,32 @@ pub const Error =
     ir.Value.DeserializeError ||
     IREvaluator.MaterializeStringError ||
     ir.Location.Error ||
+    ir.context.Error ||
     error{
         UnsupportedInstruction,
         UnsupportedWaitee,
         UnsupportedStreamee,
         UnsupportedForward,
         UnsupportedExitCodeType,
+        UnsupportedNegOperand,
         UnsupportedBinaryOperator,
         UnsupportedBinaryExpression,
         SetImmutableLocation,
         SetInstructionLocation,
+        InvalidRegisterAssignment,
         RefNotFound,
         DuplicateRef,
         ContNoInstrCounterIncInAtomic,
+        MissingCurrentThread,
+        MissingLabelAddr,
+        MissingThreadExitCode,
+        MissingCloseableResult,
+        MalformedExecutionResult,
+        MalformedExecutionHandles,
+        InvalidStructBaseAddr,
+        MissingHeapValue,
+        MalformedHeapSequence,
+        MissingSpawnedThreadContext,
     };
 
 pub const Result = union(enum) {
@@ -86,12 +99,12 @@ pub const IREvaluator = struct {
     pub fn step(self: *IREvaluator) Error!?Result {
         // self.logTrace(@src().fn_name);
 
-        const thread = self.context.getCurrentThread() orelse unreachable;
+        const thread = self.context.getCurrentThread() orelse return Error.MissingCurrentThread;
 
         const instruction = thread.currentInstruction() orelse {
             self.log("{}: no more instructions", .{thread.id});
             try self.context.closeThread(thread.id, null);
-            return self.advanceThreadCounter();
+            return try self.advanceThreadCounter();
         };
 
         const result = try self.runInstruction(thread, instruction);
@@ -108,7 +121,7 @@ pub const IREvaluator = struct {
 
         self.tempCloseStdIoCheck();
 
-        return self.advanceThreadCounter();
+        return try self.advanceThreadCounter();
     }
 
     fn tempCloseStdIoCheck(self: *IREvaluator) void {
@@ -117,15 +130,17 @@ pub const IREvaluator = struct {
             for (self.context.threads.items) |thread| {
                 if (thread.id == 0) continue;
                 if (self.context.isThreadClosed(thread.id)) continue;
-                self.context.closeThread(thread.id, .success) catch unreachable;
+                self.context.closeThread(thread.id, .success) catch |err| {
+                    self.log("failed to close lingering thread {}: {}", .{ thread.id, err });
+                };
             }
         }
     }
 
-    fn advanceThreadCounter(self: *IREvaluator) Result {
+    fn advanceThreadCounter(self: *IREvaluator) Error!Result {
         return switch (self.context.advanceThreadCounter()) {
             .cont => .cont,
-            .quit => .{ .exit = self.context.getMainThreadExitCode() },
+            .quit => .{ .exit = try self.context.getMainThreadExitCode() },
         };
     }
 
@@ -148,13 +163,13 @@ pub const IREvaluator = struct {
         self: IREvaluator,
         thread: ir.context.IRThreadContext,
         addr: ir.InstructionAddr,
-    ) ir.ResolvedInstructionAddr {
+    ) Error!ir.ResolvedInstructionAddr {
         const abs: usize = switch (addr.local_addr) {
             .abs => |abs| abs,
             .rel => |rel| @intCast(
                 @as(isize, @intCast(thread.getCurrentInstructionAddr().local_addr)) + rel,
             ),
-            .label => |label| return self.context.labels().get(label).?,
+            .label => |label| return self.context.labels().get(label) orelse Error.MissingLabelAddr,
         };
 
         return .init(addr.instr_set, abs);
@@ -254,20 +269,27 @@ pub const IREvaluator = struct {
         self: *IREvaluator,
         thread: ir.context.IRThreadContext,
         location: ir.Location,
-    ) ResolveLocationError!ExitCode {
-        const base_loc = location.undereference();
-        const base = switch (base_loc.abs) {
-            .ref, .stack, .heap, .closure => (try self.dereferenceLocation(thread, base_loc)).*,
-            else => try self.resolveLocation(thread, base_loc),
+    ) Error!ExitCode {
+        const is_thread_completion = switch (try self.executionResultFieldValue(
+            thread,
+            location,
+            .completion_is_thread,
+        )) {
+            .exit_code => |exit_code| exit_code.toBoolean(),
+            else => return Error.MalformedExecutionResult,
         };
-        const is_thread_completion = self.context.shared.heap.get(base.addr + 4).?.exit_code.toBoolean();
         if (is_thread_completion) {
-            const thread_handle = self.context.shared.heap.get(base.addr + 3).?.thread;
-            return self.context.thread_exit_codes.get(thread_handle).?;
+            const thread_handle = switch (try self.executionResultFieldValue(thread, location, .closeable)) {
+                .thread => |thread_handle| thread_handle,
+                else => return Error.MalformedExecutionResult,
+            };
+            return self.context.thread_exit_codes.get(thread_handle) orelse Error.MissingThreadExitCode;
         }
-        const handle_addr = base.addr + 3;
-        const handle = self.context.shared.heap.get(handle_addr).?.closeable;
-        const closeable = self.context.getCloseable(handle);
+        const handle = switch (try self.executionResultFieldValue(thread, location, .closeable)) {
+            .closeable => |handle| handle,
+            else => return Error.MalformedExecutionResult,
+        };
+        const closeable = try self.context.getCloseable(handle);
         return closeable.getResult() orelse closeable.close();
     }
 
@@ -275,26 +297,61 @@ pub const IREvaluator = struct {
         self: *IREvaluator,
         thread: ir.context.IRThreadContext,
         location: ir.Location,
-    ) ResolveLocationError!ExitCode {
+    ) Error!ExitCode {
+        const handle = switch (try self.executionHandlesFieldValue(thread, location, .closeable)) {
+            .closeable => |handle| handle,
+            else => return Error.MalformedExecutionHandles,
+        };
+        const closeable = try self.context.getCloseable(handle);
+        return closeable.getResult() orelse closeable.close();
+    }
+
+    fn resolveStructBaseAddr(
+        self: *IREvaluator,
+        thread: ir.context.IRThreadContext,
+        location: ir.Location,
+    ) Error!usize {
         const base_loc = location.undereference();
         const base = switch (base_loc.abs) {
             .ref, .stack, .heap, .closure => (try self.dereferenceLocation(thread, base_loc)).*,
             else => try self.resolveLocation(thread, base_loc),
         };
-        const handle_addr = base.addr + 1;
-        const handle = self.context.shared.heap.get(handle_addr).?.closeable;
-        const closeable = self.context.getCloseable(handle);
-        return closeable.getResult() orelse closeable.close();
+        return switch (base) {
+            .addr => |addr| addr,
+            else => Error.InvalidStructBaseAddr,
+        };
+    }
+
+    fn executionResultFieldValue(
+        self: *IREvaluator,
+        thread: ir.context.IRThreadContext,
+        location: ir.Location,
+        field: compiler.ExecutionResultField,
+    ) Error!ir.Value {
+        const base_addr = try self.resolveStructBaseAddr(thread, location);
+        const heap_index = base_addr + compiler.executionResultFieldOffset(field);
+        return self.context.shared.heap.get(heap_index) orelse Error.MalformedExecutionResult;
+    }
+
+    fn executionHandlesFieldValue(
+        self: *IREvaluator,
+        thread: ir.context.IRThreadContext,
+        location: ir.Location,
+        field: compiler.ExecutionHandlesField,
+    ) Error!ir.Value {
+        const base_addr = try self.resolveStructBaseAddr(thread, location);
+        const heap_index = base_addr + compiler.executionHandlesFieldOffset(field);
+        return self.context.shared.heap.get(heap_index) orelse Error.MalformedExecutionHandles;
     }
 
     fn resolveThreadExitCode(
         self: *IREvaluator,
         thread: ir.context.IRThreadContext,
         location: ir.Location,
-    ) ResolveLocationError!ExitCode {
+    ) Error!ExitCode {
         const thread_value = try self.resolveLocation(thread, location);
         const thread_handle = thread_value.thread;
-        return self.context.thread_exit_codes.get(thread_handle).?;
+        return self.context.thread_exit_codes.get(thread_handle) orelse Error.MissingThreadExitCode;
     }
 
     fn coerceExitCode(
@@ -316,7 +373,7 @@ pub const IREvaluator = struct {
         return switch (resolved) {
             .uinteger => |x| .fromByte(@intCast(@mod(x, 256))),
             .exit_code => |exit_code| exit_code,
-            .closeable => |handle| self.context.getCloseable(handle).getResult().?,
+            .closeable => |handle| (try self.context.getCloseable(handle)).getResult() orelse Error.MissingCloseableResult,
             else => error.UnsupportedExitCodeType,
         };
     }
@@ -404,12 +461,12 @@ pub const IREvaluator = struct {
                     .addr => |_| if (neg.operand.isType(compiler.execution_result_struct_type))
                         (try self.resolveExecutionResultExitCode(thread, neg.operand)).negate()
                     else
-                        unreachable,
+                        return Error.UnsupportedNegOperand,
                     .thread => if (neg.operand.isType(compiler.thread_type))
                         (try self.resolveThreadExitCode(thread, neg.operand)).negate()
                     else
-                        unreachable,
-                    else => unreachable,
+                        return Error.UnsupportedNegOperand,
+                    else => return Error.UnsupportedNegOperand,
                 };
                 try self.setLocation(thread, neg.result, .{ .exit_code = negated });
                 return .cont;
@@ -474,9 +531,9 @@ pub const IREvaluator = struct {
                 const stdout_handle = thread.private.stack.items[1].pipe;
                 const stderr_handle = thread.private.stack.items[2].pipe;
 
-                const stdin_pipe = self.context.getPipe(stdin_handle);
-                const stdout_pipe = self.context.getPipe(stdout_handle);
-                const stderr_pipe = self.context.getPipe(stderr_handle);
+                const stdin_pipe = try self.context.getPipe(stdin_handle);
+                const stdout_pipe = try self.context.getPipe(stdout_handle);
+                const stderr_pipe = try self.context.getPipe(stderr_handle);
 
                 // TODO: memory management
                 const process_io = try self.allocator.create(CloseableProcessIo);
@@ -501,7 +558,7 @@ pub const IREvaluator = struct {
                 return .cont;
             },
             .jmp => |jmp| {
-                const dest = self.resolveAddr(thread, jmp.dest);
+                const dest = try self.resolveAddr(thread, jmp.dest);
                 const cond = jmp.cond orelse {
                     thread.setInstructionCounter(dest);
                     return .cont_no_instr_counter_inc;
@@ -600,7 +657,7 @@ pub const IREvaluator = struct {
             },
             .pipe_opt => |pipe_opt| {
                 const pipe_handle = (try self.resolveLocation(thread, pipe_opt.handle)).pipe;
-                const pipe = self.context.getPipe(pipe_handle);
+                const pipe = try self.context.getPipe(pipe_handle);
                 const value = try self.resolveValueSource(thread, pipe_opt.source);
 
                 switch (pipe_opt.option) {
@@ -614,7 +671,7 @@ pub const IREvaluator = struct {
             },
             .pipe_file => |pipe_file| {
                 const pipe_handle = (try self.resolveLocation(thread, pipe_file.pipe)).pipe;
-                const pipe = self.context.getPipe(pipe_handle);
+                const pipe = try self.context.getPipe(pipe_handle);
 
                 var path_writer = std.Io.Writer.Allocating.init(self.allocator);
                 defer path_writer.deinit();
@@ -646,7 +703,7 @@ pub const IREvaluator = struct {
             },
             .pipe_write => |pipe_write| {
                 const pipe_handle = (try self.resolveLocation(thread, pipe_write.pipe)).pipe;
-                const pipe = self.context.getPipe(pipe_handle);
+                const pipe = try self.context.getPipe(pipe_handle);
                 const value = try self.resolveValueSource(thread, pipe_write.source);
                 try self.materializePipelineInput(thread, value, pipe.closeableWriter().writer);
                 return .cont;
@@ -654,8 +711,8 @@ pub const IREvaluator = struct {
             .pipe_fwd => |pipe_fwd| {
                 const source_handle = (try self.resolveLocation(thread, pipe_fwd.source)).pipe;
                 const destination_handle = (try self.resolveLocation(thread, pipe_fwd.destination)).pipe;
-                const source_pipe = self.context.getPipe(source_handle);
-                const destination_pipe = self.context.getPipe(destination_handle);
+                const source_pipe = try self.context.getPipe(source_handle);
+                const destination_pipe = try self.context.getPipe(destination_handle);
 
                 try source_pipe.connectDestination(destination_pipe.closeableWriter());
 
@@ -676,9 +733,11 @@ pub const IREvaluator = struct {
             },
             .fork => |fork| {
                 const new_thread_handle = try self.context.spawnThread();
-                const new_thread = self.context.getThreadContext(new_thread_handle).?;
+                const new_thread = self.context.getThreadContext(new_thread_handle) orelse {
+                    return Error.MissingSpawnedThreadContext;
+                };
 
-                new_thread.setInstructionCounter(self.resolveAddr(thread, fork.dest));
+                new_thread.setInstructionCounter(try self.resolveAddr(thread, fork.dest));
 
                 thread.private.result_register = .{ .thread = new_thread_handle };
 
@@ -709,7 +768,7 @@ pub const IREvaluator = struct {
                         thread.waitFor(thread_handle);
                     },
                     .closeable => |closeable_handle| {
-                        const closeable = self.context.getCloseable(closeable_handle);
+                        const closeable = try self.context.getCloseable(closeable_handle);
                         if (closeable.isClosed()) {
                             return .cont;
                         } else {
@@ -726,7 +785,7 @@ pub const IREvaluator = struct {
                 const streamee = try self.resolveLocation(thread, stream);
 
                 return switch (streamee) {
-                    .pipe => |pipe_handle| switch (try self.context.getPipe(pipe_handle).forward(.unlimited)) {
+                    .pipe => |pipe_handle| switch (try (try self.context.getPipe(pipe_handle)).forward(.unlimited)) {
                         .no_source => .cont_no_instr_counter_inc,
                         .closed => .cont,
                         .not_done => .cont_no_instr_counter_inc,
@@ -806,7 +865,10 @@ pub const IREvaluator = struct {
                             }
                             dest.* = source;
                         } else {
-                            thread.private.stack_frame = source.addr;
+                            switch (source) {
+                                .addr => |addr| thread.private.stack_frame = addr,
+                                else => return Error.InvalidRegisterAssignment,
+                            }
                         }
                     },
                     .sc => {
@@ -818,10 +880,13 @@ pub const IREvaluator = struct {
                             }
                             dest.* = source;
                         } else {
-                            try thread.private.stack.resize(
-                                self.allocator,
-                                source.addr,
-                            );
+                            switch (source) {
+                                .addr => |addr| try thread.private.stack.resize(
+                                    self.allocator,
+                                    addr,
+                                ),
+                                else => return Error.InvalidRegisterAssignment,
+                            }
                         }
                     },
                     .r => {
@@ -1019,7 +1084,52 @@ pub const IREvaluator = struct {
         GetSliceError ||
         DereferenceValueError ||
         std.Io.Writer.Error ||
-        error{UnsupportedType};
+        ir.context.Error ||
+        error{
+            UnsupportedType,
+            MissingHeapValue,
+            MalformedHeapSequence,
+        };
+
+    fn heapValueAt(
+        self: *IREvaluator,
+        addr: usize,
+    ) MaterializeStringError!ir.Value {
+        return self.context.shared.heap.get(addr) orelse MaterializeStringError.MissingHeapValue;
+    }
+
+    fn maybeHeapSequenceLen(
+        self: *IREvaluator,
+        addr: usize,
+    ) MaterializeStringError!?struct { heap_addr: usize, len: usize } {
+        const loc = self.context.mapAddr(addr);
+        const heap_addr = switch (loc.abs) {
+            .heap => |heap_addr| heap_addr,
+            else => return null,
+        };
+        const heap_value = try self.heapValueAt(heap_addr);
+        return switch (heap_value) {
+            .uinteger => |len| .{ .heap_addr = heap_addr, .len = len },
+            else => null,
+        };
+    }
+
+    fn materializeHeapSequence(
+        self: *IREvaluator,
+        thread: ir.context.IRThreadContext,
+        heap_addr: usize,
+        len: usize,
+        separator: ?u8,
+        w: *std.Io.Writer,
+    ) MaterializeStringError!void {
+        for (0..len) |i| {
+            if (separator) |sep| {
+                if (i > 0) try w.writeByte(sep);
+            }
+            const element = try self.heapValueAt(heap_addr + i + 1);
+            try self.materializeString(thread, element, w);
+        }
+    }
 
     fn materializeString(
         self: *IREvaluator,
@@ -1031,7 +1141,7 @@ pub const IREvaluator = struct {
 
         switch (value) {
             .stream => |stream| for (0..stream.len) |i| {
-                const stream_value = thread.shared.heap.get(i + stream.addr).?;
+                const stream_value = try self.heapValueAt(i + stream.addr);
                 try self.materializeString(thread, stream_value, w);
             },
             .executable => |executable| {
@@ -1046,28 +1156,23 @@ pub const IREvaluator = struct {
             },
             inline .uinteger, .float => |t| try w.print("{}", .{t}),
             .addr => |addr| {
-                const loc = self.context.mapAddr(addr);
-                switch (loc.abs) {
-                    .heap => |heap_addr| {
-                        const heap_value = thread.shared.heap.get(heap_addr).?;
-                        if (heap_value != .uinteger) {
+                if (try self.maybeHeapSequenceLen(addr)) |seq| {
+                    try self.materializeHeapSequence(thread, seq.heap_addr, seq.len, null, w);
+                } else {
+                    const loc = self.context.mapAddr(addr);
+                    switch (loc.abs) {
+                        .heap => |heap_addr| {
+                            const heap_value = try self.heapValueAt(heap_addr);
                             try self.materializeString(thread, heap_value, w);
-                            return;
-                        }
-
-                        const len = heap_value.uinteger;
-                        for (0..len) |i| {
-                            const slice_element = thread.shared.heap.get(heap_addr + i + 1).?;
-                            try self.materializeString(thread, slice_element, w);
-                        }
-                    },
-                    else => try w.print("{f}", .{loc}),
+                        },
+                        else => try w.print("{f}", .{loc}),
+                    }
                 }
             },
             inline .exit_code => |t| try w.print("{f}", .{t}),
             .zig_string => |z| try w.writeAll(z),
             .pipe => |p| {
-                const pipe = self.context.getPipe(p);
+                const pipe = try self.context.getPipe(p);
                 if (pipe.capture_writer.written().len > 0) {
                     try w.writeAll(pipe.capture_writer.written());
                 } else {
@@ -1084,28 +1189,91 @@ pub const IREvaluator = struct {
         value: ir.Value,
         w: *std.Io.Writer,
     ) MaterializeStringError!void {
-        switch (value) {
-            .addr => |addr| {
-                const loc = self.context.mapAddr(addr);
-                switch (loc.abs) {
-                    .heap => |heap_addr| {
-                        const heap_value = thread.shared.heap.get(heap_addr).?;
-                        if (heap_value == .uinteger) {
-                            const len = heap_value.uinteger;
-                            for (0..len) |i| {
-                                if (i > 0) try w.writeByte(' ');
-                                const element = thread.shared.heap.get(heap_addr + i + 1).?;
-                                try self.materializeString(thread, element, w);
-                            }
-                            return;
-                        }
-                    },
-                    else => {},
-                }
-            },
-            else => {},
+        if (value == .addr) {
+            if (try self.maybeHeapSequenceLen(value.addr)) |seq| {
+                try self.materializeHeapSequence(thread, seq.heap_addr, seq.len, ' ', w);
+                return;
+            }
         }
 
         try self.materializeString(thread, value, w);
     }
 };
+
+fn initTestEvaluator(
+    allocator: Allocator,
+) !struct {
+    tracer: Tracer,
+    stdin_stream: *ReaderWriterStream,
+    stdout_stream: *ReaderWriterStream,
+    stderr_stream: *ReaderWriterStream,
+    context: ir.context.IRProgramContext,
+} {
+    var tracer = Tracer.init(allocator, .{ .echo_to_stdout = false });
+    const stdin_stream = try Stream(u8).initReaderWriter(allocator, "test-stdin", .{}, &tracer);
+    const stdout_stream = try Stream(u8).initReaderWriter(allocator, "test-stdout", .{}, &tracer);
+    const stderr_stream = try Stream(u8).initReaderWriter(allocator, "test-stderr", .{}, &tracer);
+    const context = ir.context.IRProgramContext.init(allocator, .{
+        .data = &.{},
+        .instructions = &.{},
+        .labels = .init(),
+        .struct_types = &.{},
+        .current_heap_addr = 0,
+    });
+
+    return .{
+        .tracer = tracer,
+        .stdin_stream = stdin_stream,
+        .stdout_stream = stdout_stream,
+        .stderr_stream = stderr_stream,
+        .context = context,
+    };
+}
+
+test "evaluator step reports missing current thread" {
+    const allocator = std.testing.allocator;
+    var fixture = try initTestEvaluator(allocator);
+    defer fixture.context.deinit();
+    defer fixture.stdin_stream.deinitParent();
+    defer fixture.stdout_stream.deinitParent();
+    defer fixture.stderr_stream.deinitParent();
+    defer fixture.tracer.deinit();
+
+    var evaluator = IREvaluator.init(allocator, .{
+        .verbose = false,
+        .stdin = fixture.stdin_stream,
+        .stdout = fixture.stdout_stream,
+        .stderr = fixture.stderr_stream,
+        .tracer = &fixture.tracer,
+    }, &fixture.context);
+
+    try std.testing.expectError(Error.MissingCurrentThread, evaluator.step());
+}
+
+test "evaluator materializeString reports missing pipe handle" {
+    const allocator = std.testing.allocator;
+    var fixture = try initTestEvaluator(allocator);
+    defer fixture.context.deinit();
+    defer fixture.stdin_stream.deinitParent();
+    defer fixture.stdout_stream.deinitParent();
+    defer fixture.stderr_stream.deinitParent();
+    defer fixture.tracer.deinit();
+
+    var evaluator = IREvaluator.init(allocator, .{
+        .verbose = false,
+        .stdin = fixture.stdin_stream,
+        .stdout = fixture.stdout_stream,
+        .stderr = fixture.stderr_stream,
+        .tracer = &fixture.tracer,
+    }, &fixture.context);
+
+    try fixture.context.addMainThread();
+    const thread = fixture.context.getCurrentThread().?;
+    var writer = std.Io.Writer.Allocating.init(allocator);
+    defer writer.deinit();
+
+    try std.testing.expectError(
+        ir.context.Error.MissingPipeHandle,
+        evaluator.materializeString(thread, .{ .pipe = 999 }, &writer.writer),
+    );
+}

@@ -10,7 +10,7 @@ mapfile -t cli_scripts < <(
 )
 
 if [[ ${#cli_scripts[@]} -eq 0 ]]; then
-  echo "CLI smoke stage skipped: add shell scripts matching tests/cli_*.sh."
+  echo "CLI regression stage skipped: add shell scripts matching tests/cli_*.sh."
   exit 0
 fi
 

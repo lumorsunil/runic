@@ -45,7 +45,7 @@ run_stage() {
 
 language="$(detect_language)"
 
-echo "Runic CI pipeline (formatter → linter → unit tests → CLI smoke tests)"
+echo "Runic CI pipeline (formatter → linter → unit tests → CLI regression tests)"
 echo "Detected toolchain: $language"
 
 mkdir -p "$stages_dir"

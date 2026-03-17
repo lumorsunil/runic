@@ -1,0 +1,5 @@
+[error]: tests/diagnostics/script_args_arity.rn:2:1: expected 1 script arguments, got 0
+   1:fn Void @(file: String) String
+   2:echo "${file}"
+   3:
+

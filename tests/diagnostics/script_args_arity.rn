@@ -1,0 +1,2 @@
+fn Void @(file: String) String
+echo "${file}"

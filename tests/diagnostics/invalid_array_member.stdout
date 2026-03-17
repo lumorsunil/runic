@@ -1,0 +1,5 @@
+[error]: tests/diagnostics/invalid_array_member.rn:2:9: member "nope" not found on array value
+   1:const arr = .{ 1, 2 }
+   2:echo "${arr.nope}"
+   3:
+

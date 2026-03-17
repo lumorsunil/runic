@@ -20,6 +20,13 @@ pub const ThreadId = usize;
 pub const PipeHandle = usize;
 pub const CloseableHandle = usize;
 
+pub const Error = error{
+    MissingThreadContext,
+    MissingMainThreadExitCode,
+    MissingPipeHandle,
+    MissingCloseableHandle,
+};
+
 pub const IRProgramContext = struct {
     allocator: Allocator,
     shared: IRSharedContext,
@@ -139,16 +146,16 @@ pub const IRProgramContext = struct {
         self: *@This(),
         id: ThreadId,
         exit_code: ?ExitCode,
-    ) !void {
-        const thread = self.getThreadContext(id).?;
+    ) (Allocator.Error || Error || std.process.Child.WaitError)!void {
+        const thread = self.getThreadContext(id) orelse return Error.MissingThreadContext;
         const wait_exit_code = try thread.wait();
         const exit_code_ = exit_code orelse wait_exit_code;
         try self.thread_exit_codes.put(self.allocator, id, exit_code_);
         try self.threads_to_remove.put(self.allocator, id, {});
     }
 
-    pub fn getMainThreadExitCode(self: @This()) ExitCode {
-        return self.thread_exit_codes.get(0).?;
+    pub fn getMainThreadExitCode(self: @This()) Error!ExitCode {
+        return self.thread_exit_codes.get(0) orelse Error.MissingMainThreadExitCode;
     }
 
     pub const AdvanceEvent = enum { cont, quit };
@@ -234,8 +241,8 @@ pub const IRProgramContext = struct {
         return handle;
     }
 
-    pub fn getPipe(self: *@This(), handle: PipeHandle) *ReaderWriterStream {
-        return self.pipes.get(handle).?;
+    pub fn getPipe(self: *@This(), handle: PipeHandle) Error!*ReaderWriterStream {
+        return self.pipes.get(handle) orelse Error.MissingPipeHandle;
     }
 
     pub fn addCloseable(
@@ -248,8 +255,8 @@ pub const IRProgramContext = struct {
         return handle;
     }
 
-    pub fn getCloseable(self: *@This(), handle: CloseableHandle) *Closeable(ExitCode) {
-        return self.closeables.get(handle).?;
+    pub fn getCloseable(self: *@This(), handle: CloseableHandle) Error!*Closeable(ExitCode) {
+        return self.closeables.get(handle) orelse Error.MissingCloseableHandle;
     }
 
     pub fn addFileSink(self: *@This(), file_sink: *FileSink) !void {
@@ -392,3 +399,20 @@ pub const IRPrivateContext = struct {
         return .{};
     }
 };
+
+test "context reports missing handles and exit code explicitly" {
+    const allocator = std.testing.allocator;
+    var context = IRProgramContext.init(allocator, .{
+        .data = &.{},
+        .instructions = &.{},
+        .labels = .init(),
+        .struct_types = &.{},
+        .current_heap_addr = 0,
+    });
+    defer context.deinit();
+
+    try std.testing.expectError(Error.MissingPipeHandle, context.getPipe(0));
+    try std.testing.expectError(Error.MissingCloseableHandle, context.getCloseable(0));
+    try std.testing.expectError(Error.MissingMainThreadExitCode, context.getMainThreadExitCode());
+    try std.testing.expectError(Error.MissingThreadContext, context.closeThread(999, null));
+}
