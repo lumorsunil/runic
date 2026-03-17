@@ -295,12 +295,32 @@ pub const TypeChecker = struct {
 
         if (self.modules.contains(path)) return self.modules.get(path).?;
 
-        var script = try self.document_store.getAst(path) orelse return error.DocumentNotParsed;
+        const script = try self.document_store.getAst(path) orelse return error.DocumentNotParsed;
 
         const scope = try self.arena.allocator().create(Scope);
         scope.* = .init(script.span);
 
         const global_scope = try addGlobalScope(self.arena.allocator(), scope);
+
+        if (script.signature) |signature| {
+            switch (signature.params) {
+                ._non_variadic => |params| for (params) |param| {
+                    switch (param.pattern.*) {
+                        .discard => {},
+                        .identifier => |identifier| {
+                            try global_scope.declare(
+                                self.arena.allocator(),
+                                identifier,
+                                param.type_annotation,
+                                false,
+                            );
+                        },
+                        .tuple, .record => return error.UnsupportedStatement,
+                    }
+                },
+                ._variadic => return error.UnsupportedStatement,
+            }
+        }
 
         try self.modules.put(
             self.arena.allocator(),
@@ -308,7 +328,11 @@ pub const TypeChecker = struct {
             global_scope,
         );
 
-        try self.runBlock(global_scope, &script);
+        var root_block = ast.Block{
+            .statements = script.statements,
+            .span = script.span,
+        };
+        try self.runBlock(global_scope, &root_block);
 
         return scope;
     }
@@ -386,9 +410,17 @@ pub const TypeChecker = struct {
         return switch (statement.*) {
             .type_binding_decl => |*type_binding_decl| self.runTypeBindingDecl(scope, type_binding_decl),
             .binding_decl => |*binding_decl| self.runBindingDecl(scope, binding_decl),
+            .exit_stmt => |*exit_stmt| self.runExit(scope, exit_stmt),
             .expression => |*expr_stmt| self.runExpressionStatement(scope, expr_stmt),
             else => error.UnsupportedStatement,
         };
+    }
+
+    fn runExit(self: *TypeChecker, scope: *Scope, exit_stmt: *ast.ExitStmt) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.logTypeCheckTrace(@src().fn_name, exit_stmt.span);
+
+        if (exit_stmt.value) |value| try self.runExpression(scope, value);
     }
 
     fn runTypeBindingDecl(
@@ -586,6 +618,9 @@ pub const TypeChecker = struct {
     fn runCall(self: *TypeChecker, scope: *Scope, call: *ast.CallExpr) Error!void {
         try self.runExpression(scope, call.callee);
         for (call.arguments) |arg| try self.runExpression(scope, arg);
+        for (call.redirects) |*redirect| {
+            try self.runStringLiteral(scope, &redirect.target.path);
+        }
     }
 
     fn runExpressionStatement(
@@ -616,6 +651,7 @@ pub const TypeChecker = struct {
             .range => |*range| self.runRange(scope, range),
             .pipeline => |*pipeline| self.runPipeline(scope, pipeline),
             .member => |*member| self.runMember(scope, member),
+            .unary => |*unary| self.runUnary(scope, unary),
             .binary => |*binary| self.runBinary(scope, binary),
             .block => |*block| self.runBlockInNewScope(scope, block),
             .if_expr => |*if_expr| self.runIfExpr(scope, if_expr),
@@ -732,6 +768,16 @@ pub const TypeChecker = struct {
         }
     }
 
+    pub fn runUnary(self: *TypeChecker, scope: *Scope, unary: *ast.UnaryExpr) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.logTypeCheckTrace(@src().fn_name, unary.span);
+
+        // TODO: add checking operator type compatability
+
+        try self.runExpression(scope, unary.operand);
+        _ = try self.resolveExprType(scope, unary.operand);
+    }
+
     pub fn runBinary(self: *TypeChecker, scope: *Scope, binary: *ast.BinaryExpr) Error!void {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, binary.span);
@@ -759,7 +805,8 @@ pub const TypeChecker = struct {
             .failed => {},
             .identifier => return error.UnresolvedTypeLiteral,
             .optional => return error.MemberAccessOnOptional,
-            .promise, .error_union, .error_set, .err, .array, .struct_type, .tuple, .function, .integer, .float, .boolean, .byte, .alias, .thread, .void => return error.UnsupportedMemberAccess,
+            .array => |array| try self.runArrayMemberAccess(array, &member.member),
+            .promise, .error_union, .error_set, .err, .struct_type, .tuple, .function, .integer, .float, .boolean, .byte, .alias, .thread, .void => return error.UnsupportedMemberAccess,
             .module => |module| try self.runModuleMemberAccess(module, &member.member),
             .execution => |execution| try self.runExecutionMemberAccess(execution, &member.member),
             // .lazy => {
@@ -767,6 +814,21 @@ pub const TypeChecker = struct {
             //     return error.UnsupportedMemberAccess;
             // },
         }
+    }
+
+    pub fn runArrayMemberAccess(
+        self: *TypeChecker,
+        _: ast.TypeExpr.ArrayType,
+        identifier: *ast.Identifier,
+    ) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.logTypeCheckTrace(@src().fn_name, identifier.span);
+
+        if (std.mem.eql(u8, identifier.name, "len")) {
+            return;
+        }
+
+        return error.MemberNotFound;
     }
 
     pub fn runModuleMemberAccess(

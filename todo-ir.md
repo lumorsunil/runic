@@ -6,6 +6,11 @@
 - [x] coercion of execution result to a string needs to have both stdout and stderr merged (at least when binding or coercing directly in a string interpolation)
 - [ ] type checker? (not mvp)
 - [ ] lsp? (not mvp)
+- [x] add expected results check to tests
+- [x] main thread arguments from process startup
+- [x] exit keyword
+- [ ] builtin env variables support?
+- [ ] do we want to strip newlines at the end of an echo or not?
 
 ## data
 
@@ -80,13 +85,15 @@
 - [x] pipelines
   - [x] multiple sources in streams ReaderWriterStream (stderr usually connects many sources)
   - [ ] error handling? (not mvp)
-  - [ ] && / ||
-  - [ ] redirections
+  - [x] && / ||
+  - [x] boolean negation (!)
+  - [x] redirections
     - [ ] redirect stdout separately (not mvp)
     - [ ] redirect stderr separately (not mvp)
-    - [ ] redirect to file
-      - [ ] replace mode
-      - [ ] append mode
+    - [x] redirect to file
+      - [x] replace mode
+      - [x] append mode
+    - [ ] "redirect" from file to stdin
 - [x] function declarations
   - [x] arguments
 - [x] functions calls
@@ -196,5 +203,6 @@
 - [x] grep is not outputting anything, see ir-blocks.rn
 - [x] cannot call function multiple times
 - [x] debugger: cannot paste to stdin
-- [ ] arrays will executable calls as elements cannot be accessed with element access operator
+- [x] arrays will executable calls as elements cannot be accessed with element access operator
 - [x] pipelines are broken again
+- [ ] escaped double quotes print as \"

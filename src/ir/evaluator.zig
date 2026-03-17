@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const ir = @import("../ir.zig");
 const runic = @import("runic");
 const CloseableProcessIo = runic.process.CloseableProcessIo;
+const FileSink = runic.process.FileSink;
 const ReaderWriterStream = runic.stream.ReaderWriterStream;
 const ExitCode = runic.command_runner.ExitCode;
 const Stream = runic.stream.Stream;
@@ -13,6 +14,8 @@ pub const Error =
     Allocator.Error ||
     std.process.Child.SpawnError ||
     std.process.Child.WaitError ||
+    std.fs.File.OpenError ||
+    std.fs.File.SeekError ||
     std.Io.Reader.Error ||
     runic.stream.StreamError ||
     ir.Value.DeserializeError ||
@@ -257,10 +260,15 @@ pub const IREvaluator = struct {
             .ref, .stack, .heap, .closure => (try self.dereferenceLocation(thread, base_loc)).*,
             else => try self.resolveLocation(thread, base_loc),
         };
+        const is_thread_completion = self.context.shared.heap.get(base.addr + 4).?.exit_code.toBoolean();
+        if (is_thread_completion) {
+            const thread_handle = self.context.shared.heap.get(base.addr + 3).?.thread;
+            return self.context.thread_exit_codes.get(thread_handle).?;
+        }
         const handle_addr = base.addr + 3;
         const handle = self.context.shared.heap.get(handle_addr).?.closeable;
         const closeable = self.context.getCloseable(handle);
-        return closeable.getResult().?;
+        return closeable.getResult() orelse closeable.close();
     }
 
     fn resolveExecutionHandlesExitCode(
@@ -276,7 +284,7 @@ pub const IREvaluator = struct {
         const handle_addr = base.addr + 1;
         const handle = self.context.shared.heap.get(handle_addr).?.closeable;
         const closeable = self.context.getCloseable(handle);
-        return closeable.getResult().?;
+        return closeable.getResult() orelse closeable.close();
     }
 
     fn resolveThreadExitCode(
@@ -602,6 +610,45 @@ pub const IREvaluator = struct {
                     ) = value.exit_code.toBoolean(),
                 }
 
+                return .cont;
+            },
+            .pipe_file => |pipe_file| {
+                const pipe_handle = (try self.resolveLocation(thread, pipe_file.pipe)).pipe;
+                const pipe = self.context.getPipe(pipe_handle);
+
+                var path_writer = std.Io.Writer.Allocating.init(self.allocator);
+                defer path_writer.deinit();
+                try self.materializeString(
+                    thread,
+                    try self.resolveValueSource(thread, pipe_file.target),
+                    &path_writer.writer,
+                );
+                const path = try path_writer.toOwnedSlice();
+
+                const file = switch (pipe_file.mode) {
+                    .truncate => try std.fs.cwd().createFile(path, .{}),
+                    .append => append: {
+                        var f = std.fs.cwd().openFile(path, .{ .mode = .read_write }) catch |err| switch (err) {
+                            error.FileNotFound => try std.fs.cwd().createFile(path, .{}),
+                            else => return err,
+                        };
+                        try f.seekFromEnd(0);
+                        break :append f;
+                    },
+                };
+
+                const file_sink = try self.allocator.create(FileSink);
+                file_sink.* = .init(file, path, pipe_file.mode == .append);
+                try self.context.addFileSink(file_sink);
+                try pipe.connectDestination(file_sink.closeableWriter());
+
+                return .cont;
+            },
+            .pipe_write => |pipe_write| {
+                const pipe_handle = (try self.resolveLocation(thread, pipe_write.pipe)).pipe;
+                const pipe = self.context.getPipe(pipe_handle);
+                const value = try self.resolveValueSource(thread, pipe_write.source);
+                try self.materializePipelineInput(thread, value, pipe.closeableWriter().writer);
                 return .cont;
             },
             .pipe_fwd => |pipe_fwd| {
@@ -1029,5 +1076,36 @@ pub const IREvaluator = struct {
             },
             .void, .strct, .thread, .closeable, .fn_ref => {},
         }
+    }
+
+    fn materializePipelineInput(
+        self: *IREvaluator,
+        thread: ir.context.IRThreadContext,
+        value: ir.Value,
+        w: *std.Io.Writer,
+    ) MaterializeStringError!void {
+        switch (value) {
+            .addr => |addr| {
+                const loc = self.context.mapAddr(addr);
+                switch (loc.abs) {
+                    .heap => |heap_addr| {
+                        const heap_value = thread.shared.heap.get(heap_addr).?;
+                        if (heap_value == .uinteger) {
+                            const len = heap_value.uinteger;
+                            for (0..len) |i| {
+                                if (i > 0) try w.writeByte(' ');
+                                const element = thread.shared.heap.get(heap_addr + i + 1).?;
+                                try self.materializeString(thread, element, w);
+                            }
+                            return;
+                        }
+                    },
+                    else => {},
+                }
+            },
+            else => {},
+        }
+
+        try self.materializeString(thread, value, w);
     }
 };

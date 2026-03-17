@@ -1,0 +1,49 @@
+== commands ==
+hello, world!
+hello cat!
+== conditionals ==
+true branch
+false inline
+== loops ==
+range 0
+range 1
+range 2
+word 0 = one
+word 1 = two
+word 2 = three
+== functions ==
+Hello, Runic
+Hello again, runtime from closure
+== numbers ==
+sum = 7
+float = 2.5
+mixed = 6.5
+counter += 3 => 4
+counter -= 2 => 2
+counter *= 5 => 10
+counter /= 2 => 5
+counter %= 3 => 2
+== booleans ==
+true && false = 1
+false || true = 0
+true || false && false = 0
+== logical control flow ==
+exec and ran
+exec or ran
+nested else ok
+pipe ok
+pipeline and ran
+pipeline or ran
+== block capture ==
+capture-one
+capture-two
+
+== block pipeline ==
+right|7
+== bound pipeline result ==
+bound pipeline value
+
+== merged output ==
+outafter
+err
+runtime regression suite passed

@@ -1,0 +1,5 @@
+const x = printf "${.{printf "one", printf "two"}[1]}"
+
+echo "'${x}'"
+
+if ("${x}" == "two") echo "yes" else echo "no"

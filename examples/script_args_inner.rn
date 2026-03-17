@@ -1,0 +1,3 @@
+fn Void @(message: String) String
+
+echo "arg=${message}"

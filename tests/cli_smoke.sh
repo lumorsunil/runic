@@ -45,8 +45,55 @@ for script in "${runic_scripts[@]}"; do
   rel_path="${abs_path#"$repo_root"/}"
   [[ "$rel_path" == "$abs_path" ]] && rel_path="$abs_path"
 
+  base_path="${abs_path%.rn}"
+  stdin_fixture="${base_path}.stdin"
+  stdout_fixture="${base_path}.stdout"
+  stderr_fixture="${base_path}.stderr"
+  status_fixture="${base_path}.status"
+
+  expected_status=0
+  if [[ -f "$status_fixture" ]]; then
+    expected_status="$(tr -d '[:space:]' < "$status_fixture")"
+  fi
+
+  stdout_tmp="$(mktemp)"
+  stderr_tmp="$(mktemp)"
   echo "-- running ${rel_path}"
-  (cd "$repo_root" && zig build run -- "$rel_path")
+
+  set +e
+  if [[ -f "$stdin_fixture" ]]; then
+    (cd "$repo_root" && zig build run -- "$rel_path" < "$stdin_fixture") >"$stdout_tmp" 2>"$stderr_tmp"
+  else
+    (cd "$repo_root" && zig build run -- "$rel_path") >"$stdout_tmp" 2>"$stderr_tmp"
+  fi
+  status=$?
+  set -e
+
+  if [[ "$status" != "$expected_status" ]]; then
+    echo "Unexpected exit status for ${rel_path}: got ${status}, expected ${expected_status}" >&2
+    cat "$stderr_tmp" >&2
+    exit 1
+  fi
+
+  if [[ -f "$stdout_fixture" ]]; then
+    if ! diff -u "$stdout_fixture" "$stdout_tmp"; then
+      echo "Stdout mismatch for ${rel_path}" >&2
+      exit 1
+    fi
+  fi
+
+  if [[ -f "$stderr_fixture" ]]; then
+    if ! diff -u "$stderr_fixture" "$stderr_tmp"; then
+      echo "Stderr mismatch for ${rel_path}" >&2
+      exit 1
+    fi
+  elif [[ -s "$stderr_tmp" ]]; then
+    echo "Unexpected stderr for ${rel_path}" >&2
+    cat "$stderr_tmp" >&2
+    exit 1
+  fi
+
+  rm -f "$stdout_tmp" "$stderr_tmp"
   ((count += 1))
 done
 

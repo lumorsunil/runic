@@ -1,0 +1,21 @@
+#!/usr/bin/env runic
+
+fn Void @(targets: []String) String
+
+// Assumes cwd=project root
+const repo_root = pwd
+const script_dir = "${repo_root}/tests"
+
+echo "${repo_root}"
+
+if (! command "-v" "zig" > "/dev/null") {
+  echo "zig is required for CLI smoke tests but was not found on PATH."
+  exit 1
+}
+
+const runic_scripts = (if (targets.len > 0) {
+  targets | filter fileExists | tr " " "\n"
+} else {
+  cd "${repo_root}" >"/dev/null"
+  find "tests" "-type" "f" "-name" "*.rn" "-print" | sort
+}) | parseArray "\n"

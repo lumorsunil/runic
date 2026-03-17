@@ -17,6 +17,7 @@ const end_color = rainbow.endColor();
 pub const IRConfig = struct {
     verbose: bool,
     dry_run: bool,
+    script_args: []const []const u8 = &.{},
     stdin: *ReaderWriterStream,
     stdout: *ReaderWriterStream,
     stderr: *ReaderWriterStream,
@@ -71,6 +72,7 @@ pub const IRRunner = struct {
             self.allocator,
             self.document_store,
             self.script,
+            self.config.script_args,
         );
         const result = try compiler.compile();
 
@@ -215,7 +217,7 @@ pub fn debugIR(
 ) !RunResult {
     var arena = std.heap.ArenaAllocator.init(allocator);
     const arena_allocator = arena.allocator();
-    var compiler = try ir.compiler.IRCompiler.init(arena_allocator, document_store, script);
+    var compiler = try ir.compiler.IRCompiler.init(arena_allocator, document_store, script, &.{});
     const result = try compiler.compile();
 
     tracer.config.echo_to_stdout = true;

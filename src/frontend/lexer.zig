@@ -62,7 +62,7 @@ pub const Lexer = struct {
             }
 
             pub fn canEnd(self: @This()) bool {
-                return self.paren_counter | self.brace_counter | self.brace_counter == 0;
+                return self.paren_counter | self.bracket_counter | self.brace_counter == 0;
             }
         };
 
@@ -484,6 +484,9 @@ pub const Lexer = struct {
     fn lexGreater(self: *Lexer) token.Token {
         const start = self.mark();
         _ = self.advance();
+        if (self.match('>')) {
+            return self.finish(.startAt(start), .append_redirect);
+        }
         if (self.match('=')) {
             return self.finish(.startAt(start), .greater_equal);
         }
@@ -510,6 +513,7 @@ pub const Lexer = struct {
             }
             return self.finish(.startAt(start), .range);
         } else if (peeked == '{') {
+            self.incCounter(.brace);
             _ = self.advance();
             return self.finish(.startAt(start), .dot_l_brace);
         }
@@ -817,7 +821,7 @@ pub const Stream = struct {
 };
 
 pub fn isIdentifierStart(ch: u8) bool {
-    return std.ascii.isAlphabetic(ch) or ch == '_';
+    return std.ascii.isAlphabetic(ch) or ch == '_' or ch == '@';
 }
 
 pub fn isIdentifierContinue(ch: u8) bool {
@@ -866,6 +870,38 @@ test "lexer balances nested braces inside string interpolation" {
         .{ .tag = .r_brace, .lexeme = "}" },
         .{ .tag = .string_interp_end, .lexeme = "}" },
         .{ .tag = .string_text, .lexeme = " tail" },
+        .{ .tag = .string_end, .lexeme = "\"" },
+        .{ .tag = .newline, .lexeme = "" },
+        .{ .tag = .eof, .lexeme = "" },
+    };
+
+    for (expected) |exp| {
+        const tok = try lexer.next();
+        try std.testing.expectEqual(exp.tag, tok.tag);
+        try std.testing.expectEqualStrings(exp.lexeme, tok.lexeme);
+    }
+}
+
+test "lexer keeps array literal and indexing inside interpolation" {
+    const source = "\"${.{1,2,3}[0]}\"";
+    var lexer = try Lexer.init(std.testing.allocator, "interpolation-array.rn", source);
+    defer lexer.deinit();
+
+    const expected = [_]struct { tag: token.Tag, lexeme: []const u8 }{
+        .{ .tag = .string_start, .lexeme = "\"" },
+        .{ .tag = .string_text, .lexeme = "" },
+        .{ .tag = .string_interp_start, .lexeme = "${" },
+        .{ .tag = .dot_l_brace, .lexeme = ".{" },
+        .{ .tag = .int_literal, .lexeme = "1" },
+        .{ .tag = .comma, .lexeme = "," },
+        .{ .tag = .int_literal, .lexeme = "2" },
+        .{ .tag = .comma, .lexeme = "," },
+        .{ .tag = .int_literal, .lexeme = "3" },
+        .{ .tag = .r_brace, .lexeme = "}" },
+        .{ .tag = .l_bracket, .lexeme = "[" },
+        .{ .tag = .int_literal, .lexeme = "0" },
+        .{ .tag = .r_bracket, .lexeme = "]" },
+        .{ .tag = .string_interp_end, .lexeme = "}" },
         .{ .tag = .string_end, .lexeme = "\"" },
         .{ .tag = .newline, .lexeme = "" },
         .{ .tag = .eof, .lexeme = "" },

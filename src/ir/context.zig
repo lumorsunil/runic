@@ -11,6 +11,7 @@ const Stream = @import("../stream.zig").Stream;
 const ReaderWriterStream = @import("../stream.zig").ReaderWriterStream;
 const Closeable = @import("../closeable.zig").Closeable;
 const Ref = @import("ref.zig").Ref;
+const FileSink = @import("../process.zig").FileSink;
 
 pub const page_size = 1024 * 4;
 pub const stack_start: usize = std.math.maxInt(usize) - 1024 * 1024 * 10;
@@ -34,6 +35,7 @@ pub const IRProgramContext = struct {
     pipe_handle_counter: usize = 0,
     closeables: std.AutoArrayHashMapUnmanaged(CloseableHandle, *Closeable(ExitCode)) = .empty,
     closeable_handle_counter: usize = 0,
+    file_sinks: std.ArrayList(*FileSink) = .empty,
 
     pub fn init(allocator: Allocator, shared: IRSharedContext) @This() {
         return .{ .allocator = allocator, .shared = shared };
@@ -66,6 +68,12 @@ pub const IRProgramContext = struct {
             if (!closeable.isClosed()) _ = closeable.close();
         }
         self.closeables.deinit(self.allocator);
+
+        for (self.file_sinks.items) |file_sink| {
+            if (!file_sink.closeable.isClosed()) _ = file_sink.closeable.close();
+            file_sink.deinit(self.allocator);
+        }
+        self.file_sinks.deinit(self.allocator);
 
         self.threads_to_remove.deinit(self.allocator);
         self.pipe_threads_to_remove.deinit(self.allocator);
@@ -242,6 +250,10 @@ pub const IRProgramContext = struct {
 
     pub fn getCloseable(self: *@This(), handle: CloseableHandle) *Closeable(ExitCode) {
         return self.closeables.get(handle).?;
+    }
+
+    pub fn addFileSink(self: *@This(), file_sink: *FileSink) !void {
+        try self.file_sinks.append(self.allocator, file_sink);
     }
 };
 

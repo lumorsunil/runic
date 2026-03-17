@@ -1,0 +1,1 @@
+runic "examples/exit_inner.rn" || echo "exit observed"

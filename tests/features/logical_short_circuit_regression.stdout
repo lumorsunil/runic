@@ -1,0 +1,20 @@
+== exec short circuit ==
+exec and ran
+exec or ran
+== skipped branch output ==
+before skipped and
+after skipped and
+before skipped or
+after skipped or
+== pipeline short circuit ==
+pipe ok
+pipeline and ran
+pipeline or ran
+== block logical operands ==
+block lhs success
+block and ran
+block lhs failure
+block or ran
+== nested logical statements ==
+nested and entered
+logical short circuit regression passed

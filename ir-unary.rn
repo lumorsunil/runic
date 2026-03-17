@@ -1,0 +1,8 @@
+echo "Check a file:"
+const file = head "-n" "1" | tr "-d" "\n"
+
+if (test "-f" "${file}") {
+  echo "${file} exists"
+} else {
+  echo "${file} does not exist"
+}

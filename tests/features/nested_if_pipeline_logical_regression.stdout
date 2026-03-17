@@ -1,0 +1,5 @@
+nested else ok
+pipe ok
+pipeline and ran
+pipeline or ran
+nested if pipeline regression passed

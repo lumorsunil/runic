@@ -1,0 +1,5 @@
+const arr = .{ echo "one" }
+echo "${arr[0]}"
+
+const nested = echo "${.{echo "one", echo "two"}[1]}"
+echo "${nested}"

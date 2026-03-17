@@ -89,9 +89,12 @@ echo "== block pipeline =="
   echo "right|7"
 }) | grep "-m" "1" "right|7"
 
+echo "== bound pipeline result =="
+const bound_pipeline = echo "bound pipeline value" | cat
+echo "${bound_pipeline}"
+
 echo "== merged output =="
 const merged = bash "-c" "printf out; printf err 1>&2; printf after"
-echo "${merged}"
 echo "${merged.stdout}"
 echo "${merged.stderr}"
 

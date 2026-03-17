@@ -1,4 +1,5 @@
 const std = @import("std");
+const ExitCode = @import("runtime/command_runner.zig").ExitCode;
 
 pub fn Closeable(comptime T: type) type {
     return struct {
@@ -32,6 +33,7 @@ pub fn Closeable(comptime T: type) type {
 
 pub fn ManualCloseable(comptime T: type) type {
     return struct {
+        label: []const u8,
         result: ?T = null,
         closeable: Closeable(T) = .{ .vtable = &vtable },
 
@@ -43,7 +45,7 @@ pub fn ManualCloseable(comptime T: type) type {
 
         fn close(self: *Closeable(T)) T {
             const parent: *@This() = @fieldParentPtr("closeable", self);
-            parent.result = parent.result orelse .{ .Exited = 0 };
+            parent.result = parent.result orelse defaultResult();
             return parent.result.?;
         }
 
@@ -60,6 +62,11 @@ pub fn ManualCloseable(comptime T: type) type {
         pub fn getLabel(self: *Closeable(T)) []const u8 {
             const parent: *@This() = @fieldParentPtr("closeable", self);
             return parent.label;
+        }
+
+        fn defaultResult() T {
+            if (T == ExitCode) return @as(T, .success);
+            @compileError("ManualCloseable requires a default close result for this type");
         }
     };
 }

@@ -664,6 +664,7 @@ pub const RangeLiteral = struct {
 pub const CallExpr = struct {
     callee: *Expression,
     arguments: []const *Expression,
+    redirects: []const Redirection = &.{},
     span: Span,
 
     pub fn resolveType(
@@ -721,6 +722,13 @@ pub const UnaryExpr = struct {
 
 pub const UnaryOp = enum {
     logical_not,
+
+    pub fn fromToken(tok: token.Token) ?@This() {
+        return switch (tok.tag) {
+            .bang => .logical_not,
+            else => null,
+        };
+    }
 };
 
 pub const BinaryExpr = struct {
@@ -745,6 +753,7 @@ pub const BinaryOp = enum {
     divide,
     remainder,
     greater,
+    append_redirect,
     greater_equal,
     less,
     less_equal,
@@ -775,6 +784,7 @@ pub const BinaryOp = enum {
             .divide => 30,
             .remainder => 30,
             .greater => 15,
+            .append_redirect => 15,
             .greater_equal => 15,
             .less => 15,
             .less_equal => 15,
@@ -803,6 +813,7 @@ pub const BinaryOp = enum {
             .slash => .divide,
             .percent => .remainder,
             .greater => .greater,
+            .append_redirect => .append_redirect,
             .greater_equal => .greater_equal,
             .less => .less,
             .less_equal => .less_equal,
@@ -1113,9 +1124,9 @@ pub const RedirectionMode = enum {
     append,
 };
 
-pub const RedirectionTarget = union(enum) {
-    variable: Identifier,
-    expression: *Expression,
+pub const RedirectionTarget = struct {
+    path: StringLiteral,
+    span: Span,
 };
 
 pub const CaptureDirective = struct {
@@ -1147,7 +1158,34 @@ pub const BashBlock = struct {
 };
 
 /// Script is the root of every parsed Runic file.
-pub const Script = Block;
+pub const Script = struct {
+    signature: ?ScriptSignature = null,
+    statements: []const *Statement,
+    span: Span,
+
+    pub fn getSpan(self: @This()) Span {
+        return self.span;
+    }
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*const TypeExpr {
+        return null;
+    }
+};
+
+pub const ScriptSignature = struct {
+    params: FunctionDecl.Parameters,
+    stdin_type: ?*const TypeExpr,
+    return_type: ?*const TypeExpr,
+    span: Span,
+
+    pub fn getSpan(self: @This()) Span {
+        return self.span;
+    }
+};
 
 /// Statements represent top-level items as well as imperative expressions.
 pub const Statement = union(enum) {
@@ -1157,6 +1195,7 @@ pub const Statement = union(enum) {
 
     error_decl: ErrorDecl,
     return_stmt: ReturnStmt,
+    exit_stmt: ExitStmt,
     while_stmt: WhileStmt,
     bash_block: BashBlock,
 
@@ -1166,6 +1205,7 @@ pub const Statement = union(enum) {
             .binding_decl => |decl| decl.span,
             .error_decl => |err| err.span,
             .return_stmt => |ret| ret.span,
+            .exit_stmt => |exit_stmt| exit_stmt.span,
             // .for_stmt => |loop_stmt| loop_stmt.span,
             .while_stmt => |loop_stmt| loop_stmt.span,
             .bash_block => |bash_block| bash_block.span,
@@ -1354,6 +1394,11 @@ pub const ModulePath = struct {
 };
 
 pub const ReturnStmt = struct {
+    value: ?*Expression,
+    span: Span,
+};
+
+pub const ExitStmt = struct {
     value: ?*Expression,
     span: Span,
 };

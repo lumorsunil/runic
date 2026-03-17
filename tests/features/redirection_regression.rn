@@ -1,0 +1,11 @@
+const base = "/tmp/runic-redirection-regression"
+const path = "${base}.txt"
+
+echo "first" > "${path}"
+cat "${path}"
+
+echo "replace" > "${path}"
+cat "${path}"
+
+echo "tail" >> "${path}"
+cat "${path}"

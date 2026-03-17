@@ -415,10 +415,12 @@ pub const Parser = struct {
         }
         self.clearExpectedTokens();
 
+        const signature = try self.parseMaybeScriptSignature();
         const statements = try self.parseStatementsUntil(.eof);
 
         const script = ast.Script{
-            .span = statements.span,
+            .signature = signature,
+            .span = if (signature) |sig| sig.span.endAt(statements.span) else statements.span,
             .statements = statements.payload,
         };
 
@@ -440,10 +442,12 @@ pub const Parser = struct {
         //     .ast = null,
         //     .lexer = .init(self.arena.allocator(), source),
         // };
+        const signature = try self.parseMaybeScriptSignature();
         const statements = try self.parseStatementsUntil(.eof);
 
         const script = ast.Script{
-            .span = statements.span,
+            .signature = signature,
+            .span = if (signature) |sig| sig.span.endAt(statements.span) else statements.span,
             .statements = statements.payload,
         };
 
@@ -465,6 +469,7 @@ pub const Parser = struct {
             .kw_if => self.parseIfExpression(),
             .kw_for => self.parseForExpression(),
             else => {
+                if (try self.parseMaybeUnaryExpression()) |unary_expr| return unary_expr;
                 if (try self.parseMaybeBinaryExpression()) |binary_expr| return binary_expr;
                 return self.parsePrimaryExpression();
             },
@@ -586,6 +591,7 @@ pub const Parser = struct {
                             .identifier = identifier,
                         }),
                         .arguments = &.{},
+                        .redirects = &.{},
                         .span = identifier.span,
                     },
                 });
@@ -672,6 +678,27 @@ pub const Parser = struct {
             },
             .l_paren => {},
         }
+    }
+
+    fn parseMaybeUnaryExpression(self: *Self) Error!?*ast.Expression {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const next = try self.peekToken();
+
+        if (ast.UnaryOp.fromToken(next)) |op| {
+            _ = try self.nextToken();
+            const rhs = try self.parseExpression();
+            return self.allocExpression(.{
+                .unary = .{
+                    .op = op,
+                    .operand = rhs,
+                    .span = next.span.endAt(rhs.span()),
+                },
+            });
+        }
+
+        return null;
     }
 
     const BinaryState = enum {
@@ -786,7 +813,7 @@ pub const Parser = struct {
                 },
                 .op => {
                     switch (next.tag) {
-                        .equal_equal, .bang_equal, .greater, .greater_equal, .less, .less_equal, .plus, .minus, .star, .slash, .percent, .kw_and, .kw_or, .pipe_pipe, .amp_amp, .pipe, .dot, .assign, .plus_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign => {
+                        .equal_equal, .bang_equal, .greater, .append_redirect, .greater_equal, .less, .less_equal, .plus, .minus, .star, .slash, .percent, .kw_and, .kw_or, .pipe_pipe, .amp_amp, .pipe, .dot, .assign, .plus_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign => {
                             const breadcrumbInner = try self.createBreadcrumb("PBE:op");
                             defer breadcrumbInner.end();
                             try components.append(self.allocator, .{
@@ -861,6 +888,7 @@ pub const Parser = struct {
                             *ast.Expression,
                             &.{ call.arguments, &.{right} },
                         ),
+                        .redirects = call.redirects,
                         .span = call.span.endAt(right.span()),
                     },
                 },
@@ -871,9 +899,52 @@ pub const Parser = struct {
                             *ast.Expression,
                             &.{right},
                         ),
+                        .redirects = &.{},
                         .span = left.span().endAt(right.span()),
                     },
                 },
+            },
+            .greater, .append_redirect => redirect: {
+                const call = switch (left.*) {
+                    .call => |call| call,
+                    else => break :redirect binary,
+                };
+
+                const path = switch (right.*) {
+                    .literal => |literal| switch (literal) {
+                        .string => |string| string,
+                        else => break :redirect binary,
+                    },
+                    else => break :redirect binary,
+                };
+
+                const mode: ast.RedirectionMode = switch (binary.binary.op) {
+                    .greater => .truncate,
+                    .append_redirect => .append,
+                    else => unreachable,
+                };
+                const redirect = ast.Redirection{
+                    .stream = .stdout,
+                    .mode = mode,
+                    .target = .{
+                        .path = path,
+                        .span = path.span,
+                    },
+                    .span = left.span().endAt(right.span()),
+                };
+
+                break :redirect .{
+                    .call = .{
+                        .callee = call.callee,
+                        .arguments = call.arguments,
+                        .redirects = try std.mem.concat(
+                            self.arena.allocator(),
+                            ast.Redirection,
+                            &.{ call.redirects, &.{redirect} },
+                        ),
+                        .span = call.span.endAt(right.span()),
+                    },
+                };
             },
             .pipe => switch (left.*) {
                 .pipeline => |pipeline| .{
@@ -1086,6 +1157,8 @@ pub const Parser = struct {
 
         var args = std.ArrayList(ast.CommandPart).empty;
         defer args.deinit(self.allocator);
+        var redirects = std.ArrayList(ast.Redirection).empty;
+        defer redirects.deinit(self.allocator);
 
         var last_token = identifier;
 
@@ -1108,7 +1181,7 @@ pub const Parser = struct {
                             .capture = null,
                             .span = identifier.span.endAt(last_token.span),
                             .env_assignments = &.{},
-                            .redirects = &.{},
+                            .redirects = try self.copyToArena(ast.Redirection, redirects.items),
                         },
                     },
                     .span = identifier.span.endAt(last_token.span),
@@ -1119,6 +1192,16 @@ pub const Parser = struct {
                 .string_start => {
                     const string_literal = try self.parseStringLiteral();
                     try args.append(self.allocator, .{ .string = string_literal });
+                    last_token = next_token;
+                },
+                .greater, .append_redirect => {
+                    const redirect = try self.parseCommandRedirection();
+                    try redirects.append(self.allocator, redirect);
+                    last_token = .{
+                        .tag = next_token.tag,
+                        .lexeme = "",
+                        .span = redirect.span,
+                    };
                 },
                 // .minus, .plus => {
                 //     _ = try self.nextToken();
@@ -1126,9 +1209,31 @@ pub const Parser = struct {
                 // },
                 else => return self.failExpectedToken(next_token.tag, .string_start),
             }
-
-            last_token = next_token;
         }
+    }
+
+    fn parseCommandRedirection(self: *Self) Error!ast.Redirection {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const redirect_token = try self.nextToken();
+        const mode: ast.RedirectionMode = switch (redirect_token.tag) {
+            .greater => .truncate,
+            .append_redirect => .append,
+            else => return self.failExpectedToken(redirect_token.tag, .greater),
+        };
+
+        const target = try self.parseStringLiteral();
+
+        return .{
+            .stream = .stdout,
+            .mode = mode,
+            .target = .{
+                .path = target,
+                .span = target.span,
+            },
+            .span = redirect_token.span.endAt(target.span),
+        };
     }
 
     pub fn parseImportExpression(self: *Self) Error!*ast.Expression {
@@ -1495,6 +1600,56 @@ pub const Parser = struct {
         );
     }
 
+    fn parseMaybeScriptSignature(self: *Self) Error!?ast.ScriptSignature {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        self.skipNewlines();
+
+        const next = try self.peekToken();
+        if (next.tag != .kw_fn) return null;
+
+        var snapshot = try self.takeSnapshot();
+        defer snapshot.deinit();
+
+        const start = try self.expectTokenTag(.kw_fn);
+        const stdin_type = try self.parseMaybeTypeExpr();
+        const identifier = try self.expectTokenTag(.identifier);
+        if (!std.mem.eql(u8, identifier.lexeme, "@")) {
+            try self.restoreSnapshot(&snapshot);
+            return null;
+        }
+
+        _ = try self.expectTokenTag(.l_paren);
+        const params = try self.parseList(.comma, parseParam, .{
+            .terminators = .list(&.{.r_paren}),
+        });
+        _ = try self.expectTokenTag(.r_paren);
+        const return_type = try self.parseMaybeTypeExpr();
+
+        const end_tok = try self.peekToken();
+        switch (end_tok.tag) {
+            .newline, .semicolon => _ = try self.nextToken(),
+            .eof => {},
+            else => {
+                try self.reportParseError(
+                    Error.UnexpectedToken,
+                    end_tok.span,
+                    "expected end of script signature, actual: {t}",
+                    .{end_tok.tag},
+                );
+                return Error.UnexpectedToken;
+            },
+        }
+
+        return .{
+            .params = .nonVariadic(params.payload),
+            .stdin_type = stdin_type,
+            .return_type = return_type,
+            .span = start.span.endAt(if (return_type) |r| r.span() else params.span),
+        };
+    }
+
     fn parseBlock(self: *Self) Error!ast.Block {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
@@ -1541,6 +1696,11 @@ pub const Parser = struct {
 
         if (try self.parseMaybeReturn()) |return_stmt| {
             stmt.* = .{ .return_stmt = return_stmt };
+            return stmt;
+        }
+
+        if (try self.parseMaybeExit()) |exit_stmt| {
+            stmt.* = .{ .exit_stmt = exit_stmt };
             return stmt;
         }
 
@@ -1910,11 +2070,44 @@ pub const Parser = struct {
         };
     }
 
+    fn parseMaybeExit(self: *Self) Error!?ast.ExitStmt {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const next = try self.peekToken();
+        return switch (next.tag) {
+            .kw_exit => try self.parseExit(),
+            else => null,
+        };
+    }
+
     fn parseReturn(self: *Self) Error!ast.ReturnStmt {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
         const start = try self.expectTokenTag(.kw_return);
+        const next = try self.peekToken();
+
+        if (isExprTerminator(next.tag)) {
+            return .{
+                .value = null,
+                .span = start.span,
+            };
+        }
+
+        const value = try self.parseExpression();
+
+        return .{
+            .value = value,
+            .span = start.span.endAt(value.span()),
+        };
+    }
+
+    fn parseExit(self: *Self) Error!ast.ExitStmt {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const start = try self.expectTokenTag(.kw_exit);
         const next = try self.peekToken();
 
         if (isExprTerminator(next.tag)) {
@@ -2137,7 +2330,7 @@ pub const Parser = struct {
 
     fn isTypeExprTerminator(tag: token.Tag) bool {
         return switch (tag) {
-            .l_paren, .l_brace, .identifier, .star, .caret, .bang, .question, .kw_enum, .kw_error, .kw_union, .kw_struct => false,
+            .l_paren, .l_brace, .l_bracket, .identifier, .star, .caret, .bang, .question, .kw_enum, .kw_error, .kw_union, .kw_struct => false,
             else => true,
         };
     }
@@ -2376,6 +2569,78 @@ test "parser builds command pipelines with string arguments" {
     const segment = literal.segments[0];
     try std.testing.expect(std.meta.activeTag(segment) == .text);
     try std.testing.expectEqualStrings("hi", segment.text.payload);
+}
+
+test "parser builds command redirections with quoted file paths" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var ctx = TestCtx{ .source = "echo \"hi\" > \"file.txt\"" };
+    var parser = TestParser.init(allocator, &ctx);
+    defer parser.deinit();
+
+    const script = try parser.parseSource(ctx.source);
+    const stage = script.statements[0].expression.expression.pipeline.stages[0];
+    const command = stage.payload.command;
+
+    try std.testing.expectEqual(@as(usize, 1), command.redirects.len);
+    try std.testing.expectEqual(ast.RedirectionMode.truncate, command.redirects[0].mode);
+    try std.testing.expectEqual(@as(usize, 1), command.redirects[0].target.path.segments.len);
+    try std.testing.expect(std.meta.activeTag(command.redirects[0].target.path.segments[0]) == .text);
+    try std.testing.expectEqualStrings("file.txt", command.redirects[0].target.path.segments[0].text.payload);
+}
+
+test "parser builds append command redirections with quoted file paths" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var ctx = TestCtx{ .source = "echo \"hi\" >> \"file.txt\"" };
+    var parser = TestParser.init(allocator, &ctx);
+    defer parser.deinit();
+
+    const script = try parser.parseSource(ctx.source);
+    const stage = script.statements[0].expression.expression.pipeline.stages[0];
+    const command = stage.payload.command;
+
+    try std.testing.expectEqual(@as(usize, 1), command.redirects.len);
+    try std.testing.expectEqual(ast.RedirectionMode.append, command.redirects[0].mode);
+    try std.testing.expectEqual(@as(usize, 1), command.redirects[0].target.path.segments.len);
+    try std.testing.expect(std.meta.activeTag(command.redirects[0].target.path.segments[0]) == .text);
+    try std.testing.expectEqualStrings("file.txt", command.redirects[0].target.path.segments[0].text.payload);
+}
+
+test "parser allows interpolation in quoted redirection targets" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var ctx = TestCtx{ .source = "echo \"hi\" > \"${name}.txt\"" };
+    var parser = TestParser.init(allocator, &ctx);
+    defer parser.deinit();
+
+    const script = try parser.parseSource(ctx.source);
+    const stage = script.statements[0].expression.expression.pipeline.stages[0];
+    const command = stage.payload.command;
+    const target = command.redirects[0].target.path;
+
+    try std.testing.expectEqual(@as(usize, 2), target.segments.len);
+    try std.testing.expect(std.meta.activeTag(target.segments[0]) == .interpolation);
+    try std.testing.expect(std.meta.activeTag(target.segments[1]) == .text);
+    try std.testing.expectEqualStrings(".txt", target.segments[1].text.payload);
+}
+
+test "parser rejects unquoted redirection targets" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var ctx = TestCtx{ .source = "echo \"hi\" > file.txt" };
+    var parser = TestParser.init(allocator, &ctx);
+    defer parser.deinit();
+
+    try std.testing.expectError(Error.UnexpectedToken, parser.parseSource(ctx.source));
 }
 
 test "parser rejects interpolation in import module names" {

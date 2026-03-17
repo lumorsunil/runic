@@ -219,6 +219,17 @@ fn renderExpressionAst(writer: *std.Io.Writer, expr: *const ast.Expression, leve
             try writer.writeByte('\n');
             for (pipeline_expr.stages) |stage| try renderExpressionAst(writer, stage, level + 1);
         },
+        .unary => |unary| {
+            try writeIndent(writer, level);
+            try writer.writeAll("unary @ ");
+            try printSpanInline(writer, unary.span);
+            try writer.writeByte('\n');
+            try writeIndent(writer, level + 1);
+            try writer.print("op: {s}\n", .{@tagName(unary.op)});
+            try writeIndent(writer, level + 1);
+            try writer.writeAll("operand: \n");
+            try renderExpressionAst(writer, unary.operand, level + 1);
+        },
         .binary => |binary| {
             try writeIndent(writer, level);
             try writer.writeAll("binary @ ");

@@ -139,7 +139,7 @@ pub fn runScript(
     }, tracer);
     defer stderr_stream.stream.deinit();
 
-    var stdin_closeable = closeable.NeverCloses(ExitCode){ .label = "<<<stdin>>>" };
+    var stdin_closeable = closeable.ManualCloseable(ExitCode){ .label = "<<<stdin>>>" };
     var stdout_closeable = closeable.NeverCloses(ExitCode){ .label = "<<<stdout>>>" };
     var stderr_closeable = closeable.NeverCloses(ExitCode){ .label = "<<<stderr>>>" };
 
@@ -189,6 +189,7 @@ pub fn runScript(
             .{
                 .verbose = config.verbose,
                 .dry_run = config.dry_run,
+                .script_args = script.args,
                 .stdin = stdin_stream,
                 .stdout = stdout_stream,
                 .stderr = stderr_stream,
@@ -281,6 +282,7 @@ const StatementExpressionIterator = struct {
                 try self.cursor.appendStatements(while_stmt.body.statements);
                 try self.cursor.appendExpr(while_stmt.condition);
             },
+            .exit_stmt => |exit_stmt| if (exit_stmt.value) |v| try self.cursor.appendExpr(v),
             .return_stmt => |return_stmt| if (return_stmt.value) |v| try self.cursor.appendExpr(v),
             .expression => |expr| try self.cursor.appendExpr(expr.expression),
         }

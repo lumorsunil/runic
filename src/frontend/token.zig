@@ -162,6 +162,7 @@ pub const Tag = enum {
     kw_while,
     kw_match,
     kw_return,
+    kw_exit,
 
     // Module/interop keywords
     /// Module import keyword.
@@ -210,6 +211,7 @@ pub const Tag = enum {
     equal_equal,
     bang_equal,
     greater,
+    append_redirect,
     greater_equal,
     less,
     less_equal,
@@ -242,6 +244,7 @@ pub const Tag = enum {
             .kw_while => "while",
             .kw_match => "match",
             .kw_return => "return",
+            .kw_exit => "exit",
             .kw_import => "import",
             .kw_try => "try",
             .kw_catch => "catch",
@@ -281,6 +284,7 @@ const keyword_map = std.StaticStringMap(Tag).initComptime(.{
     .{ "while", .kw_while },
     .{ "match", .kw_match },
     .{ "return", .kw_return },
+    .{ "exit", .kw_exit },
     .{ "import", .kw_import },
     .{ "try", .kw_try },
     .{ "catch", .kw_catch },

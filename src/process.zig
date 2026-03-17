@@ -127,7 +127,11 @@ pub const ProcessCloseable = struct {
             self.stdin.isClosed(), self.stdout.isClosed(), self.stderr.isClosed(),
         });
 
-        if (self.stdin.isClosed() and self.stdout.isClosed() and self.stderr.isClosed()) {
+        // Process completion must not depend on stdin reaching EOF. Commands such
+        // as `head -n 1` exit early after producing output, leaving the parent-side
+        // stdin pipe open even though stdout/stderr are already drained.
+        if (self.stdout.isClosed() and self.stderr.isClosed()) {
+            if (!self.stdin.isClosed()) _ = self.stdin.close();
             return self.closeable.close();
         }
 
@@ -262,6 +266,97 @@ fn poll(file: std.fs.File, events: i16, tracer: *Tracer) i16 {
         else => return std.posix.POLL.ERR,
     }
 }
+
+pub const FileSink = struct {
+    file: std.fs.File,
+    writer: std.Io.Writer = .{ .vtable = &writer_vtable, .buffer = &.{}, .end = 0 },
+    closeable: Closeable(ExitCode) = .{ .vtable = &vtable },
+    path: []const u8,
+    append_mode: bool,
+    result: ?ExitCode = null,
+
+    const vtable = Closeable(ExitCode).VTable{
+        .close = close,
+        .getResult = getResult,
+        .getLabel = getLabel,
+    };
+
+    const writer_vtable = std.Io.Writer.VTable{
+        .drain = drain,
+    };
+
+    pub fn init(file: std.fs.File, path: []const u8, append_mode: bool) @This() {
+        return .{
+            .file = file,
+            .path = path,
+            .append_mode = append_mode,
+        };
+    }
+
+    pub fn writerPtr(self: *@This()) *std.Io.Writer {
+        return &self.writer;
+    }
+
+    pub fn closeableWriter(self: *@This()) CloseableWriter(ExitCode) {
+        return .init(self.writerPtr(), &self.closeable);
+    }
+
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        allocator.destroy(self);
+    }
+
+    fn close(self: *Closeable(ExitCode)) ExitCode {
+        const parent: *@This() = @fieldParentPtr("closeable", self);
+        if (parent.result) |result| return result;
+
+        parent.file.close();
+        parent.result = .success;
+        return parent.result.?;
+    }
+
+    fn getResult(self: *Closeable(ExitCode)) ?ExitCode {
+        const parent: *@This() = @fieldParentPtr("closeable", self);
+        return parent.result;
+    }
+
+    fn getLabel(self: *Closeable(ExitCode)) []const u8 {
+        const parent: *@This() = @fieldParentPtr("closeable", self);
+        return parent.path;
+    }
+
+    fn getParent(writer: *std.Io.Writer) *@This() {
+        return @fieldParentPtr("writer", writer);
+    }
+
+    fn drain(
+        writer: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
+        const parent = getParent(writer);
+        var written: usize = 0;
+
+        if (parent.append_mode) {
+            parent.file.seekFromEnd(0) catch return error.WriteFailed;
+        }
+
+        if (writer.buffered().len > 0) {
+            parent.file.writeAll(writer.buffered()) catch return error.WriteFailed;
+            written += writer.buffered().len;
+            writer.end = 0;
+        }
+
+        for (0..splat) |_| {
+            for (data) |chunk| {
+                parent.file.writeAll(chunk) catch return error.WriteFailed;
+                written += chunk.len;
+            }
+        }
+
+        return written;
+    }
+};
 
 const PipeWriter = struct {
     file: ?std.fs.File,

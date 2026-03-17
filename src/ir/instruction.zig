@@ -115,6 +115,10 @@ pub const Instruction = struct {
         pipe: Pipe,
         /// changes a pipe option
         pipe_opt: PipeOption,
+        /// connects a pipe destination to a file sink
+        pipe_file: PipeFile,
+        /// materializes a value directly into a pipe destination
+        pipe_write: PipeWrite,
         /// forwards a pipe to another pipe
         pipe_fwd: Forward,
         /// executes an instruction atomically (all instructions executed at once)
@@ -172,7 +176,7 @@ pub const Instruction = struct {
 
         pub fn format(self: @This(), w: *std.Io.Writer) !void {
             switch (self) {
-                inline .push, .exit, .exit_with, .jmp, .fork, .set, .pipe_fwd, .wait, .stream, .pipe, .pipe_opt, .ath, .log, .cmp => |t| try w.print("{t} {f}", .{ self, t }),
+                inline .push, .exit, .exit_with, .jmp, .fork, .set, .pipe_fwd, .pipe_file, .pipe_write, .wait, .stream, .pipe, .pipe_opt, .ath, .log, .cmp => |t| try w.print("{t} {f}", .{ self, t }),
                 inline .ref, .comment => |t| try w.print("{t} {s}", .{ self, t }),
                 inline .alloc => |t| try w.print("{t} {}", .{ self, t }),
                 else => try w.print("{t}", .{self}),
@@ -441,6 +445,31 @@ pub const Instruction = struct {
             writer: *std.Io.Writer,
         ) std.Io.Writer.Error!void {
             try writer.print("{f} {f}", .{ self.source, self.destination });
+        }
+    };
+
+    pub const PipeFile = struct {
+        pipe: Location,
+        target: ValueSource,
+        mode: ast.RedirectionMode,
+
+        pub fn format(
+            self: @This(),
+            writer: *std.Io.Writer,
+        ) std.Io.Writer.Error!void {
+            try writer.print("{f} {f} {t}", .{ self.pipe, self.target, self.mode });
+        }
+    };
+
+    pub const PipeWrite = struct {
+        pipe: Location,
+        source: ValueSource,
+
+        pub fn format(
+            self: @This(),
+            writer: *std.Io.Writer,
+        ) std.Io.Writer.Error!void {
+            try writer.print("{f} {f}", .{ self.pipe, self.source });
         }
     };
 
