@@ -45,6 +45,10 @@ pub const execution_result_struct_type = ast.TypeExpr{ .struct_type = .{
         .type_expr = &.{ .integer = .{ .span = .global } },
         .span = .global,
     }, .{
+        .name = .global("merged"),
+        .type_expr = &.{ .integer = .{ .span = .global } },
+        .span = .global,
+    }, .{
         .name = .global("closeable"),
         .type_expr = &.{ .integer = .{ .span = .global } },
         .span = .global,
@@ -187,6 +191,19 @@ pub const Result = union(enum) {
         return self.source == .value and self.source.value == .fn_ref;
     }
 };
+
+fn mergedResultType(a: Result, b: Result) ?ast.TypeExpr {
+    const a_type = a.typeExpr() orelse return null;
+    const b_type = b.typeExpr() orelse return null;
+    if (!std.meta.eql(a_type, b_type)) return null;
+    return a_type;
+}
+
+fn stableResultSource(result: Result) ir.ValueSource {
+    return result.source;
+}
+
+const capture_temp_ref_count = 5;
 
 pub const IRData = struct {
     data: std.ArrayList(Page) = .empty,
@@ -789,6 +806,19 @@ pub const IRCompiler = struct {
         } }));
     }
 
+    pub fn neg(
+        self: *IRCompiler,
+        source: anytype,
+        operand: ir.Location,
+        result: ir.Location,
+    ) Error!ir.Location {
+        try self.addInstruction(.init(.from(source), .{ .neg = .{
+            .operand = operand,
+            .result = result,
+        } }));
+        return result.typed(operand.options.type_expr);
+    }
+
     pub fn exec_(
         self: *IRCompiler,
         source: anytype,
@@ -876,6 +906,14 @@ pub const IRCompiler = struct {
             return self.reportSourceError(source, Error.UnsupportedExitCodeExpression, .@"error", "value type \"{t}\" cannot be coerced into an exit code", .{value.source});
         };
         return self.addInstruction(.init(.from(source), .exit_(exit_code)));
+    }
+
+    pub fn exitWith(
+        self: *IRCompiler,
+        source: anytype,
+        value: Result,
+    ) Error!void {
+        return self.addInstruction(.init(.from(source), .{ .exit_with = value.source }));
     }
 
     fn labelLessThan(_: *IRCompiler, a: ir.Label, b: ir.Label) bool {
@@ -977,23 +1015,45 @@ pub const IRCompiler = struct {
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(stmt.span()), @src().fn_name });
 
-        const result: Result = try switch (stmt.*) {
+        return switch (stmt.*) {
             .type_binding_decl => Result.fromValue(.void),
             .binding_decl => |*b| self.compileBindingDecl(stmt, b),
             .return_stmt => |r| self.compileReturn(stmt, r),
-            .expression => |expr| self.compileExpression(expr.expression),
+            .expression => |expr| self.compileExpressionStatement(stmt, expr.expression),
             else => {
                 try self.reportSourceError(stmt, Error.UnsupportedExpression, .@"error", "statement type \"{t}\" not yet supported", .{stmt.*});
                 return .fromValue(.void);
             },
         };
+    }
 
-        if (isWaitable(result)) |loc| {
-            try self.comment("wait from {s}", .{@src().fn_name});
-            try self.wait(stmt, loc);
+    fn compileExpressionStatement(
+        self: *IRCompiler,
+        source: *ast.Statement,
+        expr: *ast.Expression,
+    ) Error!Result {
+        switch (expr.*) {
+            .binary => |binary| switch (binary.op) {
+                .logical_and, .logical_or => return self.compileLogicalBinary(source, binary, .statement),
+                else => {},
+            },
+            else => {},
         }
 
-        return result;
+        const result = try self.compileExpression(expr);
+        try self.finalizeStatementResult(source, result);
+        return .fromValue(.void);
+    }
+
+    fn finalizeStatementResult(
+        self: *IRCompiler,
+        source: anytype,
+        result: Result,
+    ) Error!void {
+        if (isWaitable(result)) |loc| {
+            try self.comment("wait from {s}", .{@src().fn_name});
+            try self.wait(source, loc);
+        }
     }
 
     fn isWaitable(result: Result) ?ir.Location {
@@ -1179,6 +1239,7 @@ pub const IRCompiler = struct {
             .block => |block| self.compileBlock(expr, block),
             .fn_decl => |fn_decl| self.compileFnDecl(expr, fn_decl),
             .binary => |binary| self.compileBinary(expr, binary),
+            .unary => |unary| self.compileUnary(expr, unary),
             .array => |array| self.compileArray(expr, array),
             .for_expr => |for_expr| self.compileForLoop(expr, for_expr),
             else => {
@@ -1200,9 +1261,17 @@ pub const IRCompiler = struct {
             const stdout_pipe_ref = try self.newRef(source, "stdout_pipe");
             try self.pipe(source, stdout_pipe_ref);
             try self.pipeOpt(source, stdout_pipe_ref.dereference(), .keep_open, .fromValue(.fromBoolean(true)));
+            try self.pipeOpt(source, stdout_pipe_ref.dereference(), .close_destination, .fromValue(.fromBoolean(false)));
+            try self.pipeOpt(source, stdout_pipe_ref.dereference(), .disconnect_destination, .fromValue(.fromBoolean(false)));
             const stderr_pipe_ref = try self.newRef(source, "stderr_pipe");
             try self.pipe(source, stderr_pipe_ref);
             try self.pipeOpt(source, stderr_pipe_ref.dereference(), .keep_open, .fromValue(.fromBoolean(true)));
+            try self.pipeOpt(source, stderr_pipe_ref.dereference(), .close_destination, .fromValue(.fromBoolean(false)));
+            try self.pipeOpt(source, stderr_pipe_ref.dereference(), .disconnect_destination, .fromValue(.fromBoolean(false)));
+            const merged_pipe_ref = try self.newRef(source, "merged_pipe");
+            try self.pipe(source, merged_pipe_ref);
+            try self.pipeFwd(source, stdout_pipe_ref.dereference(), merged_pipe_ref.dereference());
+            try self.pipeFwd(source, stderr_pipe_ref.dereference(), merged_pipe_ref.dereference());
             const stdout_stream_thread_ref = try self.newRef(source, "stdout_stream_thread");
             try self.set(
                 source,
@@ -1219,31 +1288,105 @@ pub const IRCompiler = struct {
                 .out = stdout_pipe_ref.dereference(),
                 .err = stderr_pipe_ref.dereference(),
             }, expr);
+            if (result.isType(thread_type)) {
+                try self.wait(source, result.source.location);
+            }
             try self.pipeOpt(source, stdout_pipe_ref.dereference(), .keep_open, .fromValue(.fromBoolean(false)));
             try self.pipeOpt(source, stderr_pipe_ref.dereference(), .keep_open, .fromValue(.fromBoolean(false)));
             try self.wait(source, stdout_stream_thread_ref.dereference());
-
-            // if (isWaitable(result)) |waitable| {
-            //     try self.wait(source, waitable);
+            try self.wait(source, stderr_stream_thread_ref.dereference());
             if (result.isType(execution_handles_struct_type)) {
-                // alloc 3 # create execution result
-                try self.alloc(source, 3);
+                // alloc 4 # create execution result
+                try self.alloc(source, 4);
                 // set [%r+0] = @@pipe_stdout
                 try self.set(source, .initAdd(.{ .register = .r }, 0, .{ .dereference = true }), .from(stdout_pipe_ref.dereference()));
                 // set [%r+1] = @@pipe_stderr
                 try self.set(source, .initAdd(.{ .register = .r }, 1, .{ .dereference = true }), .from(stderr_pipe_ref.dereference()));
-                // set [%r+2] = [@@execution_handles+0]
-                try self.set(source, .initRegister(.r2), result.source.dereference());
-                try self.set(source, .initAdd(.{ .register = .r }, 2, .{ .dereference = true }), .fromLocation(.initAdd(.{ .register = .r2 }, 1, .{ .dereference = true })));
+                // set [%r+2] = @@pipe_merged
+                try self.set(source, .initAdd(.{ .register = .r }, 2, .{ .dereference = true }), .from(merged_pipe_ref.dereference()));
+                // set [%r+3] = [@@execution_handles+0]
+                try self.set(source, .initRegister(.r2), stableResultSource(result));
+                try self.set(source, .initAdd(.{ .register = .r }, 3, .{ .dereference = true }), .fromLocation(.initAdd(.{ .register = .r2 }, 1, .{ .dereference = true })));
                 // set [C+?] = %r
                 result = .fromLocation(.initRegister(.r));
                 result = result.typed(execution_result_struct_type);
             }
-            // }
-            return result.dereference();
+            return result;
         } else {
             return try self.compileExpression(expr);
         }
+    }
+
+    fn compileStableExpression(
+        self: *IRCompiler,
+        source: anytype,
+        expr: *ast.Expression,
+        comptime ref_name: []const u8,
+    ) Error!Result {
+        const expr_effects = self.analyzeExpressionEffects(expr);
+        if (!expr_effects.needs_stdio_capture) {
+            return try self.compileExpression(expr);
+        }
+
+        const saved_ref = try self.newRef(source, ref_name);
+        const result = try self.compileExpressionWithCapture(source, expr);
+        if (result.isType(execution_result_struct_type)) {
+            try self.set(source, .initRegister(.r2), stableResultSource(result));
+            try self.set(source, saved_ref, .fromLocation(.initRegister(.r2)));
+        } else {
+            try self.set(source, saved_ref, stableResultSource(result));
+        }
+        var i: usize = 0;
+        while (i < capture_temp_ref_count) : (i += 1) {
+            _ = try self.pop(source);
+        }
+        return try .from(saved_ref.dereference().typed(result.typeExpr()));
+    }
+
+    fn compileStableExpressionIntoRef(
+        self: *IRCompiler,
+        source: anytype,
+        expr: *ast.Expression,
+        destination: ir.Location,
+    ) Error!Result {
+        const expr_effects = self.analyzeExpressionEffects(expr);
+        if (!expr_effects.needs_stdio_capture) {
+            const result = try self.compileExpression(expr);
+            try self.set(source, destination, stableResultSource(result));
+            return .from(destination.dereference().typed(result.typeExpr()));
+        }
+
+        const result = try self.compileExpressionWithCapture(source, expr);
+        if (result.isType(execution_result_struct_type)) {
+            try self.set(source, .initRegister(.r2), stableResultSource(result));
+            try self.set(source, destination, .fromLocation(.initRegister(.r2)));
+        } else {
+            try self.set(source, destination, stableResultSource(result));
+        }
+        var i: usize = 0;
+        while (i < capture_temp_ref_count) : (i += 1) {
+            _ = try self.pop(source);
+        }
+        return .from(destination.dereference().typed(result.typeExpr()));
+    }
+
+    fn compileTransientExpression(
+        self: *IRCompiler,
+        source: anytype,
+        expr: *ast.Expression,
+    ) Error!Result {
+        const expr_effects = self.analyzeExpressionEffects(expr);
+        if (!expr_effects.needs_stdio_capture) {
+            return try self.compileExpression(expr);
+        }
+
+        const result = try self.compileExpressionWithCapture(source, expr);
+        try self.set(source, .initRegister(.r2), stableResultSource(result));
+        var i: usize = 0;
+        while (i < capture_temp_ref_count) : (i += 1) {
+            _ = try self.pop(source);
+        }
+        return .fromLocation(ir.Location.initRegister(.r2).typed(result.typeExpr()));
     }
 
     fn compileLiteral(
@@ -1464,7 +1607,7 @@ pub const IRCompiler = struct {
                 // TODO: handle array coercion
                 if (result == .location and result.location.isType(execution_result_struct_type)) {
                     try self.set(source, .initRegister(.r2), result);
-                    result = .fromLocation(.initAdd(.{ .register = .r2 }, 0, .{ .dereference = true }));
+                    result = .fromLocation(.initAdd(.{ .register = .r2 }, 2, .{ .dereference = true }));
                 }
                 try self.set(
                     source,
@@ -2112,7 +2255,7 @@ pub const IRCompiler = struct {
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
-        const condition = try self.compileExpression(if_expr.condition);
+        const condition = try self.compileTransientExpression(source, if_expr.condition);
         if (condition.source.isValueTag(.exit_code)) {
             const c = condition.source.value.exit_code.toBoolean();
 
@@ -2120,28 +2263,40 @@ pub const IRCompiler = struct {
             return switch (else_branch) {
                 .expr => |expr_| self.compileExpression(expr_),
                 .if_expr => |if_expr_| self.compileIf(source, if_expr_.*),
+                .condition => condition,
             };
         }
 
         const result = try self.newRef(source, "if_result");
+        if (else_branch == .condition) {
+            try self.set(source, result, stableResultSource(condition));
+        }
         const after_addr = try self.newLabel("if_after", .unknown);
         const else_addr = try self.newLabel("if_else", .unknown);
 
         try self.jmp(source, condition, false, else_addr);
         const then = try self.compileExpression(if_expr.then_expr);
-        try self.set(source, result, then.source);
+        try self.set(source, result, stableResultSource(then));
         try self.jmp(source, null, false, after_addr);
         try self.setLabel(else_addr.local_addr.label, .abs);
-        const else_ = try switch (else_branch) {
-            .expr => |expr_| self.compileExpression(expr_),
-            .if_expr => |if_expr_| self.compileIf(source, if_expr_.*),
-        };
-        try self.set(source, result, else_.source);
+        var result_type = if (else_branch == .condition) mergedResultType(condition, then) else null;
+        switch (else_branch) {
+            .expr => |expr_| {
+                const else_ = try self.compileExpression(expr_);
+                try self.set(source, result, stableResultSource(else_));
+                result_type = mergedResultType(then, else_);
+            },
+            .if_expr => |if_expr_| {
+                const else_ = try self.compileIf(source, if_expr_.*);
+                try self.set(source, result, stableResultSource(else_));
+                result_type = mergedResultType(then, else_);
+            },
+            .condition => {},
+        }
         try self.setLabel(after_addr.local_addr.label, .abs);
+        try self.set(source, .initRegister(.r2), .from(result.dereference()));
 
-        const result_loc = try self.pop(source);
-
-        return .from(result_loc);
+        return .fromLocation(ir.Location.initRegister(.r2).typed(result_type));
     }
 
     fn compileIfNoElse(
@@ -2151,7 +2306,7 @@ pub const IRCompiler = struct {
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
-        const condition = try self.compileExpression(if_expr.condition);
+        const condition = try self.compileTransientExpression(source, if_expr.condition);
         if (condition.source.isValueTag(.exit_code)) {
             const c = condition.source.value.exit_code.toBoolean();
 
@@ -2250,16 +2405,12 @@ pub const IRCompiler = struct {
         for (stage_sets, stage_closures, pipeline.stages[0 .. pipeline.stages.len - 1], 0..) |*stage_set, *stage_closure, stage_expr, i| {
             self.current_instruction_set = stage_set.*;
             try self.scopes.push(self.allocator, .closure);
+            _ = try self.forkInherit(source, self.stdoutStreamSet(), .noll);
             const result = try self.compileExpression(stage_expr);
 
             if (isWaitable(result)) |loc| {
-                try self.push(source, result.source);
-                _ = try self.forkInherit(source, self.stdoutStreamSet(), .noll);
-                const result_stack = (try self.pop(source)).typed(loc.options.type_expr);
-                if (isWaitable(try .from(result_stack))) |loc_| {
-                    try self.comment("wait from {s}", .{@src().fn_name});
-                    try self.wait(source, loc_);
-                }
+                try self.comment("wait from {s}", .{@src().fn_name});
+                try self.wait(source, loc);
                 try self.pipeOpt(
                     source,
                     self.threadStdout(),
@@ -2287,6 +2438,7 @@ pub const IRCompiler = struct {
             try self.comment("wait from {s} (last stage)", .{@src().fn_name});
             try self.wait(source, loc);
         }
+        try self.exitWith(source, result);
         try self.setClosureIdentifiers();
         self.current_instruction_set = orig_instr_set;
         try self.comment("closure initialization last stage: {f}", .{last_closure.return_addr});
@@ -2305,12 +2457,28 @@ pub const IRCompiler = struct {
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
         try self.scopes.push(self.allocator, .lexical);
-        defer self.scopes.pop();
 
         var result: Result = .fromValue(.void);
-        for (block.statements) |stmt| {
+        for (block.statements[0 .. block.statements.len -| 1]) |stmt| {
             result = try self.compileStatement(stmt);
         }
+        if (block.statements.len > 0) {
+            const last_stmt = block.statements[block.statements.len - 1];
+            result = switch (last_stmt.*) {
+                .expression => |expr| try self.compileExpression(expr.expression),
+                else => try self.compileStatement(last_stmt),
+            };
+        }
+
+        switch (result.source) {
+            .location => |loc| if (loc.abs == .ref) {
+                try self.set(source, .initRegister(.r2), stableResultSource(result));
+                result = .fromLocation(ir.Location.initRegister(.r2).typed(result.typeExpr()));
+            },
+            else => {},
+        }
+
+        self.scopes.pop();
 
         return result;
     }
@@ -2349,6 +2517,7 @@ pub const IRCompiler = struct {
         if (isWaitable(result)) |loc| {
             try self.wait(source, loc);
         }
+        try self.exitWith(source, result);
 
         try self.setClosureIdentifiers();
         self.current_instruction_set = orig_instr_set;
@@ -2365,7 +2534,7 @@ pub const IRCompiler = struct {
 
     fn compileResultSaveR(
         self: *IRCompiler,
-        source: *ast.Expression,
+        source: anytype,
         result: Result,
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
@@ -2379,9 +2548,26 @@ pub const IRCompiler = struct {
         return result;
     }
 
+    fn compileUnary(
+        self: *IRCompiler,
+        source: anytype,
+        unary: ast.UnaryExpr,
+    ) Error!Result {
+        switch (unary.op) {
+            .logical_not => {
+                const result = try self.compileTransientExpression(source, unary.operand);
+                if (result.source.isValueTag(.exit_code)) {
+                    return .fromValue(.fromBoolean(!result.source.value.exit_code.toBoolean()));
+                }
+                const negated = try self.neg(source, result.source.location, .initRegister(.r));
+                return .from(negated);
+            },
+        }
+    }
+
     fn compileBinary(
         self: *IRCompiler,
-        source: *ast.Expression,
+        source: anytype,
         binary: ast.BinaryExpr,
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
@@ -2402,26 +2588,7 @@ pub const IRCompiler = struct {
                 return .from(ref.dereference());
             },
             .logical_and, .logical_or => {
-                const left = try self.compileExpression(binary.left);
-
-                if (evaluateLogical(.from(binary.op), left.source)) |comptime_result| {
-                    switch (comptime_result) {
-                        .left => return left,
-                        .right => return self.compileExpression(binary.right),
-                    }
-                }
-
-                const right = try self.compileExpression(binary.right);
-                const ref = try self.newRef(source, "logical_result");
-
-                try self.addInstruction(.init(.from(source), .{ .log = .{
-                    .op = .from(binary.op),
-                    .a = left.source,
-                    .b = right.source,
-                    .result = ref,
-                } }));
-
-                return .from(ref.dereference());
+                return self.compileLogicalBinary(source, binary, .value);
             },
             .greater, .greater_equal, .less, .less_equal, .equal, .not_equal => {
                 const left = try self.compileExpression(binary.left);
@@ -2593,6 +2760,109 @@ pub const IRCompiler = struct {
         }
     }
 
+    const LogicalCompileMode = enum {
+        value,
+        statement,
+    };
+
+    fn compileLogicalBinary(
+        self: *IRCompiler,
+        source: anytype,
+        binary: ast.BinaryExpr,
+        mode: LogicalCompileMode,
+    ) Error!Result {
+        switch (mode) {
+            .statement => {
+                const left = try self.compileExpression(binary.left);
+                try self.finalizeStatementResult(source, left);
+
+                if (evaluateLogical(.from(binary.op), left.source)) |comptime_result| {
+                    return switch (comptime_result) {
+                        .left => .fromValue(.void),
+                        .right => self.compileLogicalRightStatement(source, binary.right),
+                    };
+                }
+
+                const after_addr = try self.newLabel("logical_stmt_after", .unknown);
+                switch (binary.op) {
+                    .logical_and => try self.jmp(source, left, false, after_addr),
+                    .logical_or => try self.jmp(source, left, true, after_addr),
+                    else => unreachable,
+                }
+
+                _ = try self.compileLogicalRightStatement(source, binary.right);
+                try self.setLabel(after_addr.local_addr.label, .abs);
+                return .fromValue(.void);
+            },
+            .value => {
+                const left_expr_effects = self.analyzeExpressionEffects(binary.left);
+                const right_expr_effects = self.analyzeExpressionEffects(binary.right);
+
+                if (left_expr_effects.needs_stdio_capture or right_expr_effects.needs_stdio_capture) {
+                    const result = try self.newRef(source, "logical_result");
+                    const left = try self.compileStableExpressionIntoRef(source, binary.left, result);
+
+                    if (evaluateLogical(.from(binary.op), left.source)) |comptime_result| {
+                        return switch (comptime_result) {
+                            .left => left,
+                            .right => try self.compileStableExpression(source, binary.right, "logical_right"),
+                        };
+                    }
+
+                    const after_addr = try self.newLabel("logical_after", .unknown);
+                    switch (binary.op) {
+                        .logical_and => try self.jmp(source, left, false, after_addr),
+                        .logical_or => try self.jmp(source, left, true, after_addr),
+                        else => unreachable,
+                    }
+
+                    const right = try self.compileStableExpressionIntoRef(source, binary.right, result);
+                    try self.setLabel(after_addr.local_addr.label, .abs);
+
+                    return .from(result.dereference().typed(mergedResultType(left, right)));
+                }
+
+                const left = try self.compileExpression(binary.left);
+
+                if (evaluateLogical(.from(binary.op), left.source)) |comptime_result| {
+                    return switch (comptime_result) {
+                        .left => left,
+                        .right => try self.compileExpression(binary.right),
+                    };
+                }
+
+                const right = try self.compileExpression(binary.right);
+                const ref = try self.newRef(source, "logical_result");
+
+                try self.addInstruction(.init(.from(source), .{ .log = .{
+                    .op = .from(binary.op),
+                    .a = left.source,
+                    .b = right.source,
+                    .result = ref,
+                } }));
+
+                return .from(ref.dereference());
+            },
+        }
+    }
+
+    fn compileLogicalRightStatement(
+        self: *IRCompiler,
+        source: anytype,
+        expr: *ast.Expression,
+    ) Error!Result {
+        switch (expr.*) {
+            .binary => |binary| switch (binary.op) {
+                .logical_and, .logical_or => return self.compileLogicalBinary(source, binary, .statement),
+                else => {},
+            },
+            else => {},
+        }
+        const result = try self.compileExpression(expr);
+        try self.finalizeStatementResult(source, result);
+        return .fromValue(.void);
+    }
+
     fn compileForBindingValue(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -2758,6 +3028,12 @@ pub const IRCompiler = struct {
             .pipeline => .{ .needs_stdio_capture = true }, // definitely stdio-heavy
             .block => .{ .needs_stdio_capture = true }, // may emit output
             .if_expr => |if_expr| self.analyzeIfExpressionEffects(if_expr),
+            .binary => |binary| brk: {
+                var result = self.analyzeExpressionEffects(binary.left);
+                result.merge(self.analyzeExpressionEffects(binary.right));
+                break :brk result;
+            },
+            .unary => |unary| self.analyzeExpressionEffects(unary.operand),
             .array => |_| .{ .needs_stdio_capture = false },
             else => .{},
         };
@@ -2786,6 +3062,7 @@ pub const IRCompiler = struct {
                 self.analyzeExpressionEffects(ee).needs_stdio_capture,
             .if_expr => |ie| out.needs_stdio_capture = out.needs_stdio_capture or
                 self.analyzeIfExpressionEffects(ie.*).needs_stdio_capture,
+            .condition => {},
         };
         return out;
     }

@@ -254,6 +254,10 @@ pub const Value = union(enum) {
         };
     }
 
+    pub fn fromInteger(integer: usize) @This() {
+        return .{ .uinteger = integer };
+    }
+
     pub const ToStreamError = Allocator.Error || error{UnsupportedStreamCast};
 
     pub fn toStream(self: @This(), allocator: Allocator) ToStreamError!@This() {

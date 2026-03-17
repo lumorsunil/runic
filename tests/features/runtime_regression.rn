@@ -1,0 +1,98 @@
+// Output-driven regression suite for the currently supported runtime surface.
+// Keep this file aligned with behavior that is known to work end to end.
+
+echo "== commands =="
+echo "hello, world!"
+echo "hello cat!" | cat
+
+echo "== conditionals =="
+if (true) {
+  echo "true branch"
+} else {
+  echo "false branch"
+}
+if (false) echo "true inline" else echo "false inline"
+
+echo "== loops =="
+for (0..3) |i| {
+  echo "range ${i}"
+}
+
+const words = .{ "one", "two", "three" }
+for (words, 0..) |word, i| {
+  echo "word ${i} = ${word}"
+}
+
+echo "== functions =="
+fn Void greet(name: String) String {
+  echo "Hello, ${name}"
+}
+greet "Runic"
+
+const greeting_suffix = "from closure"
+fn Void greet_again(name: String) String {
+  echo "Hello again, ${name} ${greeting_suffix}"
+}
+greet_again "runtime"
+
+echo "== numbers =="
+const int_a = 4
+const int_b = 3
+echo "sum = ${int_a + int_b}"
+
+const float_a: Float = 2.5
+echo "float = ${float_a}"
+echo "mixed = ${int_a + float_a}"
+
+var counter: Int = 1
+counter += 3
+echo "counter += 3 => ${counter}"
+counter -= 2
+echo "counter -= 2 => ${counter}"
+counter *= 5
+echo "counter *= 5 => ${counter}"
+counter /= 2
+echo "counter /= 2 => ${counter}"
+counter %= 3
+echo "counter %= 3 => ${counter}"
+
+echo "== booleans =="
+echo "true && false = ${true && false}"
+echo "false || true = ${false || true}"
+echo "true || false && false = ${true || false && false}"
+
+echo "== logical control flow =="
+bash "-c" "exit 0" && echo "exec and ran"
+bash "-c" "exit 1" || echo "exec or ran"
+if (bash "-c" "exit 0") {
+  if (bash "-c" "exit 1") {
+    echo "nested bad"
+  } else {
+    echo "nested else ok"
+  }
+} else {
+  echo "outer bad"
+}
+echo "pipe ok" | grep "pipe ok" && echo "pipeline and ran"
+bash "-c" "exit 1" | grep "pipe ok" || echo "pipeline or ran"
+
+echo "== block capture =="
+const block_capture = {
+  echo "capture-one"
+  echo "capture-two"
+}
+echo "${block_capture}"
+
+echo "== block pipeline =="
+({
+  echo "left|3"
+  echo "right|7"
+}) | grep "-m" "1" "right|7"
+
+echo "== merged output =="
+const merged = bash "-c" "printf out; printf err 1>&2; printf after"
+echo "${merged}"
+echo "${merged.stdout}"
+echo "${merged.stderr}"
+
+echo "runtime regression suite passed"

@@ -2,10 +2,10 @@
 
 ## misc
 
-- [ ] support ctrl+d for closing stdin
-- [ ] coercion of execution result to a string needs to have both stdout and stderr merged (at least when binding or coercing directly in a string interpolation)
-- [ ] type checker?
-- [ ] lsp?
+- [ ] support ctrl+d for closing stdin (not mvp)
+- [x] coercion of execution result to a string needs to have both stdout and stderr merged (at least when binding or coercing directly in a string interpolation)
+- [ ] type checker? (not mvp)
+- [ ] lsp? (not mvp)
 
 ## data
 
@@ -82,6 +82,11 @@
   - [ ] error handling? (not mvp)
   - [ ] && / ||
   - [ ] redirections
+    - [ ] redirect stdout separately (not mvp)
+    - [ ] redirect stderr separately (not mvp)
+    - [ ] redirect to file
+      - [ ] replace mode
+      - [ ] append mode
 - [x] function declarations
   - [x] arguments
 - [x] functions calls

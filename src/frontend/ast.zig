@@ -232,8 +232,12 @@ pub const TypeExpr = union(enum) {
         decls: []const StructDecl,
         span: Span,
 
-        pub fn format(_: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
-            try writer.writeAll("<struct>");
+        pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try writer.writeAll("<struct>{\n");
+            for (self.fields) |field| {
+                try writer.print("  {s}: {f},\n", .{ field.name.name, field.type_expr });
+            }
+            try writer.writeAll("}");
         }
     };
 
@@ -716,8 +720,6 @@ pub const UnaryExpr = struct {
 };
 
 pub const UnaryOp = enum {
-    positive,
-    negative,
     logical_not,
 };
 
@@ -875,11 +877,13 @@ pub const IfExpr = struct {
     pub const ElseBranch = union(enum) {
         expr: *Expression,
         if_expr: *IfExpr,
+        condition: Span,
 
         pub fn span(self: ElseBranch) Span {
             return switch (self) {
                 .expr => |expr| expr.span(),
                 .if_expr => |if_expr| if_expr.span,
+                .condition => |s| s,
             };
         }
     };

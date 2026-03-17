@@ -103,6 +103,8 @@ pub const Instruction = struct {
         cmp: Cmp,
         /// performs logical operator with a and b and stores the result into result
         log: Log,
+        /// performs logical negation
+        neg: Neg,
         /// declares a new ref (basically a labeled push)
         ref: []const u8,
         /// sets a Location to a Value from a Location
@@ -129,6 +131,8 @@ pub const Instruction = struct {
         alloc: usize,
         /// exits the process
         exit: ExitCode,
+        /// exits the process with an exit code resolved from a value source
+        exit_with: ValueSource,
 
         pub fn push_(value: ValueSource) @This() {
             return .{ .push = value };
@@ -136,6 +140,10 @@ pub const Instruction = struct {
 
         pub fn exit_(exit_code: ExitCode) @This() {
             return .{ .exit = exit_code };
+        }
+
+        pub fn exitWith_(value: ValueSource) @This() {
+            return .{ .exit_with = value };
         }
 
         pub fn fork_(
@@ -164,7 +172,7 @@ pub const Instruction = struct {
 
         pub fn format(self: @This(), w: *std.Io.Writer) !void {
             switch (self) {
-                inline .push, .exit, .jmp, .fork, .set, .pipe_fwd, .wait, .stream, .pipe, .pipe_opt, .ath, .log, .cmp => |t| try w.print("{t} {f}", .{ self, t }),
+                inline .push, .exit, .exit_with, .jmp, .fork, .set, .pipe_fwd, .wait, .stream, .pipe, .pipe_opt, .ath, .log, .cmp => |t| try w.print("{t} {f}", .{ self, t }),
                 inline .ref, .comment => |t| try w.print("{t} {s}", .{ self, t }),
                 inline .alloc => |t| try w.print("{t} {}", .{ self, t }),
                 else => try w.print("{t}", .{self}),
@@ -230,6 +238,11 @@ pub const Instruction = struct {
         const source = self.source orelse return null;
         return source.span();
     }
+
+    pub const UnaryOperation = struct {
+        operand: Location,
+        result: Location,
+    };
 
     pub fn BinaryOperation(comptime OpType: type) type {
         return struct {
@@ -350,6 +363,8 @@ pub const Instruction = struct {
         }
     };
     pub const Log = BinaryOperation(LogOp);
+
+    pub const Neg = UnaryOperation;
 
     pub const Jump = struct {
         cond: ?ValueSource,

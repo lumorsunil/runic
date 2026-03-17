@@ -336,7 +336,7 @@ pub const PipeReader = struct {
     pub fn init(file: ?std.fs.File, buffer: []u8, tracer: *Tracer) PipeReader {
         return .{
             .file = file,
-            .file_reader = if (file) |f| f.reader(buffer) else null,
+            .file_reader = if (file) |f| f.readerStreaming(buffer) else null,
             .tracer = tracer,
         };
     }
@@ -348,19 +348,37 @@ pub const PipeReader = struct {
     pub fn stream(
         r: *std.Io.Reader,
         w: *std.Io.Writer,
-        limit: std.Io.Limit,
+        _: std.Io.Limit,
     ) std.Io.Reader.StreamError!usize {
         const parent = getParent(r);
         const file = parent.file orelse return 0;
         const file_reader = if (parent.file_reader) |*fr| fr else return 0;
 
-        const revents = poll(file, std.posix.POLL.IN, parent.tracer);
+        var revents = poll(file, std.posix.POLL.IN, parent.tracer);
 
         if (revents & std.posix.POLL.ERR > 0) {
             return error.EndOfStream;
-        } else if (revents & std.posix.POLL.IN > 0) {
-            return try file_reader.interface.stream(w, limit);
-        } else if (revents & (std.posix.POLL.HUP | std.posix.POLL.NVAL) > 0) {
+        } else if (revents & (std.posix.POLL.IN | std.posix.POLL.HUP) > 0) {
+            var buffer: [256]u8 = undefined;
+            var bytes_read: usize = 0;
+            while (bytes_read < buffer.len) {
+                const n = try file_reader.read(buffer[bytes_read .. bytes_read + 1]);
+                if (n == 0) {
+                    if (bytes_read == 0) return error.EndOfStream;
+                    break;
+                }
+                bytes_read += n;
+
+                if (buffer[bytes_read - 1] == '\n') break;
+
+                revents = poll(file, std.posix.POLL.IN, parent.tracer);
+                if (revents & std.posix.POLL.ERR > 0) return error.EndOfStream;
+                if (revents & std.posix.POLL.IN == 0) break;
+            }
+
+            try w.writeAll(buffer[0..bytes_read]);
+            return bytes_read;
+        } else if (revents & std.posix.POLL.NVAL > 0) {
             return error.EndOfStream;
         }
 
@@ -393,6 +411,7 @@ pub const CloseableProcessIo = struct {
             self.stdin_writer.?.trace_file_writer = .init(
                 &self.stdin_trace_buffer,
                 &self.stdin_writer.?.file_writer.?.interface,
+                null,
                 "process_stdin",
             );
         }

@@ -32,6 +32,7 @@ fn logWithoutParent(w: *std.Io.Writer, comptime fmt: []const u8, args: anytype) 
 pub const TraceWriter = struct {
     writer: std.Io.Writer,
     wrapped: *std.Io.Writer,
+    capture: ?*std.Io.Writer,
     label: []const u8,
 
     const vtable = std.Io.Writer.VTable{
@@ -41,11 +42,12 @@ pub const TraceWriter = struct {
         .rebase = rebase,
     };
 
-    pub fn init(buffer: []u8, w: *std.Io.Writer, label: []const u8) @This() {
+    pub fn init(buffer: []u8, w: *std.Io.Writer, capture: ?*std.Io.Writer, label: []const u8) @This() {
         logWithoutParent(w, @src().fn_name ++ " ({s})", .{label});
         return .{
             .writer = .{ .vtable = &vtable, .buffer = buffer },
             .wrapped = w,
+            .capture = capture,
             .label = label,
         };
     }
@@ -57,15 +59,19 @@ pub const TraceWriter = struct {
     fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
         log(w, @src().fn_name ++ " (data.len={}, data[0].len={}, splat={})", .{ data.len, data[0].len, splat });
         const parent = getParent(w);
-        const buffer_written = try parent.wrapped.writeSplat(&.{w.buffered()}, 1);
+        const buffered = w.buffered();
+        if (parent.capture) |capture| try capture.writeAll(buffered);
+        const buffer_written = try parent.wrapped.writeSplat(&.{buffered}, 1);
         w.end -= buffer_written;
 
         var written: usize = 0;
 
         if (w.end == 0) {
+            if (parent.capture) |capture| _ = try capture.writeSplat(data, splat);
             written = try parent.wrapped.writeSplat(data, splat);
         }
 
+        if (parent.capture) |capture| try capture.flush();
         try parent.wrapped.flush();
         return written;
     }
@@ -77,6 +83,7 @@ pub const TraceWriter = struct {
     ) std.Io.Writer.FileError!usize {
         log(w, @src().fn_name ++ " ({*}, limit={})", .{ &file_reader.interface, limit });
         const parent = getParent(w);
+        if (parent.capture != null) return error.Unimplemented;
         return parent.wrapped.sendFile(file_reader, limit);
     }
 

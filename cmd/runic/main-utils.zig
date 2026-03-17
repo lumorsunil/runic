@@ -185,6 +185,10 @@ fn renderExpressionAst(writer: *std.Io.Writer, expr: *const ast.Expression, leve
                 switch (branch) {
                     .expr => |else_expr| try renderExpressionAst(writer, else_expr, level + 2),
                     .if_expr => |nested_if| try renderExpressionAst(writer, &.from(nested_if.*), level + 2),
+                    .condition => {
+                        try writeIndent(writer, level + 2);
+                        try writer.writeAll("<condition>");
+                    },
                 }
             }
         },

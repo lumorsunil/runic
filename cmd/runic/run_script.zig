@@ -145,8 +145,8 @@ pub fn runScript(
 
     var wrapped_stdout_buffer: [1024]u8 = undefined;
     var wrapped_stderr_buffer: [1024]u8 = undefined;
-    var wrapped_stdout = TraceWriter.init(&wrapped_stdout_buffer, stdout, "<<<t_stdout>>>");
-    var wrapped_stderr = TraceWriter.init(&wrapped_stderr_buffer, stderr, "<<<t_stderr>>>");
+    var wrapped_stdout = TraceWriter.init(&wrapped_stdout_buffer, stdout, null, "<<<t_stdout>>>");
+    var wrapped_stderr = TraceWriter.init(&wrapped_stderr_buffer, stderr, null, "<<<t_stderr>>>");
 
     const stdin_closeable_reader = closeable.CloseableReader(ExitCode).init(
         stdin,
@@ -336,6 +336,7 @@ const StatementExpressionIterator = struct {
         if (if_expr.else_branch) |e| switch (e) {
             .if_expr => |else_if_expr| try populateIfExpr(cursor, else_if_expr),
             .expr => |expr| try cursor.appendExpr(expr),
+            .condition => {},
         };
         try cursor.appendExpr(if_expr.then_expr);
         try cursor.appendExpr(if_expr.condition);

@@ -1,0 +1,35 @@
+echo "== exec short circuit =="
+bash "-c" "exit 0" && echo "exec and ran"
+bash "-c" "exit 1" || echo "exec or ran"
+
+echo "== skipped branch output =="
+echo "before skipped and"
+bash "-c" "exit 1" && echo "bad and branch"
+echo "after skipped and"
+
+echo "before skipped or"
+bash "-c" "exit 0" || echo "bad or branch"
+echo "after skipped or"
+
+echo "== pipeline short circuit =="
+echo "pipe ok" | grep "pipe ok" && echo "pipeline and ran"
+bash "-c" "exit 1" | grep "pipe ok" || echo "pipeline or ran"
+
+echo "== block logical operands =="
+{
+  echo "block lhs success"
+  bash "-c" "exit 0"
+} && echo "block and ran"
+
+{
+  echo "block lhs failure"
+  bash "-c" "exit 1"
+} || echo "block or ran"
+
+echo "== nested logical statements =="
+bash "-c" "exit 0" && {
+  echo "nested and entered"
+  bash "-c" "exit 1" || echo "nested or recovered"
+}
+
+echo "logical short circuit regression passed"

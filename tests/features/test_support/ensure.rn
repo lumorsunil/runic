@@ -1,6 +1,0 @@
-fn ensure(condition: Bool, label: Str) Void {
-  if !condition {
-    echo "FAIL: ${label}"
-    exit 1
-  }
-}

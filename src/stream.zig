@@ -280,6 +280,7 @@ pub const ReaderWriterStream = struct {
     writer: std.Io.Writer,
     trace_writer: TraceWriter = undefined,
     buffer_writer: std.Io.Writer.Allocating,
+    capture_writer: std.Io.Writer.Allocating,
     closeable: Closeable(ExitCode) = .{ .vtable = &closeable_vtable },
     // source: ?CloseableReader(ExitCode) = null,
     sources: std.ArrayList(CloseableReader(ExitCode)) = .empty,
@@ -333,6 +334,7 @@ pub const ReaderWriterStream = struct {
     ) std.mem.Allocator.Error!@This() {
         return .{
             .buffer_writer = .init(allocator),
+            .capture_writer = .init(allocator),
             .label = label,
             .config = config,
             .tracer = tracer,
@@ -382,6 +384,7 @@ pub const ReaderWriterStream = struct {
         self.trace_writer = .init(
             try self.buffer_writer.allocator.alloc(u8, 1024),
             destination.writer,
+            &self.capture_writer.writer,
             self.label,
         );
 
@@ -437,6 +440,7 @@ pub const ReaderWriterStream = struct {
         self.sources.deinit(allocator);
         if (self.destination) |_| allocator.free(self.trace_writer.writer.buffer);
         self.buffer_writer.deinit();
+        self.capture_writer.deinit();
         self.ref.deinit(.{ .refresh_ref = true });
     }
 
@@ -555,10 +559,11 @@ pub const ReaderWriterStream = struct {
             }
 
             const buffered = try self.buffer_writer.toOwnedSlice();
+            defer self.buffer_writer.allocator.free(buffered);
 
             if (buffered.len > 0) {
-                try self.writer.writeAll(buffered);
-                try self.writer.flush();
+                try destination.writer.writeAll(buffered);
+                try destination.writer.flush();
                 self.tracer.trace(.information, &.{ "stream", @src().fn_name, "buffer", "data" }, null, "bytes forwarded from buffered data: {}", .{buffered.len});
 
                 // if (self.isSourcesClosed()) {
@@ -651,12 +656,14 @@ pub const ReaderWriterStream = struct {
             self.tracer.trace(.information, &.{ "stream", @src().fn_name }, null, "sources closed, closing ends", .{});
             const fully_connected = self.destination != null;
 
-            self.closeEnds();
-
             if (self.config.keep_open) {
+                self.closeSources();
+                self.disconnectSourcesAll();
                 self.tracer.trace(.information, &.{ "stream", @src().fn_name }, null, "keeping open", .{});
                 return .not_done;
             }
+
+            self.closeEnds();
 
             if (fully_connected) {
                 self.tracer.trace(.information, &.{ "stream", @src().fn_name, "closed" }, null, "closing stream", .{});

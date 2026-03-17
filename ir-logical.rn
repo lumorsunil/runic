@@ -1,4 +1,4 @@
-({
+{
   echo "true && true = ${true && true}"
   echo "false && true = ${false && true}"
   echo "true && false = ${true && false}"
@@ -17,4 +17,4 @@
   echo "false || true && false = ${false || true && false}"
   echo "false || false && true = ${false || false && true}"
   echo "false || false && false = ${false || false && false}"
-}) | column "-t"
+} | column "-t"

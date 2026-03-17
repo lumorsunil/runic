@@ -1,0 +1,9 @@
+if (bash "-c" "exit 0") {
+  if (bash "-c" "exit 1") {
+    echo "nested bad"
+  } else {
+    echo "nested else ok"
+  }
+} else {
+  echo "outer bad"
+}

@@ -7,6 +7,7 @@ const ReaderWriterStream = runic.stream.ReaderWriterStream;
 const ExitCode = runic.command_runner.ExitCode;
 const Stream = runic.stream.Stream;
 const Tracer = runic.trace.Tracer;
+const compiler = runic.ir.compiler;
 
 pub const Error =
     Allocator.Error ||
@@ -22,6 +23,7 @@ pub const Error =
         UnsupportedWaitee,
         UnsupportedStreamee,
         UnsupportedForward,
+        UnsupportedExitCodeType,
         UnsupportedBinaryOperator,
         UnsupportedBinaryExpression,
         SetImmutableLocation,
@@ -245,6 +247,72 @@ pub const IREvaluator = struct {
         }
     }
 
+    fn resolveExecutionResultExitCode(
+        self: *IREvaluator,
+        thread: ir.context.IRThreadContext,
+        location: ir.Location,
+    ) ResolveLocationError!ExitCode {
+        const base_loc = location.undereference();
+        const base = switch (base_loc.abs) {
+            .ref, .stack, .heap, .closure => (try self.dereferenceLocation(thread, base_loc)).*,
+            else => try self.resolveLocation(thread, base_loc),
+        };
+        const handle_addr = base.addr + 3;
+        const handle = self.context.shared.heap.get(handle_addr).?.closeable;
+        const closeable = self.context.getCloseable(handle);
+        return closeable.getResult().?;
+    }
+
+    fn resolveExecutionHandlesExitCode(
+        self: *IREvaluator,
+        thread: ir.context.IRThreadContext,
+        location: ir.Location,
+    ) ResolveLocationError!ExitCode {
+        const base_loc = location.undereference();
+        const base = switch (base_loc.abs) {
+            .ref, .stack, .heap, .closure => (try self.dereferenceLocation(thread, base_loc)).*,
+            else => try self.resolveLocation(thread, base_loc),
+        };
+        const handle_addr = base.addr + 1;
+        const handle = self.context.shared.heap.get(handle_addr).?.closeable;
+        const closeable = self.context.getCloseable(handle);
+        return closeable.getResult().?;
+    }
+
+    fn resolveThreadExitCode(
+        self: *IREvaluator,
+        thread: ir.context.IRThreadContext,
+        location: ir.Location,
+    ) ResolveLocationError!ExitCode {
+        const thread_value = try self.resolveLocation(thread, location);
+        const thread_handle = thread_value.thread;
+        return self.context.thread_exit_codes.get(thread_handle).?;
+    }
+
+    fn coerceExitCode(
+        self: *IREvaluator,
+        thread: ir.context.IRThreadContext,
+        value: ir.ValueSource,
+    ) Error!ExitCode {
+        if (value == .location and value.location.isType(compiler.execution_result_struct_type)) {
+            return self.resolveExecutionResultExitCode(thread, value.location);
+        }
+        if (value == .location and value.location.isType(compiler.execution_handles_struct_type)) {
+            return self.resolveExecutionHandlesExitCode(thread, value.location);
+        }
+        if (value == .location and value.location.isType(compiler.thread_type)) {
+            return self.resolveThreadExitCode(thread, value.location);
+        }
+
+        const resolved = try self.resolveValueSource(thread, value);
+        return switch (resolved) {
+            .uinteger => |x| .fromByte(@intCast(@mod(x, 256))),
+            .exit_code => |exit_code| exit_code,
+            .closeable => |handle| self.context.getCloseable(handle).getResult().?,
+            else => error.UnsupportedExitCodeType,
+        };
+    }
+
     fn dereferenceLocation(
         self: IREvaluator,
         thread: ir.context.IRThreadContext,
@@ -288,6 +356,7 @@ pub const IREvaluator = struct {
 
         return switch (instruction.type) {
             .comment => return .skip,
+            .exit_with => |value| return .{ .exit = try self.coerceExitCode(thread, value) },
             .fwd_stdio => {
                 const stdin = try self.context.addPipe(self.config.stdin);
                 const stdout = try self.context.addPipe(self.config.stdout);
@@ -318,6 +387,23 @@ pub const IREvaluator = struct {
             },
             .dec => {
                 thread.private.result_register_2 = evaluateArithmetic(.sub, .fromValue(thread.private.result_register_2), .fromValue(.{ .uinteger = 1 })).?;
+                return .cont;
+            },
+            .neg => |neg| {
+                const operand = try self.resolveLocation(thread, neg.operand);
+                const negated = switch (operand) {
+                    .exit_code => |exit_code| exit_code.negate(),
+                    .addr => |_| if (neg.operand.isType(compiler.execution_result_struct_type))
+                        (try self.resolveExecutionResultExitCode(thread, neg.operand)).negate()
+                    else
+                        unreachable,
+                    .thread => if (neg.operand.isType(compiler.thread_type))
+                        (try self.resolveThreadExitCode(thread, neg.operand)).negate()
+                    else
+                        unreachable,
+                    else => unreachable,
+                };
+                try self.setLocation(thread, neg.result, .{ .exit_code = negated });
                 return .cont;
             },
             .exec => |exec| {
@@ -415,7 +501,28 @@ pub const IREvaluator = struct {
 
                 const cond_value = try self.resolveValueSource(thread, cond);
 
-                if (cond_value.exit_code.toBoolean() == jmp.jump_if) {
+                if (cond == .location and cond.location.isType(compiler.execution_result_struct_type)) {
+                    const exit_code = try self.resolveExecutionResultExitCode(thread, cond.location);
+
+                    if (exit_code.toBoolean() == jmp.jump_if) {
+                        thread.setInstructionCounter(dest);
+                        return .cont_no_instr_counter_inc;
+                    }
+                } else if (cond == .location and cond.location.isType(compiler.execution_handles_struct_type)) {
+                    const exit_code = try self.resolveExecutionHandlesExitCode(thread, cond.location);
+
+                    if (exit_code.toBoolean() == jmp.jump_if) {
+                        thread.setInstructionCounter(dest);
+                        return .cont_no_instr_counter_inc;
+                    }
+                } else if (cond == .location and cond.location.isType(compiler.thread_type)) {
+                    const exit_code = try self.resolveThreadExitCode(thread, cond.location);
+
+                    if (exit_code.toBoolean() == jmp.jump_if) {
+                        thread.setInstructionCounter(dest);
+                        return .cont_no_instr_counter_inc;
+                    }
+                } else if (cond_value.exit_code.toBoolean() == jmp.jump_if) {
                     thread.setInstructionCounter(dest);
                     return .cont_no_instr_counter_inc;
                 }
@@ -914,7 +1021,11 @@ pub const IREvaluator = struct {
             .zig_string => |z| try w.writeAll(z),
             .pipe => |p| {
                 const pipe = self.context.getPipe(p);
-                try w.writeAll(pipe.buffer_writer.written());
+                if (pipe.capture_writer.written().len > 0) {
+                    try w.writeAll(pipe.capture_writer.written());
+                } else {
+                    try w.writeAll(pipe.buffer_writer.written());
+                }
             },
             .void, .strct, .thread, .closeable, .fn_ref => {},
         }

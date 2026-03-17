@@ -793,6 +793,10 @@ pub const ExitCode = union(enum) {
         return self == .success;
     }
 
+    pub fn negate(self: @This()) @This() {
+        return .fromBoolean(!self.toBoolean());
+    }
+
     pub fn getErrorCode(self: ExitCode) u8 {
         return switch (self) {
             .success => 0,

@@ -728,6 +728,7 @@ pub const TypeChecker = struct {
         switch (else_branch.*) {
             .if_expr => |if_expr| try self.runIfExpr(scope, if_expr),
             .expr => |expr| try self.runExpression(scope, expr),
+            .condition => {},
         }
     }
 

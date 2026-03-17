@@ -1,0 +1,14 @@
+if (bash "-c" "exit 0") {
+  if (bash "-c" "exit 1") {
+    echo "nested bad"
+  } else {
+    echo "nested else ok"
+  }
+} else {
+  echo "outer bad"
+}
+
+echo "pipe ok" | grep "pipe ok" && echo "pipeline and ran"
+bash "-c" "exit 1" | grep "pipe ok" || echo "pipeline or ran"
+
+echo "nested if pipeline regression passed"
