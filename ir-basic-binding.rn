@@ -1,2 +1,0 @@
-const x: Int = 3
-var s: String = "hello"

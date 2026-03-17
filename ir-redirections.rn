@@ -1,3 +1,4 @@
 echo "hello" > "ir-redirections-temp"
 echo "hello" >> "ir-redirections-temp"
 cat "ir-redirections-temp"
+rm "ir-redirections-temp"

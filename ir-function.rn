@@ -1,3 +1,0 @@
-fn Void hello(a: String) Void echo "${a}"
-
-hello "world"

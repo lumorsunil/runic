@@ -1,6 +1,4 @@
 ({
-  // TODO: cat does not echo the input (until we press enter to make grep echo out things containing hello. in bash this actually echoes the input. Also Ctrl+D does not work in runic, but it does work in bash.)
-  cat
   echo "something"
   echo "something"
   echo "hello"

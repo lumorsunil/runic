@@ -1,5 +1,0 @@
-fn Void @(file: String) String
-
-echo "you wanted to look at this file: ${file}"
-echo "here's the file:"
-cat "${file}"

@@ -1,3 +1,0 @@
-fn hello() Void {
-  p = "this should give an error"
-}

@@ -1,3 +1,0 @@
-const s = "hello"
-echo "${s}, world!"
-echo "${jq "." "test.json"}" | jq ".hello"

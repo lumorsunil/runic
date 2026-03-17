@@ -1,2 +1,0 @@
-const s = printf "hello, world!"
-echo "${s}"
