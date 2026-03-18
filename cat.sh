@@ -1,5 +1,0 @@
-hello() {
-  cat
-}
-
-hello

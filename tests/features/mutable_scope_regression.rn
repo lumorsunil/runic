@@ -9,9 +9,3 @@ x = x + 5 + y
 }
 
 echo "x = ${x}"
-
-// echo "${y}"
-// echo "${x}"
-
-//
-// echo "${x}"

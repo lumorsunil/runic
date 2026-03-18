@@ -1,5 +1,0 @@
-const x: Int = 6
-
-fn Void hello() Void echo "${x}"
-
-hello

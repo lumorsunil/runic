@@ -1,0 +1,12 @@
+var i = 0
+
+fn Void recur() Void {
+  echo "recur"
+  i = i + 1
+
+  if (i < 3) {
+    recur
+  }
+}
+
+recur

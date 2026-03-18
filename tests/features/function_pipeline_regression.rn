@@ -1,4 +1,4 @@
-fn Void hello(greeting: String) Void {
+fn Void hello(greeting: String) String {
   echo "Hello, ${greeting}."
 }
 

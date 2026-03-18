@@ -1,0 +1,20 @@
+var x: Int = 3
+
+fn Void hello(label: String) String echo "${label}: ${x}"
+fn Void modify_x() Void x = 1
+
+echo "before = ${x}"
+modify_x
+echo "after = ${x}"
+
+x = 5
+
+fn Void hello2(label: String) String echo "${label}: ${x}"
+
+hello "hello1"
+hello2 "hello2"
+
+x = 7
+
+hello "hello1"
+hello2 "hello2"

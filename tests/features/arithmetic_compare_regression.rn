@@ -1,0 +1,13 @@
+echo "3 + 5 = ${3 + 5}"
+echo "4 - 3 = ${4 - 3}"
+echo "9 * 6 = ${9 * 6}"
+echo "22 / 11 = ${22 / 11}"
+echo "10 / 2.5 = ${10 / 2.5}"
+echo "11 % 3 = ${11 % 3}"
+
+if (1 < 2) echo "1 < 2" else echo "bad 1 < 2"
+if (1 > 2) echo "bad 1 > 2" else echo "1 > 2"
+if (4 <= 5.5) echo "4 <= 5.5" else echo "bad 4 <= 5.5"
+if (11 >= 10) echo "11 >= 10" else echo "bad 11 >= 10"
+if (3 == 3) echo "3 == 3" else echo "bad 3 == 3"
+if (3 != 3) echo "bad 3 != 3" else echo "3 != 3"

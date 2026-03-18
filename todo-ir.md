@@ -93,7 +93,7 @@
     - [x] redirect to file
       - [x] replace mode
       - [x] append mode
-    - [ ] "redirect" from file to stdin
+    - [ ] "redirect" from file to stdin (not mvp)
 - [x] function declarations
   - [x] arguments
 - [x] functions calls
@@ -206,3 +206,4 @@
 - [x] arrays will executable calls as elements cannot be accessed with element access operator
 - [x] pipelines are broken again
 - [ ] escaped double quotes print as \"
+- [ ] race condition when piping a block into grep (ir-blocks.rn)

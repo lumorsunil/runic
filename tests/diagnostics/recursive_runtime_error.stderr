@@ -1,0 +1,2 @@
+Error evaluating /home/lumorsunil/repos/runic/tests/diagnostics/recursive_runtime_error.rn:3:1: error.UnsupportedExitCodeType
+runic exited with error: UnsupportedExitCodeType
