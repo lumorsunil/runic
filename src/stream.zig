@@ -657,6 +657,12 @@ pub const ReaderWriterStream = struct {
             const fully_connected = self.destination != null;
 
             if (self.config.keep_open) {
+                // Propagate EOF to the destination even when keeping the stream open.
+                // This allows Ctrl+D on stdin to close child process stdin while still
+                // allowing new destinations to connect later (e.g. sequential commands).
+                // close_destination/disconnect_destination flags gate this per-stream.
+                self.closeDestination();
+                self.disconnectDestination();
                 self.closeSources();
                 self.disconnectSourcesAll();
                 self.tracer.trace(.information, &.{ "stream", @src().fn_name }, null, "keeping open", .{});

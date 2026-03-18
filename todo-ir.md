@@ -2,7 +2,7 @@
 
 ## misc
 
-- [ ] support ctrl+d for closing stdin (not mvp)
+- [x] support ctrl+d for closing stdin (not mvp)
 - [x] coercion of execution result to a string needs to have both stdout and stderr merged (at least when binding or coercing directly in a string interpolation)
 - [ ] type checker? (not mvp)
 - [ ] lsp? (not mvp)
@@ -206,4 +206,3 @@
 - [x] arrays will executable calls as elements cannot be accessed with element access operator
 - [x] pipelines are broken again
 - [ ] escaped double quotes print as \"
-- [ ] race condition when piping a block into grep (ir-blocks.rn)
