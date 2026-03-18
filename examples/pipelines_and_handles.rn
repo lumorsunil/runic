@@ -1,39 +1,37 @@
 // Run with: zig build run -- examples/pipelines_and_handles.rn --trace pipeline --trace process
-// Exercises pipelines, tee capture, destructuring process handles, and CLI ergonomic flags.
+// Exercises pipelines, process handles, stdout/stderr capture, and exit code inspection.
 
-const listing = ls ./src
-if listing.status.ok {
+// Capture a command's stdout and check its status
+const listing = ls "./src"
+if (listing) {
   echo "Interpreter sources:"
-  echo listing.stdout
+  echo "${listing.stdout}"
 } else {
-  echo "ls ./src failed with exit ${listing.status.exit_code}"
-  echo listing.stderr
+  echo "ls ./src failed with exit ${listing.exit_code}"
+  echo "${listing.stderr}"
 }
 
-const fmt_check = (zig fmt --check src cmd tests | tee fmt-check.log)
-if !fmt_check.status.ok {
-  echo "Formatter failed at stage ${fmt_check.status.failed_stage}"
-  echo fmt_check.stderr
-}
-
-const { stdout: git_summary, stderr: git_errors, exit_code } = git status --short
-if git_summary != "" {
-  echo "git status (short):"
-  echo git_summary
-}
-if git_errors != "" {
-  echo "git errors:"
-  echo git_errors
-}
-echo "git exited with code ${exit_code}"
-
-const build = zig build
-if build.status.ok {
-  echo "zig build completed successfully"
+// Pipelines flow stdout left to right — the whole pipeline has a combined status
+const fmt_check = (zig "fmt" "--check" "src" "cmd" "tests")
+if (fmt_check) {
+  echo "All sources are formatted correctly"
 } else {
-  echo "zig build failed with exit ${build.status.exit_code}"
-  echo build.stderr
+  echo "Formatter found violations"
+  echo "${fmt_check.stderr}"
 }
 
-echo "Build output:"
-echo build.stdout
+// Inspect stdout and stderr separately on the same handle
+const build = zig "build"
+if (build) {
+  echo "zig build succeeded"
+} else {
+  echo "zig build failed (exit ${build.exit_code})"
+  echo "${build.stderr}"
+}
+
+// Short-circuit operators chain commands on success or failure
+zig "fmt" "--check" "src" && echo "fmt passed"
+zig "fmt" "--check" "src" || echo "fmt failed"
+
+// Commands inside a pipeline can be mixed with the && / || operators
+echo "left side" | cat && echo "pipeline and-chain ran"

@@ -1,0 +1,57 @@
+// Run with: zig build run -- examples/functions_and_closures.rn
+// Demonstrates function declarations, closures over outer variables, and recursion.
+
+// Function syntax: fn <StdinType> <name>(<params>) <StdoutType> <body>
+// StdinType is the type that flows in from stdin (Void = none).
+// StdoutType is the type this function writes to stdout (Void = silent).
+
+fn Void greet(name: String) String {
+  echo "Hello, ${name}!"
+}
+
+greet "Runic"
+greet "world"
+
+// Single-expression bodies do not need braces
+fn Void stamp(label: String) String echo ">> ${label}"
+
+stamp "first"
+stamp "second"
+
+// Functions can be connected into pipelines just like external commands
+fn Void greet_pipeline(name: String) String {
+  echo "Hello, ${name}!"
+}
+
+greet_pipeline "pipeline" | cat
+
+// Functions close over variables declared in the outer scope
+var shared = 0
+
+fn Void increment() Void {
+  shared = shared + 1
+}
+
+increment
+increment
+increment
+echo "shared after 3 increments: ${shared}"
+
+// Closures observe the current value of the outer variable at call time
+fn Void show_shared() String echo "shared = ${shared}"
+
+shared = 99
+show_shared
+
+// Recursive function — the function can call itself by name
+var depth = 0
+
+fn Void countdown() String {
+  echo "depth ${depth}"
+  depth = depth + 1
+  if depth < 4 {
+    countdown
+  }
+}
+
+countdown

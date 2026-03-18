@@ -144,7 +144,7 @@ await (latest) |release| {
 Blocks rely on indentation or braces with keyword-driven control structures so scripts read like modern languages instead of `then/fi` pairs.
 
 ```rn
-fn describe(count) {
+fn Void describe(count: Int) Void {
   if count > 1 {
     echo "plural"
   } else {
@@ -160,29 +160,21 @@ fn describe(count) {
 `for` and `while` statements consume any iterator the runtime exposes, so streaming APIs and collections share the same loop syntax. Loops use Zig-style capture clauses to bind each yielded value (and optional index) to a local name.
 
 ```rn
-const fruits = ["apple", "banana", "pear"]
+const fruits = .{ "apple", "banana", "pear" }
 
 for (fruits, 0..) |fruit, idx| {
-  echo "${idx}: ${fruit.upper()}"
-}
-
-const reader = file.open("debug.log")
-while reader.lines() |line| {
-  if line.starts_with("ERR") {
-    echo line
-  }
+  echo "${idx}: ${fruit}"
 }
 ```
 
-**Result:** Iteration works uniformly across arrays, maps, generators, and IO streams without manual indexing, and the capture clause makes loop variables explicit without leaking bindings outside the block.
+**Result:** Iteration works uniformly across arrays and ranges without manual indexing, and the capture clause makes loop variables explicit without leaking bindings outside the block.
 
 ## Command vs. expression separation
 
 Runic distinguishes between invoking external commands and evaluating expressions, reducing quoting issues by making intent explicit.
 
 ```rn
-const files = ls ./src | lines()
-const uppercased = files.map(fn (path) => path.upper())
+const files = ls "./src"
 ```
 
 **Result:** `ls` executes as a command; downstream helpers operate on typed lists so you can transform data without juggling quoting rules.
@@ -192,24 +184,24 @@ const uppercased = files.map(fn (path) => path.upper())
 Starting a program returns a structured process handle whether you run it synchronously or fire it off in the background. Assigning a bare command to a `let` binding now yields that handle directly, eliminating the need for a wrapper function. Handles keep track of the PID, running state, exit code, and captured IO channels so scripts can reason about subprocesses without juggling implicit `$?` globals.
 
 ```rn
-const sync_proc = git status --short
-echo sync_proc.stdout // already finished, STDOUT buffered
-echo sync_proc.status.exit_code
+const sync_proc = git "status" "--short"
+echo "${sync_proc.stdout}" // already finished, STDOUT buffered
+echo "${sync_proc.status.exit_code}"
 
-const { stdout: sync_stdout, stderr: sync_stderr, exit_code: sync_exit_code } = git status --short
-git status --short 1>$status_stdout
-git status --short 2>$status_stderr
+const { stdout: sync_stdout, stderr: sync_stderr, exit_code: sync_exit_code } = git "status" "--short"
+git "status" "--short" 1>$status_stdout
+git "status" "--short" 2>$status_stderr
 
-const async_proc = tail -f /var/log/app.log &
+const async_proc = tail "-f" "/var/log/app.log" &
 // later...
 const finished = await async_proc
 if finished.status.ok {
-  echo finished.stdout
+  echo "${finished.stdout}"
 }
 
 // or using an if directly on a Promise will automatically await the proc as well as allow capturing the outputs
 if async_proc |stdout, stderr, status| {
-    echo stdout
+    echo "${stdout}"
 }
 ```
 
@@ -220,18 +212,18 @@ if async_proc |stdout, stderr, status| {
 Process handles expose helpers to splice commands together programmatically and capture each stream independently. You can tee outputs into variables, files, or callbacks while streaming live data to the console, and the new binding sugar works seamlessly inside larger pipelines.
 
 ```rn
-make all | tee build.log 1>build_stdout
+make "all" | tee "build.log" 1>build_stdout
 if build_stdout.status.exit_code != 0 {
   echo "Build logs:"
-  echo build_stdout.stdout
+  echo "${build_stdout.stdout}"
 }
 
-const server = python api.py capture = { stdout: :stream, stderr: :buffer } &
+const server = python "api.py" capture = { stdout: :stream, stderr: :buffer } &
 server.stdout.on_line(fn (line) => echo "[srv] ${line}")
 const status = server.wait(timeout = 5s)
 if status.timed_out {
   server.stop()
-  echo server.stderr // buffered for post-mortem
+  echo "${server.stderr}" // buffered for post-mortem
 }
 ```
 
@@ -242,7 +234,7 @@ if status.timed_out {
 Pipelines expose per-stage exit codes, enabling guarded chaining without relying on `set -e`.
 
 ```rn
-const status = (build | tee build.log).status
+const status = (build | tee "build.log").status
 if !status.ok {
   echo "Build failed at step ${status.failed_stage}"
   exit 1
@@ -256,10 +248,10 @@ if !status.ok {
 Libraries live alongside your scripts (or inside shared module directories) and can be imported with clear syntax, enabling teams to package shared utilities across scripts.
 
 ```rn
-const http = import("net/http")
+const http = import "net/http"
 
 const response = http.get("https://example.com/status")
-echo response.code
+echo "${response.code}"
 ```
 
 **Result:** Modules encapsulate functionality, provide typed APIs, and return predictable structures such as HTTP response objects.
@@ -268,7 +260,7 @@ To define your own module, add a `.rn` file relative to the script that will imp
 
 ```rn
 // <script_dir>/util/math.rn
-fn add(lhs: Int, rhs: Int) Int {
+fn Void add(lhs: Int, rhs: Int) Int {
   return lhs + rhs
 }
 
@@ -335,7 +327,7 @@ Just like in zig, all files in runic are implicitly structs. All functions or de
 ```rn
 // lib.rn
 
-fn add(x: Float, y: Float) Float {
+fn Void add(x: Float, y: Float) Float {
   return x + y
 }
 ```
@@ -345,7 +337,7 @@ fn add(x: Float, y: Float) Float {
 
 const lib = import("lib")
 
-echo lib.add(3, 5)
+echo "${lib.add(3, 5)}"
 ```
 
 **Result:** `lib.rn` will become a struct type with a function `add` declared on it. `main.rn` is importing `lib.rn` and binding it to the identifier `lib`. `lib` is of the type `struct { fn add(x: Float, y: Float) }`.

@@ -1,6 +1,6 @@
 # Runic
 
-Runic is an experiment in designing a modern bash-compatible scripting language. Its goal is to keep the terseness and command-focused workflow of traditional shell scripts while removing long-standing ergonomics issues around quoting, data safety, and program structure.
+Runic is an experiment in designing a modern scripting language heavily inspired by bash. Its goal is to keep the terseness and command-focused workflow of bash scripts while removing long-standing ergonomics issues around quoting, data safety, and program structure.
 
 Runic is still in an experimental phase, and major breaking changes may occur at any time as the design and implementation evolve.
 
@@ -11,39 +11,39 @@ Runic scripts keep the familiar "just run commands" flow you get in bash, but wi
 ```runic
 #!/usr/bin/env runic
 
-// greet with a default when no args are passed
-const name: Str = args.get(0) orelse "world"
-echo "hello ${name}"
+// receive script arguments
+fn Void @(name: String) String
+echo "you entered name: ${name}"
 
 // capture stdout and status from a pipeline
-const recent = (ls ./src | head -n 5)
-if (recent.status.ok) {
+const recent = ls "./src" | head "-n" "5"
+if (recent) {
   echo "first few entries:"
-  echo recent
+  echo "${recent.stdout}"
 }
 
 // simple function that reuses existing tools
-fn check_git() void {
-  const summary = git status --short
+fn Void check_git() String {
+  const summary = git "status" "--short"
   if (summary.stdout != "") {
     echo "working tree changes:"
-    echo summary
+    echo "${summary.stdout}"
   }
 }
 
-check_git()
+check_git
 ```
 
-## Why another shell?
+## Why another scripting language?
 
-Classic bash is ubiquitous, but it is notoriously difficult to reason about:
+Bash is ubiquitous, but it is notoriously difficult to reason about:
 
 - implicit stringly typed variables
 - confusing quoting rules and word splitting
 - inconsistent error handling defaults
 - fragile functions and control structures bolted on over decades
 
-Runic keeps the "just type commands" workflow but layers in contemporary programming language ideas so scripts are easier to read, write, and verify.
+Runic is not a shell — it does not replace bash as an interactive environment. It is a scripting language that borrows bash's command-first style and layers in contemporary programming language ideas so scripts are easier to read, write, and verify.
 
 ## Design goals
 
@@ -55,20 +55,31 @@ Runic keeps the "just type commands" workflow but layers in contemporary program
 
 ## Core ideas
 
-1. **Modern syntax surface**: indentation-aware blocks or braces with required keywords, eliminating the mix of `then`, `fi`, `do`, and `done`.
-2. **Data primitives**: strings, numbers, booleans, arrays, and maps with predictable coercion rules and convenient literals. Type names must always begin with a capital letter (`Str`, `ProcessHandle`) so they stand out from value identifiers.
+1. **Modern syntax surface**: brace-delimited blocks with required keywords, eliminating the mix of `then`, `fi`, `do`, and `done`. Bindings use `const` (immutable) and `var` (mutable).
+2. **Data primitives**: strings, numbers, booleans, arrays, and maps with predictable coercion rules and convenient literals. Type names must always begin with a capital letter (`String`, `Int`, `Float`, `Bool`, `Void`) so they stand out from value identifiers. Array and record literals use Zig-style anonymous syntax: `.{ "a", "b" }` and `.{ .key = value }`.
 3. **Command vs. expression separation**: explicit operators differentiate when you're invoking a program versus evaluating a language expression, reducing quoting headaches.
-4. **Error-aware pipelines**: pipeline execution surfaces per-stage exit codes, allowing guarded chaining without `set -e` footguns.
-5. **Module system**: reusable libraries and standard tooling for testing, formatting, and packaging scripts.
+4. **Functions as pipeline stages**: function declarations carry both a stdin type and a stdout type — `fn StdinType name(params) StdoutType { ... }` — making data flow through pipelines explicit. Functions are called like commands: `check_git` or `greet "world"`.
+5. **Error-aware pipelines**: pipeline execution surfaces per-stage exit codes, allowing guarded chaining without `set -e` footguns.
+6. **Module system**: reusable libraries imported with `const m = import "spec"`, backed by `.rn.module.json` manifests that describe typed exports.
 
-## Roadmap
+## Status
 
-1. Draft language reference covering syntax, semantics, and compatibility guarantees.
-2. Build a parser and IR runtime that can execute a useful subset of Runic scripts.
-3. Provide conversion guidelines and tooling for migrating bash scripts.
-4. Iterate on the design through real-world scripts, focusing on ergonomics and developer experience.
+A working parser, type checker, and IR-based runtime are in place. The following features run end to end:
 
-Runic aims to be familiar enough that a bash user can start using it immediately, yet principled enough to scale to large automation projects without the typical shell pitfalls.
+- Command execution and pipelines (`|`, `&&`, `||`)
+- `const` and `var` bindings with optional type annotations
+- `if`/`else`, `for` (range and collection), `while` with capture clauses
+- Functions with stdin/stdout types, closures, and recursion
+- String interpolation (`${ }`) and block capture
+- Process handle access (`.stdout`, `.stderr`, `.status.ok`, `.status.exit_code`)
+- File redirection (`>`, `>>`) and stream capture (`1>var`, `2>var`)
+- `bash { ... }` compatibility blocks
+- Script argument handling via the `@` entry-point function
+- Error declarations (`error Foo = enum/union`), `try`/`catch`, `match`
+- `async`/`await` and background processes (`&`)
+- Module imports via `import "spec"`
+
+Runic aims to be familiar enough that a bash user can start using it immediately, yet principled enough to scale to large automation projects without the typical bash scripting pitfalls.
 
 ## Implementation language & tooling
 
@@ -131,7 +142,7 @@ Runic modules are regular `.rn` files paired with JSON manifests so the loader c
 1. Place the implementation at `<script_dir>/<spec>.rn` (e.g. `scripts/net/http.rn`) and keep the spec lowercase with `/` separators.
 2. Create `<script_dir>/<spec>.rn.module.json` to declare the module's public surface. Each entry in the `exports` array is either a function (with `params`, `return_type`, and optional `is_async`) or a value with a `type` descriptor.
 3. Supported type descriptors include `primitive`, `array`, `map`, `optional`, and `promise`, matching the Zig-side parser in `src/runtime/module_loader.zig`.
-4. Import the module from scripts using `let http = import("net/http")`. Supplement search paths with `--module-path <dir>` when iterating on modules stored outside the importing script's directory.
+4. Import the module from scripts using `const http = import "net/http"`. Supplement search paths with `--module-path <dir>` when iterating on modules stored outside the importing script's directory.
 5. Validate manifests by running `zig build test` (the module loader has dedicated fixtures) and by invoking a small script via `zig build run -- examples/<script>.rn`.
 
 See `docs/module_authoring.md` for the full manifest schema, type descriptor explanations, and a sample manifest.
@@ -140,7 +151,7 @@ See `docs/module_authoring.md` for the full manifest schema, type descriptor exp
 
 Runic keeps the familiar pipeline mindset while removing bash-specific hazards. To migrate existing scripts:
 
-- Port declarations/functions to typed Runic syntax (`let`, `mut`, `fn`) before touching command pipelines so behavior stays verifiable.
+- Port declarations/functions to typed Runic syntax (`const`, `var`, `fn`) before touching command pipelines so behavior stays verifiable.
 - Replace `source`-style helper files with modules plus manifests (described above) to surface typed APIs.
 - Handle failures with `try`/`catch` and typed status objects rather than `set -e` and `$?`.
 - Embed unported fragments inside `bash { ... }` blocks so you can gradually shrink the compatibility surface without blocking the rest of the script.
@@ -150,7 +161,7 @@ Runic keeps the familiar pipeline mindset while removing bash-specific hazards. 
 
 ## CLI usage
 
-The `cmd/runic` binary accepts either a script path or `--eval` and exposes switches for tracing, module lookup paths, and environment overrides. Script execution parses `.rn` files directly, honors import/module lookups, `let` bindings, and pipelines, and forwards diagnostics and command output through the IR runtime.
+The `cmd/runic` binary accepts either a script path or `--eval` and exposes switches for tracing, module lookup paths, and environment overrides. Script execution parses `.rn` files directly, honors import/module lookups, `const`/`var` bindings, and pipelines, and forwards diagnostics and command output through the IR runtime.
 
 A typical invocation looks like:
 
@@ -166,7 +177,7 @@ Key flags:
 
 - `--help`, `-h` — show the usage summary (also the default when no arguments are provided).
 - `--trace <topic>` — enable structured tracing for the given runtime subsystem. Current topics are `pipeline` (per-stage spawn/exit), `process` (handle summaries, stage outcomes, and captured IO sizes), and `async` (scheduler + promise lifecycle). Repeat the flag to collect multiple targets (e.g. `--trace pipeline --trace process`).
-- `--module-path <dir>` — prepend an additional directory to the module loader search roots. This mirrors `let foo = import("custom/foo")` scenarios from `features.md`.
+- `--module-path <dir>` — prepend an additional directory to the module loader search roots. This mirrors `const foo = import "custom/foo"` scenarios from `features.md`.
 - `--env KEY=VALUE` — override environment bindings that will be forwarded to script executions and background commands.
 
 After the script path, `runic` forwards every argument verbatim. Insert `--` between the script and its arguments when you need to pass values that look like CLI flags.
@@ -183,12 +194,12 @@ Use these switches with either a script path or `--eval` to watch commands execu
 
 ## Examples
 
-Sample Runic scripts now live under `examples/` so you can get a feel for the CLI ergonomics before wiring your own programs. Execute them with `zig build run -- examples/<script>.rn` and pass extra flags to the script after `--`.
+Sample Runic scripts live under `examples/`. Run them with `zig build run -- examples/<script>.rn`.
 
-- `examples/pipelines_and_handles.rn` — demonstrates pipelines, tee capture, and process-handle destructuring with `--trace pipeline --trace process`.
-- `examples/data_and_flow.rn` — highlights typed bindings, array/map literals, optional-aware flow control, and loops.
-- `examples/errors_and_match.rn` — exercises error declarations, `try`/`catch`, and pattern matching for recovery.
-- `examples/async_and_legacy.rn` — covers async promises, background processes, module imports, and the `bash { ... }` escape hatch.
+- `examples/pipelines_and_handles.rn` — command pipelines, process handle inspection (`.stdout`, `.stderr`, `.status`), and `&&`/`||` chaining. Use `--trace pipeline --trace process` to see per-stage detail.
+- `examples/data_and_flow.rn` — `const`/`var` bindings with type annotations, `.{ }` array literals, `for` loops over ranges and arrays, arithmetic, and comparisons.
+- `examples/functions_and_closures.rn` — function declarations with stdin/stdout types, single-expression bodies, closures over outer variables, and recursion.
+- `examples/bash_interop.rn` — `bash { }` compatibility blocks, file redirection (`>`, `>>`), block capture, blocks in pipelines, and `bash "-c"` one-liners.
 
 ## Neovim syntax plugin
 

@@ -1,0 +1,38 @@
+// Run with: zig build run -- examples/bash_interop.rn
+// Demonstrates bash compatibility blocks, file redirection, and block capture.
+
+// Redirect command output to a file with > (truncate) or >> (append)
+const tmp = "/tmp/runic-bash-interop.txt"
+echo "first line" > "${tmp}"
+echo "second line" >> "${tmp}"
+const contents = cat "${tmp}"
+echo "File contents:"
+echo "${contents.stdout}"
+
+// A { } block captures all stdout emitted by its commands as a single value
+const report = {
+  echo "section one"
+  echo "section two"
+  echo "section three"
+}
+echo "Block captured:"
+echo "${report}"
+
+// Blocks participate in pipelines the same way external commands do
+({
+  echo "alpha"
+  echo "beta"
+  echo "gamma"
+}) | grep "beta"
+
+// bash "-c" runs an inline script — useful for quick one-liners
+bash "-c" "exit 0" && echo "exit 0 ran the && branch"
+bash "-c" "exit 1" || echo "exit 1 ran the || branch"
+
+// Combine Runic commands with bash blocks in the same script
+const files = ls "./examples"
+bash {
+  echo "total examples in bash:"
+  ls "examples/" | wc "-l"
+}
+echo "ls exit: ${files.closeable}"

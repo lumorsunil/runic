@@ -1,32 +1,50 @@
-// Run with: zig build run -- examples/data_and_flow.rn -- --port 8080
-// Demonstrates typed bindings, arrays/maps, optional-aware flow, and idiomatic loops.
+// Run with: zig build run -- examples/data_and_flow.rn
+// Demonstrates typed bindings, array literals, for loops, and arithmetic.
 
-const greeting: Str = "hello"
-var retries: Int = 2
-const services = ["api", "jobs", "web"]
-const thresholds = .{ .api = 200, .jobs = 350, .web = 150 }
+// const bindings are immutable; var bindings are mutable
+const greeting: String = "hello"
+var counter: Int = 0
+const pi: Float = 3.14159
 
-if (env.get("PORT")) |port| {
-  echo "Using env PORT=${port}"
-} else {
-  echo "Falling back to default port ${thresholds.api}"
-}
+echo "${greeting}, world!"
+echo "pi is approximately ${pi}"
 
+// Array literals use .{ } syntax
+const services = .{ "api", "jobs", "web" }
+
+// Iterate over an array with index
 for (services, 0..) |service, idx| {
-  echo "${idx}: checking ${service}"
-  let probe = echo "ping ${service}" | upper
-  if probe.status.ok {
-    echo "  ${service} responded"
-  } else {
-    echo "  ${service} failed"
-  }
+  echo "${idx}: ${service}"
 }
 
-const reader = file.open("README.md")
-while reader.lines() |line| {
-  if line.starts_with("# ") {
-    echo "Heading => ${line}"
-  }
+// Range-based for loop
+for (0..4) |n| {
+  counter += 1
+  echo "iteration ${n}, counter=${counter}"
 }
 
-echo "Retries allowed: ${retries}"
+echo "final counter: ${counter}"
+
+// Arithmetic inside string interpolation
+const a = 10
+const b = 3
+
+echo "sum      = ${a + b}"
+echo "diff     = ${a - b}"
+echo "product  = ${a * b}"
+echo "quotient = ${a / b}"
+echo "remainder = ${a % b}"
+
+// Comparisons in if/else
+if (a > b) {
+  echo "${a} is greater than ${b}"
+} else {
+  echo "${b} is greater than or equal to ${a}"
+}
+
+// Inline if/else
+if (counter == 4) echo "counter is 4" else echo "counter is not 4"
+
+// Nested arrays and index access in interpolation
+const nums = .{ 10, 20, 30 }
+echo "first=${nums[0]}, second=${nums[1]}, third=${nums[2]}"
