@@ -64,6 +64,7 @@ pub const Workspace = struct {
             .type_checker = .init(
                 allocator,
                 &documentStore.document_store,
+                null,
             ),
         };
 

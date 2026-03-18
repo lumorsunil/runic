@@ -17,6 +17,7 @@ pub const TypeChecker = struct {
     logging_enabled: bool,
     document_store: *DocumentStore,
     modules: std.StringArrayHashMapUnmanaged(*Scope),
+    env: ?*const std.process.EnvMap = null,
 
     pub const Error = Scope.Error ||
         std.fs.File.OpenError ||
@@ -84,6 +85,7 @@ pub const TypeChecker = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         document_store: *DocumentStore,
+        env: ?*const std.process.EnvMap,
     ) TypeChecker {
         const logging_enabled_s = std.process.getEnvVarOwned(allocator, "RUNIC_LOG_" ++ logging_name) catch "";
         defer allocator.free(logging_enabled_s);
@@ -94,6 +96,7 @@ pub const TypeChecker = struct {
             .logging_enabled = logging_enabled,
             .document_store = document_store,
             .modules = .empty,
+            .env = env,
         };
     }
 
@@ -300,7 +303,7 @@ pub const TypeChecker = struct {
         const scope = try self.arena.allocator().create(Scope);
         scope.* = .init(script.span);
 
-        const global_scope = try addGlobalScope(self.arena.allocator(), scope);
+        const global_scope = try addGlobalScope(self.arena.allocator(), scope, self.env);
 
         if (script.signature) |signature| {
             switch (signature.params) {
@@ -1624,11 +1627,26 @@ const global_scope_definitions = [_]Definition{
     .init("String", GlobalTypes.Array(GlobalTypes.Byte)),
 };
 
-fn addGlobalScope(allocator: std.mem.Allocator, scope: *Scope) !*Scope {
+fn addGlobalScope(allocator: std.mem.Allocator, scope: *Scope, env: ?*const std.process.EnvMap) !*Scope {
     const global_scope = try scope.addChild(allocator, scope.span);
 
     for (global_scope_definitions) |definition| {
         try global_scope.declare(allocator, definition.identifier, definition.type_expr, false);
+    }
+
+    const string_type_expr = try allocator.create(ast.TypeExpr);
+    string_type_expr.* = GlobalTypes.Array(GlobalTypes.Byte);
+
+    if (env) |env_map| {
+        var it = env_map.iterator();
+        while (it.next()) |entry| {
+            try global_scope.declare(
+                allocator,
+                .{ .name = entry.key_ptr.*, .span = .global },
+                string_type_expr,
+                false,
+            );
+        }
     }
 
     return global_scope;

@@ -489,6 +489,7 @@ pub const IRCompiler = struct {
     allocator: Allocator,
     script: *ast.Script,
     script_args: []const []const u8,
+    env: ?*const std.process.EnvMap = null,
     scopes: Scope = .init(),
     data: IRData = .init(),
     instruction_sets: std.ArrayList(InstructionSet) = .empty,
@@ -505,6 +506,7 @@ pub const IRCompiler = struct {
         document_store: *DocumentStore,
         script: *ast.Script,
         script_args: []const []const u8,
+        env: ?*const std.process.EnvMap,
     ) Allocator.Error!@This() {
         const logging_enabled_s = std.process.getEnvVarOwned(allocator, "RUNIC_LOG_" ++ logging_name) catch null;
         const logging_enabled = if (logging_enabled_s) |le| std.mem.eql(u8, le, "1") else false;
@@ -513,6 +515,7 @@ pub const IRCompiler = struct {
             .allocator = allocator,
             .script = script,
             .script_args = script_args,
+            .env = env,
             .struct_types = .fromOwnedSlice(try internalStructTypes(allocator)),
             .document_store = document_store,
             .logging_enabled = logging_enabled,
@@ -1074,6 +1077,19 @@ pub const IRCompiler = struct {
                     }
                 },
                 ._variadic => return Error.UnsupportedExpression,
+            }
+        }
+
+        if (self.env) |env_map| {
+            var it = env_map.iterator();
+            while (it.next()) |entry| {
+                const value = try self.addSlice(1, entry.value_ptr.*);
+                try self.compileIdentifierBinding(
+                    null,
+                    .{ .name = entry.key_ptr.*, .span = .global },
+                    .fromValue(value),
+                    false,
+                );
             }
         }
 
@@ -1910,6 +1926,11 @@ pub const IRCompiler = struct {
                 }
                 if (std.mem.eql(u8, rest[0..2], "\\r")) {
                     try decoded.append(self.allocator, '\r');
+                    i += 1;
+                    continue;
+                }
+                if (std.mem.eql(u8, rest[0..2], "\\\"")) {
+                    try decoded.append(self.allocator, '"');
                     i += 1;
                     continue;
                 }
@@ -3807,6 +3828,7 @@ fn compileInlineForTest(
         &document_store.document_store,
         &document.ast.?,
         script_args,
+        null,
     );
     return try compiler.compile();
 }

@@ -9,7 +9,9 @@
 - [x] add expected results check to tests
 - [x] main thread arguments from process startup
 - [x] exit keyword
-- [ ] builtin env variables support?
+- [x] builtin env variables support
+  - [x] env vars are populated into global scope
+  - [ ] way to check if identifier exists (orelse except for this specific purpose) ?
 - [ ] do we want to strip newlines at the end of an echo or not?
 
 ## data
@@ -205,4 +207,4 @@
 - [x] debugger: cannot paste to stdin
 - [x] arrays will executable calls as elements cannot be accessed with element access operator
 - [x] pipelines are broken again
-- [ ] escaped double quotes print as \"
+- [x] escaped double quotes print as \"

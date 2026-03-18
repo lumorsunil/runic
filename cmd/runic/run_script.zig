@@ -96,7 +96,7 @@ pub fn runScript(
     }
 
     if (!config.skip_type_check) {
-        var type_checker = TypeChecker.init(allocator, &document_store.document_store);
+        var type_checker = TypeChecker.init(allocator, &document_store.document_store, &env_map);
         defer type_checker.deinit();
 
         const type_checker_result = type_checker.typeCheck(resolvedPath) catch |err| {
@@ -191,6 +191,7 @@ pub fn runScript(
                 .verbose = config.verbose,
                 .dry_run = config.dry_run,
                 .script_args = script.args,
+                .env = &env_map,
                 .stdin = stdin_stream,
                 .stdout = stdout_stream,
                 .stderr = stderr_stream,
