@@ -179,7 +179,6 @@ pub const Parser = struct {
             var buf: [512]u8 = undefined;
             var writer = std.Io.Writer.fixed(&buf);
             _ = self.writeExpectedTokens(&writer) catch {};
-            _ = self.writeBreadcrumbTrail(&writer) catch {};
             const span = self.unexpected_token_span orelse token.Span.fromLocs(token.Location.global, token.Location.global);
             const message = self.arena.allocator().dupe(u8, writer.buffer[0..writer.end]) catch "unexpected token";
             self.diagnostics.append(self.arena.allocator(), .{
