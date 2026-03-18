@@ -88,8 +88,8 @@
   - [x] && / ||
   - [x] boolean negation (!)
   - [x] redirections
-    - [ ] redirect stdout separately (not mvp)
-    - [ ] redirect stderr separately (not mvp)
+    - [x] redirect stdout separately (not mvp)
+    - [x] redirect stderr separately (not mvp)
     - [x] redirect to file
       - [x] replace mode
       - [x] append mode

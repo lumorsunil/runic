@@ -2081,6 +2081,10 @@ pub const IRCompiler = struct {
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
+        if (call.callee.* == .block and call.redirects.len > 0) {
+            return self.compileBlockCallWithRedirects(source, call.callee.*.block, call.redirects);
+        }
+
         const callee = try self.compileExpression(call.callee);
 
         return switch (callee.source) {
@@ -2092,6 +2096,75 @@ pub const IRCompiler = struct {
             },
             .location => |loc| .from(loc),
         };
+    }
+
+    fn compileBlockCallWithRedirects(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        block: ast.Block,
+        redirects: []const ast.Redirection,
+    ) Error!Result {
+        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        const block_instr_set = try self.addInstructionSet();
+
+        var exec_stdout = self.threadStdout();
+        var exec_stderr = self.threadStderr();
+
+        for (redirects) |redirect| {
+            switch (redirect.target) {
+                .path => |path_target| {
+                    const redirect_target = try self.compileStringLiteral(source, path_target.value);
+                    const redirect_pipe_ref = try self.newRef(source, "stdout_redirect_pipe");
+                    try self.pipe(source, redirect_pipe_ref);
+                    try self.pipeFile(
+                        source,
+                        redirect_pipe_ref.dereference(),
+                        stableResultSource(redirect_target),
+                        redirect.mode,
+                    );
+                    switch (redirect.stream) {
+                        .stdout => exec_stdout = redirect_pipe_ref.dereference(),
+                        .stderr => exec_stderr = redirect_pipe_ref.dereference(),
+                        else => {},
+                    }
+                },
+                .fd => |target_fd| {
+                    const target_loc: ir.Location = switch (target_fd) {
+                        0 => self.threadStdin(),
+                        1 => self.threadStdout(),
+                        2 => self.threadStderr(),
+                        else => continue,
+                    };
+                    switch (redirect.stream) {
+                        .stdout => exec_stdout = target_loc,
+                        .stderr => exec_stderr = target_loc,
+                        else => {},
+                    }
+                },
+            }
+        }
+
+        const spawned = try self.spawnClosure(
+            source,
+            .initAbs(block_instr_set, 0),
+            self.threadStdin(),
+            exec_stdout,
+            exec_stderr,
+        );
+
+        const prev_instr_set = self.current_instruction_set;
+        self.current_instruction_set = block_instr_set;
+        try self.scopes.push(self.allocator, .closure);
+
+        _ = try self.compileBlock(source, block);
+        try self.exitWith(source, .fromValue(.fromBoolean(true)));
+
+        try self.setClosureIdentifiers();
+        self.current_instruction_set = prev_instr_set;
+        self.scopes.pop();
+
+        return .fromLocation(spawned.thread_handle);
     }
 
     fn compileExpressions(
@@ -2310,11 +2383,17 @@ pub const IRCompiler = struct {
         const exec_instr_set = try self.addInstructionSet();
         const redirected_stdout_slot = 2;
         var has_stdout_file_redirect = false;
+        var has_stderr_file_redirect = false;
         for (redirects) |redirect| {
-            if (redirect.stream == .stdout and redirect.target == .path) {
-                has_stdout_file_redirect = true;
-                break;
-            }
+            if (redirect.target != .path) continue;
+            const stream_fd_: u8 = switch (redirect.stream) {
+                .stdin => 0,
+                .stdout => 1,
+                .stderr => 2,
+                .descriptor => |fd| fd,
+            };
+            if (stream_fd_ == 1) has_stdout_file_redirect = true;
+            if (stream_fd_ == 2) has_stderr_file_redirect = true;
         }
 
         const execution_handles = try self.newRef(source, "execution_handles");
@@ -2331,9 +2410,15 @@ pub const IRCompiler = struct {
         for (redirects) |redirect| {
             switch (redirect.target) {
                 .path => |path_target| {
-                    if (redirect.stream != .stdout) continue;
+                    const stream_fd: u8 = switch (redirect.stream) {
+                        .stdin => 0,
+                        .stdout => 1,
+                        .stderr => 2,
+                        .descriptor => |fd| fd,
+                    };
+                    if (stream_fd != 1 and stream_fd != 2) continue;
                     const redirect_target = try self.compileStringLiteral(source, path_target.value);
-                    const redirect_pipe_ref = try self.newRef(source, "stdout_redirect_pipe");
+                    const redirect_pipe_ref = try self.newRef(source, if (stream_fd == 1) "stdout_redirect_pipe" else "stderr_redirect_pipe");
                     try self.pipe(source, redirect_pipe_ref);
                     try self.pipeFile(
                         source,
@@ -2341,17 +2426,21 @@ pub const IRCompiler = struct {
                         stableResultSource(redirect_target),
                         redirect.mode,
                     );
-                    try self.set(source, .initRegister(.r2), .from(execution_handles.dereference()));
-                    try self.set(
-                        source,
-                        .initAdd(
-                            .{ .register = .r2 },
-                            redirected_stdout_slot,
-                            .{ .dereference = true },
-                        ),
-                        .from(redirect_pipe_ref.dereference()),
-                    );
-                    exec_stdout = redirect_pipe_ref.dereference();
+                    if (stream_fd == 1) {
+                        try self.set(source, .initRegister(.r2), .from(execution_handles.dereference()));
+                        try self.set(
+                            source,
+                            .initAdd(
+                                .{ .register = .r2 },
+                                redirected_stdout_slot,
+                                .{ .dereference = true },
+                            ),
+                            .from(redirect_pipe_ref.dereference()),
+                        );
+                        exec_stdout = redirect_pipe_ref.dereference();
+                    } else {
+                        exec_stderr = redirect_pipe_ref.dereference();
+                    }
                 },
                 .fd => |target_fd| {
                     const target_loc: ir.Location = switch (target_fd) {
@@ -2460,6 +2549,10 @@ pub const IRCompiler = struct {
             .from(thread_handle_ref.dereference()),
         );
         _ = try self.pop(source);
+
+        if (has_stderr_file_redirect) {
+            _ = try self.pop(source);
+        }
 
         const execution_handles_r = try self.pop(source);
         return .from(execution_handles_r.typed(execution_handles_struct_type));

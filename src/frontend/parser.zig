@@ -922,11 +922,6 @@ pub const Parser = struct {
                 },
             },
             .greater, .append_redirect => redirect: {
-                const call = switch (left.*) {
-                    .call => |call| call,
-                    else => break :redirect binary,
-                };
-
                 const path = switch (right.*) {
                     .literal => |literal| switch (literal) {
                         .string => |string| string,
@@ -947,18 +942,97 @@ pub const Parser = struct {
                     .span = left.span().endAt(right.span()),
                 };
 
-                break :redirect .{
-                    .call = .{
-                        .callee = call.callee,
-                        .arguments = call.arguments,
-                        .redirects = try std.mem.concat(
-                            self.arena.allocator(),
-                            ast.Redirection,
-                            &.{ call.redirects, &.{redirect} },
-                        ),
-                        .span = call.span.endAt(right.span()),
+                switch (left.*) {
+                    .call => |call| break :redirect .{
+                        .call = .{
+                            .callee = call.callee,
+                            .arguments = call.arguments,
+                            .redirects = try std.mem.concat(
+                                self.arena.allocator(),
+                                ast.Redirection,
+                                &.{ call.redirects, &.{redirect} },
+                            ),
+                            .span = call.span.endAt(right.span()),
+                        },
                     },
-                };
+                    .block => break :redirect .{
+                        .call = .{
+                            .callee = left,
+                            .arguments = &.{},
+                            .redirects = try self.arena.allocator().dupe(ast.Redirection, &.{redirect}),
+                            .span = left.span().endAt(right.span()),
+                        },
+                    },
+                    // Handle chained redirects like `echo "hello" 1>&2 2>"/dev/null"`.
+                    // The Pratt parser groups `[2, apply, 2]` into `call(2, [2])` as the
+                    // right side of the inner redirect_fd. We detect and flatten this here.
+                    .binary => |inner_binary| {
+                        if (inner_binary.op != .redirect_fd) break :redirect binary;
+                        const inner_call = switch (inner_binary.left.*) {
+                            .call => |c| c,
+                            else => break :redirect binary,
+                        };
+                        // right of inner binary is call(target_fd_callee, [source_fd_arg])
+                        if (inner_binary.right.* != .call) break :redirect binary;
+                        const inner_right_call = inner_binary.right.call;
+                        if (inner_right_call.callee.* != .literal) break :redirect binary;
+                        if (inner_right_call.callee.literal != .integer) break :redirect binary;
+                        const target_fd: u8 = @intCast(std.fmt.parseInt(
+                            i64,
+                            inner_right_call.callee.literal.integer.text,
+                            10,
+                        ) catch break :redirect binary);
+                        if (inner_right_call.arguments.len != 1) break :redirect binary;
+                        const source_fd_expr = inner_right_call.arguments[0];
+                        if (source_fd_expr.* != .literal) break :redirect binary;
+                        if (source_fd_expr.literal != .integer) break :redirect binary;
+                        const path_source_fd: u8 = @intCast(std.fmt.parseInt(
+                            i64,
+                            source_fd_expr.literal.integer.text,
+                            10,
+                        ) catch break :redirect binary);
+                        // strip the trailing integer arg from inner call (it's the fd prefix for >&)
+                        var inner_args = inner_call.arguments;
+                        var fd_source_stream: ast.StreamRef = .stdout;
+                        if (inner_args.len > 0) {
+                            const last_arg = inner_args[inner_args.len - 1].*;
+                            if (last_arg == .literal and last_arg.literal == .integer) {
+                                const s_fd: u8 = @intCast(std.fmt.parseInt(
+                                    i64,
+                                    last_arg.literal.integer.text,
+                                    10,
+                                ) catch 1);
+                                fd_source_stream = .{ .descriptor = s_fd };
+                                inner_args = inner_args[0 .. inner_args.len - 1];
+                            }
+                        }
+                        const fd_redirect = ast.Redirection{
+                            .stream = fd_source_stream,
+                            .mode = .truncate,
+                            .target = .{ .fd = target_fd },
+                            .span = inner_binary.left.span().endAt(inner_binary.right.span()),
+                        };
+                        const path_redirect = ast.Redirection{
+                            .stream = .{ .descriptor = path_source_fd },
+                            .mode = mode,
+                            .target = .{ .path = .{ .value = path, .span = path.span } },
+                            .span = left.span().endAt(right.span()),
+                        };
+                        break :redirect .{
+                            .call = .{
+                                .callee = inner_call.callee,
+                                .arguments = inner_args,
+                                .redirects = try std.mem.concat(
+                                    self.arena.allocator(),
+                                    ast.Redirection,
+                                    &.{ inner_call.redirects, &.{ fd_redirect, path_redirect } },
+                                ),
+                                .span = inner_call.span.endAt(right.span()),
+                            },
+                        };
+                    },
+                    else => break :redirect binary,
+                }
             },
             .redirect_fd => redirect_fd: {
                 const call = switch (left.*) {
@@ -1086,17 +1160,18 @@ pub const Parser = struct {
         );
         const first_components = it.next().?;
         var i: usize = first_components.len + 1;
-        const op_ = components[i - 1].op.payload;
+        var op_ = components[i - 1].op.payload;
         var lhs: *ast.Expression = try self.parseBinaryExpression(first_components, op_, .left);
 
         while (it.next()) |sub_components| {
-            const right = try self.parseBinaryExpression(sub_components, op_, .right);
+            const current_op = op_;
+            const right = try self.parseBinaryExpression(sub_components, current_op, .right);
 
             lhs = try self.allocExpression(
                 try self.flattenBinaryExpression(
                     try self.initBinaryExpression(
                         lhs,
-                        op_,
+                        current_op,
                         right,
                         lhs.span().endAt(right.span()),
                     ),
@@ -1104,6 +1179,7 @@ pub const Parser = struct {
             );
 
             i += sub_components.len + 1;
+            if (i <= components.len) op_ = components[i - 1].op.payload;
         }
 
         return lhs;

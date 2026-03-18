@@ -421,7 +421,23 @@ pub const IREvaluator = struct {
 
         return switch (instruction.type) {
             .comment => return .skip,
-            .exit_with => |value| return .{ .exit = try self.coerceExitCode(thread, value) },
+            .exit_with => |value| {
+                const resolved = try self.resolveValueSource(thread, value);
+                switch (resolved) {
+                    .slice => |slice| {
+                        if (slice.element_size == 1 and thread.private.stack.items.len > 1) {
+                            const stdout_handle = thread.private.stack.items[1].pipe;
+                            const stdout_pipe = try self.context.getPipe(stdout_handle);
+                            const string = try self.getSlice(slice);
+                            var w = stdout_pipe.closeableWriter().writer;
+                            try w.writeAll(string);
+                            try w.flush();
+                        }
+                        return .{ .exit = .success };
+                    },
+                    else => return .{ .exit = try self.coerceExitCode(thread, value) },
+                }
+            },
             .resolve_exit_code => |rec| {
                 const exit_code = try self.coerceExitCode(thread, .fromLocation(rec.source));
                 try self.setLocation(thread, rec.result, .{ .exit_code = exit_code });
