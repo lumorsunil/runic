@@ -2309,16 +2309,16 @@ pub const IRCompiler = struct {
 
         const exec_instr_set = try self.addInstructionSet();
         const redirected_stdout_slot = 2;
-        var has_stdout_redirect = false;
+        var has_stdout_file_redirect = false;
         for (redirects) |redirect| {
-            if (redirect.stream == .stdout) {
-                has_stdout_redirect = true;
+            if (redirect.stream == .stdout and redirect.target == .path) {
+                has_stdout_file_redirect = true;
                 break;
             }
         }
 
         const execution_handles = try self.newRef(source, "execution_handles");
-        try self.alloc(source, if (has_stdout_redirect) 3 else 2);
+        try self.alloc(source, if (has_stdout_file_redirect) 3 else 2);
         try self.set(source, execution_handles, .fromLocation(.initRegister(.r)));
         const result_variable_identifier = try self.compileResultVariable(
             source,
@@ -2326,30 +2326,53 @@ pub const IRCompiler = struct {
         );
 
         var exec_stdout = self.threadStdout();
+        var exec_stderr = self.threadStderr();
 
         for (redirects) |redirect| {
-            if (redirect.stream != .stdout) continue;
-
-            const redirect_target = try self.compileStringLiteral(source, redirect.target.path);
-            const redirect_pipe_ref = try self.newRef(source, "stdout_redirect_pipe");
-            try self.pipe(source, redirect_pipe_ref);
-            try self.pipeFile(
-                source,
-                redirect_pipe_ref.dereference(),
-                stableResultSource(redirect_target),
-                redirect.mode,
-            );
-            try self.set(source, .initRegister(.r2), .from(execution_handles.dereference()));
-            try self.set(
-                source,
-                .initAdd(
-                    .{ .register = .r2 },
-                    redirected_stdout_slot,
-                    .{ .dereference = true },
-                ),
-                .from(redirect_pipe_ref.dereference()),
-            );
-            exec_stdout = redirect_pipe_ref.dereference();
+            switch (redirect.target) {
+                .path => |path_target| {
+                    if (redirect.stream != .stdout) continue;
+                    const redirect_target = try self.compileStringLiteral(source, path_target.value);
+                    const redirect_pipe_ref = try self.newRef(source, "stdout_redirect_pipe");
+                    try self.pipe(source, redirect_pipe_ref);
+                    try self.pipeFile(
+                        source,
+                        redirect_pipe_ref.dereference(),
+                        stableResultSource(redirect_target),
+                        redirect.mode,
+                    );
+                    try self.set(source, .initRegister(.r2), .from(execution_handles.dereference()));
+                    try self.set(
+                        source,
+                        .initAdd(
+                            .{ .register = .r2 },
+                            redirected_stdout_slot,
+                            .{ .dereference = true },
+                        ),
+                        .from(redirect_pipe_ref.dereference()),
+                    );
+                    exec_stdout = redirect_pipe_ref.dereference();
+                },
+                .fd => |target_fd| {
+                    const target_loc: ir.Location = switch (target_fd) {
+                        0 => self.threadStdin(),
+                        1 => self.threadStdout(),
+                        2 => self.threadStderr(),
+                        else => continue, // unsupported fd target
+                    };
+                    const source_fd: u8 = switch (redirect.stream) {
+                        .stdin => 0,
+                        .stdout => 1,
+                        .stderr => 2,
+                        .descriptor => |fd| fd,
+                    };
+                    switch (source_fd) {
+                        1 => exec_stdout = target_loc,
+                        2 => exec_stderr = target_loc,
+                        else => {}, // stdin redirect not supported here
+                    }
+                },
+            }
         }
 
         const spawned = try self.spawnClosure(
@@ -2357,7 +2380,7 @@ pub const IRCompiler = struct {
             .initAbs(exec_instr_set, 0),
             self.threadStdin(),
             exec_stdout,
-            self.threadStderr(),
+            exec_stderr,
         );
         try self.set(source, .initRegister(.r2), .from(execution_handles.dereference()));
         try self.set(
@@ -2404,7 +2427,7 @@ pub const IRCompiler = struct {
         try self.compileClosureInitialization(source, spawned.closure);
         self.scopes.pop();
 
-        if (has_stdout_redirect) {
+        if (has_stdout_file_redirect) {
             try self.set(source, .initRegister(.r2), .from(execution_handles.dereference()));
             const redirect_stream_thread = try self.fork(
                 source,
@@ -3051,7 +3074,7 @@ pub const IRCompiler = struct {
 
                 return .from(ref.dereference());
             },
-            .append_redirect => return Error.UnsupportedBinaryOperation,
+            .append_redirect, .redirect_fd => return Error.UnsupportedBinaryOperation,
             .assign => {
                 const left = try self.compileExpression(binary.left);
                 const right = try self.compileExpression(binary.right);

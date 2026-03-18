@@ -120,6 +120,7 @@ pub fn runScript(
         .close_destination = true,
         .disconnect_destination = true,
         .keep_open = true,
+        .propagate_eof_on_source_close = true,
     }, tracer);
     defer stdin_stream.stream.deinit();
     const stdout_stream = try Stream(u8).initReaderWriter(allocator, "<<<stdout_pipe>>>", .{

@@ -212,6 +212,7 @@ pub const Tag = enum {
     bang_equal,
     greater,
     append_redirect,
+    redirect_fd,
     greater_equal,
     less,
     less_equal,

@@ -1,0 +1,10 @@
+// Fd redirection: redirect stdout to stderr and verify separation.
+
+// 1>&2 redirects fd 1 (stdout) to fd 2 (stderr)
+echo "line1 to stderr" 1>&2
+
+// >&2 with implicit stdout source
+echo "line2 to stderr" >&2
+
+// Stdout still works normally after redirections above
+echo "line3 to stdout"

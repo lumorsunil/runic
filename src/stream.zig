@@ -297,6 +297,11 @@ pub const ReaderWriterStream = struct {
         disconnect_destination: bool = true,
         complete_after_source_closed: bool = false,
         keep_open: bool = false,
+        /// When true and keep_open is set, closing all sources propagates EOF to the
+        /// destination (close + disconnect it). Used by stdin_stream so that Ctrl+D
+        /// on the terminal closes child-process stdin. Must NOT be set on pipeline
+        /// intermediate pipes, which manage their own lifecycle via pipeOpt.
+        propagate_eof_on_source_close: bool = false,
 
         pub fn format(
             self: @This(),
@@ -604,18 +609,9 @@ pub const ReaderWriterStream = struct {
         defer sources_to_remove.deinit(allocator);
 
         for (self.sources.items, 0..) |source, i| {
-            const source_result = source.getResult();
-
-            if (source_result) |_| {
-                self.tracer.trace(.information, &.{ "stream", @src().fn_name, "source" }, null, "source closed, removing source", .{});
-                if (self.processCloseEnds()) |event| switch (event) {
-                    .not_done => return .not_done,
-                    .closed => return .closed,
-                    else => unreachable,
-                } else {
-                    try sources_to_remove.append(allocator, i);
-                }
-            }
+            // Note: do NOT call processCloseEnds() based on getResult() here.
+            // The OS pipe may still have buffered data even after the process exits;
+            // we must drain it via reader.stream() first.
 
             const bytes_forwarded = source.reader.stream(
                 &self.writer,
@@ -624,19 +620,38 @@ pub const ReaderWriterStream = struct {
                 error.EndOfStream => {
                     self.tracer.trace(.information, &.{ "stream", @src().fn_name, "source" }, null, "source ended", .{});
                     _ = source.close();
-                    if (self.processCloseEnds()) |event| return event;
+                    // Queue removal BEFORE processCloseEnds() so this source is
+                    // disconnected after the loop, even when processCloseEnds returns .not_done.
+                    try sources_to_remove.append(allocator, i);
+                    if (self.processCloseEnds()) |event| switch (event) {
+                        .closed => return .closed,
+                        // Don't return .not_done early — continue the loop so remaining
+                        // sources (which may have unread buffered data) are still processed.
+                        .not_done => {},
+                        else => unreachable,
+                    };
                     continue;
                 },
                 error.WriteFailed => {
                     self.tracer.trace(.information, &.{ "stream", @src().fn_name, "destination" }, null, "destination closed", .{});
                     _ = source.close();
-                    if (self.processCloseEnds()) |event| return event;
+                    try sources_to_remove.append(allocator, i);
+                    if (self.processCloseEnds()) |event| switch (event) {
+                        .closed => return .closed,
+                        .not_done => {},
+                        else => unreachable,
+                    };
                     continue;
                 },
                 else => {
                     self.tracer.trace(.@"error", &.{ "stream", @src().fn_name }, null, "stream error: {}", .{err});
                     _ = source.close();
-                    if (self.processCloseEnds()) |event| return event;
+                    try sources_to_remove.append(allocator, i);
+                    if (self.processCloseEnds()) |event| switch (event) {
+                        .closed => return .closed,
+                        .not_done => {},
+                        else => unreachable,
+                    };
                     continue;
                 },
             };
@@ -657,14 +672,18 @@ pub const ReaderWriterStream = struct {
             const fully_connected = self.destination != null;
 
             if (self.config.keep_open) {
-                // Propagate EOF to the destination even when keeping the stream open.
-                // This allows Ctrl+D on stdin to close child process stdin while still
-                // allowing new destinations to connect later (e.g. sequential commands).
-                // close_destination/disconnect_destination flags gate this per-stream.
-                self.closeDestination();
-                self.disconnectDestination();
-                self.closeSources();
-                self.disconnectSourcesAll();
+                // When propagate_eof_on_source_close is set (e.g. stdin_stream), closing all
+                // sources propagates EOF to the destination so child processes see Ctrl+D.
+                // Pipeline intermediate pipes must NOT set this flag — they manage their own
+                // lifecycle via pipeOpt(.keep_open, false) after the stage waits.
+                if (self.config.propagate_eof_on_source_close) {
+                    self.closeDestination();
+                    self.disconnectDestination();
+                }
+                // Do NOT call disconnectSourcesAll() here. Sources are removed one-by-one
+                // via sources_to_remove in the EndOfStream handler after their pipe data is
+                // fully drained. Disconnecting all sources now would discard buffered data
+                // from any sibling source whose process exited but whose pipe isn't yet empty.
                 self.tracer.trace(.information, &.{ "stream", @src().fn_name }, null, "keeping open", .{});
                 return .not_done;
             }

@@ -487,6 +487,9 @@ pub const Lexer = struct {
         if (self.match('>')) {
             return self.finish(.startAt(start), .append_redirect);
         }
+        if (self.match('&')) {
+            return self.finish(.startAt(start), .redirect_fd);
+        }
         if (self.match('=')) {
             return self.finish(.startAt(start), .greater_equal);
         }

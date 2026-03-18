@@ -830,7 +830,7 @@ pub const Parser = struct {
                 },
                 .op => {
                     switch (next.tag) {
-                        .equal_equal, .bang_equal, .greater, .append_redirect, .greater_equal, .less, .less_equal, .plus, .minus, .star, .slash, .percent, .kw_and, .kw_or, .pipe_pipe, .amp_amp, .pipe, .dot, .assign, .plus_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign => {
+                        .equal_equal, .bang_equal, .greater, .append_redirect, .redirect_fd, .greater_equal, .less, .less_equal, .plus, .minus, .star, .slash, .percent, .kw_and, .kw_or, .pipe_pipe, .amp_amp, .pipe, .dot, .assign, .plus_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign => {
                             const breadcrumbInner = try self.createBreadcrumb("PBE:op");
                             defer breadcrumbInner.end();
                             try components.append(self.allocator, .{
@@ -943,10 +943,7 @@ pub const Parser = struct {
                 const redirect = ast.Redirection{
                     .stream = .stdout,
                     .mode = mode,
-                    .target = .{
-                        .path = path,
-                        .span = path.span,
-                    },
+                    .target = .{ .path = .{ .value = path, .span = path.span } },
                     .span = left.span().endAt(right.span()),
                 };
 
@@ -954,6 +951,52 @@ pub const Parser = struct {
                     .call = .{
                         .callee = call.callee,
                         .arguments = call.arguments,
+                        .redirects = try std.mem.concat(
+                            self.arena.allocator(),
+                            ast.Redirection,
+                            &.{ call.redirects, &.{redirect} },
+                        ),
+                        .span = call.span.endAt(right.span()),
+                    },
+                };
+            },
+            .redirect_fd => redirect_fd: {
+                const call = switch (left.*) {
+                    .call => |call| call,
+                    else => break :redirect_fd binary,
+                };
+
+                const target_fd: u8 = switch (right.*) {
+                    .literal => |literal| switch (literal) {
+                        .integer => |int| @intCast(std.fmt.parseInt(i64, int.text, 10) catch break :redirect_fd binary),
+                        else => break :redirect_fd binary,
+                    },
+                    else => break :redirect_fd binary,
+                };
+
+                // Check if the last argument is an integer — if so, it is the source fd prefix (e.g. the "1" in "1>&2").
+                var args = call.arguments;
+                var source_stream: ast.StreamRef = .stdout;
+                if (args.len > 0) {
+                    const last_arg = args[args.len - 1].*;
+                    if (last_arg == .literal and last_arg.literal == .integer) {
+                        const source_fd: u8 = @intCast(std.fmt.parseInt(i64, last_arg.literal.integer.text, 10) catch 1);
+                        source_stream = .{ .descriptor = source_fd };
+                        args = args[0 .. args.len - 1];
+                    }
+                }
+
+                const redirect = ast.Redirection{
+                    .stream = source_stream,
+                    .mode = .truncate,
+                    .target = .{ .fd = target_fd },
+                    .span = left.span().endAt(right.span()),
+                };
+
+                break :redirect_fd .{
+                    .call = .{
+                        .callee = call.callee,
+                        .arguments = args,
                         .redirects = try std.mem.concat(
                             self.arena.allocator(),
                             ast.Redirection,
@@ -1220,6 +1263,33 @@ pub const Parser = struct {
                         .span = redirect.span,
                     };
                 },
+                .redirect_fd => {
+                    const redirect = try self.parseCommandFdRedirection(.stdout);
+                    try redirects.append(self.allocator, redirect);
+                    last_token = .{
+                        .tag = next_token.tag,
+                        .lexeme = "",
+                        .span = redirect.span,
+                    };
+                },
+                .int_literal => peek_fd: {
+                    // Peek ahead: if next is `>&`, treat this int as the source fd.
+                    _ = try self.nextToken(); // consume the int_literal
+                    const after = try self.peekToken();
+                    if (after.tag == .redirect_fd) {
+                        const source_fd: u8 = @intCast(try std.fmt.parseInt(i64, next_token.lexeme, 10));
+                        const redirect = try self.parseCommandFdRedirection(.{ .descriptor = source_fd });
+                        try redirects.append(self.allocator, redirect);
+                        last_token = .{
+                            .tag = next_token.tag,
+                            .lexeme = "",
+                            .span = redirect.span,
+                        };
+                        break :peek_fd;
+                    }
+                    // Not a redirect — error
+                    return self.failExpectedToken(next_token.tag, .string_start);
+                },
                 // .minus, .plus => {
                 //     _ = try self.nextToken();
                 //     try args.append(self.allocator, .{ .word = .fromToken(next_token) });
@@ -1245,11 +1315,27 @@ pub const Parser = struct {
         return .{
             .stream = .stdout,
             .mode = mode,
-            .target = .{
-                .path = target,
-                .span = target.span,
-            },
+            .target = .{ .path = .{ .value = target, .span = target.span } },
             .span = redirect_token.span.endAt(target.span),
+        };
+    }
+
+    fn parseCommandFdRedirection(self: *Self, source_stream: ast.StreamRef) Error!ast.Redirection {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const redirect_token = try self.nextToken(); // consumes `>&`
+        if (redirect_token.tag != .redirect_fd) return self.failExpectedToken(redirect_token.tag, .redirect_fd);
+
+        const target_token = try self.nextToken();
+        if (target_token.tag != .int_literal) return self.failExpectedToken(target_token.tag, .int_literal);
+        const target_fd: u8 = @intCast(try std.fmt.parseInt(i64, target_token.lexeme, 10));
+
+        return .{
+            .stream = source_stream,
+            .mode = .truncate,
+            .target = .{ .fd = target_fd },
+            .span = redirect_token.span.endAt(target_token.span),
         };
     }
 
@@ -2604,9 +2690,9 @@ test "parser builds command redirections with quoted file paths" {
 
     try std.testing.expectEqual(@as(usize, 1), command.redirects.len);
     try std.testing.expectEqual(ast.RedirectionMode.truncate, command.redirects[0].mode);
-    try std.testing.expectEqual(@as(usize, 1), command.redirects[0].target.path.segments.len);
-    try std.testing.expect(std.meta.activeTag(command.redirects[0].target.path.segments[0]) == .text);
-    try std.testing.expectEqualStrings("file.txt", command.redirects[0].target.path.segments[0].text.payload);
+    try std.testing.expectEqual(@as(usize, 1), command.redirects[0].target.path.value.segments.len);
+    try std.testing.expect(std.meta.activeTag(command.redirects[0].target.path.value.segments[0]) == .text);
+    try std.testing.expectEqualStrings("file.txt", command.redirects[0].target.path.value.segments[0].text.payload);
 }
 
 test "parser builds append command redirections with quoted file paths" {
@@ -2624,9 +2710,9 @@ test "parser builds append command redirections with quoted file paths" {
 
     try std.testing.expectEqual(@as(usize, 1), command.redirects.len);
     try std.testing.expectEqual(ast.RedirectionMode.append, command.redirects[0].mode);
-    try std.testing.expectEqual(@as(usize, 1), command.redirects[0].target.path.segments.len);
-    try std.testing.expect(std.meta.activeTag(command.redirects[0].target.path.segments[0]) == .text);
-    try std.testing.expectEqualStrings("file.txt", command.redirects[0].target.path.segments[0].text.payload);
+    try std.testing.expectEqual(@as(usize, 1), command.redirects[0].target.path.value.segments.len);
+    try std.testing.expect(std.meta.activeTag(command.redirects[0].target.path.value.segments[0]) == .text);
+    try std.testing.expectEqualStrings("file.txt", command.redirects[0].target.path.value.segments[0].text.payload);
 }
 
 test "parser allows interpolation in quoted redirection targets" {
@@ -2641,7 +2727,7 @@ test "parser allows interpolation in quoted redirection targets" {
     const script = try parser.parseSource(ctx.source);
     const stage = script.statements[0].expression.expression.pipeline.stages[0];
     const command = stage.payload.command;
-    const target = command.redirects[0].target.path;
+    const target = command.redirects[0].target.path.value;
 
     try std.testing.expectEqual(@as(usize, 2), target.segments.len);
     try std.testing.expect(std.meta.activeTag(target.segments[0]) == .interpolation);
@@ -2659,6 +2745,63 @@ test "parser rejects unquoted redirection targets" {
     defer parser.deinit();
 
     try std.testing.expectError(Error.UnexpectedToken, parser.parseSource(ctx.source));
+}
+
+test "parser builds fd redirect with explicit source fd (1>&2)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var ctx = TestCtx{ .source = "echo \"hi\" 1>&2" };
+    var parser = TestParser.init(allocator, &ctx);
+    defer parser.deinit();
+
+    const script = try parser.parseSource(ctx.source);
+    const call = script.statements[0].expression.expression.call;
+
+    try std.testing.expectEqual(@as(usize, 1), call.arguments.len);
+    try std.testing.expectEqual(@as(usize, 1), call.redirects.len);
+    const redirect = call.redirects[0];
+    try std.testing.expectEqual(ast.StreamRef{ .descriptor = 1 }, redirect.stream);
+    try std.testing.expectEqual(ast.RedirectionMode.truncate, redirect.mode);
+    try std.testing.expectEqual(@as(u8, 2), redirect.target.fd);
+}
+
+test "parser builds fd redirect with implicit stdout source (>&2)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var ctx = TestCtx{ .source = "echo \"hi\" >&2" };
+    var parser = TestParser.init(allocator, &ctx);
+    defer parser.deinit();
+
+    const script = try parser.parseSource(ctx.source);
+    const call = script.statements[0].expression.expression.call;
+
+    try std.testing.expectEqual(@as(usize, 1), call.arguments.len);
+    try std.testing.expectEqual(@as(usize, 1), call.redirects.len);
+    const redirect = call.redirects[0];
+    try std.testing.expectEqual(ast.StreamRef.stdout, redirect.stream);
+    try std.testing.expectEqual(ast.RedirectionMode.truncate, redirect.mode);
+    try std.testing.expectEqual(@as(u8, 2), redirect.target.fd);
+}
+
+test "parser builds fd redirect in pipeline stage (1>&2)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var ctx = TestCtx{ .source = "echo \"hi\" 1>&2" };
+    var parser = TestParser.init(allocator, &ctx);
+    defer parser.deinit();
+
+    const script = try parser.parseSource(ctx.source);
+    // The fd redirect strip should leave only the string argument (not the int prefix).
+    const call = script.statements[0].expression.expression.call;
+    try std.testing.expectEqual(@as(usize, 1), call.arguments.len);
+    try std.testing.expect(call.arguments[0].* == .literal);
+    try std.testing.expect(call.arguments[0].literal == .string);
 }
 
 test "parser rejects interpolation in import module names" {

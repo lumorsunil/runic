@@ -814,6 +814,7 @@ pub const BinaryOp = enum {
     remainder,
     greater,
     append_redirect,
+    redirect_fd,
     greater_equal,
     less,
     less_equal,
@@ -845,6 +846,7 @@ pub const BinaryOp = enum {
             .remainder => 30,
             .greater => 15,
             .append_redirect => 15,
+            .redirect_fd => 15,
             .greater_equal => 15,
             .less => 15,
             .less_equal => 15,
@@ -874,6 +876,7 @@ pub const BinaryOp = enum {
             .percent => .remainder,
             .greater => .greater,
             .append_redirect => .append_redirect,
+            .redirect_fd => .redirect_fd,
             .greater_equal => .greater_equal,
             .less => .less,
             .less_equal => .less_equal,
@@ -1184,9 +1187,12 @@ pub const RedirectionMode = enum {
     append,
 };
 
-pub const RedirectionTarget = struct {
-    path: StringLiteral,
-    span: Span,
+pub const RedirectionTarget = union(enum) {
+    path: struct {
+        value: StringLiteral,
+        span: Span,
+    },
+    fd: u8,
 };
 
 pub const CaptureDirective = struct {

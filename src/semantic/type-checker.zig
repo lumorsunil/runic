@@ -619,7 +619,10 @@ pub const TypeChecker = struct {
         try self.runExpression(scope, call.callee);
         for (call.arguments) |arg| try self.runExpression(scope, arg);
         for (call.redirects) |*redirect| {
-            try self.runStringLiteral(scope, &redirect.target.path);
+            switch (redirect.target) {
+                .path => |*p| try self.runStringLiteral(scope, &p.value),
+                .fd => {},
+            }
         }
     }
 
