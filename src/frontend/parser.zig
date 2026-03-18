@@ -35,6 +35,7 @@ pub const Parser = struct {
     // getCachedAst: *const fn (path: []const u8) ?ast.Script,
     // getSource: *const fn (path: []const u8) []const u8,
     unexpected_token: ?token.Tag = null,
+    unexpected_token_span: ?token.Span = null,
     expected_token_buffer: [max_expected_tokens]token.Tag = undefined,
     expected_token_count: usize = 0,
     breadcrumb_stack: [max_breadcrumbs][]const u8 = undefined,
@@ -172,6 +173,23 @@ pub const Parser = struct {
 
         if (self.diagnostics.items.len > 0) {
             return .errDiagnostics(self.diagnostics.items, script);
+        }
+
+        if (script == null and self.expected_token_count > 0) {
+            var buf: [512]u8 = undefined;
+            var writer = std.Io.Writer.fixed(&buf);
+            _ = self.writeExpectedTokens(&writer) catch {};
+            _ = self.writeBreadcrumbTrail(&writer) catch {};
+            const span = self.unexpected_token_span orelse token.Span.fromLocs(token.Location.global, token.Location.global);
+            const message = self.arena.allocator().dupe(u8, writer.buffer[0..writer.end]) catch "unexpected token";
+            self.diagnostics.append(self.arena.allocator(), .{
+                .err = Error.UnexpectedToken,
+                .span_ = span,
+                .message = message,
+            }) catch {};
+            if (self.diagnostics.items.len > 0) {
+                return .errDiagnostics(self.diagnostics.items, script);
+            }
         }
 
         return .fromScript(script);
@@ -1830,6 +1848,7 @@ pub const Parser = struct {
         self.captureBreadcrumbSnapshot();
         self.recordExpectedTokens(expected);
         self.unexpected_token = unexpected;
+        self.unexpected_token_span = if (self.currentToken()) |tok| tok.span else null;
         return Error.UnexpectedToken;
     }
 

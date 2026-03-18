@@ -49,7 +49,7 @@ var depth = 0
 fn Void countdown() String {
   echo "depth ${depth}"
   depth = depth + 1
-  if depth < 4 {
+  if (depth < 4) {
     countdown
   }
 }

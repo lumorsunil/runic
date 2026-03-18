@@ -137,6 +137,8 @@ pub const Instruction = struct {
         exit: ExitCode,
         /// exits the process with an exit code resolved from a value source
         exit_with: ValueSource,
+        /// resolves the exit code from an execution result or handles struct and stores it in result
+        resolve_exit_code: ResolveExitCode,
 
         pub fn push_(value: ValueSource) @This() {
             return .{ .push = value };
@@ -176,7 +178,7 @@ pub const Instruction = struct {
 
         pub fn format(self: @This(), w: *std.Io.Writer) !void {
             switch (self) {
-                inline .push, .exit, .exit_with, .jmp, .fork, .set, .pipe_fwd, .pipe_file, .pipe_write, .wait, .stream, .pipe, .pipe_opt, .ath, .log, .cmp => |t| try w.print("{t} {f}", .{ self, t }),
+                inline .push, .exit, .exit_with, .jmp, .fork, .set, .pipe_fwd, .pipe_file, .pipe_write, .wait, .stream, .pipe, .pipe_opt, .ath, .log, .cmp, .resolve_exit_code => |t| try w.print("{t} {f}", .{ self, t }),
                 inline .ref, .comment => |t| try w.print("{t} {s}", .{ self, t }),
                 inline .alloc => |t| try w.print("{t} {}", .{ self, t }),
                 else => try w.print("{t}", .{self}),
@@ -481,6 +483,18 @@ pub const Instruction = struct {
             writer: *std.Io.Writer,
         ) std.Io.Writer.Error!void {
             try writer.print("{f}", .{self.waitee});
+        }
+    };
+
+    pub const ResolveExitCode = struct {
+        source: Location,
+        result: Location,
+
+        pub fn format(
+            self: @This(),
+            writer: *std.Io.Writer,
+        ) std.Io.Writer.Error!void {
+            try writer.print("{f} -> {f}", .{ self.source, self.result });
         }
     };
 

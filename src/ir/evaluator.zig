@@ -422,6 +422,11 @@ pub const IREvaluator = struct {
         return switch (instruction.type) {
             .comment => return .skip,
             .exit_with => |value| return .{ .exit = try self.coerceExitCode(thread, value) },
+            .resolve_exit_code => |rec| {
+                const exit_code = try self.coerceExitCode(thread, .fromLocation(rec.source));
+                try self.setLocation(thread, rec.result, .{ .exit_code = exit_code });
+                return .cont;
+            },
             .fwd_stdio => {
                 const stdin = try self.context.addPipe(self.config.stdin);
                 const stdout = try self.context.addPipe(self.config.stdout);

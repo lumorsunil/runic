@@ -1746,6 +1746,15 @@ pub const IRCompiler = struct {
             return .fromValue(.void);
         }
 
+        if (std.mem.eql(u8, member.member.name, "exit_code")) {
+            const result_ref = try self.newRef(source, "exit_code_result");
+            try self.addInstruction(.init(.from(source), .{ .resolve_exit_code = .{
+                .source = object.source.location,
+                .result = result_ref,
+            } }));
+            return .fromLocation(result_ref.dereference().typed(.global(.integer)));
+        }
+
         const field_ = struct_type.fieldLayout(member.member.name) catch |err| switch (err) {
             error.FieldNotFound => {
                 try self.reportSourceError(
@@ -3476,10 +3485,19 @@ pub const IRCompiler = struct {
 
         // 4. Compile for body as statement
 
+        const stack_before_body = self.currentFrame().rel_stack_counter;
         const for_body_result = try self.compileExpression(for_expr.body);
 
         if (isWaitable(for_body_result)) |loc| {
             try self.wait(source, loc);
+        }
+
+        // Pop any refs that were allocated during the body but not cleaned up.
+        // Without this, the runtime stack grows each iteration and ref lookups
+        // based on compile-time rel_stack_addr become incorrect on iteration 2+.
+        const body_extra_refs = self.currentFrame().rel_stack_counter - stack_before_body;
+        for (0..body_extra_refs) |_| {
+            _ = try self.pop(source);
         }
 
         // 5. Pop bindings scope
