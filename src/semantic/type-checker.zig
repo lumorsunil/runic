@@ -669,7 +669,6 @@ pub const TypeChecker = struct {
             .if_expr => |*if_expr| self.runIfExpr(scope, if_expr),
             .for_expr => |*for_expr| self.runForExpr(scope, for_expr),
             .import_expr => |*import_expr| self.runImportExpr(scope, import_expr),
-            .assignment => |*assignment| self.runAssignment(scope, assignment),
             .fn_decl => |*fn_decl| self.runFnDecl(scope, fn_decl),
             .call => |*call| self.runCall(scope, call),
             else => return error.UnsupportedExpression,
@@ -796,12 +795,18 @@ pub const TypeChecker = struct {
 
         try self.runExpression(scope, binary.left);
         try self.runExpression(scope, binary.right);
-        const left_type = try self.resolveExprType(scope, binary.left);
-        const right_type = try self.resolveExprType(scope, binary.right);
-        _ = left_type;
-        _ = right_type;
+        const maybe_left_type = try self.resolveExprType(scope, binary.left);
+        const maybe_right_type = try self.resolveExprType(scope, binary.right);
 
         // TODO: implement all kinds of semantic checks here
+        // TODO: implement type expr "locations" that can be populated. These locations should be able to be resolved through expressions. This is for populating inferred type expressions.
+
+        const left_type = maybe_left_type orelse return;
+        const right_type = maybe_right_type orelse return;
+
+        if (binary.op.isAssignment()) {
+            try self.validateTypeAssignment(left_type, right_type, .{ .span = right_type.span() });
+        }
     }
 
     pub fn runMember(self: *TypeChecker, scope: *Scope, member: *ast.MemberExpr) Error!void {
@@ -1015,23 +1020,6 @@ pub const TypeChecker = struct {
         };
 
         _ = try self.requestModuleScope(module_type.module);
-    }
-
-    pub fn runAssignment(self: *TypeChecker, scope: *Scope, assignment: *ast.Assignment) Error!void {
-        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
-        try self.logTypeCheckTrace(@src().fn_name, assignment.span);
-
-        try self.runExpression(scope, assignment.expr);
-
-        const found_identifier = try self.runIdentifier(scope, &assignment.identifier);
-        if (found_identifier == .not_found) return;
-
-        try self.materializeBindingType(
-            scope,
-            assignment.identifier.name,
-            try self.resolveExprType(scope, assignment.expr),
-            assignment.expr.span(),
-        );
     }
 
     fn isUnion(comptime T: type) bool {
