@@ -2545,14 +2545,33 @@ pub const IRCompiler = struct {
 
         const fn_ref = fn_ref_value.fn_ref;
         const fn_addr = fn_ref.fn_addr;
+        const is_self_recursive = self.current_instruction_set == fn_addr.instr_set;
+        const self_closure_depth = if (is_self_recursive) blk: {
+            const frame = try self.scopes.getFrame(0);
+            break :blk if (frame.scope_type == .closure) @as(usize, 0) else try self.nearestClosureDepth();
+        } else 0;
 
         // Manual closure compilation
         // TODO: Add closure variables as well (we need to extend the function reference value to be able to understand what closure variables are needed)
         const closure_captures = self.instruction_sets.items[fn_ref.fn_addr.instr_set].closure_captures;
-        const closure_size = self.instruction_sets.items[fn_ref.fn_addr.instr_set].closure_slot_count;
+        const closure_size = if (is_self_recursive)
+            (try self.scopes.getFrame(self_closure_depth)).closure_bindings.items.len
+        else
+            self.instruction_sets.items[fn_ref.fn_addr.instr_set].closure_slot_count;
         try self.alloc(source, closure_size);
         const closure_ref = try self.newRef(source, "closure");
         try self.set(source, closure_ref, .fromLocation(.initRegister(.r)));
+
+        if (is_self_recursive) {
+            try self.set(source, .initRegister(.r), .from(closure_ref.dereference()));
+            for (0..closure_size) |slot| {
+                try self.set(
+                    source,
+                    .initAdd(.{ .register = .r }, slot, .{ .dereference = true }),
+                    .fromLocation(.initAdd(.closure, slot, .{})),
+                );
+            }
+        }
 
         for (arguments, 0..) |arg, i| {
             const arg_result = try self.compileResultSaveR(source, try self.compileExpression(arg));
@@ -2567,30 +2586,32 @@ pub const IRCompiler = struct {
 
         try self.set(source, .initRegister(.r), .from(closure_ref.dereference()));
 
-        for (closure_captures) |capture| {
-            // NOTE: Guard against refering to internal identifiers
-            if (self.lookup(capture.identifier.name, .{ .shallow = false }) == null) continue;
+        if (!is_self_recursive) {
+            for (closure_captures) |capture| {
+                // NOTE: Guard against refering to internal identifiers
+                if (self.lookup(capture.identifier.name, .{ .shallow = false }) == null) continue;
 
-            const identifier_result = try self.compileIdentifier(source, capture.identifier);
+                const identifier_result = try self.compileIdentifier(source, capture.identifier);
 
-            if (identifier_result.source == .location and identifier_result.source.location.abs == .data) {
-                try self.set(
-                    source,
-                    .initAdd(.{ .register = .r }, capture.slot, .{ .dereference = true }),
-                    identifier_result.source.undereference(),
-                );
-            } else if (identifier_result.source == .location) {
-                try self.set(
-                    source,
-                    .initAdd(.{ .register = .r }, capture.slot, .{ .dereference = true }),
-                    identifier_result.source.undereference(),
-                );
-            } else {
-                try self.set(
-                    source,
-                    .initAdd(.{ .register = .r }, capture.slot, .{ .dereference = true }),
-                    identifier_result.source,
-                );
+                if (identifier_result.source == .location and identifier_result.source.location.abs == .data) {
+                    try self.set(
+                        source,
+                        .initAdd(.{ .register = .r }, capture.slot, .{ .dereference = true }),
+                        identifier_result.source.undereference(),
+                    );
+                } else if (identifier_result.source == .location) {
+                    try self.set(
+                        source,
+                        .initAdd(.{ .register = .r }, capture.slot, .{ .dereference = true }),
+                        identifier_result.source.undereference(),
+                    );
+                } else {
+                    try self.set(
+                        source,
+                        .initAdd(.{ .register = .r }, capture.slot, .{ .dereference = true }),
+                        identifier_result.source,
+                    );
+                }
             }
         }
 
@@ -2716,7 +2737,10 @@ pub const IRCompiler = struct {
         }
         const after_addr = try self.newLabel("if_after", .unknown);
         try self.jmp(source, condition, false, after_addr);
-        _ = try self.compileExpression(if_expr.then_expr);
+        const then_result = try self.compileExpression(if_expr.then_expr);
+        if (isWaitable(then_result)) |loc| {
+            try self.wait(source, loc);
+        }
         try self.setLabel(after_addr.local_addr.label, .abs);
         return .fromValue(.void);
     }
@@ -2888,9 +2912,16 @@ pub const IRCompiler = struct {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
         const instr_set = try self.addInstructionSet();
+        const fn_ref = ir.Value{
+            .fn_ref = .{ .fn_addr = ir.InstructionAddr.initAbs(instr_set, 0) },
+        };
         const orig_instr_set = self.current_instruction_set;
         self.current_instruction_set = instr_set;
         try self.scopes.push(self.allocator, .closure);
+
+        if (fn_decl.name) |name| {
+            try self.scopes.declare(self.allocator, name.name, try .from(fn_ref), false);
+        }
 
         for (fn_decl.params._non_variadic) |param| {
             switch (param.pattern.*) {
@@ -2923,14 +2954,15 @@ pub const IRCompiler = struct {
         if (isWaitable(result)) |loc| {
             try self.wait(source, loc);
         }
-        try self.exitWith(source, result);
+        if (result.source.isValueTag(.void)) {
+            try self.exitWith(source, .fromValue(.fromBoolean(true)));
+        } else {
+            try self.exitWith(source, result);
+        }
 
         try self.setClosureIdentifiers();
         self.current_instruction_set = orig_instr_set;
         self.scopes.pop();
-        const fn_ref = ir.Value{
-            .fn_ref = .{ .fn_addr = ir.InstructionAddr.initAbs(instr_set, 0) },
-        };
         if (fn_decl.name) |name| {
             try self.scopes.declare(self.allocator, name.name, try .from(fn_ref), false);
         }
