@@ -1,0 +1,4 @@
+[error]: tests/diagnostics/type_annotation_mismatch.rn:1:14: expected type Int, actual: []Byte
+   1:var f: Int = "hello"
+   2:
+

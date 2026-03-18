@@ -472,10 +472,19 @@ pub const TypeChecker = struct {
 
         try self.runExpression(scope, binding_decl.initializer);
 
-        const type_expr = binding_annotation_type_expr orelse try self.resolveExprType(
-            scope,
-            binding_decl.initializer,
-        );
+        const initializer_type = try self.resolveExprType(scope, binding_decl.initializer);
+
+        const type_expr = binding_annotation_type_expr orelse initializer_type;
+
+        if (binding_annotation_type_expr) |annotation_type| {
+            if (initializer_type) |init_type| {
+                try self.validateTypeAssignment(
+                    annotation_type,
+                    init_type,
+                    .{ .span = binding_decl.initializer.span() },
+                );
+            }
+        }
 
         if (type_expr) |t| try self.runTypeExpression(scope, t);
 
