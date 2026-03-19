@@ -1,0 +1,4 @@
+echo "${match (1) {
+  1 => |value| { "bad" }
+  _ => { "ok" }
+}}"

@@ -808,6 +808,19 @@ pub const TypeChecker = struct {
             try switch (case.pattern) {
                 .wildcard => {},
                 .literal => |*literal| self.runLiteral(scope, @constCast(literal)),
+                .binding => |binding| {
+                    const matcher_expr = try self.matchPatternToExpression(case.pattern);
+                    const call_expr = try self.allocMatcherCallExpression(matcher_expr, match_expr.subject, case.span);
+                    try self.runExpression(scope, call_expr);
+                    _ = try self.resolveExprType(scope, call_expr);
+                    _ = binding;
+                },
+                .path => {
+                    const matcher_expr = try self.matchPatternToExpression(case.pattern);
+                    const call_expr = try self.allocMatcherCallExpression(matcher_expr, match_expr.subject, case.span);
+                    try self.runExpression(scope, call_expr);
+                    _ = try self.resolveExprType(scope, call_expr);
+                },
                 else => {
                     try self.reportSpanError(
                         case.pattern.span(),
@@ -822,6 +835,57 @@ pub const TypeChecker = struct {
 
             try self.runBlockInNewScope(scope, @constCast(&case.body));
         }
+    }
+
+    fn matchPatternToExpression(
+        self: *TypeChecker,
+        pattern: ast.MatchPattern,
+    ) Error!*ast.Expression {
+        return switch (pattern) {
+            .binding => |binding| self.allocExpression(.{ .identifier = binding }),
+            .path => |path| self.allocPathExpression(path),
+            else => error.UnsupportedExpression,
+        };
+    }
+
+    fn allocPathExpression(
+        self: *TypeChecker,
+        path: ast.Path,
+    ) Error!*ast.Expression {
+        var expr = try self.allocExpression(.{ .identifier = path.segments[0] });
+        for (path.segments[1..]) |segment| {
+            expr = try self.allocExpression(.{ .member = .{
+                .object = expr,
+                .member = segment,
+                .span = expr.span().endAt(segment.span),
+            } });
+        }
+        return expr;
+    }
+
+    fn allocMatcherCallExpression(
+        self: *TypeChecker,
+        callee: *ast.Expression,
+        subject: *ast.Expression,
+        span: ast.Span,
+    ) Error!*ast.Expression {
+        const args = try self.arena.allocator().alloc(*ast.Expression, 1);
+        args[0] = subject;
+        return self.allocExpression(.{ .call = .{
+            .callee = callee,
+            .arguments = args,
+            .redirects = &.{},
+            .span = span,
+        } });
+    }
+
+    fn allocExpression(
+        self: *TypeChecker,
+        expr: ast.Expression,
+    ) Error!*ast.Expression {
+        const ptr = try self.arena.allocator().create(ast.Expression);
+        ptr.* = expr;
+        return ptr;
     }
 
     pub fn runIfExpr(self: *TypeChecker, scope: *Scope, if_expr: *ast.IfExpr) Error!void {

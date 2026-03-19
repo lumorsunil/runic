@@ -1,0 +1,7 @@
+[error]: tests/diagnostics/match_capture_unsupported.rn:2:3: match captures are not yet supported
+   1:echo "${match (1) {
+   2:  1 => |value| { "bad" }
+   3:  _ => { "ok" }
+   4:}}"
+   5:
+

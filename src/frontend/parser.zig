@@ -1628,11 +1628,30 @@ pub const Parser = struct {
         const tok = try self.peekToken();
         return switch (tok.tag) {
             .identifier => blk: {
-                const identifier_tok = try self.nextToken();
-                if (identifier_tok.lexeme.len == 1 and identifier_tok.lexeme[0] == '_') {
-                    break :blk .{ .wildcard = identifier_tok.span };
+                const first = try self.parseIdentifier();
+                if (first.name.len == 1 and first.name[0] == '_') {
+                    break :blk .{ .wildcard = first.span };
                 }
-                break :blk .{ .binding = .fromToken(identifier_tok) };
+
+                var segments = std.ArrayList(ast.Identifier).empty;
+                defer segments.deinit(self.allocator);
+                try segments.append(self.allocator, first);
+
+                while (true) {
+                    const next = try self.peekToken();
+                    if (next.tag != .dot) break;
+                    _ = try self.nextToken();
+                    try segments.append(self.allocator, try self.parseIdentifier());
+                }
+
+                if (segments.items.len == 1) {
+                    break :blk .{ .binding = segments.items[0] };
+                }
+
+                break :blk .{ .path = .{
+                    .segments = try self.copyToArena(ast.Identifier, segments.items),
+                    .span = first.span.endAt(segments.items[segments.items.len - 1].span),
+                } };
             },
             .string_start => .{ .literal = .{ .string = try self.parseStringLiteral() } },
             .kw_null => blk: {

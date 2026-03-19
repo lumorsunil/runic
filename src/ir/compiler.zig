@@ -3250,6 +3250,72 @@ pub const IRCompiler = struct {
         return null;
     }
 
+    fn allocExpression(
+        self: *IRCompiler,
+        expr: ast.Expression,
+    ) Error!*ast.Expression {
+        const ptr = try self.allocator.create(ast.Expression);
+        ptr.* = expr;
+        return ptr;
+    }
+
+    fn allocPathExpression(
+        self: *IRCompiler,
+        path: ast.Path,
+    ) Error!*ast.Expression {
+        var expr = try self.allocExpression(.{ .identifier = path.segments[0] });
+        for (path.segments[1..]) |segment| {
+            expr = try self.allocExpression(.{ .member = .{
+                .object = expr,
+                .member = segment,
+                .span = expr.span().endAt(segment.span),
+            } });
+        }
+        return expr;
+    }
+
+    fn allocMatcherCallExpression(
+        self: *IRCompiler,
+        callee: *ast.Expression,
+        subject_identifier: ast.Identifier,
+        span: ast.Span,
+    ) Error!*ast.Expression {
+        const subject_expr = try self.allocExpression(.{ .identifier = subject_identifier });
+        const args = try self.allocator.alloc(*ast.Expression, 1);
+        args[0] = subject_expr;
+        return self.allocExpression(.{ .call = .{
+            .callee = callee,
+            .arguments = args,
+            .redirects = &.{},
+            .span = span,
+        } });
+    }
+
+    fn compileMatchPredicate(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        pattern: ast.MatchPattern,
+        subject_identifier: ast.Identifier,
+    ) Error!Result {
+        const callee = switch (pattern) {
+            .binding => |binding| try self.allocExpression(.{ .identifier = binding }),
+            .path => |path| try self.allocPathExpression(path),
+            else => {
+                try self.reportSourceError(
+                    source,
+                    Error.UnsupportedExpression,
+                    .@"error",
+                    "match currently supports only literal, predicate function, and _ patterns",
+                    .{},
+                );
+                return .fromValue(.void);
+            },
+        };
+
+        const call_expr = try self.allocMatcherCallExpression(callee, subject_identifier, pattern.span());
+        return self.compileExpression(call_expr);
+    }
+
     fn compileMatch(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -3268,8 +3334,20 @@ pub const IRCompiler = struct {
             return .fromValue(.void);
         }
 
+        try self.scopes.push(self.allocator, .lexical);
+        defer self.scopes.pop();
+
         const subject_ref = try self.newRef(source, "match_subject");
-        _ = try self.compileStableExpressionIntoRef(source, match_expr.subject, subject_ref);
+        const subject_result = try self.compileStableExpressionIntoRef(source, match_expr.subject, subject_ref);
+        const subject_identifier: ast.Identifier = .{ .name = "__match_subject", .span = match_expr.subject.span() };
+        try self.compileIdentifierBinding(
+            source,
+            subject_identifier,
+            .from(subject_ref.dereference().typed(subject_result.typeExpr())),
+            null,
+            true,
+            .normal,
+        );
 
         const result_ref = try self.newRef(source, "match_result");
         const after_addr = try self.newLabel("match_after", .unknown);
@@ -3309,16 +3387,11 @@ pub const IRCompiler = struct {
                     );
                     try self.jmp(source, .fromLocation(is_match_ref.dereference()), false, next_case_addr);
                 },
-                else => {
-                    try self.reportSourceError(
-                        source,
-                        Error.UnsupportedExpression,
-                        .@"error",
-                        "match currently supports only literal and _ patterns",
-                        .{},
-                    );
-                    return .fromValue(.void);
+                .binding, .path => {
+                    const predicate = try self.compileMatchPredicate(source, case.pattern, subject_identifier);
+                    try self.jmp(source, predicate, false, next_case_addr);
                 },
+                else => unreachable,
             }
 
             const case_result = try self.compileBlock(source, case.body);

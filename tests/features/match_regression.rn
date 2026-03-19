@@ -1,3 +1,5 @@
+fn Void isHello(value: String) Bool value == "hello"
+
 const number = 2
 echo "${match (number) {
   1 => { "one" }
@@ -10,6 +12,11 @@ echo "${match (word) {
   "zig" => { "compiler" }
   "runic" => { "shell" }
   _ => { "unknown" }
+}}"
+
+echo "${match ("hello") {
+  isHello => { "predicate matched" }
+  _ => { "predicate missed" }
 }}"
 
 echo "${match (null) {
