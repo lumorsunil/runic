@@ -784,6 +784,16 @@ pub const Parser = struct {
                                 .identifier = .fromToken(next),
                             });
                         },
+                        .question => {
+                            if (components.items.len == 0 or components.items[components.items.len - 1] != .op or components.items[components.items.len - 1].op.payload != .member) {
+                                try self.reportParseError(Error.UnexpectedToken, next.span, "expected value, actual: {t}", .{next.tag});
+                                return Error.UnexpectedToken;
+                            }
+
+                            try components.append(self.allocator, .{
+                                .identifier = .{ .name = "?", .span = next.span },
+                            });
+                        },
                         .l_paren => {
                             const breadcrumbInner = try self.createBreadcrumb("PBE:parenthesis");
                             defer breadcrumbInner.end();

@@ -680,9 +680,13 @@ pub const Expression = union(enum) {
 
     pub fn isReference(self: *@This()) bool {
         return switch (self.*) {
-            .identifier, .member => true,
+            .identifier => true,
+            .member => |member| !std.mem.eql(u8, member.member.name, "?"),
             .binary => |binary| switch (binary.op) {
-                .member => true,
+                .member => switch (binary.right.*) {
+                    .identifier => |identifier| !std.mem.eql(u8, identifier.name, "?"),
+                    else => true,
+                },
                 else => false,
             },
             else => false,
@@ -760,10 +764,19 @@ pub const MemberExpr = struct {
     span: Span,
 
     pub fn resolveType(
-        _: *@This(),
-        _: std.mem.Allocator,
-        _: *semantic.Scope,
+        self: *@This(),
+        allocator: std.mem.Allocator,
+        scope: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
+        const object_type = try self.object.resolveType(allocator, scope) orelse return null;
+
+        if (std.mem.eql(u8, self.member.name, "?")) {
+            return switch (object_type.*) {
+                .optional => |optional| optional.child,
+                else => null,
+            };
+        }
+
         return null;
     }
 };

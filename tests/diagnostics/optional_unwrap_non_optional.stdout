@@ -1,0 +1,5 @@
+[error]: tests/diagnostics/optional_unwrap_non_optional.rn:2:9: optional unwrap requires an optional value
+   1:const value = 1
+   2:echo "${value.?}"
+   3:
+

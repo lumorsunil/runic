@@ -152,6 +152,15 @@ echo "${maybe_count orelse 9}"
 
 **Result:** `?String` and `?Int` hold either a concrete value or `null`. `orelse` evaluates to the left-hand value when present and to the right-hand expression when the left side is `null`.
 
+When you want a strict unwrap, use postfix `.?` to extract the payload from an optional value.
+
+```rn
+const maybe_name: ?String = "runic"
+echo "${maybe_name.?}"
+```
+
+**Result:** `maybe_name.?` evaluates to the inner `String`. Applying `.?` to a non-optional value is rejected during checking.
+
 Optionals also integrate with `if` capture clauses. When the condition is an optional, `if (value) |inner| ...` enters the then branch only when the optional is non-`null`, and `inner` is bound to the unwrapped payload inside that branch.
 
 ```rn

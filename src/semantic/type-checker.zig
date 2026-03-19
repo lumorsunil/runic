@@ -932,6 +932,21 @@ pub const TypeChecker = struct {
             return error.MemberObjectTypeUndefined;
         };
 
+        if (std.mem.eql(u8, member.member.name, "?")) {
+            return switch (object_type.*) {
+                .optional => {},
+                else => {
+                    try self.reportSpanError(
+                        member.span,
+                        Error.UnsupportedMemberAccess,
+                        .@"error",
+                        "optional unwrap requires an optional value",
+                        .{},
+                    );
+                },
+            };
+        }
+
         switch (object_type.*) {
             .failed => {},
             .identifier => return error.UnresolvedTypeLiteral,

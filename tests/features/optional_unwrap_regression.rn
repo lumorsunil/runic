@@ -1,0 +1,8 @@
+const maybe_name: ?String = "runic"
+echo "${maybe_name.?}"
+
+var maybe_count: ?Int = 9
+echo "${maybe_count.?}"
+
+maybe_count = 11
+echo "${maybe_count.?}"

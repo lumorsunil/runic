@@ -1771,6 +1771,10 @@ pub const IRCompiler = struct {
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
+        if (std.mem.eql(u8, member.member.name, "?")) {
+            return self.compileOptionalUnwrap(source, member.object);
+        }
+
         const object = try self.compileExpression(member.object);
         const object_type = object.typeExpr() orelse {
             try self.reportSourceError(
@@ -1886,6 +1890,56 @@ pub const IRCompiler = struct {
                 .type_expr = field_.type_expr,
             },
         ));
+    }
+
+    fn compileOptionalUnwrap(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        object_expr: *ast.Expression,
+    ) Error!Result {
+        const object_ref = try self.newRef(source, "optional_unwrap_object");
+        const object = try self.compileStableExpressionIntoRef(source, object_expr, object_ref);
+
+        const object_type = object.typeExpr() orelse {
+            try self.reportSourceError(
+                source,
+                Error.UnsupportedExpression,
+                .@"error",
+                "optional unwrap requires an optional value",
+                .{},
+            );
+            return .fromValue(.void);
+        };
+
+        const child_type = switch (object_type) {
+            .optional => |optional| optional.child.*,
+            else => {
+                try self.reportSourceError(
+                    source,
+                    Error.UnsupportedExpression,
+                    .@"error",
+                    "optional unwrap requires an optional value",
+                    .{},
+                );
+                return .fromValue(.void);
+            },
+        };
+
+        const is_null_ref = try self.newRef(source, "optional_unwrap_is_null");
+        try self.cmp(
+            source,
+            .equal,
+            .from(object_ref.dereference()),
+            .fromValue(.null),
+            is_null_ref,
+        );
+
+        const after_addr = try self.newLabel("optional_unwrap_after", .unknown);
+        try self.jmp(source, try .from(is_null_ref.dereference()), false, after_addr);
+        try self.exit_(source, .fromValue(.fromBoolean(false)));
+        try self.setLabel(after_addr.local_addr.label, .abs);
+
+        return .from(object_ref.dereference().typed(child_type));
     }
 
     fn compileMemberBinary(
