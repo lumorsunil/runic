@@ -25,6 +25,7 @@ them with the CLI to validate behavior, e.g.
 
 Notable current coverage includes:
 - `tests/features/env_vars_regression.rn` for mutable env-backed globals, child-process inheritance, and subshell-local environment updates.
+- `tests/features/optional_regression.rn` for `?T`, `null`, and `orelse`.
 - `tests/features/subshell_regression.rn` for subshell cwd isolation and captured command output.
 
 ```

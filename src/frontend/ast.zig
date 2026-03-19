@@ -154,6 +154,7 @@ pub const TypeExpr = union(enum) {
     float: PrimitiveType,
     boolean: PrimitiveType,
     byte: PrimitiveType,
+    null: PrimitiveType,
     execution: PrimitiveType,
     thread: PrimitiveType,
     failed: FailedType,
@@ -448,6 +449,7 @@ pub const TypeExpr = union(enum) {
             .float,
             .boolean,
             .byte,
+            .null,
             .execution,
             .thread,
             .module,
@@ -497,6 +499,9 @@ pub const TypeExpr = union(enum) {
             },
             .byte => {
                 try writer.writeAll("Byte");
+            },
+            .null => {
+                try writer.writeAll("Null");
             },
             .execution => {
                 try writer.writeAll("Execution");
@@ -569,16 +574,13 @@ pub const Literal = union(enum) {
             .integer => .{ .integer = .{ .span = self.span() } },
             .float => .{ .float = .{ .span = self.span() } },
             .bool => .{ .boolean = .{ .span = self.span() } },
+            .null => .{ .null = .{ .span = self.span() } },
             .string => brk: {
                 const element = try allocator.create(TypeExpr);
                 element.* = .{ .byte = .{ .span = self.span() } };
                 break :brk .{
                     .array = .{ .element = element, .span = self.span() },
                 };
-            },
-            else => {
-                allocator.destroy(type_expr);
-                return null;
             },
         };
 
@@ -812,11 +814,25 @@ pub const BinaryExpr = struct {
     span: Span,
 
     pub fn resolveType(
-        _: *@This(),
-        _: std.mem.Allocator,
-        _: *semantic.Scope,
+        self: *@This(),
+        allocator: std.mem.Allocator,
+        scope: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
-        return null;
+        const left_type = try self.left.resolveType(allocator, scope);
+        const right_type = try self.right.resolveType(allocator, scope);
+
+        return switch (self.op) {
+            .assign, .add_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign => left_type,
+            .@"orelse" => blk: {
+                if (left_type) |lt| switch (lt.*) {
+                    .optional => |optional| break :blk optional.child,
+                    .null => break :blk right_type,
+                    else => break :blk null,
+                };
+                break :blk right_type;
+            },
+            else => left_type,
+        };
     }
 };
 
@@ -836,6 +852,7 @@ pub const BinaryOp = enum {
     equal,
     logical_and,
     logical_or,
+    @"orelse",
     /// (Stream(T) | fn Stream(T) (...Args) Stream(E!U)) : Stream(E!U)
     /// (Stream(E1!T) | fn Stream(T) (...Args) Stream(E2!U)) : Stream(E1||E2!U)
     /// (Stream(E1||E2!U) || do_something_else) : Stream(U)
@@ -868,6 +885,7 @@ pub const BinaryOp = enum {
             .equal => 15,
             .logical_and => 10,
             .logical_or => 5,
+            .@"orelse" => 4,
             .pipe => 50,
             .apply => 70,
             .member => 90,
@@ -899,6 +917,7 @@ pub const BinaryOp = enum {
             .amp_amp => .logical_and,
             .kw_or => .logical_or,
             .pipe_pipe => .logical_or,
+            .kw_orelse => .@"orelse",
             .equal_equal => .equal,
             .pipe => .pipe,
             .dot => .member,

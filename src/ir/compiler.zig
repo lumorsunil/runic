@@ -1089,6 +1089,7 @@ pub const IRCompiler = struct {
                                     null,
                                     identifier,
                                     value,
+                                    param.type_annotation,
                                     false,
                                     .normal,
                                 );
@@ -1105,6 +1106,7 @@ pub const IRCompiler = struct {
                                         null,
                                         identifier,
                                         .fromValue(value),
+                                        param.type_annotation,
                                         false,
                                         .normal,
                                     );
@@ -1126,6 +1128,7 @@ pub const IRCompiler = struct {
                     null,
                     .{ .name = entry.key_ptr.*, .span = .global },
                     .fromValue(value),
+                    null,
                     true,
                     .env_var,
                 );
@@ -1320,6 +1323,7 @@ pub const IRCompiler = struct {
             source,
             binding_decl.pattern,
             binding_decl.initializer,
+            binding_decl.annotation,
             binding_decl.is_mutable,
         );
     }
@@ -1329,6 +1333,7 @@ pub const IRCompiler = struct {
         source: anytype,
         pattern: *ast.BindingPattern,
         expr: *ast.Expression,
+        annotation: ?*const ast.TypeExpr,
         is_mutable: bool,
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
@@ -1340,7 +1345,14 @@ pub const IRCompiler = struct {
             },
             .identifier => |identifier| {
                 const result = try self.compileExpressionWithCapture(source, expr);
-                try self.compileIdentifierBinding(source, identifier, result.source, is_mutable, .normal);
+                try self.compileIdentifierBinding(
+                    source,
+                    identifier,
+                    result.source,
+                    annotation,
+                    is_mutable,
+                    .normal,
+                );
                 return .fromValue(.void);
             },
             else => {
@@ -1361,6 +1373,7 @@ pub const IRCompiler = struct {
         source: anytype,
         identifier: ast.Identifier,
         value: ir.ValueSource,
+        annotation: ?*const ast.TypeExpr,
         is_mutable: bool,
         kind: Scope.Binding.Kind,
     ) Error!void {
@@ -1372,11 +1385,16 @@ pub const IRCompiler = struct {
         }
 
         var result: Result = .{ .source = value };
+        const annotated_type = if (annotation) |ann| ann.* else null;
 
         if (result.source.isRegister(.r)) {
             const result_ref = try self.newRef(source, "identifier_ref");
             try self.set(source, result_ref, .fromLocation(.initRegister(.r)));
-            result = try .from(result_ref.dereference().typed(value.typeExpr()));
+            result = try .from(result_ref.dereference().typed(annotated_type orelse value.typeExpr()));
+        } else if (annotated_type != null and result.typeExpr() == null) {
+            const result_ref = try self.newRef(source, "identifier_ref");
+            try self.set(source, result_ref, value);
+            result = try .from(result_ref.dereference().typed(annotated_type));
         }
         if (is_mutable) {
             try self.compileMutableVariable(source, identifier, result.source, kind);
@@ -1721,11 +1739,8 @@ pub const IRCompiler = struct {
             .integer => |integer| .from(try parseInt(integer.text)),
             .float => |float| .from(try parseFloat(float.text)),
             .bool => |boolean| .fromValue(.{ .exit_code = .fromBoolean(boolean.value) }),
+            .null => .fromValue(.null),
             .string => |string| self.compileStringLiteral(source, string),
-            else => {
-                try self.reportSourceError(source, Error.UnsupportedLiteral, .@"error", "literal type \"{t}\" not yet supported", .{literal});
-                return .fromValue(.void);
-            },
         };
     }
 
@@ -2166,7 +2181,7 @@ pub const IRCompiler = struct {
             .value => |v| switch (v) {
                 .executable => self.compileExecutableCall(source, v, call.arguments, call.redirects),
                 .fn_ref => self.compileFunctionCall(source, v, call.arguments),
-                .slice, .stream, .addr, .void, .uinteger, .float, .strct, .exit_code, .pipe, .thread, .closeable => .from(v),
+                .slice, .stream, .addr, .void, .null, .uinteger, .float, .strct, .exit_code, .pipe, .thread, .closeable => .from(v),
                 .zig_string => Error.UnsupportedValueType,
             },
             .location => |loc| .from(loc),
@@ -2681,7 +2696,7 @@ pub const IRCompiler = struct {
         );
         const identifier = ast.Identifier.global(name);
         self.result_counter += 1;
-        try self.compileIdentifierBinding(source, identifier, value, true, .normal);
+        try self.compileIdentifierBinding(source, identifier, value, null, true, .normal);
         return identifier;
     }
 
@@ -3262,6 +3277,9 @@ pub const IRCompiler = struct {
             .logical_and, .logical_or => {
                 return self.compileLogicalBinary(source, binary, .value);
             },
+            .@"orelse" => {
+                return self.compileOrelseBinary(source, binary);
+            },
             .greater, .greater_equal, .less, .less_equal, .equal, .not_equal => {
                 const left = try self.compileExpression(binary.left);
                 const right = try self.compileExpression(binary.right);
@@ -3566,6 +3584,56 @@ pub const IRCompiler = struct {
         return .fromValue(.void);
     }
 
+    fn compileOrelseBinary(
+        self: *IRCompiler,
+        source: anytype,
+        binary: ast.BinaryExpr,
+    ) Error!Result {
+        const left_is_literal_null = binary.left.* == .literal and binary.left.literal == .null;
+        const result_ref = try self.newRef(source, "orelse_result");
+        const left = try self.compileStableExpressionIntoRef(source, binary.left, result_ref);
+
+        const result_type = if (left_is_literal_null or left.source.isValueTag(.null)) null else if (left.typeExpr()) |left_type| switch (left_type) {
+            .optional => |optional| optional.child.*,
+            .null => null,
+            else => {
+                try self.reportSourceError(
+                    source,
+                    Error.UnsupportedBinaryOperation,
+                    .@"error",
+                    "left side of orelse must be an optional",
+                    .{},
+                );
+                return .fromValue(.void);
+            },
+        } else null;
+
+        if (left_is_literal_null or left.source.isValueTag(.null)) {
+            const right = try self.compileStableExpressionIntoRef(source, binary.right, result_ref);
+            return .from(result_ref.dereference().typed(result_type orelse right.typeExpr()));
+        }
+
+        if (left.source == .value) {
+            return .from(result_ref.dereference().typed(result_type orelse left.typeExpr()));
+        }
+
+        const is_null_ref = try self.newRef(source, "orelse_is_null");
+        try self.cmp(
+            source,
+            .equal,
+            .from(result_ref.dereference()),
+            .fromValue(.null),
+            is_null_ref,
+        );
+
+        const after_addr = try self.newLabel("orelse_after", .unknown);
+        try self.jmp(source, try .from(is_null_ref.dereference()), false, after_addr);
+        const right = try self.compileStableExpressionIntoRef(source, binary.right, result_ref);
+        try self.setLabel(after_addr.local_addr.label, .abs);
+
+        return .from(result_ref.dereference().typed(result_type orelse right.typeExpr()));
+    }
+
     fn compileForBindingValue(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -3607,6 +3675,7 @@ pub const IRCompiler = struct {
             source,
             binding,
             .from(capture_ref.dereference().typed(for_source.value_type)),
+            null,
             false,
             .normal,
         );

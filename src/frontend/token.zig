@@ -176,6 +176,7 @@ pub const Tag = enum {
     kw_true,
     kw_false,
     kw_null,
+    kw_orelse,
 
     // Operators / punctuation
     plus,
@@ -253,6 +254,7 @@ pub const Tag = enum {
             .kw_true => "true",
             .kw_false => "false",
             .kw_null => "null",
+            .kw_orelse => "orelse",
             else => null,
         };
     }
@@ -293,6 +295,7 @@ const keyword_map = std.StaticStringMap(Tag).initComptime(.{
     .{ "true", .kw_true },
     .{ "false", .kw_false },
     .{ "null", .kw_null },
+    .{ "orelse", .kw_orelse },
     .{ "and", .kw_and },
     .{ "or", .kw_or },
 });

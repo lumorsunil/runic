@@ -511,7 +511,32 @@ pub const TypeChecker = struct {
 
         return switch (type_expr.*) {
             .identifier => |*identifier| self.resolveTypeIdentifierToAlias(scope, identifier),
-            else => return error.UnsupportedTypeResolve,
+            .optional => |optional| try self.allocTypeExpression(.{
+                .optional = .{
+                    .child = try self.resolveTypeExpr(scope, optional.child),
+                    .span = optional.span,
+                },
+            }),
+            .promise => |promise| try self.allocTypeExpression(.{
+                .promise = .{
+                    .child = try self.resolveTypeExpr(scope, promise.child),
+                    .span = promise.span,
+                },
+            }),
+            .error_union => |error_union| try self.allocTypeExpression(.{
+                .error_union = .{
+                    .err_set = try self.resolveTypeExpr(scope, error_union.err_set),
+                    .payload = try self.resolveTypeExpr(scope, error_union.payload),
+                    .span = error_union.span,
+                },
+            }),
+            .array => |array| try self.allocTypeExpression(.{
+                .array = .{
+                    .element = try self.resolveTypeExpr(scope, array.element),
+                    .span = array.span,
+                },
+            }),
+            else => type_expr,
         };
     }
 
@@ -693,9 +718,15 @@ pub const TypeChecker = struct {
             .identifier => |*identifier| self.runTypeIdentifier(scope, identifier),
             .alias => |*alias| self.runTypeAlias(alias),
             .failed => {},
-            .integer, .float, .boolean, .byte => {},
+            .void, .integer, .float, .boolean, .byte, .null, .execution, .thread => {},
+            .optional, .promise => |prefix| try self.runTypeExpression(scope, prefix.child),
+            .error_union => |error_union| {
+                try self.runTypeExpression(scope, error_union.err_set);
+                try self.runTypeExpression(scope, error_union.payload);
+            },
+            .error_set, .err => {},
             .array => |*array| self.runTypeArray(scope, array),
-            else => return error.UnsupportedTypeExpression,
+            .struct_type, .module, .tuple, .function => {},
         };
     }
 
@@ -808,6 +839,27 @@ pub const TypeChecker = struct {
         const left_type = maybe_left_type orelse return;
         const right_type = maybe_right_type orelse return;
 
+        if (binary.op == .@"orelse") {
+            switch (left_type.*) {
+                .optional => |optional| try self.validateTypeAssignment(
+                    optional.child,
+                    right_type,
+                    .{ .span = right_type.span() },
+                ),
+                .null => {},
+                else => {
+                    try self.reportSpanError(
+                        binary.left.span(),
+                        Error.TypeMismatch,
+                        .@"error",
+                        "left side of orelse must be an optional or null",
+                        .{},
+                    );
+                },
+            }
+            return;
+        }
+
         if (binary.op.isAssignment()) {
             try self.validateTypeAssignment(left_type, right_type, .{ .span = right_type.span() });
         }
@@ -827,7 +879,7 @@ pub const TypeChecker = struct {
             .identifier => return error.UnresolvedTypeLiteral,
             .optional => return error.MemberAccessOnOptional,
             .array => |array| try self.runArrayMemberAccess(array, &member.member),
-            .promise, .error_union, .error_set, .err, .struct_type, .tuple, .function, .integer, .float, .boolean, .byte, .alias, .thread, .void => return error.UnsupportedMemberAccess,
+            .null, .promise, .error_union, .error_set, .err, .struct_type, .tuple, .function, .integer, .float, .boolean, .byte, .alias, .thread, .void => return error.UnsupportedMemberAccess,
             .module => |module| try self.runModuleMemberAccess(module, &member.member),
             .execution => |execution| try self.runExecutionMemberAccess(execution, &member.member),
             // .lazy => {
@@ -1200,6 +1252,11 @@ pub const TypeChecker = struct {
                 assignment_type,
                 options,
             ),
+            .null => |*null_| self.validateTypeAssignmentNull(
+                null_,
+                assignment_type,
+                options,
+            ),
             .byte => |*byte| self.validateTypeAssignmentByte(
                 byte,
                 assignment_type,
@@ -1295,8 +1352,27 @@ pub const TypeChecker = struct {
                 optional.child,
                 options,
             ),
+            .null => return,
             else => try self.validateTypeAssignment(assignee.child, assignment_type, options),
         }
+    }
+
+    pub fn validateTypeAssignmentNull(
+        self: *TypeChecker,
+        assignee: *const ast.TypeExpr.PrimitiveType,
+        assignment_type: *const ast.TypeExpr,
+        options: ValidateTypeAssignmentOptions,
+    ) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.logTypeCheckTrace(@src().fn_name, assignment_type.span());
+
+        if (assignment_type.* == .null) return;
+
+        try self.reportAssignmentError(
+            @as(*const ast.TypeExpr, @fieldParentPtr("null", assignee)),
+            assignment_type,
+            options,
+        );
     }
 
     pub fn validateTypeAssignmentPromise(

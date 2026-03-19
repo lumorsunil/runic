@@ -1,0 +1,11 @@
+const maybe_name: ?String = null
+echo "${maybe_name orelse "fallback"}"
+
+var maybe_count: ?Int = 7
+echo "${maybe_count orelse 9}"
+
+maybe_count = null
+echo "${maybe_count orelse 9}"
+
+const direct_fallback = null orelse "from null"
+echo "${direct_fallback}"

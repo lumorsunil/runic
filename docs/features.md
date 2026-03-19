@@ -14,7 +14,7 @@ echo "hello world" | upper
 
 ## Strong, predictable data semantics
 
-Variables are typed, immutable by default, and only change through explicit `mut` declarations. Arrays and maps use literal syntax that sidesteps legacy word-splitting quirks.
+Variables are typed, immutable by default, and only change through explicit `var` declarations. Arrays and maps use literal syntax that sidesteps legacy word-splitting quirks.
 
 ```rn
 const greeting = "hello"
@@ -137,19 +137,20 @@ fn read_config(path: Str) FileError!Config {
 
 ### Optional data that behaves like Zig
 
-Any type can be wrapped in an optional using Zig-style `?T` syntax, and `null` denotes the absence of a value. Optionals participate in control flow: `if` automatically unwraps them and exposes the value to a capture clause that only runs when the optional contains data.
+Any type can be wrapped in an optional using Zig-style `?T` syntax, and `null` denotes the absence of a value. Use `orelse` to provide a fallback value when an optional is empty.
 
 ```rn
-const maybe_port = env.get("PORT") // returns ?Int
+const maybe_name: ?String = null
+echo "${maybe_name orelse "fallback"}"
 
-if (maybe_port) |port| {
-  echo "Running on port ${port}"
-} else {
-  echo "Falling back to default"
-}
+var maybe_count: ?Int = 7
+echo "${maybe_count orelse 9}"
+
+maybe_count = null
+echo "${maybe_count orelse 9}"
 ```
 
-**Result:** Optional-aware `if` statements unwrap the value only within the `|port|` block, preventing accidental use outside the scope, while the `else` branch covers the `null` case explicitly.
+**Result:** `?String` and `?Int` hold either a concrete value or `null`. `orelse` evaluates to the left-hand value when present and to the right-hand expression when the left side is `null`.
 
 ### Promises as native asynchronous values
 

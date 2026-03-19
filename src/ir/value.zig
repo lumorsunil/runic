@@ -12,6 +12,7 @@ const InstructionAddr = @import("instruction-addr.zig").InstructionAddr;
 
 pub const Value = union(enum) {
     void,
+    null,
     uinteger: usize,
     // TODO: decide on f32 or f64?
     float: f64,
@@ -44,7 +45,7 @@ pub const Value = union(enum) {
 
     pub fn deinit(self: *@This(), allocator: Allocator) void {
         switch (self.*) {
-            .void, .location, .uinteger, .slice, .executable, .exit_code, .addr, .thread => {},
+            .void, .null, .location, .uinteger, .slice, .executable, .exit_code, .addr, .thread => {},
             .strct => |strct| strct.deinit(allocator),
             .stream => |stream| allocator.free(stream),
         }

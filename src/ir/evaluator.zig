@@ -1121,6 +1121,24 @@ pub const IREvaluator = struct {
         right: ir.ValueSource,
     ) ?ir.Value {
         return switch (op) {
+            .eq => {
+                if (left.isValueTag(.null) or right.isValueTag(.null)) {
+                    return .fromBoolean(left.isValueTag(.null) and right.isValueTag(.null));
+                }
+                if (left.toFloat()) |l| if (right.toFloat()) |r| {
+                    return .fromBoolean(l == r);
+                };
+                return null;
+            },
+            .ne => {
+                if (left.isValueTag(.null) or right.isValueTag(.null)) {
+                    return .fromBoolean(left.isValueTag(.null) != right.isValueTag(.null));
+                }
+                if (left.toFloat()) |l| if (right.toFloat()) |r| {
+                    return .fromBoolean(l != r);
+                };
+                return null;
+            },
             .gt => {
                 if (left.toFloat()) |l| if (right.toFloat()) |r| {
                     return .fromBoolean(l > r);
@@ -1142,18 +1160,6 @@ pub const IREvaluator = struct {
             .lte => {
                 if (left.toFloat()) |l| if (right.toFloat()) |r| {
                     return .fromBoolean(l <= r);
-                };
-                return null;
-            },
-            .eq => {
-                if (left.toFloat()) |l| if (right.toFloat()) |r| {
-                    return .fromBoolean(l == r);
-                };
-                return null;
-            },
-            .ne => {
-                if (left.toFloat()) |l| if (right.toFloat()) |r| {
-                    return .fromBoolean(l != r);
                 };
                 return null;
             },
@@ -1307,6 +1313,7 @@ pub const IREvaluator = struct {
                     try w.writeAll(pipe.buffer_writer.written());
                 }
             },
+            .null => try w.writeAll("null"),
             .void, .strct, .thread, .closeable, .fn_ref => {},
         }
     }

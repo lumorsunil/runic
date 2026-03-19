@@ -641,6 +641,7 @@ pub const Parser = struct {
         int: ast.IntegerLiteral,
         float: ast.FloatLiteral,
         boolean: ast.BoolLiteral,
+        null: ast.NullLiteral,
         string: ast.StringLiteral,
         array: ast.ArrayLiteral,
 
@@ -650,6 +651,7 @@ pub const Parser = struct {
                 .float_literal => .{ .float = .{ .text = tok.lexeme, .span = tok.span } },
                 .kw_true => .{ .boolean = .{ .value = true, .span = tok.span } },
                 .kw_false => .{ .boolean = .{ .value = false, .span = tok.span } },
+                .kw_null => .{ .null = .{ .span = tok.span } },
                 else => @panic("shouldn't happen :)"),
             };
         }
@@ -664,6 +666,9 @@ pub const Parser = struct {
                 }),
                 .boolean => |boolean| parser.allocExpression(.{
                     .literal = .{ .bool = boolean },
+                }),
+                .null => |null_| parser.allocExpression(.{
+                    .literal = .{ .null = null_ },
                 }),
                 .string => |string| parser.allocExpression(.{
                     .literal = .{ .string = string },
@@ -805,7 +810,7 @@ pub const Parser = struct {
                             });
                             continue;
                         },
-                        .int_literal, .float_literal, .kw_true, .kw_false => {
+                        .int_literal, .float_literal, .kw_true, .kw_false, .kw_null => {
                             const breadcrumbInner = try self.createBreadcrumb("PBE:literal");
                             defer breadcrumbInner.end();
                             try components.append(self.allocator, .{
@@ -838,7 +843,7 @@ pub const Parser = struct {
                 },
                 .op => {
                     switch (next.tag) {
-                        .equal_equal, .bang_equal, .greater, .append_redirect, .redirect_fd, .greater_equal, .less, .less_equal, .plus, .minus, .star, .slash, .percent, .kw_and, .kw_or, .pipe_pipe, .amp_amp, .pipe, .dot, .assign, .plus_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign => {
+                        .equal_equal, .bang_equal, .greater, .append_redirect, .redirect_fd, .greater_equal, .less, .less_equal, .plus, .minus, .star, .slash, .percent, .kw_and, .kw_or, .kw_orelse, .pipe_pipe, .amp_amp, .pipe, .dot, .assign, .plus_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign => {
                             const breadcrumbInner = try self.createBreadcrumb("PBE:op");
                             defer breadcrumbInner.end();
                             try components.append(self.allocator, .{
@@ -2421,7 +2426,7 @@ pub const Parser = struct {
             // .kw_error => self.parseErrorTypeExpr(),
             .l_bracket => self.parseArrayTypeExpr(),
             // .caret => self.parsePromiseTypeExpr(),
-            // .question => self.parseOptionalTypeExpr(),
+            .question => self.parseOptionalTypeExpr(),
             .l_paren => {
                 _ = try self.nextToken();
                 const type_expr = try self.parseTypeExpr();
@@ -2430,6 +2435,19 @@ pub const Parser = struct {
             },
             else => null,
         };
+    }
+
+    fn parseOptionalTypeExpr(self: *Self) Error!*const ast.TypeExpr {
+        const question = try self.expectTokenTag(.question);
+        const child = try self.parseTypeExpr();
+        const type_expr = try self.arena.allocator().create(ast.TypeExpr);
+        type_expr.* = .{
+            .optional = .{
+                .child = child,
+                .span = token.Span.fromTo(question.span, child.span()),
+            },
+        };
+        return type_expr;
     }
 
     fn parseTypeExpr(self: *Self) Error!*const ast.TypeExpr {
