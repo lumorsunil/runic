@@ -1528,6 +1528,7 @@ pub const IRCompiler = struct {
             .call => |call| self.compileCall(expr, call),
             .member => |member| self.compileMember(expr, member),
             .if_expr => |if_expr| self.compileIf(expr, if_expr),
+            .match_expr => |match_expr| self.compileMatch(expr, match_expr),
             .pipeline => |pipeline| self.compilePipeline(expr, pipeline),
             .block => |block| self.compileBlock(expr, block),
             .fn_decl => |fn_decl| self.compileFnDecl(expr, fn_decl),
@@ -3237,6 +3238,105 @@ pub const IRCompiler = struct {
         return result;
     }
 
+    fn mergeResultTypes(
+        self: *IRCompiler,
+        current: ?ast.TypeExpr,
+        next: Result,
+    ) ?ast.TypeExpr {
+        _ = self;
+        const next_type = next.typeExpr() orelse return null;
+        const current_type = current orelse return next_type;
+        if (std.meta.eql(current_type, next_type)) return current_type;
+        return null;
+    }
+
+    fn compileMatch(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        match_expr: ast.MatchExpr,
+    ) Error!Result {
+        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        if (match_expr.cases.len == 0) {
+            try self.reportSourceError(
+                source,
+                Error.UnsupportedExpression,
+                .@"error",
+                "match requires at least one case",
+                .{},
+            );
+            return .fromValue(.void);
+        }
+
+        const subject_ref = try self.newRef(source, "match_subject");
+        _ = try self.compileStableExpressionIntoRef(source, match_expr.subject, subject_ref);
+
+        const result_ref = try self.newRef(source, "match_result");
+        const after_addr = try self.newLabel("match_after", .unknown);
+        var result_type: ?ast.TypeExpr = null;
+        var has_wildcard = false;
+
+        for (match_expr.cases, 0..) |case, i| {
+            if (case.capture != null) {
+                try self.reportSourceError(
+                    source,
+                    Error.UnsupportedExpression,
+                    .@"error",
+                    "match captures are not yet supported",
+                    .{},
+                );
+                return .fromValue(.void);
+            }
+
+            const next_case_addr = try self.newLabel(
+                try std.fmt.allocPrint(self.allocator, "match_case_next_{}", .{i}),
+                .unknown,
+            );
+
+            switch (case.pattern) {
+                .wildcard => {
+                    has_wildcard = true;
+                },
+                .literal => |literal| {
+                    const pattern = try self.compileLiteral(source, literal);
+                    const is_match_ref = try self.newRef(source, "match_case_is_match");
+                    try self.cmp(
+                        source,
+                        .equal,
+                        .from(subject_ref.dereference()),
+                        pattern.source,
+                        is_match_ref,
+                    );
+                    try self.jmp(source, .fromLocation(is_match_ref.dereference()), false, next_case_addr);
+                },
+                else => {
+                    try self.reportSourceError(
+                        source,
+                        Error.UnsupportedExpression,
+                        .@"error",
+                        "match currently supports only literal and _ patterns",
+                        .{},
+                    );
+                    return .fromValue(.void);
+                },
+            }
+
+            const case_result = try self.compileBlock(source, case.body);
+            try self.set(source, result_ref, stableResultSource(case_result));
+            result_type = self.mergeResultTypes(result_type, case_result);
+            try self.jmp(source, null, false, after_addr);
+            try self.setLabel(next_case_addr.local_addr.label, .abs);
+        }
+
+        if (!has_wildcard) {
+            try self.exit_(source, .fromValue(.fromBoolean(false)));
+        }
+
+        try self.setLabel(after_addr.local_addr.label, .abs);
+        try self.set(source, .initRegister(.r2), .from(result_ref.dereference()));
+        return .fromLocation(ir.Location.initRegister(.r2).typed(result_type));
+    }
+
     fn refLocation(self: *IRCompiler, ref_def: RefDef) ir.Location {
         return .fromRef(
             ref_def.name,
@@ -4085,6 +4185,11 @@ pub const IRCompiler = struct {
             .pipeline => .{ .needs_stdio_capture = true }, // definitely stdio-heavy
             .block => .{ .needs_stdio_capture = true }, // may emit output
             .if_expr => |if_expr| self.analyzeIfExpressionEffects(if_expr),
+            .match_expr => |match_expr| brk: {
+                var result = self.analyzeExpressionEffects(match_expr.subject);
+                if (match_expr.cases.len > 0) result.needs_stdio_capture = true;
+                break :brk result;
+            },
             .binary => |binary| brk: {
                 var result = self.analyzeExpressionEffects(binary.left);
                 result.merge(self.analyzeExpressionEffects(binary.right));

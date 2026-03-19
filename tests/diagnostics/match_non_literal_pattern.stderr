@@ -1,0 +1,8 @@
+[error]: tests/diagnostics/match_non_literal_pattern.rn:4:3: match currently supports only literal and _ patterns
+   2:
+   3:echo "${match (value) {
+   4:  name => { "bad" }
+   5:  _ => { "ok" }
+   6:}}"
+   7:
+

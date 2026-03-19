@@ -1,0 +1,6 @@
+const value = 1
+
+echo "${match (value) {
+  name => { "bad" }
+  _ => { "ok" }
+}}"

@@ -25,6 +25,7 @@ them with the CLI to validate behavior, e.g.
 
 Notable current coverage includes:
 - `tests/features/env_vars_regression.rn` and `tests/features/env_var_lookup_regression.rn` for explicit `$NAME` environment access, child-process inheritance, and subshell-local environment updates.
+- `tests/features/match_regression.rn` plus `tests/diagnostics/match_non_literal_pattern.rn` for exact-value `match` and the current literal-or-`_` pattern restriction.
 - `tests/features/optional_if_capture_regression.rn` for `if (optional) |value|` capture semantics.
 - `tests/features/optional_regression.rn` for `?T`, `null`, and `orelse`.
 - `tests/features/optional_unwrap_regression.rn` plus `tests/diagnostics/optional_unwrap_non_optional.rn` for postfix `.?` unwrap semantics.

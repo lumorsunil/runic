@@ -78,7 +78,7 @@ echo "${nested}"
 
 ### Errors as first-class types
 
-Runic treats `error` the same way Zig does: it is a special type that can be declared as a simple enum when all variants are opaque or as a tagged union when each variant should carry structured data. Functions that can fail return `!T` (an error or a `T`), and callers use `try`/`catch` mechanics plus pattern matching to branch on the exact error.
+Runic treats `error` the same way Zig does: it is a special type that can be declared as a simple enum when all variants are opaque or as a tagged union when each variant should carry structured data. Functions that can fail return `!T` (an error or a `T`), and callers use `try`/`catch` mechanics to branch on failure paths explicitly.
 
 ```rn
 error NetworkError = enum { Timeout, ConnectionLost }
@@ -92,15 +92,11 @@ fn load_config() !Config {
 }
 
 const config = load_config() catch |err| {
-  match err {
-    error.FileError.NotFound => |info| echo "Missing ${info.path}"
-    error.FileError.PermissionDenied => |info| echo "Denied for ${info.user}"
-    error.NetworkError.Timeout => echo "Network timeout"
-  }
+  echo "load failed: ${err}"
 }
 ```
 
-**Result:** Error sets become inspectable data. Authors define lightweight enums for terse cases or unions when extra context matters, and downstream code can match on each variant to tailor recovery or logging without relying on string comparisons.
+**Result:** Error sets become inspectable data. Authors define lightweight enums for terse cases or unions when extra context matters, and callers can catch failures in a structured way instead of relying on string comparisons or shell exit-code conventions.
 
 #### Mandatory explicit handling
 
@@ -138,6 +134,22 @@ fn read_config(path: Str) FileError!Config {
 ```
 
 **Result:** `read_config` advertises that it can only fail with the specific file-related variants, so callers that already handle `NetworkError` or other families know they never have to match on them when invoking this function.
+
+### Exact-value `match`
+
+Runic also supports `match` as an expression for exact-value dispatch. In the current implementation, patterns are limited to literals and `_`, and the first matching case wins.
+
+```rn
+const label = match ("runic") {
+  "zig" => { "compiler" }
+  "runic" => { "shell" }
+  _ => { "unknown" }
+}
+
+echo "${label}"
+```
+
+**Result:** `label` evaluates to `shell`. Cases are tested in order, `_` acts as the fallback, and each case body is a block expression whose final value becomes the match result. Capture clauses and richer matcher forms are planned, but not available yet.
 
 ### Optional data that behaves like Zig
 

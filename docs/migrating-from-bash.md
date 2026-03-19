@@ -11,7 +11,7 @@ Runic targets bash users who want safer defaults without abandoning the command-
 ## Recommended porting workflow
 
 1. **Stage the script in `examples/` (optional).** Keeping the original and Runic versions next to each other makes diffing behavior easier while the interpreter is still evolving.
-2. **Translate declarations and control flow first.** Replace `VAR=value` with typed bindings (`let home: Str = env.HOME`) and re-express functions with `fn`. Use the explicit `if`/`for` syntax shown in `features.md`.
+2. **Translate declarations and control flow first.** Replace `VAR=value` with typed bindings and explicit env access (`const home = $HOME orelse "/tmp"` or `$HOME = "/tmp/home"`) and re-express functions with `fn`. Use the explicit `if`/`for` syntax shown in `features.md`.
 3. **Keep commands command-like.** Runic preserves the “bare words launch binaries” rule, so start by copying pipelines verbatim. When you need to transform data, pivot into expressions explicitly—`let files = ls src | lines()`—to avoid quoting pitfalls.
 4. **Handle errors intentionally.** Instead of `set -e`, rely on typed errors and `try`/`catch`. Pipelines expose rich status objects, so branch on failures instead of reading `$?`.
 5. **Convert sourced helpers into modules.** Shared functions should move into `src/<spec>.rn` with a matching `.module.json` manifest (see `docs/module_authoring.md`). Consumers can then `let helpers = import("ci/helpers")` and the loader will enforce interface contracts.
@@ -20,7 +20,7 @@ Runic targets bash users who want safer defaults without abandoning the command-
 
 ## Migration tips
 
-- Environment variables are explicit fields under an `env` namespace; e.g., `env["HOME"]` or helper APIs once the runtime lands.
+- Environment variables are explicit through `$NAME`; e.g., `$HOME orelse "/tmp"` or `$HOME = "/tmp/home"`.
 - Prefer modules over ad-hoc `source` calls. They provide typed signatures and play nicely with the loader cache.
 - Structured data literals (`[]`, `{}`) eliminate most quoting/IFS juggling. Use them early to reduce the amount of legacy shell escaping you have to reason about.
 - Pair every migration with notes in `docs/progress.md` or a commit description so the broader team understands which bash features still require interop blocks.

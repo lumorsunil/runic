@@ -1,0 +1,33 @@
+const number = 2
+echo "${match (number) {
+  1 => { "one" }
+  2 => { "two" }
+  _ => { "other" }
+}}"
+
+const word = "runic"
+echo "${match (word) {
+  "zig" => { "compiler" }
+  "runic" => { "shell" }
+  _ => { "unknown" }
+}}"
+
+echo "${match (null) {
+  null => { "nil" }
+  _ => { "not nil" }
+}}"
+
+match (true) {
+  false => {
+    echo "bad branch"
+    "no"
+  }
+  true => {
+    echo "matched branch"
+    "yes"
+  }
+  _ => {
+    echo "bad wildcard"
+    "other"
+  }
+}

@@ -548,7 +548,7 @@ fn read_config(path: Str) FileError!Config {
               </p>
               <div>
                 <div class="example-label">Example</div>
-                <pre><code class="language-rn">let maybe_port: ?Int = env.get("PORT")
+                <pre><code class="language-rn">const maybe_port: ?String = $PORT
 if (maybe_port) |port| {
   echo "Running on port ${port}"
 } else {
@@ -649,17 +649,13 @@ const vars = { greeting: greeting, total: count }</code></pre>
                 first-class types
               </h3>
               <p>
-                Model recoverable failures via typed error sets and match over
-                individual variants instead of parsing strings.
+                Model recoverable failures via typed error sets and handle them
+                explicitly with <code>catch</code> instead of parsing strings.
               </p>
               <div>
                 <div class="example-label">Example</div>
-                <pre><code class="language-rn">let config = load_config() catch |err| {
-  match err {
-    error.FileError.NotFound =&gt; |info| echo "Missing ${info.path}"
-    error.FileError.PermissionDenied =&gt; |info| echo "Denied for ${info.user}"
-    error.NetworkError.Timeout =&gt; echo "Network timeout"
-  }
+                <pre><code class="language-rn">const config = load_config() catch |err| {
+  echo "load failed: ${err}"
 }</code></pre>
               </div>
             </article>
@@ -732,7 +728,7 @@ const vars = { greeting: greeting, total: count }</code></pre>
               </p>
               <div>
                 <div class="example-label">Example</div>
-                <pre><code class="language-rn">let maybe_port = env.get("PORT")
+                <pre><code class="language-rn">const maybe_port = $PORT
 if (maybe_port) |port| {
   echo "Running on port ${port}"
 } else {

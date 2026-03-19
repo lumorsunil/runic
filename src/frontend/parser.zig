@@ -485,6 +485,7 @@ pub const Parser = struct {
             .identifier => self.parseIdentifierExpression(),
             .kw_if => self.parseIfExpression(),
             .kw_for => self.parseForExpression(),
+            .kw_match => self.parseMatchExpression(),
             else => {
                 if (try self.parseMaybeUnaryExpression()) |unary_expr| return unary_expr;
                 if (try self.parseMaybeBinaryExpression()) |binary_expr| return binary_expr;
@@ -1563,6 +1564,99 @@ pub const Parser = struct {
                 .span = for_tok.span.endAt(body.span()),
             },
         });
+    }
+
+    fn parseMatchExpression(self: *Self) Error!*ast.Expression {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const match_tok = try self.expect(.kw_match);
+        _ = try self.expect(.l_paren);
+        const subject = try self.parseExpression();
+        _ = try self.expect(.r_paren);
+        _ = try self.expect(.l_brace);
+        self.skipNewlines();
+
+        var cases = std.ArrayList(ast.MatchCase).empty;
+        defer cases.deinit(self.allocator);
+
+        while (true) {
+            self.skipNewlines();
+            const next = try self.peekToken();
+            if (next.tag == .r_brace) {
+                const close = try self.nextToken();
+                return self.allocExpression(.{
+                    .match_expr = .{
+                        .subject = subject,
+                        .cases = try self.copyToArena(ast.MatchCase, cases.items),
+                        .span = match_tok.span.endAt(close.span),
+                    },
+                });
+            }
+
+            try cases.append(self.allocator, try self.parseMatchCase());
+            self.skipNewlines();
+
+            const delimiter = try self.peekToken();
+            if (delimiter.tag == .comma) {
+                _ = try self.nextToken();
+            }
+        }
+    }
+
+    fn parseMatchCase(self: *Self) Error!ast.MatchCase {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const pattern = try self.parseMatchPattern();
+        _ = try self.expect(.fat_arrow);
+        const capture = try self.parseOptionalCaptureClause();
+        const body = try self.parseBlock();
+
+        return .{
+            .pattern = pattern,
+            .capture = capture,
+            .body = body,
+            .span = pattern.span().endAt(body.span),
+        };
+    }
+
+    fn parseMatchPattern(self: *Self) Error!ast.MatchPattern {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const tok = try self.peekToken();
+        return switch (tok.tag) {
+            .identifier => blk: {
+                const identifier_tok = try self.nextToken();
+                if (identifier_tok.lexeme.len == 1 and identifier_tok.lexeme[0] == '_') {
+                    break :blk .{ .wildcard = identifier_tok.span };
+                }
+                break :blk .{ .binding = .fromToken(identifier_tok) };
+            },
+            .string_start => .{ .literal = .{ .string = try self.parseStringLiteral() } },
+            .kw_null => blk: {
+                const null_tok = try self.nextToken();
+                break :blk .{ .literal = .{ .null = .{ .span = null_tok.span } } };
+            },
+            .kw_true => blk: {
+                const true_tok = try self.nextToken();
+                break :blk .{ .literal = .{ .bool = .{ .value = true, .span = true_tok.span } } };
+            },
+            .kw_false => blk: {
+                const false_tok = try self.nextToken();
+                break :blk .{ .literal = .{ .bool = .{ .value = false, .span = false_tok.span } } };
+            },
+            .int_literal => blk: {
+                const int_tok = try self.nextToken();
+                break :blk .{ .literal = .{ .integer = .{ .text = int_tok.lexeme, .span = int_tok.span } } };
+            },
+            .float_literal => blk: {
+                const float_tok = try self.nextToken();
+                break :blk .{ .literal = .{ .float = .{ .text = float_tok.lexeme, .span = float_tok.span } } };
+            },
+            else => self.failExpectedTokens(tok.tag, &.{ .identifier, .string_start, .kw_null, .kw_true, .kw_false, .int_literal, .float_literal }),
+        };
     }
 
     fn parseForSources(self: *Self) Error![]const *ast.Expression {

@@ -697,6 +697,7 @@ pub const TypeChecker = struct {
             .block => |*block| self.runBlockInNewScope(scope, block),
             .if_expr => |*if_expr| self.runIfExpr(scope, if_expr),
             .for_expr => |*for_expr| self.runForExpr(scope, for_expr),
+            .match_expr => |*match_expr| self.runMatchExpr(scope, match_expr),
             .import_expr => |*import_expr| self.runImportExpr(scope, import_expr),
             .fn_decl => |*fn_decl| self.runFnDecl(scope, fn_decl),
             .call => |*call| self.runCall(scope, call),
@@ -784,6 +785,43 @@ pub const TypeChecker = struct {
         }
 
         try self.runExpression(for_scope, for_expr.body);
+    }
+
+    pub fn runMatchExpr(self: *TypeChecker, scope: *Scope, match_expr: *ast.MatchExpr) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.logTypeCheckTrace(@src().fn_name, match_expr.span);
+
+        try self.runExpression(scope, match_expr.subject);
+
+        for (match_expr.cases) |case| {
+            if (case.capture != null) {
+                try self.reportSpanError(
+                    case.span,
+                    Error.UnsupportedExpression,
+                    .@"error",
+                    "match captures are not yet supported",
+                    .{},
+                );
+                continue;
+            }
+
+            try switch (case.pattern) {
+                .wildcard => {},
+                .literal => |*literal| self.runLiteral(scope, @constCast(literal)),
+                else => {
+                    try self.reportSpanError(
+                        case.pattern.span(),
+                        Error.UnsupportedExpression,
+                        .@"error",
+                        "match currently supports only literal and _ patterns",
+                        .{},
+                    );
+                    continue;
+                },
+            };
+
+            try self.runBlockInNewScope(scope, @constCast(&case.body));
+        }
     }
 
     pub fn runIfExpr(self: *TypeChecker, scope: *Scope, if_expr: *ast.IfExpr) Error!void {

@@ -74,11 +74,11 @@ A working parser, type checker, and IR-based runtime are in place. The following
 - Process handle access (`.stdout`, `.stderr`, `.status.ok`, `.status.exit_code`)
 - File redirection (`>`, `>>`) and stream capture (`1>var`, `2>var`)
 - Builtin `cd` with subshell-local working-directory updates
-- Environment-backed globals with mutable updates scoped to the current subshell
+- Explicit environment access via `$NAME`, with mutable updates scoped to the current subshell
 - Optional types via `?T`, `null`, `orelse`, `.?`, and captured `if` unwrapping
 - `bash { ... }` compatibility blocks
 - Script argument handling via the `@` entry-point function
-- Error declarations (`error Foo = enum/union`), `try`/`catch`, `match`
+- Error declarations (`error Foo = enum/union`), `try`/`catch`, and exact-value `match`
 - `async`/`await` and background processes (`&`)
 - Module imports via `import "spec"`
 
