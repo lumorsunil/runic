@@ -1,0 +1,32 @@
+const RUNIC_ENV_LOOKUP_TEST = "binding"
+echo "${RUNIC_ENV_LOOKUP_TEST}"
+echo "${$RUNIC_ENV_LOOKUP_TEST orelse "missing"}"
+
+if ($RUNIC_ENV_LOOKUP_TEST) |value| {
+  echo "bad capture=${value}"
+} else {
+  echo "missing capture"
+}
+
+$RUNIC_ENV_LOOKUP_TEST = "present"
+echo "${RUNIC_ENV_LOOKUP_TEST}"
+echo "${$RUNIC_ENV_LOOKUP_TEST orelse "missing"}"
+
+if ($RUNIC_ENV_LOOKUP_TEST) |value| {
+  echo "capture=${value}"
+} else {
+  echo "bad missing after set"
+}
+
+printenv "RUNIC_ENV_LOOKUP_TEST"
+
+$RUNIC_ENV_LOOKUP_TEST = null
+echo "${$RUNIC_ENV_LOOKUP_TEST orelse "missing"}"
+
+if ($RUNIC_ENV_LOOKUP_TEST) |value| {
+  echo "bad capture after unset=${value}"
+} else {
+  echo "missing after unset"
+}
+
+bash "-c" "if printenv RUNIC_ENV_LOOKUP_TEST >/dev/null; then echo present; else echo missing; fi"

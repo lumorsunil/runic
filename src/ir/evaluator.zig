@@ -746,10 +746,23 @@ pub const IREvaluator = struct {
                     },
                 };
             },
+            .get_env => |get_env| {
+                const ctx = self.context.getSubshellContextPtr(thread.private.subshell_context);
+                const value: ir.Value = if (ctx.env) |env_map|
+                    if (env_map.get(get_env.name)) |text| .{ .zig_string = text } else .null
+                else
+                    .null;
+                try self.setLocation(thread, get_env.result, value);
+                return .cont;
+            },
             .set_env => |set_env| {
                 const ctx = self.context.getSubshellContextPtr(thread.private.subshell_context);
                 const env_map = try self.getOrCreateSubshellEnv(ctx);
                 const value = try self.resolveValueSource(thread, set_env.value);
+                if (value == .null) {
+                    _ = env_map.remove(set_env.name);
+                    return .cont;
+                }
                 const text = try self.materializeOwnedString(thread, value);
                 defer self.allocator.free(text);
                 try env_map.put(set_env.name, text);

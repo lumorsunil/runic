@@ -181,7 +181,7 @@ Key flags:
 - `--help`, `-h` — show the usage summary (also the default when no arguments are provided).
 - `--trace <topic>` — enable structured tracing for the given runtime subsystem. Current topics are `pipeline` (per-stage spawn/exit), `process` (handle summaries, stage outcomes, and captured IO sizes), and `async` (scheduler + promise lifecycle). Repeat the flag to collect multiple targets (e.g. `--trace pipeline --trace process`).
 - `--module-path <dir>` — prepend an additional directory to the module loader search roots. This mirrors `const foo = import "custom/foo"` scenarios from `features.md`.
-- `--env KEY=VALUE` — seed or override environment bindings for the initial script context. Reassigning an env-backed identifier inside Runic updates the current subshell context, and child processes inherit that subshell-local value.
+- `--env KEY=VALUE` — seed or override environment bindings for the initial script context. Read them explicitly as `$NAME`, reassign them with `$NAME = ...`, and child processes inherit the current subshell-local values.
 
 After the script path, `runic` forwards every argument verbatim. Insert `--` between the script and its arguments when you need to pass values that look like CLI flags.
 

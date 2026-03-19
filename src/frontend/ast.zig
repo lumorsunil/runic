@@ -626,6 +626,7 @@ pub const NullLiteral = struct {
 /// within other expressions. Nested expressions are stored as pointers.
 pub const Expression = union(enum) {
     identifier: Identifier,
+    env_var: EnvVarExpr,
     path: Path,
     literal: Literal,
     array: ArrayLiteral,
@@ -680,7 +681,7 @@ pub const Expression = union(enum) {
 
     pub fn isReference(self: *@This()) bool {
         return switch (self.*) {
-            .identifier => true,
+            .identifier, .env_var => true,
             .member => |member| !std.mem.eql(u8, member.member.name, "?"),
             .binary => |binary| switch (binary.op) {
                 .member => switch (binary.right.*) {
@@ -691,6 +692,31 @@ pub const Expression = union(enum) {
             },
             else => false,
         };
+    }
+};
+
+pub const EnvVarExpr = struct {
+    identifier: Identifier,
+    span: Span,
+
+    pub fn resolveType(
+        self: *@This(),
+        allocator: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*const TypeExpr {
+        const element = try allocator.create(TypeExpr);
+        element.* = .{ .byte = .{ .span = self.span } };
+
+        const string_type = try allocator.create(TypeExpr);
+        string_type.* = .{ .array = .{ .element = element, .span = self.span } };
+
+        const optional_type = try allocator.create(TypeExpr);
+        optional_type.* = .{ .optional = .{
+            .child = string_type,
+            .span = self.span,
+        } };
+
+        return optional_type;
     }
 };
 

@@ -35,23 +35,27 @@ const config: Map(Str, Int) = { port: 8080 }
 
 **Result:** Each declaration advertises its type at the point of definition, catching mismatches such as assigning a string to `retries` before the script ever runs.
 
-### Environment-backed globals
+### Environment variables
 
-Process environment entries are exposed as string-backed global identifiers. They can be reassigned like other mutable bindings, and the updated value is written into the current subshell context so later child processes inherit it.
+Environment variables are explicit. Use `$NAME` to read an environment entry as `?String`, and `$NAME = ...` to update the current subshell context so later child processes inherit the new value. Bare identifiers like `HOME` are normal Runic bindings and are distinct from `$HOME`.
 
 ```rn
-HOME = "/tmp/runic-home"
+const HOME = "binding-home"
+echo "${HOME}"
+echo "${$HOME orelse "missing"}"
+
+$HOME = "/tmp/runic-home"
 printenv "HOME"
 
 const nested = $({
-  HOME = "/tmp/runic-nested-home"
+  $HOME = "/tmp/runic-nested-home"
   printenv "HOME"
 })
 
 printenv "HOME"
 ```
 
-**Result:** The outer `printenv` sees `/tmp/runic-home`, the nested subshell sees `/tmp/runic-nested-home`, and once the subshell exits the parent context still reports `/tmp/runic-home`.
+**Result:** `HOME` prints `binding-home`, `$HOME` reads from the process environment, the outer `printenv` sees `/tmp/runic-home`, the nested subshell sees `/tmp/runic-nested-home`, and once the subshell exits the parent context still reports `/tmp/runic-home`.
 
 ### Builtin `cd`
 

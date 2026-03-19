@@ -784,6 +784,21 @@ pub const Parser = struct {
                                 .identifier = .fromToken(next),
                             });
                         },
+                        .dollar => {
+                            const breadcrumbInner = try self.createBreadcrumb("PBE:env");
+                            defer breadcrumbInner.end();
+                            _ = try self.nextToken();
+                            const identifier = try self.expectTokenTag(.identifier);
+                            try components.append(self.allocator, .{
+                                .expr = try self.allocExpression(.{
+                                    .env_var = .{
+                                        .identifier = .fromToken(identifier),
+                                        .span = next.span.endAt(identifier.span),
+                                    },
+                                }),
+                            });
+                            continue;
+                        },
                         .question => {
                             if (components.items.len == 0 or components.items[components.items.len - 1] != .op or components.items[components.items.len - 1].op.payload != .member) {
                                 try self.reportParseError(Error.UnexpectedToken, next.span, "expected value, actual: {t}", .{next.tag});
@@ -1970,6 +1985,7 @@ pub const Parser = struct {
 
         const expected_primary_tokens = [_]token.Tag{
             .identifier,
+            .dollar,
             .kw_null,
             .kw_true,
             .kw_false,
@@ -1994,6 +2010,15 @@ pub const Parser = struct {
             .identifier => self.allocExpression(.{
                 .identifier = .{ .name = tok.lexeme, .span = tok.span },
             }),
+            .dollar => blk: {
+                const identifier = try self.expectTokenTag(.identifier);
+                break :blk self.allocExpression(.{
+                    .env_var = .{
+                        .identifier = .fromToken(identifier),
+                        .span = tok.span.endAt(identifier.span),
+                    },
+                });
+            },
             .kw_null => self.allocExpression(.{
                 .literal = .{ .null = .{ .span = tok.span } },
             }),

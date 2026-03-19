@@ -1,5 +1,5 @@
 // cd builtin changes the working directory for the current shell context.
-const original = PWD
+const original = $PWD orelse "/"
 
 cd "/tmp"
 pwd

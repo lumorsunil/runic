@@ -24,7 +24,7 @@ legacy bash blocks, etc.) so regressions show up immediately. Execute any of
 them with the CLI to validate behavior, e.g.
 
 Notable current coverage includes:
-- `tests/features/env_vars_regression.rn` for mutable env-backed globals, child-process inheritance, and subshell-local environment updates.
+- `tests/features/env_vars_regression.rn` and `tests/features/env_var_lookup_regression.rn` for explicit `$NAME` environment access, child-process inheritance, and subshell-local environment updates.
 - `tests/features/optional_if_capture_regression.rn` for `if (optional) |value|` capture semantics.
 - `tests/features/optional_regression.rn` for `?T`, `null`, and `orelse`.
 - `tests/features/optional_unwrap_regression.rn` plus `tests/diagnostics/optional_unwrap_non_optional.rn` for postfix `.?` unwrap semantics.

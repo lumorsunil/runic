@@ -303,7 +303,7 @@ pub const TypeChecker = struct {
         const scope = try self.arena.allocator().create(Scope);
         scope.* = .init(script.span);
 
-        const global_scope = try addGlobalScope(self.arena.allocator(), scope, self.env);
+        const global_scope = try addGlobalScope(self.arena.allocator(), scope);
 
         if (script.signature) |signature| {
             switch (signature.params) {
@@ -686,6 +686,7 @@ pub const TypeChecker = struct {
 
         try switch (expr.*) {
             .identifier => |*identifier| _ = try self.runIdentifier(scope, identifier),
+            .env_var => {},
             .literal => |*literal| self.runLiteral(scope, literal),
             .array => |*array| self.runArray(scope, array),
             .range => |*range| self.runRange(scope, range),
@@ -1777,26 +1778,11 @@ const global_scope_definitions = [_]Definition{
     .init("String", GlobalTypes.Array(GlobalTypes.Byte)),
 };
 
-fn addGlobalScope(allocator: std.mem.Allocator, scope: *Scope, env: ?*const std.process.EnvMap) !*Scope {
+fn addGlobalScope(allocator: std.mem.Allocator, scope: *Scope) !*Scope {
     const global_scope = try scope.addChild(allocator, scope.span);
 
     for (global_scope_definitions) |definition| {
         try global_scope.declare(allocator, definition.identifier, definition.type_expr, false);
-    }
-
-    const string_type_expr = try allocator.create(ast.TypeExpr);
-    string_type_expr.* = GlobalTypes.Array(GlobalTypes.Byte);
-
-    if (env) |env_map| {
-        var it = env_map.iterator();
-        while (it.next()) |entry| {
-            try global_scope.declare(
-                allocator,
-                .{ .name = entry.key_ptr.*, .span = .global },
-                string_type_expr,
-                true,
-            );
-        }
     }
 
     return global_scope;

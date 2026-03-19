@@ -61,6 +61,15 @@ pub const execution_result_struct_type = ast.TypeExpr{ .struct_type = .{
 } };
 
 pub const thread_type = ast.TypeExpr.global(.thread);
+pub const string_element_type = ast.TypeExpr.global(.byte);
+pub const string_type = ast.TypeExpr{ .array = .{
+    .element = &string_element_type,
+    .span = .global,
+} };
+pub const optional_string_type = ast.TypeExpr{ .optional = .{
+    .child = &string_type,
+    .span = .global,
+} };
 
 pub const ExecutionHandlesField = enum {
     thread,
@@ -1005,6 +1014,20 @@ pub const IRCompiler = struct {
         }));
     }
 
+    pub fn getEnv(
+        self: *IRCompiler,
+        source: anytype,
+        name: []const u8,
+        result: ir.Location,
+    ) Error!void {
+        return self.addInstruction(.init(.from(source), .{
+            .get_env = .{
+                .name = name,
+                .result = result,
+            },
+        }));
+    }
+
     pub fn alloc(self: *IRCompiler, source: anytype, size: usize) Error!void {
         return self.addInstruction(.init(.from(source), .{ .alloc = size }));
     }
@@ -1128,21 +1151,6 @@ pub const IRCompiler = struct {
                     }
                 },
                 ._variadic => return Error.UnsupportedExpression,
-            }
-        }
-
-        if (self.env) |env_map| {
-            var it = env_map.iterator();
-            while (it.next()) |entry| {
-                const value = try self.addSlice(1, entry.value_ptr.*);
-                try self.compileIdentifierBinding(
-                    null,
-                    .{ .name = entry.key_ptr.*, .span = .global },
-                    .fromValue(value),
-                    null,
-                    true,
-                    .env_var,
-                );
             }
         }
 
@@ -1516,6 +1524,7 @@ pub const IRCompiler = struct {
         return switch (expr.*) {
             .literal => |literal| self.compileLiteral(expr, literal),
             .identifier => |identifier| self.compileIdentifier(expr, identifier),
+            .env_var => |env_var| self.compileEnvVar(expr, env_var),
             .call => |call| self.compileCall(expr, call),
             .member => |member| self.compileMember(expr, member),
             .if_expr => |if_expr| self.compileIf(expr, if_expr),
@@ -2569,6 +2578,18 @@ pub const IRCompiler = struct {
         return result;
     }
 
+    fn compileEnvVar(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        env_var: ast.EnvVarExpr,
+    ) Error!Result {
+        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        const result_ref = try self.newRef(source, "env_var");
+        try self.getEnv(source, env_var.identifier.name, result_ref);
+        return .from(result_ref.dereference().typed(optional_string_type));
+    }
+
     fn compileExecutableCall(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -3532,18 +3553,18 @@ pub const IRCompiler = struct {
             },
             .append_redirect, .redirect_fd => return Error.UnsupportedBinaryOperation,
             .assign => {
+                if (binary.left.* == .env_var) {
+                    const env_var = binary.left.env_var;
+                    const right = try self.compileExpression(binary.right);
+                    try self.setEnv(source, env_var.identifier.name, right.source);
+                    const result_ref = try self.newRef(source, "env_var_assign");
+                    try self.set(source, result_ref, right.source);
+                    return .from(result_ref.dereference().typed(optional_string_type));
+                }
+
                 const left = try self.compileExpression(binary.left);
                 const right = try self.compileExpression(binary.right);
                 try self.set(source, left.source.location, right.source);
-
-                if (binary.left.* == .identifier) {
-                    const identifier = binary.left.identifier;
-                    if (self.lookup(identifier.name, .{ .shallow = false })) |binding| {
-                        if (binding.kind == .env_var) {
-                            try self.setEnv(source, identifier.name, right.source);
-                        }
-                    }
-                }
 
                 return .from(left.source.location);
             },
