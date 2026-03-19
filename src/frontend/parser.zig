@@ -1288,7 +1288,7 @@ pub const Parser = struct {
 
     fn isExprTerminator(tag: token.Tag) bool {
         return switch (tag) {
-            .r_paren, .r_bracket, .r_brace, .comma, .pipe, .pipe_pipe, .amp_amp, .amp, .string_interp_end, .newline, .l_brace, .range, .dot_l_brace, .kw_else => true,
+            .r_paren, .r_bracket, .r_brace, .comma, .pipe, .pipe_pipe, .amp_amp, .amp, .string_interp_end, .newline, .semicolon, .l_brace, .range, .dot_l_brace, .kw_else => true,
             else => false,
         };
     }
@@ -1998,7 +1998,7 @@ pub const Parser = struct {
     fn skipNewlines(self: *Self) void {
         while (true) {
             const tok = self.peekToken() catch return;
-            if (tok.tag != .newline) break;
+            if (tok.tag != .newline and tok.tag != .semicolon) break;
             _ = self.nextToken() catch return;
         }
     }

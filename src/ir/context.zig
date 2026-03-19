@@ -19,6 +19,12 @@ pub const stack_start: usize = std.math.maxInt(usize) - 1024 * 1024 * 10;
 pub const ThreadId = usize;
 pub const PipeHandle = usize;
 pub const CloseableHandle = usize;
+pub const SubshellContextHandle = usize;
+
+pub const SubshellContext = struct {
+    /// null = inherit the OS process's working directory (no cd has been issued)
+    cwd: ?[]const u8 = null,
+};
 
 pub const Error = error{
     MissingThreadContext,
@@ -44,6 +50,9 @@ pub const IRProgramContext = struct {
     closeable_handle_counter: usize = 0,
     file_sinks: std.ArrayList(*FileSink) = .empty,
 
+    subshell_contexts: std.AutoArrayHashMapUnmanaged(SubshellContextHandle, SubshellContext) = .empty,
+    subshell_context_handle_counter: SubshellContextHandle = 0,
+
     pub fn init(allocator: Allocator, shared: IRSharedContext) @This() {
         return .{ .allocator = allocator, .shared = shared };
     }
@@ -51,12 +60,14 @@ pub const IRProgramContext = struct {
     pub fn deinit(self: *@This()) void {
         for (self.threads.items) |thread| {
             thread.private.stack.deinit(self.allocator);
+            thread.private.subshell_context_stack.deinit(self.allocator);
             self.allocator.destroy(thread.private);
         }
         self.threads.deinit(self.allocator);
 
         for (self.pipe_threads.items) |thread| {
             thread.private.stack.deinit(self.allocator);
+            thread.private.subshell_context_stack.deinit(self.allocator);
             self.allocator.destroy(thread.private);
         }
         self.pipe_threads.deinit(self.allocator);
@@ -86,10 +97,23 @@ pub const IRProgramContext = struct {
         self.pipe_threads_to_remove.deinit(self.allocator);
         self.thread_exit_codes.deinit(self.allocator);
         self.shared.heap.deinit(self.allocator);
+        self.subshell_contexts.deinit(self.allocator);
     }
 
     pub fn addMainThread(self: *@This()) Allocator.Error!void {
-        _ = try self.spawnThread();
+        const initial_ctx = try self.addSubshellContext(.{});
+        _ = try self.spawnThread(initial_ctx);
+    }
+
+    pub fn addSubshellContext(self: *@This(), ctx: SubshellContext) Allocator.Error!SubshellContextHandle {
+        const handle = self.subshell_context_handle_counter;
+        self.subshell_context_handle_counter += 1;
+        try self.subshell_contexts.put(self.allocator, handle, ctx);
+        return handle;
+    }
+
+    pub fn getSubshellContextPtr(self: *@This(), handle: SubshellContextHandle) *SubshellContext {
+        return self.subshell_contexts.getPtr(handle).?;
     }
 
     pub fn dataSize(self: @This()) usize {
@@ -126,10 +150,10 @@ pub const IRProgramContext = struct {
         return self.threads.items[self.thread_counter];
     }
 
-    pub fn spawnThread(self: *@This()) Allocator.Error!ThreadId {
+    pub fn spawnThread(self: *@This(), subshell_context: SubshellContextHandle) Allocator.Error!ThreadId {
         const id = self.newThreadId();
         const private = try self.allocator.create(IRPrivateContext);
-        private.* = .init();
+        private.* = .init(subshell_context);
         try self.threads.append(self.allocator, .init(id, &self.shared, private));
         return id;
     }
@@ -394,9 +418,12 @@ pub const IRPrivateContext = struct {
     result_register_2: Value = .void,
     process: ?*std.process.Child = null,
     waiting_for: ?ThreadId = null,
+    subshell_context: SubshellContextHandle = 0,
+    /// Saved handles for nested subshell enter/exit
+    subshell_context_stack: std.ArrayListUnmanaged(SubshellContextHandle) = .empty,
 
-    pub fn init() @This() {
-        return .{};
+    pub fn init(subshell_context: SubshellContextHandle) @This() {
+        return .{ .subshell_context = subshell_context };
     }
 };
 

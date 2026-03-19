@@ -912,6 +912,7 @@ pub const IRCompiler = struct {
         stdout: ir.Location,
         stderr: ir.Location,
         closure: ir.Location,
+        subshell: ir.Instruction.Fork.Subshell,
     ) Error!ir.Location {
         try self.addInstruction(.init(.from(source), .fork_(
             dest,
@@ -919,6 +920,7 @@ pub const IRCompiler = struct {
             stdout,
             stderr,
             closure,
+            subshell,
         )));
 
         // Moved this logic to addInstructionSet, all sets now are assumed to be called using forks
@@ -947,6 +949,7 @@ pub const IRCompiler = struct {
             self.threadStdout(),
             self.threadStderr(),
             closure,
+            .inherit,
         );
     }
 
@@ -1168,9 +1171,9 @@ pub const IRCompiler = struct {
 
         self.current_instruction_set = prev_instr_set;
 
-        _ = try self.fork(null, .initAbs(stdin_set, 0), self.threadStdin(), self.threadStdout(), self.threadStderr(), .noll);
-        _ = try self.fork(null, .initAbs(stdout_set, 0), self.threadStdin(), self.threadStdout(), self.threadStderr(), .noll);
-        _ = try self.fork(null, .initAbs(stderr_set, 0), self.threadStdin(), self.threadStdout(), self.threadStderr(), .noll);
+        _ = try self.fork(null, .initAbs(stdin_set, 0), self.threadStdin(), self.threadStdout(), self.threadStderr(), .noll, .inherit);
+        _ = try self.fork(null, .initAbs(stdout_set, 0), self.threadStdin(), self.threadStdout(), self.threadStderr(), .noll, .inherit);
+        _ = try self.fork(null, .initAbs(stderr_set, 0), self.threadStdin(), self.threadStdout(), self.threadStderr(), .noll, .inherit);
 
         return closure;
     }
@@ -1443,6 +1446,7 @@ pub const IRCompiler = struct {
             .unary => |unary| self.compileUnary(expr, unary),
             .array => |array| self.compileArray(expr, array),
             .for_expr => |for_expr| self.compileForLoop(expr, for_expr),
+            .subshell => |subshell| self.compileSubshell(expr, subshell),
             else => {
                 try self.reportSourceError(expr, Error.UnsupportedExpression, .@"error", "expression type \"{t}\" not yet supported", .{expr.*});
                 return .fromValue(.void);
@@ -1477,13 +1481,13 @@ pub const IRCompiler = struct {
             try self.set(
                 source,
                 stdout_stream_thread_ref,
-                .from(try self.fork(source, self.stdoutStreamSet(), self.threadStdin(), stdout_pipe_ref.dereference(), self.threadStderr(), .noll)),
+                .from(try self.fork(source, self.stdoutStreamSet(), self.threadStdin(), stdout_pipe_ref.dereference(), self.threadStderr(), .noll, .inherit)),
             );
             const stderr_stream_thread_ref = try self.newRef(source, "stderr_stream_thread");
             try self.set(
                 source,
                 stderr_stream_thread_ref,
-                .from(try self.fork(source, self.stderrStreamSet(), self.threadStdin(), self.threadStdout(), stderr_pipe_ref.dereference(), .noll)),
+                .from(try self.fork(source, self.stderrStreamSet(), self.threadStdin(), self.threadStdout(), stderr_pipe_ref.dereference(), .noll, .inherit)),
             );
             var result = try self.compileWithContext(source, .{
                 .out = stdout_pipe_ref.dereference(),
@@ -2307,6 +2311,7 @@ pub const IRCompiler = struct {
             stdout,
             stderr,
             closure.closure_ref.dereference(),
+            .inherit,
         );
         try self.compileClosurePostFork(source);
         return .{
@@ -2416,6 +2421,19 @@ pub const IRCompiler = struct {
 
         try self.addInstruction(.init(.from(source), .{ .cd = path }));
         return .fromLocation(.initRegister(.r));
+    }
+
+    fn compileSubshell(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        subshell: ast.SubshellExpr,
+    ) Error!Result {
+        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        try self.addInstruction(.init(.from(source), .enter_subshell));
+        const result = try self.compileExpressionWithCapture(source, subshell.child);
+        try self.addInstruction(.init(.from(source), .exit_subshell));
+        return result;
     }
 
     fn compileExecutableCall(
@@ -2576,6 +2594,7 @@ pub const IRCompiler = struct {
                 ),
                 self.threadStderr(),
                 .noll,
+                .inherit,
             );
             try self.wait(source, redirect_stream_thread);
             try self.push(source, .from(execution_handles.dereference()));

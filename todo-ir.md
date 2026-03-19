@@ -13,6 +13,7 @@
   - [x] env vars are populated into global scope
   - [ ] way to check if identifier exists (orelse except for this specific purpose) ?
 - [ ] do we want to strip newlines at the end of an echo or not?
+- [ ] modifying env vars should affect called processes
 
 ## data
 

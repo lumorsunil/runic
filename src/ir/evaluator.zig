@@ -456,12 +456,64 @@ pub const IREvaluator = struct {
                 };
                 defer self.allocator.free(path);
 
-                std.posix.chdir(path) catch {
+                const ctx = self.context.getSubshellContextPtr(thread.private.subshell_context);
+
+                // Resolve path to an absolute, normalised form.
+                // Use Dir.realpathAlloc so that relative paths are resolved against the
+                // current subshell context's cwd (or the OS process cwd if none is set yet).
+                // std.fs.path.resolve must NOT be used here — on POSIX it does not prepend
+                // the cwd, so it leaves relative paths relative.
+                const abs_path: []const u8 = blk: {
+                    if (ctx.cwd) |base| {
+                        var base_dir = std.fs.openDirAbsolute(base, .{}) catch {
+                            thread.private.result_register = .{ .exit_code = .fromByte(1) };
+                            return .cont;
+                        };
+                        defer base_dir.close();
+                        break :blk base_dir.realpathAlloc(self.allocator, path) catch {
+                            thread.private.result_register = .{ .exit_code = .fromByte(1) };
+                            return .cont;
+                        };
+                    } else {
+                        break :blk std.fs.cwd().realpathAlloc(self.allocator, path) catch {
+                            thread.private.result_register = .{ .exit_code = .fromByte(1) };
+                            return .cont;
+                        };
+                    }
+                };
+                defer self.allocator.free(abs_path);
+
+                // Verify abs_path is a directory (realpathAlloc verifies existence but not type).
+                var target_dir = std.fs.openDirAbsolute(abs_path, .{}) catch {
                     thread.private.result_register = .{ .exit_code = .fromByte(1) };
                     return .cont;
                 };
+                target_dir.close();
 
+                // Update the subshell context's cwd (do NOT call chdir — each subshell context
+                // tracks its own directory; child processes receive it via child.cwd).
+                if (ctx.cwd) |old| self.allocator.free(old);
+                ctx.cwd = try self.allocator.dupe(u8, abs_path);
                 thread.private.result_register = .{ .exit_code = .success };
+                return .cont;
+            },
+            .enter_subshell => {
+                // Push current subshell context handle onto the save stack.
+                try thread.private.subshell_context_stack.append(
+                    self.allocator,
+                    thread.private.subshell_context,
+                );
+                // Clone the current context into a fresh one for the subshell.
+                const parent_ctx = self.context.getSubshellContextPtr(thread.private.subshell_context);
+                const new_cwd: ?[]const u8 = if (parent_ctx.cwd) |c| try self.allocator.dupe(u8, c) else null;
+                const new_handle = try self.context.addSubshellContext(.{ .cwd = new_cwd });
+                thread.private.subshell_context = new_handle;
+                return .cont;
+            },
+            .exit_subshell => {
+                // Restore the saved subshell context handle.
+                const saved = thread.private.subshell_context_stack.pop().?;
+                thread.private.subshell_context = saved;
                 return .cont;
             },
             .fwd_stdio => {
@@ -566,6 +618,7 @@ pub const IREvaluator = struct {
                 child.stdin_behavior = .Pipe;
                 child.stdout_behavior = .Pipe;
                 child.stderr_behavior = .Pipe;
+                child.cwd = self.context.getSubshellContextPtr(thread.private.subshell_context).cwd;
                 try child.spawn();
                 thread.private.process = child;
 
@@ -774,7 +827,15 @@ pub const IREvaluator = struct {
                 return .cont;
             },
             .fork => |fork| {
-                const new_thread_handle = try self.context.spawnThread();
+                const child_ctx_handle = switch (fork.subshell) {
+                    .inherit => thread.private.subshell_context,
+                    .new => blk: {
+                        const parent_ctx = self.context.getSubshellContextPtr(thread.private.subshell_context);
+                        const new_cwd: ?[]const u8 = if (parent_ctx.cwd) |c| try self.allocator.dupe(u8, c) else null;
+                        break :blk try self.context.addSubshellContext(.{ .cwd = new_cwd });
+                    },
+                };
+                const new_thread_handle = try self.context.spawnThread(child_ctx_handle);
                 const new_thread = self.context.getThreadContext(new_thread_handle) orelse {
                     return Error.MissingSpawnedThreadContext;
                 };

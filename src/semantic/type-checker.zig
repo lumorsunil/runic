@@ -674,6 +674,7 @@ pub const TypeChecker = struct {
             .import_expr => |*import_expr| self.runImportExpr(scope, import_expr),
             .fn_decl => |*fn_decl| self.runFnDecl(scope, fn_decl),
             .call => |*call| self.runCall(scope, call),
+            .subshell => |*subshell| self.runExpression(scope, subshell.child),
             else => return error.UnsupportedExpression,
         };
     }

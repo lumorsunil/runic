@@ -141,6 +141,10 @@ pub const Instruction = struct {
         resolve_exit_code: ResolveExitCode,
         /// changes the current working directory; void path means use HOME
         cd: ValueSource,
+        /// saves current subshell context handle and switches to a fresh one
+        enter_subshell,
+        /// restores the subshell context handle saved by enter_subshell
+        exit_subshell,
 
         pub fn push_(value: ValueSource) @This() {
             return .{ .push = value };
@@ -160,6 +164,7 @@ pub const Instruction = struct {
             stdout: Location,
             stderr: Location,
             closure: Location,
+            subshell: Fork.Subshell,
         ) @This() {
             return .{ .fork = .{
                 .dest = dest,
@@ -167,6 +172,7 @@ pub const Instruction = struct {
                 .stdout = stdout,
                 .stderr = stderr,
                 .closure = closure,
+                .subshell = subshell,
             } };
         }
 
@@ -434,9 +440,17 @@ pub const Instruction = struct {
         stdout: Location,
         stderr: Location,
         closure: Location,
+        subshell: Subshell = .inherit,
+
+        pub const Subshell = enum {
+            /// New thread shares the parent's SubshellContext (cwd, env).
+            inherit,
+            /// New thread gets a fresh SubshellContext copied from the parent's.
+            new,
+        };
 
         pub fn format(self: @This(), w: *std.Io.Writer) !void {
-            try w.print("{f} {f} {f} {f} {f}", .{ self.dest, self.stdin, self.stdout, self.stderr, self.closure });
+            try w.print("{f} {f} {f} {f} {f} {t}", .{ self.dest, self.stdin, self.stdout, self.stderr, self.closure, self.subshell });
         }
     };
 

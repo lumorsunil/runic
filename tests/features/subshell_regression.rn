@@ -1,0 +1,13 @@
+// $(expr) runs in an isolated subshell context.
+// cd inside a subshell does NOT affect the parent's working directory.
+
+cd "/tmp"
+bash "-c" "pwd"
+
+// cd inside a subshell — parent must remain at /tmp after
+$(cd "/")
+bash "-c" "pwd"
+
+// capture output of a command running in an isolated context
+const result = $(bash "-c" "pwd")
+echo "${result.stdout}"
