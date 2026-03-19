@@ -1,0 +1,8 @@
+// cd builtin changes the working directory for the current shell context.
+const original = PWD
+
+cd "/tmp"
+bash "-c" "pwd"
+
+cd "${original}"
+bash "-c" "pwd"

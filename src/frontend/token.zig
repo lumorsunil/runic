@@ -227,6 +227,7 @@ pub const Tag = enum {
     l_bracket,
     r_bracket,
     dot_l_brace,
+    dollar_l_paren,
 
     pub fn toKeyword(tag: Tag) ?[]const u8 {
         return switch (tag) {

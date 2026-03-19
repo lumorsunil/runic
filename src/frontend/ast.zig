@@ -67,6 +67,19 @@ pub const Block = struct {
     }
 };
 
+pub const SubshellExpr = struct {
+    child: *Expression,
+    span: Span,
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*const TypeExpr {
+        return null;
+    }
+};
+
 /// Patterns are shared between `const` bindings, destructuring assignment, loop
 /// captures, and catch clauses.
 pub const BindingPattern = union(enum) {
@@ -634,6 +647,7 @@ pub const Expression = union(enum) {
     assignment: Assignment,
     executable: ExecutableExpr,
     builtin: BuiltinExpr,
+    subshell: SubshellExpr,
 
     pub fn span(self: Expression) Span {
         return switch (self) {

@@ -789,6 +789,14 @@ pub const Parser = struct {
                             _ = try self.expectTokenTag(.r_paren);
                             continue;
                         },
+                        .dollar_l_paren => {
+                            const breadcrumbInner = try self.createBreadcrumb("PBE:subshell");
+                            defer breadcrumbInner.end();
+                            try components.append(self.allocator, .{
+                                .expr = try self.parseSubshellExpression(),
+                            });
+                            continue;
+                        },
                         .l_brace => {
                             const breadcrumbInner = try self.createBreadcrumb("PBE:block");
                             defer breadcrumbInner.end();
@@ -1840,6 +1848,20 @@ pub const Parser = struct {
             .statements = statements.payload,
             .span = open.span.endAt(statements.span),
         };
+    }
+
+    fn parseSubshellExpression(self: *Self) Error!*ast.Expression {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const open = try self.expect(.dollar_l_paren);
+        const child = try self.parseExpression();
+        const close = try self.expect(.r_paren);
+
+        return self.allocExpression(.{ .subshell = .{
+            .child = child,
+            .span = open.span.endAt(close.span),
+        } });
     }
 
     fn parseBlockExpression(self: *Self) Error!*ast.Expression {

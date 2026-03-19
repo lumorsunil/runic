@@ -2106,6 +2106,13 @@ pub const IRCompiler = struct {
             return self.compileBlockCallWithRedirects(source, call.callee.*.block, call.redirects);
         }
 
+        if (call.callee.* == .identifier) {
+            const name = call.callee.identifier.name;
+            if (std.mem.eql(u8, name, "cd") and self.lookup(name, .{ .shallow = false }) == null) {
+                return self.compileBuiltinCd(source, call.arguments);
+            }
+        }
+
         const callee = try self.compileExpression(call.callee);
 
         return switch (callee.source) {
@@ -2390,6 +2397,25 @@ pub const IRCompiler = struct {
             i += 1;
         }
         self.currentInstrSet().closure_captures = closure_captures;
+    }
+
+    fn compileBuiltinCd(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        arguments: []const *ast.Expression,
+    ) Error!Result {
+        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        // No argument: evaluator will use HOME from process environment
+        const path: ir.ValueSource = if (arguments.len == 0)
+            .fromValue(.void)
+        else blk: {
+            const compiled = try self.compileExpression(arguments[0]);
+            break :blk stableResultSource(compiled);
+        };
+
+        try self.addInstruction(.init(.from(source), .{ .cd = path }));
+        return .fromLocation(.initRegister(.r));
     }
 
     fn compileExecutableCall(

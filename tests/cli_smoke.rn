@@ -1,7 +1,6 @@
 #!/usr/bin/env runic
 
 // Missing features:
-// - cd
 // - subshells $(...)
 // - orelse
 
@@ -41,20 +40,18 @@ if (targets.len > 0) {
   )
 }
 
-if [[ ${#runic_scripts[@]} -eq 0 ]]; then
+if (runic_scripts.len == 0) {
   echo "CLI smoke tests skipped: no Runic feature scripts found under tests/features/."
-  exit 0
-fi
+  exit
+}
 
-count=0
-for script in "${runic_scripts[@]}"; do
-  abs_path="$script"
-  if [[ -f "$repo_root/$script" ]]; then
-    abs_path="$repo_root/$script"
-  fi
-
-  rel_path="${abs_path#"$repo_root"/}"
-  [[ "$rel_path" == "$abs_path" ]] && rel_path="$abs_path"
+var count = 0
+for (runic_scripts) |script| {
+  var abs_path = script
+  if (test "-f" "${repo_root}/${script}") {
+    abs_path = "${repo_root}/${script}"
+  }
+  const rel_path = bash "-c" "p=\"${abs_path}\"; r=\"${repo_root}\"; \${p#\"$r\"/}"
 
   base_path="${abs_path%.rn}"
   stdin_fixture="${base_path}.stdin"
@@ -106,6 +103,6 @@ for script in "${runic_scripts[@]}"; do
 
   rm -f "$stdout_tmp" "$stderr_tmp"
   ((count += 1))
-done
+}
 
 echo "CLI smoke tests passed (${count} scripts)."

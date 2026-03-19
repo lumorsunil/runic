@@ -253,6 +253,13 @@ fn renderExpressionAst(writer: *std.Io.Writer, expr: *const ast.Expression, leve
             try writer.print("{s} =\n", .{assignment.identifier.name});
             try renderExpressionAst(writer, assignment.expr, level + 1);
         },
+        .subshell => |subshell| {
+            try writeIndent(writer, level);
+            try writer.writeAll("subshell @ ");
+            try printSpanInline(writer, subshell.span);
+            try writer.writeByte('\n');
+            try renderExpressionAst(writer, subshell.child, level + 1);
+        },
         .call => |call| {
             try writeIndent(writer, level);
             try writer.writeAll("call @ ");

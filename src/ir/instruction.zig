@@ -139,6 +139,8 @@ pub const Instruction = struct {
         exit_with: ValueSource,
         /// resolves the exit code from an execution result or handles struct and stores it in result
         resolve_exit_code: ResolveExitCode,
+        /// changes the current working directory; void path means use HOME
+        cd: ValueSource,
 
         pub fn push_(value: ValueSource) @This() {
             return .{ .push = value };
@@ -178,7 +180,7 @@ pub const Instruction = struct {
 
         pub fn format(self: @This(), w: *std.Io.Writer) !void {
             switch (self) {
-                inline .push, .exit, .exit_with, .jmp, .fork, .set, .pipe_fwd, .pipe_file, .pipe_write, .wait, .stream, .pipe, .pipe_opt, .ath, .log, .cmp, .resolve_exit_code => |t| try w.print("{t} {f}", .{ self, t }),
+                inline .push, .exit, .exit_with, .jmp, .fork, .set, .pipe_fwd, .pipe_file, .pipe_write, .wait, .stream, .pipe, .pipe_opt, .ath, .log, .cmp, .resolve_exit_code, .cd => |t| try w.print("{t} {f}", .{ self, t }),
                 inline .ref, .comment => |t| try w.print("{t} {s}", .{ self, t }),
                 inline .alloc => |t| try w.print("{t} {}", .{ self, t }),
                 else => try w.print("{t}", .{self}),

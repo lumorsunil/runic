@@ -443,6 +443,27 @@ pub const IREvaluator = struct {
                 try self.setLocation(thread, rec.result, .{ .exit_code = exit_code });
                 return .cont;
             },
+            .cd => |path_source| {
+                const resolved = try self.resolveValueSource(thread, path_source);
+                const path: []const u8 = if (resolved == .void) blk: {
+                    // cd with no argument: go to HOME
+                    // TODO: use the current shell context env map
+                    break :blk std.process.getEnvVarOwned(self.allocator, "HOME") catch "/";
+                } else blk: {
+                    var path_writer = std.Io.Writer.Allocating.init(self.allocator);
+                    try self.materializeString(thread, resolved, &path_writer.writer);
+                    break :blk try path_writer.toOwnedSlice();
+                };
+                defer self.allocator.free(path);
+
+                std.posix.chdir(path) catch {
+                    thread.private.result_register = .{ .exit_code = .fromByte(1) };
+                    return .cont;
+                };
+
+                thread.private.result_register = .{ .exit_code = .success };
+                return .cont;
+            },
             .fwd_stdio => {
                 const stdin = try self.context.addPipe(self.config.stdin);
                 const stdout = try self.context.addPipe(self.config.stdout);

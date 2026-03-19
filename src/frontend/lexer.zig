@@ -241,7 +241,8 @@ pub const Lexer = struct {
             '.' => self.lexDotLike(),
             '|' => self.lexPipe(),
             '&' => self.lexAmp(),
-            '$' => self.singleCharToken(.dollar),
+            // '$' => self.singleCharToken(.dollar),
+            '$' => self.lexDollar(),
             '/' => self.lexSlash(),
             else => Error.UnexpectedCharacter,
         };
@@ -539,6 +540,15 @@ pub const Lexer = struct {
             return self.finish(.startAt(start), .amp_amp);
         }
         return self.finish(.startAt(start), .amp);
+    }
+
+    fn lexDollar(self: *Lexer) token.Token {
+        const start = self.mark();
+        _ = self.advance();
+        if (self.match('(')) {
+            return self.finish(.startAt(start), .dollar_l_paren);
+        }
+        return self.finish(.startAt(start), .dollar);
     }
 
     fn singleCharToken(self: *Lexer, tag: token.Tag) token.Token {
