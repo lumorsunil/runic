@@ -336,37 +336,55 @@ const Scope = struct {
             name: []const u8,
             result: Result,
             is_mutable: bool,
+            kind: Binding.Kind,
         ) Error!void {
             return self.bindings.put(allocator, name, .{
                 .is_mutable = is_mutable,
                 .result = result,
+                .kind = kind,
             });
         }
     };
 
     pub const Binding = struct {
+        pub const Kind = enum {
+            normal,
+            env_var,
+        };
+
         is_mutable: bool,
         result: Result,
+        kind: Kind = .normal,
     };
 
     pub const ClosureBinding = struct {
         depth: usize,
         type: enum { outer, mutable },
         identifier: ast.Identifier,
+        kind: Binding.Kind = .normal,
 
-        pub fn outer(identifier: ast.Identifier, depth: usize) @This() {
+        pub fn outer(
+            identifier: ast.Identifier,
+            depth: usize,
+            kind: Binding.Kind,
+        ) @This() {
             return .{
                 .type = .outer,
                 .identifier = identifier,
                 .depth = depth,
+                .kind = kind,
             };
         }
 
-        pub fn mutable(identifier: ast.Identifier) @This() {
+        pub fn mutable(
+            identifier: ast.Identifier,
+            kind: Binding.Kind,
+        ) @This() {
             return .{
                 .type = .mutable,
                 .identifier = identifier,
                 .depth = 0,
+                .kind = kind,
             };
         }
     };
@@ -399,9 +417,10 @@ const Scope = struct {
         name: []const u8,
         result: Result,
         is_mutable: bool,
+        kind: Binding.Kind,
     ) Error!void {
         const frame = try self.getFrame(0);
-        return frame.declare(allocator, name, result, is_mutable);
+        return frame.declare(allocator, name, result, is_mutable, kind);
     }
 
     pub const LookupOptions = struct {
@@ -703,7 +722,7 @@ pub const IRCompiler = struct {
         result: Result,
         is_mutable: bool,
     ) Error!void {
-        return self.scopes.declare(self.allocator, name, result, is_mutable);
+        return self.scopes.declare(self.allocator, name, result, is_mutable, .normal);
     }
 
     pub fn lookup(
@@ -961,6 +980,20 @@ pub const IRCompiler = struct {
         return self.addInstruction(.init(.from(source), .stream_(streamee)));
     }
 
+    pub fn setEnv(
+        self: *IRCompiler,
+        source: anytype,
+        name: []const u8,
+        value: ir.ValueSource,
+    ) Error!void {
+        return self.addInstruction(.init(.from(source), .{
+            .set_env = .{
+                .name = name,
+                .value = value,
+            },
+        }));
+    }
+
     pub fn alloc(self: *IRCompiler, source: anytype, size: usize) Error!void {
         return self.addInstruction(.init(.from(source), .{ .alloc = size }));
     }
@@ -1057,6 +1090,7 @@ pub const IRCompiler = struct {
                                     identifier,
                                     value,
                                     false,
+                                    .normal,
                                 );
                             },
                             .tuple, .record => return Error.UnsupportedBindingPattern,
@@ -1072,6 +1106,7 @@ pub const IRCompiler = struct {
                                         identifier,
                                         .fromValue(value),
                                         false,
+                                        .normal,
                                     );
                                 },
                                 .tuple, .record => return Error.UnsupportedBindingPattern,
@@ -1091,7 +1126,8 @@ pub const IRCompiler = struct {
                     null,
                     .{ .name = entry.key_ptr.*, .span = .global },
                     .fromValue(value),
-                    false,
+                    true,
+                    .env_var,
                 );
             }
         }
@@ -1304,7 +1340,7 @@ pub const IRCompiler = struct {
             },
             .identifier => |identifier| {
                 const result = try self.compileExpressionWithCapture(source, expr);
-                try self.compileIdentifierBinding(source, identifier, result.source, is_mutable);
+                try self.compileIdentifierBinding(source, identifier, result.source, is_mutable, .normal);
                 return .fromValue(.void);
             },
             else => {
@@ -1326,6 +1362,7 @@ pub const IRCompiler = struct {
         identifier: ast.Identifier,
         value: ir.ValueSource,
         is_mutable: bool,
+        kind: Scope.Binding.Kind,
     ) Error!void {
         const T = @TypeOf(source);
         if (T == @TypeOf(null)) {
@@ -1342,13 +1379,16 @@ pub const IRCompiler = struct {
             result = try .from(result_ref.dereference().typed(value.typeExpr()));
         }
         if (is_mutable) {
-            try self.compileMutableVariable(source, identifier, result.source);
+            try self.compileMutableVariable(source, identifier, result.source, kind);
+            const binding = self.lookup(identifier.name, .{ .shallow = true }).?;
+            binding.kind = kind;
         } else {
             try self.scopes.declare(
                 self.allocator,
                 identifier.name,
                 result,
                 is_mutable,
+                kind,
             );
         }
     }
@@ -1358,6 +1398,7 @@ pub const IRCompiler = struct {
         source: anytype,
         identifier: ast.Identifier,
         value: ir.ValueSource,
+        kind: Scope.Binding.Kind,
     ) Error!void {
         const T = @TypeOf(source);
         if (T == @TypeOf(null)) {
@@ -1370,14 +1411,14 @@ pub const IRCompiler = struct {
         const storage_depth = if (current_frame.scope_type == .closure) @as(usize, 0) else try self.nearestClosureDepth();
         const closure_location = if (storage_depth == 0)
             try self.declareClosureValue(
-                .mutable(identifier),
+                .mutable(identifier, kind),
                 0,
                 true,
                 value.typeExpr(),
             )
         else blk: {
             const location = try self.allocClosureValue(
-                .mutable(identifier),
+                .mutable(identifier, kind),
                 storage_depth,
                 value.typeExpr(),
             );
@@ -1386,6 +1427,7 @@ pub const IRCompiler = struct {
                 identifier.name,
                 try .from(location),
                 true,
+                kind,
             );
             break :blk location;
         };
@@ -1991,6 +2033,7 @@ pub const IRCompiler = struct {
                 binding.identifier.name,
                 try .from(location),
                 is_mutable,
+                binding.kind,
             );
         }
 
@@ -2073,7 +2116,7 @@ pub const IRCompiler = struct {
 
             const next_source_depth = source_depth - (depth_cursor - 1);
             const location = try self.declareClosureValue(
-                .outer(identifier, next_source_depth),
+                .outer(identifier, next_source_depth, source_binding.kind),
                 depth_cursor - 1,
                 source_binding.is_mutable,
                 source_binding.result.typeExpr(),
@@ -2638,7 +2681,7 @@ pub const IRCompiler = struct {
         );
         const identifier = ast.Identifier.global(name);
         self.result_counter += 1;
-        try self.compileIdentifierBinding(source, identifier, value, true);
+        try self.compileIdentifierBinding(source, identifier, value, true, .normal);
         return identifier;
     }
 
@@ -3111,7 +3154,7 @@ pub const IRCompiler = struct {
         try self.scopes.push(self.allocator, .closure);
 
         if (fn_decl.name) |name| {
-            try self.scopes.declare(self.allocator, name.name, try .from(fn_ref), false);
+            try self.scopes.declare(self.allocator, name.name, try .from(fn_ref), false, .normal);
         }
 
         for (fn_decl.params._non_variadic) |param| {
@@ -3119,7 +3162,7 @@ pub const IRCompiler = struct {
                 .discard => {},
                 .identifier => |identifier| {
                     _ = try self.declareClosureValue(
-                        .mutable(identifier),
+                        .mutable(identifier, .normal),
                         0,
                         false,
                         if (param.type_annotation) |type_annotation| type_annotation.* else null,
@@ -3155,7 +3198,7 @@ pub const IRCompiler = struct {
         self.current_instruction_set = orig_instr_set;
         self.scopes.pop();
         if (fn_decl.name) |name| {
-            try self.scopes.declare(self.allocator, name.name, try .from(fn_ref), false);
+            try self.scopes.declare(self.allocator, name.name, try .from(fn_ref), false, .normal);
         }
 
         return .from(fn_ref);
@@ -3238,6 +3281,15 @@ pub const IRCompiler = struct {
                 const left = try self.compileExpression(binary.left);
                 const right = try self.compileExpression(binary.right);
                 try self.set(source, left.source.location, right.source);
+
+                if (binary.left.* == .identifier) {
+                    const identifier = binary.left.identifier;
+                    if (self.lookup(identifier.name, .{ .shallow = false })) |binding| {
+                        if (binding.kind == .env_var) {
+                            try self.setEnv(source, identifier.name, right.source);
+                        }
+                    }
+                }
 
                 return .from(left.source.location);
             },
@@ -3556,6 +3608,7 @@ pub const IRCompiler = struct {
             binding,
             .from(capture_ref.dereference().typed(for_source.value_type)),
             false,
+            .normal,
         );
     }
 

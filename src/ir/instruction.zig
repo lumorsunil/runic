@@ -141,6 +141,8 @@ pub const Instruction = struct {
         resolve_exit_code: ResolveExitCode,
         /// changes the current working directory; void path means use HOME
         cd: ValueSource,
+        /// updates the runtime environment map entry with a materialized string value
+        set_env: SetEnv,
         /// saves current subshell context handle and switches to a fresh one
         enter_subshell,
         /// restores the subshell context handle saved by enter_subshell
@@ -186,7 +188,7 @@ pub const Instruction = struct {
 
         pub fn format(self: @This(), w: *std.Io.Writer) !void {
             switch (self) {
-                inline .push, .exit, .exit_with, .jmp, .fork, .set, .pipe_fwd, .pipe_file, .pipe_write, .wait, .stream, .pipe, .pipe_opt, .ath, .log, .cmp, .resolve_exit_code, .cd => |t| try w.print("{t} {f}", .{ self, t }),
+                inline .push, .exit, .exit_with, .jmp, .fork, .set, .pipe_fwd, .pipe_file, .pipe_write, .wait, .stream, .pipe, .pipe_opt, .ath, .log, .cmp, .resolve_exit_code, .cd, .set_env => |t| try w.print("{t} {f}", .{ self, t }),
                 inline .ref, .comment => |t| try w.print("{t} {s}", .{ self, t }),
                 inline .alloc => |t| try w.print("{t} {}", .{ self, t }),
                 else => try w.print("{t}", .{self}),
@@ -511,6 +513,18 @@ pub const Instruction = struct {
             writer: *std.Io.Writer,
         ) std.Io.Writer.Error!void {
             try writer.print("{f} -> {f}", .{ self.source, self.result });
+        }
+    };
+
+    pub const SetEnv = struct {
+        name: []const u8,
+        value: ValueSource,
+
+        pub fn format(
+            self: @This(),
+            writer: *std.Io.Writer,
+        ) std.Io.Writer.Error!void {
+            try writer.print("{s} {f}", .{ self.name, self.value });
         }
     };
 

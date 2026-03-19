@@ -18,7 +18,7 @@ pub const IRConfig = struct {
     verbose: bool,
     dry_run: bool,
     script_args: []const []const u8 = &.{},
-    env: ?*const std.process.EnvMap = null,
+    env: ?*std.process.EnvMap = null,
     stdin: *ReaderWriterStream,
     stdout: *ReaderWriterStream,
     stderr: *ReaderWriterStream,
@@ -170,7 +170,7 @@ pub fn runIR(
     var context = result.success;
     defer context.deinit();
 
-    try context.addMainThread();
+    try context.addMainThread(config.env);
 
     runner.log("IR Compilation Results", .{});
 
@@ -230,7 +230,7 @@ pub fn debugIR(
 
     var context = ir.context.IRProgramContext.init(arena_allocator, shared);
     defer context.deinit();
-    try context.addMainThread();
+    try context.addMainThread(null);
     var debugger = try ir.debugger.IRDebugger.init(
         arena_allocator,
         .{

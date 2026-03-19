@@ -1645,7 +1645,7 @@ fn addGlobalScope(allocator: std.mem.Allocator, scope: *Scope, env: ?*const std.
                 allocator,
                 .{ .name = entry.key_ptr.*, .span = .global },
                 string_type_expr,
-                false,
+                true,
             );
         }
     }

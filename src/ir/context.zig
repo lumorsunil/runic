@@ -24,7 +24,51 @@ pub const SubshellContextHandle = usize;
 pub const SubshellContext = struct {
     /// null = inherit the OS process's working directory (no cd has been issued)
     cwd: ?[]const u8 = null,
+    env: ?*std.process.EnvMap = null,
+
+    pub fn initOwned(
+        allocator: Allocator,
+        cwd: ?[]const u8,
+        env: ?*const std.process.EnvMap,
+    ) Allocator.Error!@This() {
+        return .{
+            .cwd = if (cwd) |path| try allocator.dupe(u8, path) else null,
+            .env = if (env) |env_map| blk: {
+                const env_clone = try allocator.create(std.process.EnvMap);
+                errdefer allocator.destroy(env_clone);
+                env_clone.* = try cloneEnvMap(allocator, env_map);
+                break :blk env_clone;
+            } else null,
+        };
+    }
+
+    pub fn clone(self: @This(), allocator: Allocator) Allocator.Error!@This() {
+        return initOwned(allocator, self.cwd, self.env);
+    }
+
+    pub fn deinit(self: *@This(), allocator: Allocator) void {
+        if (self.cwd) |cwd| allocator.free(cwd);
+        if (self.env) |env| {
+            env.deinit();
+            allocator.destroy(env);
+        }
+    }
 };
+
+fn cloneEnvMap(
+    allocator: Allocator,
+    env: *const std.process.EnvMap,
+) Allocator.Error!std.process.EnvMap {
+    var clone = std.process.EnvMap.init(allocator);
+    errdefer clone.deinit();
+
+    var it = env.iterator();
+    while (it.next()) |entry| {
+        try clone.put(entry.key_ptr.*, entry.value_ptr.*);
+    }
+
+    return clone;
+}
 
 pub const Error = error{
     MissingThreadContext,
@@ -97,11 +141,17 @@ pub const IRProgramContext = struct {
         self.pipe_threads_to_remove.deinit(self.allocator);
         self.thread_exit_codes.deinit(self.allocator);
         self.shared.heap.deinit(self.allocator);
+        for (self.subshell_contexts.values()) |*ctx| {
+            ctx.deinit(self.allocator);
+        }
         self.subshell_contexts.deinit(self.allocator);
     }
 
-    pub fn addMainThread(self: *@This()) Allocator.Error!void {
-        const initial_ctx = try self.addSubshellContext(.{});
+    pub fn addMainThread(
+        self: *@This(),
+        env: ?*const std.process.EnvMap,
+    ) Allocator.Error!void {
+        const initial_ctx = try self.addSubshellContext(try .initOwned(self.allocator, null, env));
         _ = try self.spawnThread(initial_ctx);
     }
 

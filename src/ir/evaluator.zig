@@ -444,10 +444,15 @@ pub const IREvaluator = struct {
                 return .cont;
             },
             .cd => |path_source| {
+                const ctx = self.context.getSubshellContextPtr(thread.private.subshell_context);
                 const resolved = try self.resolveValueSource(thread, path_source);
                 const path: []const u8 = if (resolved == .void) blk: {
                     // cd with no argument: go to HOME
-                    // TODO: use the current shell context env map
+                    if (ctx.env) |env_map| {
+                        if (env_map.get("HOME")) |home| {
+                            break :blk try self.allocator.dupe(u8, home);
+                        }
+                    }
                     break :blk std.process.getEnvVarOwned(self.allocator, "HOME") catch "/";
                 } else blk: {
                     var path_writer = std.Io.Writer.Allocating.init(self.allocator);
@@ -455,8 +460,6 @@ pub const IREvaluator = struct {
                     break :blk try path_writer.toOwnedSlice();
                 };
                 defer self.allocator.free(path);
-
-                const ctx = self.context.getSubshellContextPtr(thread.private.subshell_context);
 
                 // Resolve path to an absolute, normalised form.
                 // Use Dir.realpathAlloc so that relative paths are resolved against the
@@ -505,8 +508,7 @@ pub const IREvaluator = struct {
                 );
                 // Clone the current context into a fresh one for the subshell.
                 const parent_ctx = self.context.getSubshellContextPtr(thread.private.subshell_context);
-                const new_cwd: ?[]const u8 = if (parent_ctx.cwd) |c| try self.allocator.dupe(u8, c) else null;
-                const new_handle = try self.context.addSubshellContext(.{ .cwd = new_cwd });
+                const new_handle = try self.context.addSubshellContext(try parent_ctx.clone(self.allocator));
                 thread.private.subshell_context = new_handle;
                 return .cont;
             },
@@ -615,10 +617,12 @@ pub const IREvaluator = struct {
 
                 const child = try self.allocator.create(std.process.Child);
                 child.* = std.process.Child.init(try argv.toOwnedSlice(self.allocator), self.allocator);
+                const ctx = self.context.getSubshellContextPtr(thread.private.subshell_context);
+                child.env_map = ctx.env;
                 child.stdin_behavior = .Pipe;
                 child.stdout_behavior = .Pipe;
                 child.stderr_behavior = .Pipe;
-                child.cwd = self.context.getSubshellContextPtr(thread.private.subshell_context).cwd;
+                child.cwd = ctx.cwd;
                 try child.spawn();
                 thread.private.process = child;
 
@@ -742,6 +746,15 @@ pub const IREvaluator = struct {
                     },
                 };
             },
+            .set_env => |set_env| {
+                const ctx = self.context.getSubshellContextPtr(thread.private.subshell_context);
+                const env_map = try self.getOrCreateSubshellEnv(ctx);
+                const value = try self.resolveValueSource(thread, set_env.value);
+                const text = try self.materializeOwnedString(thread, value);
+                defer self.allocator.free(text);
+                try env_map.put(set_env.name, text);
+                return .cont;
+            },
             .pipe => |instr_pipe| {
                 const pipe = try Stream(u8).initReaderWriter(self.allocator, "pipe", .{}, self.config.tracer);
                 const pipe_handle = try self.context.addPipe(pipe);
@@ -831,8 +844,7 @@ pub const IREvaluator = struct {
                     .inherit => thread.private.subshell_context,
                     .new => blk: {
                         const parent_ctx = self.context.getSubshellContextPtr(thread.private.subshell_context);
-                        const new_cwd: ?[]const u8 = if (parent_ctx.cwd) |c| try self.allocator.dupe(u8, c) else null;
-                        break :blk try self.context.addSubshellContext(.{ .cwd = new_cwd });
+                        break :blk try self.context.addSubshellContext(try parent_ctx.clone(self.allocator));
                     },
                 };
                 const new_thread_handle = try self.context.spawnThread(child_ctx_handle);
@@ -1182,6 +1194,19 @@ pub const IREvaluator = struct {
         return try alloc_writer.toOwnedSlice();
     }
 
+    fn getOrCreateSubshellEnv(
+        self: *IREvaluator,
+        ctx: *ir.context.SubshellContext,
+    ) Allocator.Error!*std.process.EnvMap {
+        if (ctx.env) |env| return env;
+
+        const env = try self.allocator.create(std.process.EnvMap);
+        errdefer self.allocator.destroy(env);
+        env.* = std.process.EnvMap.init(self.allocator);
+        ctx.env = env;
+        return env;
+    }
+
     pub const MaterializeStringError =
         Allocator.Error ||
         GetSliceError ||
@@ -1370,7 +1395,7 @@ test "evaluator materializeString reports missing pipe handle" {
         .tracer = &fixture.tracer,
     }, &fixture.context);
 
-    try fixture.context.addMainThread();
+    try fixture.context.addMainThread(null);
     const thread = fixture.context.getCurrentThread().?;
     var writer = std.Io.Writer.Allocating.init(allocator);
     defer writer.deinit();
