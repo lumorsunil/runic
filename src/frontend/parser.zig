@@ -1459,9 +1459,12 @@ pub const Parser = struct {
 
         const if_tok = try self.expect(.kw_if);
         _ = try self.expect(.l_paren);
-        const condition = try self.parseExpression();
+        var condition = try self.parseExpression();
         _ = try self.expect(.r_paren);
         const capture = try self.parseOptionalCaptureClause();
+        if (capture != null) {
+            condition = try self.rewriteBareIdentifierCallForIfCapture(condition);
+        }
         // const then_block = try self.parseBlock();
         const then_expr = try self.parseExpression();
 
@@ -1496,6 +1499,19 @@ pub const Parser = struct {
                 .span = if_tok.span.endAt(end_span),
             },
         });
+    }
+
+    fn rewriteBareIdentifierCallForIfCapture(
+        self: *Self,
+        condition: *ast.Expression,
+    ) Error!*ast.Expression {
+        if (condition.* != .call) return condition;
+
+        const call = condition.call;
+        if (call.arguments.len != 0 or call.redirects.len != 0) return condition;
+        if (call.callee.* != .identifier) return condition;
+
+        return self.allocExpression(.{ .identifier = call.callee.identifier });
     }
 
     // for (items) |item| {...}

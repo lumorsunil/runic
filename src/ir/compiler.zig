@@ -335,12 +335,14 @@ const Scope = struct {
             allocator: Allocator,
             name: []const u8,
             result: Result,
+            type_expr: ?ast.TypeExpr,
             is_mutable: bool,
             kind: Binding.Kind,
         ) Error!void {
             return self.bindings.put(allocator, name, .{
                 .is_mutable = is_mutable,
                 .result = result,
+                .type_expr = type_expr,
                 .kind = kind,
             });
         }
@@ -354,6 +356,7 @@ const Scope = struct {
 
         is_mutable: bool,
         result: Result,
+        type_expr: ?ast.TypeExpr = null,
         kind: Kind = .normal,
     };
 
@@ -416,11 +419,12 @@ const Scope = struct {
         allocator: Allocator,
         name: []const u8,
         result: Result,
+        type_expr: ?ast.TypeExpr,
         is_mutable: bool,
         kind: Binding.Kind,
     ) Error!void {
         const frame = try self.getFrame(0);
-        return frame.declare(allocator, name, result, is_mutable, kind);
+        return frame.declare(allocator, name, result, type_expr, is_mutable, kind);
     }
 
     pub const LookupOptions = struct {
@@ -722,7 +726,14 @@ pub const IRCompiler = struct {
         result: Result,
         is_mutable: bool,
     ) Error!void {
-        return self.scopes.declare(self.allocator, name, result, is_mutable, .normal);
+        return self.scopes.declare(
+            self.allocator,
+            name,
+            result,
+            result.typeExpr(),
+            is_mutable,
+            .normal,
+        );
     }
 
     pub fn lookup(
@@ -1386,12 +1397,19 @@ pub const IRCompiler = struct {
 
         var result: Result = .{ .source = value };
         const annotated_type = if (annotation) |ann| ann.* else null;
+        const needs_annotated_storage = if (annotated_type) |annotation_type|
+            if (result.typeExpr()) |result_type|
+                !std.meta.eql(result_type, annotation_type)
+            else
+                true
+        else
+            false;
 
         if (result.source.isRegister(.r)) {
             const result_ref = try self.newRef(source, "identifier_ref");
             try self.set(source, result_ref, .fromLocation(.initRegister(.r)));
             result = try .from(result_ref.dereference().typed(annotated_type orelse value.typeExpr()));
-        } else if (annotated_type != null and result.typeExpr() == null) {
+        } else if (needs_annotated_storage) {
             const result_ref = try self.newRef(source, "identifier_ref");
             try self.set(source, result_ref, value);
             result = try .from(result_ref.dereference().typed(annotated_type));
@@ -1405,6 +1423,7 @@ pub const IRCompiler = struct {
                 self.allocator,
                 identifier.name,
                 result,
+                annotated_type orelse result.typeExpr(),
                 is_mutable,
                 kind,
             );
@@ -1444,6 +1463,7 @@ pub const IRCompiler = struct {
                 self.allocator,
                 identifier.name,
                 try .from(location),
+                value.typeExpr(),
                 true,
                 kind,
             );
@@ -2047,6 +2067,7 @@ pub const IRCompiler = struct {
                 self.allocator,
                 binding.identifier.name,
                 try .from(location),
+                type_expr,
                 is_mutable,
                 binding.kind,
             );
@@ -2926,11 +2947,12 @@ pub const IRCompiler = struct {
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
-        const condition = try self.compileTransientExpression(source, if_expr.condition);
+        const if_condition = try self.compileIfCondition(source, if_expr);
+        const condition = if_condition.condition;
         if (condition.source.isValueTag(.exit_code)) {
             const c = condition.source.value.exit_code.toBoolean();
 
-            if (c) return self.compileExpression(if_expr.then_expr);
+            if (c) return self.compileIfBranchExpression(source, if_expr.then_expr, if_condition.capture_binding);
             return switch (else_branch) {
                 .expr => |expr_| self.compileExpression(expr_),
                 .if_expr => |if_expr_| self.compileIf(source, if_expr_.*),
@@ -2946,7 +2968,7 @@ pub const IRCompiler = struct {
         const else_addr = try self.newLabel("if_else", .unknown);
 
         try self.jmp(source, condition, false, else_addr);
-        const then = try self.compileExpression(if_expr.then_expr);
+        const then = try self.compileIfBranchExpression(source, if_expr.then_expr, if_condition.capture_binding);
         try self.set(source, result, stableResultSource(then));
         try self.jmp(source, null, false, after_addr);
         try self.setLabel(else_addr.local_addr.label, .abs);
@@ -2977,21 +2999,167 @@ pub const IRCompiler = struct {
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
-        const condition = try self.compileTransientExpression(source, if_expr.condition);
+        const if_condition = try self.compileIfCondition(source, if_expr);
+        const condition = if_condition.condition;
         if (condition.source.isValueTag(.exit_code)) {
             const c = condition.source.value.exit_code.toBoolean();
 
-            if (c) return self.compileExpression(if_expr.then_expr);
+            if (c) return self.compileIfBranchExpression(source, if_expr.then_expr, if_condition.capture_binding);
             return .fromValue(.void);
         }
         const after_addr = try self.newLabel("if_after", .unknown);
         try self.jmp(source, condition, false, after_addr);
-        const then_result = try self.compileExpression(if_expr.then_expr);
+        const then_result = try self.compileIfBranchExpression(source, if_expr.then_expr, if_condition.capture_binding);
         if (isWaitable(then_result)) |loc| {
             try self.wait(source, loc);
         }
         try self.setLabel(after_addr.local_addr.label, .abs);
         return .fromValue(.void);
+    }
+
+    const IfCaptureBinding = struct {
+        pattern: *ast.BindingPattern,
+        value: ir.ValueSource,
+    };
+
+    const IfCondition = struct {
+        condition: Result,
+        capture_binding: ?IfCaptureBinding = null,
+    };
+
+    fn compileIfCondition(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        if_expr: ast.IfExpr,
+    ) Error!IfCondition {
+        const condition = try self.compileTransientExpression(source, if_expr.condition);
+        const capture = if_expr.capture;
+
+        const condition_type = blk: {
+            if (condition.typeExpr()) |type_expr| break :blk type_expr;
+            if (if_expr.condition.* == .identifier) {
+                const identifier = if_expr.condition.identifier;
+                if (self.lookup(identifier.name, .{ .shallow = false })) |binding| {
+                    if (binding.result.typeExpr()) |type_expr| break :blk type_expr;
+                }
+            }
+            break :blk null;
+        };
+        const is_literal_null = condition.source.isValueTag(.null) or
+            (if_expr.condition.* == .literal and if_expr.condition.literal == .null);
+
+        if (condition_type) |condition_type_| switch (condition_type_) {
+            .optional => |optional| {
+                const is_present_ref = try self.newRef(source, "if_optional_present");
+                try self.cmp(
+                    source,
+                    .not_equal,
+                    stableResultSource(condition),
+                    .fromValue(.null),
+                    is_present_ref,
+                );
+
+                return .{
+                    .condition = try .from(is_present_ref.dereference()),
+                    .capture_binding = if (capture) |capture_clause| blk: {
+                        if (capture_clause.bindings.len != 1) {
+                            try self.reportSourceError(
+                                source,
+                                Error.UnsupportedBindingPattern,
+                                .@"error",
+                                "if capture clauses currently require exactly one binding",
+                                .{},
+                            );
+                            return .{ .condition = .fromValue(.void) };
+                        }
+
+                        var capture_value = condition.source;
+                        if (capture_value == .location) {
+                            capture_value.location = capture_value.location.typed(optional.child.*);
+                        }
+
+                        break :blk .{
+                            .pattern = capture_clause.bindings[0],
+                            .value = capture_value,
+                        };
+                    } else null,
+                };
+            },
+            else => {},
+        };
+
+        if (is_literal_null) {
+            if (capture) |_| {
+                try self.reportSourceError(
+                    source,
+                    Error.UnsupportedExpression,
+                    .@"error",
+                    "if capture requires an optional condition",
+                    .{},
+                );
+                return .{ .condition = .fromValue(.void) };
+            }
+
+            return .{ .condition = .fromValue(.fromBoolean(false)) };
+        }
+
+        if (capture) |_| {
+            try self.reportSourceError(
+                source,
+                Error.UnsupportedExpression,
+                .@"error",
+                "if capture requires an optional condition",
+                .{},
+            );
+            return .{ .condition = .fromValue(.void) };
+        }
+
+        return .{ .condition = condition };
+    }
+
+    fn compileIfBranchExpression(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        expr: *ast.Expression,
+        capture_binding: ?IfCaptureBinding,
+    ) Error!Result {
+        try self.scopes.push(self.allocator, .lexical);
+        defer self.scopes.pop();
+
+        if (capture_binding) |binding| {
+            switch (binding.pattern.*) {
+                .discard => {},
+                .identifier => |identifier| try self.compileIdentifierBinding(
+                    source,
+                    identifier,
+                    binding.value,
+                    null,
+                    false,
+                    .normal,
+                ),
+                else => {
+                    try self.reportSourceError(
+                        source,
+                        Error.UnsupportedBindingPattern,
+                        .@"error",
+                        "if capture binding pattern not yet supported",
+                        .{},
+                    );
+                    return .fromValue(.void);
+                },
+            }
+        }
+
+        var result = try self.compileExpression(expr);
+        switch (result.source) {
+            .location => |loc| if (loc.abs == .ref) {
+                try self.set(source, .initRegister(.r2), stableResultSource(result));
+                result = .fromLocation(ir.Location.initRegister(.r2).typed(result.typeExpr()));
+            },
+            else => {},
+        }
+
+        return result;
     }
 
     fn refLocation(self: *IRCompiler, ref_def: RefDef) ir.Location {
@@ -3169,7 +3337,14 @@ pub const IRCompiler = struct {
         try self.scopes.push(self.allocator, .closure);
 
         if (fn_decl.name) |name| {
-            try self.scopes.declare(self.allocator, name.name, try .from(fn_ref), false, .normal);
+            try self.scopes.declare(
+                self.allocator,
+                name.name,
+                try .from(fn_ref),
+                null,
+                false,
+                .normal,
+            );
         }
 
         for (fn_decl.params._non_variadic) |param| {
@@ -3213,7 +3388,14 @@ pub const IRCompiler = struct {
         self.current_instruction_set = orig_instr_set;
         self.scopes.pop();
         if (fn_decl.name) |name| {
-            try self.scopes.declare(self.allocator, name.name, try .from(fn_ref), false, .normal);
+            try self.scopes.declare(
+                self.allocator,
+                name.name,
+                try .from(fn_ref),
+                null,
+                false,
+                .normal,
+            );
         }
 
         return .from(fn_ref);

@@ -1,0 +1,23 @@
+const outer = "outer"
+const maybe_name: ?String = "runic"
+
+if (maybe_name) |value| {
+  echo "name=${value}"
+} else {
+  echo "bad missing name"
+}
+
+echo "outer=${outer}"
+
+const missing_name: ?String = null
+if (missing_name) |value| {
+  echo "bad value=${value}"
+} else {
+  echo "missing ok"
+}
+
+var maybe_count: ?Int = 9
+if (maybe_count) |count| echo "count=${count}" else echo "bad missing count"
+
+maybe_count = null
+if (maybe_count) |count| echo "bad count=${count}" else echo "count missing"

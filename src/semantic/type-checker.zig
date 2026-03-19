@@ -790,10 +790,68 @@ pub const TypeChecker = struct {
         try self.logTypeCheckTrace(@src().fn_name, if_expr.span);
 
         try self.runExpression(scope, if_expr.condition);
+        const condition_type = try self.resolveExprType(scope, if_expr.condition);
         const then_scope = try scope.addChild(self.arena.allocator(), if_expr.span);
+        try self.runIfCapture(then_scope, if_expr, condition_type);
         try self.runExpression(then_scope, if_expr.then_expr);
         if (if_expr.else_branch) |*else_branch| {
-            try self.runElseBranch(then_scope, else_branch);
+            try self.runElseBranch(scope, else_branch);
+        }
+    }
+
+    fn runIfCapture(
+        self: *TypeChecker,
+        then_scope: *Scope,
+        if_expr: *ast.IfExpr,
+        condition_type: ?*const ast.TypeExpr,
+    ) Error!void {
+        const capture = if_expr.capture orelse return;
+
+        if (capture.bindings.len != 1) {
+            try self.reportSpanError(
+                capture.span,
+                Error.BindingPatternNotSupported,
+                .@"error",
+                "if capture clauses currently require exactly one binding",
+                .{},
+            );
+            return;
+        }
+
+        const resolved_condition_type = condition_type orelse blk: {
+            if (if_expr.condition.* == .identifier) {
+                const identifier = if_expr.condition.identifier;
+                if (then_scope.parent.?.lookup(identifier.name)) |binding| {
+                    break :blk binding.type_expr;
+                }
+            }
+            break :blk null;
+        };
+
+        const cond_type = resolved_condition_type orelse {
+            try self.reportSpanError(
+                if_expr.condition.span(),
+                Error.TypeMismatch,
+                .@"error",
+                "if capture requires an optional condition",
+                .{},
+            );
+            return;
+        };
+
+        switch (cond_type.*) {
+            .optional => |optional| try self.runBindingPattern(
+                then_scope,
+                capture.bindings[0],
+                optional.child,
+                false,
+            ),
+            else => try self.runBindingPattern(
+                then_scope,
+                capture.bindings[0],
+                cond_type,
+                false,
+            ),
         }
     }
 
