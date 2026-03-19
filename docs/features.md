@@ -152,6 +152,20 @@ echo "${maybe_count orelse 9}"
 
 **Result:** `?String` and `?Int` hold either a concrete value or `null`. `orelse` evaluates to the left-hand value when present and to the right-hand expression when the left side is `null`.
 
+Optionals also integrate with `if` capture clauses. When the condition is an optional, `if (value) |inner| ...` enters the then branch only when the optional is non-`null`, and `inner` is bound to the unwrapped payload inside that branch.
+
+```rn
+const maybe_name: ?String = "runic"
+
+if (maybe_name) |name| {
+  echo "name=${name}"
+} else {
+  echo "missing"
+}
+```
+
+**Result:** The then branch runs only when `maybe_name` contains a string, and `name` is available only inside that branch as the inner `String`.
+
 ### Promises as native asynchronous values
 
 Promises are first-class types that use the dedicated `^T` syntax, mirroring the shorthand used for optionals (`?T`) and error unions (`!T`). Any function or expression marked `async` returns a `^T`, and `await` unwraps the eventual value while preserving the same capture ergonomics used elsewhere in the language.
