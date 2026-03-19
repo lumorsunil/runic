@@ -13,6 +13,8 @@ end before release.
   `tests/diagnostics/` against the built `zig-out/bin/runic` binary, strips ANSI
   color codes, and compares the rendered diagnostics against `.stdout` / `.stderr`
   fixtures.
+- Use `__RUNIC_PWD__` inside `.stdout` or `.stderr` fixtures when the output
+  should include the repository root used for that test run.
 
 ## Feature coverage suites
 

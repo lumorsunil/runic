@@ -1,0 +1,9 @@
+// Semicolon acts as a statement separator, equivalent to a newline.
+
+cd "/tmp"; bash "-c" "pwd"
+
+// Multiple semicolons in sequence
+bash "-c" "echo one"; bash "-c" "echo two"; bash "-c" "echo three"
+
+// Semicolon with assignment and command
+const x = "hello"; echo "${x}"

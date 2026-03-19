@@ -4,6 +4,7 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="${RUNIC_REPO_ROOT:-$(cd "$script_dir/.." && pwd)}"
+pwd_marker="__RUNIC_PWD__"
 
 if ! command -v zig >/dev/null 2>&1; then
   echo "zig is required for CLI diagnostic tests but was not found on PATH." >&2
@@ -37,6 +38,16 @@ fi
 
 strip_ansi() {
   perl -pe 's/\e\[[0-9;]*m//g'
+}
+
+normalize_output() {
+  RUNIC_NORMALIZE_PWD="$repo_root" RUNIC_PWD_MARKER="$pwd_marker" perl -pe '
+    BEGIN {
+      $pwd = $ENV{RUNIC_NORMALIZE_PWD} // "";
+      $marker = $ENV{RUNIC_PWD_MARKER} // "__RUNIC_PWD__";
+    }
+    s/\Q$pwd\E/$marker/g if length $pwd;
+  '
 }
 
 (
@@ -75,6 +86,8 @@ for script in "${runic_scripts[@]}"; do
   stderr_tmp="$(mktemp)"
   stdout_norm_tmp="$(mktemp)"
   stderr_norm_tmp="$(mktemp)"
+  stdout_fixture_norm_tmp="$(mktemp)"
+  stderr_fixture_norm_tmp="$(mktemp)"
   echo "-- running ${rel_path}"
 
   set +e
@@ -86,8 +99,8 @@ for script in "${runic_scripts[@]}"; do
   status=$?
   set -e
 
-  strip_ansi <"$stdout_tmp" >"$stdout_norm_tmp"
-  strip_ansi <"$stderr_tmp" >"$stderr_norm_tmp"
+  strip_ansi <"$stdout_tmp" | normalize_output >"$stdout_norm_tmp"
+  strip_ansi <"$stderr_tmp" | normalize_output >"$stderr_norm_tmp"
 
   if [[ "$status" != "$expected_status" ]]; then
     echo "Unexpected exit status for ${rel_path}: got ${status}, expected ${expected_status}" >&2
@@ -97,7 +110,8 @@ for script in "${runic_scripts[@]}"; do
   fi
 
   if [[ -f "$stdout_fixture" ]]; then
-    if ! diff -u "$stdout_fixture" "$stdout_norm_tmp"; then
+    strip_ansi <"$stdout_fixture" | normalize_output >"$stdout_fixture_norm_tmp"
+    if ! diff -u "$stdout_fixture_norm_tmp" "$stdout_norm_tmp"; then
       echo "Stdout mismatch for ${rel_path}" >&2
       exit 1
     fi
@@ -108,7 +122,8 @@ for script in "${runic_scripts[@]}"; do
   fi
 
   if [[ -f "$stderr_fixture" ]]; then
-    if ! diff -u "$stderr_fixture" "$stderr_norm_tmp"; then
+    strip_ansi <"$stderr_fixture" | normalize_output >"$stderr_fixture_norm_tmp"
+    if ! diff -u "$stderr_fixture_norm_tmp" "$stderr_norm_tmp"; then
       echo "Stderr mismatch for ${rel_path}" >&2
       exit 1
     fi
@@ -118,7 +133,13 @@ for script in "${runic_scripts[@]}"; do
     exit 1
   fi
 
-  rm -f "$stdout_tmp" "$stderr_tmp" "$stdout_norm_tmp" "$stderr_norm_tmp"
+  rm -f \
+    "$stdout_tmp" \
+    "$stderr_tmp" \
+    "$stdout_norm_tmp" \
+    "$stderr_norm_tmp" \
+    "$stdout_fixture_norm_tmp" \
+    "$stderr_fixture_norm_tmp"
   ((count += 1))
 done
 

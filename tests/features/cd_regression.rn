@@ -2,7 +2,7 @@
 const original = PWD
 
 cd "/tmp"
-bash "-c" "pwd"
+pwd
 
 cd "${original}"
-bash "-c" "pwd"
+pwd

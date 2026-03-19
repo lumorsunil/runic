@@ -1,0 +1,13 @@
+// cd supports relative paths in addition to absolute paths.
+// Regression: relative cd used to panic with resolvePosix asserting non-relative input.
+
+cd "/"
+pwd
+
+// relative cd: "/" + "tmp" = "/tmp"
+cd "tmp"
+pwd
+
+// relative cd with ".." goes back up
+cd ".."
+pwd

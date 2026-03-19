@@ -393,6 +393,16 @@ pub const ReaderWriterStream = struct {
             self.label,
         );
 
+        // A downstream consumer may connect after an upstream source has already
+        // produced output into this stream's buffer. Flush that buffered data
+        // immediately so late pipeline-stage attachment does not lose bytes.
+        const buffered = try self.buffer_writer.toOwnedSlice();
+        defer self.buffer_writer.allocator.free(buffered);
+        if (buffered.len > 0) {
+            try self.trace_writer.writer.writeAll(buffered);
+            try self.trace_writer.writer.flush();
+        }
+
         const allocator = self.buffer_writer.allocator;
         var sources_to_remove = std.ArrayList(usize).empty;
         defer sources_to_remove.deinit(allocator);
@@ -660,8 +670,23 @@ pub const ReaderWriterStream = struct {
             self.tracer.trace(.information, &.{ "stream", @src().fn_name, "data" }, null, "bytes forwarded: {}", .{bytes_forwarded});
         }
 
-        std.mem.sort(usize, sources_to_remove.items, self, lessThan);
-        self.disconnectSources(sources_to_remove.items);
+        if (self.sources.items.len > 0 and sources_to_remove.items.len > 0) {
+            std.mem.sort(usize, sources_to_remove.items, self, lessThan);
+
+            var write_index: usize = 0;
+            var last_index: ?usize = null;
+            for (sources_to_remove.items) |index| {
+                if (index >= self.sources.items.len) continue;
+                if (last_index != null and last_index.? == index) continue;
+                sources_to_remove.items[write_index] = index;
+                write_index += 1;
+                last_index = index;
+            }
+
+            if (write_index > 0) {
+                self.disconnectSources(sources_to_remove.items[0..write_index]);
+            }
+        }
 
         return .not_done;
     }

@@ -4,6 +4,7 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="${RUNIC_REPO_ROOT:-$(cd "$script_dir/.." && pwd)}"
+pwd_marker="__RUNIC_PWD__"
 
 if ! command -v zig >/dev/null 2>&1; then
   echo "zig is required for CLI smoke tests but was not found on PATH." >&2
@@ -35,6 +36,16 @@ if [[ ${#runic_scripts[@]} -eq 0 ]]; then
   exit 0
 fi
 
+normalize_output() {
+  RUNIC_NORMALIZE_PWD="$repo_root" RUNIC_PWD_MARKER="$pwd_marker" perl -pe '
+    BEGIN {
+      $pwd = $ENV{RUNIC_NORMALIZE_PWD} // "";
+      $marker = $ENV{RUNIC_PWD_MARKER} // "__RUNIC_PWD__";
+    }
+    s/\Q$pwd\E/$marker/g if length $pwd;
+  '
+}
+
 count=0
 for script in "${runic_scripts[@]}"; do
   abs_path="$script"
@@ -58,6 +69,10 @@ for script in "${runic_scripts[@]}"; do
 
   stdout_tmp="$(mktemp)"
   stderr_tmp="$(mktemp)"
+  stdout_norm_tmp="$(mktemp)"
+  stderr_norm_tmp="$(mktemp)"
+  stdout_fixture_norm_tmp="$(mktemp)"
+  stderr_fixture_norm_tmp="$(mktemp)"
   echo "-- running ${rel_path}"
 
   set +e
@@ -69,31 +84,42 @@ for script in "${runic_scripts[@]}"; do
   status=$?
   set -e
 
+  normalize_output <"$stdout_tmp" >"$stdout_norm_tmp"
+  normalize_output <"$stderr_tmp" >"$stderr_norm_tmp"
+
   if [[ "$status" != "$expected_status" ]]; then
     echo "Unexpected exit status for ${rel_path}: got ${status}, expected ${expected_status}" >&2
-    cat "$stderr_tmp" >&2
+    cat "$stderr_norm_tmp" >&2
     exit 1
   fi
 
   if [[ -f "$stdout_fixture" ]]; then
-    if ! diff -u "$stdout_fixture" "$stdout_tmp"; then
+    normalize_output <"$stdout_fixture" >"$stdout_fixture_norm_tmp"
+    if ! diff -u "$stdout_fixture_norm_tmp" "$stdout_norm_tmp"; then
       echo "Stdout mismatch for ${rel_path}" >&2
       exit 1
     fi
   fi
 
   if [[ -f "$stderr_fixture" ]]; then
-    if ! diff -u "$stderr_fixture" "$stderr_tmp"; then
+    normalize_output <"$stderr_fixture" >"$stderr_fixture_norm_tmp"
+    if ! diff -u "$stderr_fixture_norm_tmp" "$stderr_norm_tmp"; then
       echo "Stderr mismatch for ${rel_path}" >&2
       exit 1
     fi
-  elif [[ -s "$stderr_tmp" ]]; then
+  elif [[ -s "$stderr_norm_tmp" ]]; then
     echo "Unexpected stderr for ${rel_path}" >&2
-    cat "$stderr_tmp" >&2
+    cat "$stderr_norm_tmp" >&2
     exit 1
   fi
 
-  rm -f "$stdout_tmp" "$stderr_tmp"
+  rm -f \
+    "$stdout_tmp" \
+    "$stderr_tmp" \
+    "$stdout_norm_tmp" \
+    "$stderr_norm_tmp" \
+    "$stdout_fixture_norm_tmp" \
+    "$stderr_fixture_norm_tmp"
   ((count += 1))
 done
 
