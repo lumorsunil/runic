@@ -35,6 +35,43 @@ const config: Map(Str, Int) = { port: 8080 }
 
 **Result:** Each declaration advertises its type at the point of definition, catching mismatches such as assigning a string to `retries` before the script ever runs.
 
+### Environment-backed globals
+
+Process environment entries are exposed as string-backed global identifiers. They can be reassigned like other mutable bindings, and the updated value is written into the current subshell context so later child processes inherit it.
+
+```rn
+HOME = "/tmp/runic-home"
+printenv "HOME"
+
+const nested = $({
+  HOME = "/tmp/runic-nested-home"
+  printenv "HOME"
+})
+
+printenv "HOME"
+```
+
+**Result:** The outer `printenv` sees `/tmp/runic-home`, the nested subshell sees `/tmp/runic-nested-home`, and once the subshell exits the parent context still reports `/tmp/runic-home`.
+
+### Builtin `cd`
+
+`cd` is a builtin rather than an external process. It updates the working directory stored on the current subshell context, which means later commands in that same context inherit the new directory without mutating the host process running Runic.
+
+```rn
+cd "/tmp"
+pwd
+
+const nested = $({
+  cd "/"
+  pwd
+})
+
+pwd
+echo "${nested}"
+```
+
+**Result:** The first `pwd` prints `/tmp`, the nested subshell prints `/`, and once the subshell exits the parent context still reports `/tmp`. Calling `cd` with no argument uses the current subshell's `HOME` value.
+
 ### Errors as first-class types
 
 Runic treats `error` the same way Zig does: it is a special type that can be declared as a simple enum when all variants are opaque or as a tagged union when each variant should carry structured data. Functions that can fail return `!T` (an error or a `T`), and callers use `try`/`catch` mechanics plus pattern matching to branch on the exact error.

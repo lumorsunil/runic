@@ -73,6 +73,8 @@ A working parser, type checker, and IR-based runtime are in place. The following
 - String interpolation (`${ }`) and block capture
 - Process handle access (`.stdout`, `.stderr`, `.status.ok`, `.status.exit_code`)
 - File redirection (`>`, `>>`) and stream capture (`1>var`, `2>var`)
+- Builtin `cd` with subshell-local working-directory updates
+- Environment-backed globals with mutable updates scoped to the current subshell
 - `bash { ... }` compatibility blocks
 - Script argument handling via the `@` entry-point function
 - Error declarations (`error Foo = enum/union`), `try`/`catch`, `match`
@@ -178,7 +180,7 @@ Key flags:
 - `--help`, `-h` — show the usage summary (also the default when no arguments are provided).
 - `--trace <topic>` — enable structured tracing for the given runtime subsystem. Current topics are `pipeline` (per-stage spawn/exit), `process` (handle summaries, stage outcomes, and captured IO sizes), and `async` (scheduler + promise lifecycle). Repeat the flag to collect multiple targets (e.g. `--trace pipeline --trace process`).
 - `--module-path <dir>` — prepend an additional directory to the module loader search roots. This mirrors `const foo = import "custom/foo"` scenarios from `features.md`.
-- `--env KEY=VALUE` — override environment bindings that will be forwarded to script executions and background commands.
+- `--env KEY=VALUE` — seed or override environment bindings for the initial script context. Reassigning an env-backed identifier inside Runic updates the current subshell context, and child processes inherit that subshell-local value.
 
 After the script path, `runic` forwards every argument verbatim. Insert `--` between the script and its arguments when you need to pass values that look like CLI flags.
 
