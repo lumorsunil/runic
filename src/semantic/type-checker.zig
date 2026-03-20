@@ -657,7 +657,7 @@ pub const TypeChecker = struct {
         for (call.arguments) |arg| try self.runExpression(scope, arg);
         for (call.redirects) |*redirect| {
             switch (redirect.target) {
-                .path => |*p| try self.runStringLiteral(scope, &p.value),
+                .path => |p| try self.runExpression(scope, p.value),
                 .fd => {},
             }
         }
@@ -1055,7 +1055,8 @@ pub const TypeChecker = struct {
             .identifier => return error.UnresolvedTypeLiteral,
             .optional => return error.MemberAccessOnOptional,
             .array => |array| try self.runArrayMemberAccess(array, &member.member),
-            .null, .promise, .error_union, .error_set, .err, .struct_type, .tuple, .function, .integer, .float, .boolean, .byte, .alias, .thread, .void => return error.UnsupportedMemberAccess,
+            .thread => try self.runThreadMemberAccess(&member.member),
+            .null, .promise, .error_union, .error_set, .err, .struct_type, .tuple, .function, .integer, .float, .boolean, .byte, .alias, .void => return error.UnsupportedMemberAccess,
             .module => |module| try self.runModuleMemberAccess(module, &member.member),
             .execution => |execution| try self.runExecutionMemberAccess(execution, &member.member),
             // .lazy => {
@@ -1100,11 +1101,23 @@ pub const TypeChecker = struct {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, identifier.span);
 
-        const valid_members: []const []const u8 = &.{ "exit_code", "stdout", "stderr" };
+        const valid_members: []const []const u8 = &.{ "exit_code", "stdout", "stderr", "wait" };
 
         for (valid_members) |m| if (std.mem.eql(u8, m, identifier.name)) {
             return;
         };
+
+        return error.MemberNotFound;
+    }
+
+    pub fn runThreadMemberAccess(
+        self: *TypeChecker,
+        identifier: *ast.Identifier,
+    ) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.logTypeCheckTrace(@src().fn_name, identifier.span);
+
+        if (std.mem.eql(u8, identifier.name, "wait")) return;
 
         return error.MemberNotFound;
     }

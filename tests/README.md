@@ -19,13 +19,14 @@ end before release.
 ## Feature coverage suites
 
 `tests/features/` now hosts a battery of single-purpose `.rn` scripts—each one
-drives a single Runic feature (pipelines, optionals, promises, module imports,
-legacy bash blocks, etc.) so regressions show up immediately. Execute any of
+drives a single Runic feature (pipelines, optionals, background execution, module imports,
+etc.) so regressions show up immediately. Execute any of
 them with the CLI to validate behavior, e.g.
 
 Notable current coverage includes:
 - `tests/features/env_vars_regression.rn` and `tests/features/env_var_lookup_regression.rn` for explicit `$NAME` environment access, child-process inheritance, and subshell-local environment updates.
 - `tests/features/match_regression.rn` plus `tests/diagnostics/match_capture_unsupported.rn` for exact-value `match`, predicate matcher cases, and the current lack of match-case captures.
+- `tests/features/async_background_regression.rn` for trailing `&`, bound background execution capture, and `.wait`.
 - `tests/features/optional_if_capture_regression.rn` for `if (optional) |value|` capture semantics.
 - `tests/features/optional_regression.rn` for `?T`, `null`, and `orelse`.
 - `tests/features/optional_unwrap_regression.rn` plus `tests/diagnostics/optional_unwrap_non_optional.rn` for postfix `.?` unwrap semantics.

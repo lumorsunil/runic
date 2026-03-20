@@ -5,6 +5,9 @@ const resolveModulePath = @import("document_store.zig").resolveModulePath;
 
 pub const Span = token.Span;
 pub const Spanned = token.Spanned;
+const globalExecutionType = TypeExpr{
+    .execution = .{ .span = .global },
+};
 
 /// Identifiers back every binding name as well as module and member
 /// references. The slice is backed by the original source text.
@@ -56,13 +59,15 @@ pub const Path = struct {
 /// one place.
 pub const Block = struct {
     statements: []const *Statement,
+    background: bool = false,
     span: Span,
 
     pub fn resolveType(
-        _: *@This(),
+        self: *@This(),
         _: std.mem.Allocator,
         _: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
+        if (self.background) return &globalExecutionType;
         return null;
     }
 };
@@ -771,13 +776,15 @@ pub const CallExpr = struct {
     callee: *Expression,
     arguments: []const *Expression,
     redirects: []const Redirection = &.{},
+    background: bool = false,
     span: Span,
 
     pub fn resolveType(
-        _: *@This(),
+        self: *@This(),
         _: std.mem.Allocator,
         _: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
+        if (self.background) return &globalExecutionType;
         // 1. turn expression into function (or already function)
         // 2. return return type of function
         return null;
@@ -799,6 +806,14 @@ pub const MemberExpr = struct {
         if (std.mem.eql(u8, self.member.name, "?")) {
             return switch (object_type.*) {
                 .optional => |optional| optional.child,
+                else => null,
+            };
+        }
+
+        if (std.mem.eql(u8, self.member.name, "wait")) {
+            return switch (object_type.*) {
+                .execution => object_type,
+                .thread => object_type,
                 else => null,
             };
         }
@@ -1139,13 +1154,15 @@ pub const ImportExpr = struct {
 
 pub const Pipeline = struct {
     stages: []*Expression,
+    background: bool = false,
     span: Span,
 
     pub fn resolveType(
-        _: *@This(),
+        self: *@This(),
         _: std.mem.Allocator,
         _: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
+        if (self.background) return &globalExecutionType;
         return null;
     }
 };
@@ -1261,7 +1278,7 @@ pub const RedirectionMode = enum {
 
 pub const RedirectionTarget = union(enum) {
     path: struct {
-        value: StringLiteral,
+        value: *Expression,
         span: Span,
     },
     fd: u8,

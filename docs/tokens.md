@@ -72,15 +72,13 @@ Optionals take Zig’s `?T` syntax and reserve `null` as the absence of a value:
 | `question` | `?`    | Optional prefix               |
 | `kw_null`  | `null` | Explicit empty optional value |
 
-## Promises and Asynchronous Blocks
+## Background Execution
 
-Promises use the dedicated `^T` shorthand and lean on `async`/`await` keywords:
+Background execution currently uses the existing ampersand token as a trailing operator on command, pipeline, and block-expression statements:
 
-| Tag        | Lexeme  | Purpose                                   |
-| ---------- | ------- | ----------------------------------------- |
-| `caret`    | `^`     | Promise prefix                            |
-| `kw_async` | `async` | Async blocks/functions returning promises |
-| `kw_await` | `await` | Await expressions and capture clauses     |
+| Tag   | Lexeme | Purpose                                  |
+| ----- | ------ | ---------------------------------------- |
+| `amp` | `&`    | Run a command/pipeline/block in background |
 
 ## Modules and Imports
 
@@ -91,17 +89,6 @@ member access uses the existing `dot` token:
 | ----------- | -------- | ------------------------------------- |
 | `kw_import` | `import` | Starts an import binding              |
 | `dot`       | `.`      | Member access within imported modules |
-
-## `bash { ... }` Compatibility Blocks
-
-The compatibility mode is initiated by a keyword and delimited by braces. The
-tokenizer does not treat Bash contents specially—parsing happens inside a single
-Runic block once the lexer hands over `kw_bash` and the brace tokens.
-
-| Tag                  | Lexeme   | Purpose                  |
-| -------------------- | -------- | ------------------------ |
-| `kw_bash`            | `bash`   | Signals a legacy block   |
-| `l_brace`, `r_brace` | `{`, `}` | Wrap the raw Bash script |
 
 ---
 

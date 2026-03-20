@@ -125,15 +125,14 @@ pub const IREvaluator = struct {
     }
 
     fn tempCloseStdIoCheck(self: *IREvaluator) void {
-        const is_main_thread_done = self.context.isThreadClosed(0);
-        if (is_main_thread_done) {
-            for (self.context.threads.items) |thread| {
-                if (thread.id == 0) continue;
-                if (self.context.isThreadClosed(thread.id)) continue;
-                self.context.closeThread(thread.id, .success) catch |err| {
-                    self.log("failed to close lingering thread {}: {}", .{ thread.id, err });
-                };
-            }
+        if (!self.context.isThreadClosed(0)) return;
+
+        for (self.context.threads.items) |thread| {
+            if (thread.id == 0) continue;
+            if (self.context.isThreadClosed(thread.id)) continue;
+            self.context.closeThread(thread.id, .success) catch |err| {
+                self.log("failed to close lingering thread {}: {}", .{ thread.id, err });
+            };
         }
     }
 
@@ -897,7 +896,7 @@ pub const IREvaluator = struct {
                     },
                     .closeable => |closeable_handle| {
                         const closeable = try self.context.getCloseable(closeable_handle);
-                        if (closeable.isClosed()) {
+                        if (closeable.isClosed() or closeable.getResult() != null) {
                             return .cont;
                         } else {
                             return .cont_no_instr_counter_inc;

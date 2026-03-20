@@ -7,3 +7,6 @@ bash "-c" "echo one"; bash "-c" "echo two"; bash "-c" "echo three"
 
 // Semicolon with assignment and command
 const x = "hello"; echo "${x}"
+
+// Parenthesized command sequence
+(echo "hello"; echo "cat")

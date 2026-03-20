@@ -217,6 +217,10 @@ fn renderExpressionAst(writer: *std.Io.Writer, expr: *const ast.Expression, leve
             try writer.print("pipeline @ ", .{});
             try printSpanInline(writer, pipeline_expr.span);
             try writer.writeByte('\n');
+            if (pipeline_expr.background) {
+                try writeIndent(writer, level + 1);
+                try writer.writeAll("background\n");
+            }
             for (pipeline_expr.stages) |stage| try renderExpressionAst(writer, stage, level + 1);
         },
         .unary => |unary| {
@@ -265,6 +269,10 @@ fn renderExpressionAst(writer: *std.Io.Writer, expr: *const ast.Expression, leve
             try writer.writeAll("call @ ");
             try printSpanInline(writer, call.span);
             try writer.writeByte('\n');
+            if (call.background) {
+                try writeIndent(writer, level + 1);
+                try writer.writeAll("background\n");
+            }
             try writeIndent(writer, level + 1);
             try writer.writeAll("callee:\n");
             try renderExpressionAst(writer, call.callee, level + 2);

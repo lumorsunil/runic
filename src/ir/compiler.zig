@@ -1277,9 +1277,61 @@ pub const IRCompiler = struct {
             else => {},
         }
 
+        if (isBackgroundExecutionExpression(expr)) {
+            _ = try self.compileDetachedExpressionStatement(source, expr);
+            return .fromValue(.void);
+        }
+
         const result = try self.compileExpression(expr);
         try self.finalizeStatementResult(source, result);
         return .fromValue(.void);
+    }
+
+    fn isBackgroundExecutionExpression(expr: *const ast.Expression) bool {
+        return switch (expr.*) {
+            .call => |call| call.background,
+            .pipeline => |pipeline| pipeline.background,
+            .block => |block| block.background,
+            else => false,
+        };
+    }
+
+    fn compileDetachedExpressionStatement(
+        self: *IRCompiler,
+        source: *ast.Statement,
+        expr: *ast.Expression,
+    ) Error!Result {
+        return self.compileBackgroundExpression(source, expr);
+    }
+
+    fn compileBackgroundExpression(
+        self: *IRCompiler,
+        source: anytype,
+        expr: *ast.Expression,
+    ) Error!Result {
+        const instr_set = try self.addInstructionSet();
+        const spawned = try self.spawnClosure(
+            source,
+            .initAbs(instr_set, 0),
+            self.threadStdin(),
+            self.threadStdout(),
+            self.threadStderr(),
+        );
+
+        const orig_instr_set = self.current_instruction_set;
+        self.current_instruction_set = instr_set;
+        try self.scopes.push(self.allocator, .closure);
+
+        const result = try self.compileExpression(expr);
+        try self.finalizeStatementResult(source, result);
+        try self.exit_(source, .fromValue(.{ .exit_code = .success }));
+
+        try self.setClosureIdentifiers();
+        self.current_instruction_set = orig_instr_set;
+        try self.compileClosureInitialization(source, spawned.closure);
+        self.scopes.pop();
+
+        return .fromLocation(spawned.thread_handle);
     }
 
     fn finalizeStatementResult(
@@ -1525,12 +1577,27 @@ pub const IRCompiler = struct {
             .literal => |literal| self.compileLiteral(expr, literal),
             .identifier => |identifier| self.compileIdentifier(expr, identifier),
             .env_var => |env_var| self.compileEnvVar(expr, env_var),
-            .call => |call| self.compileCall(expr, call),
+            .call => |call| if (call.background) blk: {
+                var call_copy = call;
+                call_copy.background = false;
+                var expr_copy = ast.Expression{ .call = call_copy };
+                break :blk self.compileBackgroundExpression(expr, &expr_copy);
+            } else self.compileCall(expr, call),
             .member => |member| self.compileMember(expr, member),
             .if_expr => |if_expr| self.compileIf(expr, if_expr),
             .match_expr => |match_expr| self.compileMatch(expr, match_expr),
-            .pipeline => |pipeline| self.compilePipeline(expr, pipeline),
-            .block => |block| self.compileBlock(expr, block),
+            .pipeline => |pipeline| if (pipeline.background) blk: {
+                var pipeline_copy = pipeline;
+                pipeline_copy.background = false;
+                var expr_copy = ast.Expression{ .pipeline = pipeline_copy };
+                break :blk self.compileBackgroundExpression(expr, &expr_copy);
+            } else self.compilePipeline(expr, pipeline),
+            .block => |block| if (block.background) blk: {
+                var block_copy = block;
+                block_copy.background = false;
+                var expr_copy = ast.Expression{ .block = block_copy };
+                break :blk self.compileBackgroundExpression(expr, &expr_copy);
+            } else self.compileBlock(expr, block),
             .fn_decl => |fn_decl| self.compileFnDecl(expr, fn_decl),
             .binary => |binary| self.compileBinary(expr, binary),
             .unary => |unary| self.compileUnary(expr, unary),
@@ -1549,8 +1616,9 @@ pub const IRCompiler = struct {
         source: anytype,
         expr: *ast.Expression,
     ) Error!Result {
+        const background_capture = isBackgroundExecutionExpression(expr);
         const expr_effects = self.analyzeExpressionEffects(expr);
-        if (expr_effects.needs_stdio_capture) {
+        if (expr_effects.needs_stdio_capture or background_capture) {
             // TODO: We need something that cleans up the pipes because otherwise they will get stuck if they are not used
             // Suggestion: Maybe we can have a nested variable structure for inner threads that will set to true when the thread is done processing. We can then continuously check that variable from the outermost scope (here), and whenever it is set to true, we would set the pipes to be closed.
             const stdout_pipe_ref = try self.newRef(source, "stdout_pipe");
@@ -1584,9 +1652,9 @@ pub const IRCompiler = struct {
                 .err = stderr_pipe_ref.dereference(),
             }, expr);
             result = try self.compileResultSaveR(source, result);
-            if (result.isType(thread_type)) {
+            if (!background_capture and result.isType(thread_type)) {
                 try self.wait(source, result.source.location);
-            } else if (result.isType(execution_handles_struct_type)) {
+            } else if (!background_capture and result.isType(execution_handles_struct_type)) {
                 try self.set(source, .initRegister(.r2), stableResultSource(result));
                 try self.wait(
                     source,
@@ -1597,10 +1665,12 @@ pub const IRCompiler = struct {
                     ).typed(thread_type),
                 );
             }
-            try self.pipeOpt(source, stdout_pipe_ref.dereference(), .keep_open, .fromValue(.fromBoolean(false)));
-            try self.pipeOpt(source, stderr_pipe_ref.dereference(), .keep_open, .fromValue(.fromBoolean(false)));
-            try self.wait(source, stdout_stream_thread_ref.dereference());
-            try self.wait(source, stderr_stream_thread_ref.dereference());
+            if (!background_capture) {
+                try self.pipeOpt(source, stdout_pipe_ref.dereference(), .keep_open, .fromValue(.fromBoolean(false)));
+                try self.pipeOpt(source, stderr_pipe_ref.dereference(), .keep_open, .fromValue(.fromBoolean(false)));
+                try self.wait(source, stdout_stream_thread_ref.dereference());
+                try self.wait(source, stderr_stream_thread_ref.dereference());
+            }
             if (result.isType(execution_handles_struct_type)) {
                 // alloc 5 # create execution result
                 try self.alloc(source, 5);
@@ -1785,6 +1855,10 @@ pub const IRCompiler = struct {
             return self.compileOptionalUnwrap(source, member.object);
         }
 
+        if (std.mem.eql(u8, member.member.name, "wait")) {
+            return self.compileWaitMember(source, member.object);
+        }
+
         const object = try self.compileExpression(member.object);
         const object_type = object.typeExpr() orelse {
             try self.reportSourceError(
@@ -1900,6 +1974,101 @@ pub const IRCompiler = struct {
                 .type_expr = field_.type_expr,
             },
         ));
+    }
+
+    fn compileWaitMember(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        object_expr: *ast.Expression,
+    ) Error!Result {
+        const object_ref = try self.newRef(source, "wait_member_object");
+        const object = try self.compileStableExpressionIntoRef(source, object_expr, object_ref);
+
+        if (object.isType(thread_type)) {
+            try self.wait(source, object_ref.dereference().typed(thread_type));
+            return .from(object_ref.dereference().typed(thread_type));
+        }
+
+        if (object.isType(execution_result_struct_type)) {
+            try self.set(source, .initRegister(.r2), .from(object_ref.dereference()));
+
+            const completion_is_thread = try self.newRef(source, "wait_member_completion_is_thread");
+            try self.set(
+                source,
+                completion_is_thread,
+                .fromLocation(.initAdd(
+                    .{ .register = .r2 },
+                    executionResultFieldOffset(.completion_is_thread),
+                    .{ .dereference = true, .type_expr = .global(.boolean) },
+                )),
+            );
+
+            const wait_closeable = try self.newLabel("wait_member_closeable", .unknown);
+            const wait_done = try self.newLabel("wait_member_done", .unknown);
+            try self.jmp(source, try .from(completion_is_thread.dereference()), true, wait_closeable);
+            try self.wait(
+                source,
+                .initAdd(
+                    .{ .register = .r2 },
+                    executionResultFieldOffset(.closeable),
+                    .{ .dereference = true },
+                ),
+            );
+            try self.jmp(source, null, false, wait_done);
+            try self.setLabel(wait_closeable.local_addr.label, .abs);
+            try self.wait(
+                source,
+                .initAdd(
+                    .{ .register = .r2 },
+                    executionResultFieldOffset(.closeable),
+                    .{ .dereference = true, .type_expr = thread_type },
+                ),
+            );
+            try self.setLabel(wait_done.local_addr.label, .abs);
+            try self.pipeOpt(
+                source,
+                .initAdd(
+                    .{ .register = .r2 },
+                    executionResultFieldOffset(.stdout),
+                    .{ .dereference = true },
+                ),
+                .keep_open,
+                .fromValue(.fromBoolean(false)),
+            );
+            try self.pipeOpt(
+                source,
+                .initAdd(
+                    .{ .register = .r2 },
+                    executionResultFieldOffset(.stderr),
+                    .{ .dereference = true },
+                ),
+                .keep_open,
+                .fromValue(.fromBoolean(false)),
+            );
+            try self.pipeOpt(
+                source,
+                .initAdd(
+                    .{ .register = .r2 },
+                    executionResultFieldOffset(.merged),
+                    .{ .dereference = true },
+                ),
+                .keep_open,
+                .fromValue(.fromBoolean(false)),
+            );
+            return .from(object_ref.dereference().typed(execution_result_struct_type));
+        }
+
+        if (!object.isType(thread_type)) {
+            try self.reportSourceError(
+                source,
+                Error.UnsupportedExpression,
+                .@"error",
+                "wait member requires an execution or thread-backed background handle",
+                .{},
+            );
+            return .fromValue(.void);
+        }
+        unreachable;
     }
 
     fn compileOptionalUnwrap(
@@ -2289,7 +2458,7 @@ pub const IRCompiler = struct {
         for (redirects) |redirect| {
             switch (redirect.target) {
                 .path => |path_target| {
-                    const redirect_target = try self.compileStringLiteral(source, path_target.value);
+                    const redirect_target = try self.compileExpression(path_target.value);
                     const redirect_pipe_ref = try self.newRef(source, "stdout_redirect_pipe");
                     try self.pipe(source, redirect_pipe_ref);
                     try self.pipeFile(
@@ -2637,7 +2806,7 @@ pub const IRCompiler = struct {
                         .descriptor => |fd| fd,
                     };
                     if (stream_fd != 1 and stream_fd != 2) continue;
-                    const redirect_target = try self.compileStringLiteral(source, path_target.value);
+                    const redirect_target = try self.compileExpression(path_target.value);
                     const redirect_pipe_ref = try self.newRef(source, if (stream_fd == 1) "stdout_redirect_pipe" else "stderr_redirect_pipe");
                     try self.pipe(source, redirect_pipe_ref);
                     try self.pipeFile(

@@ -39,7 +39,6 @@ fn keywordSymbols(allocator: Allocator) ![]const symbols.Symbol {
     // .kw_while => "while",
     // .kw_match => "match",
     // .kw_return => "return",
-    // .kw_bash => "bash",
     // .kw_try => "try",
     // .kw_catch => "catch",
     // .kw_true => "true",

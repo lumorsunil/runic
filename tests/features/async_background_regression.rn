@@ -1,0 +1,17 @@
+(sleep 0.05; echo "bg-one") &
+echo "after one"
+sleep 0.20
+
+(sleep 0.05; echo "bg-pipe") | cat &
+echo "after pipe"
+sleep 0.20
+
+(sleep 0.05; echo "bg-block") &
+echo "after block"
+sleep 0.20
+
+const job = (sleep 0.05; echo "bg-wait" &)
+echo "before wait"
+job.wait
+echo "after wait"
+printf "%s" "${job.stdout}"

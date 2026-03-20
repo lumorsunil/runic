@@ -560,32 +560,26 @@ if (maybe_port) |port| {
             <article
               class="entry"
               data-searchable
-              data-keywords="promise async await ^t type concurrency"
+              data-keywords="background execution wait type concurrency"
             >
               <h3>
-                <span class="badge badge-type">Type</span> Promises
-                (<code>^T</code>)
+                <span class="badge badge-type">Type</span> Background
+                executions
               </h3>
               <p>
-                Async functions return <code>^T</code> handles. Await them with
-                the same capture syntax used for optionals, then branch on
-                success or typed errors.
+                A trailing <code>&amp;</code> starts a command, pipeline, or
+                block expression in the background. When you bind that result,
+                its output stays buffered in memory and <code>.wait</code>
+                blocks until it finishes.
               </p>
               <div>
                 <div class="example-label">Example</div>
-                <pre><code class="language-rn">fn fetch_release(tag: Str) ^ReleaseError!Release {
-  async {
-    let resp = try http.get("https://api.example.com/releases/${tag}")
-    return try parse_release(resp.body)
-  }
-}
+                <pre><code class="language-rn">(sleep 0.05; echo "warmup") &amp;
+echo "continued"
 
-const latest = fetch_release("stable")
-await (latest) |release| {
-  echo "Shipping ${release.version}"
-} catch |err| {
-  echo "Release lookup failed: ${err}"
-}</code></pre>
+const job = (sleep 0.05; echo "hello from job" &amp;)
+job.wait
+printf "%s" "${job.stdout}"</code></pre>
               </div>
             </article>
           </div>
@@ -740,25 +734,23 @@ if (maybe_port) |port| {
             <article
               class="entry"
               data-searchable
-              data-keywords="promises async await capture concurrency"
+              data-keywords="background wait capture concurrency"
             >
               <h3>
-                <span class="badge badge-feature">Feature</span> Promises as
-                native async values
+                <span class="badge badge-feature">Feature</span> Background
+                commands with <code>.wait</code>
               </h3>
               <p>
-                <code>async</code> blocks return <code>^T</code>, and
-                <code>await</code> mirrors optional captures plus
-                <code>catch</code> for typed failures.
+                Background execution uses a trailing <code>&amp;</code>. Bound
+                background executions capture stdout/stderr just like synchronous
+                bindings, and <code>.wait</code> blocks until the work finishes.
               </p>
               <div>
                 <div class="example-label">Example</div>
-                <pre><code class="language-rn">let latest = fetch_release("stable")
-await (latest) |release| {
-  echo "Shipping ${release.version}"
-} catch |err| {
-  echo "Release lookup failed: ${err}"
-}</code></pre>
+                <pre><code class="language-rn">const job = (sleep 0.05; echo "done" &amp;)
+echo "before wait"
+job.wait
+printf "%s" "${job.stdout}"</code></pre>
               </div>
             </article>
 
@@ -854,11 +846,9 @@ const uppercased = files.map(fn (path) =&gt; path.upper())</code></pre>
 echo sync_proc.stdout
 echo sync_proc.status.exit_code
 
-const async_proc = tail -f /var/log/app.log &amp;
-const finished = await async_proc
-if finished.status.ok {
-  echo finished.stdout
-}</code></pre>
+const async_proc = (sleep 0.05; echo "done" &amp;)
+async_proc.wait
+printf "%s" "${async_proc.stdout}"</code></pre>
               </div>
             </article>
 
@@ -929,28 +919,6 @@ echo response.code</code></pre>
               </div>
             </article>
 
-            <article
-              class="entry"
-              data-searchable
-              data-keywords="legacy compatibility bash block escape hatch"
-            >
-              <h3>
-                <span class="badge badge-feature">Feature</span> Legacy
-                compatibility escape hatch
-              </h3>
-              <p>
-                Embed raw bash blocks verbatim so migrations can proceed
-                incrementally without rewriting everything at once.
-              </p>
-              <div>
-                <div class="example-label">Example</div>
-                <pre><code class="language-rn">bash {
-  for f in *.txt; do
-    echo "legacy: $f"
-  done
-}</code></pre>
-              </div>
-            </article>
           </div>
         </section>
 

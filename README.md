@@ -76,10 +76,9 @@ A working parser, type checker, and IR-based runtime are in place. The following
 - Builtin `cd` with subshell-local working-directory updates
 - Explicit environment access via `$NAME`, with mutable updates scoped to the current subshell
 - Optional types via `?T`, `null`, `orelse`, `.?`, and captured `if` unwrapping
-- `bash { ... }` compatibility blocks
 - Script argument handling via the `@` entry-point function
 - Error declarations (`error Foo = enum/union`), `try`/`catch`, and exact-value `match`
-- `async`/`await` and background processes (`&`)
+- Background process execution via trailing `&`, with `.wait` on captured execution values
 - Module imports via `import "spec"`
 
 Runic aims to be familiar enough that a bash user can start using it immediately, yet principled enough to scale to large automation projects without the typical bash scripting pitfalls.
@@ -157,7 +156,6 @@ Runic keeps the familiar pipeline mindset while removing bash-specific hazards. 
 - Port declarations/functions to typed Runic syntax (`const`, `var`, `fn`) before touching command pipelines so behavior stays verifiable.
 - Replace `source`-style helper files with modules plus manifests (described above) to surface typed APIs.
 - Handle failures with `try`/`catch` and typed status objects rather than `set -e` and `$?`.
-- Embed unported fragments inside `bash { ... }` blocks so you can gradually shrink the compatibility surface without blocking the rest of the script.
 - Exercise the CLI via `zig build run -- path/to/script.rn --trace pipeline` and add CLI smoke tests to `tests/` as soon as a migration lands.
 
 `docs/migrating-from-bash.md` includes a checklist that walks through the recommended workflow, highlights common traps, and links back to `features.md` entries that replace legacy bash behaviors.
@@ -179,7 +177,7 @@ zig build run -- --eval 'echo "${1 + 2}"'
 Key flags:
 
 - `--help`, `-h` — show the usage summary (also the default when no arguments are provided).
-- `--trace <topic>` — enable structured tracing for the given runtime subsystem. Current topics are `pipeline` (per-stage spawn/exit), `process` (handle summaries, stage outcomes, and captured IO sizes), and `async` (scheduler + promise lifecycle). Repeat the flag to collect multiple targets (e.g. `--trace pipeline --trace process`).
+- `--trace <topic>` — enable structured tracing for the given runtime subsystem. Current topics are `pipeline` (per-stage spawn/exit), `process` (handle summaries, stage outcomes, and captured IO sizes), and `async` (background task lifecycle). Repeat the flag to collect multiple targets (e.g. `--trace pipeline --trace process`).
 - `--module-path <dir>` — prepend an additional directory to the module loader search roots. This mirrors `const foo = import "custom/foo"` scenarios from `features.md`.
 - `--env KEY=VALUE` — seed or override environment bindings for the initial script context. Read them explicitly as `$NAME`, reassign them with `$NAME = ...`, and child processes inherit the current subshell-local values.
 
@@ -187,11 +185,11 @@ After the script path, `runic` forwards every argument verbatim. Insert `--` bet
 
 ### Debug tracing
 
-Tracing is the fastest way to inspect how Runic pipelines, async tasks, and process handles behave while the runtime is still under construction. Enable one or more topics via `--trace`:
+Tracing is the fastest way to inspect how Runic pipelines, background tasks, and process handles behave while the runtime is still under construction. Enable one or more topics via `--trace`:
 
 - `pipeline` — prints `[trace pipeline]` records when a pipeline starts, when each stage exits (including PID, status, duration, and capture sizes), and when the pipeline finishes.
 - `process` — captures the resulting handle summary: PID, duration, failed stage (if any), and a per-stage status recap. This is useful when destructuring handles in scripts.
-- `async` — follows the scheduler lifecycle. Every background task logs its spawn, completion/error, promise wait events, and the resolved handle summary so you can see exactly when async work finishes.
+- `async` — follows background execution lifecycle. Every detached task logs its spawn, completion/error, and the resolved handle summary so you can see exactly when background work finishes.
 
 Use these switches with either a script path or `--eval` to watch commands execute in real time.
 
@@ -202,7 +200,6 @@ Sample Runic scripts live under `examples/`. Run them with `zig build run -- exa
 - `examples/pipelines_and_handles.rn` — command pipelines, process handle inspection (`.stdout`, `.stderr`, `.status`), and `&&`/`||` chaining. Use `--trace pipeline --trace process` to see per-stage detail.
 - `examples/data_and_flow.rn` — `const`/`var` bindings with type annotations, `.{ }` array literals, `for` loops over ranges and arrays, arithmetic, and comparisons.
 - `examples/functions_and_closures.rn` — function declarations with stdin/stdout types, single-expression bodies, closures over outer variables, and recursion.
-- `examples/bash_interop.rn` — `bash { }` compatibility blocks, file redirection (`>`, `>>`), block capture, blocks in pipelines, and `bash "-c"` one-liners.
 
 ## Neovim syntax plugin
 

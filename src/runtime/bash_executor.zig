@@ -4,9 +4,9 @@ const command_runner = @import("command_runner.zig");
 const CommandRunner = command_runner.CommandRunner;
 const ProcessHandle = command_runner.ProcessHandle;
 
-/// BashExecutor runs `bash { ... }` compatibility blocks by shelling out via
-/// the system `bash` binary and returning a standard `ProcessHandle` so the
-/// rest of the interpreter interacts with them like any other command stage.
+/// BashExecutor shells out via the system `bash` binary and returns a standard
+/// `ProcessHandle` so the rest of the interpreter interacts with it like any
+/// other command stage.
 pub const BashExecutor = struct {
     runner: CommandRunner,
     config: Config,

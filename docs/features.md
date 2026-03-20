@@ -191,30 +191,21 @@ if (maybe_name) |name| {
 
 **Result:** The then branch runs only when `maybe_name` contains a string, and `name` is available only inside that branch as the inner `String`.
 
-### Promises as native asynchronous values
+### Background commands and `.wait`
 
-Promises are first-class types that use the dedicated `^T` syntax, mirroring the shorthand used for optionals (`?T`) and error unions (`!T`). Any function or expression marked `async` returns a `^T`, and `await` unwraps the eventual value while preserving the same capture ergonomics used elsewhere in the language.
+Runic supports bash-style background execution with a trailing `&`. In statement position the command continues in the background while the script moves on immediately. When you bind a background execution, the command's stdout/stderr are captured in memory just like any other bound execution result, and `.wait` blocks until the background work finishes.
 
 ```rn
-error ReleaseError = enum { Timeout, Offline }
+(sleep 0.05; echo "warmup") &
+echo "continued"
 
-fn fetch_release(tag: Str) ^ReleaseError!Release {
-  async {
-    let resp = try http.get("https://api.example.com/releases/${tag}")
-    return try parse_release(resp.body)
-  }
-}
-
-const latest = fetch_release("stable")
-
-await (latest) |release| {
-  echo "Shipping ${release.version}"
-} catch |err| {
-  echo "Release lookup failed: ${err}"
-}
+const job = (sleep 0.05; echo "hello from job" &)
+echo "before wait"
+job.wait
+printf "%s" "${job.stdout}"
 ```
 
-**Result:** `^ReleaseError!Release` advertises that `fetch_release` completes in the future and may fail with a typed error set. `await (latest) |release| { ... }` uses the same capture clause syntax as optional-aware `if` statements to bind the resolved value, and `catch |err| { ... }` mirrors error handling so scripts can branch on successful resolutions or failures without bespoke glue code.
+**Result:** The first background block runs without blocking the next statement. The bound `job` stays silent while it is running, `job.wait` waits for completion, and `job.stdout` exposes the buffered output afterward.
 
 ## Structured flow control
 
@@ -258,7 +249,7 @@ const files = ls "./src"
 
 ## Processes as first-class values
 
-Starting a program returns a structured process handle whether you run it synchronously or fire it off in the background. Assigning a bare command to a `let` binding now yields that handle directly, eliminating the need for a wrapper function. Handles keep track of the PID, running state, exit code, and captured IO channels so scripts can reason about subprocesses without juggling implicit `$?` globals.
+Starting a program returns a structured execution value. Binding a command captures stdout/stderr plus exit metadata, and appending `&` starts the work in the background while still producing a capturable execution value.
 
 ```rn
 const sync_proc = git "status" "--short"
@@ -269,42 +260,12 @@ const { stdout: sync_stdout, stderr: sync_stderr, exit_code: sync_exit_code } = 
 git "status" "--short" 1>$status_stdout
 git "status" "--short" 2>$status_stderr
 
-const async_proc = tail "-f" "/var/log/app.log" &
-// later...
-const finished = await async_proc
-if finished.status.ok {
-  echo "${finished.stdout}"
-}
-
-// or using an if directly on a Promise will automatically await the proc as well as allow capturing the outputs
-if async_proc |stdout, stderr, status| {
-    echo "${stdout}"
-}
+const async_proc = (sleep 0.05; echo "done" &)
+async_proc.wait
+echo "${async_proc.stdout}"
 ```
 
-**Result:** Binding `let var = <command ...>` executes the program synchronously and returns its full output plus exit metadata. You can destructure the process handle to grab only `stdout`, `stderr`, or `exit_code`, or append the `1>var`/`2>var` shorthand to redirect a single stream directly into a variable while still receiving the same handle for status checks. Appending `&` to a command runs it asynchronously and yields a handle that can be waited on later. All handles surface stdout, stderr, PID, start/stop timestamps, and the final status code so you never have to poll global shell state.
-
-### Capturing pipelines and multiplexed IO
-
-Process handles expose helpers to splice commands together programmatically and capture each stream independently. You can tee outputs into variables, files, or callbacks while streaming live data to the console, and the new binding sugar works seamlessly inside larger pipelines.
-
-```rn
-make "all" | tee "build.log" 1>build_stdout
-if build_stdout.status.exit_code != 0 {
-  echo "Build logs:"
-  echo "${build_stdout.stdout}"
-}
-
-const server = python "api.py" capture = { stdout: :stream, stderr: :buffer } &
-server.stdout.on_line(fn (line) => echo "[srv] ${line}")
-const status = server.wait(timeout = 5s)
-if status.timed_out {
-  server.stop()
-  echo "${server.stderr}" // buffered for post-mortem
-}
-```
-
-**Result:** Capture policies declare whether each stream should be buffered, inherited, or streamed through a callback. Pipelines preserve per-stage exit codes inside a parent process object, and the streamlined binding syntax makes it easy to grab stdout or stderr without destructuring the whole handle. Waiting returns a final snapshot containing stdout, stderr, and the exit metadata so scripts can log failures deterministically.
+**Result:** Binding `const proc = <command ...>` executes the program synchronously and returns its buffered output plus exit metadata. You can destructure the execution value to grab only `stdout`, `stderr`, or `exit_code`, or append the `1>var`/`2>var` shorthand to redirect a single stream directly into a variable while still receiving the same execution value for status checks. Appending `&` runs the work in the background; when you bind that value, its output is still buffered rather than printed immediately, and `.wait` blocks until it finishes.
 
 ## Error-aware pipelines
 
@@ -369,20 +330,6 @@ Each module also carries a manifest named `<file>.module.json` that documents wh
 ```
 
 The manifest uses a concise schema (`primitive`, `array`, `map`, `optional`, `promise`, etc.) so downstream scripts know what they are importing before the runtime executes the module. See `docs/module_authoring.md` for the full list of descriptors and publishing conventions.
-
-## Legacy compatibility escape hatch
-
-When you need to embed classic bash, Runic offers compatibility blocks so you can adopt the language incrementally.
-
-```rn
-bash {
-  for f in *.txt; do
-    echo "legacy: $f"
-  done
-}
-```
-
-**Result:** The block executes verbatim in bash, allowing existing snippets to run untouched while the surrounding script benefits from Runic’s safer semantics.
 
 ## Structs
 

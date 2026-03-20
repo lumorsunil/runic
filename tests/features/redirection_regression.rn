@@ -9,3 +9,11 @@ cat "${path}"
 
 echo "tail" >> "${path}"
 cat "${path}"
+
+const file_name = "${base}-ident.txt"
+
+echo "ident-first" > file_name
+cat "${file_name}"
+
+echo "ident-tail" >> file_name
+cat "${file_name}"

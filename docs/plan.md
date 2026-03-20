@@ -26,7 +26,7 @@ This plan decomposes the work required to build an interpreter that satisfies th
 3. Define baseline CI/test scripts that run formatter → linter → unit tests → CLI smoke tests so future changes adhere to the workflow.
 
 ## Phase 2 — Front-End (Lexer, Parser, AST)
-4. Design the token definitions for Runic syntax, covering commands, pipelines, declarations (`let`, `mut`, `fn`), literals (arrays, maps), error declarations, optionals (`?T`), promises (`^T`), modules, and `bash { ... }` compatibility blocks.
+4. Design the token definitions for Runic syntax, covering commands, pipelines, declarations (`let`, `mut`, `fn`), literals (arrays, maps), error declarations, optionals (`?T`), promises (`^T`), and modules.
 5. Implement a streaming lexer that emits tokens with location info for precise diagnostics.
 6. Define the Abstract Syntax Tree (AST) nodes for all constructs mentioned in `features.md`, ensuring pipeline stages carry metadata about command vs. expression nodes.
 7. Build a Pratt- or precedence-based parser that produces ASTs for scripts, including indentation/brace block handling, function definitions, pattern matching, capture clauses, and async/await expressions.
@@ -46,7 +46,6 @@ This plan decomposes the work required to build an interpreter that satisfies th
 17. Add pipeline orchestration that preserves per-stage outputs and exit codes, enabling downstream inspection (`status.failed_stage` etc.).
 18. Support redirection sugar (`1>var`, `2>var`) and destructuring assignments from process handles.
 19. Implement background command execution (`&`) returning promise-backed process handles that integrate with the main scheduler.
-20. Create the legacy `bash { ... }` execution mode that shells out verbatim and bridges IO back into Runic values.
 
 ## Phase 5 — Language Features Beyond Core Commands
 21. Implement literal evaluation for arrays, maps, and embedded expressions so data semantics stay predictable.
@@ -63,7 +62,7 @@ This plan decomposes the work required to build an interpreter that satisfies th
 30. Add logging/tracing hooks to inspect pipelines, async tasks, and process handles for debugging scripts.
 
 ## Phase 7 — Testing, Examples, and Documentation
-31. Populate `tests/` with integration suites mirroring the scenarios in `features.md` (commands, pipelines, errors, async, modules, bash blocks).
+31. Populate `tests/` with integration suites mirroring the scenarios in `features.md` (commands, pipelines, errors, async, modules).
 32. Create regression tests for both success and failure flows—especially error propagation, optional handling, and async promise resolution.
 33. Add `examples/` Runic scripts showcasing the documented features and verifying CLI ergonomics.
 34. Expand `README.md` (and potentially `docs/`) with instructions on building, running tests, authoring modules, and migrating from bash.

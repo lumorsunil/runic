@@ -610,6 +610,7 @@ pub const Parser = struct {
                         }),
                         .arguments = &.{},
                         .redirects = &.{},
+                        .background = false,
                         .span = identifier.span,
                     },
                 });
@@ -813,11 +814,9 @@ pub const Parser = struct {
                         .l_paren => {
                             const breadcrumbInner = try self.createBreadcrumb("PBE:parenthesis");
                             defer breadcrumbInner.end();
-                            _ = try self.nextToken();
                             try components.append(self.allocator, .{
-                                .expr = try self.parseExpression(),
+                                .expr = try self.parseParenthesizedExpression(),
                             });
-                            _ = try self.expectTokenTag(.r_paren);
                             continue;
                         },
                         .dollar_l_paren => {
@@ -861,6 +860,9 @@ pub const Parser = struct {
                             continue;
                         },
                         else => return {
+                            if (components.items.len > 0 and isExprTerminator(next.tag)) {
+                                if (components.items[components.items.len - 1] != .op) break;
+                            }
                             try self.reportParseError(Error.UnexpectedToken, next.span, "expected value, actual: {t}", .{next.tag});
                             // TODO: how to keep parser going
                             return Error.UnexpectedToken;
@@ -945,6 +947,7 @@ pub const Parser = struct {
                             &.{ call.arguments, &.{right} },
                         ),
                         .redirects = call.redirects,
+                        .background = call.background,
                         .span = call.span.endAt(right.span()),
                     },
                 },
@@ -956,28 +959,22 @@ pub const Parser = struct {
                             &.{right},
                         ),
                         .redirects = &.{},
+                        .background = false,
                         .span = left.span().endAt(right.span()),
                     },
                 },
             },
             .greater, .append_redirect => redirect: {
-                const path = switch (right.*) {
-                    .literal => |literal| switch (literal) {
-                        .string => |string| string,
-                        else => break :redirect binary,
-                    },
-                    else => break :redirect binary,
-                };
-
                 const mode: ast.RedirectionMode = switch (binary.binary.op) {
                     .greater => .truncate,
                     .append_redirect => .append,
                     else => unreachable,
                 };
+                const path = try coerceRedirectionTargetExpression(right);
                 const redirect = ast.Redirection{
                     .stream = .stdout,
                     .mode = mode,
-                    .target = .{ .path = .{ .value = path, .span = path.span } },
+                    .target = .{ .path = .{ .value = path, .span = path.span() } },
                     .span = left.span().endAt(right.span()),
                 };
 
@@ -991,6 +988,7 @@ pub const Parser = struct {
                                 ast.Redirection,
                                 &.{ call.redirects, &.{redirect} },
                             ),
+                            .background = call.background,
                             .span = call.span.endAt(right.span()),
                         },
                     },
@@ -999,6 +997,7 @@ pub const Parser = struct {
                             .callee = left,
                             .arguments = &.{},
                             .redirects = try self.arena.allocator().dupe(ast.Redirection, &.{redirect}),
+                            .background = false,
                             .span = left.span().endAt(right.span()),
                         },
                     },
@@ -1054,7 +1053,7 @@ pub const Parser = struct {
                         const path_redirect = ast.Redirection{
                             .stream = .{ .descriptor = path_source_fd },
                             .mode = mode,
-                            .target = .{ .path = .{ .value = path, .span = path.span } },
+                            .target = .{ .path = .{ .value = path, .span = path.span() } },
                             .span = left.span().endAt(right.span()),
                         };
                         break :redirect .{
@@ -1066,6 +1065,7 @@ pub const Parser = struct {
                                     ast.Redirection,
                                     &.{ inner_call.redirects, &.{ fd_redirect, path_redirect } },
                                 ),
+                                .background = inner_call.background,
                                 .span = inner_call.span.endAt(right.span()),
                             },
                         };
@@ -1115,6 +1115,7 @@ pub const Parser = struct {
                             ast.Redirection,
                             &.{ call.redirects, &.{redirect} },
                         ),
+                        .background = call.background,
                         .span = call.span.endAt(right.span()),
                     },
                 };
@@ -1127,12 +1128,14 @@ pub const Parser = struct {
                             *ast.Expression,
                             &.{ pipeline.stages, &.{right} },
                         ),
+                        .background = pipeline.background,
                         .span = binary.span(),
                     },
                 },
                 else => .{
                     .pipeline = .{
                         .stages = try self.copyToArena(*ast.Expression, &.{ left, right }),
+                        .background = false,
                         .span = binary.span(),
                     },
                 },
@@ -1425,13 +1428,32 @@ pub const Parser = struct {
             else => return self.failExpectedToken(redirect_token.tag, .greater),
         };
 
-        const target = try self.parseStringLiteral();
+        const target = try self.parseRedirectionTargetExpression();
 
         return .{
             .stream = .stdout,
             .mode = mode,
-            .target = .{ .path = .{ .value = target, .span = target.span } },
-            .span = redirect_token.span.endAt(target.span),
+            .target = .{ .path = .{ .value = target, .span = target.span() } },
+            .span = redirect_token.span.endAt(target.span()),
+        };
+    }
+
+    fn parseRedirectionTargetExpression(self: *Self) Error!*ast.Expression {
+        const expr = try self.parseExpression();
+        return coerceRedirectionTargetExpression(expr);
+    }
+
+    fn coerceRedirectionTargetExpression(
+        expr: *ast.Expression,
+    ) Error!*ast.Expression {
+        return switch (expr.*) {
+            .call => |call| blk: {
+                if (call.arguments.len == 0 and call.redirects.len == 0 and call.callee.* == .identifier) {
+                    break :blk call.callee;
+                }
+                break :blk expr;
+            },
+            else => expr,
         };
     }
 
@@ -2065,6 +2087,9 @@ pub const Parser = struct {
         }
 
         const expr = try self.parseExpression();
+        if (try self.stream.consumeIf(.amp)) {
+            try self.markExpressionBackground(expr);
+        }
         const expr_span = expr.span();
         stmt.* = .{
             .expression = .{
@@ -2074,6 +2099,41 @@ pub const Parser = struct {
         };
         try self.consumeStatementTerminator();
         return stmt;
+    }
+
+    fn markExpressionBackground(self: *Self, expr: *ast.Expression) Error!void {
+        switch (expr.*) {
+            .call => |*call| call.background = true,
+            .pipeline => |*pipeline| pipeline.background = true,
+            .block => |*block| block.background = true,
+            else => {
+                try self.reportParseError(
+                    Error.UnexpectedToken,
+                    expr.span(),
+                    "background execution is currently only supported for command calls, pipelines, and block expressions",
+                    .{},
+                );
+                return Error.UnexpectedToken;
+            },
+        }
+    }
+
+    fn clearExpressionBackground(expr: *ast.Expression) void {
+        switch (expr.*) {
+            .call => |*call| call.background = false,
+            .pipeline => |*pipeline| pipeline.background = false,
+            .block => |*block| block.background = false,
+            else => {},
+        }
+    }
+
+    fn isBackgroundExecutionExpression(expr: *const ast.Expression) bool {
+        return switch (expr.*) {
+            .call => |call| call.background,
+            .pipeline => |pipeline| pipeline.background,
+            .block => |block| block.background,
+            else => false,
+        };
     }
 
     fn consumeStatementTerminator(self: *Self) Error!void {
@@ -2148,9 +2208,8 @@ pub const Parser = struct {
                 .literal = .{ .float = .{ .text = tok.lexeme, .span = tok.span } },
             }),
             .l_paren => blk: {
-                const expr = try self.parseExpression();
-                _ = try self.expect(.r_paren);
-                break :blk expr;
+                try self.restoreSnapshot(&snapshot);
+                break :blk try self.parseParenthesizedExpression();
             },
             .l_brace => blk: {
                 try self.restoreSnapshot(&snapshot);
@@ -2162,6 +2221,36 @@ pub const Parser = struct {
             },
             else => self.failExpectedTokens(tok.tag, &expected_primary_tokens),
         };
+    }
+
+    fn parseParenthesizedExpression(self: *Self) Error!*ast.Expression {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const open = try self.expect(.l_paren);
+        const statements = try self.parseStatementsUntil(.r_paren);
+
+        var lift_background = false;
+        if (statements.payload.len > 1) {
+            const last_stmt = statements.payload[statements.payload.len - 1];
+            if (last_stmt.* == .expression and isBackgroundExecutionExpression(last_stmt.expression.expression)) {
+                lift_background = true;
+                clearExpressionBackground(last_stmt.expression.expression);
+            }
+        }
+
+        if (statements.payload.len == 1 and !lift_background) {
+            const stmt = statements.payload[0];
+            if (stmt.* == .expression) {
+                return stmt.expression.expression;
+            }
+        }
+
+        return self.allocExpression(.{ .block = ast.Block{
+            .statements = statements.payload,
+            .background = lift_background,
+            .span = open.span.endAt(statements.span),
+        } });
     }
 
     fn skipNewlines(self: *Self) void {

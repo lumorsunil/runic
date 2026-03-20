@@ -7,4 +7,4 @@ Reference material, specs, and planning artifacts live here. Add new language no
 - `module_authoring.md` — walks through structuring modules, wiring manifests,
   and surfacing typed exports for the loader.
 - `migrating-from-bash.md` — step-by-step guidance for porting existing bash
-  scripts to Runic while leaning on compatibility blocks where needed.
+  scripts to Runic using the currently supported native feature set.
