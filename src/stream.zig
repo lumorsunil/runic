@@ -4,6 +4,7 @@ const RCError = @import("mem/root.zig").RCError;
 const Closeable = @import("closeable.zig").Closeable;
 const CloseableReader = @import("closeable.zig").CloseableReader;
 const CloseableWriter = @import("closeable.zig").CloseableWriter;
+const ManualCloseable = @import("closeable.zig").ManualCloseable;
 const NeverCloses = @import("closeable.zig").NeverCloses;
 const ExitCode = @import("runtime/command_runner.zig").ExitCode;
 const rainbow = @import("rainbow.zig");
@@ -374,6 +375,7 @@ pub const ReaderWriterStream = struct {
         self: *@This(),
         destination: CloseableWriter(ExitCode),
     ) StreamError!void {
+        const had_prior_connection = self.has_been_connected;
         log(
             self,
             @src().fn_name ++ ": ({s}) {*} + {*}",
@@ -401,6 +403,18 @@ pub const ReaderWriterStream = struct {
         if (buffered.len > 0) {
             try self.trace_writer.writer.writeAll(buffered);
             try self.trace_writer.writer.flush();
+        }
+
+        // A downstream destination may attach after upstream processing has already
+        // completed and removed all sources. In that case there will never be
+        // another forward() call to propagate EOF, so close the destination here
+        // once any buffered data has been flushed.
+        if (self.sources.items.len == 0 and had_prior_connection and !self.config.keep_open) {
+            if (self.config.close_destination) {
+                _ = destination.close();
+            }
+            self.disconnectDestination();
+            return;
         }
 
         const allocator = self.buffer_writer.allocator;
@@ -1162,4 +1176,32 @@ pub fn Stream(comptime T: type) type {
             return e;
         }
     };
+}
+
+test "late destination connection flushes buffered data and propagates EOF" {
+    const allocator = std.testing.allocator;
+    var tracer = Tracer.init(allocator, .{ .echo_to_stdout = false });
+    defer tracer.deinit();
+
+    const stream = try Stream(u8).initReaderWriter(allocator, "late-connect", .{}, &tracer);
+    defer stream.deinitParent();
+
+    var source_reader = std.Io.Reader.fixed("hello");
+    var source_closeable = ManualCloseable(ExitCode){ .label = "source" };
+    try stream.connectSource(.init(&source_reader, &source_closeable.closeable));
+
+    try std.testing.expectEqual(ReaderWriterStream.ForwardEvent.not_done, try stream.forward(.unlimited));
+    try std.testing.expectEqual(ReaderWriterStream.ForwardEvent.not_done, try stream.forward(.unlimited));
+    try std.testing.expectEqual(ReaderWriterStream.ForwardEvent.closed, try stream.forward(.unlimited));
+
+    var destination_buffer = std.Io.Writer.Allocating.init(allocator);
+    defer destination_buffer.deinit();
+    var destination_closeable = ManualCloseable(ExitCode){ .label = "destination" };
+    try stream.connectDestination(.init(&destination_buffer.writer, &destination_closeable.closeable));
+
+    const written = try destination_buffer.toOwnedSlice();
+    defer allocator.free(written);
+
+    try std.testing.expectEqualStrings("hello", written);
+    try std.testing.expect(destination_closeable.closeable.isClosed());
 }

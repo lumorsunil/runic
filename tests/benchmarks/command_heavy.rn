@@ -1,0 +1,10 @@
+uname "-s"
+uname "-m"
+id "-u"
+id "-g"
+env
+uname "-s"
+uname "-m"
+id "-u"
+id "-g"
+env

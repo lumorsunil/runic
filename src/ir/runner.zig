@@ -98,7 +98,8 @@ pub const IRRunner = struct {
         );
 
         while (evaluator.step() catch |err| {
-            const current_instr = (evaluator.context.getCurrentThread() orelse unreachable).currentInstruction();
+            const current_thread = evaluator.context.getCurrentThreadPtr() orelse unreachable;
+            const current_instr = current_thread.currentInstruction();
 
             if (current_instr) |ci| {
                 if (ci.source) |source| {
@@ -113,7 +114,7 @@ pub const IRRunner = struct {
                         err,
                     });
                 } else {
-                    const addr = (evaluator.context.getCurrentThread() orelse unreachable).getCurrentInstructionAddr();
+                    const addr = current_thread.getCurrentInstructionAddr();
                     std.log.err("Error evaluating instruction {f}: {}", .{ addr, err });
                 }
             }

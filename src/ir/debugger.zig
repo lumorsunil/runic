@@ -1230,7 +1230,7 @@ pub const IRDebugger = struct {
         try self.print("heap at 0x{x}+{}:\n", .{ addr, len });
         for (0..len) |i| {
             const a = i + addr;
-            const value = self.evaluator.context.shared.heap.get(a);
+            const value = self.evaluator.context.shared.heapGet(a);
             try self.print("\n0x{x}: {?f}", .{ a, value });
         }
         try self.writeAll("\n\n");

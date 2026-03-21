@@ -123,6 +123,10 @@ pub const Instruction = struct {
         pipe_fwd: Forward,
         /// executes an instruction atomically (all instructions executed at once)
         atomic: usize,
+        /// executes a counted range loop body instruction set for the current thread
+        counted_loop: CountedLoop,
+        /// synchronously executes a simple command with inherited stdio
+        simple_exec: SimpleExec,
         /// spawns a process using argv, env map and cwd from scope
         exec: Exec,
         /// spawns a new thread at the given instruction addr
@@ -399,6 +403,29 @@ pub const Instruction = struct {
             } else {
                 try w.print("(true) {f}", .{self.dest});
             }
+        }
+    };
+
+    pub const CountedLoop = struct {
+        counter: Location,
+        limit: ValueSource,
+        body_instr_set: usize,
+
+        pub fn format(self: @This(), w: *std.Io.Writer) !void {
+            try w.print("{f} < {f} body_set={}", .{
+                self.counter.dereference(),
+                self.limit,
+                self.body_instr_set,
+            });
+        }
+    };
+
+    pub const SimpleExec = struct {
+        executable: ValueSource,
+        arguments: []const ValueSource,
+
+        pub fn format(self: @This(), w: *std.Io.Writer) !void {
+            try w.print("{f} argc={}", .{ self.executable, self.arguments.len });
         }
     };
 

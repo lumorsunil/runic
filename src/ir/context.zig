@@ -200,6 +200,11 @@ pub const IRProgramContext = struct {
         return self.threads.items[self.thread_counter];
     }
 
+    pub fn getCurrentThreadPtr(self: *@This()) ?*IRThreadContext {
+        if (self.threads.items.len <= self.thread_counter) return null;
+        return &self.threads.items[self.thread_counter];
+    }
+
     pub fn spawnThread(self: *@This(), subshell_context: SubshellContextHandle) Allocator.Error!ThreadId {
         const id = self.newThreadId();
         const private = try self.allocator.create(IRPrivateContext);
@@ -209,7 +214,12 @@ pub const IRProgramContext = struct {
     }
 
     pub fn getThreadContext(self: @This(), id: ThreadId) ?IRThreadContext {
-        for (self.threads.items) |tc| {
+        const thread = self.getThreadContextPtr(id) orelse return null;
+        return thread.*;
+    }
+
+    pub fn getThreadContextPtr(self: @This(), id: ThreadId) ?*IRThreadContext {
+        for (self.threads.items) |*tc| {
             if (tc.id == id) return tc;
         }
 
@@ -254,17 +264,21 @@ pub const IRProgramContext = struct {
         return .quit;
     }
 
-    pub fn getNextActiveThread(self: @This(), i: ?usize) ?usize {
+    pub fn getNextActiveThread(self: *@This(), i: ?usize) ?usize {
         var i_ = i orelse self.thread_counter;
 
         while (true) : (i_ += 1) {
             if (i_ >= self.threads.items.len) return null;
-            if (self.isThreadActive(self.threads.items[i_].id)) return i_;
+            const thread = &self.threads.items[i_];
+            if (self.threads_to_remove.contains(thread.id)) continue;
+            self.processWaitingFor(thread);
+            if (thread.private.waiting_for != null) continue;
+            return i_;
         }
     }
 
-    pub fn isThreadActive(self: @This(), id: ThreadId) bool {
-        const thread = self.getThreadContext(id) orelse return false;
+    pub fn isThreadActive(self: *@This(), id: ThreadId) bool {
+        const thread = self.getThreadContextPtr(id) orelse return false;
         if (self.threads_to_remove.contains(thread.id)) return false;
         self.processWaitingFor(thread);
         if (thread.private.waiting_for != null) return false;
@@ -275,7 +289,7 @@ pub const IRProgramContext = struct {
         return self.getThreadContext(id) == null or self.threads_to_remove.contains(id);
     }
 
-    fn processWaitingFor(self: @This(), thread: IRThreadContext) void {
+    fn processWaitingFor(self: *@This(), thread: *IRThreadContext) void {
         if (thread.private.waiting_for) |waiting_for| {
             if (self.isThreadClosed(waiting_for)) {
                 thread.private.waiting_for = null;
@@ -431,7 +445,7 @@ pub const IRSharedContext = struct {
     instructions: []const []const Instruction,
     labels: Labels,
     struct_types: []const Value.Struct.Type,
-    heap: std.AutoArrayHashMapUnmanaged(usize, Value) = .empty,
+    heap: std.ArrayListUnmanaged(Value) = .empty,
     current_heap_addr: usize,
 
     pub fn dataSize(self: @This()) usize {
@@ -451,11 +465,30 @@ pub const IRSharedContext = struct {
         }
     }
 
+    fn heapIndex(self: @This(), addr: usize) ?usize {
+        const data_end = self.dataSize();
+        if (addr < data_end or addr >= stack_start) return null;
+        const index = addr - data_end;
+        if (index >= self.heap.items.len) return null;
+        return index;
+    }
+
+    pub fn heapGet(self: @This(), addr: usize) ?Value {
+        const index = self.heapIndex(addr) orelse return null;
+        return self.heap.items[index];
+    }
+
+    pub fn heapGetPtr(self: *@This(), addr: usize) ?*Value {
+        const index = self.heapIndex(addr) orelse return null;
+        return &self.heap.items[index];
+    }
+
     pub fn alloc(self: *@This(), allocator: Allocator, size: usize) !Value {
-        defer self.current_heap_addr += size;
-        for (self.current_heap_addr..self.current_heap_addr + size) |addr| {
-            try self.heap.put(allocator, addr, .void);
+        try self.heap.ensureUnusedCapacity(allocator, size);
+        for (0..size) |_| {
+            self.heap.appendAssumeCapacity(.void);
         }
+        defer self.current_heap_addr += size;
         return .fromAddr(self.current_heap_addr);
     }
 };
@@ -492,4 +525,24 @@ test "context reports missing handles and exit code explicitly" {
     try std.testing.expectError(Error.MissingCloseableHandle, context.getCloseable(0));
     try std.testing.expectError(Error.MissingMainThreadExitCode, context.getMainThreadExitCode());
     try std.testing.expectError(Error.MissingThreadContext, context.closeThread(999, null));
+}
+
+test "shared heap allocates dense contiguous storage" {
+    const allocator = std.testing.allocator;
+    var shared = IRSharedContext{
+        .data = &.{},
+        .instructions = &.{},
+        .labels = .init(),
+        .struct_types = &.{},
+        .current_heap_addr = 0,
+    };
+    defer shared.heap.deinit(allocator);
+
+    const base = try shared.alloc(allocator, 3);
+    try std.testing.expectEqual(@as(usize, 0), base.addr);
+    try std.testing.expectEqual(@as(usize, 3), shared.heap.items.len);
+
+    shared.heapGetPtr(1).?.* = .{ .uinteger = 42 };
+    try std.testing.expectEqual(@as(?Value, .{ .uinteger = 42 }), shared.heapGet(1));
+    try std.testing.expectEqual(@as(?Value, null), shared.heapGet(99));
 }

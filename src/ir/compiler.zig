@@ -532,6 +532,7 @@ pub const IRCompiler = struct {
     logging_enabled: bool,
     diagnostics: std.ArrayList(Diagnostic) = .empty,
     result_counter: usize = 0,
+    allow_simple_exec: bool = false,
 
     pub fn init(
         allocator: Allocator,
@@ -943,6 +944,18 @@ pub const IRCompiler = struct {
         return .initAbs(.{ .register = .r }, .{});
     }
 
+    pub fn simpleExec(
+        self: *IRCompiler,
+        source: anytype,
+        executable: ir.ValueSource,
+        arguments: []const ir.ValueSource,
+    ) Error!void {
+        try self.addInstruction(.init(.from(source), .{ .simple_exec = .{
+            .executable = executable,
+            .arguments = arguments,
+        } }));
+    }
+
     pub fn fork(
         self: *IRCompiler,
         source: anytype,
@@ -1269,6 +1282,14 @@ pub const IRCompiler = struct {
         source: *ast.Statement,
         expr: *ast.Expression,
     ) Error!Result {
+        return self.compileExpressionAsStatement(source, expr);
+    }
+
+    fn compileExpressionAsStatement(
+        self: *IRCompiler,
+        source: anytype,
+        expr: *ast.Expression,
+    ) Error!Result {
         switch (expr.*) {
             .binary => |binary| switch (binary.op) {
                 .logical_and, .logical_or => return self.compileLogicalBinary(source, binary, .statement),
@@ -1282,8 +1303,87 @@ pub const IRCompiler = struct {
             return .fromValue(.void);
         }
 
+        if (expr.* == .block) {
+            return self.compileBlockAsStatement(expr, expr.block);
+        }
+
+        if (self.allow_simple_exec and expr.* == .call and self.isDirectExecutableStatementCall(expr.call)) {
+            return self.compileDirectExecutableStatement(expr, expr.call);
+        }
+
         const result = try self.compileExpression(expr);
         try self.finalizeStatementResult(source, result);
+        return .fromValue(.void);
+    }
+
+    fn compileBlockAsStatement(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        block: ast.Block,
+    ) Error!Result {
+        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+        try self.scopes.push(self.allocator, .lexical);
+        defer self.scopes.pop();
+
+        for (block.statements) |stmt| {
+            _ = try self.compileStatement(stmt);
+        }
+
+        return .fromValue(.void);
+    }
+
+    fn isDirectExecutableStatementCall(self: *IRCompiler, call: ast.CallExpr) bool {
+        if (call.background or call.redirects.len != 0) return false;
+        if (call.callee.* != .identifier) return false;
+
+        const name = call.callee.identifier.name;
+        if (std.mem.eql(u8, name, "cd")) return false;
+        for (call.arguments) |arg| {
+            if (!isSimpleExecArgument(arg)) return false;
+        }
+        return self.lookup(name, .{ .shallow = false }) == null;
+    }
+
+    fn isSimpleExecArgument(expr: *ast.Expression) bool {
+        return switch (expr.*) {
+            .identifier, .env_var => true,
+            .literal => |literal| switch (literal) {
+                .string => |string| blk: {
+                    for (string.segments) |segment| {
+                        if (segment != .text) break :blk false;
+                    }
+                    break :blk true;
+                },
+                else => true,
+            },
+            else => false,
+        };
+    }
+
+    fn compileDirectExecutableStatement(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        call: ast.CallExpr,
+    ) Error!Result {
+        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        const stack_before_args = self.currentFrame().rel_stack_counter;
+        const args = try self.allocator.alloc(ir.ValueSource, call.arguments.len);
+        defer self.allocator.free(args);
+        for (call.arguments, 0..) |arg_expr, i| {
+            const arg = try self.compileExpression(arg_expr);
+            args[i] = arg.source;
+        }
+
+        const executable = ir.ValueSource.fromValue(.{
+            .executable = (try self.addSlice(1, call.callee.identifier.name)).slice,
+        });
+        try self.simpleExec(source, executable, try self.allocator.dupe(ir.ValueSource, args));
+
+        const extra_refs = self.currentFrame().rel_stack_counter - stack_before_args;
+        for (0..extra_refs) |_| {
+            _ = try self.pop(source);
+        }
         return .fromValue(.void);
     }
 
@@ -1298,16 +1398,25 @@ pub const IRCompiler = struct {
 
     fn compileDetachedExpressionStatement(
         self: *IRCompiler,
-        source: *ast.Statement,
+        source: anytype,
         expr: *ast.Expression,
     ) Error!Result {
-        return self.compileBackgroundExpression(source, expr);
+        _ = source;
+        return self.compileBackgroundExpression(expr, expr);
     }
 
     fn compileBackgroundExpression(
         self: *IRCompiler,
         source: anytype,
         expr: *ast.Expression,
+    ) Error!Result {
+        return self.compileBackgroundExpressionValue(source, expr.*);
+    }
+
+    fn compileBackgroundExpressionValue(
+        self: *IRCompiler,
+        source: anytype,
+        expr: ast.Expression,
     ) Error!Result {
         const instr_set = try self.addInstructionSet();
         const spawned = try self.spawnClosure(
@@ -1322,7 +1431,12 @@ pub const IRCompiler = struct {
         self.current_instruction_set = instr_set;
         try self.scopes.push(self.allocator, .closure);
 
-        const result = try self.compileExpression(expr);
+        const result = switch (expr) {
+            .call => |call| try self.compileCall(source, call),
+            .pipeline => |pipeline| try self.compilePipeline(source, pipeline),
+            .block => |block| try self.compileBlock(source, block),
+            else => try self.compileExpression(source),
+        };
         try self.finalizeStatementResult(source, result);
         try self.exit_(source, .fromValue(.{ .exit_code = .success }));
 
@@ -1573,6 +1687,12 @@ pub const IRCompiler = struct {
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(expr.span()), @src().fn_name });
 
+        if (try self.evalComptimeExpression(expr)) |comptime_result| {
+            if (!(comptime_result.source == .value and comptime_result.source.value == .zig_string)) {
+                return comptime_result;
+            }
+        }
+
         return switch (expr.*) {
             .literal => |literal| self.compileLiteral(expr, literal),
             .identifier => |identifier| self.compileIdentifier(expr, identifier),
@@ -1580,8 +1700,7 @@ pub const IRCompiler = struct {
             .call => |call| if (call.background) blk: {
                 var call_copy = call;
                 call_copy.background = false;
-                var expr_copy = ast.Expression{ .call = call_copy };
-                break :blk self.compileBackgroundExpression(expr, &expr_copy);
+                break :blk self.compileBackgroundExpressionValue(expr, .{ .call = call_copy });
             } else self.compileCall(expr, call),
             .member => |member| self.compileMember(expr, member),
             .if_expr => |if_expr| self.compileIf(expr, if_expr),
@@ -1589,14 +1708,12 @@ pub const IRCompiler = struct {
             .pipeline => |pipeline| if (pipeline.background) blk: {
                 var pipeline_copy = pipeline;
                 pipeline_copy.background = false;
-                var expr_copy = ast.Expression{ .pipeline = pipeline_copy };
-                break :blk self.compileBackgroundExpression(expr, &expr_copy);
+                break :blk self.compileBackgroundExpressionValue(expr, .{ .pipeline = pipeline_copy });
             } else self.compilePipeline(expr, pipeline),
             .block => |block| if (block.background) blk: {
                 var block_copy = block;
                 block_copy.background = false;
-                var expr_copy = ast.Expression{ .block = block_copy };
-                break :blk self.compileBackgroundExpression(expr, &expr_copy);
+                break :blk self.compileBackgroundExpressionValue(expr, .{ .block = block_copy });
             } else self.compileBlock(expr, block),
             .fn_decl => |fn_decl| self.compileFnDecl(expr, fn_decl),
             .binary => |binary| self.compileBinary(expr, binary),
@@ -1608,6 +1725,169 @@ pub const IRCompiler = struct {
                 try self.reportSourceError(expr, Error.UnsupportedExpression, .@"error", "expression type \"{t}\" not yet supported", .{expr.*});
                 return .fromValue(.void);
             },
+        };
+    }
+
+    fn evalComptimeLiteral(self: *IRCompiler, literal: ast.Literal) Error!?Result {
+        _ = self;
+        return switch (literal) {
+            .integer => |integer| .fromValue(try parseInt(integer.text)),
+            .float => |float| .fromValue(try parseFloat(float.text)),
+            .bool => |boolean| .fromValue(.{ .exit_code = .fromBoolean(boolean.value) }),
+            .null => .fromValue(.null),
+            .string => |string| blk: {
+                if (string.segments.len != 1 or string.segments[0] != .text) break :blk null;
+                break :blk .fromValue(.{ .zig_string = string.segments[0].text.payload });
+            },
+        };
+    }
+
+    fn evalComptimeBlock(
+        self: *IRCompiler,
+        block: ast.Block,
+    ) Error!?Result {
+        if (block.statements.len != 1) return null;
+        const stmt = block.statements[0];
+        if (stmt.* != .expression) return null;
+        return self.evalComptimeExpression(stmt.expression.expression);
+    }
+
+    fn comptimeValueEql(self: *IRCompiler, left: Result, right: Result) bool {
+        _ = self;
+        if (left.source != .value or right.source != .value) return false;
+        return switch (left.source.value) {
+            .null => right.source.value == .null,
+            .uinteger => |l| right.source.value == .uinteger and l == right.source.value.uinteger,
+            .float => |l| right.source.value == .float and l == right.source.value.float,
+            .exit_code => |l| right.source.value == .exit_code and l.toBoolean() == right.source.value.exit_code.toBoolean(),
+            .zig_string => |l| right.source.value == .zig_string and std.mem.eql(u8, l, right.source.value.zig_string),
+            else => false,
+        };
+    }
+
+    fn comptimeConditionTruth(
+        self: *IRCompiler,
+        expr: *ast.Expression,
+        result: Result,
+    ) ?bool {
+        if (result.source != .value) return null;
+
+        const condition_type = blk: {
+            if (result.typeExpr()) |type_expr| break :blk type_expr;
+            if (expr.* == .identifier) {
+                if (self.lookup(expr.identifier.name, .{ .shallow = false })) |binding| {
+                    if (binding.type_expr) |type_expr| break :blk type_expr;
+                }
+            }
+            break :blk null;
+        };
+
+        if (condition_type) |type_expr| switch (type_expr) {
+            .optional => return result.source.value != .null,
+            else => {},
+        };
+
+        return switch (result.source.value) {
+            .exit_code => |exit_code| exit_code.toBoolean(),
+            .null => false,
+            else => null,
+        };
+    }
+
+    fn evalComptimeExpression(
+        self: *IRCompiler,
+        expr: *ast.Expression,
+    ) Error!?Result {
+        return switch (expr.*) {
+            .literal => |literal| try self.evalComptimeLiteral(literal),
+            .identifier => |identifier| blk: {
+                const binding = self.lookup(identifier.name, .{ .shallow = false }) orelse break :blk null;
+                if (binding.is_mutable or binding.result.source != .value) break :blk null;
+                break :blk binding.result;
+            },
+            .unary => |unary| blk: {
+                const operand = (try self.evalComptimeExpression(unary.operand)) orelse break :blk null;
+                break :blk switch (unary.op) {
+                    .logical_not => if (operand.source.isValueTag(.exit_code))
+                        Result.fromValue(.fromBoolean(!operand.source.value.exit_code.toBoolean()))
+                    else
+                        null,
+                };
+            },
+            .binary => |binary| blk: {
+                switch (binary.op) {
+                    .logical_and, .logical_or => {
+                        const left = (try self.evalComptimeExpression(binary.left)) orelse break :blk null;
+                        if (evaluateLogical(.from(binary.op), left.source)) |logical_result| {
+                            break :blk switch (logical_result) {
+                                .left => left,
+                                .right => (try self.evalComptimeExpression(binary.right)) orelse break :blk null,
+                            };
+                        }
+                        break :blk null;
+                    },
+                    .@"orelse" => {
+                        const left = (try self.evalComptimeExpression(binary.left)) orelse break :blk null;
+                        if (left.source.isValueTag(.null)) {
+                            break :blk (try self.evalComptimeExpression(binary.right)) orelse break :blk null;
+                        }
+                        break :blk left;
+                    },
+                    .add, .subtract, .multiply, .divide, .remainder => {
+                        const left = (try self.evalComptimeExpression(binary.left)) orelse break :blk null;
+                        const right = (try self.evalComptimeExpression(binary.right)) orelse break :blk null;
+                        break :blk if (evaluateArithmetic(.from(binary.op), left.source, right.source)) |result|
+                            .fromValue(result)
+                        else
+                            null;
+                    },
+                    .greater, .greater_equal, .less, .less_equal, .equal, .not_equal => {
+                        const left = (try self.evalComptimeExpression(binary.left)) orelse break :blk null;
+                        const right = (try self.evalComptimeExpression(binary.right)) orelse break :blk null;
+                        if (evaluateCompare(.from(binary.op), left.source, right.source)) |result| {
+                            break :blk .fromValue(result);
+                        }
+                        if (binary.op == .equal or binary.op == .not_equal) {
+                            const equal = self.comptimeValueEql(left, right);
+                            break :blk .fromValue(.fromBoolean(if (binary.op == .equal) equal else !equal));
+                        }
+                        break :blk null;
+                    },
+                    else => break :blk null,
+                }
+            },
+            .if_expr => |if_expr| blk: {
+                const condition = (try self.evalComptimeExpression(if_expr.condition)) orelse break :blk null;
+                const truth = self.comptimeConditionTruth(if_expr.condition, condition) orelse break :blk null;
+                if (truth) {
+                    break :blk (try self.evalComptimeExpression(if_expr.then_expr)) orelse break :blk null;
+                }
+                if (if_expr.else_branch) |else_branch| switch (else_branch) {
+                    .expr => |expr_| break :blk (try self.evalComptimeExpression(expr_)) orelse break :blk null,
+                    .if_expr => |if_expr_| {
+                        const else_expr = try self.allocExpression(.{ .if_expr = if_expr_.* });
+                        break :blk (try self.evalComptimeExpression(else_expr)) orelse break :blk null;
+                    },
+                    .condition => break :blk condition,
+                };
+                break :blk .fromValue(.void);
+            },
+            .match_expr => |match_expr| blk: {
+                const subject = (try self.evalComptimeExpression(match_expr.subject)) orelse break :blk null;
+                for (match_expr.cases) |case| {
+                    switch (case.pattern) {
+                        .wildcard => break :blk (try self.evalComptimeBlock(case.body)) orelse break :blk null,
+                        .literal => |literal| {
+                            const pattern = (try self.evalComptimeLiteral(literal)) orelse break :blk null;
+                            if (!self.comptimeValueEql(subject, pattern)) continue;
+                            break :blk (try self.evalComptimeBlock(case.body)) orelse break :blk null;
+                        },
+                        else => break :blk null,
+                    }
+                }
+                break :blk null;
+            },
+            else => null,
         };
     }
 
@@ -3151,6 +3431,22 @@ pub const IRCompiler = struct {
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
+        if (if_expr.capture == null) {
+            if (try self.evalComptimeExpression(if_expr.condition)) |condition| {
+                if (self.comptimeConditionTruth(if_expr.condition, condition)) |truth| {
+                    if (truth) {
+                        return self.compileExpression(if_expr.then_expr);
+                    }
+                    if (if_expr.else_branch) |else_branch| return switch (else_branch) {
+                        .expr => |expr_| self.compileExpression(expr_),
+                        .if_expr => |if_expr_| self.compileIf(source, if_expr_.*),
+                        .condition => condition,
+                    };
+                    return .fromValue(.void);
+                }
+            }
+        }
+
         if (self.hasMixedIfCaptureRequirements(if_expr)) {
             try self.reportSourceError(
                 source,
@@ -3501,6 +3797,22 @@ pub const IRCompiler = struct {
                 .{},
             );
             return .fromValue(.void);
+        }
+
+        if (try self.evalComptimeExpression(match_expr.subject)) |subject| {
+            for (match_expr.cases) |case| {
+                if (case.capture != null) break;
+                switch (case.pattern) {
+                    .wildcard => return self.compileBlock(source, case.body),
+                    .literal => |literal| {
+                        const pattern = (try self.evalComptimeLiteral(literal)) orelse continue;
+                        if (self.comptimeValueEql(subject, pattern)) {
+                            return self.compileBlock(source, case.body);
+                        }
+                    },
+                    else => break,
+                }
+            }
         }
 
         try self.scopes.push(self.allocator, .lexical);
@@ -3905,6 +4217,25 @@ pub const IRCompiler = struct {
                 }
 
                 const left = try self.compileExpression(binary.left);
+                if (left.source == .location and binary.right.* == .binary) {
+                    const right_binary = binary.right.binary;
+                    switch (right_binary.op) {
+                        .add, .subtract, .multiply, .divide, .remainder => {
+                            if (expressionsStructurallyEqual(binary.left, right_binary.left)) {
+                                const right_operand = (try self.compileExpression(right_binary.right)).dereference();
+                                try self.ath(
+                                    source,
+                                    right_binary.op,
+                                    left.source,
+                                    right_operand.source,
+                                    left.source.location,
+                                );
+                                return .from(left.source.location);
+                            }
+                        },
+                        else => {},
+                    }
+                }
                 const right = try self.compileExpression(binary.right);
                 try self.set(source, left.source.location, right.source);
 
@@ -3964,6 +4295,23 @@ pub const IRCompiler = struct {
         return .fromValue(.void);
     }
 
+    fn expressionsStructurallyEqual(a: *ast.Expression, b: *ast.Expression) bool {
+        const a_name = bareIdentifierName(a) orelse return false;
+        const b_name = bareIdentifierName(b) orelse return false;
+        return std.mem.eql(u8, a_name, b_name);
+    }
+
+    fn bareIdentifierName(expr: *ast.Expression) ?[]const u8 {
+        return switch (expr.*) {
+            .identifier => |identifier| identifier.name,
+            .call => |call| if (call.arguments.len == 0 and call.redirects.len == 0 and !call.background and call.callee.* == .identifier)
+                call.callee.identifier.name
+            else
+                null,
+            else => null,
+        };
+    }
+
     fn compileArray(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -3991,6 +4339,8 @@ pub const IRCompiler = struct {
         base_ref: ?ir.Location = null,
         start_ref: ?ir.Location = null,
         len_ref: ?ir.Location = null,
+        range_limit_ref: ?ir.Location = null,
+        zero_based_range: bool = false,
     };
 
     fn compileForSource(
@@ -4001,37 +4351,50 @@ pub const IRCompiler = struct {
     ) Error!ForSource {
         switch (for_source.*) {
             .range => |range| {
-                const start_result = try self.compileExpression(range.start);
-                const start_ref = try self.newRef(source, try std.fmt.allocPrint(self.allocator, "for_source_{}_range_start", .{index}));
-                try self.set(source, start_ref, start_result.source);
+                const zero_based_range = isLiteralZero(range.start);
+                const start_ref: ?ir.Location = if (zero_based_range) null else blk: {
+                    const start_result = try self.compileExpression(range.start);
+                    const ref = try self.newRef(source, try std.fmt.allocPrint(self.allocator, "for_source_{}_range_start", .{index}));
+                    try self.set(source, ref, start_result.source);
+                    break :blk ref;
+                };
 
                 var len_ref: ?ir.Location = null;
+                var range_limit_ref: ?ir.Location = null;
                 if (range.end) |end_expr| {
                     const end_result = try self.compileExpression(end_expr);
-                    const end_ref = try self.newRef(source, try std.fmt.allocPrint(self.allocator, "for_source_{}_range_end", .{index}));
-                    try self.set(source, end_ref, end_result.source);
-
-                    const range_len_ref = try self.newRef(source, try std.fmt.allocPrint(self.allocator, "for_source_{}_range_len", .{index}));
-                    try self.ath(
-                        source,
-                        .subtract,
-                        .from(end_ref.dereference()),
-                        .from(start_ref.dereference()),
-                        range_len_ref,
-                    );
-                    if (range.inclusive_end) {
-                        try self.set(source, .initRegister(.r2), .from(range_len_ref.dereference()));
-                        try self.inc(source);
-                        try self.set(source, range_len_ref, .fromLocation(.initRegister(.r2)));
+                    if (zero_based_range) {
+                        const range_len_ref = try self.newRef(source, try std.fmt.allocPrint(self.allocator, "for_source_{}_range_len", .{index}));
+                        try self.set(source, range_len_ref, end_result.source);
+                        len_ref = range_len_ref;
+                        range_limit_ref = range_len_ref;
+                    } else {
+                        const range_limit_ref_ = try self.newRef(source, try std.fmt.allocPrint(self.allocator, "for_source_{}_range_limit", .{index}));
+                        try self.set(source, range_limit_ref_, end_result.source);
+                        const range_len_ref = try self.newRef(source, try std.fmt.allocPrint(self.allocator, "for_source_{}_range_len", .{index}));
+                        try self.ath(
+                            source,
+                            .subtract,
+                            .from(range_limit_ref_.dereference()),
+                            .from(start_ref.?.dereference()),
+                            range_len_ref,
+                        );
+                        len_ref = range_len_ref;
+                        range_limit_ref = range_limit_ref_;
                     }
-                    len_ref = range_len_ref;
+                    if (range.inclusive_end) {
+                        try self.ath(source, .add, .from(range_limit_ref.?.dereference()), .fromValue(.{ .uinteger = 1 }), range_limit_ref.?);
+                        try self.ath(source, .add, .from(len_ref.?.dereference()), .fromValue(.{ .uinteger = 1 }), len_ref.?);
+                    }
                 }
 
                 return .{
                     .kind = .range,
                     .start_ref = start_ref,
                     .len_ref = len_ref,
+                    .range_limit_ref = range_limit_ref,
                     .value_type = ast.TypeExpr.global(.integer),
+                    .zero_based_range = zero_based_range,
                 };
             },
             else => {
@@ -4053,13 +4416,19 @@ pub const IRCompiler = struct {
                 try self.set(source, len_ref, .fromLocation(.initAbs(.{ .register = .r2 }, .{ .dereference = true })));
 
                 return .{
-                    .kind = .array,
-                    .base_ref = source_ref,
-                    .len_ref = len_ref,
-                    .value_type = source_result.typeExpr().?.array.element.*,
-                };
+            .kind = .array,
+            .base_ref = source_ref,
+            .len_ref = len_ref,
+            .range_limit_ref = null,
+            .value_type = source_result.typeExpr().?.array.element.*,
+        };
             },
         }
+    }
+
+    fn isLiteralZero(expr: *ast.Expression) bool {
+        if (expr.* != .literal or expr.literal != .integer) return false;
+        return std.mem.eql(u8, expr.literal.integer.text, "0");
     }
 
     const LogicalCompileMode = enum {
@@ -4188,6 +4557,13 @@ pub const IRCompiler = struct {
         source: anytype,
         binary: ast.BinaryExpr,
     ) Error!Result {
+        if (try self.evalComptimeExpression(binary.left)) |left_comptime| {
+            if (left_comptime.source.isValueTag(.null)) {
+                return self.compileExpression(binary.right);
+            }
+            return self.compileExpression(binary.left);
+        }
+
         const left_is_literal_null = binary.left.* == .literal and binary.left.literal == .null;
         const result_ref = try self.newRef(source, "orelse_result");
         const left = try self.compileStableExpressionIntoRef(source, binary.left, result_ref);
@@ -4239,10 +4615,11 @@ pub const IRCompiler = struct {
         for_source: ForSource,
         counter_ref: ir.Location,
         binding: ast.Identifier,
-        capture_ref: ir.Location,
+        capture_ref: ?ir.Location,
     ) Error!void {
         switch (for_source.kind) {
             .array => {
+                const capture_ref_ = capture_ref orelse return Error.ScopeNotFound;
                 const source_ref = for_source.base_ref.?;
                 try self.set(
                     source,
@@ -4257,23 +4634,29 @@ pub const IRCompiler = struct {
                     .initRegister(.r2),
                 );
                 try self.inc(source);
-                try self.set(source, capture_ref, .fromLocation(.initAbs(.{ .register = .r2 }, .{ .dereference = true })));
+                try self.set(source, capture_ref_, .fromLocation(.initAbs(.{ .register = .r2 }, .{ .dereference = true })));
             },
             .range => {
-                try self.ath(
-                    source,
-                    .add,
-                    .from(for_source.start_ref.?.dereference()),
-                    .from(counter_ref.dereference()),
-                    capture_ref,
-                );
+                if (!for_source.zero_based_range) {
+                    const capture_ref_ = capture_ref orelse return Error.ScopeNotFound;
+                    try self.ath(
+                        source,
+                        .add,
+                        .from(for_source.start_ref.?.dereference()),
+                        .from(counter_ref.dereference()),
+                        capture_ref_,
+                    );
+                }
             },
         }
 
         try self.compileIdentifierBinding(
             source,
             binding,
-            .from(capture_ref.dereference().typed(for_source.value_type)),
+            if (for_source.kind == .range and for_source.zero_based_range)
+                .from(counter_ref.dereference().typed(for_source.value_type))
+            else
+                .from(capture_ref.?.dereference().typed(for_source.value_type)),
             null,
             false,
             .normal,
@@ -4286,13 +4669,20 @@ pub const IRCompiler = struct {
         for_sources: []const ForSource,
     ) Error!?ir.Location {
         var iterations_ref: ?ir.Location = null;
+        var needs_owned_iterations_ref = false;
 
         for (for_sources, 0..) |for_source, i| {
             const len_ref = for_source.len_ref orelse continue;
             if (iterations_ref == null) {
-                iterations_ref = try self.newRef(source, "for_iterations");
-                try self.set(source, iterations_ref.?, .from(len_ref.dereference()));
+                iterations_ref = len_ref;
                 continue;
+            }
+
+            if (!needs_owned_iterations_ref) {
+                const owned_iterations_ref = try self.newRef(source, "for_iterations");
+                try self.set(source, owned_iterations_ref, .from(iterations_ref.?.dereference()));
+                iterations_ref = owned_iterations_ref;
+                needs_owned_iterations_ref = true;
             }
 
             try self.cmp(
@@ -4325,11 +4715,19 @@ pub const IRCompiler = struct {
         for (for_expr.sources, 0..) |for_source_expr, i| {
             for_sources[i] = try self.compileForSource(source, for_source_expr, i);
         }
+
+        if (for_sources.len == 1 and for_sources[0].kind == .range and for_sources[0].range_limit_ref != null) {
+            return self.compileSingleRangeForLoop(source, for_expr, for_sources[0]);
+        }
+
         const capture_refs = try self.allocator.alloc(?ir.Location, for_expr.capture.bindings.len);
         defer self.allocator.free(capture_refs);
-        for (for_expr.capture.bindings, 0..) |capture, i| {
+        for (for_expr.capture.bindings, for_sources, 0..) |capture, for_source, i| {
             capture_refs[i] = switch (capture.*) {
-                .identifier => try self.newRef(source, try std.fmt.allocPrint(self.allocator, "for_capture_{}", .{i})),
+                .identifier => if (for_source.kind == .range and for_source.zero_based_range)
+                    null
+                else
+                    try self.newRef(source, try std.fmt.allocPrint(self.allocator, "for_capture_{}", .{i})),
                 .discard => null,
                 .tuple, .record => {
                     try self.reportSourceError(
@@ -4371,7 +4769,7 @@ pub const IRCompiler = struct {
                     for_source,
                     counter_ref,
                     identifier,
-                    capture_refs[i].?,
+                    capture_refs[i],
                 ),
                 .tuple, .record => {
                     try self.reportSourceError(
@@ -4389,17 +4787,17 @@ pub const IRCompiler = struct {
         // 4. Compile for body as statement
 
         const stack_before_body = self.currentFrame().rel_stack_counter;
-        const for_body_result = try self.compileExpression(for_expr.body);
+        const fallback_for_body_result = try self.compileExpressionAsStatement(source, for_expr.body);
 
-        if (isWaitable(for_body_result)) |loc| {
+        if (isWaitable(fallback_for_body_result)) |loc| {
             try self.wait(source, loc);
         }
 
         // Pop any refs that were allocated during the body but not cleaned up.
         // Without this, the runtime stack grows each iteration and ref lookups
         // based on compile-time rel_stack_addr become incorrect on iteration 2+.
-        const body_extra_refs = self.currentFrame().rel_stack_counter - stack_before_body;
-        for (0..body_extra_refs) |_| {
+        const fallback_body_extra_refs = self.currentFrame().rel_stack_counter - stack_before_body;
+        for (0..fallback_body_extra_refs) |_| {
             _ = try self.pop(source);
         }
 
@@ -4407,9 +4805,13 @@ pub const IRCompiler = struct {
 
         self.scopes.pop();
 
-        try self.set(source, .initRegister(.r2), .from(counter_ref.dereference()));
-        try self.inc(source);
-        try self.set(source, counter_ref, .fromLocation(.initRegister(.r2)));
+        try self.ath(
+            source,
+            .add,
+            .from(counter_ref.dereference()),
+            .fromValue(.{ .uinteger = 1 }),
+            counter_ref,
+        );
         try self.jmp(source, null, true, for_label);
 
         try self.setLabel(after_label.local_addr.label, .abs);
@@ -4418,12 +4820,146 @@ pub const IRCompiler = struct {
         return .fromValue(.void);
     }
 
+    fn compileSingleRangeForLoop(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        for_expr: ast.ForExpr,
+        for_source: ForSource,
+    ) Error!Result {
+        const iter_ref = try self.newRef(source, "for_counter");
+        if (for_source.zero_based_range) {
+            try self.set(source, iter_ref, .fromValue(.{ .uinteger = 0 }));
+        } else {
+            try self.set(source, iter_ref, .from(for_source.start_ref.?.dereference()));
+        }
+
+        const frame_before_body = self.currentFrame().rel_stack_counter;
+        const body_set = try self.addInstructionSet();
+        const prev_set = self.current_instruction_set;
+        const prev_allow_simple_exec = self.allow_simple_exec;
+        self.current_instruction_set = body_set;
+        self.allow_simple_exec = true;
+        defer self.current_instruction_set = prev_set;
+        defer self.allow_simple_exec = prev_allow_simple_exec;
+
+        try self.scopes.push(self.allocator, .lexical);
+        defer self.scopes.pop();
+
+        switch (for_expr.capture.bindings[0].*) {
+            .discard => {},
+            .identifier => |identifier| try self.compileIdentifierBinding(
+                source,
+                identifier,
+                .from(iter_ref.dereference().typed(for_source.value_type)),
+                null,
+                false,
+                .normal,
+            ),
+            .tuple, .record => {
+                try self.reportSourceError(
+                    source,
+                    Error.UnsupportedBindingPattern,
+                    .@"error",
+                    "for-loop destructuring captures are not yet supported in IR",
+                    .{},
+                );
+                return .fromValue(.void);
+            },
+        }
+
+        const counted_loop_stack_before_body = self.currentFrame().rel_stack_counter;
+        const for_body_result = try self.compileExpressionAsStatement(source, for_expr.body);
+        const body_extra_refs = self.currentFrame().rel_stack_counter - counted_loop_stack_before_body;
+        for (0..body_extra_refs) |_| {
+            _ = try self.pop(source);
+        }
+
+        const can_use_counted_loop = isWaitable(for_body_result) == null and self.instructionSetIsCountedLoopSafe(body_set);
+        self.currentFrame().rel_stack_counter = frame_before_body;
+
+        self.current_instruction_set = prev_set;
+        if (can_use_counted_loop) {
+            try self.addInstruction(.init(.from(source), .{ .counted_loop = .{
+                .counter = iter_ref,
+                .limit = .from(for_source.range_limit_ref.?.dereference()),
+                .body_instr_set = body_set,
+            } }));
+            return .fromValue(.void);
+        }
+
+        const after_label = try self.newLabel("for_after", .unknown);
+        const for_label = try self.newLabel("for", .abs);
+
+        try self.cmp(source, .less, .from(iter_ref.dereference()), .from(for_source.range_limit_ref.?.dereference()), .initRegister(.r2));
+        try self.jmp(source, .fromLocation(.initRegister(.r2)), false, after_label);
+
+        try self.scopes.push(self.allocator, .lexical);
+
+        switch (for_expr.capture.bindings[0].*) {
+            .discard => {},
+            .identifier => |identifier| try self.compileIdentifierBinding(
+                source,
+                identifier,
+                .from(iter_ref.dereference().typed(for_source.value_type)),
+                null,
+                false,
+                .normal,
+            ),
+            .tuple, .record => {
+                try self.reportSourceError(
+                    source,
+                    Error.UnsupportedBindingPattern,
+                    .@"error",
+                    "for-loop destructuring captures are not yet supported in IR",
+                    .{},
+                );
+                return .fromValue(.void);
+            },
+        }
+
+        const stack_before_body = self.currentFrame().rel_stack_counter;
+        const fallback_for_body_result = try self.compileExpressionAsStatement(source, for_expr.body);
+
+        if (isWaitable(fallback_for_body_result)) |loc| {
+            try self.wait(source, loc);
+        }
+
+        const fallback_body_extra_refs = self.currentFrame().rel_stack_counter - stack_before_body;
+        for (0..fallback_body_extra_refs) |_| {
+            _ = try self.pop(source);
+        }
+
+        self.scopes.pop();
+
+        try self.ath(
+            source,
+            .add,
+            .from(iter_ref.dereference()),
+            .fromValue(.{ .uinteger = 1 }),
+            iter_ref,
+        );
+        try self.jmp(source, null, true, for_label);
+
+        try self.setLabel(after_label.local_addr.label, .abs);
+        return .fromValue(.void);
+    }
+
+    fn instructionSetIsCountedLoopSafe(self: *IRCompiler, instr_set: usize) bool {
+        for (self.instruction_sets.items[instr_set].instructions.items) |instr| {
+            switch (instr.type) {
+                .comment, .set, .ath, .cmp, .neg, .get_env, .set_env, .simple_exec => {},
+                else => return false,
+            }
+        }
+        return true;
+    }
+
     fn analyzeExpressionEffects(
         self: *IRCompiler,
         expr: *ast.Expression,
     ) ExprEffects {
         return switch (expr.*) {
-            .call => .{ .needs_stdio_capture = true }, // conservative
+            .call => |call| .{ .needs_stdio_capture = callNeedsStdioCapture(self, call) },
             .pipeline => .{ .needs_stdio_capture = true }, // definitely stdio-heavy
             .block => .{ .needs_stdio_capture = true }, // may emit output
             .if_expr => |if_expr| self.analyzeIfExpressionEffects(if_expr),
@@ -4440,6 +4976,22 @@ pub const IRCompiler = struct {
             .unary => |unary| self.analyzeExpressionEffects(unary.operand),
             .array => |_| .{ .needs_stdio_capture = false },
             else => .{},
+        };
+    }
+
+    fn callNeedsStdioCapture(self: *IRCompiler, call: ast.CallExpr) bool {
+        if (call.arguments.len != 0 or call.redirects.len != 0 or call.background) {
+            return true;
+        }
+
+        return switch (call.callee.*) {
+            .identifier => |identifier| blk: {
+                if (std.mem.eql(u8, identifier.name, "cd") and self.lookup(identifier.name, .{ .shallow = false }) == null) {
+                    break :blk false;
+                }
+                break :blk self.lookup(identifier.name, .{ .shallow = false }) == null;
+            },
+            else => true,
         };
     }
 

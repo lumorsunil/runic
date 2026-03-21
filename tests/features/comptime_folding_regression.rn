@@ -1,0 +1,17 @@
+const base = 2
+const folded = base + 3
+echo "${folded}"
+
+if (1 < 2) {
+  echo "if then"
+} else {
+  echo "bad if else"
+}
+
+echo "${match ("runic") {
+  "zig" => { "bad" }
+  "runic" => { "match ok" }
+  _ => { "bad wildcard" }
+}}"
+
+echo "${null orelse "fallback"}"

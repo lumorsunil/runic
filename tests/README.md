@@ -51,3 +51,21 @@ Run the documented regression harnesses locally with:
 bash tests/cli_smoke.sh
 bash tests/cli_diagnostics.sh
 ```
+
+## Benchmarks
+
+`tests/benchmarks/` holds measurement-oriented scripts rather than pass/fail regressions.
+They are intended for local performance work and should be run with an optimized
+binary, not a debug build.
+
+Use the helper from the repository root:
+
+```
+zig build -Doptimize=ReleaseFast
+bash scripts/bench.sh
+```
+
+Current workloads:
+- `tests/benchmarks/command_heavy.rn` and `.sh` stress repeated external command execution.
+- `tests/benchmarks/evaluator_heavy.rn` and `.sh` stress pure arithmetic and loop evaluation.
+- `tests/benchmarks/mixed_loop_exec.rn` and `.sh` stress loops that also spawn commands each iteration.

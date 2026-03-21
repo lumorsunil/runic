@@ -111,6 +111,24 @@ The runtime and CLI are implemented in Zig (tested with Zig 0.15.1). Zig's build
 - Stage-specific reruns: `./scripts/stages/unit_tests.sh`, `./scripts/stages/cli_smoke.sh`, etc., respect the same `RUNIC_REPO_ROOT`/`RUNIC_LANG` environment variables.
 - Add new CLI regression tests by dropping shell scripts under `tests/cli_*.sh`. They run inside `run_ci.sh` and should invoke `zig build run -- ...` to interact with the current binary.
 
+### Benchmarking
+
+Use optimized binaries for performance work. Debug builds are useful for correctness, but their timings are too noisy to compare with bash or to judge runtime changes reliably.
+
+1. Build an optimized CLI:
+   `zig build -Doptimize=ReleaseFast`
+2. Run the benchmark harness:
+   `bash scripts/bench.sh`
+3. Increase repetitions when comparing close changes:
+   `bash scripts/bench.sh 25`
+
+The harness compares Runic and bash on two representative workloads:
+- `tests/benchmarks/command_heavy.*` for repeated external-command spawning
+- `tests/benchmarks/evaluator_heavy.*` for pure arithmetic/control-flow evaluation
+- `tests/benchmarks/mixed_loop_exec.*` for loops that also spawn commands each iteration
+
+Override the binary path with `RUNIC_BIN=/path/to/runic bash scripts/bench.sh` if you want to compare multiple builds.
+
 ### Formatting and linting
 
 - `zig fmt src cmd tests` formats every Zig source file and is enforced in CI before code review.

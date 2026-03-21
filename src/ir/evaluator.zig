@@ -10,6 +10,23 @@ const Stream = runic.stream.Stream;
 const Tracer = runic.trace.Tracer;
 const compiler = runic.ir.compiler;
 
+const FastUIntSource = union(enum) {
+    ptr: *ir.Value,
+    immediate: usize,
+
+    fn get(self: @This()) usize {
+        return switch (self) {
+            .ptr => |ptr| ptr.uinteger,
+            .immediate => |value| value,
+        };
+    }
+};
+
+const MaterializedExecArgv = struct {
+    argv: std.ArrayList([]const u8),
+    owned: std.ArrayList(bool),
+};
+
 pub const Error =
     Allocator.Error ||
     std.process.Child.SpawnError ||
@@ -90,7 +107,7 @@ pub const IREvaluator = struct {
     }
 
     fn logTrace(self: *IREvaluator, comptime label: []const u8) void {
-        const thread = self.context.getCurrentThread();
+        const thread = self.context.getCurrentThreadPtr().?;
         const instr_addr = thread.getCurrentInstructionAddr();
         const instr = thread.currentInstruction();
         self.log(label ++ ": t:{}, i:{f}: {?f}", .{ thread.id, instr_addr, instr });
@@ -99,7 +116,12 @@ pub const IREvaluator = struct {
     pub fn step(self: *IREvaluator) Error!?Result {
         // self.logTrace(@src().fn_name);
 
-        const thread = self.context.getCurrentThread() orelse return Error.MissingCurrentThread;
+        if (self.singleThreadFastPathEligible()) {
+            return try self.stepSingleThreadFastPath();
+        }
+
+        const current_thread_index = self.context.thread_counter;
+        const thread = self.context.getCurrentThreadPtr() orelse return Error.MissingCurrentThread;
 
         const instruction = thread.currentInstruction() orelse {
             self.log("{}: no more instructions", .{thread.id});
@@ -107,14 +129,14 @@ pub const IREvaluator = struct {
             return try self.advanceThreadCounter();
         };
 
-        const result = try self.runInstruction(thread, instruction);
+        const result = try self.runInstruction(thread.*, instruction);
 
         switch (result) {
             .exit => |exit_code| try self.context.closeThread(thread.id, exit_code),
-            .cont => thread.incInstructionCounter(),
+            .cont => self.context.threads.items[current_thread_index].incInstructionCounter(),
             .cont_no_instr_counter_inc => {},
             .skip => {
-                thread.incInstructionCounter();
+                self.context.threads.items[current_thread_index].incInstructionCounter();
                 return .skip;
             },
         }
@@ -122,6 +144,255 @@ pub const IREvaluator = struct {
         self.tempCloseStdIoCheck();
 
         return try self.advanceThreadCounter();
+    }
+
+    fn singleThreadFastPathEligible(self: *IREvaluator) bool {
+        if (self.context.thread_counter != 0) return false;
+        if (self.context.threads.items.len != 1) return false;
+        if (self.context.threads_to_remove.count() != 0) return false;
+        return self.context.threads.items[0].private.waiting_for == null;
+    }
+
+    fn stepSingleThreadFastPath(self: *IREvaluator) Error!?Result {
+        while (self.singleThreadFastPathEligible()) {
+            const instr_addr = self.context.threads.items[0].private.instruction_counter;
+            const instruction_set = self.context.threads.items[0].shared.instructions[instr_addr.instr_set];
+
+            if (instruction_set.len <= instr_addr.local_addr) {
+                const thread = self.context.threads.items[0];
+                self.log("{}: no more instructions", .{thread.id});
+                try self.context.closeThread(thread.id, null);
+                self.tempCloseStdIoCheck();
+                return .{ .exit = try self.context.getMainThreadExitCode() };
+            }
+
+            if (try self.tryRunFastRangeLoop(&self.context.threads.items[0], instruction_set)) {
+                continue;
+            }
+
+            const instruction = instruction_set[instr_addr.local_addr];
+            const result = try self.runInstruction(self.context.threads.items[0], instruction);
+
+            switch (result) {
+                .exit => |exit_code| {
+                    const thread = self.context.threads.items[0];
+                    try self.context.closeThread(thread.id, exit_code);
+                    self.tempCloseStdIoCheck();
+                    return .{ .exit = try self.context.getMainThreadExitCode() };
+                },
+                .cont => {
+                    self.context.threads.items[0].incInstructionCounter();
+                    continue;
+                },
+                .cont_no_instr_counter_inc => return .cont_no_instr_counter_inc,
+                .skip => {
+                    self.context.threads.items[0].incInstructionCounter();
+                    continue;
+                },
+            }
+        }
+
+        return .cont;
+    }
+
+    fn tryRunFastRangeLoop(
+        self: *IREvaluator,
+        thread: *ir.context.IRThreadContext,
+        instruction_set: []const ir.Instruction,
+    ) Error!bool {
+        const current_addr = thread.getCurrentInstructionAddr();
+        const start = current_addr.local_addr;
+        if (instruction_set.len <= start + 4) return false;
+
+        const cmp = switch (instruction_set[start].type) {
+            .cmp => |cmp| cmp,
+            else => return false,
+        };
+        if (cmp.op != .lt) return false;
+
+        const jump_after = switch (instruction_set[start + 1].type) {
+            .jmp => |jump| jump,
+            else => return false,
+        };
+        if (jump_after.cond == null or jump_after.jump_if) return false;
+        if (!std.meta.eql(jump_after.cond.?, ir.ValueSource.fromLocation(cmp.result))) return false;
+
+        const body = switch (instruction_set[start + 2].type) {
+            .ath => |ath| ath,
+            else => return false,
+        };
+
+        const increment = switch (instruction_set[start + 3].type) {
+            .ath => |ath| ath,
+            else => return false,
+        };
+        if (increment.op != .add) return false;
+
+        const jump_back = switch (instruction_set[start + 4].type) {
+            .jmp => |jump| jump,
+            else => return false,
+        };
+        if (jump_back.cond != null) return false;
+
+        const exit_addr = try self.resolveAddr(thread.*, jump_after.dest);
+        if (exit_addr.instr_set != current_addr.instr_set or exit_addr.local_addr != start + 5) return false;
+
+        const loop_addr = try self.resolveAddr(thread.*, jump_back.dest);
+        if (loop_addr.instr_set != current_addr.instr_set or loop_addr.local_addr != start) return false;
+
+        const counter_loc = switch (cmp.a) {
+            .location => |loc| loc,
+            else => return false,
+        };
+        const counter_ptr = self.resolveFastUIntPointer(thread.*, counter_loc) orelse return false;
+        const limit = self.resolveFastUIntSource(thread.*, cmp.b) orelse return false;
+
+        const increment_result = increment.result;
+        if (!std.meta.eql(counter_loc.undereference(), increment_result)) return false;
+        if (!std.meta.eql(increment.a, cmp.a)) return false;
+        const increment_by = self.resolveFastUIntSource(thread.*, increment.b) orelse return false;
+        if (increment_by.get() != 1) return false;
+
+        const body_dest = self.resolveFastUIntPointer(thread.*, body.result) orelse return false;
+        const body_left = self.resolveFastUIntSource(thread.*, body.a) orelse return false;
+        const body_right = self.resolveFastUIntSource(thread.*, body.b) orelse return false;
+
+        while (counter_ptr.uinteger < limit.get()) {
+            body_dest.* = .{ .uinteger = switch (body.op) {
+                .add => body_left.get() +| body_right.get(),
+                .sub => body_left.get() -| body_right.get(),
+                .mul => body_left.get() *| body_right.get(),
+                else => return false,
+            } };
+            counter_ptr.* = .{ .uinteger = counter_ptr.uinteger +| 1 };
+        }
+
+        if (!try self.setFastLocation(thread.*, cmp.result, .fromBoolean(false))) {
+            try self.setLocation(thread.*, cmp.result, .fromBoolean(false));
+        }
+        thread.setInstructionCounter(exit_addr);
+        return true;
+    }
+
+    fn runAtomicInstructionSet(
+        self: *IREvaluator,
+        thread: ir.context.IRThreadContext,
+        instr_set: usize,
+    ) Error!Result {
+        const instructions = self.context.instructions()[instr_set];
+
+        for (instructions) |instr| {
+            switch (try self.runInstruction(thread, instr)) {
+                .cont, .skip => continue,
+                .cont_no_instr_counter_inc => return Error.ContNoInstrCounterIncInAtomic,
+                .exit => |exit_code| return .{ .exit = exit_code },
+            }
+        }
+
+        return .cont;
+    }
+
+    fn runCountedLoop(
+        self: *IREvaluator,
+        thread: ir.context.IRThreadContext,
+        counted_loop: ir.Instruction.CountedLoop,
+    ) Error!Result {
+        while (true) {
+            const counter_ptr = self.resolveFastUIntPointer(thread, counted_loop.counter.dereference()) orelse return Error.UnsupportedInstruction;
+            if (counter_ptr.* != .uinteger) return Error.UnsupportedInstruction;
+
+            const limit = self.resolveFastUIntSource(thread, counted_loop.limit) orelse return Error.UnsupportedInstruction;
+            if (counter_ptr.uinteger >= limit.get()) break;
+
+            switch (try self.runAtomicInstructionSet(thread, counted_loop.body_instr_set)) {
+                .cont, .skip => {},
+                .cont_no_instr_counter_inc => return Error.ContNoInstrCounterIncInAtomic,
+                .exit => |exit_code| return .{ .exit = exit_code },
+            }
+            counter_ptr.* = .{ .uinteger = counter_ptr.uinteger +| 1 };
+        }
+
+        return .cont;
+    }
+
+    fn materializeExecArgv(
+        self: *IREvaluator,
+        thread: ir.context.IRThreadContext,
+        executable: ir.ValueSource,
+        arguments: []const ir.ValueSource,
+    ) Error!MaterializedExecArgv {
+        var argv = try std.ArrayList([]const u8).initCapacity(self.allocator, arguments.len + 1);
+        errdefer argv.deinit(self.allocator);
+        var owned = try std.ArrayList(bool).initCapacity(self.allocator, arguments.len + 1);
+        errdefer {
+            for (argv.items, owned.items) |arg, is_owned| {
+                if (is_owned) self.allocator.free(arg);
+            }
+            owned.deinit(self.allocator);
+        }
+
+        const all_sources = try self.allocator.alloc(ir.ValueSource, arguments.len + 1);
+        defer self.allocator.free(all_sources);
+        all_sources[0] = executable;
+        @memcpy(all_sources[1..], arguments);
+
+        for (all_sources) |arg_source| {
+            const arg = try self.resolveValueSource(thread, arg_source);
+            switch (arg) {
+                .executable => |slice| {
+                    argv.appendAssumeCapacity(try self.getSlice(slice));
+                    owned.appendAssumeCapacity(false);
+                },
+                .slice => |slice| {
+                    if (slice.element_size != 1) return Error.UnsupportedType;
+                    argv.appendAssumeCapacity(try self.getSlice(slice));
+                    owned.appendAssumeCapacity(false);
+                },
+                .zig_string => |text| {
+                    argv.appendAssumeCapacity(text);
+                    owned.appendAssumeCapacity(false);
+                },
+                else => {
+                    var arg_writer = std.Io.Writer.Allocating.init(self.allocator);
+                    try self.materializeString(thread, arg, &arg_writer.writer);
+                    argv.appendAssumeCapacity(try arg_writer.toOwnedSlice());
+                    owned.appendAssumeCapacity(true);
+                },
+            }
+        }
+
+        return .{ .argv = argv, .owned = owned };
+    }
+
+    fn spawnSimpleExec(
+        self: *IREvaluator,
+        thread: ir.context.IRThreadContext,
+        executable: ir.ValueSource,
+        arguments: []const ir.ValueSource,
+    ) Error!ExitCode {
+        var argv = try self.materializeExecArgv(thread, executable, arguments);
+        const owned_flags = try argv.owned.toOwnedSlice(self.allocator);
+        defer self.allocator.free(owned_flags);
+
+        const ctx = self.context.getSubshellContextPtr(thread.private.subshell_context);
+        var child = std.process.Child.init(try argv.argv.toOwnedSlice(self.allocator), self.allocator);
+        defer {
+            for (child.argv, owned_flags) |arg, is_owned| {
+                if (is_owned) self.allocator.free(arg);
+            }
+            self.allocator.free(child.argv);
+        }
+        child.env_map = ctx.env;
+        child.stdin_behavior = .Inherit;
+        child.stdout_behavior = .Inherit;
+        child.stderr_behavior = .Inherit;
+        child.cwd = ctx.cwd;
+        try child.spawn();
+        return switch (try child.wait()) {
+            .Exited => |code| .fromByte(@intCast(code)),
+            .Signal => |sig| .fromByte(@intCast(128 + sig)),
+            else => .fromByte(1),
+        };
     }
 
     fn tempCloseStdIoCheck(self: *IREvaluator) void {
@@ -183,17 +454,7 @@ pub const IREvaluator = struct {
         mod: ?ir.LocationMod,
     ) DereferenceValueError!*ir.Value {
         return switch (value) {
-            .addr => |addr| {
-                const loc = self.context.mapAddr(addr);
-                return switch (loc.abs) {
-                    .data, .register, .instruction, .ref, .closure => {
-                        std.log.err("Could not dereference location of type {t}", .{loc.abs});
-                        return DereferenceValueError.UnsupportedDereferenceValueType;
-                    },
-                    .stack => |stack| &thread.private.stack.items[ir.LocationMod.applyMaybe(mod, stack)],
-                    .heap => |heap| thread.shared.heap.getPtr(ir.LocationMod.applyMaybe(mod, heap)).?,
-                };
-            },
+            .addr => |addr| self.resolveAddrPointer(thread, addr, mod),
             // .register => |reg| switch (reg.abs) {
             //     .ic => DereferenceValueError.UnsupportedDereferenceValueType,
             //     .sf => .{ .uinteger = reg.applyMod(thread.private.stack_frame) },
@@ -211,6 +472,23 @@ pub const IREvaluator = struct {
         };
     }
 
+    fn resolveAddrPointer(
+        self: IREvaluator,
+        thread: ir.context.IRThreadContext,
+        addr: usize,
+        mod: ?ir.LocationMod,
+    ) DereferenceValueError!*ir.Value {
+        _ = self;
+        const resolved_addr = ir.LocationMod.applyMaybe(mod, addr);
+        if (resolved_addr >= ir.context.stack_start) {
+            return &thread.private.stack.items[resolved_addr - ir.context.stack_start];
+        }
+        return thread.shared.heapGetPtr(resolved_addr) orelse {
+            std.log.err("Could not dereference address 0x{x}", .{resolved_addr});
+            return DereferenceValueError.UnsupportedDereferenceValueType;
+        };
+    }
+
     fn resolveValueSource(
         self: IREvaluator,
         thread: ir.context.IRThreadContext,
@@ -220,6 +498,193 @@ pub const IREvaluator = struct {
             .location => |loc| self.resolveLocation(thread, loc),
             .value => |value| value,
         };
+    }
+
+    fn tryResolveFastValueSource(
+        self: *IREvaluator,
+        thread: ir.context.IRThreadContext,
+        value_source: ir.ValueSource,
+    ) ResolveLocationError!?ir.Value {
+        return switch (value_source) {
+            .value => |value| value,
+            .location => |loc| switch (loc.abs) {
+                .ref => |ref| if (!loc.options.dereference)
+                    .fromAddr(try loc.toAddrWithContext(
+                        thread.private.stack_frame,
+                        thread.private.stack.items[3].addr,
+                    ))
+                else
+                    thread.getRefPtr(ref, loc.mod).*,
+                .closure => {
+                    const closure_base = thread.private.stack.items[3].addr;
+                    const closure_slot = thread.shared.heapGetPtr(loc.applyMod(closure_base)).?;
+                    if (!loc.options.dereference) {
+                        return closure_slot.*;
+                    }
+
+                    return switch (closure_slot.*) {
+                        .addr => |addr| (try self.dereferenceValue(thread, .{ .addr = addr }, null)).*,
+                        else => closure_slot.*,
+                    };
+                },
+                .register => |reg| switch (reg) {
+                    .r => if (!loc.options.dereference)
+                        thread.private.result_register
+                    else switch (thread.private.result_register) {
+                        .addr => |addr| (try self.dereferenceValue(thread, .{ .addr = addr }, loc.mod)).*,
+                        else => return null,
+                    },
+                    .r2 => if (!loc.options.dereference)
+                        thread.private.result_register_2
+                    else switch (thread.private.result_register_2) {
+                        .addr => |addr| (try self.dereferenceValue(thread, .{ .addr = addr }, loc.mod)).*,
+                        else => return null,
+                    },
+                    .sf => if (!loc.options.dereference)
+                        .fromAddr(loc.applyMod(thread.private.stack_frame))
+                    else
+                        thread.private.stack.items[loc.applyMod(thread.private.stack_frame)],
+                    .sc => if (!loc.options.dereference)
+                        .fromAddr(loc.applyMod(thread.private.stack.items.len))
+                    else
+                        thread.private.stack.items[loc.applyMod(thread.private.stack.items.len)],
+                    else => null,
+                },
+                else => null,
+            },
+        };
+    }
+
+    fn setFastLocation(
+        self: *IREvaluator,
+        thread: ir.context.IRThreadContext,
+        loc: ir.Location,
+        source: ir.Value,
+    ) Error!bool {
+        switch (loc.abs) {
+            .ref => |ref| {
+                if (loc.options.dereference) return false;
+                thread.setRef(ref, loc.mod, source);
+                return true;
+            },
+            .closure => {
+                const closure_base = thread.private.stack.items[3].addr;
+                const closure_addr = loc.applyMod(closure_base);
+                var dest = thread.shared.heapGetPtr(closure_addr).?;
+                if (loc.options.dereference) {
+                    dest = try self.dereferenceValue(thread, dest.*, null);
+                }
+                dest.* = source;
+                return true;
+            },
+            .register => |reg| switch (reg) {
+                .r => {
+                    if (loc.options.dereference) return false;
+                    thread.private.result_register = source;
+                    return true;
+                },
+                .r2 => {
+                    if (loc.options.dereference) return false;
+                    thread.private.result_register_2 = source;
+                    return true;
+                },
+                else => return false,
+            },
+            else => return false,
+        }
+    }
+
+    fn resolveFastUIntPointer(
+        self: *IREvaluator,
+        thread: ir.context.IRThreadContext,
+        loc: ir.Location,
+    ) ?*ir.Value {
+        if (!loc.options.dereference) return null;
+
+        const slot = blk: switch (loc.abs) {
+            .ref => |ref| break :blk thread.getRefPtr(ref, loc.mod),
+            .closure => {
+                const closure_base = thread.private.stack.items[3].addr;
+                const closure_addr = loc.applyMod(closure_base);
+                break :blk thread.shared.heapGetPtr(closure_addr) orelse return null;
+            },
+            else => return null,
+        };
+
+        var current = slot;
+        while (current.* == .addr) {
+            current = self.resolveAddrPointer(thread, current.addr, null) catch return null;
+        }
+        return current;
+    }
+
+    fn resolveFastUIntSource(
+        self: *IREvaluator,
+        thread: ir.context.IRThreadContext,
+        source: ir.ValueSource,
+    ) ?FastUIntSource {
+        return switch (source) {
+            .value => |value| switch (value) {
+                .uinteger => |uinteger| .{ .immediate = uinteger },
+                else => null,
+            },
+            .location => |loc| .{ .ptr = self.resolveFastUIntPointer(thread, loc) orelse return null },
+        };
+    }
+
+    fn runFastIntegerAth(
+        self: *IREvaluator,
+        thread: ir.context.IRThreadContext,
+        ath: ir.Instruction.Ath,
+    ) !bool {
+        const dest = self.resolveFastUIntPointer(thread, ath.result) orelse return false;
+        const left = switch (ath.a) {
+            .location => |loc| self.resolveFastUIntPointer(thread, loc) orelse return false,
+            else => return false,
+        };
+        const right = switch (ath.b) {
+            .location => |loc| self.resolveFastUIntPointer(thread, loc) orelse return false,
+            else => return false,
+        };
+
+        if (left.* != .uinteger or right.* != .uinteger or dest.* != .uinteger) return false;
+
+        dest.* = switch (ath.op) {
+            .add => .{ .uinteger = left.uinteger +| right.uinteger },
+            .sub => .{ .uinteger = left.uinteger -| right.uinteger },
+            .mul => .{ .uinteger = left.uinteger *| right.uinteger },
+            else => return false,
+        };
+
+        return true;
+    }
+
+    fn runFastIntegerCmp(
+        self: *IREvaluator,
+        thread: ir.context.IRThreadContext,
+        cmp: ir.Instruction.Cmp,
+    ) !bool {
+        const left = switch (cmp.a) {
+            .location => |loc| self.resolveFastUIntPointer(thread, loc) orelse return false,
+            else => return false,
+        };
+        const right = switch (cmp.b) {
+            .location => |loc| self.resolveFastUIntPointer(thread, loc) orelse return false,
+            else => return false,
+        };
+
+        if (left.* != .uinteger or right.* != .uinteger) return false;
+
+        const result = switch (cmp.op) {
+            .eq => left.uinteger == right.uinteger,
+            .ne => left.uinteger != right.uinteger,
+            .gt => left.uinteger > right.uinteger,
+            .gte => left.uinteger >= right.uinteger,
+            .lt => left.uinteger < right.uinteger,
+            .lte => left.uinteger <= right.uinteger,
+        };
+
+        return self.setFastLocation(thread, cmp.result, .fromBoolean(result));
     }
 
     pub const ResolveLocationError = DereferenceValueError || ir.Location.Error;
@@ -329,7 +794,7 @@ pub const IREvaluator = struct {
     ) Error!ir.Value {
         const base_addr = try self.resolveStructBaseAddr(thread, location);
         const heap_index = base_addr + compiler.executionResultFieldOffset(field);
-        return self.context.shared.heap.get(heap_index) orelse Error.MalformedExecutionResult;
+        return self.context.shared.heapGet(heap_index) orelse Error.MalformedExecutionResult;
     }
 
     fn executionHandlesFieldValue(
@@ -340,7 +805,7 @@ pub const IREvaluator = struct {
     ) Error!ir.Value {
         const base_addr = try self.resolveStructBaseAddr(thread, location);
         const heap_index = base_addr + compiler.executionHandlesFieldOffset(field);
-        return self.context.shared.heap.get(heap_index) orelse Error.MalformedExecutionHandles;
+        return self.context.shared.heapGet(heap_index) orelse Error.MalformedExecutionHandles;
     }
 
     fn resolveThreadExitCode(
@@ -578,13 +1043,9 @@ pub const IREvaluator = struct {
                 // TODO: memory management
                 var argv = try std.ArrayList([]const u8).initCapacity(
                     self.allocator,
-                    // argv_value.slice.len + 2,
-                    argv_len + 2,
+                    argv_len,
                 );
                 defer argv.deinit(self.allocator);
-
-                // TODO: figure out how to do this ourselves
-                argv.appendSliceAssumeCapacity(&.{ "stdbuf", "-oL" });
 
                 // const element_size = argv_value.slice.element_size;
                 // for (0..argv_value.slice.len) |i| {
@@ -623,6 +1084,7 @@ pub const IREvaluator = struct {
                 child.stderr_behavior = .Pipe;
                 child.cwd = ctx.cwd;
                 try child.spawn();
+                try child.waitForSpawn();
                 thread.private.process = child;
 
                 const stdin_handle = thread.private.stack.items[0].pipe;
@@ -637,8 +1099,6 @@ pub const IREvaluator = struct {
                 const process_io = try self.allocator.create(CloseableProcessIo);
                 process_io.* = .init(child, self.config.tracer);
                 process_io.connect();
-
-                try child.waitForSpawn();
 
                 try stdin_pipe.connectDestination(process_io.closeableStdin());
                 try stdout_pipe.connectSource(process_io.closeableStdout());
@@ -723,7 +1183,7 @@ pub const IREvaluator = struct {
                     },
                     .heap => |heap| {
                         const addr = set.destination.applyMod(heap);
-                        var dest = thread.shared.heap.getPtr(addr).?;
+                        var dest = thread.shared.heapGetPtr(addr).?;
                         if (set.destination.options.dereference) {
                             dest = try self.dereferenceValue(thread, dest.*, null);
                         }
@@ -732,7 +1192,7 @@ pub const IREvaluator = struct {
                     },
                     .closure => {
                         const addr = set.destination.applyMod(thread.private.stack.items[3].addr);
-                        var dest = thread.shared.heap.getPtr(addr).?;
+                        var dest = thread.shared.heapGetPtr(addr).?;
                         if (set.destination.options.dereference) {
                             dest = try self.dereferenceValue(thread, dest.*, null);
                         }
@@ -838,17 +1298,14 @@ pub const IREvaluator = struct {
 
                 return .cont;
             },
-            .atomic => |instr_set| {
-                const instructions = self.context.instructions()[instr_set];
-
-                for (instructions) |instr| {
-                    switch (try self.runInstruction(thread, instr)) {
-                        .cont, .skip => continue,
-                        .cont_no_instr_counter_inc => return Error.ContNoInstrCounterIncInAtomic,
-                        .exit => |exit_code| return .{ .exit = exit_code },
-                    }
-                }
-
+            .atomic => |instr_set| return self.runAtomicInstructionSet(thread, instr_set),
+            .counted_loop => |counted_loop| return self.runCountedLoop(thread, counted_loop),
+            .simple_exec => |simple_exec| {
+                thread.private.result_register = .{ .exit_code = try self.spawnSimpleExec(
+                    thread,
+                    simple_exec.executable,
+                    simple_exec.arguments,
+                ) };
                 return .cont;
             },
             .fork => |fork| {
@@ -860,7 +1317,7 @@ pub const IREvaluator = struct {
                     },
                 };
                 const new_thread_handle = try self.context.spawnThread(child_ctx_handle);
-                const new_thread = self.context.getThreadContext(new_thread_handle) orelse {
+                const new_thread = self.context.getThreadContextPtr(new_thread_handle) orelse {
                     return Error.MissingSpawnedThreadContext;
                 };
 
@@ -928,11 +1385,17 @@ pub const IREvaluator = struct {
                 return .cont;
             },
             .ath => |ath| {
-                const left = try self.resolveValueSource(thread, ath.a);
-                const right = try self.resolveValueSource(thread, ath.b);
+                if (try self.runFastIntegerAth(thread, ath)) {
+                    return .cont;
+                }
+
+                const left = (try self.tryResolveFastValueSource(thread, ath.a)) orelse try self.resolveValueSource(thread, ath.a);
+                const right = (try self.tryResolveFastValueSource(thread, ath.b)) orelse try self.resolveValueSource(thread, ath.b);
 
                 if (evaluateArithmetic(ath.op, .from(left), .from(right))) |result| {
-                    try self.setLocation(thread, ath.result, result);
+                    if (!try self.setFastLocation(thread, ath.result, result)) {
+                        try self.setLocation(thread, ath.result, result);
+                    }
                 } else {
                     return Error.UnsupportedBinaryExpression;
                 }
@@ -940,13 +1403,16 @@ pub const IREvaluator = struct {
                 return .cont;
             },
             .log => |log_expr| {
-                const left = try self.resolveValueSource(thread, log_expr.a);
+                const left = (try self.tryResolveFastValueSource(thread, log_expr.a)) orelse try self.resolveValueSource(thread, log_expr.a);
 
                 if (evaluateLogical(log_expr.op, .from(left))) |result| {
-                    try self.setLocation(thread, log_expr.result, switch (result) {
+                    const resolved = switch (result) {
                         .left => left,
-                        .right => try self.resolveValueSource(thread, log_expr.b),
-                    });
+                        .right => (try self.tryResolveFastValueSource(thread, log_expr.b)) orelse try self.resolveValueSource(thread, log_expr.b),
+                    };
+                    if (!try self.setFastLocation(thread, log_expr.result, resolved)) {
+                        try self.setLocation(thread, log_expr.result, resolved);
+                    }
                 } else {
                     return Error.UnsupportedBinaryExpression;
                 }
@@ -954,13 +1420,20 @@ pub const IREvaluator = struct {
                 return .cont;
             },
             .cmp => |cmp| {
-                const left = try self.resolveValueSource(thread, cmp.a);
-                const right = try self.resolveValueSource(thread, cmp.b);
+                if (try self.runFastIntegerCmp(thread, cmp)) {
+                    return .cont;
+                }
+                const left = (try self.tryResolveFastValueSource(thread, cmp.a)) orelse try self.resolveValueSource(thread, cmp.a);
+                const right = (try self.tryResolveFastValueSource(thread, cmp.b)) orelse try self.resolveValueSource(thread, cmp.b);
 
                 if (evaluateCompare(cmp.op, .from(left), .from(right))) |result| {
-                    try self.setLocation(thread, cmp.result, result);
+                    if (!try self.setFastLocation(thread, cmp.result, result)) {
+                        try self.setLocation(thread, cmp.result, result);
+                    }
                 } else if (try self.evaluateStringCompare(thread, cmp.op, left, right)) |result| {
-                    try self.setLocation(thread, cmp.result, result);
+                    if (!try self.setFastLocation(thread, cmp.result, result)) {
+                        try self.setLocation(thread, cmp.result, result);
+                    }
                 } else {
                     return Error.UnsupportedBinaryExpression;
                 }
@@ -980,6 +1453,14 @@ pub const IREvaluator = struct {
     ) Error!void {
         switch (loc.abs) {
             .ref => |ref| thread.setRef(ref, loc.mod, source),
+            .closure => {
+                const addr = loc.applyMod(thread.private.stack.items[3].addr);
+                var dest = thread.shared.heapGetPtr(addr).?;
+                if (loc.options.dereference) {
+                    dest = try self.dereferenceValue(thread, dest.*, null);
+                }
+                dest.* = source;
+            },
             .register => |reg| {
                 try switch (reg) {
                     .ic => Error.UnsupportedInstruction,
@@ -1241,7 +1722,7 @@ pub const IREvaluator = struct {
         self: *IREvaluator,
         addr: usize,
     ) MaterializeStringError!ir.Value {
-        return self.context.shared.heap.get(addr) orelse MaterializeStringError.MissingHeapValue;
+        return self.context.shared.heapGet(addr) orelse MaterializeStringError.MissingHeapValue;
     }
 
     fn maybeHeapSequenceLen(
@@ -1423,4 +1904,235 @@ test "evaluator materializeString reports missing pipe handle" {
         ir.context.Error.MissingPipeHandle,
         evaluator.materializeString(thread, .{ .pipe = 999 }, &writer.writer),
     );
+}
+
+test "evaluator fast arithmetic path updates ref destination" {
+    const allocator = std.testing.allocator;
+    var fixture = try initTestEvaluator(allocator);
+    defer fixture.context.deinit();
+    defer fixture.stdin_stream.deinitParent();
+    defer fixture.stdout_stream.deinitParent();
+    defer fixture.stderr_stream.deinitParent();
+    defer fixture.tracer.deinit();
+
+    var evaluator = IREvaluator.init(allocator, .{
+        .verbose = false,
+        .stdin = fixture.stdin_stream,
+        .stdout = fixture.stdout_stream,
+        .stderr = fixture.stderr_stream,
+        .tracer = &fixture.tracer,
+    }, &fixture.context);
+
+    try fixture.context.addMainThread(null);
+    const thread = fixture.context.getCurrentThread().?;
+    try thread.private.stack.appendSlice(allocator, &.{ .{ .uinteger = 4 }, .{ .uinteger = 7 } });
+
+    const left = ir.Location.initAbs(.{ .ref = .{ .name = "left", .rel_stack_addr = 0 } }, .{});
+    const right = ir.Location.initAbs(.{ .ref = .{ .name = "right", .rel_stack_addr = 1 } }, .{});
+    const result = ir.Location.initAbs(.{ .ref = .{ .name = "result", .rel_stack_addr = 1 } }, .{});
+
+    switch (try evaluator.runInstruction(thread, .init(null, .{ .ath = .{
+        .op = .add,
+        .a = .fromLocation(left.dereference()),
+        .b = .fromLocation(right.dereference()),
+        .result = result,
+    } }))) {
+        .cont => {},
+        else => unreachable,
+    }
+
+    try std.testing.expectEqual(@as(u64, 11), thread.private.stack.items[1].uinteger);
+}
+
+test "evaluator fast arithmetic path updates closure destination" {
+    const allocator = std.testing.allocator;
+    var fixture = try initTestEvaluator(allocator);
+    defer fixture.context.deinit();
+    defer fixture.stdin_stream.deinitParent();
+    defer fixture.stdout_stream.deinitParent();
+    defer fixture.stderr_stream.deinitParent();
+    defer fixture.tracer.deinit();
+
+    var evaluator = IREvaluator.init(allocator, .{
+        .verbose = false,
+        .stdin = fixture.stdin_stream,
+        .stdout = fixture.stdout_stream,
+        .stderr = fixture.stderr_stream,
+        .tracer = &fixture.tracer,
+    }, &fixture.context);
+
+    try fixture.context.addMainThread(null);
+    const thread = fixture.context.getCurrentThread().?;
+    try thread.private.stack.resize(allocator, 4);
+    @memset(thread.private.stack.items, .void);
+
+    const closure_base = try fixture.context.shared.alloc(allocator, 1);
+    const closure_addr = switch (closure_base) {
+        .addr => |addr| addr,
+        else => unreachable,
+    };
+    thread.private.stack.items[3] = .fromAddr(closure_addr);
+    fixture.context.shared.heapGetPtr(closure_addr).?.* = .{ .uinteger = 4 };
+
+    const closure_slot = ir.Location.initAbs(.closure, .{}).dereference();
+
+    switch (try evaluator.runInstruction(thread, .init(null, .{ .ath = .{
+        .op = .add,
+        .a = .fromLocation(closure_slot),
+        .b = .fromValue(.{ .uinteger = 7 }),
+        .result = closure_slot,
+    } }))) {
+        .cont => {},
+        else => unreachable,
+    }
+
+    try std.testing.expectEqual(@as(u64, 11), fixture.context.shared.heapGet(closure_addr).?.uinteger);
+}
+
+test "evaluator fast compare path updates register destination" {
+    const allocator = std.testing.allocator;
+    var fixture = try initTestEvaluator(allocator);
+    defer fixture.context.deinit();
+    defer fixture.stdin_stream.deinitParent();
+    defer fixture.stdout_stream.deinitParent();
+    defer fixture.stderr_stream.deinitParent();
+    defer fixture.tracer.deinit();
+
+    var evaluator = IREvaluator.init(allocator, .{
+        .verbose = false,
+        .stdin = fixture.stdin_stream,
+        .stdout = fixture.stdout_stream,
+        .stderr = fixture.stderr_stream,
+        .tracer = &fixture.tracer,
+    }, &fixture.context);
+
+    try fixture.context.addMainThread(null);
+    const thread = fixture.context.getCurrentThread().?;
+    thread.private.result_register = .{ .uinteger = 9 };
+    thread.private.result_register_2 = .{ .uinteger = 3 };
+
+    switch (try evaluator.runInstruction(thread, .init(null, .{ .cmp = .{
+        .op = .gt,
+        .a = .fromLocation(.initRegister(.r)),
+        .b = .fromLocation(.initRegister(.r2)),
+        .result = .initRegister(.r2),
+    } }))) {
+        .cont => {},
+        else => unreachable,
+    }
+
+    try std.testing.expect(switch (thread.private.result_register_2) {
+        .exit_code => |exit_code| exit_code.toBoolean(),
+        else => false,
+    });
+}
+
+test "evaluator fast compare path reads dereferenced refs" {
+    const allocator = std.testing.allocator;
+    var fixture = try initTestEvaluator(allocator);
+    defer fixture.context.deinit();
+    defer fixture.stdin_stream.deinitParent();
+    defer fixture.stdout_stream.deinitParent();
+    defer fixture.stderr_stream.deinitParent();
+    defer fixture.tracer.deinit();
+
+    var evaluator = IREvaluator.init(allocator, .{
+        .verbose = false,
+        .stdin = fixture.stdin_stream,
+        .stdout = fixture.stdout_stream,
+        .stderr = fixture.stderr_stream,
+        .tracer = &fixture.tracer,
+    }, &fixture.context);
+
+    try fixture.context.addMainThread(null);
+    const thread = fixture.context.getCurrentThread().?;
+    try thread.private.stack.appendSlice(allocator, &.{ .{ .uinteger = 3 }, .{ .uinteger = 7 } });
+
+    const left = ir.Location.initAbs(.{ .ref = .{ .name = "left", .rel_stack_addr = 0 } }, .{});
+    const right = ir.Location.initAbs(.{ .ref = .{ .name = "right", .rel_stack_addr = 1 } }, .{});
+
+    switch (try evaluator.runInstruction(thread, .init(null, .{ .cmp = .{
+        .op = .lt,
+        .a = .fromLocation(left.dereference()),
+        .b = .fromLocation(right.dereference()),
+        .result = .initRegister(.r2),
+    } }))) {
+        .cont => {},
+        else => unreachable,
+    }
+
+    try std.testing.expect(switch (thread.private.result_register_2) {
+        .exit_code => |exit_code| exit_code.toBoolean(),
+        else => false,
+    });
+}
+
+test "evaluator fused range loop updates accumulator and exits loop" {
+    const allocator = std.testing.allocator;
+    var fixture = try initTestEvaluator(allocator);
+    defer fixture.context.deinit();
+    defer fixture.stdin_stream.deinitParent();
+    defer fixture.stdout_stream.deinitParent();
+    defer fixture.stderr_stream.deinitParent();
+    defer fixture.tracer.deinit();
+
+    var evaluator = IREvaluator.init(allocator, .{
+        .verbose = false,
+        .stdin = fixture.stdin_stream,
+        .stdout = fixture.stdout_stream,
+        .stderr = fixture.stderr_stream,
+        .tracer = &fixture.tracer,
+    }, &fixture.context);
+
+    try fixture.context.addMainThread(null);
+    const thread = fixture.context.getCurrentThreadPtr().?;
+    try thread.private.stack.appendSlice(allocator, &.{
+        .{ .uinteger = 0 },
+        .{ .uinteger = 5 },
+        .{ .uinteger = 0 },
+    });
+
+    const total = ir.Location.initAbs(.{ .ref = .{ .name = "total", .rel_stack_addr = 0 } }, .{});
+    const len = ir.Location.initAbs(.{ .ref = .{ .name = "len", .rel_stack_addr = 1 } }, .{});
+    const counter = ir.Location.initAbs(.{ .ref = .{ .name = "counter", .rel_stack_addr = 2 } }, .{});
+
+    const instructions = [_]ir.Instruction{
+        .init(null, .{ .cmp = .{
+            .op = .lt,
+            .a = .fromLocation(counter.dereference()),
+            .b = .fromLocation(len.dereference()),
+            .result = .initRegister(.r2),
+        } }),
+        .init(null, .{ .jmp = .{
+            .cond = .fromLocation(.initRegister(.r2)),
+            .jump_if = false,
+            .dest = .init(0, .{ .abs = 5 }),
+        } }),
+        .init(null, .{ .ath = .{
+            .op = .add,
+            .a = .fromLocation(total.dereference()),
+            .b = .fromLocation(counter.dereference()),
+            .result = total.dereference(),
+        } }),
+        .init(null, .{ .ath = .{
+            .op = .add,
+            .a = .fromLocation(counter.dereference()),
+            .b = .fromValue(.{ .uinteger = 1 }),
+            .result = counter,
+        } }),
+        .init(null, .{ .jmp = .{
+            .cond = null,
+            .jump_if = false,
+            .dest = .init(0, .{ .abs = 0 }),
+        } }),
+    };
+
+    try std.testing.expect(try evaluator.tryRunFastRangeLoop(thread, &instructions));
+    try std.testing.expectEqual(@as(u64, 10), thread.private.stack.items[0].uinteger);
+    try std.testing.expectEqual(@as(u64, 5), thread.private.stack.items[2].uinteger);
+    try std.testing.expectEqual(@as(usize, 5), thread.getCurrentInstructionAddr().local_addr);
+    try std.testing.expect(switch (thread.private.result_register_2) {
+        .exit_code => |exit_code| !exit_code.toBoolean(),
+        else => false,
+    });
 }
