@@ -383,16 +383,47 @@ pub const IREvaluator = struct {
             self.allocator.free(child.argv);
         }
         child.env_map = ctx.env;
-        child.stdin_behavior = .Inherit;
-        child.stdout_behavior = .Inherit;
-        child.stderr_behavior = .Inherit;
+        child.stdin_behavior = .Pipe;
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Pipe;
         child.cwd = ctx.cwd;
         try child.spawn();
-        return switch (try child.wait()) {
+
+        const child_ptr = try self.allocator.create(std.process.Child);
+        child_ptr.* = child;
+
+        const stdin_handle = thread.private.stack.items[0].pipe;
+        const stdout_handle = thread.private.stack.items[1].pipe;
+        const stderr_handle = thread.private.stack.items[2].pipe;
+
+        const stdin_pipe = try self.context.getPipe(stdin_handle);
+        const stdout_pipe = try self.context.getPipe(stdout_handle);
+        const stderr_pipe = try self.context.getPipe(stderr_handle);
+
+        const process_io = try self.allocator.create(CloseableProcessIo);
+        process_io.* = .init(child_ptr, self.config.tracer);
+        process_io.connect();
+
+        try stdin_pipe.connectDestination(process_io.closeableStdin());
+        try stdout_pipe.connectSource(process_io.closeableStdout());
+        try stderr_pipe.connectSource(process_io.closeableStderr());
+
+        const exit_code: ExitCode = switch (try child_ptr.wait()) {
             .Exited => |code| .fromByte(@intCast(code)),
             .Signal => |sig| .fromByte(@intCast(128 + sig)),
             else => .fromByte(1),
         };
+
+        while (true) {
+            const event = try stdout_pipe.forward(.unlimited);
+            if (event != .not_done) break;
+        }
+        while (true) {
+            const event = try stderr_pipe.forward(.unlimited);
+            if (event != .not_done) break;
+        }
+
+        return exit_code;
     }
 
     fn tempCloseStdIoCheck(self: *IREvaluator) void {

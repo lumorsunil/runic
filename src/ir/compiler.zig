@@ -4836,11 +4836,8 @@ pub const IRCompiler = struct {
         const frame_before_body = self.currentFrame().rel_stack_counter;
         const body_set = try self.addInstructionSet();
         const prev_set = self.current_instruction_set;
-        const prev_allow_simple_exec = self.allow_simple_exec;
         self.current_instruction_set = body_set;
-        self.allow_simple_exec = true;
         defer self.current_instruction_set = prev_set;
-        defer self.allow_simple_exec = prev_allow_simple_exec;
 
         try self.scopes.push(self.allocator, .lexical);
         defer self.scopes.pop();
