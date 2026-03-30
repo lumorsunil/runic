@@ -260,12 +260,33 @@ const { stdout: sync_stdout, stderr: sync_stderr, exit_code: sync_exit_code } = 
 git "status" "--short" 1>$status_stdout
 git "status" "--short" 2>$status_stderr
 
+const combined = printf "hello\n" && printf "warning\n" >&2
+echo "${combined.stdout}"
+echo "${combined.stderr}"
+
+const sequenced = printf "hello\n"; printf "warning\n" >&2
+echo "${sequenced.stdout}"
+echo "${sequenced.stderr}"
+
 const async_proc = (sleep 0.05; echo "done" &)
 async_proc.wait
 echo "${async_proc.stdout}"
 ```
 
-**Result:** Binding `const proc = <command ...>` executes the program synchronously and returns its buffered output plus exit metadata. You can destructure the execution value to grab only `stdout`, `stderr`, or `exit_code`, or append the `1>var`/`2>var` shorthand to redirect a single stream directly into a variable while still receiving the same execution value for status checks. Appending `&` runs the work in the background; when you bind that value, its output is still buffered rather than printed immediately, and `.wait` blocks until it finishes.
+**Result:** Binding `const proc = <command ...>` executes the program synchronously and returns its buffered output plus exit metadata. You can destructure the execution value to grab only `stdout`, `stderr`, or `exit_code`, or append the `1>var`/`2>var` shorthand to redirect a single stream directly into a variable while still receiving the same execution value for status checks. When command-producing expressions are chained with `&&`, `||`, or `;`, the resulting bound value still exposes the buffered `stdout`, `stderr`, and exit metadata from the evaluated expression. Appending `&` runs the work in the background; when you bind that value, its output is still buffered rather than printed immediately, and `.wait` blocks until it finishes.
+
+### File descriptor redirects
+
+Runic supports explicit stdout/stderr redirects for commands and preserves shell-style left-to-right redirect ordering when fd duplication is involved.
+
+```rn
+echo "saved output" 1>"out.log"
+echo "saved error" 2>"err.log"
+
+echo "hello" 1>&2 2>"/dev/null"
+```
+
+**Result:** `1>...` redirects stdout, `2>...` redirects stderr, and `1>&2` duplicates stdout onto the current stderr target. Because redirects are applied left to right, `echo "hello" 1>&2 2>"/dev/null"` still writes `hello` to the original stderr stream instead of discarding it.
 
 ## Error-aware pipelines
 

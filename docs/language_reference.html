@@ -493,13 +493,20 @@ echo "Listening on ${config.port}"</code></pre>
               <p>
                 Structured results returned by every command invocation. Access
                 <code>stdout</code>, <code>stderr</code>, <code>status</code>,
-                and metadata without shell globals.
+                and metadata without shell globals, even when command-producing
+                expressions are chained with <code>&amp;&amp;</code>,
+                <code>||</code>, or <code>;</code>.
               </p>
               <div>
                 <div class="example-label">Example</div>
-                <pre><code class="language-rn">let status_handle = git status --short
-echo status_handle.stdout
-echo status_handle.status.exit_code</code></pre>
+                <pre><code class="language-rn">const combined = printf "hello\n" &amp;&amp; printf "warning\n" &gt;&amp;2
+echo combined.stdout
+echo combined.stderr
+
+const sequenced = printf "hello\n"; printf "warning\n" &gt;&amp;2
+echo sequenced.stdout
+echo sequenced.stderr
+echo sequenced.status.exit_code</code></pre>
               </div>
             </article>
 
@@ -839,12 +846,19 @@ const uppercased = files.map(fn (path) =&gt; path.upper())</code></pre>
               <p>
                 Every command invocation yields a handle with stdout, stderr,
                 status, and metadata instead of relying on global shell state.
+                Bound command expressions keep that handle data available after
+                <code>&amp;&amp;</code>, <code>||</code>, and
+                <code>;</code> sequencing.
               </p>
               <div>
                 <div class="example-label">Example</div>
                 <pre><code class="language-rn">let sync_proc = git status --short
 echo sync_proc.stdout
 echo sync_proc.status.exit_code
+
+const combined = printf "hello\n" &amp;&amp; printf "warning\n" &gt;&amp;2
+echo combined.stdout
+echo combined.stderr
 
 const async_proc = (sleep 0.05; echo "done" &amp;)
 async_proc.wait
@@ -863,14 +877,21 @@ printf "%s" "${async_proc.stdout}"</code></pre>
               </h3>
               <p>
                 Capture stdout/stderr independently, tee outputs to variables,
-                and redirect streams without losing handle metadata.
+                and redirect streams without losing handle metadata. Explicit
+                fd redirects such as <code>1&gt;... </code>,
+                <code>2&gt;... </code>, and <code>1&gt;&amp;2</code> follow
+                shell-style left-to-right ordering.
               </p>
               <div>
                 <div class="example-label">Example</div>
                 <pre><code class="language-rn">make all | tee build.log 1&gt;build_stdout
 if build_stdout.status.exit_code != 0 {
   echo build_stdout.stdout
-}</code></pre>
+}
+
+echo "saved output" 1&gt;"out.log"
+echo "saved error" 2&gt;"err.log"
+echo "hello" 1&gt;&amp;2 2&gt;"/dev/null"</code></pre>
               </div>
             </article>
 

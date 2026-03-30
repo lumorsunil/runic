@@ -10,6 +10,14 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- Chained fd redirects now preserve left-to-right shell semantics, so forms like `echo "hello" 1>&2 2>"/dev/null"` keep writing to the original stderr stream before the later redirect replaces fd `2`.
+
+### Changed
+- Bound command expressions now preserve execution-result data more consistently across `&&`, `||`, and `;`, so `.stdout`, `.stderr`, and `.exit_code` remain available after sequencing command-producing expressions.
+
 ## [0.1.0] — 2026-03-22
 
 Initial versioned release. Establishes a baseline for tracking changes going forward.
