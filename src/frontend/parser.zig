@@ -600,7 +600,7 @@ pub const Parser = struct {
             op: ?ast.BinaryOp,
             chirality: Chirality,
         ) Error!*ast.Expression {
-            if (op == .member) {
+            if (op != null and op.? == .member) {
                 return parser.allocExpression(.{ .identifier = identifier });
             } else if (op != null and op.?.isAssignment() and chirality == .left) {
                 return parser.allocExpression(.{ .identifier = identifier });
@@ -873,12 +873,32 @@ pub const Parser = struct {
                 },
                 .op => {
                     switch (next.tag) {
-                        .equal_equal, .bang_equal, .greater, .append_redirect, .redirect_fd, .greater_equal, .less, .less_equal, .plus, .minus, .star, .slash, .percent, .kw_and, .kw_or, .kw_orelse, .pipe_pipe, .amp_amp, .pipe, .dot, .assign, .plus_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign => {
+                        .equal_equal, .bang_equal, .fd_source_truncate_redirect, .fd_source_append_redirect, .greater, .append_redirect, .redirect_fd, .greater_equal, .less, .less_equal, .plus, .minus, .star, .slash, .percent, .kw_and, .kw_or, .kw_orelse, .pipe_pipe, .amp_amp, .pipe, .dot, .assign, .plus_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign => {
                             const breadcrumbInner = try self.createBreadcrumb("PBE:op");
                             defer breadcrumbInner.end();
                             try components.append(self.allocator, .{
                                 .op = token.Spanned(ast.BinaryOp).fromToken(next) orelse @panic("shouldn't happen :)"),
                             });
+
+                            switch (next.tag) {
+                                .fd_source_truncate_redirect, .fd_source_append_redirect, .greater, .append_redirect => {
+                                    _ = try self.nextToken();
+                                    const next_value_token = try self.peekToken();
+                                    switch (next_value_token.tag) {
+                                        .amp => {
+                                            _ = try self.nextToken();
+                                            const int = try self.parseIntegerLiteral();
+                                            try components.append(self.allocator, .{
+                                                .literal = .{ .int = int },
+                                            });
+                                            state.advance();
+                                            continue;
+                                        },
+                                        else => continue,
+                                    }
+                                },
+                                else => {},
+                            }
                         },
                         .l_bracket => {
                             _ = try self.nextToken();
@@ -966,15 +986,17 @@ pub const Parser = struct {
                     },
                 },
             },
-            .greater, .append_redirect => redirect: {
+            .greater, .append_redirect, .fd_source_truncate_redirect, .fd_source_append_redirect => redirect: {
                 const mode: ast.RedirectionMode = switch (binary.binary.op) {
+                    .fd_source_truncate_redirect => .truncate,
+                    .fd_source_append_redirect => .append,
                     .greater => .truncate,
                     .append_redirect => .append,
                     else => unreachable,
                 };
                 const path = try coerceRedirectionTargetExpression(right);
                 const redirect = ast.Redirection{
-                    .stream = .stdout,
+                    .stream = binary.binary.op.redirectStream(),
                     .mode = mode,
                     .target = .{ .path = .{ .value = path, .span = path.span() } },
                     .span = left.span().endAt(right.span()),
@@ -1374,6 +1396,7 @@ pub const Parser = struct {
                     try args.append(self.allocator, .{ .string = string_literal });
                     last_token = next_token;
                 },
+                // TODO: implement for fd_source_..._redirect
                 .greater, .append_redirect => {
                     const redirect = try self.parseCommandRedirection();
                     try redirects.append(self.allocator, redirect);
@@ -3301,6 +3324,32 @@ test "parser builds fd redirect in pipeline stage (1>&2)" {
     try std.testing.expectEqual(@as(usize, 1), call.arguments.len);
     try std.testing.expect(call.arguments[0].* == .literal);
     try std.testing.expect(call.arguments[0].literal == .string);
+}
+
+test "parser preserves chained fd redirect ordering (1>&2 2>path)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var ctx = TestCtx{ .source = "echo \"hi\" 1>&2 2>\"/dev/null\"" };
+    var parser = TestParser.init(allocator, &ctx);
+    defer parser.deinit();
+
+    const script = try parser.parseSource(ctx.source);
+    const call = script.statements[0].expression.expression.call;
+
+    try std.testing.expectEqual(@as(usize, 1), call.arguments.len);
+    try std.testing.expectEqual(@as(usize, 2), call.redirects.len);
+
+    const fd_redirect = call.redirects[0];
+    try std.testing.expectEqual(ast.StreamRef{ .descriptor = 1 }, fd_redirect.stream);
+    try std.testing.expectEqual(ast.RedirectionMode.truncate, fd_redirect.mode);
+    try std.testing.expectEqual(@as(u8, 2), fd_redirect.target.fd);
+
+    const path_redirect = call.redirects[1];
+    try std.testing.expectEqual(ast.StreamRef.stderr, path_redirect.stream);
+    try std.testing.expectEqual(ast.RedirectionMode.truncate, path_redirect.mode);
+    try std.testing.expect(path_redirect.target == .path);
 }
 
 test "parser rejects interpolation in import module names" {

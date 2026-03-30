@@ -902,13 +902,15 @@ pub const BinaryExpr = struct {
     }
 };
 
-pub const BinaryOp = enum {
+pub const BinaryOp = union(enum) {
     add,
     subtract,
     multiply,
     divide,
     remainder,
     greater,
+    fd_source_truncate_redirect: StreamRef,
+    fd_source_append_redirect: StreamRef,
     append_redirect,
     redirect_fd,
     greater_equal,
@@ -933,6 +935,9 @@ pub const BinaryOp = enum {
     mul_assign,
     div_assign,
     rem_assign,
+    /// Sequential execution: run left then right, result is right's result.
+    /// Created by `parseBinding` when `;` follows a command expression initializer.
+    sequence,
 
     pub fn precedence(self: BinaryOp) usize {
         return switch (self) {
@@ -942,6 +947,8 @@ pub const BinaryOp = enum {
             .divide => 30,
             .remainder => 30,
             .greater => 15,
+            .fd_source_truncate_redirect => 15,
+            .fd_source_append_redirect => 15,
             .append_redirect => 15,
             .redirect_fd => 15,
             .greater_equal => 15,
@@ -952,7 +959,7 @@ pub const BinaryOp = enum {
             .logical_and => 10,
             .logical_or => 5,
             .@"orelse" => 4,
-            .pipe => 50,
+            .pipe => 12,
             .apply => 70,
             .member => 90,
             .array_access => 90,
@@ -962,6 +969,14 @@ pub const BinaryOp = enum {
             .mul_assign => 0,
             .div_assign => 0,
             .rem_assign => 0,
+            .sequence => 1,
+        };
+    }
+
+    fn streamFromToken(tok: token.Token) StreamRef {
+        return switch (tok.tag) {
+            .fd_source_truncate_redirect, .fd_source_append_redirect => if (tok.lexeme[0] == '1') .stdout else if (tok.lexeme[0] == '2') .stderr else @panic("shouldn't happen <|:)-|--<"),
+            else => @panic("shouldn't happen <|:)-|--<"),
         };
     }
 
@@ -972,6 +987,8 @@ pub const BinaryOp = enum {
             .star => .multiply,
             .slash => .divide,
             .percent => .remainder,
+            .fd_source_truncate_redirect => .{ .fd_source_truncate_redirect = streamFromToken(tok) },
+            .fd_source_append_redirect => .{ .fd_source_append_redirect = streamFromToken(tok) },
             .greater => .greater,
             .append_redirect => .append_redirect,
             .redirect_fd => .redirect_fd,
@@ -1019,6 +1036,16 @@ pub const BinaryOp = enum {
             .mul_assign => .multiply,
             .div_assign => .divide,
             .rem_assign => .remainder,
+            else => @panic("shouldn't happen <|:)-|--<"),
+        };
+    }
+
+    pub fn redirectStream(self: @This()) StreamRef {
+        return switch (self) {
+            .fd_source_truncate_redirect => |s| s,
+            .fd_source_append_redirect => |s| s,
+            .greater => .stdout,
+            .append_redirect => .stdout,
             else => @panic("shouldn't happen <|:)-|--<"),
         };
     }

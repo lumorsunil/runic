@@ -1305,7 +1305,7 @@ pub const IRCompiler = struct {
     ) Error!Result {
         switch (expr.*) {
             .binary => |binary| switch (binary.op) {
-                .logical_and, .logical_or => return self.compileLogicalBinary(source, binary, .statement),
+                .logical_and, .logical_or, .sequence => return self.compileLogicalBinary(source, binary, .statement),
                 else => {},
             },
             else => {},
@@ -3222,7 +3222,17 @@ pub const IRCompiler = struct {
 
         var it = std.mem.reverseIterator(arguments);
         while (it.next()) |arg_expr| {
-            const arg = try self.compileExpression(arg_expr);
+            var arg = try self.compileExpression(arg_expr);
+            if (arg.isType(execution_result_struct_type)) {
+                const arg_ref = try self.newRef(source, "exec_result_arg");
+                try self.set(source, arg_ref, arg.source);
+                try self.set(source, .initRegister(.r2), .from(arg_ref.dereference()));
+                arg = .fromLocation(.initAdd(
+                    .{ .register = .r2 },
+                    executionResultFieldOffset(.merged),
+                    .{ .dereference = true },
+                ));
+            }
             try self.push(source, arg.source);
         }
         try self.push(source, .from(executable));
@@ -4589,7 +4599,7 @@ pub const IRCompiler = struct {
 
                 return .from(ref.dereference());
             },
-            .logical_and, .logical_or => {
+            .logical_and, .logical_or, .sequence => {
                 return self.compileLogicalBinary(source, binary, .value);
             },
             .@"orelse" => {
@@ -4609,7 +4619,7 @@ pub const IRCompiler = struct {
 
                 return .from(ref.dereference());
             },
-            .append_redirect, .redirect_fd => return Error.UnsupportedBinaryOperation,
+            .fd_source_truncate_redirect, .fd_source_append_redirect, .append_redirect, .redirect_fd => return Error.UnsupportedBinaryOperation,
             .assign => {
                 if (binary.left.* == .env_var) {
                     const env_var = binary.left.env_var;
@@ -4851,6 +4861,12 @@ pub const IRCompiler = struct {
                 const left = try self.compileExpression(binary.left);
                 try self.finalizeStatementResult(source, left);
 
+                // sequence (;) always runs right — no conditional jump needed
+                if (binary.op == .sequence) {
+                    _ = try self.compileLogicalRightStatement(source, binary.right);
+                    return .fromValue(.void);
+                }
+
                 if (evaluateLogical(.from(binary.op), left.source)) |comptime_result| {
                     return switch (comptime_result) {
                         .left => .fromValue(.void),
@@ -4883,13 +4899,32 @@ pub const IRCompiler = struct {
                 const right_expr_effects = self.analyzeExpressionEffects(binary.right);
 
                 if (left_expr_effects.needs_stdio_capture or right_expr_effects.needs_stdio_capture) {
-                    const result = try self.newRef(source, "logical_result");
-                    const left = try self.compileStableExpressionIntoRef(source, binary.left, result);
+                    // Compile sub-expressions directly — we are already inside a capture fork
+                    // (set up by compileExpressionWithCapture → compileWithContext) where the
+                    // current thread's stdout/stderr ARE the outer capture pipes. Creating
+                    // nested captures here would intercept the output into inner pipes and
+                    // leave the outer pipes empty.
+                    const result_ref = try self.newRef(source, "logical_result");
+                    const left = try self.compileExpression(binary.left);
+                    // Wait for left so we can check its exit code (for &&/||)
+                    try self.finalizeStatementResult(source, left);
+                    try self.set(source, result_ref, stableResultSource(left));
+
+                    // sequence (;): always run right
+                    if (binary.op == .sequence) {
+                        const right = try self.compileExpression(binary.right);
+                        try self.set(source, result_ref, stableResultSource(right));
+                        return .from(result_ref.dereference().typed(mergedResultType(left, right)));
+                    }
 
                     if (evaluateLogical(.from(binary.op), left.source)) |comptime_result| {
                         return switch (comptime_result) {
                             .left => left,
-                            .right => try self.compileStableExpression(source, binary.right, "logical_right"),
+                            .right => blk: {
+                                const right = try self.compileExpression(binary.right);
+                                try self.set(source, result_ref, stableResultSource(right));
+                                break :blk .from(result_ref.dereference().typed(mergedResultType(left, right)));
+                            },
                         };
                     }
 
@@ -4909,10 +4944,17 @@ pub const IRCompiler = struct {
                         },
                     }
 
-                    const right = try self.compileStableExpressionIntoRef(source, binary.right, result);
+                    const right = try self.compileExpression(binary.right);
+                    try self.set(source, result_ref, stableResultSource(right));
                     try self.setLabel(after_addr.local_addr.label, .abs);
 
-                    return .from(result.dereference().typed(mergedResultType(left, right)));
+                    return .from(result_ref.dereference().typed(mergedResultType(left, right)));
+                }
+
+                // No stdio capture needed — compile normally
+                if (binary.op == .sequence) {
+                    _ = try self.compileExpression(binary.left);
+                    return try self.compileExpression(binary.right);
                 }
 
                 const left = try self.compileExpression(binary.left);
@@ -4946,7 +4988,7 @@ pub const IRCompiler = struct {
     ) Error!Result {
         switch (expr.*) {
             .binary => |binary| switch (binary.op) {
-                .logical_and, .logical_or => return self.compileLogicalBinary(source, binary, .statement),
+                .logical_and, .logical_or, .sequence => return self.compileLogicalBinary(source, binary, .statement),
                 else => {},
             },
             else => {},

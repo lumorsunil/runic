@@ -307,6 +307,31 @@ fn renderCallExpression(writer: *std.Io.Writer, level: usize, call: ast.CallExpr
         try writer.print("arg {}:\n", .{i});
         try renderExpressionAst(writer, arg, level + 2);
     }
+    if (call.redirects.len > 0) {
+        try writeIndent(writer, level + 1);
+        try writer.writeAll("redirects:\n");
+        for (call.redirects) |redirect| {
+            try writeIndent(writer, level + 2);
+            try writer.print("stream: ", .{});
+            switch (redirect.stream) {
+                .stdin, .stdout, .stderr => try writer.print("{t}\n", .{redirect.stream}),
+                .descriptor => |d| try writer.print("fd: {}\n", .{d}),
+            }
+
+            try writeIndent(writer, level + 2);
+            try writer.print("mode: {t}\n", .{redirect.mode});
+
+            try writeIndent(writer, level + 2);
+            try writer.print("target:\n", .{});
+            switch (redirect.target) {
+                .path => |path| try renderExpressionAst(writer, path.value, level + 3),
+                .fd => |fd| {
+                    try writeIndent(writer, level + 3);
+                    try writer.print("fd: {}\n", .{fd});
+                },
+            }
+        }
+    }
 }
 
 fn renderBlockStatements(writer: *std.Io.Writer, block: ast.Block, level: usize) !void {
