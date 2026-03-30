@@ -450,6 +450,242 @@ pub const Server = struct {
         };
     }
 
+    fn handleDefinition(
+        self: *Server,
+        id: types.RequestId,
+        params: types.DefinitionParams,
+    ) !void {
+        const path = try self.resolveUriPath(params.textDocument.uri);
+        defer self.allocator.free(path);
+
+        const doc = self.documents.get(params.textDocument.uri);
+
+        var loc = params.position.toLocation(path);
+        if (doc) |d| loc.offset = params.position.findIndex(d.text) orelse 0;
+        const extracted_identifier = if (doc) |d| self.extractIdentifier(loc, d.text) else null;
+        const scope = self.workspace.type_checker.getScopeFromLoc(loc);
+
+        const binding: ?*runic.semantic.Scope.Binding = brk: {
+            if (scope) |s| if (extracted_identifier) |i| {
+                break :brk s.lookup(i.name);
+            };
+            break :brk null;
+        };
+
+        if (binding) |b| {
+            const result = types.Location{
+                .uri = params.textDocument.uri,
+                .range = types.Range.fromSpan(b.identifier.span),
+            };
+            try self.sendJson(types.response(id, result));
+        } else {
+            try self.sendJson(types.response(id, std.json.Value{ .null = {} }));
+        }
+    }
+
+    fn handleReferences(
+        self: *Server,
+        id: types.RequestId,
+        params: types.ReferenceParams,
+    ) !void {
+        const path = try self.resolveUriPath(params.textDocument.uri);
+        defer self.allocator.free(path);
+
+        const doc = self.documents.get(params.textDocument.uri);
+
+        var loc = params.position.toLocation(path);
+        if (doc) |d| loc.offset = params.position.findIndex(d.text) orelse 0;
+        const extracted_identifier = if (doc) |d| self.extractIdentifier(loc, d.text) else null;
+        const scope = self.workspace.type_checker.getScopeFromLoc(loc);
+
+        const binding: ?*runic.semantic.Scope.Binding = brk: {
+            if (scope) |s| if (extracted_identifier) |i| {
+                break :brk s.lookup(i.name);
+            };
+            break :brk null;
+        };
+
+        var locations = std.ArrayList(types.Location).empty;
+        defer locations.deinit(self.allocator);
+
+        if (binding) |b| {
+            try locations.append(self.allocator, .{
+                .uri = params.textDocument.uri,
+                .range = types.Range.fromSpan(b.identifier.span),
+            });
+        }
+
+        try self.sendJson(types.response(id, locations.items));
+    }
+
+    fn handleDocumentSymbols(
+        self: *Server,
+        id: types.RequestId,
+        params: types.DocumentSymbolParams,
+    ) !void {
+        const path = try self.resolveUriPath(params.textDocument.uri);
+        defer self.allocator.free(path);
+
+        _ = self.documents.get(params.textDocument.uri) orelse {
+            try self.sendJson(types.response(id, std.json.Value{ .null = {} }));
+            return;
+        };
+
+        var doc_symbols = std.ArrayList(types.DocumentSymbol).empty;
+
+        if (self.workspace.documents.get(params.textDocument.uri)) |ws_doc| {
+            for (ws_doc.symbols.items) |sym| {
+                const kind: types.SymbolKind = switch (sym.kind) {
+                    .function => .function,
+                    .variable => .variable,
+                    .module => .module,
+                    .keyword => .keyword,
+                };
+
+                try doc_symbols.append(self.allocator, .{
+                    .name = try self.allocator.dupe(u8, sym.name),
+                    .kind = kind,
+                    .detail = try self.allocator.dupe(u8, sym.detail),
+                    .range = types.Range{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 0 } },
+                    .selectionRange = types.Range{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 0 } },
+                });
+            }
+        }
+
+        try self.sendJson(types.response(id, doc_symbols.items));
+    }
+
+    fn handleRename(
+        self: *Server,
+        id: types.RequestId,
+        params: types.RenameParams,
+    ) !void {
+        const path = try self.resolveUriPath(params.textDocument.uri);
+        defer self.allocator.free(path);
+
+        const doc = self.documents.get(params.textDocument.uri);
+
+        var loc = params.position.toLocation(path);
+        if (doc) |d| loc.offset = params.position.findIndex(d.text) orelse 0;
+        const extracted_identifier = if (doc) |d| self.extractIdentifier(loc, d.text) else null;
+
+        if (extracted_identifier == null) {
+            try self.sendJson(types.response(id, std.json.Value{ .null = {} }));
+            return;
+        }
+
+        const result = types.WorkspaceEdit{
+            .documentChanges = &.{
+                .{
+                    .textDocumentEdit = .{
+                        .textDocument = .{ .uri = params.textDocument.uri, .version = null },
+                        .edits = &.{
+                            .{
+                                .range = types.Range{ .start = params.position, .end = params.position },
+                                .newText = params.newName,
+                            },
+                        },
+                    },
+                },
+            },
+        };
+
+        try self.sendJson(types.response(id, result));
+    }
+
+    fn handleFormatting(
+        self: *Server,
+        id: types.RequestId,
+        params: types.DocumentFormattingParams,
+    ) !void {
+        const doc = self.documents.get(params.textDocument.uri) orelse {
+            try self.sendJson(types.response(id, std.json.Value{ .null = {} }));
+            return;
+        };
+
+        const text = doc.text;
+        var formatted = std.ArrayList(u8).init(self.allocator);
+        defer formatted.deinit(self.allocator);
+
+        var i: usize = 0;
+        var indent_level: usize = 0;
+        var in_string = false;
+        var string_char: u8 = '"';
+
+        while (i < text.len) : (i += 1) {
+            const ch = text[i];
+
+            if (!in_string and (ch == '"' or ch == '\'')) {
+                in_string = true;
+                string_char = ch;
+                try formatted.append(ch);
+                continue;
+            }
+
+            if (in_string and ch == string_char and (i == 0 or text[i - 1] != '\\')) {
+                in_string = false;
+                try formatted.append(ch);
+                continue;
+            }
+
+            if (in_string) {
+                try formatted.append(ch);
+                continue;
+            }
+
+            if (ch == '#') {
+                while (i < text.len and text[i] != '\n') : (i += 1) {}
+                continue;
+            }
+
+            if (ch == '{') {
+                try formatted.append(ch);
+                try formatted.append(' ');
+                indent_level += 1;
+                continue;
+            }
+
+            if (ch == '}') {
+                indent_level -= 1;
+                if (formatted.items.len > 1 and formatted.items[formatted.items.len - 1] == ' ') {
+                    _ = formatted.pop();
+                }
+                try formatted.append(ch);
+                continue;
+            }
+
+            if (ch == '\n') {
+                try formatted.append(ch);
+                var j: usize = 0;
+                while (j < indent_level) : (j += 1) {
+                    try formatted.append(' ');
+                    try formatted.append(' ');
+                }
+                continue;
+            }
+
+            if (ch == ' ' or ch == '\t') {
+                if (formatted.items.len == 0 or formatted.items[formatted.items.len - 1] == ' ' or formatted.items[formatted.items.len - 1] == '\n' or formatted.items[formatted.items.len - 1] == '{') {
+                    continue;
+                }
+                try formatted.append(ch);
+                continue;
+            }
+
+            try formatted.append(ch);
+        }
+
+        const text_edit = types.TextEdit{
+            .range = types.Range{
+                .start = .{ .line = 0, .character = 0 },
+                .end = .{ .line = @intCast(std.mem.count(u8, text, "\n")), .character = 0 },
+            },
+            .newText = formatted.items,
+        };
+
+        try self.sendJson(types.response(id, &.{text_edit}));
+    }
+
     fn sendInitializeResult(self: *Server, id: types.RequestId) !void {
         const result = types.InitializeResult{
             .capabilities = .{
@@ -465,6 +701,31 @@ pub const Server = struct {
                 },
                 .hoverProvider = .{ .payload = .{
                     .hoverOptions = .{
+                        .workDoneProgress = false,
+                    },
+                } },
+                .definitionProvider = .{ .payload = .{
+                    .definitionOptions = .{
+                        .workDoneProgress = false,
+                    },
+                } },
+                .referencesProvider = .{ .payload = .{
+                    .referenceOptions = .{
+                        .workDoneProgress = false,
+                    },
+                } },
+                .documentSymbolProvider = .{ .payload = .{
+                    .documentSymbolOptions = .{
+                        .workDoneProgress = false,
+                    },
+                } },
+                .renameProvider = .{ .payload = .{
+                    .renameOptions = .{
+                        .prepareProvider = false,
+                    },
+                } },
+                .documentFormattingProvider = .{ .payload = .{
+                    .documentFormattingOptions = .{
                         .workDoneProgress = false,
                     },
                 } },
