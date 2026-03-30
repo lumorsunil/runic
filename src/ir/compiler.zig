@@ -2652,6 +2652,12 @@ pub const IRCompiler = struct {
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
+        if (std.mem.eql(u8, identifier.name, "@src")) {
+            const path = self.script.span.start.file;
+            const value = try self.addSlice(1, path);
+            return .fromValue(value);
+        }
+
         const source_binding = self.lookup(identifier.name, .{ .shallow = false }) orelse {
             const executable = try self.addSlice(1, identifier.name);
             return .fromValue(.{ .executable = executable.slice });
@@ -2760,6 +2766,9 @@ pub const IRCompiler = struct {
 
         if (call.callee.* == .identifier) {
             const name = call.callee.identifier.name;
+            if (std.mem.eql(u8, name, "@src")) {
+                return self.compileIdentifier(source, call.callee.identifier);
+            }
             if (std.mem.eql(u8, name, "cd") and self.lookup(name, .{ .shallow = false }) == null) {
                 return self.compileBuiltinCd(source, call.arguments);
             }
@@ -5378,6 +5387,7 @@ pub const IRCompiler = struct {
 
         return switch (call.callee.*) {
             .identifier => |identifier| blk: {
+                if (std.mem.eql(u8, identifier.name, "@src")) break :blk false;
                 if (std.mem.eql(u8, identifier.name, "cd") and self.lookup(identifier.name, .{ .shallow = false }) == null) {
                     break :blk false;
                 }
