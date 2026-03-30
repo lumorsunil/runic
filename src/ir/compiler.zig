@@ -1716,6 +1716,7 @@ pub const IRCompiler = struct {
                 break :blk self.compileBackgroundExpressionValue(expr, .{ .block = block_copy });
             } else self.compileBlock(expr, block),
             .fn_decl => |fn_decl| self.compileFnDecl(expr, fn_decl),
+            .lambda => |lambda| self.compileLambda(expr, lambda),
             .binary => |binary| self.compileBinary(expr, binary),
             .unary => |unary| self.compileUnary(expr, unary),
             .array => |array| self.compileArray(expr, array),
@@ -4130,6 +4131,62 @@ pub const IRCompiler = struct {
         return .from(fn_ref);
     }
 
+    fn compileLambda(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        lambda: ast.Lambda,
+    ) Error!Result {
+        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        const instr_set = try self.addInstructionSet();
+        const fn_ref = ir.Value{
+            .fn_ref = .{ .fn_addr = ir.InstructionAddr.initAbs(instr_set, 0) },
+        };
+        const orig_instr_set = self.current_instruction_set;
+        self.current_instruction_set = instr_set;
+        try self.scopes.push(self.allocator, .closure);
+
+        for (lambda.params._non_variadic) |param| {
+            switch (param.pattern.*) {
+                .discard => {},
+                .identifier => |identifier| {
+                    _ = try self.declareClosureValue(
+                        .mutable(identifier, .normal),
+                        0,
+                        false,
+                        if (param.type_annotation) |type_annotation| type_annotation.* else null,
+                    );
+                },
+                .tuple, .record => {
+                    try self.reportSourceError(
+                        source,
+                        Error.UnsupportedBindingPattern,
+                        .@"error",
+                        "lambda parameter destructuring is not yet supported in IR",
+                        .{},
+                    );
+                    return .fromValue(.void);
+                },
+            }
+        }
+
+        const result = try self.compileExpression(lambda.body);
+        if (isWaitable(result)) |loc| {
+            try self.wait(source, loc);
+        }
+        if (result.source.isValueTag(.void)) {
+            try self.exitWith(source, .fromValue(.fromBoolean(true)));
+        } else {
+            try self.exitWith(source, result);
+        }
+
+        try self.setClosureIdentifiers();
+        self.current_instruction_set = orig_instr_set;
+        self.scopes.pop();
+
+        return .from(fn_ref);
+    }
+
     fn compileResultSaveR(
         self: *IRCompiler,
         source: anytype,
@@ -4416,12 +4473,12 @@ pub const IRCompiler = struct {
                 try self.set(source, len_ref, .fromLocation(.initAbs(.{ .register = .r2 }, .{ .dereference = true })));
 
                 return .{
-            .kind = .array,
-            .base_ref = source_ref,
-            .len_ref = len_ref,
-            .range_limit_ref = null,
-            .value_type = source_result.typeExpr().?.array.element.*,
-        };
+                    .kind = .array,
+                    .base_ref = source_ref,
+                    .len_ref = len_ref,
+                    .range_limit_ref = null,
+                    .value_type = source_result.typeExpr().?.array.element.*,
+                };
             },
         }
     }

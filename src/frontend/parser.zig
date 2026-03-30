@@ -481,6 +481,7 @@ pub const Parser = struct {
 
         return switch (next.tag) {
             .kw_fn => self.parseFn(),
+            .pipe => self.parseLambda(),
             .kw_import => self.parseImportExpression(),
             .identifier => self.parseIdentifierExpression(),
             .kw_if => self.parseIfExpression(),
@@ -2622,6 +2623,34 @@ pub const Parser = struct {
             .name = .{ .name = identifier.lexeme, .span = identifier.span },
             .params = .nonVariadic(params.payload),
             .stdin_type = stdinType,
+            .return_type = returnType,
+            .body = body,
+            .span = start.span.endAt(body.span()),
+        } });
+    }
+
+    fn parseLambda(self: *Self) Error!*ast.Expression {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const start = try self.expectTokenTag(.pipe);
+        const params = try self.parseList(.comma, parseParam, .{
+            .terminators = .list(&.{.pipe}),
+        });
+        _ = try self.expectTokenTag(.pipe);
+
+        var returnType: ?*const ast.TypeExpr = null;
+        const next = try self.peekToken();
+        if (next.tag == .arrow) {
+            _ = try self.nextToken();
+            returnType = try self.parseMaybeTypeExpr();
+        }
+
+        const body = try self.parseExpression();
+
+        return self.allocExpression(.{ .lambda = .{
+            .params = .nonVariadic(params.payload),
+            .stdin_type = null,
             .return_type = returnType,
             .body = body,
             .span = start.span.endAt(body.span()),

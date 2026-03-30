@@ -447,7 +447,6 @@ pub const PipeReader = struct {
     ) std.Io.Reader.StreamError!usize {
         const parent = getParent(r);
         const file = parent.file orelse return 0;
-        const file_reader = if (parent.file_reader) |*fr| fr else return 0;
 
         var revents = poll(file, std.posix.POLL.IN, parent.tracer);
 
@@ -456,8 +455,10 @@ pub const PipeReader = struct {
         } else if (revents & (std.posix.POLL.IN | std.posix.POLL.HUP) > 0) {
             var buffer: [256]u8 = undefined;
             var bytes_read: usize = 0;
+            var file_reader = file.reader(&buffer);
             while (bytes_read < buffer.len) {
-                const n = try file_reader.read(buffer[bytes_read .. bytes_read + 1]);
+                var slices: [1][]u8 = .{buffer[bytes_read..]};
+                const n = try file_reader.interface.readVec(&slices);
                 if (n == 0) {
                     if (bytes_read == 0) return error.EndOfStream;
                     break;
