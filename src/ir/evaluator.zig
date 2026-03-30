@@ -1013,6 +1013,20 @@ pub const IREvaluator = struct {
                 thread.private.subshell_context = saved;
                 return .cont;
             },
+            .get_module_cache => |path| {
+                if (self.context.module_cache.get(path)) |cached| {
+                    thread.private.result_register = cached;
+                    thread.private.result_register_2 = .fromBoolean(true);
+                } else {
+                    thread.private.result_register_2 = .fromBoolean(false);
+                }
+                return .cont;
+            },
+            .set_module_cache => |path| {
+                const path_owned = try self.allocator.dupe(u8, path);
+                try self.context.module_cache.put(self.allocator, path_owned, thread.private.result_register);
+                return .cont;
+            },
             .fwd_stdio => {
                 const stdin = try self.context.addPipe(self.config.stdin);
                 const stdout = try self.context.addPipe(self.config.stdout);

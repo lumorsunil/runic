@@ -164,6 +164,14 @@ pub const TypeExpr = union(enum) {
     thread: PrimitiveType,
     failed: FailedType,
     // lazy: LazyType,
+    /// A compile-time function reference pointing to a specific IR instruction set.
+    /// Used for module pub fn exports so compileMember can return the fn_ref value directly.
+    fn_ref_type: FnRefType,
+
+    pub const FnRefType = struct {
+        instr_set: usize,
+        span: Span,
+    };
 
     pub fn global(comptime tag: std.meta.Tag(@This())) @This() {
         return @unionInit(@This(), @tagName(tag), .{ .span = .global });
@@ -469,6 +477,7 @@ pub const TypeExpr = union(enum) {
             .alias,
             .identifier,
             .failed,
+            .fn_ref_type,
             => 1,
             .struct_type => |struct_type| blk: {
                 var size: usize = 0;
@@ -510,6 +519,9 @@ pub const TypeExpr = union(enum) {
             },
             .execution => {
                 try writer.writeAll("Execution");
+            },
+            .fn_ref_type => |frt| {
+                try writer.print("<fn_ref:{}>", .{frt.instr_set});
             },
             inline else => |s| try s.format(writer),
         }
@@ -1133,6 +1145,7 @@ pub const CatchClause = struct {
 pub const ImportExpr = struct {
     importer: []const u8,
     module_name: []const u8,
+    call: CallExpr,
     span: Span,
 
     pub fn resolveType(
@@ -1380,6 +1393,7 @@ pub const Statement = union(enum) {
 };
 
 pub const TypeBindingDecl = struct {
+    is_pub: bool = true,
     identifier: Identifier,
     type_expr: *const TypeExpr,
     span: Span,
@@ -1395,6 +1409,7 @@ pub const TypeBindingDecl = struct {
 
 pub const BindingDecl = struct {
     is_mutable: bool,
+    is_pub: bool,
     pattern: *BindingPattern,
     annotation: ?*const TypeExpr,
     initializer: *Expression,
@@ -1431,6 +1446,7 @@ pub const Parameter = struct {
 };
 
 pub const FunctionDecl = struct {
+    is_pub: bool,
     name: ?Identifier,
     params: Parameters,
     stdin_type: ?*const TypeExpr,

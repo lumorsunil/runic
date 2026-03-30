@@ -1,9 +1,5 @@
 #!/usr/bin/env runic
 
-// Missing features:
-// - subshells $(...)
-// - orelse
-
 fn Void @(targets: []String) String
 
 const script_dir = $(cd "${dirname "${RUNIC_SOURCE}" && pwd}")

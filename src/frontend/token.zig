@@ -138,6 +138,8 @@ pub const Tag = enum {
     kw_var,
     /// Function declarations/expressions.
     kw_fn,
+    /// Pub modifier.
+    kw_pub,
 
     // Error/type keywords
     /// Starts error set declarations.
@@ -276,6 +278,7 @@ const keyword_map = std.StaticStringMap(Tag).initComptime(.{
     .{ "const", .kw_const },
     .{ "var", .kw_var },
     .{ "fn", .kw_fn },
+    .{ "pub", .kw_pub },
     .{ "error", .kw_error },
     .{ "enum", .kw_enum },
     .{ "union", .kw_union },

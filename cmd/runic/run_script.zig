@@ -395,6 +395,8 @@ fn parseImports(
                     import_expr.module_name,
                 );
                 defer allocator.free(module_path);
+                // Skip already-parsed modules (cycle detection)
+                if ((document_store.getAst(module_path) catch null) != null) continue;
                 const parser = try document_store.getParser(module_path);
                 const result = parser.parseScript(module_path);
                 const import_script = try processResult(document_store, writer, result) orelse return .fromByte(1);

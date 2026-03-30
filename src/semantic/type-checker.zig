@@ -282,12 +282,10 @@ pub const TypeChecker = struct {
     }
 
     pub fn typeCheck(self: *TypeChecker, path: []const u8) Error!Result {
-        const duped_path = try self.arena.child_allocator.dupe(u8, path);
-
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
-        try self.log(@src().fn_name ++ ": {s}", .{duped_path});
+        try self.log(@src().fn_name ++ ": {s}", .{path});
 
-        _ = try self.scopesFromAst(duped_path);
+        _ = try self.scopesFromAst(path);
 
         return self.compileResult();
     }
@@ -315,6 +313,7 @@ pub const TypeChecker = struct {
                                 self.arena.allocator(),
                                 identifier,
                                 param.type_annotation,
+                                true,
                                 false,
                             );
                         },
@@ -325,9 +324,10 @@ pub const TypeChecker = struct {
             }
         }
 
+        const path_owned = try self.arena.child_allocator.dupe(u8, path);
         try self.modules.put(
             self.arena.allocator(),
-            path,
+            path_owned,
             global_scope,
         );
 
@@ -442,6 +442,7 @@ pub const TypeChecker = struct {
             self.arena.allocator(),
             type_binding_decl.identifier,
             resolved_type_expr,
+            type_binding_decl.is_pub,
             false,
         ) catch |err| try switch (err) {
             error.IdentifierAlreadyDeclared => {
@@ -495,6 +496,7 @@ pub const TypeChecker = struct {
             scope,
             binding_decl.pattern,
             type_expr,
+            binding_decl.is_pub,
             binding_decl.is_mutable,
         );
     }
@@ -577,6 +579,7 @@ pub const TypeChecker = struct {
         scope: *Scope,
         pattern: *ast.BindingPattern,
         type_expr: ?*const ast.TypeExpr,
+        is_pub: bool,
         is_mutable: bool,
     ) Error!void {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
@@ -588,6 +591,7 @@ pub const TypeChecker = struct {
                     self.arena.allocator(),
                     identifier,
                     type_expr,
+                    is_pub,
                     is_mutable,
                 ) catch |err| try switch (err) {
                     error.IdentifierAlreadyDeclared => {
@@ -616,6 +620,7 @@ pub const TypeChecker = struct {
                 self.arena.allocator(),
                 identifier,
                 try self.resolveExprType(scope, fn_decl),
+                fn_decl.is_pub,
                 false,
             );
         }
@@ -633,6 +638,7 @@ pub const TypeChecker = struct {
                     param.pattern,
                     param_type,
                     false,
+                    false,
                 );
             },
             ._variadic => |param| {
@@ -644,6 +650,7 @@ pub const TypeChecker = struct {
                     fn_scope,
                     param.pattern,
                     param_type,
+                    false,
                     false,
                 );
             },
@@ -728,7 +735,7 @@ pub const TypeChecker = struct {
             },
             .error_set, .err => {},
             .array => |*array| self.runTypeArray(scope, array),
-            .struct_type, .module, .tuple, .function => {},
+            .struct_type, .module, .tuple, .function, .fn_ref_type => {},
         };
     }
 
@@ -781,7 +788,7 @@ pub const TypeChecker = struct {
         for (for_expr.sources, for_expr.capture.bindings) |source, pattern| {
             try self.runExpression(scope, source);
             const type_expr = try self.resolveExprType(scope, source);
-            try self.runBindingPattern(for_scope, pattern, type_expr, false);
+            try self.runBindingPattern(for_scope, pattern, type_expr, false, false);
         }
 
         try self.runExpression(for_scope, for_expr.body);
@@ -948,11 +955,13 @@ pub const TypeChecker = struct {
                 capture.bindings[0],
                 optional.child,
                 false,
+                false,
             ),
             else => try self.runBindingPattern(
                 then_scope,
                 capture.bindings[0],
                 cond_type,
+                false,
                 false,
             ),
         }
@@ -1056,7 +1065,7 @@ pub const TypeChecker = struct {
             .optional => return error.MemberAccessOnOptional,
             .array => |array| try self.runArrayMemberAccess(array, &member.member),
             .thread => try self.runThreadMemberAccess(&member.member),
-            .null, .promise, .error_union, .error_set, .err, .struct_type, .tuple, .function, .integer, .float, .boolean, .byte, .alias, .void => return error.UnsupportedMemberAccess,
+            .null, .promise, .error_union, .error_set, .err, .struct_type, .tuple, .function, .fn_ref_type, .integer, .float, .boolean, .byte, .alias, .void => return error.UnsupportedMemberAccess,
             .module => |module| try self.runModuleMemberAccess(module, &member.member),
             .execution => |execution| try self.runExecutionMemberAccess(execution, &member.member),
             // .lazy => {
@@ -1090,7 +1099,14 @@ pub const TypeChecker = struct {
         try self.logTypeCheckTrace(@src().fn_name, identifier.span);
 
         const module_scope = try self.requestModuleScope(module) orelse return;
-        _ = try self.runIdentifier(module_scope, identifier);
+
+        // Only pub declarations are accessible on a module; fall back to
+        // execution-result fields (exit_code, stdout, stderr, wait) for the rest.
+        if (module_scope.lookup(identifier.name)) |binding| {
+            if (binding.is_pub) return;
+        }
+
+        try self.runExecutionMemberAccess(undefined, identifier);
     }
 
     pub fn runExecutionMemberAccess(
@@ -1265,6 +1281,33 @@ pub const TypeChecker = struct {
         };
 
         _ = try self.requestModuleScope(module_type.module);
+
+        // Modules must not declare parameters — use a function in a module instead.
+        const module_script = try self.document_store.getAst(module_type.module.path) orelse return;
+        if (module_script.signature) |sig| {
+            switch (sig.params) {
+                ._non_variadic => |params| {
+                    if (params.len > 0) {
+                        try self.reportSpanError(
+                            import.span,
+                            Error.UnsupportedExpression,
+                            .@"error",
+                            "module \"{s}\" cannot be imported because it declares parameters; expose its functionality as pub functions instead",
+                            .{import.module_name},
+                        );
+                    }
+                },
+                ._variadic => {
+                    try self.reportSpanError(
+                        import.span,
+                        Error.UnsupportedExpression,
+                        .@"error",
+                        "module \"{s}\" cannot be imported because it declares parameters; expose its functionality as pub functions instead",
+                        .{import.module_name},
+                    );
+                },
+            }
+        }
     }
 
     fn isUnion(comptime T: type) bool {
@@ -1456,6 +1499,7 @@ pub const TypeChecker = struct {
                 assignment_type,
                 options,
             ),
+            .fn_ref_type => {},
             // .lazy => |lazy| self.validateTypeAssignmentLazy(
             //     lazy,
             //     assignment_type,
@@ -1897,7 +1941,7 @@ fn addGlobalScope(allocator: std.mem.Allocator, scope: *Scope) !*Scope {
     const global_scope = try scope.addChild(allocator, scope.span);
 
     for (global_scope_definitions) |definition| {
-        try global_scope.declare(allocator, definition.identifier, definition.type_expr, false);
+        try global_scope.declare(allocator, definition.identifier, definition.type_expr, true, false);
     }
 
     return global_scope;

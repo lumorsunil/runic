@@ -96,6 +96,7 @@ pub const IRProgramContext = struct {
 
     subshell_contexts: std.AutoArrayHashMapUnmanaged(SubshellContextHandle, SubshellContext) = .empty,
     subshell_context_handle_counter: SubshellContextHandle = 0,
+    module_cache: std.StringHashMapUnmanaged(Value) = .empty,
 
     pub fn init(allocator: Allocator, shared: IRSharedContext) @This() {
         return .{ .allocator = allocator, .shared = shared };
@@ -145,6 +146,11 @@ pub const IRProgramContext = struct {
             ctx.deinit(self.allocator);
         }
         self.subshell_contexts.deinit(self.allocator);
+        var module_cache_iter = self.module_cache.keyIterator();
+        while (module_cache_iter.next()) |key| {
+            self.allocator.free(key.*);
+        }
+        self.module_cache.deinit(self.allocator);
     }
 
     pub fn addMainThread(

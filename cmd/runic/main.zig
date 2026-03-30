@@ -1,5 +1,6 @@
 const std = @import("std");
 const utils = @import("main-utils.zig");
+const build_options = @import("build_options");
 const dispatch = @import("dispatch.zig").dispatch;
 const runic = @import("runic");
 const PipeReader = runic.process.PipeReader;
@@ -52,6 +53,10 @@ fn mainImpl() !runic.command_runner.ExitCode {
     switch (result) {
         .show_help => {
             try utils.printUsage(stdout);
+            return .success;
+        },
+        .show_version => {
+            try stdout.print("{s}\n", .{build_options.version});
             return .success;
         },
         .usage_error => |message| {
