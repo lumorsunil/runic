@@ -22,6 +22,6 @@ Runic targets bash users who want safer defaults without abandoning the command-
 - Environment variables are explicit through `$NAME`; e.g., `$HOME orelse "/tmp"` or `$HOME = "/tmp/home"`.
 - Prefer modules over ad-hoc `source` calls. They are cached by resolved path, expose `pub` declarations, and compose better than shell-sourced files.
 - Structured data literals (`[]`, `{}`) eliminate most quoting/IFS juggling. Use them early to reduce the amount of legacy shell escaping you have to reason about.
-- Pair every migration with notes in `docs/progress.md` or a commit description so the broader team understands which bash-specific patterns still need native Runic equivalents.
+- Pair every migration with a commit description or roadmap note so the broader team understands which bash-specific patterns still need native Runic equivalents.
 
-Once the interpreter core lands, this workflow becomes even more powerful: you can mix native Runic functions with background processes, wait on captured executions via `.wait`, and trust the type system to prevent whole classes of bash bugs.
+This workflow becomes more powerful as the language stabilizes: you can mix native Runic functions with background processes, wait on captured executions via `.wait`, and rely on the type system to prevent whole classes of bash bugs.

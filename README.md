@@ -142,7 +142,7 @@ Override the binary path with `RUNIC_BIN=/path/to/runic bash scripts/bench.sh` i
 
 ## Development workflow
 
-Run `./scripts/run_ci.sh` before pushing changes. The script enforces the formatter → linter → unit tests → CLI smoke tests flow described in `docs/plan.md` and automatically selects the toolchain (currently Zig because `build.zig` is present):
+Run `./scripts/run_ci.sh` before pushing changes. The script enforces the formatter → linter → unit tests → CLI smoke tests flow and automatically selects the toolchain (currently Zig because `build.zig` is present):
 
 1. **Formatter** — runs `zig fmt` across `src/`, `cmd/`, and `tests/`.
 2. **Linter** — runs `zig fmt --check` on the same set of Zig sources so misformatted files fail the build.

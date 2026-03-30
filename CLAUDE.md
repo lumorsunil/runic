@@ -94,7 +94,7 @@ To run a single regression script manually:
 
 ## Language Features Reference
 
-See `docs/features.md` for the full language spec and `docs/plan.md` for the implementation roadmap. Example scripts in `examples/` demonstrate pipelines, functions, closures, and bash interop.
+See `docs/features.md` for the current language surface and `docs/plan.md` for the current project roadmap. Example scripts in `examples/` demonstrate pipelines, functions, closures, and bash interop.
 
 Key syntax rules:
 - Command arguments must be quoted strings: `echo "hello"`, `ls "./src"`, `git "status" "--short"`
