@@ -921,22 +921,24 @@ if !status.ok {
             <article
               class="entry"
               data-searchable
-              data-keywords="module system import reuse manifest"
+              data-keywords="module system import reuse module file pub exports"
             >
               <h3>
                 <span class="badge badge-feature">Feature</span> Module system
                 and reuse
               </h3>
               <p>
-                Import reusable helpers from <code>src/</code> via
-                manifest-backed modules so scripts depend on typed APIs.
+                Import reusable helpers from other <code>.rn</code> files.
+                Imported modules are resolved from the importing file, execute
+                once per resolved path, expose <code>pub</code> declarations,
+                and also retain execution-result fields on the imported value.
               </p>
               <div>
                 <div class="example-label">Example</div>
-                <pre><code class="language-rn">let http = import("net/http")
+                <pre><code class="language-rn">const math = import "util/math.rn"
 
-const response = http.get("https://example.com/status")
-echo response.code</code></pre>
+echo math.pi
+echo math.exit_code</code></pre>
               </div>
             </article>
 

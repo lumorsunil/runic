@@ -4,7 +4,8 @@ Reference material, specs, and planning artifacts live here. Add new language no
 
 - `tokens.md` — summarizes the Runic lexer/token vocabulary and how each
   category maps to commands, pipelines, declarations, and interop features.
-- `module_authoring.md` — walks through structuring modules, wiring manifests,
-  and surfacing typed exports for the loader.
+- `import.md` — documents the current `import` implementation: path resolution,
+  parameter restrictions, caching, circular-import handling, and the shape of
+  imported values.
 - `migrating-from-bash.md` — step-by-step guidance for porting existing bash
   scripts to Runic using the currently supported native feature set.

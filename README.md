@@ -60,7 +60,7 @@ Runic is not a shell — it does not replace bash as an interactive environment.
 3. **Command vs. expression separation**: explicit operators differentiate when you're invoking a program versus evaluating a language expression, reducing quoting headaches.
 4. **Functions as pipeline stages**: function declarations carry both a stdin type and a stdout type — `fn StdinType name(params) StdoutType { ... }` — making data flow through pipelines explicit. Functions are called like commands: `check_git` or `greet "world"`.
 5. **Error-aware pipelines**: pipeline execution surfaces per-stage exit codes, allowing guarded chaining without `set -e` footguns.
-6. **Module system**: reusable libraries imported with `const m = import "spec"`, backed by `.rn.module.json` manifests that describe typed exports.
+6. **Module system**: reusable libraries imported with `const m = import "spec"`, resolved relative to the importing file, with `pub` declarations exposed on the imported value.
 
 ## Status
 
@@ -157,22 +157,21 @@ Each stage script expects `RUNIC_REPO_ROOT` to point at the repository root and 
 
 ## Authoring modules
 
-Runic modules are regular `.rn` files paired with JSON manifests so the loader can expose typed exports to consumers:
+Runic modules are currently regular `.rn` files imported from other `.rn`
+files:
 
-1. Place the implementation at `<script_dir>/<spec>.rn` (e.g. `scripts/net/http.rn`) and keep the spec lowercase with `/` separators.
-2. Create `<script_dir>/<spec>.rn.module.json` to declare the module's public surface. Each entry in the `exports` array is either a function (with `params`, `return_type`, and optional `is_async`) or a value with a `type` descriptor.
-3. Supported type descriptors include `primitive`, `array`, `map`, `optional`, and `promise`, matching the Zig-side parser in `src/runtime/module_loader.zig`.
-4. Import the module from scripts using `const http = import "net/http"`. Supplement search paths with `--module-path <dir>` when iterating on modules stored outside the importing script's directory.
-5. Validate manifests by running `zig build test` (the module loader has dedicated fixtures) and by invoking a small script via `zig build run -- examples/<script>.rn`.
-
-See `docs/module_authoring.md` for the full manifest schema, type descriptor explanations, and a sample manifest.
+1. Place the implementation at `<script_dir>/<spec>.rn` and import it with `const m = import "spec.rn"` or another relative spec that resolves from the importing file.
+2. Keep imported modules parameterless. A file that declares parameters in its `@(...)` signature cannot currently be imported.
+3. Export reusable bindings with `pub` so they are visible on the imported value.
+4. Be aware that importing a module executes its top-level body, captures its execution result, and exposes both execution-result fields and `pub` declarations on the imported value.
+5. Validate module behavior by running `zig build test` and by invoking a small importing script via `zig build run -- path/to/script.rn`.
 
 ## Migrating from bash
 
 Runic keeps the familiar pipeline mindset while removing bash-specific hazards. To migrate existing scripts:
 
 - Port declarations/functions to typed Runic syntax (`const`, `var`, `fn`) before touching command pipelines so behavior stays verifiable.
-- Replace `source`-style helper files with modules plus manifests (described above) to surface typed APIs.
+- Replace `source`-style helper files with plain `.rn` modules imported via `import "..."`, and move reusable entry points behind `pub` declarations.
 - Handle failures with `try`/`catch` and typed status objects rather than `set -e` and `$?`.
 - Exercise the CLI via `zig build run -- path/to/script.rn --trace pipeline` and add CLI smoke tests to `tests/` as soon as a migration lands.
 
