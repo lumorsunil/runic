@@ -2593,7 +2593,30 @@ pub const Parser = struct {
         const pattern = try self.parseBindingPattern();
         const annotation = try self.parseMaybeTypeAnnotation();
         _ = try self.expectTokenTag(.assign);
-        const initializer = try self.parseExpression();
+        var initializer = try self.parseExpression();
+
+        // If the initializer is a command-producing expression, allow `;` to sequence
+        // additional commands under the same capture (e.g. `const b = cmd1; cmd2`).
+        // String literals, identifiers, and other non-command expressions do NOT
+        // continue the sequence, preserving `const x = "hello"; echo x` semantics.
+        while (true) {
+            const next = try self.peekToken();
+            if (next.tag != .semicolon) break;
+            switch (initializer.*) {
+                .call, .pipeline, .binary, .block, .subshell => {},
+                else => break,
+            }
+            _ = try self.nextToken(); // consume `;`
+            const right = try self.parseExpression();
+            const seq_expr = try self.arena.allocator().create(ast.Expression);
+            seq_expr.* = .{ .binary = .{
+                .left = initializer,
+                .right = right,
+                .op = .sequence,
+                .span = initializer.span().endAt(right.span()),
+            } };
+            initializer = seq_expr;
+        }
 
         return ast.BindingDecl{
             .is_pub = pub_token != null,

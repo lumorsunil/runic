@@ -311,12 +311,47 @@ pub const Lexer = struct {
         var has_dot = false;
         var has_exponent = false;
 
-        self.consumeDigits();
+        var digits_buffer: [2]u8 = undefined;
+        const digits = self.consumeDigits(&digits_buffer);
+
+        if (digits.len == 1 and (digits[0] == 1 or digits[0] == 2)) {
+            // Preserve `1>&2` / `2>&1` as `int_literal` + `redirect_fd` so the
+            // parser can build an fd-dup redirect instead of a path redirect.
+            if (self.peekIs('>') and self.peekNextIs('&')) {
+                const lexeme = self.source[start_index..self.index];
+                return .{
+                    .tag = .int_literal,
+                    .lexeme = lexeme,
+                    .span = .{ .start = start, .end = self.location() },
+                };
+            }
+            if (self.peekIs('>')) {
+                _ = self.advance();
+
+                if (self.peekIs('>')) {
+                    _ = self.advance();
+                    const lexeme = self.source[start_index..self.index];
+                    return .{
+                        .tag = .fd_source_append_redirect,
+                        .lexeme = lexeme,
+                        .span = .{ .start = start, .end = self.location() },
+                    };
+                }
+
+                const lexeme = self.source[start_index..self.index];
+                return .{
+                    .tag = .fd_source_truncate_redirect,
+                    .lexeme = lexeme,
+                    .span = .{ .start = start, .end = self.location() },
+                };
+            }
+        }
+
         if (self.peekIs('.')) {
             if (!self.peekNextIs('.')) {
                 has_dot = true;
                 _ = self.advance(); // consume '.'
-                self.consumeDigits();
+                _ = self.consumeDigits(null);
             }
         }
 
@@ -324,7 +359,7 @@ pub const Lexer = struct {
             has_exponent = true;
             _ = self.advance();
             if (self.peekIs('+') or self.peekIs('-')) _ = self.advance();
-            self.consumeDigits();
+            _ = self.consumeDigits(null);
         }
 
         const lexeme = self.source[start_index..self.index];
@@ -613,12 +648,17 @@ pub const Lexer = struct {
         }
     }
 
-    fn consumeDigits(self: *Lexer) void {
-        while (!self.isAtEnd()) {
+    fn consumeDigits(self: *Lexer, buffer: ?[]u8) []u8 {
+        var i: usize = 0;
+        while (!self.isAtEnd()) : (i += 1) {
             const ch = self.peek().?;
             if (!std.ascii.isDigit(ch)) break;
             _ = self.advance();
+            if (buffer) |b| if (i < b.len) {
+                b[i] = ch - '0';
+            };
         }
+        return if (buffer) |b| b[0..i] else &.{};
     }
 
     fn peek(self: *Lexer) ?u8 {
