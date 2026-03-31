@@ -1,0 +1,3 @@
+fn Void @(name: String) Void
+
+pub const version = "0.0.1"

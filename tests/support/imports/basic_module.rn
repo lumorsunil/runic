@@ -1,0 +1,9 @@
+fn Void @() Void
+
+echo "module boot"
+
+pub const version = "0.0.1"
+
+pub fn Void greeting() String {
+  echo "hello from module"
+}

@@ -1,0 +1,2 @@
+pub const name = "b"
+const a = import "cycle_a.rn"

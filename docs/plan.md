@@ -26,8 +26,8 @@ expected to keep moving while the core model stabilizes.
 
 - Keep the roadmap tied to implemented code, not speculative architecture.
 - Prefer a small number of active themes over long sequential phase lists.
-- Treat `todo.md` and `todo-ir.md` as engineering backlogs, not as public
-  product-roadmap documents.
+- Treat `todo.md` as the engineering backlog, not as a public product-roadmap
+  document.
 - Use focused design notes such as `future/error-handling.md` and
   `future/typed-pipes.md` to capture feature direction before that work is
   ready to land in the implemented language reference.
@@ -157,8 +157,8 @@ This roadmap does not try to enumerate every open task.
 
 Use:
 
-- `todo.md` for broad language/runtime backlog items
-- `todo-ir.md` for IR/runtime-oriented backlog items
+- `todo.md` for backlog items across language, runtime, IR, tooling, and
+  debugger work
 - `docs/lsp.md` for the current LSP-specific roadmap
 - `future/error-handling.md` and `future/typed-pipes.md` for feature-design
   notes that inform the roadmap but are not yet part of the implemented
