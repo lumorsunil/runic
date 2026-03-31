@@ -3,7 +3,7 @@ const Closeable = @import("closeable.zig").Closeable;
 const CloseableReader = @import("closeable.zig").CloseableReader;
 const CloseableWriter = @import("closeable.zig").CloseableWriter;
 const ReaderWriterStream = @import("stream.zig").ReaderWriterStream;
-const ExitCode = @import("runtime/command_runner.zig").ExitCode;
+const ExitCode = @import("runtime/exit_code.zig").ExitCode;
 const TraceWriter = @import("trace-writer.zig").TraceWriter;
 const Tracer = @import("trace.zig").Tracer;
 

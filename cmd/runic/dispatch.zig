@@ -11,7 +11,7 @@ pub fn dispatch(
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
     tracer: *runic.trace.Tracer,
-) !runic.command_runner.ExitCode {
+) !runic.ExitCode {
     return try runScript(
         allocator,
         config.script,

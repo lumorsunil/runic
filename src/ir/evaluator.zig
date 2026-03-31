@@ -5,7 +5,7 @@ const runic = @import("runic");
 const CloseableProcessIo = runic.process.CloseableProcessIo;
 const FileSink = runic.process.FileSink;
 const ReaderWriterStream = runic.stream.ReaderWriterStream;
-const ExitCode = runic.command_runner.ExitCode;
+const ExitCode = runic.ExitCode;
 const Stream = runic.stream.Stream;
 const Tracer = runic.trace.Tracer;
 const compiler = runic.ir.compiler;
@@ -73,7 +73,7 @@ pub const Result = union(enum) {
     cont_no_instr_counter_inc,
     /// Advances instruction counter, retains thread counter (used for comments)
     skip,
-    exit: runic.command_runner.ExitCode,
+    exit: runic.ExitCode,
 };
 
 pub const IREvaluator = struct {

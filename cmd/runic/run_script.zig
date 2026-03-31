@@ -8,7 +8,7 @@ const rainbow = runic.rainbow;
 const ast = runic.ast;
 const Stream = runic.stream.Stream;
 const closeable = runic.closeable;
-const ExitCode = runic.command_runner.ExitCode;
+const ExitCode = runic.ExitCode;
 const TraceWriter = runic.TraceWriter;
 const Tracer = runic.trace.Tracer;
 const ir = runic.ir;
@@ -381,7 +381,7 @@ fn parseImports(
     writer: *std.Io.Writer,
     document_store: *runic.DocumentStore,
     script: runic.ast.Script,
-) !runic.command_runner.ExitCode {
+) !runic.ExitCode {
     var it = try StatementExpressionIterator.init(allocator, script);
     defer it.deinit();
     while (try it.next()) |node| {

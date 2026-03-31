@@ -21,7 +21,7 @@ pub fn main() !void {
     }
 }
 
-fn mainImpl() !runic.command_runner.ExitCode {
+fn mainImpl() !runic.ExitCode {
     var gpa = std.heap.GeneralPurposeAllocator(.{ .stack_trace_frames = 24 }){};
     defer {
         const status = gpa.deinit();
