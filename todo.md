@@ -386,3 +386,4 @@
 - [ ] syntax highlighting not implemented for:
   - [ ] match
 - [ ] `true "hello` is parsed as a call with `true` as the callee
+- [ ] scripts/run_ci.rn fails with: `Type checker failed to run: error.UnsupportedStatement`
