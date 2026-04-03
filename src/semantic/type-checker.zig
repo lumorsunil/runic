@@ -652,42 +652,6 @@ pub const TypeChecker = struct {
         try self.runExpression(fn_scope, fn_decl.body);
     }
 
-    fn runLambda(self: *TypeChecker, scope: *Scope, lambda: *ast.Lambda) Error!void {
-        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
-        try self.logTypeCheckTrace(@src().fn_name, lambda.span);
-
-        const fn_scope = try scope.addChild(self.arena.allocator(), lambda.span);
-
-        switch (lambda.params) {
-            ._non_variadic => |params| for (params) |param| {
-                const param_type = try self.resolveExprType(
-                    fn_scope,
-                    param,
-                );
-                try self.runBindingPattern(
-                    fn_scope,
-                    param.pattern,
-                    param_type,
-                    false,
-                );
-            },
-            ._variadic => |param| {
-                const param_type = try self.resolveExprType(
-                    fn_scope,
-                    param,
-                );
-                try self.runBindingPattern(
-                    fn_scope,
-                    param.pattern,
-                    param_type,
-                    false,
-                );
-            },
-        }
-
-        try self.runExpression(fn_scope, lambda.body);
-    }
-
     fn runCall(self: *TypeChecker, scope: *Scope, call: *ast.CallExpr) Error!void {
         try self.runExpression(scope, call.callee);
         for (call.arguments) |arg| try self.runExpression(scope, arg);
@@ -736,7 +700,6 @@ pub const TypeChecker = struct {
             .match_expr => |*match_expr| self.runMatchExpr(scope, match_expr),
             .import_expr => |*import_expr| self.runImportExpr(scope, import_expr),
             .fn_decl => |*fn_decl| self.runFnDecl(scope, fn_decl),
-            .lambda => |*lambda| self.runLambda(scope, lambda),
             .call => |*call| self.runCall(scope, call),
             .subshell => |*subshell| self.runExpression(scope, subshell.child),
             else => return error.UnsupportedExpression,

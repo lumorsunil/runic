@@ -646,7 +646,6 @@ pub const Expression = union(enum) {
     binary: BinaryExpr,
     block: Block,
     fn_decl: FunctionDecl,
-    lambda: Lambda,
     if_expr: IfExpr,
     for_expr: ForExpr,
     match_expr: MatchExpr,
@@ -1453,44 +1452,6 @@ pub const FunctionDecl = struct {
             return .{ ._variadic = _variadic };
         }
     };
-
-    pub fn resolveType(
-        self: *@This(),
-        allocator: std.mem.Allocator,
-        scope: *semantic.Scope,
-    ) semantic.Scope.Error!?*const TypeExpr {
-        const params_types: TypeExpr.FunctionType.Parameters = switch (self.params) {
-            ._non_variadic => |params| brk: {
-                const params_types = try allocator.alloc(?*const TypeExpr, params.len);
-
-                for (params_types, params) |*param_type, param| {
-                    param_type.* = try param.resolveType(allocator, scope);
-                }
-
-                break :brk .nonVariadic(params_types);
-            },
-            ._variadic => |params| .variadic(try params.resolveType(allocator, scope)),
-        };
-
-        const fn_type = try allocator.create(TypeExpr);
-
-        fn_type.* = .{ .function = .{
-            .params = params_types,
-            .stdin_type = self.stdin_type,
-            .return_type = self.return_type,
-            .span = self.span,
-        } };
-
-        return fn_type;
-    }
-};
-
-pub const Lambda = struct {
-    params: FunctionDecl.Parameters,
-    stdin_type: ?*const TypeExpr,
-    return_type: ?*const TypeExpr,
-    body: *Expression,
-    span: Span,
 
     pub fn resolveType(
         self: *@This(),

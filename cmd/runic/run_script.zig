@@ -313,7 +313,6 @@ const StatementExpressionIterator = struct {
             },
             .block => |block| try populateBlockExpr(cursor, block),
             .fn_decl => |fn_decl| try self.cursor.appendExpr(fn_decl.body),
-            .lambda => |lambda| try self.cursor.appendExpr(lambda.body),
             .if_expr => |*if_expr| try populateIfExpr(cursor, if_expr),
             .match_expr => |match_expr| {
                 for (match_expr.cases) |c| try populateBlockExpr(cursor, c.body);
