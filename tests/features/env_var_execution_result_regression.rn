@@ -1,0 +1,10 @@
+const text = "hello"
+$W = text
+echo "string=${$W}"
+
+const result = echo "hello"
+$X = result
+echo "identifier=${$X}"
+
+$Y = echo "hello"
+echo "direct=${$Y}"

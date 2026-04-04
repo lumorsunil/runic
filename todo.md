@@ -386,4 +386,6 @@
 - [ ] syntax highlighting not implemented for:
   - [ ] match
 - [ ] `true "hello` is parsed as a call with `true` as the callee
-- [ ] scripts/run_ci.rn fails with: `Type checker failed to run: error.UnsupportedStatement`
+- [x] scripts/run_ci.rn fails with: `Type checker failed to run: error.UnsupportedStatement`
+- [x] scripts/run_ci.rn fails to detect Zig when repo-root paths are built from env-backed strings
+- [x] assigning a bound string or execution result into an env var does not populate the env var correctly

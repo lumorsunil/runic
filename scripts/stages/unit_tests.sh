@@ -2,8 +2,13 @@
 
 set -euo pipefail
 
-lang="${RUNIC_LANG:-unknown}"
-repo_root="${RUNIC_REPO_ROOT:?RUNIC_REPO_ROOT must be set}"
+repo_root="${RUNIC_REPO_ROOT:-${1:-}}"
+lang="${RUNIC_LANG:-${2:-unknown}}"
+
+if [[ -z "$repo_root" ]]; then
+  echo "RUNIC_REPO_ROOT must be set (or passed as the first argument)." >&2
+  exit 1
+fi
 
 case "$lang" in
   rust)

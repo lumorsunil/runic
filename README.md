@@ -91,7 +91,7 @@ The runtime and CLI are implemented in Zig (tested with Zig 0.15.1). Zig's build
 
 - Install Zig 0.15.1 (matching the `build.zig` defaults). Confirm with `zig version`.
 - Ensure `zig` and `zig fmt` are on your `PATH`; every script in `scripts/` expects the CLI to be invocable directly.
-- Optional environment variables `RUNIC_LANG=zig` and `RUNIC_REPO_ROOT=/path/to/runic` are exported automatically by `scripts/run_ci.sh`, but you can set them manually when calling the stage scripts yourself.
+- Optional environment variables `RUNIC_LANG=zig` and `RUNIC_REPO_ROOT=/path/to/runic` are exported automatically by `scripts/run_ci.rn`, but you can set them manually when calling the stage scripts yourself.
 
 ### Building from source
 
@@ -105,11 +105,11 @@ The runtime and CLI are implemented in Zig (tested with Zig 0.15.1). Zig's build
 ### Running tests
 
 - `zig build test` — executes every Zig `test` block, covering lexer/parser/runtime modules along with module-loader fixtures. Run this command before sending any PR.
-- `./scripts/run_ci.sh` — enforces formatter → linter → `zig build test` → CLI smoke suites (`tests/cli_*.sh`). Use this script for a full pre-push verification.
+- `zig build run -- scripts/run_ci.rn` — enforces formatter → linter → `zig build test` → CLI smoke suites (`tests/cli_*.sh`). Use this script for a full pre-push verification.
 - `bash tests/cli_smoke.sh` — runs the positive end-to-end feature scripts under `tests/features/` through the CLI.
 - `bash tests/cli_diagnostics.sh` — runs the negative CLI diagnostic fixtures under `tests/diagnostics/` against the built `zig-out/bin/runic` binary, with ANSI stripped before diffing.
 - Stage-specific reruns: `./scripts/stages/unit_tests.sh`, `./scripts/stages/cli_smoke.sh`, etc., respect the same `RUNIC_REPO_ROOT`/`RUNIC_LANG` environment variables.
-- Add new CLI regression tests by dropping shell scripts under `tests/cli_*.sh`. They run inside `run_ci.sh` and should invoke `zig build run -- ...` to interact with the current binary.
+- Add new CLI regression tests by dropping shell scripts under `tests/cli_*.sh`. They run inside `run_ci.rn` and should invoke `zig build run -- ...` to interact with the current binary.
 
 ### Benchmarking
 
@@ -142,7 +142,7 @@ Override the binary path with `RUNIC_BIN=/path/to/runic bash scripts/bench.sh` i
 
 ## Development workflow
 
-Run `./scripts/run_ci.sh` before pushing changes. The script enforces the formatter → linter → unit tests → CLI smoke tests flow and automatically selects the toolchain (currently Zig because `build.zig` is present):
+Run `zig build run -- scripts/run_ci.rn` before pushing changes. The script enforces the formatter → linter → unit tests → CLI smoke tests flow and automatically selects the toolchain (currently Zig because `build.zig` is present):
 
 1. **Formatter** — runs `zig fmt` across `src/`, `cmd/`, and `tests/`.
 2. **Linter** — runs `zig fmt --check` on the same set of Zig sources so misformatted files fail the build.
@@ -153,7 +153,7 @@ Run `./scripts/run_ci.sh` before pushing changes. The script enforces the format
 
 Each stage stops the pipeline on failure so contributors get immediate feedback. Extend the stage scripts under `scripts/stages/` if a different toolchain or extra checks are required.
 
-Each stage script expects `RUNIC_REPO_ROOT` to point at the repository root and `RUNIC_LANG` to describe the toolchain; `scripts/run_ci.sh` exports both before invoking a stage. You can rerun an individual phase by calling, for example, `RUNIC_LANG=zig RUNIC_REPO_ROOT=$PWD ./scripts/stages/unit_tests.sh` when iterating on a specific failure.
+Each stage script expects `RUNIC_REPO_ROOT` to point at the repository root and `RUNIC_LANG` to describe the toolchain; `scripts/run_ci.rn` exports both before invoking a stage. You can rerun an individual phase by calling, for example, `RUNIC_LANG=zig RUNIC_REPO_ROOT=$PWD ./scripts/stages/unit_tests.sh` when iterating on a specific failure.
 
 ## Authoring modules
 

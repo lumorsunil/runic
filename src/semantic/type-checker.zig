@@ -413,10 +413,18 @@ pub const TypeChecker = struct {
         return switch (statement.*) {
             .type_binding_decl => |*type_binding_decl| self.runTypeBindingDecl(scope, type_binding_decl),
             .binding_decl => |*binding_decl| self.runBindingDecl(scope, binding_decl),
+            .return_stmt => |*return_stmt| self.runReturn(scope, return_stmt),
             .exit_stmt => |*exit_stmt| self.runExit(scope, exit_stmt),
             .expression => |*expr_stmt| self.runExpressionStatement(scope, expr_stmt),
             else => error.UnsupportedStatement,
         };
+    }
+
+    fn runReturn(self: *TypeChecker, scope: *Scope, return_stmt: *ast.ReturnStmt) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.logTypeCheckTrace(@src().fn_name, return_stmt.span);
+
+        if (return_stmt.value) |value| try self.runExpression(scope, value);
     }
 
     fn runExit(self: *TypeChecker, scope: *Scope, exit_stmt: *ast.ExitStmt) Error!void {

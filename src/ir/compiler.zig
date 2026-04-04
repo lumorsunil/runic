@@ -1477,7 +1477,17 @@ pub const IRCompiler = struct {
         source: anytype,
         result: Result,
     ) Error!void {
-        if (isWaitable(result)) |loc| {
+        if (result.isType(execution_handles_struct_type) and result.source.isRegister(.r)) {
+            try self.comment("wait from {s}", .{@src().fn_name});
+            try self.wait(source, ir.Location.initRegister(.r).typed(thread_type));
+            return;
+        }
+
+        const stable = if (result.source.isRegister(.r) and result.isType(thread_type))
+            try self.compileResultSaveR(source, result)
+        else
+            result;
+        if (isWaitable(stable)) |loc| {
             try self.comment("wait from {s}", .{@src().fn_name});
             try self.wait(source, loc);
         }
@@ -1501,8 +1511,15 @@ pub const IRCompiler = struct {
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
-        const result: Result = if (r.value) |value| try self.compileExpression(value) else .fromValue(.{ .exit_code = .success });
-        try self.exit_(source, result);
+        var result: Result = if (r.value) |value| try self.compileExpression(value) else .fromValue(.void);
+        switch (result.source) {
+            .location => |loc| if (loc.abs == .ref) {
+                try self.set(source, .initRegister(.r2), stableResultSource(result));
+                result = .fromLocation(ir.Location.initRegister(.r2).typed(result.typeExpr()));
+            },
+            else => {},
+        }
+        try self.exitWith(source, result);
         return .fromValue(.void);
     }
 
@@ -2223,9 +2240,7 @@ pub const IRCompiler = struct {
                     return .fromValue(.void);
                 }
 
-                const object_ref = try self.newRef(source, "array_member_object_ref");
-                try self.set(source, object_ref, object.source);
-                try self.set(source, .initRegister(.r2), .from(object_ref.dereference()));
+                try self.set(source, .initRegister(.r2), object.source);
 
                 return .fromLocation(.initAbs(
                     .{ .register = .r2 },
@@ -3642,12 +3657,14 @@ pub const IRCompiler = struct {
         if (else_branch == .condition) {
             try self.set(source, result, stableResultSource(condition));
         }
+        const branch_stack_base = self.currentFrame().rel_stack_counter;
         const after_addr = try self.newLabel("if_after", .unknown);
         const else_addr = try self.newLabel("if_else", .unknown);
 
         try self.jmp(source, condition, false, else_addr);
         const then = try self.compileIfBranchExpression(source, if_expr.then_expr, if_condition.capture_binding);
         try self.set(source, result, stableResultSource(then));
+        self.currentFrame().rel_stack_counter = branch_stack_base;
         try self.jmp(source, null, false, after_addr);
         try self.setLabel(else_addr.local_addr.label, .abs);
         var result_type = if (else_branch == .condition) mergedResultType(condition, then) else null;
@@ -3664,6 +3681,7 @@ pub const IRCompiler = struct {
             },
             .condition => {},
         }
+        self.currentFrame().rel_stack_counter = branch_stack_base;
         try self.setLabel(after_addr.local_addr.label, .abs);
         try self.set(source, .initRegister(.r2), .from(result.dereference()));
 
@@ -3686,11 +3704,13 @@ pub const IRCompiler = struct {
             return .fromValue(.void);
         }
         const after_addr = try self.newLabel("if_after", .unknown);
+        const branch_stack_base = self.currentFrame().rel_stack_counter;
         try self.jmp(source, condition, false, after_addr);
         const then_result = try self.compileIfBranchExpression(source, if_expr.then_expr, if_condition.capture_binding);
         if (isWaitable(then_result)) |loc| {
             try self.wait(source, loc);
         }
+        self.currentFrame().rel_stack_counter = branch_stack_base;
         try self.setLabel(after_addr.local_addr.label, .abs);
         return .fromValue(.void);
     }
@@ -4623,10 +4643,58 @@ pub const IRCompiler = struct {
             .assign => {
                 if (binary.left.* == .env_var) {
                     const env_var = binary.left.env_var;
-                    const right = try self.compileExpression(binary.right);
+                    var exec_result_ref_opt: ?ir.Location = null;
+                    var right = try self.compileExpressionWithCapture(source, binary.right);
+                    if (right.isType(execution_result_struct_type)) {
+                        const exec_result_ref = try self.newRef(source, "env_var_exec_result");
+                        try self.set(source, exec_result_ref, stableResultSource(right));
+                        exec_result_ref_opt = exec_result_ref;
+                        try self.set(source, .initRegister(.r2), .from(exec_result_ref.dereference()));
+                        right = .fromLocation(ir.Location.initAdd(
+                            .{ .register = .r2 },
+                            executionResultFieldOffset(.merged),
+                            .{
+                                .dereference = true,
+                                .type_expr = string_type,
+                            },
+                        ));
+                    }
                     try self.setEnv(source, env_var.identifier.name, right.source);
                     const result_ref = try self.newRef(source, "env_var_assign");
                     try self.set(source, result_ref, right.source);
+                    if (exec_result_ref_opt) |exec_result_ref| {
+                        try self.set(source, .initRegister(.r2), .from(exec_result_ref.dereference()));
+                        try self.pipeOpt(
+                            source,
+                            .initAdd(
+                                .{ .register = .r2 },
+                                executionResultFieldOffset(.stdout),
+                                .{ .dereference = true },
+                            ),
+                            .keep_open,
+                            .fromValue(.fromBoolean(false)),
+                        );
+                        try self.pipeOpt(
+                            source,
+                            .initAdd(
+                                .{ .register = .r2 },
+                                executionResultFieldOffset(.stderr),
+                                .{ .dereference = true },
+                            ),
+                            .keep_open,
+                            .fromValue(.fromBoolean(false)),
+                        );
+                        try self.pipeOpt(
+                            source,
+                            .initAdd(
+                                .{ .register = .r2 },
+                                executionResultFieldOffset(.merged),
+                                .{ .dereference = true },
+                            ),
+                            .keep_open,
+                            .fromValue(.fromBoolean(false)),
+                        );
+                    }
                     return .from(result_ref.dereference().typed(optional_string_type));
                 }
 
@@ -4858,7 +4926,10 @@ pub const IRCompiler = struct {
     ) Error!Result {
         switch (mode) {
             .statement => {
-                const left = try self.compileExpression(binary.left);
+                var left = try self.compileExpression(binary.left);
+                if (left.source.isRegister(.r) and left.isType(thread_type)) {
+                    left = try self.compileResultSaveR(source, left);
+                }
                 try self.finalizeStatementResult(source, left);
 
                 // sequence (;) always runs right — no conditional jump needed
@@ -4913,6 +4984,7 @@ pub const IRCompiler = struct {
                     // sequence (;): always run right
                     if (binary.op == .sequence) {
                         const right = try self.compileExpression(binary.right);
+                        try self.finalizeStatementResult(source, right);
                         try self.set(source, result_ref, stableResultSource(right));
                         return .from(result_ref.dereference().typed(mergedResultType(left, right)));
                     }
@@ -4922,6 +4994,7 @@ pub const IRCompiler = struct {
                             .left => left,
                             .right => blk: {
                                 const right = try self.compileExpression(binary.right);
+                                try self.finalizeStatementResult(source, right);
                                 try self.set(source, result_ref, stableResultSource(right));
                                 break :blk .from(result_ref.dereference().typed(mergedResultType(left, right)));
                             },
@@ -4945,6 +5018,7 @@ pub const IRCompiler = struct {
                     }
 
                     const right = try self.compileExpression(binary.right);
+                    try self.finalizeStatementResult(source, right);
                     try self.set(source, result_ref, stableResultSource(right));
                     try self.setLabel(after_addr.local_addr.label, .abs);
 

@@ -22,7 +22,7 @@ zig build test
 zig build runic-lsp
 
 # Full CI pipeline (formatter → linter → unit tests → CLI smoke tests)
-./scripts/run_ci.sh
+zig build run -- scripts/run_ci.rn
 
 # Individual CI stages
 ./scripts/stages/formatter.sh   # zig fmt src cmd tests
@@ -61,11 +61,7 @@ Source → Lexer → Parser → Type Checker → IR Compiler → IR Runner → P
 - **`value.zig`** — Runtime value types (String, Int, Bool, Float, Array, Map, Process handles, etc.)
 
 ### Runtime (`src/runtime/`)
-- **`command_runner.zig`** — Spawns external processes, manages I/O capture and exit codes
-- **`scheduler.zig`** — Async task scheduling for background processes (`^T` promises)
-- **`module_loader.zig`** — Loads typed modules via `.rn.module.json` manifests
-- **`bash_executor.zig`** — Embeds legacy bash blocks (`bash { ... }`)
-- **`match_executor.zig`** — Pattern matching and destructuring logic
+- **`exit_code.zig`** — Shared exit-code representation used by the CLI, IR compiler, evaluator, process, and stream layers
 
 ### CLI Entry Points (`cmd/`)
 - **`cmd/runic/main.zig`** — Entry point, signal handling

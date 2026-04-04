@@ -4,6 +4,7 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="${RUNIC_REPO_ROOT:-$(cd "$script_dir/.." && pwd)}"
+repo_root="$(cd "$repo_root" && pwd)"
 pwd_marker="__RUNIC_PWD__"
 
 if ! command -v zig >/dev/null 2>&1; then

@@ -930,6 +930,17 @@ pub const IREvaluator = struct {
                         }
                         return .{ .exit = .success };
                     },
+                    .zig_string, .stream, .pipe => {
+                        if (thread.private.stack.items.len > 1) {
+                            const stdout_handle = thread.private.stack.items[1].pipe;
+                            const stdout_pipe = try self.context.getPipe(stdout_handle);
+                            var w = stdout_pipe.closeableWriter().writer;
+                            try self.materializeString(thread, resolved, w);
+                            try w.flush();
+                            return .{ .exit = .success };
+                        }
+                        return .{ .exit = try self.coerceExitCode(thread, value) };
+                    },
                     else => return .{ .exit = try self.coerceExitCode(thread, value) },
                 }
             },
@@ -1402,6 +1413,23 @@ pub const IREvaluator = struct {
                             return .cont;
                         } else {
                             return .cont_no_instr_counter_inc;
+                        }
+                    },
+                    .addr => |addr| {
+                        const heap_value = self.context.shared.heapGet(addr) orelse return Error.UnsupportedWaitee;
+                        switch (heap_value) {
+                            .thread => |thread_handle| {
+                                thread.waitFor(thread_handle);
+                            },
+                            .closeable => |closeable_handle| {
+                                const closeable = try self.context.getCloseable(closeable_handle);
+                                if (closeable.isClosed() or closeable.getResult() != null) {
+                                    return .cont;
+                                } else {
+                                    return .cont_no_instr_counter_inc;
+                                }
+                            },
+                            else => return Error.UnsupportedWaitee,
                         }
                     },
                     else => return Error.UnsupportedWaitee,
