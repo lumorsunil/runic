@@ -1,12 +1,12 @@
 // Env vars are mutable, propagate to child processes, and are isolated by subshell context.
 $HOME = "/tmp/runic-parent-home"
-echo "${$HOME orelse "missing"}"
+echo ($HOME orelse "missing")
 printenv "HOME"
 
 const subshell_home = $({
   $HOME = "/tmp/runic-subshell-home"
   printenv "HOME" | tr "-d" "\n"
 })
-echo "${subshell_home}"
+echo subshell_home
 
 printenv "HOME"

@@ -17,4 +17,5 @@ block lhs failure
 block or ran
 == nested logical statements ==
 nested and entered
+nested or recovered
 logical short circuit regression passed

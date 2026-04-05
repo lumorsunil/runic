@@ -1,5 +1,5 @@
 const std = @import("std");
-const ExitCode = @import("runtime/command_runner.zig").ExitCode;
+const ExitCode = @import("runtime/exit_code.zig").ExitCode;
 
 pub fn Closeable(comptime T: type) type {
     return struct {

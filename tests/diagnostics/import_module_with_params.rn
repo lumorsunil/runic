@@ -1,0 +1,3 @@
+const m = import "../support/imports/module_with_params.rn"
+
+echo "${m.version}"

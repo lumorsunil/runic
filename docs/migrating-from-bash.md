@@ -1,6 +1,6 @@
 # Migrating Bash Scripts to Runic
 
-Runic targets bash users who want safer defaults without abandoning the command-first workflow. This guide outlines a lightweight methodology for porting existing `.sh` scripts while preserving their behavior. Use it alongside `features.md` (language semantics) and the module authoring guide when extracting reusable helpers.
+Runic targets bash users who want safer defaults without abandoning the command-first workflow. This guide outlines a lightweight methodology for porting existing `.sh` scripts while preserving their behavior. Use it alongside `features.md` (language semantics) when extracting reusable helpers.
 
 ## Prerequisites
 
@@ -14,14 +14,14 @@ Runic targets bash users who want safer defaults without abandoning the command-
 2. **Translate declarations and control flow first.** Replace `VAR=value` with typed bindings and explicit env access (`const home = $HOME orelse "/tmp"` or `$HOME = "/tmp/home"`) and re-express functions with `fn`. Use the explicit `if`/`for` syntax shown in `features.md`.
 3. **Keep commands command-like.** Runic preserves the “bare words launch binaries” rule, so start by copying pipelines verbatim. When you need to transform data, pivot into expressions explicitly—`let files = ls src | lines()`—to avoid quoting pitfalls.
 4. **Handle errors intentionally.** Instead of `set -e`, rely on typed errors and `try`/`catch`. Pipelines expose rich status objects, so branch on failures instead of reading `$?`.
-5. **Convert sourced helpers into modules.** Shared functions should move into `src/<spec>.rn` with a matching `.module.json` manifest (see `docs/module_authoring.md`). Consumers can then `let helpers = import("ci/helpers")` and the loader will enforce interface contracts.
+5. **Convert sourced helpers into modules.** Shared functions should move into plain `.rn` files that are imported with `import "..."`. Keep imported modules parameterless and expose reusable bindings via `pub` declarations.
 6. **Validate incrementally.** Run `zig build run -- path/to/script.rn --trace pipeline` to confirm each stage behaves as expected. Add CLI smoke tests under `tests/cli_*.sh` to lock in regressions as soon as the interpreter reaches parity with your use case.
 
 ## Migration tips
 
 - Environment variables are explicit through `$NAME`; e.g., `$HOME orelse "/tmp"` or `$HOME = "/tmp/home"`.
-- Prefer modules over ad-hoc `source` calls. They provide typed signatures and play nicely with the loader cache.
+- Prefer modules over ad-hoc `source` calls. They are cached by resolved path, expose `pub` declarations, and compose better than shell-sourced files.
 - Structured data literals (`[]`, `{}`) eliminate most quoting/IFS juggling. Use them early to reduce the amount of legacy shell escaping you have to reason about.
-- Pair every migration with notes in `docs/progress.md` or a commit description so the broader team understands which bash-specific patterns still need native Runic equivalents.
+- Pair every migration with a commit description or roadmap note so the broader team understands which bash-specific patterns still need native Runic equivalents.
 
-Once the interpreter core lands, this workflow becomes even more powerful: you can mix native Runic functions with background processes, wait on captured executions via `.wait`, and trust the type system to prevent whole classes of bash bugs.
+This workflow becomes more powerful as the language stabilizes: you can mix native Runic functions with background processes, wait on captured executions via `.wait`, and rely on the type system to prevent whole classes of bash bugs.

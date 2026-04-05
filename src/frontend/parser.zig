@@ -15,6 +15,7 @@ pub const Error = error{
     ForCapturesMustMatchSources,
     ExpectedTypeIdentifier,
     ExpectedTypeExpr,
+    ExpectedKeyword,
 } || std.mem.Allocator.Error || lexer.Error;
 
 /// Parser consumes tokens from the streaming lexer and produces AST nodes.
@@ -480,7 +481,8 @@ pub const Parser = struct {
         const next = try self.peekToken();
 
         return switch (next.tag) {
-            .kw_fn => self.parseFn(),
+            .kw_pub => self.parsePub(),
+            .kw_fn => self.parseFn(null),
             .kw_import => self.parseImportExpression(),
             .identifier => self.parseIdentifierExpression(),
             .kw_if => self.parseIfExpression(),
@@ -598,7 +600,7 @@ pub const Parser = struct {
             op: ?ast.BinaryOp,
             chirality: Chirality,
         ) Error!*ast.Expression {
-            if (op == .member) {
+            if (op != null and op.? == .member) {
                 return parser.allocExpression(.{ .identifier = identifier });
             } else if (op != null and op.?.isAssignment() and chirality == .left) {
                 return parser.allocExpression(.{ .identifier = identifier });
@@ -871,12 +873,32 @@ pub const Parser = struct {
                 },
                 .op => {
                     switch (next.tag) {
-                        .equal_equal, .bang_equal, .greater, .append_redirect, .redirect_fd, .greater_equal, .less, .less_equal, .plus, .minus, .star, .slash, .percent, .kw_and, .kw_or, .kw_orelse, .pipe_pipe, .amp_amp, .pipe, .dot, .assign, .plus_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign => {
+                        .equal_equal, .bang_equal, .fd_source_truncate_redirect, .fd_source_append_redirect, .greater, .append_redirect, .redirect_fd, .greater_equal, .less, .less_equal, .plus, .minus, .star, .slash, .percent, .kw_and, .kw_or, .kw_orelse, .pipe_pipe, .amp_amp, .pipe, .dot, .assign, .plus_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign => {
                             const breadcrumbInner = try self.createBreadcrumb("PBE:op");
                             defer breadcrumbInner.end();
                             try components.append(self.allocator, .{
                                 .op = token.Spanned(ast.BinaryOp).fromToken(next) orelse @panic("shouldn't happen :)"),
                             });
+
+                            switch (next.tag) {
+                                .fd_source_truncate_redirect, .fd_source_append_redirect, .greater, .append_redirect => {
+                                    _ = try self.nextToken();
+                                    const next_value_token = try self.peekToken();
+                                    switch (next_value_token.tag) {
+                                        .amp => {
+                                            _ = try self.nextToken();
+                                            const int = try self.parseIntegerLiteral();
+                                            try components.append(self.allocator, .{
+                                                .literal = .{ .int = int },
+                                            });
+                                            state.advance();
+                                            continue;
+                                        },
+                                        else => continue,
+                                    }
+                                },
+                                else => {},
+                            }
                         },
                         .l_bracket => {
                             _ = try self.nextToken();
@@ -972,15 +994,17 @@ pub const Parser = struct {
                     },
                 },
             },
-            .greater, .append_redirect => redirect: {
+            .greater, .append_redirect, .fd_source_truncate_redirect, .fd_source_append_redirect => redirect: {
                 const mode: ast.RedirectionMode = switch (binary.binary.op) {
+                    .fd_source_truncate_redirect => .truncate,
+                    .fd_source_append_redirect => .append,
                     .greater => .truncate,
                     .append_redirect => .append,
                     else => unreachable,
                 };
                 const path = try coerceRedirectionTargetExpression(right);
                 const redirect = ast.Redirection{
-                    .stream = .stdout,
+                    .stream = binary.binary.op.redirectStream(),
                     .mode = mode,
                     .target = .{ .path = .{ .value = path, .span = path.span() } },
                     .span = left.span().endAt(right.span()),
@@ -1380,6 +1404,7 @@ pub const Parser = struct {
                     try args.append(self.allocator, .{ .string = string_literal });
                     last_token = next_token;
                 },
+                // TODO: implement for fd_source_..._redirect
                 .greater, .append_redirect => {
                     const redirect = try self.parseCommandRedirection();
                     try redirects.append(self.allocator, redirect);
@@ -1489,14 +1514,61 @@ pub const Parser = struct {
         defer breadcrumb.end();
 
         const start = try self.expectTokenTag(.kw_import);
-        // _ = try self.expectTokenTag(.l_paren);
-        const module_name = try self.parseStringLiteralWithoutInterp();
-        // const end = try self.expectTokenTag(.r_paren);
+        const next = try self.peekToken();
+        const call = try self.parseMaybeBinaryExpression() orelse {
+            try self.reportParseError(
+                Error.UnexpectedToken,
+                start.span.endAt(next.span),
+                "expected module import",
+                .{},
+            );
+            return Error.UnexpectedToken;
+        };
+
+        // A bare string literal `import "mod.rn"` is a 0-arg module import.
+        if (call.* == .literal and call.literal == .string) {
+            const module_name = try self.stringLiteralToString(call.literal.string);
+            const empty_call = ast.CallExpr{
+                .callee = call,
+                .arguments = &.{},
+                .background = false,
+                .span = call.span(),
+            };
+            return self.allocExpression(.{ .import_expr = .{
+                .importer = self.path,
+                .module_name = module_name,
+                .call = empty_call,
+                .span = start.span.endAt(call.span()),
+            } });
+        }
+
+        if (call.* != .call) {
+            try self.reportParseError(
+                Error.UnexpectedToken,
+                call.span(),
+                "expected module import",
+                .{},
+            );
+            return Error.UnexpectedToken;
+        }
+
+        if (call.call.callee.* != .literal or call.call.callee.literal != .string) {
+            try self.reportParseError(
+                Error.UnexpectedToken,
+                call.call.callee.span(),
+                "expected module file name as string literal",
+                .{},
+            );
+            return Error.UnexpectedToken;
+        }
+
+        const module_name = try self.stringLiteralToString(call.call.callee.literal.string);
 
         return self.allocExpression(.{ .import_expr = .{
             .importer = self.path,
-            .module_name = module_name.payload,
-            .span = start.span.endAt(module_name.span),
+            .module_name = module_name,
+            .call = call.call,
+            .span = start.span.endAt(call.span()),
         } });
     }
 
@@ -1877,7 +1949,7 @@ pub const Parser = struct {
 
     fn parseList(
         self: *Self,
-        comptime delimiter: token.Tag,
+        comptime delimiter: ?token.Tag,
         parser: anytype,
         options: ParseAndSkipUntilOptions,
     ) Error!ast.Spanned([]ParserPayload(@TypeOf(parser))) {
@@ -1898,34 +1970,39 @@ pub const Parser = struct {
         var parsed = std.ArrayList(T).empty;
         defer parsed.deinit(self.allocator);
 
-        while (true) {
+        while (true) : (_ = try self.nextToken()) {
             if (options.skipNewLines) self.skipNewlines();
 
             try parsed.append(self.allocator, try parser(self));
 
             const next = try self.peekToken();
-            if (next.tag != delimiter) {
-                const last_item = parsed.getLast();
-                const last_item_span = brk: {
-                    const Item = switch (@typeInfo(T)) {
-                        .pointer => |pointer| pointer.child,
-                        else => T,
-                    };
+            const delim = delimiter orelse {
+                const terminators = options.terminators orelse continue;
+                if (terminators.isTerminator(next.tag)) break else continue;
+            };
+            if (next.tag == delim) continue;
 
-                    if (std.meta.hasFn(Item, "span")) {
-                        break :brk last_item.span();
-                    } else {
-                        break :brk last_item.span;
-                    }
-                };
-
-                return .{
-                    .payload = try self.copyToArena(T, parsed.items),
-                    .span = start.span.endAt(last_item_span),
-                };
-            }
-            _ = try self.nextToken();
+            break;
         }
+
+        const last_item = parsed.getLast();
+        const last_item_span = brk: {
+            const Item = switch (@typeInfo(T)) {
+                .pointer => |pointer| pointer.child,
+                else => T,
+            };
+
+            if (std.meta.hasFn(Item, "span")) {
+                break :brk last_item.span();
+            } else {
+                break :brk last_item.span;
+            }
+        };
+
+        return .{
+            .payload = try self.copyToArena(T, parsed.items),
+            .span = start.span.endAt(last_item_span),
+        };
     }
 
     fn parseUntil(
@@ -2079,7 +2156,7 @@ pub const Parser = struct {
             return stmt;
         }
 
-        if (try self.parseMaybeBinding()) |binding_decl| {
+        if (try self.parseMaybeBinding(null)) |binding_decl| {
             stmt.* = .{ .binding_decl = binding_decl };
             return stmt;
         }
@@ -2394,20 +2471,26 @@ pub const Parser = struct {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
-        const stringLiteral = try self.parseStringLiteral();
+        const string_literal = try self.parseStringLiteral();
+        const string = try self.stringLiteralToString(string_literal);
+
+        return .{
+            .payload = string,
+            .span = string_literal.span,
+        };
+    }
+
+    fn stringLiteralToString(self: *Self, string_literal: ast.StringLiteral) Error![]const u8 {
         var result: std.ArrayList(u8) = .empty;
         defer result.deinit(self.allocator);
-        for (stringLiteral.segments) |segment| {
+        for (string_literal.segments) |segment| {
             if (segment == .interpolation) {
                 return Error.StringInterpNotAllowed;
             }
             try result.appendSlice(self.allocator, segment.text.payload);
         }
 
-        return .{
-            .payload = try self.copyToArena(u8, result.items),
-            .span = stringLiteral.span,
-        };
+        return try self.copyToArena(u8, result.items);
     }
 
     fn parseStringLiteral(self: *Self) Error!ast.StringLiteral {
@@ -2493,18 +2576,43 @@ pub const Parser = struct {
         };
     }
 
-    fn parseMaybeBinding(self: *Self) Error!?ast.BindingDecl {
+    fn parseMaybeBinding(self: *Self, pub_token: ?token.Token) Error!?ast.BindingDecl {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
+        var snapshot = try self.takeSnapshot();
+        defer snapshot.deinit();
+
         const next = try self.peekToken();
         return switch (next.tag) {
-            .kw_const, .kw_var => try self.parseBinding(),
-            else => null,
+            .kw_pub => {
+                _ = try self.nextToken();
+
+                if (pub_token != null) {
+                    try self.reportParseError(
+                        Error.ExpectedKeyword,
+                        next.span,
+                        "expected const, var or fn, actual: {s}",
+                        .{next.lexeme},
+                    );
+
+                    return Error.ExpectedKeyword;
+                }
+
+                return try self.parseMaybeBinding(next) orelse {
+                    try self.restoreSnapshot(&snapshot);
+                    return null;
+                };
+            },
+            .kw_const, .kw_var => try self.parseBinding(pub_token),
+            else => {
+                try self.restoreSnapshot(&snapshot);
+                return null;
+            },
         };
     }
 
-    fn parseBinding(self: *Self) Error!ast.BindingDecl {
+    fn parseBinding(self: *Self, pub_token: ?token.Token) Error!ast.BindingDecl {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
@@ -2516,9 +2624,33 @@ pub const Parser = struct {
         const pattern = try self.parseBindingPattern();
         const annotation = try self.parseMaybeTypeAnnotation();
         _ = try self.expectTokenTag(.assign);
-        const initializer = try self.parseExpression();
+        var initializer = try self.parseExpression();
+
+        // If the initializer is a command-producing expression, allow `;` to sequence
+        // additional commands under the same capture (e.g. `const b = cmd1; cmd2`).
+        // String literals, identifiers, and other non-command expressions do NOT
+        // continue the sequence, preserving `const x = "hello"; echo x` semantics.
+        while (true) {
+            const next = try self.peekToken();
+            if (next.tag != .semicolon) break;
+            switch (initializer.*) {
+                .call, .pipeline, .binary, .block, .subshell => {},
+                else => break,
+            }
+            _ = try self.nextToken(); // consume `;`
+            const right = try self.parseExpression();
+            const seq_expr = try self.arena.allocator().create(ast.Expression);
+            seq_expr.* = .{ .binary = .{
+                .left = initializer,
+                .right = right,
+                .op = .sequence,
+                .span = initializer.span().endAt(right.span()),
+            } };
+            initializer = seq_expr;
+        }
 
         return ast.BindingDecl{
+            .is_pub = pub_token != null,
             .is_mutable = constOrVar.tag == .kw_var,
             .span = constOrVar.span.endAt(initializer.span()),
             .annotation = annotation,
@@ -2609,11 +2741,31 @@ pub const Parser = struct {
         return null;
     }
 
-    fn parseFn(self: *Self) Error!*ast.Expression {
+    fn parsePub(self: *Self) Error!*ast.Expression {
+        const pub_token = try self.expectTokenTag(.kw_pub);
+        const next = try self.peekToken();
+
+        switch (next.tag) {
+            .kw_fn => return self.parseFn(pub_token),
+            else => {
+                try self.reportParseError(
+                    Error.ExpectedKeyword,
+                    next.span,
+                    "expected const, var or fn, actual: {s}",
+                    .{next.lexeme},
+                );
+
+                return Error.ExpectedKeyword;
+            },
+        }
+    }
+
+    fn parseFn(self: *Self, pub_token: ?token.Token) Error!*ast.Expression {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
-        const start = try self.expectTokenTag(.kw_fn);
+        const fn_token = try self.expectTokenTag(.kw_fn);
+        const start = pub_token orelse fn_token;
         const stdinType = try self.parseMaybeTypeExpr();
         const identifier = try self.expectTokenTag(.identifier);
         _ = try self.expectTokenTag(.l_paren);
@@ -2625,6 +2777,7 @@ pub const Parser = struct {
         const body = try self.parseExpression();
 
         return self.allocExpression(.{ .fn_decl = .{
+            .is_pub = pub_token != null,
             .name = .{ .name = identifier.lexeme, .span = identifier.span },
             .params = .nonVariadic(params.payload),
             .stdin_type = stdinType,
@@ -3177,6 +3330,32 @@ test "parser builds fd redirect in pipeline stage (1>&2)" {
     try std.testing.expectEqual(@as(usize, 1), call.arguments.len);
     try std.testing.expect(call.arguments[0].* == .literal);
     try std.testing.expect(call.arguments[0].literal == .string);
+}
+
+test "parser preserves chained fd redirect ordering (1>&2 2>path)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var ctx = TestCtx{ .source = "echo \"hi\" 1>&2 2>\"/dev/null\"" };
+    var parser = TestParser.init(allocator, &ctx);
+    defer parser.deinit();
+
+    const script = try parser.parseSource(ctx.source);
+    const call = script.statements[0].expression.expression.call;
+
+    try std.testing.expectEqual(@as(usize, 1), call.arguments.len);
+    try std.testing.expectEqual(@as(usize, 2), call.redirects.len);
+
+    const fd_redirect = call.redirects[0];
+    try std.testing.expectEqual(ast.StreamRef{ .descriptor = 1 }, fd_redirect.stream);
+    try std.testing.expectEqual(ast.RedirectionMode.truncate, fd_redirect.mode);
+    try std.testing.expectEqual(@as(u8, 2), fd_redirect.target.fd);
+
+    const path_redirect = call.redirects[1];
+    try std.testing.expectEqual(ast.StreamRef.stderr, path_redirect.stream);
+    try std.testing.expectEqual(ast.RedirectionMode.truncate, path_redirect.mode);
+    try std.testing.expect(path_redirect.target == .path);
 }
 
 test "parser rejects interpolation in import module names" {

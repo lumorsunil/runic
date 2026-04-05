@@ -5,7 +5,7 @@ const original = $(pwd | tr "-d" "\n")
 
 cd "/tmp"
 pwd
-cd "${original}"
+cd original
 pwd
 
 // cd inside a subshell — parent must remain at the restored repo root after
@@ -14,4 +14,4 @@ pwd
 
 // capture output of a command running in an isolated context
 const result = $(pwd | tr "-d" "\n")
-echo "${result}"
+echo result

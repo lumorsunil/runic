@@ -4,5 +4,5 @@ const original = $PWD orelse "/"
 cd "/tmp"
 pwd
 
-cd "${original}"
+cd original
 pwd

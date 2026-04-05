@@ -3,7 +3,7 @@ const Allocator = std.mem.Allocator;
 const ast = @import("ast.zig");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
-const command_runner = @import("../runtime/command_runner.zig");
+const ExitCode = @import("../runtime/exit_code.zig").ExitCode;
 const DocumentStore = @import("../document_store.zig").DocumentStore;
 
 const MAX_DOCUMENT_LEN = 4 * 1024 * 1024;
@@ -13,7 +13,7 @@ pub const Document = struct {
     source: []const u8,
     ast: ?ast.Script = null,
     parser: parser.Parser,
-    exitCode: ?command_runner.ExitCode = null,
+    exitCode: ?ExitCode = null,
 };
 
 /// Made to be used by an arena allocator

@@ -4,7 +4,11 @@ Reference material, specs, and planning artifacts live here. Add new language no
 
 - `tokens.md` — summarizes the Runic lexer/token vocabulary and how each
   category maps to commands, pipelines, declarations, and interop features.
-- `module_authoring.md` — walks through structuring modules, wiring manifests,
-  and surfacing typed exports for the loader.
+- `plan.md` — the current top-level project roadmap.
+- `lsp.md` — the current status and roadmap for the language server.
 - `migrating-from-bash.md` — step-by-step guidance for porting existing bash
   scripts to Runic using the currently supported native feature set.
+
+The repository also has a top-level `future/` directory for focused feature
+design notes. Those notes are not implemented-language references; they feed
+into `docs/plan.md` when a future feature becomes part of the active roadmap.

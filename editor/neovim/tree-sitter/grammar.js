@@ -19,6 +19,7 @@ module.exports = grammar({
 
   conflicts: $ => [
     [$.logical_operator, $.sigil],
+    [$.capture_clause, $.pipeline_operator],
   ],
 
   rules: {
@@ -35,6 +36,7 @@ module.exports = grammar({
     )),
 
     _argument: $ => choice(
+      $.capture_clause,
       $.keyword_type,
       $.keyword_async,
       $.keyword_control,
@@ -63,6 +65,7 @@ module.exports = grammar({
     ),
 
     _expression_atom: $ => choice(
+      $.capture_clause,
       $.keyword_declaration,
       $.keyword_type,
       $.keyword_async,
@@ -92,14 +95,14 @@ module.exports = grammar({
       // $.heredoc_fence
     ),
 
-    keyword_declaration: _ => choice('const', 'var', 'fn'),
-    keyword_type: _ => choice('error', 'enum', 'union'),
+    keyword_declaration: _ => choice('const', 'var', 'fn', 'pub'),
+    keyword_type: _ => choice('error', 'enum', 'union', 'struct'),
     keyword_async: _ => choice('async', 'await'),
-    keyword_control: _ => choice('if', 'else', 'match', 'return'),
+    keyword_control: _ => choice('if', 'else', 'match', 'return', 'exit'),
     keyword_loop: _ => choice('for', 'while'),
-    keyword_import: _ => choice('import', 'from'),
+    keyword_import: _ => 'import',
     keyword_interop: _ => 'bash',
-    keyword_try: _ => 'try',
+    keyword_try: _ => choice('try', 'catch', 'orelse'),
     keyword_catch: _ => 'catch',
 
     boolean_literal: _ => choice('true', 'false'),
@@ -139,8 +142,73 @@ module.exports = grammar({
 
     interpolation_expression: $ => seq(
       '${',
-      $._expression_atom,
-      //$.interpolation_content,
+      repeat(choice(
+        $.command,
+        $._interpolation_atom,
+        $.stage_separator
+      )),
+      '}'
+    ),
+
+    _interpolation_atom: $ => choice(
+      $.capture_clause,
+      $.keyword_declaration,
+      $.keyword_type,
+      $.keyword_async,
+      $.keyword_control,
+      $.keyword_loop,
+      $.keyword_import,
+      $.keyword_interop,
+      $.keyword_try,
+      $.boolean_literal,
+      $.null_literal,
+      $.number_literal,
+      $.string_literal,
+      $.rune_literal,
+      $.builtin_command,
+      $.type_identifier,
+      $.pipeline_operator,
+      $.process_operator,
+      $.logical_operator,
+      $.assignment_operator,
+      $.comparison_operator,
+      $.range_operator,
+      $.arrow_operator,
+      $.sigil,
+      $.punctuation_delimiter,
+      $.identifier,
+      $.interpolation_paren_group,
+      $.interpolation_bracket_group,
+      $.interpolation_brace_group
+    ),
+
+    interpolation_paren_group: $ => seq(
+      '(',
+      repeat(choice(
+        $.command,
+        $._interpolation_atom,
+        $.stage_separator
+      )),
+      ')'
+    ),
+
+    interpolation_bracket_group: $ => seq(
+      '[',
+      repeat(choice(
+        $.command,
+        $._interpolation_atom,
+        $.stage_separator
+      )),
+      ']'
+    ),
+
+    interpolation_brace_group: $ => seq(
+      '{',
+      repeat(choice(
+        $.command,
+        $._interpolation_atom,
+        $.stage_separator
+      )),
       '}'
     ),
 
@@ -177,12 +245,12 @@ module.exports = grammar({
 
     _capture_bindings: $ => seq(
       $._capture_binding,
-      optional(seq(',', $._capture_binding))
+      repeat(seq(',', $._capture_binding))
     ),
 
     _capture_binding: $ => choice($.identifier, '_'),
 
-    builtin_command: _ => choice('echo', 'upper', 'lower'),
+    builtin_command: _ => choice('cd', 'echo', 'inspect', 'lower', 'upper'),
 
     type_identifier: _ => token(prec(1, seq(
       optional(/[?^!]+/),
@@ -193,11 +261,13 @@ module.exports = grammar({
     pipeline_operator: _ => choice('|', '&'),
 
     process_operator: _ => token(choice(
-      seq(optional(/\d+/), '>', optional('>')),
+      seq(optional(/\d+/), '>&'),
+      seq(optional(/\d+/), '>>'),
+      seq(optional(/\d+/), '>'),
       '<<'
     )),
 
-    logical_operator: _ => choice('and', 'or', '!'),
+    logical_operator: _ => token(choice('&&', '||', 'and', 'or', '!')),
 
     comparison_operator: _ => token(choice(
       '==',
@@ -208,15 +278,15 @@ module.exports = grammar({
       '>'
     )),
 
-    assignment_operator: _ => token('='),
+    assignment_operator: _ => token(choice('+=', '-=', '*=', '/=', '%=', '=')),
 
     range_operator: _ => choice('..', '...'),
 
     arrow_operator: _ => choice('->', '=>'),
 
-    sigil: _ => choice('?', '^', '!'),
+    sigil: _ => choice('$', '?', '^', '!'),
 
-    bracket: _ => choice('(', ')', '[', ']', '{', '}'),
+    bracket: _ => choice('$(', '.{', '(', ')', '[', ']', '{', '}'),
 
     punctuation_delimiter: _ => choice(',', ':', '.'),
 

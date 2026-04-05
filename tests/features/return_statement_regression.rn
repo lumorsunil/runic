@@ -1,0 +1,15 @@
+fn Void classify(value: Int) String {
+  if (value < 0) {
+    return "negative"
+  }
+
+  if (value == 0) {
+    return "zero"
+  }
+
+  return "positive"
+}
+
+echo "${classify(1)}"
+echo "${classify(0)}"
+echo "${classify(3)}"

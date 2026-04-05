@@ -6,7 +6,7 @@ const LocationMod = @import("location.zig").LocationMod;
 const Labels = @import("labels.zig").Labels;
 const Instruction = @import("instruction.zig").Instruction;
 const ResolvedInstructionAddr = @import("instruction-addr.zig").ResolvedInstructionAddr;
-const ExitCode = @import("../runtime/command_runner.zig").ExitCode;
+const ExitCode = @import("../runtime/exit_code.zig").ExitCode;
 const Stream = @import("../stream.zig").Stream;
 const ReaderWriterStream = @import("../stream.zig").ReaderWriterStream;
 const Closeable = @import("../closeable.zig").Closeable;
@@ -96,6 +96,7 @@ pub const IRProgramContext = struct {
 
     subshell_contexts: std.AutoArrayHashMapUnmanaged(SubshellContextHandle, SubshellContext) = .empty,
     subshell_context_handle_counter: SubshellContextHandle = 0,
+    module_cache: std.StringHashMapUnmanaged(Value) = .empty,
 
     pub fn init(allocator: Allocator, shared: IRSharedContext) @This() {
         return .{ .allocator = allocator, .shared = shared };
@@ -145,6 +146,11 @@ pub const IRProgramContext = struct {
             ctx.deinit(self.allocator);
         }
         self.subshell_contexts.deinit(self.allocator);
+        var module_cache_iter = self.module_cache.keyIterator();
+        while (module_cache_iter.next()) |key| {
+            self.allocator.free(key.*);
+        }
+        self.module_cache.deinit(self.allocator);
     }
 
     pub fn addMainThread(

@@ -2,12 +2,13 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ir = @import("../ir.zig");
 const ast = @import("../frontend/ast.zig");
-const ExitCode = @import("../runtime/command_runner.zig").ExitCode;
+const ExitCode = @import("../runtime/exit_code.zig").ExitCode;
 const rainbow = @import("../rainbow.zig");
 const DocumentStore = @import("../document_store.zig").DocumentStore;
 const Stream = @import("../stream.zig").Stream;
 const RCError = @import("../mem/rc.zig").RCError;
 const FrontendDocumentStore = @import("../frontend/document_store.zig").FrontendDocumentStore;
+const resolveModulePath = @import("../frontend/document_store.zig").resolveModulePath;
 const evaluateArithmetic = ir.evaluator.IREvaluator.evaluateArithmetic;
 const evaluateLogical = ir.evaluator.IREvaluator.evaluateLogical;
 const evaluateCompare = ir.evaluator.IREvaluator.evaluateCompare;
@@ -364,6 +365,7 @@ const Scope = struct {
         };
 
         is_mutable: bool,
+        is_pub: bool = false,
         result: Result,
         type_expr: ?ast.TypeExpr = null,
         kind: Kind = .normal,
@@ -464,6 +466,15 @@ const InstructionSet = struct {
     frames: std.ArrayList(StackFrame) = .empty,
     closure_slot_count: usize = 0,
     closure_captures: []const ClosureCapture = &.{},
+    pub_exports: []const PubExport = &.{},
+
+    pub const PubExport = struct {
+        name: []const u8,
+        slot: usize,
+        type_expr: ?ast.TypeExpr = null,
+        /// For pub fn exports: the compile-time fn_ref value so callers can emit a direct call.
+        fn_ref_value: ?ir.Value = null,
+    };
 
     pub fn init() @This() {
         return .{};
@@ -533,6 +544,8 @@ pub const IRCompiler = struct {
     diagnostics: std.ArrayList(Diagnostic) = .empty,
     result_counter: usize = 0,
     allow_simple_exec: bool = false,
+    compiled_modules: std.StringHashMapUnmanaged(usize) = .empty,
+    loading_set: std.StringHashMapUnmanaged(void) = .empty,
 
     pub fn init(
         allocator: Allocator,
@@ -1292,7 +1305,7 @@ pub const IRCompiler = struct {
     ) Error!Result {
         switch (expr.*) {
             .binary => |binary| switch (binary.op) {
-                .logical_and, .logical_or => return self.compileLogicalBinary(source, binary, .statement),
+                .logical_and, .logical_or, .sequence => return self.compileLogicalBinary(source, binary, .statement),
                 else => {},
             },
             else => {},
@@ -1312,6 +1325,17 @@ pub const IRCompiler = struct {
         }
 
         const result = try self.compileExpression(expr);
+
+        // Auto-call fn_ref values from member access used as statements (e.g., `m.greeting`).
+        // Mirrors how bare identifier calls work, but only for member-access expressions so
+        // fn declarations and identifier references are not inadvertently called.
+        const is_member_access = expr.* == .binary and expr.binary.op == .member;
+        if (is_member_access and result.source == .value and result.source.value == .fn_ref) {
+            const call_result = try self.compileFunctionCall(expr, result.source.value, &.{});
+            try self.finalizeStatementResult(source, call_result);
+            return .fromValue(.void);
+        }
+
         try self.finalizeStatementResult(source, result);
         return .fromValue(.void);
     }
@@ -1453,7 +1477,17 @@ pub const IRCompiler = struct {
         source: anytype,
         result: Result,
     ) Error!void {
-        if (isWaitable(result)) |loc| {
+        if (result.isType(execution_handles_struct_type) and result.source.isRegister(.r)) {
+            try self.comment("wait from {s}", .{@src().fn_name});
+            try self.wait(source, ir.Location.initRegister(.r).typed(thread_type));
+            return;
+        }
+
+        const stable = if (result.source.isRegister(.r) and result.isType(thread_type))
+            try self.compileResultSaveR(source, result)
+        else
+            result;
+        if (isWaitable(stable)) |loc| {
             try self.comment("wait from {s}", .{@src().fn_name});
             try self.wait(source, loc);
         }
@@ -1477,8 +1511,15 @@ pub const IRCompiler = struct {
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
-        const result: Result = if (r.value) |value| try self.compileExpression(value) else .fromValue(.{ .exit_code = .success });
-        try self.exit_(source, result);
+        var result: Result = if (r.value) |value| try self.compileExpression(value) else .fromValue(.void);
+        switch (result.source) {
+            .location => |loc| if (loc.abs == .ref) {
+                try self.set(source, .initRegister(.r2), stableResultSource(result));
+                result = .fromLocation(ir.Location.initRegister(.r2).typed(result.typeExpr()));
+            },
+            else => {},
+        }
+        try self.exitWith(source, result);
         return .fromValue(.void);
     }
 
@@ -1504,13 +1545,26 @@ pub const IRCompiler = struct {
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
-        return self.compileBinding(
+        const result = try self.compileBinding(
             source,
             binding_decl.pattern,
             binding_decl.initializer,
             binding_decl.annotation,
             binding_decl.is_mutable,
         );
+
+        if (binding_decl.is_pub) {
+            switch (binding_decl.pattern.*) {
+                .identifier => |identifier| {
+                    if (self.lookup(identifier.name, .{ .shallow = true })) |binding| {
+                        binding.is_pub = true;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        return result;
     }
 
     fn compileBinding(
@@ -1716,6 +1770,7 @@ pub const IRCompiler = struct {
                 break :blk self.compileBackgroundExpressionValue(expr, .{ .block = block_copy });
             } else self.compileBlock(expr, block),
             .fn_decl => |fn_decl| self.compileFnDecl(expr, fn_decl),
+            .import_expr => |import_expr| self.compileImportExpr(expr, import_expr),
             .binary => |binary| self.compileBinary(expr, binary),
             .unary => |unary| self.compileUnary(expr, unary),
             .array => |array| self.compileArray(expr, array),
@@ -2028,6 +2083,16 @@ pub const IRCompiler = struct {
                 // set [C+?] = %r
                 result = .fromLocation(.initRegister(.r));
                 result = result.typed(execution_result_struct_type);
+            } else if (blk: {
+                const rtype = result.typeExpr() orelse break :blk false;
+                break :blk rtype == .struct_type;
+            }) {
+                // Merged struct from compileFunctionCall with pub exports — patch in the
+                // captured pipe references for stdout/stderr/merged.
+                try self.set(source, .initRegister(.r2), stableResultSource(result));
+                try self.set(source, .initAdd(.{ .register = .r2 }, executionResultFieldOffset(.stdout), .{ .dereference = true }), .from(stdout_pipe_ref.dereference()));
+                try self.set(source, .initAdd(.{ .register = .r2 }, executionResultFieldOffset(.stderr), .{ .dereference = true }), .from(stderr_pipe_ref.dereference()));
+                try self.set(source, .initAdd(.{ .register = .r2 }, executionResultFieldOffset(.merged), .{ .dereference = true }), .from(merged_pipe_ref.dereference()));
             }
             return result;
         } else {
@@ -2175,9 +2240,7 @@ pub const IRCompiler = struct {
                     return .fromValue(.void);
                 }
 
-                const object_ref = try self.newRef(source, "array_member_object_ref");
-                try self.set(source, object_ref, object.source);
-                try self.set(source, .initRegister(.r2), .from(object_ref.dereference()));
+                try self.set(source, .initRegister(.r2), object.source);
 
                 return .fromLocation(.initAbs(
                     .{ .register = .r2 },
@@ -2242,6 +2305,14 @@ pub const IRCompiler = struct {
                 return .fromValue(.void);
             },
         };
+        // For fn_ref_type fields, the fn_ref is a compile-time constant; return it as a value
+        // directly so call compilation can emit a direct fork without runtime indirection.
+        if (field_.type_expr == .fn_ref_type) {
+            return .from(ir.Value{ .fn_ref = .{
+                .fn_addr = ir.InstructionAddr.initAbs(field_.type_expr.fn_ref_type.instr_set, 0),
+            } });
+        }
+
         const object_ref = try self.newRef(source, "member_object_ref");
         try self.set(source, object_ref, object.source);
         try self.set(source, .initRegister(.r2), .from(object_ref.dereference()));
@@ -2596,6 +2667,12 @@ pub const IRCompiler = struct {
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
+        if (std.mem.eql(u8, identifier.name, "@src")) {
+            const path = self.script.span.start.file;
+            const value = try self.addSlice(1, path);
+            return .fromValue(value);
+        }
+
         const source_binding = self.lookup(identifier.name, .{ .shallow = false }) orelse {
             const executable = try self.addSlice(1, identifier.name);
             return .fromValue(.{ .executable = executable.slice });
@@ -2704,6 +2781,9 @@ pub const IRCompiler = struct {
 
         if (call.callee.* == .identifier) {
             const name = call.callee.identifier.name;
+            if (std.mem.eql(u8, name, "@src")) {
+                return self.compileIdentifier(source, call.callee.identifier);
+            }
             if (std.mem.eql(u8, name, "cd") and self.lookup(name, .{ .shallow = false }) == null) {
                 return self.compileBuiltinCd(source, call.arguments);
             }
@@ -3157,7 +3237,17 @@ pub const IRCompiler = struct {
 
         var it = std.mem.reverseIterator(arguments);
         while (it.next()) |arg_expr| {
-            const arg = try self.compileExpression(arg_expr);
+            var arg = try self.compileExpression(arg_expr);
+            if (arg.isType(execution_result_struct_type)) {
+                const arg_ref = try self.newRef(source, "exec_result_arg");
+                try self.set(source, arg_ref, arg.source);
+                try self.set(source, .initRegister(.r2), .from(arg_ref.dereference()));
+                arg = .fromLocation(.initAdd(
+                    .{ .register = .r2 },
+                    executionResultFieldOffset(.merged),
+                    .{ .dereference = true },
+                ));
+            }
             try self.push(source, arg.source);
         }
         try self.push(source, .from(executable));
@@ -3415,6 +3505,68 @@ pub const IRCompiler = struct {
             fn_addr,
             closure_ref.dereference(),
         );
+
+        const pub_exports = self.instruction_sets.items[fn_ref.fn_addr.instr_set].pub_exports;
+        const n_pub = pub_exports.len;
+
+        if (n_pub > 0) {
+            // Save thread handle and wait for function body to finish so pub exports are populated
+            const thread_ref = try self.newRef(source, "fn_thread");
+            try self.set(source, thread_ref, .from(handle));
+            try self.wait(source, thread_ref.dereference().typed(thread_type));
+
+            // Build merged result struct: 5 standard fields + n_pub pub fields
+            try self.alloc(source, 5 + n_pub);
+            const result_ref = try self.newRef(source, "fn_result");
+            try self.set(source, result_ref, .fromLocation(.initRegister(.r)));
+
+            try self.set(source, .initRegister(.r2), .from(result_ref.dereference()));
+            // stdout/stderr/merged: null — function uses inherited I/O, no capture
+            try self.set(source, .initAdd(.{ .register = .r2 }, executionResultFieldOffset(.stdout), .{ .dereference = true }), .fromValue(.null));
+            try self.set(source, .initAdd(.{ .register = .r2 }, executionResultFieldOffset(.stderr), .{ .dereference = true }), .fromValue(.null));
+            try self.set(source, .initAdd(.{ .register = .r2 }, executionResultFieldOffset(.merged), .{ .dereference = true }), .fromValue(.null));
+            try self.set(source, .initAdd(.{ .register = .r2 }, executionResultFieldOffset(.closeable), .{ .dereference = true }), .from(thread_ref.dereference()));
+            try self.set(source, .initAdd(.{ .register = .r2 }, executionResultFieldOffset(.completion_is_thread), .{ .dereference = true }), .fromValue(.fromBoolean(true)));
+
+            for (pub_exports, 0..) |pub_export, i| {
+                try self.set(source, .initRegister(.r), .from(closure_ref.dereference()));
+                try self.set(source, .initRegister(.r2), .from(result_ref.dereference()));
+                try self.set(
+                    source,
+                    .initAdd(.{ .register = .r2 }, 5 + i, .{ .dereference = true }),
+                    .fromLocation(.initAdd(.{ .register = .r }, pub_export.slot, .{ .dereference = true })),
+                );
+            }
+
+            // Build merged struct type for member-access typing
+            const all_fields = try self.allocator.alloc(ast.TypeExpr.StructField, 5 + n_pub);
+            @memcpy(all_fields[0..5], execution_result_struct_type.struct_type.fields);
+            for (pub_exports, 0..) |pub_export, i| {
+                const field_type_ptr = try self.allocator.create(ast.TypeExpr);
+                if (pub_export.fn_ref_value) |fn_ref_val| {
+                    field_type_ptr.* = .{ .fn_ref_type = .{
+                        .instr_set = fn_ref_val.fn_ref.fn_addr.instr_set,
+                        .span = .global,
+                    } };
+                } else {
+                    field_type_ptr.* = pub_export.type_expr orelse .global(.integer);
+                }
+                all_fields[5 + i] = .{
+                    .name = ast.Identifier.global(pub_export.name),
+                    .type_expr = field_type_ptr,
+                    .span = .global,
+                };
+            }
+            const merged_type = ast.TypeExpr{ .struct_type = .{
+                .span = .global,
+                .decls = &.{},
+                .fields = all_fields,
+            } };
+
+            return .fromLocation(result_ref.dereference().typed(merged_type));
+        }
+
+        // No pub exports: original behavior — return thread handle
         try self.set(source, .initRegister(.r2), .from(handle));
         try self.consume(source, try .from(closure_ref));
         try self.set(source, .initRegister(.r), .fromLocation(.initRegister(.r2)));
@@ -3505,12 +3657,14 @@ pub const IRCompiler = struct {
         if (else_branch == .condition) {
             try self.set(source, result, stableResultSource(condition));
         }
+        const branch_stack_base = self.currentFrame().rel_stack_counter;
         const after_addr = try self.newLabel("if_after", .unknown);
         const else_addr = try self.newLabel("if_else", .unknown);
 
         try self.jmp(source, condition, false, else_addr);
         const then = try self.compileIfBranchExpression(source, if_expr.then_expr, if_condition.capture_binding);
         try self.set(source, result, stableResultSource(then));
+        self.currentFrame().rel_stack_counter = branch_stack_base;
         try self.jmp(source, null, false, after_addr);
         try self.setLabel(else_addr.local_addr.label, .abs);
         var result_type = if (else_branch == .condition) mergedResultType(condition, then) else null;
@@ -3527,6 +3681,7 @@ pub const IRCompiler = struct {
             },
             .condition => {},
         }
+        self.currentFrame().rel_stack_counter = branch_stack_base;
         try self.setLabel(after_addr.local_addr.label, .abs);
         try self.set(source, .initRegister(.r2), .from(result.dereference()));
 
@@ -3549,11 +3704,13 @@ pub const IRCompiler = struct {
             return .fromValue(.void);
         }
         const after_addr = try self.newLabel("if_after", .unknown);
+        const branch_stack_base = self.currentFrame().rel_stack_counter;
         try self.jmp(source, condition, false, after_addr);
         const then_result = try self.compileIfBranchExpression(source, if_expr.then_expr, if_condition.capture_binding);
         if (isWaitable(then_result)) |loc| {
             try self.wait(source, loc);
         }
+        self.currentFrame().rel_stack_counter = branch_stack_base;
         try self.setLabel(after_addr.local_addr.label, .abs);
         return .fromValue(.void);
     }
@@ -4050,6 +4207,223 @@ pub const IRCompiler = struct {
         return result;
     }
 
+    fn compileImportExpr(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        import_expr: ast.ImportExpr,
+    ) Error!Result {
+        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        // 1. Resolve module path
+        const module_path = resolveModulePath(
+            self.allocator,
+            import_expr.importer,
+            import_expr.module_name,
+        ) catch {
+            try self.reportSourceError(source, Error.UnsupportedExpression, .@"error", "cannot resolve module path \"{s}\"", .{import_expr.module_name});
+            return .fromValue(.void);
+        };
+        defer self.allocator.free(module_path);
+
+        // Cycle detection: error if this module is already being compiled up the call stack
+        if (self.loading_set.contains(module_path)) {
+            try self.reportSourceError(source, Error.UnsupportedExpression, .@"error", "circular import detected for \"{s}\"", .{import_expr.module_name});
+            return .fromValue(.void);
+        }
+
+        // 2. Get module AST
+        const module_ast = self.document_store.getAst(module_path) catch {
+            try self.reportSourceError(source, Error.UnsupportedExpression, .@"error", "module \"{s}\" not found", .{import_expr.module_name});
+            return .fromValue(.void);
+        } orelse {
+            try self.reportSourceError(source, Error.UnsupportedExpression, .@"error", "module \"{s}\" not found", .{import_expr.module_name});
+            return .fromValue(.void);
+        };
+
+        // 3. Compile module statements as a new instruction set (compile-time cache)
+        const module_instr_set: usize = if (self.compiled_modules.get(module_path)) |cached| cached else blk: {
+            const instr_set = try self.addInstructionSet();
+            const orig_instr_set = self.current_instruction_set;
+            self.current_instruction_set = instr_set;
+
+            // Mark this module as in-flight so nested imports of the same path error
+            try self.loading_set.put(self.allocator, module_path, {});
+            try self.scopes.push(self.allocator, .closure);
+
+            for (module_ast.statements) |stmt| {
+                _ = try self.compileStatement(stmt);
+            }
+
+            // Pub-export epilogue: write each pub binding to a closure slot
+            const module_frame = try self.scopes.getFrame(0);
+            const pub_slot_base = module_frame.closure_bindings.items.len;
+            var pub_exports_list = std.ArrayListUnmanaged(InstructionSet.PubExport){};
+            {
+                var frame_iter = module_frame.bindings.iterator();
+                while (frame_iter.next()) |entry| {
+                    if (!entry.value_ptr.is_pub) continue;
+                    const slot = pub_slot_base + pub_exports_list.items.len;
+                    try self.set(
+                        source,
+                        ir.Location.initAdd(.closure, slot, .{}),
+                        entry.value_ptr.result.source,
+                    );
+                    try pub_exports_list.append(self.allocator, .{
+                        .name = entry.key_ptr.*,
+                        .slot = slot,
+                        .type_expr = entry.value_ptr.type_expr,
+                        .fn_ref_value = if (entry.value_ptr.result.source == .value and
+                            entry.value_ptr.result.source.value == .fn_ref)
+                            entry.value_ptr.result.source.value
+                        else
+                            null,
+                    });
+                }
+            }
+            try self.exitWith(source, .fromValue(.fromBoolean(true)));
+            try self.setClosureIdentifiers();
+            const n_pub_inner = pub_exports_list.items.len;
+            self.currentInstrSet().closure_slot_count += n_pub_inner;
+            self.currentInstrSet().pub_exports = try pub_exports_list.toOwnedSlice(self.allocator);
+
+            self.current_instruction_set = orig_instr_set;
+            self.scopes.pop();
+            _ = self.loading_set.remove(module_path);
+
+            const path_owned = try self.allocator.dupe(u8, module_path);
+            try self.compiled_modules.put(self.allocator, path_owned, instr_set);
+            break :blk instr_set;
+        };
+
+        const module_fn_addr = ir.InstructionAddr.initAbs(module_instr_set, 0);
+        const pub_exports = self.instruction_sets.items[module_instr_set].pub_exports;
+        const n_pub = pub_exports.len;
+
+        // Allocate path string for runtime cache instructions (lifetime = instruction set lifetime)
+        const module_path_ir = try self.allocator.dupe(u8, module_path);
+
+        // Pre-declare ALL refs before the cache check so the stack layout is consistent on
+        // both cache-hit and cache-miss paths (jumped-over `ref` instructions would corrupt it).
+        const result_ref = try self.newRef(source, "import_result");
+        const stdout_pipe_ref = try self.newRef(source, "import_stdout_pipe");
+        const stderr_pipe_ref = try self.newRef(source, "import_stderr_pipe");
+        const merged_pipe_ref = try self.newRef(source, "import_merged_pipe");
+        const stdout_stream_ref = try self.newRef(source, "import_stdout_stream");
+        const stderr_stream_ref = try self.newRef(source, "import_stderr_stream");
+        const closure_ref = try self.newRef(source, "import_closure");
+        const thread_ref = try self.newRef(source, "import_thread");
+
+        // Runtime cache check — jump past execution block on hit
+        const cache_hit_label = try self.newLabel("import_cache_hit", .unknown);
+        const cache_end_label = try self.newLabel("import_cache_end", .unknown);
+        try self.addInstruction(.init(.from(source), .{ .get_module_cache = module_path_ir }));
+        const cache_hit_cond = Result.fromLocation(ir.Location.initRegister(.r2).typed(.global(.boolean)));
+        try self.jmp(source, cache_hit_cond, true, cache_hit_label);
+
+        // 4. Set up I/O capture pipes (same pattern as compileExpressionWithCapture)
+        try self.pipe(source, stdout_pipe_ref);
+        try self.pipeOpt(source, stdout_pipe_ref.dereference(), .keep_open, .fromValue(.fromBoolean(true)));
+        try self.pipeOpt(source, stdout_pipe_ref.dereference(), .close_destination, .fromValue(.fromBoolean(false)));
+        try self.pipeOpt(source, stdout_pipe_ref.dereference(), .disconnect_destination, .fromValue(.fromBoolean(false)));
+        try self.pipe(source, stderr_pipe_ref);
+        try self.pipeOpt(source, stderr_pipe_ref.dereference(), .keep_open, .fromValue(.fromBoolean(true)));
+        try self.pipeOpt(source, stderr_pipe_ref.dereference(), .close_destination, .fromValue(.fromBoolean(false)));
+        try self.pipeOpt(source, stderr_pipe_ref.dereference(), .disconnect_destination, .fromValue(.fromBoolean(false)));
+        try self.pipe(source, merged_pipe_ref);
+        try self.pipeFwd(source, stdout_pipe_ref.dereference(), merged_pipe_ref.dereference());
+        try self.pipeFwd(source, stderr_pipe_ref.dereference(), merged_pipe_ref.dereference());
+        try self.set(source, stdout_stream_ref, .from(
+            try self.fork(source, self.stdoutStreamSet(), self.threadStdin(), stdout_pipe_ref.dereference(), self.threadStderr(), .noll, .inherit),
+        ));
+        try self.set(source, stderr_stream_ref, .from(
+            try self.fork(source, self.stderrStreamSet(), self.threadStdin(), self.threadStdout(), stderr_pipe_ref.dereference(), .noll, .inherit),
+        ));
+
+        // 5. Allocate module closure and fork
+        const closure_size = self.instruction_sets.items[module_instr_set].closure_slot_count;
+        try self.alloc(source, @max(closure_size, 1));
+        try self.set(source, closure_ref, .fromLocation(.initRegister(.r)));
+        try self.set(source, .initRegister(.r), .from(closure_ref.dereference()));
+        const thread_location = try self.fork(
+            source,
+            module_fn_addr,
+            self.threadStdin(),
+            stdout_pipe_ref.dereference(),
+            stderr_pipe_ref.dereference(),
+            closure_ref.dereference(),
+            .inherit,
+        );
+        try self.set(source, thread_ref, .from(thread_location));
+
+        // 6. Wait for module to complete
+        try self.wait(source, thread_ref.dereference().typed(thread_type));
+
+        // 7. Close pipes and wait for stream drain threads
+        try self.pipeOpt(source, stdout_pipe_ref.dereference(), .keep_open, .fromValue(.fromBoolean(false)));
+        try self.pipeOpt(source, stderr_pipe_ref.dereference(), .keep_open, .fromValue(.fromBoolean(false)));
+        try self.wait(source, stdout_stream_ref.dereference());
+        try self.wait(source, stderr_stream_ref.dereference());
+
+        // 8. Build merged result struct: 5 standard execution result fields + n_pub pub fields
+        try self.alloc(source, 5 + n_pub);
+        try self.set(source, result_ref, .fromLocation(.initRegister(.r)));
+
+        try self.set(source, .initRegister(.r2), .from(result_ref.dereference()));
+        try self.set(source, .initAdd(.{ .register = .r2 }, executionResultFieldOffset(.stdout), .{ .dereference = true }), .from(stdout_pipe_ref.dereference()));
+        try self.set(source, .initAdd(.{ .register = .r2 }, executionResultFieldOffset(.stderr), .{ .dereference = true }), .from(stderr_pipe_ref.dereference()));
+        try self.set(source, .initAdd(.{ .register = .r2 }, executionResultFieldOffset(.merged), .{ .dereference = true }), .from(merged_pipe_ref.dereference()));
+        try self.set(source, .initAdd(.{ .register = .r2 }, executionResultFieldOffset(.closeable), .{ .dereference = true }), .from(thread_ref.dereference()));
+        try self.set(source, .initAdd(.{ .register = .r2 }, executionResultFieldOffset(.completion_is_thread), .{ .dereference = true }), .fromValue(.fromBoolean(true)));
+
+        for (pub_exports, 0..) |pub_export, i| {
+            try self.set(source, .initRegister(.r), .from(closure_ref.dereference()));
+            try self.set(source, .initRegister(.r2), .from(result_ref.dereference()));
+            try self.set(
+                source,
+                .initAdd(.{ .register = .r2 }, 5 + i, .{ .dereference = true }),
+                .fromLocation(.initAdd(.{ .register = .r }, pub_export.slot, .{ .dereference = true })),
+            );
+        }
+
+        // Store result addr in %r and cache it, then jump past cache-hit block
+        try self.set(source, .initRegister(.r), .fromLocation(result_ref.dereference()));
+        try self.addInstruction(.init(.from(source), .{ .set_module_cache = module_path_ir }));
+        try self.jmp(source, null, false, cache_end_label);
+
+        // Cache-hit path: %r already holds the cached heap addr; save to result_ref
+        try self.setLabel(cache_hit_label.local_addr.label, .abs);
+        try self.set(source, result_ref, .fromLocation(.initRegister(.r)));
+
+        try self.setLabel(cache_end_label.local_addr.label, .abs);
+
+        // 9. Build the merged struct type for member access
+        const all_fields = try self.allocator.alloc(ast.TypeExpr.StructField, 5 + n_pub);
+        @memcpy(all_fields[0..5], execution_result_struct_type.struct_type.fields);
+        for (pub_exports, 0..) |pub_export, i| {
+            const field_type_ptr = try self.allocator.create(ast.TypeExpr);
+            if (pub_export.fn_ref_value) |fn_ref_val| {
+                field_type_ptr.* = .{ .fn_ref_type = .{
+                    .instr_set = fn_ref_val.fn_ref.fn_addr.instr_set,
+                    .span = .global,
+                } };
+            } else {
+                field_type_ptr.* = pub_export.type_expr orelse .global(.integer);
+            }
+            all_fields[5 + i] = .{
+                .name = ast.Identifier.global(pub_export.name),
+                .type_expr = field_type_ptr,
+                .span = .global,
+            };
+        }
+        const merged_type = ast.TypeExpr{ .struct_type = .{
+            .span = .global,
+            .decls = &.{},
+            .fields = all_fields,
+        } };
+
+        return .fromLocation(result_ref.dereference().typed(merged_type));
+    }
+
     fn compileFnDecl(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -4102,7 +4476,60 @@ pub const IRCompiler = struct {
 
         // TODO: closure bindings, how do we manage them (non-parameters)?
         // TODO: figure out how to be able to call async functions multiple times and have the result not be overwritten in a ref
-        const result = try self.compileExpression(fn_decl.body);
+        //
+        // Compile the function body directly in the closure scope (no extra lexical push/pop)
+        // so that top-level `pub` bindings land in the closure frame and are visible to the
+        // pub-export epilogue below.  For non-block bodies fall back to compileExpression.
+        const result = if (fn_decl.body.* == .block) blk: {
+            const block = fn_decl.body.block;
+            var r: Result = .fromValue(.void);
+            for (block.statements[0..block.statements.len -| 1]) |stmt| {
+                _ = try self.compileStatement(stmt);
+            }
+            if (block.statements.len > 0) {
+                const last_stmt = block.statements[block.statements.len - 1];
+                r = switch (last_stmt.*) {
+                    .expression => |expr| try self.compileExpression(expr.expression),
+                    else => try self.compileStatement(last_stmt),
+                };
+            }
+            // Mirror compileBlock: stabilize ref-location results to a register
+            switch (r.source) {
+                .location => |loc| if (loc.abs == .ref) {
+                    try self.set(source, .initRegister(.r2), stableResultSource(r));
+                    r = .fromLocation(ir.Location.initRegister(.r2).typed(r.typeExpr()));
+                },
+                else => {},
+            }
+            break :blk r;
+        } else try self.compileExpression(fn_decl.body);
+
+        // Pub-export epilogue: write each pub binding's value to a closure slot so the
+        // caller can read it after the fork completes.
+        const current_frame = try self.scopes.getFrame(0);
+        const pub_slot_base = current_frame.closure_bindings.items.len;
+        var pub_exports_list = std.ArrayListUnmanaged(InstructionSet.PubExport){};
+        var frame_iter = current_frame.bindings.iterator();
+        while (frame_iter.next()) |entry| {
+            if (!entry.value_ptr.is_pub) continue;
+            const slot = pub_slot_base + pub_exports_list.items.len;
+            try self.set(
+                source,
+                ir.Location.initAdd(.closure, slot, .{}),
+                entry.value_ptr.result.source,
+            );
+            try pub_exports_list.append(self.allocator, .{
+                .name = entry.key_ptr.*,
+                .slot = slot,
+                .type_expr = entry.value_ptr.type_expr,
+                .fn_ref_value = if (entry.value_ptr.result.source == .value and
+                    entry.value_ptr.result.source.value == .fn_ref)
+                    entry.value_ptr.result.source.value
+                else
+                    null,
+            });
+        }
+
         // TODO: figure out how to make this async
         if (isWaitable(result)) |loc| {
             try self.wait(source, loc);
@@ -4114,6 +4541,8 @@ pub const IRCompiler = struct {
         }
 
         try self.setClosureIdentifiers();
+        self.currentInstrSet().closure_slot_count += pub_exports_list.items.len;
+        self.currentInstrSet().pub_exports = try pub_exports_list.toOwnedSlice(self.allocator);
         self.current_instruction_set = orig_instr_set;
         self.scopes.pop();
         if (fn_decl.name) |name| {
@@ -4125,6 +4554,11 @@ pub const IRCompiler = struct {
                 false,
                 .normal,
             );
+            if (fn_decl.is_pub) {
+                if (self.lookup(name.name, .{ .shallow = true })) |binding| {
+                    binding.is_pub = true;
+                }
+            }
         }
 
         return .from(fn_ref);
@@ -4185,7 +4619,7 @@ pub const IRCompiler = struct {
 
                 return .from(ref.dereference());
             },
-            .logical_and, .logical_or => {
+            .logical_and, .logical_or, .sequence => {
                 return self.compileLogicalBinary(source, binary, .value);
             },
             .@"orelse" => {
@@ -4205,14 +4639,62 @@ pub const IRCompiler = struct {
 
                 return .from(ref.dereference());
             },
-            .append_redirect, .redirect_fd => return Error.UnsupportedBinaryOperation,
+            .fd_source_truncate_redirect, .fd_source_append_redirect, .append_redirect, .redirect_fd => return Error.UnsupportedBinaryOperation,
             .assign => {
                 if (binary.left.* == .env_var) {
                     const env_var = binary.left.env_var;
-                    const right = try self.compileExpression(binary.right);
+                    var exec_result_ref_opt: ?ir.Location = null;
+                    var right = try self.compileExpressionWithCapture(source, binary.right);
+                    if (right.isType(execution_result_struct_type)) {
+                        const exec_result_ref = try self.newRef(source, "env_var_exec_result");
+                        try self.set(source, exec_result_ref, stableResultSource(right));
+                        exec_result_ref_opt = exec_result_ref;
+                        try self.set(source, .initRegister(.r2), .from(exec_result_ref.dereference()));
+                        right = .fromLocation(ir.Location.initAdd(
+                            .{ .register = .r2 },
+                            executionResultFieldOffset(.merged),
+                            .{
+                                .dereference = true,
+                                .type_expr = string_type,
+                            },
+                        ));
+                    }
                     try self.setEnv(source, env_var.identifier.name, right.source);
                     const result_ref = try self.newRef(source, "env_var_assign");
                     try self.set(source, result_ref, right.source);
+                    if (exec_result_ref_opt) |exec_result_ref| {
+                        try self.set(source, .initRegister(.r2), .from(exec_result_ref.dereference()));
+                        try self.pipeOpt(
+                            source,
+                            .initAdd(
+                                .{ .register = .r2 },
+                                executionResultFieldOffset(.stdout),
+                                .{ .dereference = true },
+                            ),
+                            .keep_open,
+                            .fromValue(.fromBoolean(false)),
+                        );
+                        try self.pipeOpt(
+                            source,
+                            .initAdd(
+                                .{ .register = .r2 },
+                                executionResultFieldOffset(.stderr),
+                                .{ .dereference = true },
+                            ),
+                            .keep_open,
+                            .fromValue(.fromBoolean(false)),
+                        );
+                        try self.pipeOpt(
+                            source,
+                            .initAdd(
+                                .{ .register = .r2 },
+                                executionResultFieldOffset(.merged),
+                                .{ .dereference = true },
+                            ),
+                            .keep_open,
+                            .fromValue(.fromBoolean(false)),
+                        );
+                    }
                     return .from(result_ref.dereference().typed(optional_string_type));
                 }
 
@@ -4444,8 +4926,17 @@ pub const IRCompiler = struct {
     ) Error!Result {
         switch (mode) {
             .statement => {
-                const left = try self.compileExpression(binary.left);
+                var left = try self.compileExpression(binary.left);
+                if (left.source.isRegister(.r) and left.isType(thread_type)) {
+                    left = try self.compileResultSaveR(source, left);
+                }
                 try self.finalizeStatementResult(source, left);
+
+                // sequence (;) always runs right — no conditional jump needed
+                if (binary.op == .sequence) {
+                    _ = try self.compileLogicalRightStatement(source, binary.right);
+                    return .fromValue(.void);
+                }
 
                 if (evaluateLogical(.from(binary.op), left.source)) |comptime_result| {
                     return switch (comptime_result) {
@@ -4479,13 +4970,34 @@ pub const IRCompiler = struct {
                 const right_expr_effects = self.analyzeExpressionEffects(binary.right);
 
                 if (left_expr_effects.needs_stdio_capture or right_expr_effects.needs_stdio_capture) {
-                    const result = try self.newRef(source, "logical_result");
-                    const left = try self.compileStableExpressionIntoRef(source, binary.left, result);
+                    // Compile sub-expressions directly — we are already inside a capture fork
+                    // (set up by compileExpressionWithCapture → compileWithContext) where the
+                    // current thread's stdout/stderr ARE the outer capture pipes. Creating
+                    // nested captures here would intercept the output into inner pipes and
+                    // leave the outer pipes empty.
+                    const result_ref = try self.newRef(source, "logical_result");
+                    const left = try self.compileExpression(binary.left);
+                    // Wait for left so we can check its exit code (for &&/||)
+                    try self.finalizeStatementResult(source, left);
+                    try self.set(source, result_ref, stableResultSource(left));
+
+                    // sequence (;): always run right
+                    if (binary.op == .sequence) {
+                        const right = try self.compileExpression(binary.right);
+                        try self.finalizeStatementResult(source, right);
+                        try self.set(source, result_ref, stableResultSource(right));
+                        return .from(result_ref.dereference().typed(mergedResultType(left, right)));
+                    }
 
                     if (evaluateLogical(.from(binary.op), left.source)) |comptime_result| {
                         return switch (comptime_result) {
                             .left => left,
-                            .right => try self.compileStableExpression(source, binary.right, "logical_right"),
+                            .right => blk: {
+                                const right = try self.compileExpression(binary.right);
+                                try self.finalizeStatementResult(source, right);
+                                try self.set(source, result_ref, stableResultSource(right));
+                                break :blk .from(result_ref.dereference().typed(mergedResultType(left, right)));
+                            },
                         };
                     }
 
@@ -4505,10 +5017,18 @@ pub const IRCompiler = struct {
                         },
                     }
 
-                    const right = try self.compileStableExpressionIntoRef(source, binary.right, result);
+                    const right = try self.compileExpression(binary.right);
+                    try self.finalizeStatementResult(source, right);
+                    try self.set(source, result_ref, stableResultSource(right));
                     try self.setLabel(after_addr.local_addr.label, .abs);
 
-                    return .from(result.dereference().typed(mergedResultType(left, right)));
+                    return .from(result_ref.dereference().typed(mergedResultType(left, right)));
+                }
+
+                // No stdio capture needed — compile normally
+                if (binary.op == .sequence) {
+                    _ = try self.compileExpression(binary.left);
+                    return try self.compileExpression(binary.right);
                 }
 
                 const left = try self.compileExpression(binary.left);
@@ -4542,7 +5062,7 @@ pub const IRCompiler = struct {
     ) Error!Result {
         switch (expr.*) {
             .binary => |binary| switch (binary.op) {
-                .logical_and, .logical_or => return self.compileLogicalBinary(source, binary, .statement),
+                .logical_and, .logical_or, .sequence => return self.compileLogicalBinary(source, binary, .statement),
                 else => {},
             },
             else => {},
@@ -4983,6 +5503,7 @@ pub const IRCompiler = struct {
 
         return switch (call.callee.*) {
             .identifier => |identifier| blk: {
+                if (std.mem.eql(u8, identifier.name, "@src")) break :blk false;
                 if (std.mem.eql(u8, identifier.name, "cd") and self.lookup(identifier.name, .{ .shallow = false }) == null) {
                     break :blk false;
                 }

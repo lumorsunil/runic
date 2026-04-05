@@ -1,0 +1,13 @@
+const a = printf "hello\n" && printf "error: some error" >&2
+
+echo a
+echo a.stdout
+echo a.stderr
+echo a.exit_code
+
+const b = printf "hello\n"; printf "error: some error" >&2
+
+echo b
+echo b.stdout
+echo b.stderr
+echo b.exit_code

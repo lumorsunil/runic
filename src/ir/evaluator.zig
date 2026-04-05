@@ -5,7 +5,7 @@ const runic = @import("runic");
 const CloseableProcessIo = runic.process.CloseableProcessIo;
 const FileSink = runic.process.FileSink;
 const ReaderWriterStream = runic.stream.ReaderWriterStream;
-const ExitCode = runic.command_runner.ExitCode;
+const ExitCode = runic.ExitCode;
 const Stream = runic.stream.Stream;
 const Tracer = runic.trace.Tracer;
 const compiler = runic.ir.compiler;
@@ -73,7 +73,7 @@ pub const Result = union(enum) {
     cont_no_instr_counter_inc,
     /// Advances instruction counter, retains thread counter (used for comments)
     skip,
-    exit: runic.command_runner.ExitCode,
+    exit: runic.ExitCode,
 };
 
 pub const IREvaluator = struct {
@@ -930,6 +930,17 @@ pub const IREvaluator = struct {
                         }
                         return .{ .exit = .success };
                     },
+                    .zig_string, .stream, .pipe => {
+                        if (thread.private.stack.items.len > 1) {
+                            const stdout_handle = thread.private.stack.items[1].pipe;
+                            const stdout_pipe = try self.context.getPipe(stdout_handle);
+                            var w = stdout_pipe.closeableWriter().writer;
+                            try self.materializeString(thread, resolved, w);
+                            try w.flush();
+                            return .{ .exit = .success };
+                        }
+                        return .{ .exit = try self.coerceExitCode(thread, value) };
+                    },
                     else => return .{ .exit = try self.coerceExitCode(thread, value) },
                 }
             },
@@ -1011,6 +1022,20 @@ pub const IREvaluator = struct {
                 // Restore the saved subshell context handle.
                 const saved = thread.private.subshell_context_stack.pop().?;
                 thread.private.subshell_context = saved;
+                return .cont;
+            },
+            .get_module_cache => |path| {
+                if (self.context.module_cache.get(path)) |cached| {
+                    thread.private.result_register = cached;
+                    thread.private.result_register_2 = .fromBoolean(true);
+                } else {
+                    thread.private.result_register_2 = .fromBoolean(false);
+                }
+                return .cont;
+            },
+            .set_module_cache => |path| {
+                const path_owned = try self.allocator.dupe(u8, path);
+                try self.context.module_cache.put(self.allocator, path_owned, thread.private.result_register);
                 return .cont;
             },
             .fwd_stdio => {
@@ -1388,6 +1413,23 @@ pub const IREvaluator = struct {
                             return .cont;
                         } else {
                             return .cont_no_instr_counter_inc;
+                        }
+                    },
+                    .addr => |addr| {
+                        const heap_value = self.context.shared.heapGet(addr) orelse return Error.UnsupportedWaitee;
+                        switch (heap_value) {
+                            .thread => |thread_handle| {
+                                thread.waitFor(thread_handle);
+                            },
+                            .closeable => |closeable_handle| {
+                                const closeable = try self.context.getCloseable(closeable_handle);
+                                if (closeable.isClosed() or closeable.getResult() != null) {
+                                    return .cont;
+                                } else {
+                                    return .cont_no_instr_counter_inc;
+                                }
+                            },
+                            else => return Error.UnsupportedWaitee,
                         }
                     },
                     else => return Error.UnsupportedWaitee,

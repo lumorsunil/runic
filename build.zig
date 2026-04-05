@@ -4,6 +4,9 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", "0.1.0");
+
     const runtime = b.addModule("runic", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -27,6 +30,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     cli.root_module.addImport("runic", runtime);
+    cli.root_module.addOptions("build_options", build_options);
     b.installArtifact(cli);
 
     const run_cmd = b.addRunArtifact(cli);
@@ -54,6 +58,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     lsp_cli.root_module.addImport("runic_lsp", lsp);
+    lsp_cli.root_module.addOptions("build_options", build_options);
     b.installArtifact(lsp_cli);
 
     const lsp_build = b.step("runic-lsp", "Build the Runic language server");

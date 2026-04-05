@@ -260,12 +260,33 @@ const { stdout: sync_stdout, stderr: sync_stderr, exit_code: sync_exit_code } = 
 git "status" "--short" 1>$status_stdout
 git "status" "--short" 2>$status_stderr
 
+const combined = printf "hello\n" && printf "warning\n" >&2
+echo "${combined.stdout}"
+echo "${combined.stderr}"
+
+const sequenced = printf "hello\n"; printf "warning\n" >&2
+echo "${sequenced.stdout}"
+echo "${sequenced.stderr}"
+
 const async_proc = (sleep 0.05; echo "done" &)
 async_proc.wait
 echo "${async_proc.stdout}"
 ```
 
-**Result:** Binding `const proc = <command ...>` executes the program synchronously and returns its buffered output plus exit metadata. You can destructure the execution value to grab only `stdout`, `stderr`, or `exit_code`, or append the `1>var`/`2>var` shorthand to redirect a single stream directly into a variable while still receiving the same execution value for status checks. Appending `&` runs the work in the background; when you bind that value, its output is still buffered rather than printed immediately, and `.wait` blocks until it finishes.
+**Result:** Binding `const proc = <command ...>` executes the program synchronously and returns its buffered output plus exit metadata. You can destructure the execution value to grab only `stdout`, `stderr`, or `exit_code`, or append the `1>var`/`2>var` shorthand to redirect a single stream directly into a variable while still receiving the same execution value for status checks. When command-producing expressions are chained with `&&`, `||`, or `;`, the resulting bound value still exposes the buffered `stdout`, `stderr`, and exit metadata from the evaluated expression. Appending `&` runs the work in the background; when you bind that value, its output is still buffered rather than printed immediately, and `.wait` blocks until it finishes.
+
+### File descriptor redirects
+
+Runic supports explicit stdout/stderr redirects for commands and preserves shell-style left-to-right redirect ordering when fd duplication is involved.
+
+```rn
+echo "saved output" 1>"out.log"
+echo "saved error" 2>"err.log"
+
+echo "hello" 1>&2 2>"/dev/null"
+```
+
+**Result:** `1>...` redirects stdout, `2>...` redirects stderr, and `1>&2` duplicates stdout onto the current stderr target. Because redirects are applied left to right, `echo "hello" 1>&2 2>"/dev/null"` still writes `hello` to the original stderr stream instead of discarding it.
 
 ## Error-aware pipelines
 
@@ -292,44 +313,51 @@ const response = http.get("https://example.com/status")
 echo "${response.code}"
 ```
 
-**Result:** Modules encapsulate functionality, provide typed APIs, and return predictable structures such as HTTP response objects.
+**Result:** Modules encapsulate reusable functionality and expose their `pub` declarations on the imported value.
 
-To define your own module, add a `.rn` file relative to the script that will import it. A spec of `util/math` resolves to `<script_dir>/util/math.rn`:
+To define your own module, add a `.rn` file relative to the script that will import it. A spec of `util/math.rn` resolves to `<script_dir>/util/math.rn`:
 
 ```rn
 // <script_dir>/util/math.rn
-fn Void add(lhs: Int, rhs: Int) Int {
+fn Void @() Void
+
+pub fn Void add(lhs: Int, rhs: Int) Int {
   return lhs + rhs
 }
 
-const pi = 3.14159
+pub const pi = 3.14159
 ```
 
-Each module also carries a manifest named `<file>.module.json` that documents which functions or values are exported and their types. The module loader reads this metadata to surface strongly-typed APIs to consumers:
+Imported modules must not declare parameters in their `@(...)` signature. Use
+`pub` functions instead of module parameters when you need reusable behavior.
 
-```json
-// <script_dir>/util/math.rn.module.json
-{
-  "exports": [
-    {
-      "kind": "function",
-      "name": "add",
-      "params": [
-        { "name": "lhs", "type": { "kind": "primitive", "name": "int" } },
-        { "name": "rhs", "type": { "kind": "primitive", "name": "int" } }
-      ],
-      "return_type": { "kind": "primitive", "name": "int" }
-    },
-    {
-      "kind": "value",
-      "name": "pi",
-      "type": { "kind": "primitive", "name": "float" }
-    }
-  ]
+The current implementation executes the imported module, caches it by resolved
+path, rejects circular imports, and returns a merged value that includes:
+
+- execution-result fields such as `stdout`, `stderr`, `exit_code`, and `wait`
+- every `pub` top-level declaration from the module
+
+Example:
+
+```rn
+// <script_dir>/util/math.rn
+fn Void @() Void
+
+pub fn Void add(lhs: Int, rhs: Int) Int {
+  return lhs + rhs
 }
+
+pub const pi = 3.14159
 ```
 
-The manifest uses a concise schema (`primitive`, `array`, `map`, `optional`, `promise`, etc.) so downstream scripts know what they are importing before the runtime executes the module. See `docs/module_authoring.md` for the full list of descriptors and publishing conventions.
+```rn
+// importer
+const math = import "util/math.rn"
+echo "${math.pi}"
+echo "${math.exit_code}"
+```
+
+**Result:** Importing a module runs it, exposes its `pub` declarations, and also leaves the module execution result available for inspection.
 
 ## Structs
 
