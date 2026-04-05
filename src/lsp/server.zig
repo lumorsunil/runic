@@ -68,6 +68,8 @@ pub const Server = struct {
     pub fn deinit(self: *Server) void {
         self.workspace.deinit();
         self.documents.deinit();
+        self.allocator.destroy(self.workspace);
+        self.allocator.destroy(self.documents);
     }
 
     pub fn initInterface(self: *Server) void {
@@ -156,6 +158,26 @@ pub const Server = struct {
                         return err;
                     };
                 }
+                return true;
+            },
+            .@"textDocument/definition" => |params| {
+                if (request.id) |id| try self.handleDefinition(id, params);
+                return true;
+            },
+            .@"textDocument/references" => |params| {
+                if (request.id) |id| try self.handleReferences(id, params);
+                return true;
+            },
+            .@"textDocument/documentSymbol" => |params| {
+                if (request.id) |id| try self.handleDocumentSymbols(id, params);
+                return true;
+            },
+            .@"textDocument/rename" => |params| {
+                if (request.id) |id| try self.handleRename(id, params);
+                return true;
+            },
+            .@"textDocument/formatting" => |params| {
+                if (request.id) |id| try self.handleFormatting(id, params);
                 return true;
             },
             .@"workspace/didChangeConfiguration", .@"workspace/didChangeWatchedFiles" => {
@@ -419,6 +441,31 @@ pub const Server = struct {
         span: runic.ast.Span,
     };
 
+    fn findIdentifierRanges(
+        self: *Server,
+        text: []const u8,
+        name: []const u8,
+    ) !std.ArrayList(types.Range) {
+        var ranges = std.ArrayList(types.Range).empty;
+        if (name.len == 0) return ranges;
+
+        var lexer = try runic.lexer.Lexer.init(self.allocator, "", text);
+        defer lexer.deinit();
+
+        while (true) {
+            const tok = try lexer.next();
+            switch (tok.tag) {
+                .identifier => if (std.mem.eql(u8, tok.lexeme, name)) {
+                    try ranges.append(self.allocator, types.Range.fromSpan(tok.span));
+                },
+                .eof => break,
+                else => {},
+            }
+        }
+
+        return ranges;
+    }
+
     fn extractIdentifier(
         self: *@This(),
         loc: runic.token.Location,
@@ -439,6 +486,7 @@ pub const Server = struct {
         if (!runic.lexer.isIdentifierStart(text[start])) start += 1;
 
         var lexer = runic.lexer.Lexer.init(self.allocator, loc.file, text[start..]) catch return null;
+        defer lexer.deinit();
         const tok = lexer.next() catch return null;
 
         return switch (tok.tag) {
@@ -473,14 +521,44 @@ pub const Server = struct {
         };
 
         if (binding) |b| {
+            const definition_uri = try self.documents.resolveUri(b.identifier.span.start.file);
+            defer self.allocator.free(definition_uri);
             const result = types.Location{
-                .uri = params.textDocument.uri,
+                .uri = definition_uri,
                 .range = types.Range.fromSpan(b.identifier.span),
             };
             try self.sendJson(types.response(id, result));
-        } else {
-            try self.sendJson(types.response(id, std.json.Value{ .null = {} }));
+            return;
         }
+
+        if (extracted_identifier) |identifier| {
+            var found_location: ?types.Location = null;
+            var it = self.documents.map.iterator();
+            while (it.next()) |entry| {
+                const uri = entry.key_ptr.*;
+                const ref_doc = entry.value_ptr.*;
+
+                for (ref_doc.symbols.items) |sym| {
+                    if (!std.mem.eql(u8, sym.name, identifier.name)) continue;
+                    const location = types.Location{
+                        .uri = uri,
+                        .range = types.Range.fromSpan(sym.span),
+                    };
+                    if (found_location != null and !std.meta.eql(found_location.?, location)) {
+                        try self.sendJson(types.response(id, std.json.Value{ .null = {} }));
+                        return;
+                    }
+                    found_location = location;
+                }
+            }
+
+            if (found_location) |location| {
+                try self.sendJson(types.response(id, location));
+                return;
+            }
+        }
+
+        try self.sendJson(types.response(id, std.json.Value{ .null = {} }));
     }
 
     fn handleReferences(
@@ -508,11 +586,37 @@ pub const Server = struct {
         var locations = std.ArrayList(types.Location).empty;
         defer locations.deinit(self.allocator);
 
-        if (binding) |b| {
-            try locations.append(self.allocator, .{
-                .uri = params.textDocument.uri,
-                .range = types.Range.fromSpan(b.identifier.span),
-            });
+        const reference_name = if (binding) |b|
+            b.identifier.name
+        else if (extracted_identifier) |i|
+            i.name
+        else
+            null;
+
+        if (reference_name) |name| {
+            const declaration_file = if (binding) |b| b.identifier.span.start.file else null;
+            const declaration_range = if (binding) |b| types.Range.fromSpan(b.identifier.span) else null;
+
+            var it = self.documents.map.iterator();
+            while (it.next()) |entry| {
+                const uri = entry.key_ptr.*;
+                const ref_doc = entry.value_ptr.*;
+                var ranges = try self.findIdentifierRanges(ref_doc.text, name);
+                defer ranges.deinit(self.allocator);
+
+                for (ranges.items) |range| {
+                    if (!params.context.includeDeclaration and declaration_range != null and declaration_file != null and
+                        std.mem.eql(u8, ref_doc.path, declaration_file.?) and std.meta.eql(range, declaration_range.?))
+                    {
+                        continue;
+                    }
+
+                    try locations.append(self.allocator, .{
+                        .uri = uri,
+                        .range = range,
+                    });
+                }
+            }
         }
 
         try self.sendJson(types.response(id, locations.items));
@@ -532,6 +636,7 @@ pub const Server = struct {
         };
 
         var doc_symbols = std.ArrayList(types.DocumentSymbol).empty;
+        defer doc_symbols.deinit(self.allocator);
 
         if (self.workspace.documents.get(params.textDocument.uri)) |ws_doc| {
             for (ws_doc.symbols.items) |sym| {
@@ -543,11 +648,11 @@ pub const Server = struct {
                 };
 
                 try doc_symbols.append(self.allocator, .{
-                    .name = try self.allocator.dupe(u8, sym.name),
+                    .name = sym.name,
                     .kind = kind,
-                    .detail = try self.allocator.dupe(u8, sym.detail),
-                    .range = types.Range{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 0 } },
-                    .selectionRange = types.Range{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 0 } },
+                    .detail = sym.detail,
+                    .range = types.Range.fromSpan(sym.span),
+                    .selectionRange = types.Range.fromSpan(sym.span),
                 });
             }
         }
@@ -574,17 +679,30 @@ pub const Server = struct {
             return;
         }
 
+        const text = if (doc) |d| d.text else {
+            try self.sendJson(types.response(id, std.json.Value{ .null = {} }));
+            return;
+        };
+
+        var ranges = try self.findIdentifierRanges(text, extracted_identifier.?.name);
+        defer ranges.deinit(self.allocator);
+
+        var edits = std.ArrayList(types.TextEdit).empty;
+        defer edits.deinit(self.allocator);
+
+        for (ranges.items) |range| {
+            try edits.append(self.allocator, .{
+                .range = range,
+                .newText = params.newName,
+            });
+        }
+
         const result = types.WorkspaceEdit{
             .documentChanges = &.{
                 .{
                     .textDocumentEdit = .{
                         .textDocument = .{ .uri = params.textDocument.uri, .version = null },
-                        .edits = &.{
-                            .{
-                                .range = types.Range{ .start = params.position, .end = params.position },
-                                .newText = params.newName,
-                            },
-                        },
+                        .edits = edits.items,
                     },
                 },
             },
@@ -604,7 +722,7 @@ pub const Server = struct {
         };
 
         const text = doc.text;
-        var formatted = std.ArrayList(u8).init(self.allocator);
+        var formatted = std.ArrayList(u8).empty;
         defer formatted.deinit(self.allocator);
 
         var i: usize = 0;
@@ -618,29 +736,41 @@ pub const Server = struct {
             if (!in_string and (ch == '"' or ch == '\'')) {
                 in_string = true;
                 string_char = ch;
-                try formatted.append(ch);
+                try formatted.append(self.allocator, ch);
                 continue;
             }
 
             if (in_string and ch == string_char and (i == 0 or text[i - 1] != '\\')) {
                 in_string = false;
-                try formatted.append(ch);
+                try formatted.append(self.allocator, ch);
                 continue;
             }
 
             if (in_string) {
-                try formatted.append(ch);
+                try formatted.append(self.allocator, ch);
                 continue;
             }
 
             if (ch == '#') {
-                while (i < text.len and text[i] != '\n') : (i += 1) {}
+                try formatted.append(self.allocator, ch);
+                while (i + 1 < text.len and text[i + 1] != '\n') : (i += 1) {
+                    try formatted.append(self.allocator, text[i + 1]);
+                }
+                if (i + 1 < text.len and text[i + 1] == '\n') {
+                    i += 1;
+                    try formatted.append(self.allocator, '\n');
+                    var j: usize = 0;
+                    while (j < indent_level) : (j += 1) {
+                        try formatted.append(self.allocator, ' ');
+                        try formatted.append(self.allocator, ' ');
+                    }
+                }
                 continue;
             }
 
             if (ch == '{') {
-                try formatted.append(ch);
-                try formatted.append(' ');
+                try formatted.append(self.allocator, ch);
+                try formatted.append(self.allocator, ' ');
                 indent_level += 1;
                 continue;
             }
@@ -650,16 +780,16 @@ pub const Server = struct {
                 if (formatted.items.len > 1 and formatted.items[formatted.items.len - 1] == ' ') {
                     _ = formatted.pop();
                 }
-                try formatted.append(ch);
+                try formatted.append(self.allocator, ch);
                 continue;
             }
 
             if (ch == '\n') {
-                try formatted.append(ch);
+                try formatted.append(self.allocator, ch);
                 var j: usize = 0;
                 while (j < indent_level) : (j += 1) {
-                    try formatted.append(' ');
-                    try formatted.append(' ');
+                    try formatted.append(self.allocator, ' ');
+                    try formatted.append(self.allocator, ' ');
                 }
                 continue;
             }
@@ -668,11 +798,11 @@ pub const Server = struct {
                 if (formatted.items.len == 0 or formatted.items[formatted.items.len - 1] == ' ' or formatted.items[formatted.items.len - 1] == '\n' or formatted.items[formatted.items.len - 1] == '{') {
                     continue;
                 }
-                try formatted.append(ch);
+                try formatted.append(self.allocator, ch);
                 continue;
             }
 
-            try formatted.append(ch);
+            try formatted.append(self.allocator, ch);
         }
 
         const text_edit = types.TextEdit{
@@ -758,10 +888,9 @@ pub const Server = struct {
         version: ?types.DocumentVersion,
         diagnostics: []const diag.Diagnostic,
     ) !void {
-        std.log.err("sending diagnostics: {} version: {?} uri: {s}", .{ diagnostics.len, version, uri });
-
+        try self.log("sending diagnostics: {} version: {?} uri: {s}", .{ diagnostics.len, version, uri });
         if (diagnostics.len == 1) {
-            std.log.err("{f}", .{std.json.fmt(diagnostics[0], .{})});
+            try self.log("{f}", .{std.json.fmt(diagnostics[0], .{})});
         }
 
         var diagnosticsResult = try self.allocator.alloc(types.Diagnostic, diagnostics.len);

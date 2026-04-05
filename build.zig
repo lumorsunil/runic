@@ -67,4 +67,16 @@ pub fn build(b: *std.Build) void {
     const lsp_tests = b.addTest(.{ .root_module = lsp });
     const lsp_runner = b.addRunArtifact(lsp_tests);
     test_step.dependOn(&lsp_runner.step);
+
+    const lsp_protocol_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/lsp_protocol.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    lsp_protocol_tests.root_module.addImport("runic_lsp", lsp);
+    lsp_protocol_tests.root_module.addImport("runic", runtime);
+    const lsp_protocol_runner = b.addRunArtifact(lsp_protocol_tests);
+    test_step.dependOn(&lsp_protocol_runner.step);
 }

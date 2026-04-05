@@ -15,6 +15,7 @@ fn makeKeyword(allocator: Allocator, name: []const u8, documentation: []const u8
         .documentation = try allocator.dupe(u8, documentation),
         .name = try allocator.dupe(u8, name),
         .kind = .keyword,
+        .span = .global,
     };
 }
 

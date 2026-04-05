@@ -16,6 +16,7 @@ pub const Symbol = struct {
     detail: []const u8,
     documentation: []const u8 = &[_]u8{},
     kind: SymbolKind,
+    span: ast.Span,
 
     pub fn deinit(self: *Symbol, allocator: Allocator) void {
         allocator.free(self.name);
@@ -53,7 +54,7 @@ pub fn collectSymbols(
                         const name = identifier.name;
                         // const initializer = binding_decl.initializer.span().sliceFrom(contents);
 
-                        try appendSymbol(allocator, list, .variable, name, detail);
+                        try appendSymbol(allocator, list, .variable, name, detail, identifier.span);
                     },
                 }
             },
@@ -94,12 +95,14 @@ fn appendSymbol(
     kind: SymbolKind,
     name: []const u8,
     detail: []const u8,
+    span: ast.Span,
 ) !void {
     var entry = Symbol{
         .name = try allocator.dupe(u8, name),
         .detail = try allocator.dupe(u8, detail),
         .documentation = try std.fmt.allocPrint(allocator, "`{s}`", .{@tagName(kind)}),
         .kind = kind,
+        .span = span,
     };
     errdefer entry.deinit(allocator);
     try list.append(allocator, entry);
