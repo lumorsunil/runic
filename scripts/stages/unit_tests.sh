@@ -30,7 +30,7 @@ case "$lang" in
       echo "zig command not found in PATH. Install Zig to run tests." >&2
       exit 1
     fi
-    (cd "$repo_root" && zig build test)
+    (cd "$repo_root" && zig build test --summary all)
     ;;
   *)
     echo "Unit test stage skipped: no recognized toolchain (set RUNIC_LANG or add Cargo.toml/go.mod/build.zig)."

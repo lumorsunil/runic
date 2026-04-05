@@ -142,8 +142,7 @@ test "lsp rename ignores strings and comments" {
     var fixture = try TestFixture.init(allocator);
     defer fixture.deinit();
 
-    const uri = try fixture.writeDocument(
-        "main.rn",
+    const uri = try fixture.writeDocument("main.rn",
         \\const foo = 1
         \\echo "foo should stay in strings"
         \\# foo should stay in comments
@@ -292,8 +291,7 @@ test "lsp references can exclude declaration" {
     var fixture = try TestFixture.init(allocator);
     defer fixture.deinit();
 
-    const uri = try fixture.writeDocument(
-        "main.rn",
+    const uri = try fixture.writeDocument("main.rn",
         \\const foo = 1
         \\echo foo
         \\
@@ -333,8 +331,7 @@ test "lsp publishes diagnostics for invalid source" {
     var fixture = try TestFixture.init(allocator);
     defer fixture.deinit();
 
-    const uri = try fixture.writeDocument(
-        "main.rn",
+    const uri = try fixture.writeDocument("main.rn",
         \\const foo =
         \\
     );
