@@ -84,6 +84,12 @@ zig build
 zig build test
 bash tests/cli_smoke.sh
 bash tests/cli_diagnostics.sh
+bash scripts/run_ci.sh
+```
+
+If you are debugging the Runic CI implementation itself, also run:
+
+```bash
 zig build run -- scripts/run_ci.rn
 ```
 
@@ -97,6 +103,9 @@ Guidelines:
   relying on broad smoke coverage.
 - If the test suite exposes a regression caused by your change, keep going until
   the regression is fixed or clearly documented.
+- If your change implements or fixes an item already tracked in
+  [todo.md](todo.md), update `todo.md` in the same change so the backlog stays
+  aligned with reality.
 
 ## Documentation Expectations
 
