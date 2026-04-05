@@ -180,6 +180,8 @@ pub fn runScript(
             stdin_stream,
             stdout_stream,
             stderr_stream,
+            std.fs.File.stdout().isTty(),
+            std.fs.File.stderr().isTty(),
             tracer,
         );
     } else {
@@ -195,6 +197,8 @@ pub fn runScript(
                 .stdin = stdin_stream,
                 .stdout = stdout_stream,
                 .stderr = stderr_stream,
+                .stdout_is_tty = std.fs.File.stdout().isTty(),
+                .stderr_is_tty = std.fs.File.stderr().isTty(),
                 .tracer = tracer,
             },
         );

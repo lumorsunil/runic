@@ -217,8 +217,8 @@
   - [x] env vars are populated into global scope
   - [ ] way to check if identifier exists (orelse except for this specific purpose) ?
 - [ ] do we want to strip newlines at the end of an echo or not?
-- [ ] preserve ANSI/TTY-aware output when a Runic script runs subprocesses
-  - executables launched from inside scripts like `scripts/run_ci.rn` should still emit color/ANSI output when appropriate
+- [x] preserve ANSI/TTY-aware output when a Runic script runs subprocesses
+  - direct top-level executable calls now inherit stdout/stderr only when Runic itself is attached to a TTY, so scripts like `scripts/run_ci.rn` can preserve color/ANSI output without breaking redirected or captured output
 
 ### data
 

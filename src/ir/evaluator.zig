@@ -86,6 +86,8 @@ pub const IREvaluator = struct {
         stdin: *ReaderWriterStream,
         stdout: *ReaderWriterStream,
         stderr: *ReaderWriterStream,
+        stdout_is_tty: bool = false,
+        stderr_is_tty: bool = false,
         tracer: *Tracer,
     };
 
@@ -383,15 +385,6 @@ pub const IREvaluator = struct {
             self.allocator.free(child.argv);
         }
         child.env_map = ctx.env;
-        child.stdin_behavior = .Pipe;
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Pipe;
-        child.cwd = ctx.cwd;
-        try child.spawn();
-
-        const child_ptr = try self.allocator.create(std.process.Child);
-        child_ptr.* = child;
-
         const stdin_handle = thread.private.stack.items[0].pipe;
         const stdout_handle = thread.private.stack.items[1].pipe;
         const stderr_handle = thread.private.stack.items[2].pipe;
@@ -400,13 +393,24 @@ pub const IREvaluator = struct {
         const stdout_pipe = try self.context.getPipe(stdout_handle);
         const stderr_pipe = try self.context.getPipe(stderr_handle);
 
+        child.stdin_behavior = self.childStdinBehavior();
+        child.stdout_behavior = try self.childStdIoBehavior(stdout_pipe, self.config.stdout, self.config.stdout_is_tty);
+        child.stderr_behavior = try self.childStdIoBehavior(stderr_pipe, self.config.stderr, self.config.stderr_is_tty);
+        child.cwd = ctx.cwd;
+        try flushInheritedChildOutput(stdout_pipe, child.stdout_behavior);
+        try flushInheritedChildOutput(stderr_pipe, child.stderr_behavior);
+        try child.spawn();
+
+        const child_ptr = try self.allocator.create(std.process.Child);
+        child_ptr.* = child;
+
         const process_io = try self.allocator.create(CloseableProcessIo);
         process_io.* = .init(child_ptr, self.config.tracer);
         process_io.connect();
 
         try stdin_pipe.connectDestination(process_io.closeableStdin());
-        try stdout_pipe.connectSource(process_io.closeableStdout());
-        try stderr_pipe.connectSource(process_io.closeableStderr());
+        if (child.stdout_behavior == .Pipe) try stdout_pipe.connectSource(process_io.closeableStdout());
+        if (child.stderr_behavior == .Pipe) try stderr_pipe.connectSource(process_io.closeableStderr());
 
         const exit_code: ExitCode = switch (try child_ptr.wait()) {
             .Exited => |code| .fromByte(@intCast(code)),
@@ -414,16 +418,38 @@ pub const IREvaluator = struct {
             else => .fromByte(1),
         };
 
-        while (true) {
+        if (child.stdout_behavior == .Pipe) while (true) {
             const event = try stdout_pipe.forward(.unlimited);
             if (event != .not_done) break;
-        }
-        while (true) {
+        };
+        if (child.stderr_behavior == .Pipe) while (true) {
             const event = try stderr_pipe.forward(.unlimited);
             if (event != .not_done) break;
-        }
+        };
 
         return exit_code;
+    }
+
+    fn childStdIoBehavior(
+        self: *IREvaluator,
+        pipe: *ReaderWriterStream,
+        root_pipe: *ReaderWriterStream,
+        root_is_tty: bool,
+    ) Error!std.process.Child.StdIo {
+        _ = self;
+        return if (root_is_tty and pipe == root_pipe) .Inherit else .Pipe;
+    }
+
+    fn childStdinBehavior(self: *IREvaluator) std.process.Child.StdIo {
+        _ = self;
+        return .Pipe;
+    }
+
+    fn flushInheritedChildOutput(pipe: *ReaderWriterStream, behavior: std.process.Child.StdIo) Error!void {
+        if (behavior != .Inherit) return;
+        if (pipe.destination) |destination| {
+            try destination.writer.flush();
+        }
     }
 
     fn tempCloseStdIoCheck(self: *IREvaluator) void {
@@ -1135,14 +1161,6 @@ pub const IREvaluator = struct {
                 child.* = std.process.Child.init(try argv.toOwnedSlice(self.allocator), self.allocator);
                 const ctx = self.context.getSubshellContextPtr(thread.private.subshell_context);
                 child.env_map = ctx.env;
-                child.stdin_behavior = .Pipe;
-                child.stdout_behavior = .Pipe;
-                child.stderr_behavior = .Pipe;
-                child.cwd = ctx.cwd;
-                try child.spawn();
-                try child.waitForSpawn();
-                thread.private.process = child;
-
                 const stdin_handle = thread.private.stack.items[0].pipe;
                 const stdout_handle = thread.private.stack.items[1].pipe;
                 const stderr_handle = thread.private.stack.items[2].pipe;
@@ -1151,14 +1169,24 @@ pub const IREvaluator = struct {
                 const stdout_pipe = try self.context.getPipe(stdout_handle);
                 const stderr_pipe = try self.context.getPipe(stderr_handle);
 
+                child.stdin_behavior = self.childStdinBehavior();
+                child.stdout_behavior = try self.childStdIoBehavior(stdout_pipe, self.config.stdout, self.config.stdout_is_tty);
+                child.stderr_behavior = try self.childStdIoBehavior(stderr_pipe, self.config.stderr, self.config.stderr_is_tty);
+                child.cwd = ctx.cwd;
+                try flushInheritedChildOutput(stdout_pipe, child.stdout_behavior);
+                try flushInheritedChildOutput(stderr_pipe, child.stderr_behavior);
+                try child.spawn();
+                try child.waitForSpawn();
+                thread.private.process = child;
+
                 // TODO: memory management
                 const process_io = try self.allocator.create(CloseableProcessIo);
                 process_io.* = .init(child, self.config.tracer);
                 process_io.connect();
 
                 try stdin_pipe.connectDestination(process_io.closeableStdin());
-                try stdout_pipe.connectSource(process_io.closeableStdout());
-                try stderr_pipe.connectSource(process_io.closeableStderr());
+                if (child.stdout_behavior == .Pipe) try stdout_pipe.connectSource(process_io.closeableStdout());
+                if (child.stderr_behavior == .Pipe) try stderr_pipe.connectSource(process_io.closeableStderr());
 
                 const handle = try self.context.addCloseable(process_io.closeable());
                 thread.private.result_register = .{ .closeable = handle };
@@ -1945,10 +1973,98 @@ test "evaluator step reports missing current thread" {
         .stdin = fixture.stdin_stream,
         .stdout = fixture.stdout_stream,
         .stderr = fixture.stderr_stream,
+        .stdout_is_tty = true,
+        .stderr_is_tty = true,
         .tracer = &fixture.tracer,
     }, &fixture.context);
 
     try std.testing.expectError(Error.MissingCurrentThread, evaluator.step());
+}
+
+test "evaluator tty regression inherits direct root stdout and stderr" {
+    const allocator = std.testing.allocator;
+    var fixture = try initTestEvaluator(allocator);
+    defer fixture.context.deinit();
+    defer fixture.stdin_stream.deinitParent();
+    defer fixture.stdout_stream.deinitParent();
+    defer fixture.stderr_stream.deinitParent();
+    defer fixture.tracer.deinit();
+
+    var evaluator = IREvaluator.init(allocator, .{
+        .verbose = false,
+        .stdin = fixture.stdin_stream,
+        .stdout = fixture.stdout_stream,
+        .stderr = fixture.stderr_stream,
+        .stdout_is_tty = true,
+        .stderr_is_tty = true,
+        .tracer = &fixture.tracer,
+    }, &fixture.context);
+
+    try std.testing.expectEqual(
+        std.process.Child.StdIo.Inherit,
+        try evaluator.childStdIoBehavior(fixture.stdout_stream, fixture.stdout_stream, true),
+    );
+    try std.testing.expectEqual(
+        std.process.Child.StdIo.Inherit,
+        try evaluator.childStdIoBehavior(fixture.stderr_stream, fixture.stderr_stream, true),
+    );
+}
+
+test "evaluator tty regression keeps redirected output on pipes" {
+    const allocator = std.testing.allocator;
+    var fixture = try initTestEvaluator(allocator);
+    defer fixture.context.deinit();
+    defer fixture.stdin_stream.deinitParent();
+    defer fixture.stdout_stream.deinitParent();
+    defer fixture.stderr_stream.deinitParent();
+    defer fixture.tracer.deinit();
+
+    const redirected_stdout = try Stream(u8).initReaderWriter(allocator, "redirected-stdout", .{}, &fixture.tracer);
+    defer redirected_stdout.deinitParent();
+
+    var evaluator = IREvaluator.init(allocator, .{
+        .verbose = false,
+        .stdin = fixture.stdin_stream,
+        .stdout = fixture.stdout_stream,
+        .stderr = fixture.stderr_stream,
+        .stdout_is_tty = true,
+        .stderr_is_tty = true,
+        .tracer = &fixture.tracer,
+    }, &fixture.context);
+
+    try std.testing.expectEqual(
+        std.process.Child.StdIo.Pipe,
+        try evaluator.childStdIoBehavior(redirected_stdout, fixture.stdout_stream, true),
+    );
+    try std.testing.expectEqual(
+        std.process.Child.StdIo.Pipe,
+        try evaluator.childStdIoBehavior(fixture.stdout_stream, fixture.stdout_stream, false),
+    );
+}
+
+test "evaluator tty regression keeps stdin piped" {
+    const allocator = std.testing.allocator;
+    var fixture = try initTestEvaluator(allocator);
+    defer fixture.context.deinit();
+    defer fixture.stdin_stream.deinitParent();
+    defer fixture.stdout_stream.deinitParent();
+    defer fixture.stderr_stream.deinitParent();
+    defer fixture.tracer.deinit();
+
+    var evaluator = IREvaluator.init(allocator, .{
+        .verbose = false,
+        .stdin = fixture.stdin_stream,
+        .stdout = fixture.stdout_stream,
+        .stderr = fixture.stderr_stream,
+        .stdout_is_tty = true,
+        .stderr_is_tty = true,
+        .tracer = &fixture.tracer,
+    }, &fixture.context);
+
+    try std.testing.expectEqual(
+        std.process.Child.StdIo.Pipe,
+        evaluator.childStdinBehavior(),
+    );
 }
 
 test "evaluator materializeString reports missing pipe handle" {
