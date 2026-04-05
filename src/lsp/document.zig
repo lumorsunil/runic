@@ -28,6 +28,7 @@ pub const LspDocumentStore = struct {
         while (it.next()) |entry| {
             self.allocator.free(@constCast(entry.key_ptr.*));
             entry.value_ptr.*.deinit(self.allocator);
+            self.allocator.destroy(entry.value_ptr.*);
         }
         self.map.deinit();
     }
@@ -96,6 +97,7 @@ pub const LspDocumentStore = struct {
             self.allocator.free(@constCast(removed.key));
             var removed_copy = removed.value;
             removed_copy.deinit(self.allocator);
+            self.allocator.destroy(removed.value);
         }
 
         const document = try self.createAndStoreDocument(uri, path, text, version, .client);

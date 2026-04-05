@@ -2766,8 +2766,6 @@ pub const Parser = struct {
         });
         _ = try self.expectTokenTag(.r_paren);
         const returnType = try self.parseMaybeTypeExpr();
-        // TODO: lambdas
-        // const block = try self.parseBlock();
         const body = try self.parseExpression();
 
         return self.allocExpression(.{ .fn_decl = .{
