@@ -148,7 +148,7 @@ pub const DidCloseTextDocumentParams = struct {
     textDocument: TextDocumentIdentifier,
 };
 
-// {"params":{"textDocument":{"uri":"file:\\/\\/\\/home\\/lumorsunil\\/repos\\/runic\\/test.rn"},"position":{"line":7,"character":1},"context":{"triggerKind":1}},"jsonrpc":"2.0","method":"textDocument\\/completion","id":2}
+// {"params":{"textDocument":{"uri":"file:///path/to/test.rn"},"position":{"line":7,"character":1},"context":{"triggerKind":1}},"jsonrpc":"2.0","method":"textDocument/completion","id":2}
 pub const CompletionParams = struct {
     textDocument: TextDocumentIdentifier,
     position: Position,
