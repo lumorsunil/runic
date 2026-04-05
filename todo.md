@@ -129,16 +129,23 @@
 - [ ] implement basic snippets (const/var/fn)
 - [x] hover
   - [x] basic hover implementation, identifier lookup
-- [ ] go to definition
+- [x] go to definition
+- [ ] workspace-wide go to definition for symbols not present in currently tracked documents
 - [x] completions for keywords
   - [ ] bug: markdown syntax highlighting does not work for runic
 - [x] restart causes leaks and crashes
 - [x] completions for import module names
 - [x] document change does not reflect new symbols
 - [x] didChange support, document diagnostics
+- [ ] add protocol regressions for incremental `didChange` edits
 - [x] crashes (investigate that we do similar setup as run_script)
 - [x] type checker integration
   - [x] type checking imports
+- [x] references
+- [ ] workspace-wide references beyond currently tracked/open documents
+- [x] rename
+- [ ] workspace-wide rename
+- [ ] improve semantic definition/rename/reference resolution for module members so it does not rely on conservative symbol fallbacks
 - [ ] bug: takes 100% cpu after a while
 - [ ] bug: stops working after a while, may be related to bug above
 - [ ] add support for document links?
@@ -161,6 +168,13 @@
 
 - [ ] std lib special import module name "std"
 - [ ] stored on file system so that you can access the source code through the lsp
+
+## repo / tooling
+
+- [ ] replace remaining `.sh` scripts in the repo with `.rn` equivalents where practical
+  - long term goal: Runic should be able to drive its own contributor/test/tooling workflows instead of depending on shell wrappers
+- [ ] add first-class regression coverage for `scripts/run_ci.rn`
+- [ ] move Neovim tree-sitter/parser registration out of `editor/neovim/syntax/runic.vim` into a more appropriate plugin/setup file
 
 ## parser
 
@@ -201,6 +215,8 @@
   - [x] env vars are populated into global scope
   - [ ] way to check if identifier exists (orelse except for this specific purpose) ?
 - [ ] do we want to strip newlines at the end of an echo or not?
+- [ ] preserve ANSI/TTY-aware output when a Runic script runs subprocesses
+  - executables launched from inside scripts like `scripts/run_ci.rn` should still emit color/ANSI output when appropriate
 
 ### data
 
