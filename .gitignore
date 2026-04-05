@@ -29,3 +29,6 @@ tmp/
 
 # Env
 .env
+
+# Codex
+.codex
