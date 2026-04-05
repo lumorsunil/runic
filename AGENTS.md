@@ -13,5 +13,8 @@ Follow the idioms of the chosen language (folder structure, naming, indentation)
 ## Testing Guidelines
 Place unit tests alongside their modules when the language supports it and rely on `tests/` for public API and CLI smoke suites. Favor table-driven cases for quoting and pipeline semantics. Every new feature should include at least one regression test covering both success and failure flows; when behavior spans multiple binaries, prefer snapshot-style tests under `tests/cli_*`. After making changes, run a local regression pass before concluding the work. Use the broader combination-oriented Runic suite in `tests/features/feature_combinations.rn` alongside the rest of the suite so interactions between features are exercised, not just isolated primitives. If the regression pass exposes issues in the recent implementation, continue by investigating and fixing those failures as part of the same task. Run the full test suite locally before pushing and note any ignored tests in the PR body.
 
+## Backlog Hygiene
+Keep [todo.md](todo.md) aligned with the current implementation. If you implement or fix an item that is already tracked there, update the checklist entry in the same change instead of leaving stale backlog state behind.
+
 ## Commit & Pull Request Guidelines
 Adopt a Conventional Commits prefix (`parser:`, `runtime:`, `docs:`) plus an imperative summary under 72 characters, e.g., `runtime: enforce exit code propagation`. Each PR should describe motivation, implementation notes, and verification steps; link issues with `Fixes #ID` and attach logs or terminal transcripts demonstrating the change. Keep PRs narrowly scoped and request reviews only after formatting, linting, and tests pass.
