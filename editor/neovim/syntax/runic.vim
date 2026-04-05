@@ -2,13 +2,16 @@ if exists("b:current_syntax")
   finish
 endif
 
+let s:runic_treesitter_dir = fnamemodify(expand('<sfile>:p:h') . '/../tree-sitter', ':p')
+let g:runic_treesitter_dir = s:runic_treesitter_dir
+
 lua << EOF
 local parser_config = require("nvim-treesitter.parsers").get_parser_configs()
 
 parser_config.runic = {
     install_info = {
       -- path to the directory containing grammar.js and src/parser.c
-      url = "/home/lumorsunil/repos/runic/editor/neovim/tree-sitter",
+      url = vim.fn.expand(vim.g.runic_treesitter_dir or ""),
       files = { "src/parser.c" },  -- add "src/scanner.c" or ".cc" if you have one
       generate_requires_npm = false,
       requires_generate_from_grammar = false,
@@ -16,6 +19,8 @@ parser_config.runic = {
     filetype = "runic",  -- internal name; can be "rn" if you prefer
 }
 EOF
+
+unlet s:runic_treesitter_dir
 
 " Basic Vim syntax fallback/highlighting for Runic.
 "
