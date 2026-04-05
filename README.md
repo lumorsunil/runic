@@ -155,6 +155,21 @@ Each stage stops the pipeline on failure so contributors get immediate feedback.
 
 Each stage script expects `RUNIC_REPO_ROOT` to point at the repository root and `RUNIC_LANG` to describe the toolchain; `scripts/run_ci.rn` exports both before invoking a stage. You can rerun an individual phase by calling, for example, `RUNIC_LANG=zig RUNIC_REPO_ROOT=$PWD ./scripts/stages/unit_tests.sh` when iterating on a specific failure.
 
+## Contributing
+
+Contributions are welcome, but Runic is still changing quickly, so it helps to
+start from the current implementation and roadmap rather than older design
+notes.
+
+- Read [CONTRIBUTING.md](CONTRIBUTING.md) for contributor workflow, testing
+  expectations, and PR guidance.
+- Read [docs/plan.md](docs/plan.md) for the current roadmap.
+- Read [todo.md](todo.md) for lower-level backlog items and known bugs.
+
+In general, the most useful contributions are focused bug fixes, regression
+tests, roadmap-aligned improvements, and documentation updates that match the
+current behavior.
+
 ## Authoring modules
 
 Runic modules are currently regular `.rn` files imported from other `.rn`
