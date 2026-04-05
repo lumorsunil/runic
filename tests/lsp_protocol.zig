@@ -8,6 +8,16 @@ const ProtocolResponse = struct {
     body: []const u8,
 };
 
+const ServerRunResult = struct {
+    stdout: []const u8,
+    stderr: []const u8,
+
+    fn deinit(self: ServerRunResult, allocator: Allocator) void {
+        allocator.free(self.stdout);
+        allocator.free(self.stderr);
+    }
+};
+
 test "lsp formatting preserves comments" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
@@ -360,6 +370,48 @@ test "lsp publishes diagnostics for invalid source" {
     try std.testing.expect(diagnostics.len > 0);
 }
 
+test "lsp didChange and completion stay quiet on stderr" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const uri = try fixture.writeDocument("main.rn",
+        \\const foo = 1
+        \\echo foo
+        \\
+    );
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri,
+            \\const foo = 1
+            \\echo foo
+            \\
+        ),
+        try makeDidChangeWholeDocument(allocator, uri, 2,
+            \\const food = 1
+            \\echo food
+            \\
+        ),
+        try makeCompletionRequest(allocator, 8, uri, 1, 9),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const result = try runServerWithMessagesDetailed(allocator, &messages);
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqualStrings("", result.stderr);
+
+    const response = try findResponseById(allocator, result.stdout, 8);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const items = parsed.value.object.get("result").?.object.get("items").?.array.items;
+    try std.testing.expect(items.len > 0);
+}
+
 const TestFixture = struct {
     allocator: Allocator,
     tmp_dir: std.testing.TmpDir,
@@ -391,6 +443,12 @@ const TestFixture = struct {
 };
 
 fn runServerWithMessages(allocator: Allocator, messages: []const []const u8) ![]u8 {
+    const result = try runServerWithMessagesDetailed(allocator, messages);
+    defer allocator.free(result.stderr);
+    return @constCast(result.stdout);
+}
+
+fn runServerWithMessagesDetailed(allocator: Allocator, messages: []const []const u8) !ServerRunResult {
     var fixture = try TestFixture.init(allocator);
     defer fixture.deinit();
 
@@ -424,7 +482,13 @@ fn runServerWithMessages(allocator: Allocator, messages: []const []const u8) ![]
     try server.run();
 
     try output_file.seekTo(0);
-    return try output_file.readToEndAlloc(allocator, 1024 * 1024);
+    const stdout = try output_file.readToEndAlloc(allocator, 1024 * 1024);
+    try error_file.seekTo(0);
+    const stderr = try error_file.readToEndAlloc(allocator, 1024 * 1024);
+    return .{
+        .stdout = stdout,
+        .stderr = stderr,
+    };
 }
 
 fn findResponseById(allocator: Allocator, output: []const u8, wanted_id: i64) !ProtocolResponse {
@@ -500,6 +564,48 @@ fn makeDidOpen(allocator: Allocator, uri: []const u8, text: []const u8) ![]u8 {
                 .languageId = "runic",
                 .version = 1,
                 .text = text,
+            },
+        },
+    });
+}
+
+fn makeDidChangeWholeDocument(
+    allocator: Allocator,
+    uri: []const u8,
+    version: i64,
+    text: []const u8,
+) ![]u8 {
+    return toJsonAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .method = "textDocument/didChange",
+        .params = .{
+            .textDocument = .{
+                .uri = uri,
+                .version = version,
+            },
+            .contentChanges = &.{
+                .{ .text = text },
+            },
+        },
+    });
+}
+
+fn makeCompletionRequest(
+    allocator: Allocator,
+    id: i64,
+    uri: []const u8,
+    line: u32,
+    character: u32,
+) ![]u8 {
+    return toJsonAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .id = id,
+        .method = "textDocument/completion",
+        .params = .{
+            .textDocument = .{ .uri = uri },
+            .position = .{
+                .line = line,
+                .character = character,
             },
         },
     });

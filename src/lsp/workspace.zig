@@ -23,10 +23,10 @@ fn keywordSymbols(allocator: Allocator) ![]const symbols.Symbol {
     var list = std.ArrayList(symbols.Symbol).empty;
 
     try list.appendSlice(allocator, &.{
-        try makeKeyword(allocator, "import", "# import\nImport a runic module.\n\n```runic\nconst lib = import \"lib.rn\"\n```"),
-        try makeKeyword(allocator, "const", "Define a constant.\n\n```runic\nconst myConst = 5\n```"),
-        try makeKeyword(allocator, "var", "Define a variable.\n\n```runic\nvar myConst = 5\nmyConst = 3\n```"),
-        try makeKeyword(allocator, "fn", "Declare a function.\n\n```runic\nfn hello() Void {\n    echo \"hello\"\n}\n```"),
+        try makeKeyword(allocator, "import", "# import\nImport a runic module.\n\n```\nconst lib = import \"lib.rn\"\n```"),
+        try makeKeyword(allocator, "const", "Define a constant.\n\n```\nconst myConst = 5\n```"),
+        try makeKeyword(allocator, "var", "Define a variable.\n\n```\nvar myConst = 5\nmyConst = 3\n```"),
+        try makeKeyword(allocator, "fn", "Declare a function.\n\n```\nfn hello() Void {\n    echo \"hello\"\n}\n```"),
     });
 
     return try list.toOwnedSlice(allocator);

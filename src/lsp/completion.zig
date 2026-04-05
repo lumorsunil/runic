@@ -99,7 +99,6 @@ fn determineCompletionKind(context: CollectMatchesContext) !CompletionKind {
     const line_slice = getLine(context);
     var lexer = try runic.lexer.Stream.init(context.allocator, context.file, line_slice);
     defer lexer.deinit();
-    lexer.lexer.logging_enabled = true;
 
     while (true) {
         const next = lexer.next() catch return .symbol;
@@ -154,7 +153,6 @@ fn collectModuleMatches(context: CollectMatchesContext) !MatchList {
     const dirname = try std.fs.path.join(context.allocator, &.{ script_dirname, module_path_prefix });
     defer context.allocator.free(dirname);
 
-    std.log.err("collecting module matches in: {s}", .{dirname});
     var dir = try std.fs.openDirAbsolute(dirname, .{ .iterate = true });
     defer dir.close();
     var it = dir.iterate();
@@ -197,7 +195,6 @@ fn appendMatches(
     mode: FilterMode,
 ) !void {
     for (symbol_list) |*entry| {
-        std.log.err("Trying to match \"{s}\" against \"{s}\"", .{ prefix, entry.name });
         if (!symbolMatches(entry.name, prefix, mode)) continue;
         try matches.items.append(matches.allocator, .{ .symbol = .{ .notOwned = entry }, .source = source });
     }

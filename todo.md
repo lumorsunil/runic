@@ -132,7 +132,7 @@
 - [x] go to definition
 - [ ] workspace-wide go to definition for symbols not present in currently tracked documents
 - [x] completions for keywords
-  - [ ] bug: markdown syntax highlighting does not work for runic
+  - [x] bug: markdown syntax highlighting does not work for runic
 - [x] restart causes leaks and crashes
 - [x] completions for import module names
 - [x] document change does not reflect new symbols
@@ -146,8 +146,8 @@
 - [x] rename
 - [ ] workspace-wide rename
 - [ ] improve semantic definition/rename/reference resolution for module members so it does not rely on conservative symbol fallbacks
-- [ ] bug: takes 100% cpu after a while
-- [ ] bug: stops working after a while, may be related to bug above
+- [x] bug: takes 100% cpu after a while
+- [x] bug: stops working after a while, may be related to bug above
 - [ ] add support for document links?
 
 ## imports
@@ -171,6 +171,8 @@
 
 ## repo / tooling
 
+- [x] add a shell safety wrapper for `scripts/run_ci.rn`
+  - `scripts/run_ci.sh` should validate that the Runic-driven CI path emits expected output and fall back to the direct shell stages if the Runic path regresses
 - [ ] replace remaining `.sh` scripts in the repo with `.rn` equivalents where practical
   - long term goal: Runic should be able to drive its own contributor/test/tooling workflows instead of depending on shell wrappers
 - [ ] add first-class regression coverage for `scripts/run_ci.rn`
@@ -399,8 +401,7 @@
 - [x] pipelines are broken again
 - [x] escaped double quotes print as \"
 - [ ] `$(sleep 0.5; echo "after")` produces a parsing error
-- [ ] syntax highlighting not implemented for:
-  - [ ] match
+- [x] syntax highlighting for match
 - [ ] `true "hello` is parsed as a call with `true` as the callee
 - [x] scripts/run_ci.rn fails with: `Type checker failed to run: error.UnsupportedStatement`
 - [x] scripts/run_ci.rn fails to detect Zig when repo-root paths are built from env-backed strings

@@ -225,8 +225,6 @@ pub const LspDocumentStore = struct {
         doc.manage_mode = .client;
 
         const text = try self.updateDocumentText(doc, events);
-        std.log.err("new document text: \n\n{s}", .{text});
-
         try doc.setText(self.allocator, text, version);
         self.allocator.free(text);
         try doc.rebuildSymbols(
@@ -280,15 +278,12 @@ pub const LspDocumentStore = struct {
     }
 
     pub fn close(self: *LspDocumentStore, uri: []const u8) void {
-        const document = self.get(uri) orelse return;
-        document.manage_mode = .server;
-        document.version = 0;
-
-        // if (self.map.fetchRemove(uri)) |removed| {
-        //     self.allocator.free(@constCast(removed.key));
-        //     var document = removed.value;
-        //     document.deinit(self.allocator);
-        // }
+        if (self.map.fetchRemove(uri)) |removed| {
+            self.allocator.free(@constCast(removed.key));
+            var document = removed.value;
+            document.deinit(self.allocator);
+            self.allocator.destroy(document);
+        }
     }
 
     pub fn resolveUri(self: LspDocumentStore, path: []const u8) ![]const u8 {

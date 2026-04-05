@@ -143,20 +143,13 @@ pub const Server = struct {
             },
             .@"textDocument/completion" => |params| {
                 if (request.id) |id| {
-                    // try self.handleCompletion(id, params);
-                    self.handleCompletion(id, params) catch |err| {
-                        std.log.err("Could not handleCompletion: {}, writer error: {?}", .{ err, self.stdout_writer.err });
-                        return err;
-                    };
+                    try self.handleCompletion(id, params);
                 }
                 return true;
             },
             .@"textDocument/hover" => |params| {
                 if (request.id) |id| {
-                    self.handleHover(id, params) catch |err| {
-                        std.log.err("Could not handleHover: {}, writer error: {?}", .{ err, self.stdout_writer.err });
-                        return err;
-                    };
+                    try self.handleHover(id, params);
                 }
                 return true;
             },
@@ -358,8 +351,6 @@ pub const Server = struct {
         const doc_symbols = if (doc) |d| d.symbols.items else &[_]symbols.Symbol{};
         const workspace_symbols = self.workspace.symbolSlice();
 
-        std.log.err("workspace_symbols: {}", .{workspace_symbols.len});
-
         var matches = try completion.collectMatches(.{
             .allocator = self.allocator,
             .file = owned_path,
@@ -407,7 +398,7 @@ pub const Server = struct {
         defer alloc_writer.deinit();
 
         if (binding) |b| {
-            alloc_writer.writer.writeAll("```runic\n") catch {};
+            alloc_writer.writer.writeAll("```\n") catch {};
             if (b.is_mutable) {
                 alloc_writer.writer.writeAll("var ") catch {};
             } else {
