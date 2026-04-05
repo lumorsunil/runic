@@ -903,7 +903,7 @@ pub const Parser = struct {
                         .l_bracket => {
                             _ = try self.nextToken();
                             try components.append(self.allocator, .{
-                                .op = token.Spanned(ast.BinaryOp).fromToken(next) orelse @panic("shouldn't happen :)"),
+                                .op = token.Spanned(ast.BinaryOp).fromToken(next) orelse @panic("shouldn't happen <:)-|-<"),
                             });
                             state.advance();
                             try components.append(self.allocator, .{
@@ -911,14 +911,6 @@ pub const Parser = struct {
                             });
                             _ = try self.expectTokenTag(.r_bracket);
                             continue;
-                        },
-                        .comma => {
-                            try components.append(self.allocator, .{
-                                .op = token.Spanned(ast.BinaryOp){
-                                    .payload = .apply,
-                                    .span = next.span,
-                                },
-                            });
                         },
                         else => {
                             if (next.tag == .range) break;
