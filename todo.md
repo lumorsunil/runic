@@ -124,7 +124,7 @@
 
 ## lsp
 
-- [ ] completions for member access (need some sort of scope machinery around collecting symbols and stuff, and it would help a ton with semantic analysis)
+- [x] completions for member access
 - [ ] add more information to completion results (symbol type, etc)
 - [ ] implement basic snippets (const/var/fn)
 - [x] hover

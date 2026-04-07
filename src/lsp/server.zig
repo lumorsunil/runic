@@ -347,6 +347,19 @@ pub const Server = struct {
         const char_val = params.position.character;
         const line_index: usize = @as(usize, @intCast(line_val));
         const char_index: usize = @as(usize, @intCast(char_val));
+        var loc = params.position.toLocation(owned_path);
+        loc.offset = params.position.findIndex(text_slice) orelse 0;
+
+        var scope = self.workspace.type_checker.getScopeFromLoc(loc);
+        if (scope == null and loc.offset > 0) {
+            var prev_loc = loc;
+            prev_loc.offset -= 1;
+            prev_loc.column -|= 1;
+            scope = self.workspace.type_checker.getScopeFromLoc(prev_loc);
+        }
+        if (scope == null) {
+            scope = self.workspace.type_checker.modules.get(owned_path);
+        }
 
         const doc_symbols = if (doc) |d| d.symbols.items else &[_]symbols.Symbol{};
         const workspace_symbols = self.workspace.symbolSlice();
@@ -359,6 +372,8 @@ pub const Server = struct {
             .char_index = char_index,
             .doc_symbols = doc_symbols,
             .workspace_symbols = workspace_symbols,
+            .scope = scope,
+            .type_checker = &self.workspace.type_checker,
         });
         defer matches.deinit();
 
@@ -378,6 +393,7 @@ pub const Server = struct {
         var loc = params.position.toLocation(path);
         if (doc) |d| loc.offset = params.position.findIndex(d.text) orelse 0;
         const extracted_identifier = if (doc) |d| self.extractIdentifier(loc, d.text) else null;
+        const extracted_member = if (doc) |d| self.extractMember(loc, d.text) else null;
         const scope = self.workspace.type_checker.getScopeFromLoc(loc);
 
         const binding: ?*runic.semantic.Scope.Binding = brk: {
@@ -388,7 +404,16 @@ pub const Server = struct {
             break :brk null;
         };
 
+        const member_binding: ?*runic.semantic.Scope.Binding = brk: {
+            if (scope) |s| if (extracted_member) |m| {
+                break :brk s.lookup(m.object_name);
+            };
+
+            break :brk null;
+        };
+
         const range: types.Range = brk: {
+            if (extracted_member) |m| break :brk .fromSpan(m.member_span);
             if (binding) |b| break :brk .fromSpan(b.identifier.span);
             if (extracted_identifier) |i| break :brk .fromSpan(i.span);
             break :brk .fromLocation(loc);
@@ -397,21 +422,14 @@ pub const Server = struct {
         var alloc_writer = std.Io.Writer.Allocating.init(self.allocator);
         defer alloc_writer.deinit();
 
-        if (binding) |b| {
-            alloc_writer.writer.writeAll("```\n") catch {};
-            if (b.is_mutable) {
-                alloc_writer.writer.writeAll("var ") catch {};
-            } else {
-                alloc_writer.writer.writeAll("const ") catch {};
+        if (extracted_member) |member| {
+            if (member_binding) |b| {
+                if (b.type_expr) |binding_type| {
+                    self.writeHoverMember(&alloc_writer, binding_type, member.member_name);
+                }
             }
-            alloc_writer.writer.writeAll(b.identifier.name) catch {};
-            if (b.identifier.isTypeIdentifier()) {
-                alloc_writer.writer.writeAll(" = ") catch {};
-            } else {
-                alloc_writer.writer.writeAll(": ") catch {};
-            }
-            alloc_writer.writer.print("{?f}\n", .{b.type_expr}) catch {};
-            alloc_writer.writer.writeAll("```") catch {};
+        } else if (binding) |b| {
+            self.writeHoverBinding(&alloc_writer, b);
         } else {
             // alloc_writer.writer.writeAll("Something went wrong.") catch {};
         }
@@ -430,6 +448,12 @@ pub const Server = struct {
     const ExtractedIdentifier = struct {
         name: []const u8,
         span: runic.ast.Span,
+    };
+
+    const ExtractedMember = struct {
+        object_name: []const u8,
+        member_name: []const u8,
+        member_span: runic.ast.Span,
     };
 
     fn findIdentifierRanges(
@@ -481,12 +505,114 @@ pub const Server = struct {
         const tok = lexer.next() catch return null;
 
         return switch (tok.tag) {
-            .identifier => .{
-                .name = tok.lexeme,
-                .span = tok.span,
+            .identifier => blk: {
+                const start_column = loc.column -| (loc.offset - start);
+                break :blk .{
+                    .name = tok.lexeme,
+                    .span = .{
+                        .start = .{
+                            .file = loc.file,
+                            .line = loc.line,
+                            .column = start_column,
+                            .offset = start,
+                        },
+                        .end = .{
+                            .file = loc.file,
+                            .line = loc.line,
+                            .column = start_column + tok.lexeme.len,
+                            .offset = start + tok.lexeme.len,
+                        },
+                    },
+                };
             },
             else => null,
         };
+    }
+
+    fn extractMember(
+        self: *@This(),
+        loc: runic.token.Location,
+        text: []const u8,
+    ) ?ExtractedMember {
+        const member = self.extractIdentifier(loc, text) orelse return null;
+        if (member.span.start.offset == 0) return null;
+        if (text[member.span.start.offset - 1] != '.') return null;
+        if (member.span.start.offset < 2) return null;
+
+        const object_loc = runic.token.Location{
+            .file = loc.file,
+            .line = member.span.start.line,
+            .column = member.span.start.column -| 2,
+            .offset = member.span.start.offset - 2,
+        };
+        const object = self.extractIdentifier(object_loc, text) orelse return null;
+
+        return .{
+            .object_name = object.name,
+            .member_name = member.name,
+            .member_span = member.span,
+        };
+    }
+
+    fn writeHoverBinding(
+        _: *Server,
+        alloc_writer: *std.Io.Writer.Allocating,
+        binding: *const runic.semantic.Scope.Binding,
+    ) void {
+        alloc_writer.writer.writeAll("```\n") catch {};
+        if (binding.is_mutable) {
+            alloc_writer.writer.writeAll("var ") catch {};
+        } else {
+            alloc_writer.writer.writeAll("const ") catch {};
+        }
+        alloc_writer.writer.writeAll(binding.identifier.name) catch {};
+        if (binding.identifier.isTypeIdentifier()) {
+            alloc_writer.writer.writeAll(" = ") catch {};
+        } else {
+            alloc_writer.writer.writeAll(": ") catch {};
+        }
+        alloc_writer.writer.print("{?f}\n", .{binding.type_expr}) catch {};
+        alloc_writer.writer.writeAll("```") catch {};
+    }
+
+    fn writeHoverMember(
+        self: *Server,
+        alloc_writer: *std.Io.Writer.Allocating,
+        binding_type: *const runic.ast.TypeExpr,
+        member_name: []const u8,
+    ) void {
+        const resolved_type = switch (binding_type.*) {
+            .alias => |alias_type| self.workspace.type_checker.resolveAliasType(&alias_type),
+            else => binding_type,
+        };
+
+        alloc_writer.writer.writeAll("```\n") catch {};
+        alloc_writer.writer.print("const {s}: ", .{member_name}) catch {};
+
+        switch (resolved_type.*) {
+            .execution => {
+                if (std.mem.eql(u8, member_name, "stdout") or std.mem.eql(u8, member_name, "stderr")) {
+                    alloc_writer.writer.writeAll("[]Byte\n") catch {};
+                } else if (std.mem.eql(u8, member_name, "exit_code")) {
+                    alloc_writer.writer.writeAll("Int\n") catch {};
+                } else if (std.mem.eql(u8, member_name, "wait")) {
+                    alloc_writer.writer.writeAll("ExecutionResult\n") catch {};
+                }
+            },
+            .thread => {
+                if (std.mem.eql(u8, member_name, "wait")) {
+                    alloc_writer.writer.writeAll("ExecutionResult\n") catch {};
+                }
+            },
+            .struct_type => |struct_type| {
+                if (struct_type.memberType(member_name)) |member_type| {
+                    alloc_writer.writer.print("{f}\n", .{member_type}) catch {};
+                }
+            },
+            else => {},
+        }
+
+        alloc_writer.writer.writeAll("```") catch {};
     }
 
     fn handleDefinition(
@@ -633,7 +759,9 @@ pub const Server = struct {
             for (ws_doc.symbols.items) |sym| {
                 const kind: types.SymbolKind = switch (sym.kind) {
                     .function => .function,
+                    .method => .method,
                     .variable => .variable,
+                    .field => .field,
                     .module => .module,
                     .keyword => .keyword,
                 };

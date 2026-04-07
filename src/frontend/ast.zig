@@ -282,6 +282,24 @@ pub const TypeExpr = union(enum) {
             return LayoutError.FieldNotFound;
         }
 
+        pub fn memberType(
+            self: @This(),
+            member_name: []const u8,
+        ) ?*const TypeExpr {
+            for (self.fields) |field| {
+                if (std.mem.eql(u8, field.name.name, member_name)) {
+                    return field.type_expr;
+                }
+            }
+
+            for (self.decls) |decl| {
+                if (!std.mem.eql(u8, decl.name.name, member_name)) continue;
+                return decl.type_expr;
+            }
+
+            return null;
+        }
+
         pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
             try writer.writeAll("<struct>{\n");
             for (self.fields) |field| {
@@ -518,7 +536,7 @@ pub const TypeExpr = union(enum) {
                 try writer.writeAll("Null");
             },
             .execution => {
-                try writer.writeAll("Execution");
+                try writer.writeAll("ExecutionResult");
             },
             .fn_ref_type => |frt| {
                 try writer.print("<fn_ref:{}>", .{frt.instr_set});
@@ -793,13 +811,17 @@ pub const CallExpr = struct {
 
     pub fn resolveType(
         self: *@This(),
-        _: std.mem.Allocator,
-        _: *semantic.Scope,
+        allocator: std.mem.Allocator,
+        scope: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
         if (self.background) return &globalExecutionType;
-        // 1. turn expression into function (or already function)
-        // 2. return return type of function
-        return null;
+
+        const callee_type = try self.callee.resolveType(allocator, scope) orelse return null;
+
+        return switch (callee_type.*) {
+            .function => |function| function.return_type orelse &globalExecutionType,
+            else => null,
+        };
     }
 };
 
@@ -826,11 +848,19 @@ pub const MemberExpr = struct {
             return switch (object_type.*) {
                 .execution => object_type,
                 .thread => object_type,
+                .struct_type => |struct_type| if (isExecutionLikeStruct(struct_type)) object_type else null,
                 else => null,
             };
         }
 
-        return null;
+        return switch (object_type.*) {
+            .struct_type => |struct_type| struct_type.memberType(self.member.name),
+            else => null,
+        };
+    }
+
+    fn isExecutionLikeStruct(struct_type: TypeExpr.StructType) bool {
+        return struct_type.memberType("stdout") != null and struct_type.memberType("stderr") != null;
     }
 };
 
@@ -1199,11 +1229,12 @@ pub const Pipeline = struct {
 
     pub fn resolveType(
         self: *@This(),
-        _: std.mem.Allocator,
-        _: *semantic.Scope,
+        allocator: std.mem.Allocator,
+        scope: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
         if (self.background) return &globalExecutionType;
-        return null;
+        if (self.stages.len == 0) return null;
+        return self.stages[self.stages.len - 1].resolveType(allocator, scope);
     }
 };
 
@@ -1535,7 +1566,7 @@ pub const ExecutableExpr = struct {
         _: std.mem.Allocator,
         _: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
-        return null;
+        return &TypeExpr.executableType;
     }
 };
 

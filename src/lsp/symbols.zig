@@ -7,7 +7,9 @@ const Allocator = std.mem.Allocator;
 pub const SymbolKind = enum {
     module,
     function,
+    method,
     variable,
+    field,
     keyword,
 };
 

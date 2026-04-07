@@ -412,6 +412,203 @@ test "lsp didChange and completion stay quiet on stderr" {
     try std.testing.expect(items.len > 0);
 }
 
+test "lsp member completion prefers module members over keywords" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const module_uri = try fixture.writeDocument("module.rn",
+        \\pub const version = "0.0.1"
+        \\pub fn add(x: Int, y: Int) Int {
+        \\    return x + y
+        \\}
+        \\
+    );
+    defer allocator.free(module_uri);
+
+    const main_uri = try fixture.writeDocument("main.rn",
+        \\const m = import "./module.rn"
+        \\echo m.v
+        \\
+    );
+    defer allocator.free(main_uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, module_uri,
+            \\pub const version = "0.0.1"
+            \\pub fn add(x: Int, y: Int) Int {
+            \\    return x + y
+            \\}
+            \\
+        ),
+        try makeDidOpen(allocator, main_uri,
+            \\const m = import "./module.rn"
+            \\echo m.v
+            \\
+        ),
+        try makeCompletionRequest(allocator, 9, main_uri, 1, 7),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 9);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const items = parsed.value.object.get("result").?.object.get("items").?.array.items;
+    try std.testing.expect(items.len > 0);
+
+    var saw_version = false;
+    var saw_add = false;
+    var saw_stdout = false;
+    var saw_keyword_const = false;
+    for (items) |item| {
+        const label = item.object.get("label").?.string;
+        if (std.mem.eql(u8, label, "version")) saw_version = true;
+        if (std.mem.eql(u8, label, "add")) saw_add = true;
+        if (std.mem.eql(u8, label, "stdout")) saw_stdout = true;
+        if (std.mem.eql(u8, label, "const")) saw_keyword_const = true;
+    }
+
+    try std.testing.expect(saw_version);
+    try std.testing.expect(saw_add);
+    try std.testing.expect(saw_stdout);
+    try std.testing.expect(!saw_keyword_const);
+}
+
+test "lsp hover shows execution result type for bound command" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const uri = try fixture.writeDocument("main.rn",
+        \\const h = echo "hello"
+        \\echo "${h.stdout}"
+        \\
+    );
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri,
+            \\const h = echo "hello"
+            \\echo "${h.stdout}"
+            \\
+        ),
+        try makeHoverRequest(allocator, 10, uri, 0, 6),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 10);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const value = parsed.value.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, value, "ExecutionResult") != null);
+}
+
+test "lsp hover shows execution result member type" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const uri = try fixture.writeDocument("main.rn",
+        \\const h = echo "hello"
+        \\echo h.stdout
+        \\
+    );
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri,
+            \\const h = echo "hello"
+            \\echo h.stdout
+            \\
+        ),
+        try makeHoverRequest(allocator, 12, uri, 1, 7),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 12);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const value = parsed.value.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, value, "stdout") != null);
+    try std.testing.expect(std.mem.indexOf(u8, value, "Byte") != null);
+}
+
+test "lsp member completion shows execution result members" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const uri = try fixture.writeDocument("main.rn",
+        \\const h = echo "hello"
+        \\echo h.
+        \\
+    );
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri,
+            \\const h = echo "hello"
+            \\echo h.
+            \\
+        ),
+        try makeCompletionRequest(allocator, 11, uri, 1, 7),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 11);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const items = parsed.value.object.get("result").?.object.get("items").?.array.items;
+    try std.testing.expect(items.len > 0);
+
+    var saw_stdout = false;
+    var saw_stderr = false;
+    var saw_exit_code = false;
+    var saw_wait = false;
+    var saw_keyword_const = false;
+    for (items) |item| {
+        const label = item.object.get("label").?.string;
+        if (std.mem.eql(u8, label, "stdout")) saw_stdout = true;
+        if (std.mem.eql(u8, label, "stderr")) saw_stderr = true;
+        if (std.mem.eql(u8, label, "exit_code")) saw_exit_code = true;
+        if (std.mem.eql(u8, label, "wait")) saw_wait = true;
+        if (std.mem.eql(u8, label, "const")) saw_keyword_const = true;
+    }
+
+    try std.testing.expect(saw_stdout);
+    try std.testing.expect(saw_stderr);
+    try std.testing.expect(saw_exit_code);
+    try std.testing.expect(saw_wait);
+    try std.testing.expect(!saw_keyword_const);
+
+    const first_kind = items[0].object.get("kind").?;
+    try std.testing.expect(first_kind == .integer);
+}
+
 const TestFixture = struct {
     allocator: Allocator,
     tmp_dir: std.testing.TmpDir,
@@ -671,6 +868,27 @@ fn makeDefinitionRequest(
         .jsonrpc = "2.0",
         .id = id,
         .method = "textDocument/definition",
+        .params = .{
+            .textDocument = .{ .uri = uri },
+            .position = .{
+                .line = line,
+                .character = character,
+            },
+        },
+    });
+}
+
+fn makeHoverRequest(
+    allocator: Allocator,
+    id: i64,
+    uri: []const u8,
+    line: u32,
+    character: u32,
+) ![]u8 {
+    return toJsonAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .id = id,
+        .method = "textDocument/hover",
         .params = .{
             .textDocument = .{ .uri = uri },
             .position = .{

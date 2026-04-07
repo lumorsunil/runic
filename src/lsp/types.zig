@@ -1450,6 +1450,13 @@ pub const CompletionItemKind = enum(u32) {
     event = 23,
     operator = 24,
     typeParameter = 25,
+
+    pub fn jsonStringify(
+        self: @This(),
+        stringify: *std.json.Stringify,
+    ) std.json.Stringify.Error!void {
+        try stringify.write(@intFromEnum(self));
+    }
 };
 
 /// Completion item tags are extra annotations that tweak the rendering of a completion item.

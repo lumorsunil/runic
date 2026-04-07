@@ -386,6 +386,70 @@ pub const TypeChecker = struct {
         };
     }
 
+    pub fn resolveModuleScopeForMemberCompletion(
+        self: *TypeChecker,
+        module: ast.TypeExpr.ModuleType,
+    ) Error!?*Scope {
+        return self.requestModuleScope(module);
+    }
+
+    fn allocStringType(self: *TypeChecker) Error!*const ast.TypeExpr {
+        const byte_type = try self.allocTypeExpression(.global(.byte));
+        return self.allocTypeExpression(.{ .array = .{
+            .element = byte_type,
+            .span = .global,
+        } });
+    }
+
+    fn buildModuleValueType(
+        self: *TypeChecker,
+        module: ast.TypeExpr.ModuleType,
+    ) Error!?*const ast.TypeExpr {
+        const module_scope = try self.requestModuleScope(module) orelse return null;
+
+        var public_count: usize = 0;
+        var it_count = module_scope.bindings.iterator();
+        while (it_count.next()) |entry| {
+            if (entry.value_ptr.is_pub) public_count += 1;
+        }
+
+        const fields = try self.arena.allocator().alloc(ast.TypeExpr.StructField, 3 + public_count);
+        fields[0] = .{
+            .name = ast.Identifier.global("stdout"),
+            .type_expr = try self.allocStringType(),
+            .span = .global,
+        };
+        fields[1] = .{
+            .name = ast.Identifier.global("stderr"),
+            .type_expr = try self.allocStringType(),
+            .span = .global,
+        };
+        fields[2] = .{
+            .name = ast.Identifier.global("exit_code"),
+            .type_expr = try self.allocTypeExpression(.global(.integer)),
+            .span = .global,
+        };
+
+        var i: usize = 3;
+        var it = module_scope.bindings.iterator();
+        while (it.next()) |entry| {
+            const binding = entry.value_ptr.*;
+            if (!binding.is_pub) continue;
+            fields[i] = .{
+                .name = binding.identifier,
+                .type_expr = binding.type_expr orelse try self.allocTypeExpression(.global(.void)),
+                .span = binding.identifier.span,
+            };
+            i += 1;
+        }
+
+        return self.allocTypeExpression(.{ .struct_type = .{
+            .fields = fields,
+            .decls = &.{},
+            .span = module.span,
+        } });
+    }
+
     fn runBlock(self: *TypeChecker, scope: *Scope, block: *ast.Block) Error!void {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, block.span);
@@ -1039,6 +1103,9 @@ pub const TypeChecker = struct {
         }
 
         if (binary.op.isAssignment()) {
+            if (binary.left.* == .env_var and isEnvAssignableType(right_type)) {
+                return;
+            }
             try self.validateTypeAssignment(left_type, right_type, .{ .span = right_type.span() });
         }
     }
@@ -1067,13 +1134,22 @@ pub const TypeChecker = struct {
             };
         }
 
+        if (std.mem.eql(u8, member.member.name, "wait")) {
+            return switch (object_type.*) {
+                .execution, .thread => {},
+                .struct_type => |struct_type| if (isExecutionLikeStruct(struct_type)) {} else error.MemberNotFound,
+                else => error.UnsupportedMemberAccess,
+            };
+        }
+
         switch (object_type.*) {
             .failed => {},
             .identifier => return error.UnresolvedTypeLiteral,
             .optional => return error.MemberAccessOnOptional,
             .array => |array| try self.runArrayMemberAccess(array, &member.member),
             .thread => try self.runThreadMemberAccess(&member.member),
-            .null, .promise, .error_union, .error_set, .err, .struct_type, .tuple, .function, .fn_ref_type, .integer, .float, .boolean, .byte, .alias, .void => return error.UnsupportedMemberAccess,
+            .struct_type => |struct_type| try self.runStructMemberAccess(struct_type, &member.member),
+            .null, .promise, .error_union, .error_set, .err, .tuple, .function, .fn_ref_type, .integer, .float, .boolean, .byte, .alias, .void => return error.UnsupportedMemberAccess,
             .module => |module| try self.runModuleMemberAccess(module, &member.member),
             .execution => |execution| try self.runExecutionMemberAccess(execution, &member.member),
             // .lazy => {
@@ -1094,6 +1170,19 @@ pub const TypeChecker = struct {
         if (std.mem.eql(u8, identifier.name, "len")) {
             return;
         }
+
+        return error.MemberNotFound;
+    }
+
+    pub fn runStructMemberAccess(
+        self: *TypeChecker,
+        struct_type: ast.TypeExpr.StructType,
+        identifier: *ast.Identifier,
+    ) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.logTypeCheckTrace(@src().fn_name, identifier.span);
+
+        if (struct_type.memberType(identifier.name) != null) return;
 
         return error.MemberNotFound;
     }
@@ -1144,6 +1233,18 @@ pub const TypeChecker = struct {
         if (std.mem.eql(u8, identifier.name, "wait")) return;
 
         return error.MemberNotFound;
+    }
+
+    fn isExecutionLikeStruct(struct_type: ast.TypeExpr.StructType) bool {
+        return struct_type.memberType("stdout") != null and struct_type.memberType("stderr") != null;
+    }
+
+    fn isEnvAssignableType(type_expr: *const ast.TypeExpr) bool {
+        return switch (type_expr.*) {
+            .execution => true,
+            .struct_type => |struct_type| isExecutionLikeStruct(struct_type),
+            else => false,
+        };
     }
 
     pub fn runPipeline(self: *TypeChecker, scope: *Scope, pipeline: *ast.Pipeline) Error!void {
@@ -1277,7 +1378,7 @@ pub const TypeChecker = struct {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, import.span);
 
-        const module_type = try self.resolveExprType(scope, import) orelse {
+        const raw_module_type = try import.resolveType(self.arena.allocator(), scope) orelse {
             try self.reportSpanError(
                 import.span,
                 Error.ModuleNotFound,
@@ -1288,10 +1389,10 @@ pub const TypeChecker = struct {
             return;
         };
 
-        _ = try self.requestModuleScope(module_type.module);
+        _ = try self.requestModuleScope(raw_module_type.module);
 
         // Modules must not declare parameters — use a function in a module instead.
-        const module_script = try self.document_store.getAst(module_type.module.path) orelse return;
+        const module_script = try self.document_store.getAst(raw_module_type.module.path) orelse return;
         if (module_script.signature) |sig| {
             switch (sig.params) {
                 ._non_variadic => |params| {
@@ -1358,6 +1459,19 @@ pub const TypeChecker = struct {
             self.arena.allocator(),
             scope,
         );
+
+        if (T == *ast.ImportExpr) {
+            if (result) |resolved| switch (resolved.*) {
+                .module => |module| return self.buildModuleValueType(module),
+                else => {},
+            };
+        }
+        if (T == ast.ImportExpr) {
+            if (result) |resolved| switch (resolved.*) {
+                .module => |module| return self.buildModuleValueType(module),
+                else => {},
+            };
+        }
 
         try self.logWithoutPrefix("result: {?f}\n", .{result});
 
