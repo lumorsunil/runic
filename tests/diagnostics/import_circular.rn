@@ -1,0 +1,3 @@
+const cycle = import "../support/imports/cycle_a.rn"
+
+echo "${cycle.name}"

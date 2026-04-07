@@ -1,0 +1,39 @@
+#!/usr/bin/env runic
+
+const repo_root = $RUNIC_REPO_ROOT orelse "."
+echo "repo_root=${repo_root}"
+
+const language = $RUNIC_LANG orelse (if (test "-f" "${repo_root}/Cargo.toml") {
+  "rust"
+} else if (test "-f" "${repo_root}/go.mod") {
+  "go"
+} else if (test "-f" "${repo_root}/build.zig") {
+  "zig"
+} else {
+  "unknown"
+})
+
+fn Void run_stage(stage_name: String) String {
+  const script_path = "./scripts/stages/${stage_name}.sh"
+
+  if (!test "-x" script_path) {
+    echo "Missing stage script: ${script_path}" >&2
+    exit 1
+  }
+
+  echo ""
+  echo "==> ${stage_name}"
+  $RUNIC_LANG = language
+  $RUNIC_REPO_ROOT = "."
+  bash script_path
+}
+
+echo "Runic CI pipeline (formatter → linter → unit tests → CLI regression tests)"
+echo "Detected toolchain: ${language}"
+
+mkdir "-p" "./scripts/stages"
+
+run_stage "formatter"
+run_stage "linter"
+run_stage "unit_tests"
+run_stage "cli_smoke"

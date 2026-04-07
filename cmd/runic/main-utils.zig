@@ -10,7 +10,6 @@ const ManagedArrayList = std.array_list.Managed;
 pub const CliConfig = struct {
     script: ScriptInvocation,
     trace_topics: [][]const u8,
-    module_paths: [][]const u8,
     env_overrides: []EnvOverride,
     print_ast: bool = false,
     print_tokens: bool = false,
@@ -37,8 +36,6 @@ pub const CliConfig = struct {
         if (self.script.source) |source| allocator.free(source);
 
         freeStringList(allocator, self.trace_topics);
-        freeStringList(allocator, self.module_paths);
-
         freeEnvOverrides(allocator, self.env_overrides);
         self.* = undefined;
     }
@@ -46,6 +43,7 @@ pub const CliConfig = struct {
 
 const ParseResult = union(enum) {
     show_help,
+    show_version,
     usage_error: []const u8,
     ready: CliConfig,
 };
@@ -200,8 +198,8 @@ fn renderExpressionAst(writer: *std.Io.Writer, expr: *const ast.Expression, leve
             try writeIndent(writer, level + 1);
             try writer.print("from: {s}\n", .{import_expr.importer});
             try writeIndent(writer, level + 1);
-            try writer.print("module: {s}", .{import_expr.module_name});
-            try writer.writeByte('\n');
+            try writer.print("module: {s}\n", .{import_expr.module_name});
+            try renderCallExpression(writer, level + 1, import_expr.call);
         },
         .member => |member_expr| {
             try writeIndent(writer, level);
@@ -264,26 +262,10 @@ fn renderExpressionAst(writer: *std.Io.Writer, expr: *const ast.Expression, leve
             try writer.writeByte('\n');
             try renderExpressionAst(writer, subshell.child, level + 1);
         },
-        .call => |call| {
-            try writeIndent(writer, level);
-            try writer.writeAll("call @ ");
-            try printSpanInline(writer, call.span);
-            try writer.writeByte('\n');
-            if (call.background) {
-                try writeIndent(writer, level + 1);
-                try writer.writeAll("background\n");
-            }
-            try writeIndent(writer, level + 1);
-            try writer.writeAll("callee:\n");
-            try renderExpressionAst(writer, call.callee, level + 2);
-            for (call.arguments, 0..) |arg, i| {
-                try writeIndent(writer, level + 1);
-                try writer.print("arg {}:\n", .{i});
-                try renderExpressionAst(writer, arg, level + 2);
-            }
-        },
+        .call => |call| try renderCallExpression(writer, level, call),
         .fn_decl => |fn_decl| {
             try writeIndent(writer, level);
+            if (fn_decl.is_pub) try writer.writeAll("pub ");
             try writer.print("fn_decl @ ", .{});
             try printSpanInline(writer, fn_decl.span);
             try writer.writeByte('\n');
@@ -305,6 +287,50 @@ fn renderExpressionAst(writer: *std.Io.Writer, expr: *const ast.Expression, leve
             try printSpanInline(writer, node.span());
             try writer.print(" (printing not implemented)\n", .{});
         },
+    }
+}
+
+fn renderCallExpression(writer: *std.Io.Writer, level: usize, call: ast.CallExpr) !void {
+    try writeIndent(writer, level);
+    try writer.writeAll("call @ ");
+    try printSpanInline(writer, call.span);
+    try writer.writeByte('\n');
+    if (call.background) {
+        try writeIndent(writer, level + 1);
+        try writer.writeAll("background\n");
+    }
+    try writeIndent(writer, level + 1);
+    try writer.writeAll("callee:\n");
+    try renderExpressionAst(writer, call.callee, level + 2);
+    for (call.arguments, 0..) |arg, i| {
+        try writeIndent(writer, level + 1);
+        try writer.print("arg {}:\n", .{i});
+        try renderExpressionAst(writer, arg, level + 2);
+    }
+    if (call.redirects.len > 0) {
+        try writeIndent(writer, level + 1);
+        try writer.writeAll("redirects:\n");
+        for (call.redirects) |redirect| {
+            try writeIndent(writer, level + 2);
+            try writer.print("stream: ", .{});
+            switch (redirect.stream) {
+                .stdin, .stdout, .stderr => try writer.print("{t}\n", .{redirect.stream}),
+                .descriptor => |d| try writer.print("fd: {}\n", .{d}),
+            }
+
+            try writeIndent(writer, level + 2);
+            try writer.print("mode: {t}\n", .{redirect.mode});
+
+            try writeIndent(writer, level + 2);
+            try writer.print("target:\n", .{});
+            switch (redirect.target) {
+                .path => |path| try renderExpressionAst(writer, path.value, level + 3),
+                .fd => |fd| {
+                    try writeIndent(writer, level + 3);
+                    try writer.print("fd: {}\n", .{fd});
+                },
+            }
+        }
     }
 }
 
@@ -342,6 +368,7 @@ fn renderStatementAst(writer: *std.Io.Writer, stmt: *const ast.Statement, level:
         },
         .binding_decl => |binding_decl| {
             try writeIndent(writer, level);
+            if (binding_decl.is_pub) try writer.writeAll("pub ");
             try writer.print("binding_decl @ ", .{});
             try printSpanInline(writer, binding_decl.span);
             try writer.writeByte('\n');
@@ -587,16 +614,11 @@ pub fn computeScriptDirectory(allocator: Allocator, script_path: []const u8) ![]
 
 pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseResult {
     const trace_prefix = "--trace=";
-    const module_prefix = "--module-path=";
     const env_prefix = "--env=";
 
     var trace_topics = ManagedArrayList([]const u8).init(allocator);
     var trace_cleanup = true;
     defer if (trace_cleanup) trace_topics.deinit();
-
-    var module_paths = ManagedArrayList([]const u8).init(allocator);
-    var module_cleanup = true;
-    defer if (module_cleanup) module_paths.deinit();
 
     var env_overrides = ManagedArrayList(CliConfig.EnvOverride).init(allocator);
     var env_cleanup = true;
@@ -630,6 +652,9 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
         if (parsing_options and arg.len > 0 and arg[0] == '-') {
             if (argEqual(arg, "--help") or argEqual(arg, "-h")) {
                 return ParseResult.show_help;
+            }
+            if (argEqual(arg, "--version") or argEqual(arg, "-V")) {
+                return ParseResult.show_version;
             }
             if (argEqual(arg, "--print-ast")) {
                 print_ast = true;
@@ -680,20 +705,6 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
                 idx += 1;
                 if (value.len == 0) return usageError(allocator, "--trace requires a topic name", .{});
                 try trace_topics.append(try allocator.dupe(u8, value));
-                continue;
-            }
-            if (std.mem.startsWith(u8, arg, module_prefix)) {
-                const value = arg[module_prefix.len..];
-                if (value.len == 0) return usageError(allocator, "--module-path requires a directory", .{});
-                try module_paths.append(try allocator.dupe(u8, value));
-                continue;
-            }
-            if (argEqual(arg, "--module-path")) {
-                if (idx >= argv.len) return usageError(allocator, "--module-path requires a directory", .{});
-                const value = argv[idx];
-                idx += 1;
-                if (value.len == 0) return usageError(allocator, "--module-path requires a directory", .{});
-                try module_paths.append(try allocator.dupe(u8, value));
                 continue;
             }
             if (std.mem.startsWith(u8, arg, env_prefix)) {
@@ -749,7 +760,6 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
     }
 
     const trace_slice = try finalizeList([]const u8, &trace_topics, &trace_cleanup);
-    const module_slice = try finalizeList([]const u8, &module_paths, &module_cleanup);
     const env_slice = try finalizeList(CliConfig.EnvOverride, &env_overrides, &env_cleanup);
     const args_slice = try finalizeList([]const u8, &script_args, &args_cleanup);
 
@@ -757,7 +767,6 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
         .ready = .{
             .script = .{ .path = path, .args = args_slice, .source = script_source },
             .trace_topics = trace_slice,
-            .module_paths = module_slice,
             .env_overrides = env_slice,
             .print_ast = print_ast,
             .print_tokens = print_tokens,
@@ -781,6 +790,7 @@ pub fn printUsage(writer: *std.Io.Writer) !void {
         \\
         \\Options:
         \\  --help, -h           Display this help text.
+        \\  --version, -V        Print the version and exit.
         \\  --verbose            Enable verbose logging.
         \\  --env KEY=VALUE      Override an environment variable during execution.
         \\  --print-ast          Parse the script and emit its AST instead of executing.

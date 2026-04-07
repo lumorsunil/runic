@@ -2,7 +2,12 @@
 
 set -euo pipefail
 
-repo_root="${RUNIC_REPO_ROOT:?RUNIC_REPO_ROOT must be set}"
+repo_root="${RUNIC_REPO_ROOT:-${1:-}}"
+
+if [[ -z "$repo_root" ]]; then
+  echo "RUNIC_REPO_ROOT must be set (or passed as the first argument)." >&2
+  exit 1
+fi
 
 mapfile -t cli_scripts < <(
   cd "$repo_root"

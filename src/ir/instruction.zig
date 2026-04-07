@@ -2,7 +2,7 @@ const std = @import("std");
 const ast = @import("../frontend/ast.zig");
 const Value = @import("value.zig").Value;
 const Ref = @import("ref.zig").Ref;
-const ExitCode = @import("../runtime/command_runner.zig").ExitCode;
+const ExitCode = @import("../runtime/exit_code.zig").ExitCode;
 const Location = @import("location.zig").Location;
 const RegisterAbs = @import("location.zig").RegisterAbs;
 const InstructionAddr = @import("instruction-addr.zig").InstructionAddr;
@@ -153,6 +153,10 @@ pub const Instruction = struct {
         enter_subshell,
         /// restores the subshell context handle saved by enter_subshell
         exit_subshell,
+        /// checks module cache; if hit: stores cached heap addr in %r and true in %r2; else false in %r2
+        get_module_cache: []const u8,
+        /// stores %r (heap addr) in module cache under path
+        set_module_cache: []const u8,
 
         pub fn push_(value: ValueSource) @This() {
             return .{ .push = value };
@@ -195,7 +199,7 @@ pub const Instruction = struct {
         pub fn format(self: @This(), w: *std.Io.Writer) !void {
             switch (self) {
                 inline .push, .exit, .exit_with, .jmp, .fork, .set, .pipe_fwd, .pipe_file, .pipe_write, .wait, .stream, .pipe, .pipe_opt, .ath, .log, .cmp, .resolve_exit_code, .cd, .get_env, .set_env => |t| try w.print("{t} {f}", .{ self, t }),
-                inline .ref, .comment => |t| try w.print("{t} {s}", .{ self, t }),
+                inline .ref, .comment, .get_module_cache, .set_module_cache => |t| try w.print("{t} {s}", .{ self, t }),
                 inline .alloc => |t| try w.print("{t} {}", .{ self, t }),
                 else => try w.print("{t}", .{self}),
             }

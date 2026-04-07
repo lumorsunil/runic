@@ -1,19 +1,16 @@
 #!/usr/bin/env runic
 
-// Missing features:
-// - subshells $(...)
-// - orelse
-
 fn Void @(targets: []String) String
 
-const script_dir = $(cd "${dirname "${RUNIC_SOURCE}" && pwd}")
-const repo_root = $(RUNIC_REPO_ROOT orelse cd "${script_dir}/.." && pwd)
+const script_dir = $(cd "${dirname @src && pwd}")
+const repo_root = $RUNIC_REPO_ROOT orelse $(cd "${script_dir}/.." && pwd)
 
-if (! bash "-c" "command -v zig" >/dev/null 2>&1) {
+if (! bash "-c" "command -v zig" >"/dev/null" 2>&1) {
   echo "zig is required for CLI smoke tests but was not found on PATH." >&2
   exit 1
 }
 
+// TODO: change to array and implement dynamic arrays (appending items)
 var runic_scripts: String = ""
 
 if (targets.len > 0) {
@@ -34,10 +31,10 @@ if (targets.len > 0) {
     }
   }
 } else {
-  runic_scripts = $(
+  runic_scripts = $({
     cd "${repo_root}" > "/dev/null"
     find "tests/features" "-type" "f" "-name" "*.rn" "-print" 2>"/dev/null" | sort
-  )
+  })
 }
 
 if (runic_scripts.len == 0) {
@@ -53,56 +50,55 @@ for (runic_scripts) |script| {
   }
   const rel_path = bash "-c" "p=\"${abs_path}\"; r=\"${repo_root}\"; \${p#\"$r\"/}"
 
-  base_path="${abs_path%.rn}"
-  stdin_fixture="${base_path}.stdin"
-  stdout_fixture="${base_path}.stdout"
-  stderr_fixture="${base_path}.stderr"
-  status_fixture="${base_path}.status"
+  const base_path = bash "-c" "abs_path=\"${abs_path}\"; echo \"\${abs_path%.rn}\""
+  const stdin_fixture = "${base_path}.stdin"
+  const stdout_fixture = "${base_path}.stdout"
+  const stderr_fixture = "${base_path}.stderr"
+  const status_fixture = "${base_path}.status"
 
-  expected_status=0
-  if [[ -f "$status_fixture" ]]; then
-    expected_status="$(tr -d '[:space:]' < "$status_fixture")"
-  fi
+  var expected_status = true
+  if (test "-f" "${status_fixture}") {
+    expected_status = (cat "${status_fixture}" | tr "-d" "[:space:]").stdout == "0"
+  }
 
-  stdout_tmp="$(mktemp)"
-  stderr_tmp="$(mktemp)"
+  const stdout_tmp = mktemp
+  const stderr_tmp = mktemp
   echo "-- running ${rel_path}"
 
-  set +e
-  if [[ -f "$stdin_fixture" ]]; then
-    (cd "$repo_root" && zig build run -- "$rel_path" < "$stdin_fixture") >"$stdout_tmp" 2>"$stderr_tmp"
-  else
-    (cd "$repo_root" && zig build run -- "$rel_path") >"$stdout_tmp" 2>"$stderr_tmp"
-  fi
-  status=$?
-  set -e
+  // set +e
+  const status = (if (test "-f" stdin_fixture) {
+    $(cd repo_root && (cat stdin_fixture | zig "build" "run" "--" rel_path)) >stdout_tmp 2>stderr_tmp
+  } else {
+    $(cd repo_root && zig "build" "run" "--" rel_path) >stdout_tmp 2>stderr_tmp
+  }).exit_code
+  // set -e
 
-  if [[ "$status" != "$expected_status" ]]; then
+  if (status != expected_status) {
     echo "Unexpected exit status for ${rel_path}: got ${status}, expected ${expected_status}" >&2
-    cat "$stderr_tmp" >&2
+    cat stderr_tmp >&2
     exit 1
-  fi
+  }
 
-  if [[ -f "$stdout_fixture" ]]; then
-    if ! diff -u "$stdout_fixture" "$stdout_tmp"; then
+  if (test "-f" stdout_fixture) {
+    if (!diff "-u" stdout_fixture stdout_tmp) {
       echo "Stdout mismatch for ${rel_path}" >&2
       exit 1
-    fi
-  fi
+    }
+  }
 
-  if [[ -f "$stderr_fixture" ]]; then
-    if ! diff -u "$stderr_fixture" "$stderr_tmp"; then
+  if (test "-f" stderr_fixture) {
+    if (!diff "-u" stderr_fixture stderr_tmp) {
       echo "Stderr mismatch for ${rel_path}" >&2
       exit 1
-    fi
-  elif [[ -s "$stderr_tmp" ]]; then
+    }
+  } else if (test "-s" stderr_tmp) {
     echo "Unexpected stderr for ${rel_path}" >&2
-    cat "$stderr_tmp" >&2
+    cat stderr_tmp >&2
     exit 1
-  fi
+  }
 
-  rm -f "$stdout_tmp" "$stderr_tmp"
-  ((count += 1))
+  rm "-f" stdout_tmp stderr_tmp
+  count += 1
 }
 
 echo "CLI smoke tests passed (${count} scripts)."

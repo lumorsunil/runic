@@ -1,0 +1,6 @@
+[error]: tests/diagnostics/import_module_with_params.rn:1:11: module "../support/imports/module_with_params.rn" cannot be imported because it declares parameters; expose its functionality as pub functions instead
+   1:const m = import "../support/imports/module_with_params.rn"
+   2:
+   3:echo "${m.version}"
+   4:
+

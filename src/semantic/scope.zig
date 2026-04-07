@@ -48,6 +48,7 @@ pub const Scope = struct {
         allocator: std.mem.Allocator,
         identifier: ast.Identifier,
         type_expr: ?*const ast.TypeExpr,
+        is_pub: bool,
         is_mutable: bool,
     ) Error!void {
         const entry = try self.bindings.getOrPut(allocator, identifier.name);
@@ -59,6 +60,7 @@ pub const Scope = struct {
         entry.value_ptr.* = .{
             .identifier = identifier,
             .type_expr = type_expr,
+            .is_pub = is_pub,
             .is_mutable = is_mutable,
         };
     }
@@ -66,6 +68,7 @@ pub const Scope = struct {
     pub const Binding = struct {
         identifier: ast.Identifier,
         type_expr: ?*const ast.TypeExpr,
+        is_pub: bool,
         is_mutable: bool,
     };
 };

@@ -1,0 +1,5 @@
+[error]: tests/support/imports/cycle_b.rn:2:11: circular import detected for "cycle_a.rn"
+   1:pub const name = "b"
+   2:const a = import "cycle_a.rn"
+   3:
+

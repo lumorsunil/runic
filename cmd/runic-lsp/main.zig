@@ -1,5 +1,6 @@
 const std = @import("std");
 const lsp = @import("runic_lsp");
+const build_options = @import("build_options");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -105,6 +106,6 @@ fn printUsage() !void {
 
 fn printVersion() !void {
     var writer = std.fs.File.stdout().writer(&.{});
-    try writer.interface.writeAll("0.0.1");
+    try writer.interface.print("{s}\n", .{build_options.version});
     try writer.interface.flush();
 }

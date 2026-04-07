@@ -26,3 +26,9 @@ tmp/
 # Nvim
 .cache/
 .nvimlog
+
+# Env
+.env
+
+# Codex
+.codex

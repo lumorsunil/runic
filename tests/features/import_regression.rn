@@ -1,0 +1,6 @@
+const m = import "../support/imports/basic_module.rn"
+
+echo "${m.version}"
+m.greeting
+echo "${m.stdout}"
+echo "${m.stderr}"

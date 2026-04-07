@@ -12,23 +12,28 @@
 (keyword_control) @keyword.control
 (keyword_loop) @keyword.repeat
 (keyword_import) @keyword.import
-(keyword_interop) @keyword.special
+(keyword_interop) @keyword.operator
 (keyword_try) @keyword.exception
 
 ; Literals & builtins ---------------------------------------------------------
 
 (boolean_literal) @boolean
-(null_literal) @number
+(null_literal) @constant.builtin
 (number_literal) @number
 (string_literal) @string
 (string_fragment) @string
 (escape_sequence) @string.escape
 (interpolation_expression
   "${" @string.special.symbol
-  (_) @embedded
   "}" @string.special.symbol)
+(interpolation_expression
+  (_) @embedded)
 (rune_literal) @character
-;(capture_clause) @keyword.capture
+(capture_clause
+  "|" @punctuation.special
+  "|" @punctuation.special)
+(capture_clause
+  (identifier) @variable.parameter)
 (builtin_command) @function.builtin
 (type_identifier) @type
 

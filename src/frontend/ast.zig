@@ -164,6 +164,14 @@ pub const TypeExpr = union(enum) {
     thread: PrimitiveType,
     failed: FailedType,
     // lazy: LazyType,
+    /// A compile-time function reference pointing to a specific IR instruction set.
+    /// Used for module pub fn exports so compileMember can return the fn_ref value directly.
+    fn_ref_type: FnRefType,
+
+    pub const FnRefType = struct {
+        instr_set: usize,
+        span: Span,
+    };
 
     pub fn global(comptime tag: std.meta.Tag(@This())) @This() {
         return @unionInit(@This(), @tagName(tag), .{ .span = .global });
@@ -469,6 +477,7 @@ pub const TypeExpr = union(enum) {
             .alias,
             .identifier,
             .failed,
+            .fn_ref_type,
             => 1,
             .struct_type => |struct_type| blk: {
                 var size: usize = 0;
@@ -510,6 +519,9 @@ pub const TypeExpr = union(enum) {
             },
             .execution => {
                 try writer.writeAll("Execution");
+            },
+            .fn_ref_type => |frt| {
+                try writer.print("<fn_ref:{}>", .{frt.instr_set});
             },
             inline else => |s| try s.format(writer),
         }
@@ -890,13 +902,15 @@ pub const BinaryExpr = struct {
     }
 };
 
-pub const BinaryOp = enum {
+pub const BinaryOp = union(enum) {
     add,
     subtract,
     multiply,
     divide,
     remainder,
     greater,
+    fd_source_truncate_redirect: StreamRef,
+    fd_source_append_redirect: StreamRef,
     append_redirect,
     redirect_fd,
     greater_equal,
@@ -921,6 +935,9 @@ pub const BinaryOp = enum {
     mul_assign,
     div_assign,
     rem_assign,
+    /// Sequential execution: run left then right, result is right's result.
+    /// Created by `parseBinding` when `;` follows a command expression initializer.
+    sequence,
 
     pub fn precedence(self: BinaryOp) usize {
         return switch (self) {
@@ -930,6 +947,8 @@ pub const BinaryOp = enum {
             .divide => 30,
             .remainder => 30,
             .greater => 15,
+            .fd_source_truncate_redirect => 15,
+            .fd_source_append_redirect => 15,
             .append_redirect => 15,
             .redirect_fd => 15,
             .greater_equal => 15,
@@ -940,7 +959,7 @@ pub const BinaryOp = enum {
             .logical_and => 10,
             .logical_or => 5,
             .@"orelse" => 4,
-            .pipe => 50,
+            .pipe => 12,
             .apply => 70,
             .member => 90,
             .array_access => 90,
@@ -950,6 +969,14 @@ pub const BinaryOp = enum {
             .mul_assign => 0,
             .div_assign => 0,
             .rem_assign => 0,
+            .sequence => 1,
+        };
+    }
+
+    fn streamFromToken(tok: token.Token) StreamRef {
+        return switch (tok.tag) {
+            .fd_source_truncate_redirect, .fd_source_append_redirect => if (tok.lexeme[0] == '1') .stdout else if (tok.lexeme[0] == '2') .stderr else @panic("shouldn't happen <|:)-|--<"),
+            else => @panic("shouldn't happen <|:)-|--<"),
         };
     }
 
@@ -960,6 +987,8 @@ pub const BinaryOp = enum {
             .star => .multiply,
             .slash => .divide,
             .percent => .remainder,
+            .fd_source_truncate_redirect => .{ .fd_source_truncate_redirect = streamFromToken(tok) },
+            .fd_source_append_redirect => .{ .fd_source_append_redirect = streamFromToken(tok) },
             .greater => .greater,
             .append_redirect => .append_redirect,
             .redirect_fd => .redirect_fd,
@@ -1007,6 +1036,16 @@ pub const BinaryOp = enum {
             .mul_assign => .multiply,
             .div_assign => .divide,
             .rem_assign => .remainder,
+            else => @panic("shouldn't happen <|:)-|--<"),
+        };
+    }
+
+    pub fn redirectStream(self: @This()) StreamRef {
+        return switch (self) {
+            .fd_source_truncate_redirect => |s| s,
+            .fd_source_append_redirect => |s| s,
+            .greater => .stdout,
+            .append_redirect => .stdout,
             else => @panic("shouldn't happen <|:)-|--<"),
         };
     }
@@ -1133,6 +1172,7 @@ pub const CatchClause = struct {
 pub const ImportExpr = struct {
     importer: []const u8,
     module_name: []const u8,
+    call: CallExpr,
     span: Span,
 
     pub fn resolveType(
@@ -1380,6 +1420,7 @@ pub const Statement = union(enum) {
 };
 
 pub const TypeBindingDecl = struct {
+    is_pub: bool = true,
     identifier: Identifier,
     type_expr: *const TypeExpr,
     span: Span,
@@ -1395,6 +1436,7 @@ pub const TypeBindingDecl = struct {
 
 pub const BindingDecl = struct {
     is_mutable: bool,
+    is_pub: bool,
     pattern: *BindingPattern,
     annotation: ?*const TypeExpr,
     initializer: *Expression,
@@ -1431,6 +1473,7 @@ pub const Parameter = struct {
 };
 
 pub const FunctionDecl = struct {
+    is_pub: bool,
     name: ?Identifier,
     params: Parameters,
     stdin_type: ?*const TypeExpr,

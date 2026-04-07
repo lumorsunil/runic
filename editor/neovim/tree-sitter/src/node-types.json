@@ -36,6 +36,21 @@
     "fields": {}
   },
   {
+    "type": "capture_clause",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "identifier",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "command",
     "named": true,
     "fields": {},
@@ -61,6 +76,10 @@
         },
         {
           "type": "builtin_command",
+          "named": true
+        },
+        {
+          "type": "capture_clause",
           "named": true
         },
         {
@@ -167,12 +186,12 @@
     }
   },
   {
-    "type": "interpolation_expression",
+    "type": "interpolation_brace_group",
     "named": true,
     "fields": {},
     "children": {
-      "multiple": false,
-      "required": true,
+      "multiple": true,
+      "required": false,
       "types": [
         {
           "type": "arrow_operator",
@@ -187,11 +206,15 @@
           "named": true
         },
         {
-          "type": "bracket",
+          "type": "builtin_command",
           "named": true
         },
         {
-          "type": "builtin_command",
+          "type": "capture_clause",
+          "named": true
+        },
+        {
+          "type": "command",
           "named": true
         },
         {
@@ -200,6 +223,18 @@
         },
         {
           "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "interpolation_brace_group",
+          "named": true
+        },
+        {
+          "type": "interpolation_bracket_group",
+          "named": true
+        },
+        {
+          "type": "interpolation_paren_group",
           "named": true
         },
         {
@@ -271,6 +306,415 @@
           "named": true
         },
         {
+          "type": "stage_separator",
+          "named": true
+        },
+        {
+          "type": "string_literal",
+          "named": true
+        },
+        {
+          "type": "type_identifier",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "interpolation_bracket_group",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "arrow_operator",
+          "named": true
+        },
+        {
+          "type": "assignment_operator",
+          "named": true
+        },
+        {
+          "type": "boolean_literal",
+          "named": true
+        },
+        {
+          "type": "builtin_command",
+          "named": true
+        },
+        {
+          "type": "capture_clause",
+          "named": true
+        },
+        {
+          "type": "command",
+          "named": true
+        },
+        {
+          "type": "comparison_operator",
+          "named": true
+        },
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "interpolation_brace_group",
+          "named": true
+        },
+        {
+          "type": "interpolation_bracket_group",
+          "named": true
+        },
+        {
+          "type": "interpolation_paren_group",
+          "named": true
+        },
+        {
+          "type": "keyword_async",
+          "named": true
+        },
+        {
+          "type": "keyword_control",
+          "named": true
+        },
+        {
+          "type": "keyword_declaration",
+          "named": true
+        },
+        {
+          "type": "keyword_import",
+          "named": true
+        },
+        {
+          "type": "keyword_interop",
+          "named": true
+        },
+        {
+          "type": "keyword_loop",
+          "named": true
+        },
+        {
+          "type": "keyword_try",
+          "named": true
+        },
+        {
+          "type": "keyword_type",
+          "named": true
+        },
+        {
+          "type": "logical_operator",
+          "named": true
+        },
+        {
+          "type": "null_literal",
+          "named": true
+        },
+        {
+          "type": "number_literal",
+          "named": true
+        },
+        {
+          "type": "pipeline_operator",
+          "named": true
+        },
+        {
+          "type": "process_operator",
+          "named": true
+        },
+        {
+          "type": "punctuation_delimiter",
+          "named": true
+        },
+        {
+          "type": "range_operator",
+          "named": true
+        },
+        {
+          "type": "rune_literal",
+          "named": true
+        },
+        {
+          "type": "sigil",
+          "named": true
+        },
+        {
+          "type": "stage_separator",
+          "named": true
+        },
+        {
+          "type": "string_literal",
+          "named": true
+        },
+        {
+          "type": "type_identifier",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "interpolation_expression",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "arrow_operator",
+          "named": true
+        },
+        {
+          "type": "assignment_operator",
+          "named": true
+        },
+        {
+          "type": "boolean_literal",
+          "named": true
+        },
+        {
+          "type": "builtin_command",
+          "named": true
+        },
+        {
+          "type": "capture_clause",
+          "named": true
+        },
+        {
+          "type": "command",
+          "named": true
+        },
+        {
+          "type": "comparison_operator",
+          "named": true
+        },
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "interpolation_brace_group",
+          "named": true
+        },
+        {
+          "type": "interpolation_bracket_group",
+          "named": true
+        },
+        {
+          "type": "interpolation_paren_group",
+          "named": true
+        },
+        {
+          "type": "keyword_async",
+          "named": true
+        },
+        {
+          "type": "keyword_control",
+          "named": true
+        },
+        {
+          "type": "keyword_declaration",
+          "named": true
+        },
+        {
+          "type": "keyword_import",
+          "named": true
+        },
+        {
+          "type": "keyword_interop",
+          "named": true
+        },
+        {
+          "type": "keyword_loop",
+          "named": true
+        },
+        {
+          "type": "keyword_try",
+          "named": true
+        },
+        {
+          "type": "keyword_type",
+          "named": true
+        },
+        {
+          "type": "logical_operator",
+          "named": true
+        },
+        {
+          "type": "null_literal",
+          "named": true
+        },
+        {
+          "type": "number_literal",
+          "named": true
+        },
+        {
+          "type": "pipeline_operator",
+          "named": true
+        },
+        {
+          "type": "process_operator",
+          "named": true
+        },
+        {
+          "type": "punctuation_delimiter",
+          "named": true
+        },
+        {
+          "type": "range_operator",
+          "named": true
+        },
+        {
+          "type": "rune_literal",
+          "named": true
+        },
+        {
+          "type": "sigil",
+          "named": true
+        },
+        {
+          "type": "stage_separator",
+          "named": true
+        },
+        {
+          "type": "string_literal",
+          "named": true
+        },
+        {
+          "type": "type_identifier",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "interpolation_paren_group",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "arrow_operator",
+          "named": true
+        },
+        {
+          "type": "assignment_operator",
+          "named": true
+        },
+        {
+          "type": "boolean_literal",
+          "named": true
+        },
+        {
+          "type": "builtin_command",
+          "named": true
+        },
+        {
+          "type": "capture_clause",
+          "named": true
+        },
+        {
+          "type": "command",
+          "named": true
+        },
+        {
+          "type": "comparison_operator",
+          "named": true
+        },
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "interpolation_brace_group",
+          "named": true
+        },
+        {
+          "type": "interpolation_bracket_group",
+          "named": true
+        },
+        {
+          "type": "interpolation_paren_group",
+          "named": true
+        },
+        {
+          "type": "keyword_async",
+          "named": true
+        },
+        {
+          "type": "keyword_control",
+          "named": true
+        },
+        {
+          "type": "keyword_declaration",
+          "named": true
+        },
+        {
+          "type": "keyword_import",
+          "named": true
+        },
+        {
+          "type": "keyword_interop",
+          "named": true
+        },
+        {
+          "type": "keyword_loop",
+          "named": true
+        },
+        {
+          "type": "keyword_try",
+          "named": true
+        },
+        {
+          "type": "keyword_type",
+          "named": true
+        },
+        {
+          "type": "logical_operator",
+          "named": true
+        },
+        {
+          "type": "null_literal",
+          "named": true
+        },
+        {
+          "type": "number_literal",
+          "named": true
+        },
+        {
+          "type": "pipeline_operator",
+          "named": true
+        },
+        {
+          "type": "process_operator",
+          "named": true
+        },
+        {
+          "type": "punctuation_delimiter",
+          "named": true
+        },
+        {
+          "type": "range_operator",
+          "named": true
+        },
+        {
+          "type": "rune_literal",
+          "named": true
+        },
+        {
+          "type": "sigil",
+          "named": true
+        },
+        {
+          "type": "stage_separator",
+          "named": true
+        },
+        {
           "type": "string_literal",
           "named": true
         },
@@ -297,22 +741,17 @@
     "fields": {}
   },
   {
-    "type": "keyword_import",
-    "named": true,
-    "fields": {}
-  },
-  {
     "type": "keyword_loop",
     "named": true,
     "fields": {}
   },
   {
-    "type": "keyword_type",
+    "type": "keyword_try",
     "named": true,
     "fields": {}
   },
   {
-    "type": "logical_operator",
+    "type": "keyword_type",
     "named": true,
     "fields": {}
   },
@@ -378,6 +817,10 @@
         },
         {
           "type": "builtin_command",
+          "named": true
+        },
+        {
+          "type": "capture_clause",
           "named": true
         },
         {
@@ -507,6 +950,14 @@
     "named": false
   },
   {
+    "type": "$",
+    "named": false
+  },
+  {
+    "type": "$(",
+    "named": false
+  },
+  {
     "type": "${",
     "named": false
   },
@@ -551,6 +1002,10 @@
     "named": false
   },
   {
+    "type": ".{",
+    "named": false
+  },
+  {
     "type": "/*",
     "named": false
   },
@@ -583,7 +1038,7 @@
     "named": false
   },
   {
-    "type": "and",
+    "type": "_",
     "named": false
   },
   {
@@ -596,6 +1051,14 @@
   },
   {
     "type": "await",
+    "named": false
+  },
+  {
+    "type": "catch",
+    "named": false
+  },
+  {
+    "type": "cd",
     "named": false
   },
   {
@@ -631,6 +1094,10 @@
     "named": true
   },
   {
+    "type": "exit",
+    "named": false
+  },
+  {
     "type": "false",
     "named": false
   },
@@ -643,10 +1110,6 @@
     "named": false
   },
   {
-    "type": "from",
-    "named": false
-  },
-  {
     "type": "identifier",
     "named": true
   },
@@ -655,21 +1118,25 @@
     "named": false
   },
   {
-    "type": "import",
+    "type": "inspect",
     "named": false
+  },
+  {
+    "type": "keyword_import",
+    "named": true
   },
   {
     "type": "keyword_interop",
     "named": true
   },
   {
-    "type": "keyword_try",
-    "named": true
-  },
-  {
     "type": "line_comment",
     "named": true,
     "extra": true
+  },
+  {
+    "type": "logical_operator",
+    "named": true
   },
   {
     "type": "lower",
@@ -688,12 +1155,16 @@
     "named": true
   },
   {
-    "type": "or",
+    "type": "orelse",
     "named": false
   },
   {
     "type": "process_operator",
     "named": true
+  },
+  {
+    "type": "pub",
+    "named": false
   },
   {
     "type": "return",
@@ -708,7 +1179,15 @@
     "named": true
   },
   {
+    "type": "struct",
+    "named": false
+  },
+  {
     "type": "true",
+    "named": false
+  },
+  {
+    "type": "try",
     "named": false
   },
   {

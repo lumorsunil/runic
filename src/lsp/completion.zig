@@ -172,6 +172,7 @@ fn collectModuleMatches(context: CollectMatchesContext) !MatchList {
                         .kind = .module,
                         .detail = try context.allocator.dupe(u8, entry.name),
                         .documentation = &.{},
+                        .span = .global,
                     };
 
                     try matches.items.append(context.allocator, .{

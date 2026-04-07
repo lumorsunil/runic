@@ -1,10 +1,10 @@
 // Simple math helpers used by module system tests.
 
-fn add(lhs: Int, rhs: Int) Int {
+fn Void add(lhs: Int, rhs: Int) Int {
   return lhs + rhs
 }
 
-fn square(value: Int) Int {
+fn Void square(value: Int) Int {
   return value * value
 }
 

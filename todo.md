@@ -5,10 +5,10 @@
 - [x] import modules
 - [x] bind module to identifier
 - [x] execute statements in module when imported
-- [ ] use output of module execution
+- [x] use output of module execution
 - [x] member access on modules
-- [ ] pub keyword for accessible bindings (maybe?)
-- [ ] define a function signature for the runic file `fn String @() String`
+- [x] pub keyword for accessible bindings
+- [x] define a function signature for imported runic files
 
 ## executables
 
@@ -35,8 +35,11 @@
   - `@stdin`
   - `@stdin | cat`
 - [ ] typed pipes
-- [ ] exit code
-- [ ] a lot of things missing (stdin, stdout/stderr capturing and piping, return statements, etc.)
+- [x] exit code
+- [ ] remaining function/runtime gaps
+  - stdin semantics
+  - stdout/stderr capturing and piping
+  - typed pipes
 
 ## expressions
 
@@ -59,7 +62,7 @@
   - [ ] maybe ban?
 - [x] array literals
 - [ ] slicing
-- [ ] array element accessor
+- [x] array element accessor
 - [x] if
 - [x] for loops
   - [x] ranges
@@ -67,17 +70,17 @@
   - [x] multiple sources
 - [ ] pipeline_or, pipeline_and
 - [x] recursive functions (add function def to closure?)
-- [ ] exit/return statement
+- [x] exit/return statement
 - [ ] blocks as anonymous functions?
 - [ ] value references `const my_function = &module.some_function`
   - [ ] partial applications
     - `fn Void add(x: Int, y: Int) Int { return x + y }`
     - `const add5 = &add 5`
     - `const add5_2 = &add 5 2`
-- [ ] pattern matching
+- [ ] pattern matching expansion
   - [ ] regex patterns
   - [ ] glob patterns?
-  - [ ] pattern matching expression
+  - [x] basic pattern matching expression
     - ```runic
         const number_pattern = /[0-9]+/
         const file_pattern = glob "*/*.*"
@@ -124,7 +127,7 @@
 - [ ] completions for member access (need some sort of scope machinery around collecting symbols and stuff, and it would help a ton with semantic analysis)
 - [ ] add more information to completion results (symbol type, etc)
 - [ ] implement basic snippets (const/var/fn)
-- [ ] hover
+- [x] hover
   - [x] basic hover implementation, identifier lookup
 - [ ] go to definition
 - [x] completions for keywords
@@ -165,8 +168,7 @@
   - when parsing fails entirely in a statement or expression, look for the next expression terminator and continue parsing from there, storing the error for later diagnostics
   - still produce a valid ast for the type checker to use
   - [x] in progress
-- [ ] type expression parser
-  - [x] in progress
+- [x] type expression parser
 
 ## type checker
 
@@ -183,3 +185,207 @@
 ## error handling
 
 - [ ] call stack when executing functions
+- [ ] review and generalize diagnostic/error reporting
+  - normalize which errors are reported on stdout vs stderr
+  - make compiler/runtime diagnostic output behavior consistent across failure kinds
+
+## ir / runtime
+
+### misc
+
+- [x] support ctrl+d for closing stdin (not mvp)
+- [x] coercion of execution result to a string needs to have both stdout and stderr merged (at least when binding or coercing directly in a string interpolation)
+- [x] add expected results check to tests
+- [x] main thread arguments from process startup
+- [x] builtin env variables support
+  - [x] env vars are populated into global scope
+  - [ ] way to check if identifier exists (orelse except for this specific purpose) ?
+- [ ] do we want to strip newlines at the end of an echo or not?
+
+### data
+
+- [x] void
+- [x] exit code
+- [x] unsigned integer
+- [x] string (as slice)
+- [x] stream
+- [x] addr
+- [x] struct
+- [x] closeable (handles) (processes/etc)
+- [x] pipe (handles)
+  - [x] generic sources/destinations
+    - [x] executable (file handle)
+    - [x] blocks
+    - [x] function calls
+    - [ ] values (not mvp)
+- [x] blocks
+- [x] blocks as pipes
+- [x] arrays
+
+### instructions
+
+- [x] instruction addr
+- [x] labels
+- [x] stack push
+- [x] stack pop
+- [x] arithmetic
+- [x] compare
+- [x] logical
+- [x] new ref
+- [x] set addr to value
+- [x] unconditional jump
+- [x] conditional jump if true
+- [x] conditional jump if false
+- [x] call executable
+- [x] wait
+- [x] fork
+- [x] new pipe
+- [x] set pipe option
+- [x] forward pipe
+- [x] exit
+
+### compiler
+
+- [x] sharing bindings between scopes/threads
+  - [x] each thread has it's own closure
+  - [x] closure-relative addresses
+  - [x] shared binding for deeply nested closures
+  - [x] mutable variables
+- [x] mutable variables
+- [x] binding to executable calls
+  - [x] executable call result struct
+  - [x] create a context when binding to blocks/calls that is stored in memory
+- [x] address mapping
+- [x] basic executable calls
+- [x] if else
+- [x] labels have the wrong address if we have closures (since closures alter addresses after the fact by inserting instructions)
+- [x] for loops
+  - [x] array iterator
+  - [x] range iterator
+- [x] read-only data
+- [x] instructions
+- [x] labels
+- [x] refs
+- [x] structs
+  - [ ] user-land structs (not mvp)
+- [x] struct types
+  - [ ] user defined struct types (not mvp)
+- [x] arithmetic
+- [x] boolean algebra
+- [x] pipelines
+  - [x] multiple sources in streams ReaderWriterStream (stderr usually connects many sources)
+  - [ ] error handling? (not mvp)
+  - [x] && / ||
+  - [x] boolean negation (!)
+  - [x] redirections
+    - [x] redirect stdout separately (not mvp)
+    - [x] redirect stderr separately (not mvp)
+    - [x] redirect to file
+      - [x] replace mode
+      - [x] append mode
+    - [ ] "redirect" from file to stdin (not mvp)
+- [x] function declarations
+  - [x] arguments
+- [x] functions calls
+  - [x] arguments
+  - [x] fix ref bug (calling same function multiple times to trigger)
+  - [x] closures
+- [x] bindings
+- [x] compound assignment operators
+- [x] member access
+  - [x] execution result
+- [x] arrays
+  - [x] arrays that do not require stdio context
+  - [x] arrays that do require stdio context
+  - [x] element access
+
+### execution context
+
+- [x] (virtual) threads
+- [ ] document one execution step
+  - main thread sleeps/wakes, executes instructions, and publishes the program exit code on exit
+  - background threads sleep/wakes and continue instruction execution
+  - pipe threads forward available data and terminate when streams end
+- [ ] document shared between threads
+  - read-only data
+  - instructions
+  - struct types
+  - labels
+- [ ] document per thread state
+  - refs
+  - stack and stack counter
+  - instruction counter
+
+### evaluator
+
+- [x] instruction step
+- [x] new ref
+- [x] push
+- [x] pop
+- [x] set
+- [x] jump
+- [x] executables
+  - [x] execute
+  - [x] wait for executable
+- [x] exit
+- [x] pipes
+  - [x] new pipe
+  - [x] stream pipe (blocking)
+  - [x] set pipe option
+  - [x] forward pipe
+- [x] threads
+  - [x] fork
+  - [x] wait for thread
+- [x] materialize string
+  - [x] stream
+  - [x] slice
+  - [x] unsigned integer
+  - [x] dereference addr
+  - [x] exit code
+  - [x] execution result
+- [x] arithmetic
+- [x] logical
+- [x] compare
+
+## debugger
+
+- [x] commands
+  - [x] step
+  - [x] quit
+  - [x] threads
+  - [x] instructions
+  - [x] pipes
+  - [x] breakpoint
+    - [x] add
+    - [x] remove
+    - [x] list
+- [x] command history per session
+- [x] stdin processing
+  - [x] up/down arrow -> move command history cursor
+  - [x] autocomplete
+    - [x] main commands (only first part of the command is autocompleted right now)
+    - [ ] sub-commands
+    - [ ] arguments
+  - [x] undo word/line
+- [ ] memory view
+- [ ] IR instructions view
+- [ ] source code view
+- [ ] output view (stdout/stderr/combined)
+- [ ] tui lib?
+- [ ] mark thread as skip
+
+## bugs
+
+- [x] grep is not outputting anything, see ir-blocks.rn
+- [x] cannot call function multiple times
+- [x] debugger: cannot paste to stdin
+- [x] arrays will executable calls as elements cannot be accessed with element access operator
+- [x] pipelines are broken again
+- [x] escaped double quotes print as \"
+- [ ] `$(sleep 0.5; echo "after")` produces a parsing error
+- [ ] syntax highlighting not implemented for:
+  - [ ] match
+- [ ] `true "hello` is parsed as a call with `true` as the callee
+- [x] scripts/run_ci.rn fails with: `Type checker failed to run: error.UnsupportedStatement`
+- [x] scripts/run_ci.rn fails to detect Zig when repo-root paths are built from env-backed strings
+- [x] assigning a bound string or execution result into an env var does not populate the env var correctly

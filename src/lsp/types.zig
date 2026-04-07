@@ -109,6 +109,11 @@ pub const ClientRequestPayload = union(enum) {
     @"textDocument/didClose": DidCloseTextDocumentParams,
     @"textDocument/completion": CompletionParams,
     @"textDocument/hover": HoverParams,
+    @"textDocument/definition": DefinitionParams,
+    @"textDocument/references": ReferenceParams,
+    @"textDocument/documentSymbol": DocumentSymbolParams,
+    @"textDocument/rename": RenameParams,
+    @"textDocument/formatting": DocumentFormattingParams,
     @"workspace/didChangeConfiguration": DidChangeConfigurationParams,
     @"workspace/didChangeWatchedFiles": DidChangeWatchedFilesParams,
     @"$/cancelRequest",
@@ -143,7 +148,7 @@ pub const DidCloseTextDocumentParams = struct {
     textDocument: TextDocumentIdentifier,
 };
 
-// {"params":{"textDocument":{"uri":"file:\\/\\/\\/home\\/lumorsunil\\/repos\\/runic\\/test.rn"},"position":{"line":7,"character":1},"context":{"triggerKind":1}},"jsonrpc":"2.0","method":"textDocument\\/completion","id":2}
+// {"params":{"textDocument":{"uri":"file:///path/to/test.rn"},"position":{"line":7,"character":1},"context":{"triggerKind":1}},"jsonrpc":"2.0","method":"textDocument/completion","id":2}
 pub const CompletionParams = struct {
     textDocument: TextDocumentIdentifier,
     position: Position,
@@ -158,6 +163,41 @@ pub const HoverParams = struct {
 
     /// The position inside the text document.
     position: Position,
+};
+
+pub const DefinitionParams = struct {
+    textDocument: TextDocumentIdentifier,
+    position: Position,
+};
+
+pub const ReferenceContext = struct {
+    includeDeclaration: bool = true,
+};
+
+pub const ReferenceParams = struct {
+    textDocument: TextDocumentIdentifier,
+    position: Position,
+    context: ReferenceContext,
+};
+
+pub const DocumentSymbolParams = struct {
+    textDocument: TextDocumentIdentifier,
+};
+
+pub const RenameParams = struct {
+    textDocument: TextDocumentIdentifier,
+    position: Position,
+    newName: []const u8,
+};
+
+pub const FormattingOptions = struct {
+    tabSize: u32 = 4,
+    insertSpaces: bool = true,
+};
+
+pub const DocumentFormattingParams = struct {
+    textDocument: TextDocumentIdentifier,
+    options: FormattingOptions,
 };
 
 pub const ProgressToken = IntegerOrString;
@@ -1497,6 +1537,24 @@ pub const TextEdit = struct {
     newText: []const u8,
 };
 
+pub const OptionalVersionedTextDocumentIdentifier = struct {
+    uri: DocumentUri,
+    version: ?DocumentVersion = null,
+};
+
+pub const TextDocumentEdit = struct {
+    textDocument: OptionalVersionedTextDocumentIdentifier,
+    edits: []const TextEdit,
+};
+
+pub const DocumentChangeOperation = union(enum) {
+    textDocumentEdit: TextDocumentEdit,
+};
+
+pub const WorkspaceEdit = struct {
+    documentChanges: ?[]const DocumentChangeOperation = null,
+};
+
 /// A special text edit to provide an insert and a replace operation.
 ///
 /// @since 3.16.0
@@ -1589,6 +1647,45 @@ pub const DiagnosticRelatedInformation = struct {
 pub const Location = struct {
     uri: DocumentUri,
     range: Range,
+};
+
+pub const SymbolKind = enum(u32) {
+    file = 1,
+    module = 2,
+    namespace = 3,
+    package = 4,
+    class = 5,
+    method = 6,
+    property = 7,
+    field = 8,
+    constructor = 9,
+    @"enum" = 10,
+    interface = 11,
+    function = 12,
+    variable = 13,
+    constant = 14,
+    string = 15,
+    number = 16,
+    boolean = 17,
+    array = 18,
+    object = 19,
+    key = 20,
+    null = 21,
+    enumMember = 22,
+    @"struct" = 23,
+    event = 24,
+    operator = 25,
+    typeParameter = 26,
+    keyword = 27,
+};
+
+pub const DocumentSymbol = struct {
+    name: []const u8,
+    detail: ?[]const u8 = null,
+    kind: SymbolKind,
+    range: Range,
+    selectionRange: Range,
+    children: ?[]const DocumentSymbol = null,
 };
 
 pub const DiagnosticSeverity = enum(u32) {
@@ -1741,4 +1838,33 @@ pub fn MethodResponse(comptime T: type) type {
             };
         }
     };
+}
+
+test "client request parses textDocument/rename" {
+    const allocator = std.testing.allocator;
+    const payload =
+        \\{"jsonrpc":"2.0","id":1,"method":"textDocument/rename","params":{"textDocument":{"uri":"file:///tmp/test.rn"},"position":{"line":1,"character":2},"newName":"renamed"}}
+    ;
+
+    const parsed = try std.json.parseFromSlice(ClientRequest, allocator, payload, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(parsed.value.payload != null);
+    try std.testing.expectEqualStrings("textDocument/rename", parsed.value.method);
+    try std.testing.expect(std.meta.activeTag(parsed.value.payload.?) == .@"textDocument/rename");
+    try std.testing.expectEqualStrings("renamed", parsed.value.payload.?.@"textDocument/rename".newName);
+}
+
+test "client request parses textDocument/documentSymbol" {
+    const allocator = std.testing.allocator;
+    const payload =
+        \\{"jsonrpc":"2.0","id":1,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":"file:///tmp/test.rn"}}}
+    ;
+
+    const parsed = try std.json.parseFromSlice(ClientRequest, allocator, payload, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(parsed.value.payload != null);
+    try std.testing.expectEqualStrings("textDocument/documentSymbol", parsed.value.method);
+    try std.testing.expect(std.meta.activeTag(parsed.value.payload.?) == .@"textDocument/documentSymbol");
 }

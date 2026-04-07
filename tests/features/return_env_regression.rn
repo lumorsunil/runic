@@ -1,0 +1,7 @@
+$RUNIC_TEST_RET = "from-env"
+
+fn Void probe() String {
+  return $RUNIC_TEST_RET orelse "missing"
+}
+
+echo "${probe}"

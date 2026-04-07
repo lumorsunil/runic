@@ -1,6 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const ExitCode = @import("../runtime/command_runner.zig").ExitCode;
+const ExitCode = @import("../runtime/exit_code.zig").ExitCode;
 const endian = @import("constants.zig").endian;
 const TypeAddr = @import("type-addr.zig").TypeAddr;
 const Location = @import("location.zig").Location;
