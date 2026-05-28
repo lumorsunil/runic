@@ -16,6 +16,10 @@
   - `!echo "hello" // runs echo with argument "hello"`
   - `const echo = &!echo // binds echo to echo command`
   - `const !echo // shorthand syntax for above statement`
+- [ ] support escaping spaces in bareword executable names, and decide whether
+  the same escaping model should apply to identifiers as well
+- [ ] support invoking dotted executable names such as `cmd.exe`, and decide
+  how that syntax coexists with `.` member access
 - [ ] trying to call a command as an identifier that is not bound will result in unknown identifier error
 - [ ] all executables can be thought of as runic functions with the signature:
       `fn Stream(String) <exec-name>(...[]String) Stream(String)`

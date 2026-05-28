@@ -107,6 +107,11 @@ Likely near- to mid-term candidates:
 - additional operators and assignment forms
 - improved function references / partial application support
 - better user-defined struct/type support
+- support escaping whitespace in bareword executable/identifier syntax so
+  commands or names containing spaces can be represented without immediately
+  collapsing to quoted-string behavior
+- support invoking dotted executable names such as `cmd.exe`, with a parsing
+  model that does not conflict with `.` as member access
 - clearer command syntax decisions, if the current bareword model proves too
   ambiguous in practice
 
