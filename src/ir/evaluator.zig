@@ -64,6 +64,7 @@ pub const Error =
         MissingHeapValue,
         MalformedHeapSequence,
         MissingSpawnedThreadContext,
+        InvalidInt,
     };
 
 pub const Result = union(enum) {
@@ -967,6 +968,39 @@ pub const IREvaluator = struct {
                         }
                         return .{ .exit = try self.coerceExitCode(thread, value) };
                     },
+                    .addr => |addr_val| {
+                        // Heap-allocated strings (multi-segment string interpolation)
+                        // are heap sequences. Serialize them like other string types.
+                        // Non-string addr values (execution results, etc.) fall
+                        // through to coerceExitCode.
+                        if (try self.maybeHeapSequenceLen(addr_val)) |_| {
+                            if (thread.private.stack.items.len > 1) {
+                                const stdout_handle = thread.private.stack.items[1].pipe;
+                                const stdout_pipe = try self.context.getPipe(stdout_handle);
+                                var w = stdout_pipe.closeableWriter().writer;
+                                try self.materializeString(thread, resolved, w);
+                                try w.flush();
+                                return .{ .exit = .success };
+                            }
+                        }
+                        return .{ .exit = try self.coerceExitCode(thread, value) };
+                    },
+                    .uinteger, .float => {
+                        // Typed numeric pipe values travel as canonical decimal
+                        // text, so an Int/Float-returning stage both prints and
+                        // feeds a downstream typed `@stdin`. (Bool is represented
+                        // as `.exit_code` and is unaffected, keeping match
+                        // predicates exit-code based.)
+                        if (thread.private.stack.items.len > 1) {
+                            const stdout_handle = thread.private.stack.items[1].pipe;
+                            const stdout_pipe = try self.context.getPipe(stdout_handle);
+                            var w = stdout_pipe.closeableWriter().writer;
+                            try self.materializeString(thread, resolved, w);
+                            try w.flush();
+                            return .{ .exit = .success };
+                        }
+                        return .{ .exit = try self.coerceExitCode(thread, value) };
+                    },
                     else => return .{ .exit = try self.coerceExitCode(thread, value) },
                 }
             },
@@ -1062,6 +1096,40 @@ pub const IREvaluator = struct {
             .set_module_cache => |path| {
                 const path_owned = try self.allocator.dupe(u8, path);
                 try self.context.module_cache.put(self.allocator, path_owned, thread.private.result_register);
+                return .cont;
+            },
+            .collect_stdin => {
+                // Reads all bytes from the thread's stdin pipe into a zig_string.
+                // Blocks (retries without advancing the instruction counter) until
+                // the upstream stage signals completion by setting keep_open=false.
+                if (thread.private.stack.items.len < 1) return Error.MissingPipeHandle;
+                const stdin_value = thread.private.stack.items[0];
+                if (stdin_value != .pipe) return Error.MissingPipeHandle;
+                const stdin_pipe = try self.context.getPipe(stdin_value.pipe);
+
+                // Mark the pipe as having a virtual consumer (@stdin). This lets
+                // the upstream stage's stream thread see has_been_connected=true
+                // and exit cleanly once keep_open=false is set (rather than
+                // looping on .no_source forever).
+                stdin_pipe.has_been_connected = true;
+
+                // Wait until the upstream signals "done" by setting keep_open=false.
+                if (stdin_pipe.config.keep_open) return .cont_no_instr_counter_inc;
+
+                // All data is buffered in buffer_writer. Collect it.
+                const bytes = stdin_pipe.buffer_writer.written();
+                const owned = try self.allocator.dupe(u8, bytes);
+                thread.private.result_register = .{ .zig_string = owned };
+                return .cont;
+            },
+            .parse_int => {
+                // Parse the string currently in %r into an Int (uinteger).
+                var text_writer = std.Io.Writer.Allocating.init(self.allocator);
+                defer text_writer.deinit();
+                try self.materializeString(thread, thread.private.result_register, &text_writer.writer);
+                const trimmed = std.mem.trim(u8, text_writer.written(), " \t\r\n");
+                const parsed = std.fmt.parseInt(usize, trimmed, 10) catch return Error.InvalidInt;
+                thread.private.result_register = .{ .uinteger = parsed };
                 return .cont;
             },
             .fwd_stdio => {
@@ -1369,7 +1437,11 @@ pub const IREvaluator = struct {
                 const pipe_handle = (try self.resolveLocation(thread, pipe_write.pipe)).pipe;
                 const pipe = try self.context.getPipe(pipe_handle);
                 const value = try self.resolveValueSource(thread, pipe_write.source);
-                try self.materializePipelineInput(thread, value, pipe.closeableWriter().writer);
+                var w = pipe.closeableWriter().writer;
+                try self.materializePipelineInput(thread, value, w);
+                // Flush so the bytes reach buffer_writer, where a downstream
+                // @stdin/collect_stdin reads them directly.
+                try w.flush();
                 return .cont;
             },
             .pipe_fwd => |pipe_fwd| {

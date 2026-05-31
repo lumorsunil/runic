@@ -157,6 +157,14 @@ pub const Instruction = struct {
         get_module_cache: []const u8,
         /// stores %r (heap addr) in module cache under path
         set_module_cache: []const u8,
+        /// reads all bytes from the thread's stdin pipe into a zig_string value.
+        /// blocks (retries) until the stdin pipe signals completion (keep_open=false).
+        /// stores the result in %r.
+        collect_stdin,
+        /// parses the string in %r into an Int (uinteger) value, trimming
+        /// surrounding whitespace. stores the result in %r. invalid input is a
+        /// runtime error.
+        parse_int,
 
         pub fn push_(value: ValueSource) @This() {
             return .{ .push = value };

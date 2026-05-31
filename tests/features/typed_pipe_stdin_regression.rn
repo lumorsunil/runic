@@ -1,0 +1,10 @@
+fn Void produce() String {
+    return "hello typed stdin"
+}
+
+fn String transform() String {
+    const received = @stdin
+    return "${received}!"
+}
+
+produce | transform

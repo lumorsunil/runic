@@ -1,0 +1,10 @@
+fn Void source() String {
+    return "mixed"
+}
+
+fn String middle() String {
+    const s = @stdin
+    return "${s} typed"
+}
+
+source | middle | cat

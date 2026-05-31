@@ -1,0 +1,15 @@
+fn Void source() String {
+    return "stage"
+}
+
+fn String middle() String {
+    const s = @stdin
+    return "three ${s}"
+}
+
+fn String sink() String {
+    const s = @stdin
+    return "${s} pipeline"
+}
+
+source | middle | sink

@@ -1,0 +1,6 @@
+[error]: tests/diagnostics/typed_pipe_mismatch.rn:4:11: pipeline type mismatch: upstream stdout is String, downstream stdin expects Int
+   2:fn Int consume() Void {}
+   3:
+   4:produce | consume
+   5:
+

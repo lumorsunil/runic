@@ -359,6 +359,153 @@ echo "${math.exit_code}"
 
 **Result:** Importing a module runs it, exposes its `pub` declarations, and also leaves the module execution result available for inspection.
 
+## Typed pipeline boundaries
+
+Function signatures carry explicit stdin and stdout types using the form
+`fn StdinType name(params) StdoutType`. The pipe operator `|` enforces that the
+upstream stdout type matches the downstream stdin type at every boundary. A
+mismatch is a compile-time error.
+
+```rn
+fn Void produce() String echo "typed output"
+fn String passthrough() String cat
+
+produce | passthrough
+```
+
+**Result:** `produce` outputs `String` to stdout; `passthrough` accepts `String`
+on stdin and forwards it. The type checker validates that these types align
+before the script runs.
+
+### `@stdin` — reading typed stdin as a value
+
+Inside a function body with a typed stdin, the built-in `@stdin` expression
+reads all bytes from the function's stdin pipe and returns them as a `String`
+value. This lets you process pipeline input with pure Runic expressions instead
+of relying on executables like `cat`.
+
+```rn
+fn Void produce() String {
+    return "hello from pipe"
+}
+
+fn String transform() String {
+    const received = @stdin
+    return "${received}!"
+}
+
+produce | transform
+```
+
+**Result:** Prints `hello from pipe!`. `produce` returns the string directly
+(no process involved), `transform` collects it via `@stdin` and appends `"!"`.
+
+The `@stdin` value has the type declared in the function's stdin position. Using
+it in a function that has `Void` stdin would be a type error.
+
+### Mixed executable and typed-function pipelines
+
+Executable stages and typed Runic functions can be freely mixed. An executable
+that precedes a typed function must match the function's declared stdin type
+(which must be `String`, since executables always output bytes):
+
+```rn
+fn String process() String {
+    const input = @stdin
+    return "${input}!"
+}
+
+// executable output → typed function via @stdin
+echo "exec input" | process
+```
+
+Multi-stage pipelines work in all combinations:
+
+```rn
+fn Void source() String { return "pipeline" }
+fn String middle() String { const s = @stdin; return "typed ${s}" }
+
+// typed fn → typed fn → executable
+source | middle | cat
+```
+
+### Non-string typed values and `parseInt`
+
+Pipelines are not limited to strings. A function whose stdin type is `Int`
+receives `@stdin` already parsed into an `Int`, so it can do arithmetic on it
+directly. The `parseInt` builtin bridges a `String` stage to an `Int` stage,
+making the type transition explicit:
+
+```rn
+fn Int doubler() Int {
+    return @stdin * 2
+}
+
+fn Int inc() Int {
+    return @stdin + 1
+}
+
+// String → parseInt → Int → Int : prints 21
+echo "10" | parseInt | doubler | inc
+```
+
+**Result:** `echo "10"` produces the text `10`; `parseInt` asserts it as an
+`Int`; `doubler` reads `@stdin` as `10` and returns `20`; `inc` returns `21`.
+Numeric values travel between stages as their canonical decimal text, and each
+stage's declared type drives how the bytes are interpreted. `parseInt` has the
+type `fn String parseInt() Int`, so a following stage must declare `Int` stdin —
+feeding its output into a `String` stage is a compile-time mismatch.
+
+### Optional coercion at pipe boundaries
+
+A stage that outputs `T` can feed a downstream stage whose stdin is `?T`. The
+value flows through unchanged and the downstream sees it as the non-null case,
+so `@stdin orelse "default"` reads the piped value when present:
+
+```rn
+fn Void produce() String {
+    return "coerced value"
+}
+
+fn ?String consume() String {
+    const received = @stdin orelse "fallback"
+    return "${received}"
+}
+
+produce | consume
+```
+
+**Result:** Prints `coerced value`. The `?String` stdin of `consume` accepts the
+`String` produced upstream (a `T → ?T` coercion), and `@stdin` is typed as
+`?String` so the `orelse` fallback type-checks.
+
+### Void boundaries and rejected mismatches
+
+A `Void` stdin type means the function does not read from the pipeline; a `Void`
+stdout type means nothing is written. Connecting a stage with `Void` output to a
+stage that expects a non-`Void` input is rejected:
+
+```rn
+fn Void make_void() Void {}
+fn String need_string() String cat
+
+// rejected: upstream stdout is Void, downstream stdin expects String
+make_void | need_string
+```
+
+The type checker also enforces that calls made inside a function body are
+compatible with the enclosing function's declared stdin type. Calling a function
+with a different stdin contract from within another function is an error:
+
+```rn
+fn Void hello() String echo "hello"
+// rejected: greetings declares String stdin but calls hello which expects Void stdin
+fn String greetings() String hello
+```
+
+External executables use the catch-all boundary `fn String @(...String) ExecutionResult`,
+so a typed function that follows an executable stage must declare `String` stdin.
+
 ## Structs
 
 Structs are a collection of fields, each with their own type.
@@ -389,7 +536,7 @@ fn Void add(x: Float, y: Float) Float {
 
 const lib = import("lib")
 
-echo "${lib.add(3, 5)}"
+echo "${lib.add 3 5}"
 ```
 
 **Result:** `lib.rn` will become a struct type with a function `add` declared on it. `main.rn` is importing `lib.rn` and binding it to the identifier `lib`. `lib` is of the type `struct { fn add(x: Float, y: Float) }`.

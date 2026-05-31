@@ -1,0 +1,4 @@
+fn Void produce() String echo "typed"
+fn Int consume() Void {}
+
+produce | consume

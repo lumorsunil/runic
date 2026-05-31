@@ -70,6 +70,13 @@ A working parser, type checker, and IR-based runtime are in place. The following
 - `const` and `var` bindings with optional type annotations
 - `if`/`else`, `for` (range and collection), `while` with capture clauses
 - Functions with stdin/stdout types, closures, and recursion
+- **Typed pipeline boundary enforcement**: the type checker validates that the
+  upstream stdout type matches the downstream stdin type at every `|` boundary.
+  Mismatches are caught before execution. Function bodies are also checked
+  against their declared stdin/stdout contracts.
+- **`@stdin` access**: inside a function with a typed stdin, `@stdin` reads all
+  bytes from the function's stdin pipe as a `String` value, enabling pure Runic
+  processing without relying on executables like `cat`.
 - String interpolation (`${ }`) and block capture
 - Process handle access (`.stdout`, `.stderr`, `.status.ok`, `.status.exit_code`)
 - File redirection (`>`, `>>`) and stream capture (`1>var`, `2>var`)

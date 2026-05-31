@@ -249,6 +249,26 @@ fn stableResultSource(result: Result) ir.ValueSource {
     return result.source;
 }
 
+/// Returns true when `type_expr` denotes the given primitive type name, whether
+/// it is already a resolved primitive tag or an unresolved `.identifier`/`.alias`
+/// referring to that name (e.g. `Int`). Used for type-directed `@stdin` parsing
+/// where the compiler only has the raw declared stdin type.
+fn typeExprIsNamed(type_expr: ast.TypeExpr, name: []const u8) bool {
+    return switch (type_expr) {
+        .integer => std.mem.eql(u8, name, "Int"),
+        .float => std.mem.eql(u8, name, "Float"),
+        .boolean => std.mem.eql(u8, name, "Bool"),
+        .byte => std.mem.eql(u8, name, "Byte"),
+        .alias => |alias| std.mem.eql(u8, alias.name, name),
+        .identifier => |named| blk: {
+            const segments = named.path.segments;
+            if (segments.len == 0) break :blk false;
+            break :blk std.mem.eql(u8, segments[segments.len - 1].name, name);
+        },
+        else => false,
+    };
+}
+
 const capture_temp_ref_count = 5;
 
 pub const IRData = struct {
@@ -546,6 +566,9 @@ pub const IRCompiler = struct {
     allow_simple_exec: bool = false,
     compiled_modules: std.StringHashMapUnmanaged(usize) = .empty,
     loading_set: std.StringHashMapUnmanaged(void) = .empty,
+    /// Stack of enclosing functions' declared stdin types, so `@stdin` can be
+    /// typed correctly for coercions. Top is the innermost function.
+    stdin_type_stack: std.ArrayList(?ast.TypeExpr) = .empty,
 
     pub fn init(
         allocator: Allocator,
@@ -2660,6 +2683,22 @@ pub const IRCompiler = struct {
         return location;
     }
 
+    /// Copies the value currently in `%r` into a fresh ref slot and returns a
+    /// dereferenced location for it. Value-producing builtins (`@stdin`,
+    /// `parseInt`) leave their result directly in `%r`, but the rest of the
+    /// compiler expects value expressions to yield a `ref.dereference()`
+    /// location (so callers like arithmetic operands can `.dereference()` it).
+    fn stabilizeRegisterResult(
+        self: *IRCompiler,
+        source: anytype,
+        comptime name: []const u8,
+        type_expr: ?ast.TypeExpr,
+    ) Error!Result {
+        const ref = try self.newRef(source, name);
+        try self.set(source, ref, .fromLocation(.initRegister(.r)));
+        return .fromLocation(ref.dereference().typed(type_expr));
+    }
+
     fn compileIdentifier(
         self: *IRCompiler,
         source: anytype,
@@ -2671,6 +2710,37 @@ pub const IRCompiler = struct {
             const path = self.script.span.start.file;
             const value = try self.addSlice(1, path);
             return .fromValue(value);
+        }
+
+        if (std.mem.eql(u8, identifier.name, "@stdin")) {
+            // Type @stdin with the enclosing function's declared stdin type so
+            // coercions like T→?T work (e.g. @stdin in a ?String function is
+            // ?String, so `@stdin orelse "default"` type-checks). Fall back to
+            // String when no declared type is available.
+            const declared_type: ?ast.TypeExpr = if (self.stdin_type_stack.items.len > 0)
+                self.stdin_type_stack.items[self.stdin_type_stack.items.len - 1]
+            else
+                null;
+            try self.addInstruction(.init(.from(source), .collect_stdin));
+            // Type-directed parsing: an Int-typed stdin parses the collected
+            // bytes into an Int value so arithmetic on @stdin works.
+            if (declared_type) |dt| {
+                if (typeExprIsNamed(dt, "Int")) {
+                    try self.addInstruction(.init(.from(source), .parse_int));
+                    return try self.stabilizeRegisterResult(source, "stdin_value", .global(.integer));
+                }
+            }
+            return try self.stabilizeRegisterResult(source, "stdin_value", declared_type orelse string_type);
+        }
+
+        // parseInt builtin: a pipeline stage with type `fn String parseInt() Int`.
+        // A user-defined parseInt in scope takes precedence (checked below).
+        if (std.mem.eql(u8, identifier.name, "parseInt") and
+            self.lookup(identifier.name, .{ .shallow = false }) == null)
+        {
+            try self.addInstruction(.init(.from(source), .collect_stdin));
+            try self.addInstruction(.init(.from(source), .parse_int));
+            return try self.stabilizeRegisterResult(source, "parse_int_value", .global(.integer));
         }
 
         const source_binding = self.lookup(identifier.name, .{ .shallow = false }) orelse {
@@ -4055,6 +4125,80 @@ pub const IRCompiler = struct {
         );
     }
 
+    /// The kind of transport used (or planned) between two adjacent pipeline stages.
+    const PipeBoundaryKind = enum {
+        /// Both stages carry a matching non-void, non-execution typed value.
+        /// Currently still compiled with byte pipes; will use direct value
+        /// passing once @stdin is supported.
+        exact_typed,
+        /// At least one stage is an external executable whose return type is
+        /// ExecutionResult (mapped to String at boundaries). Byte pipes required.
+        byte_stream,
+        /// One side is Void; no data is transported.
+        void_boundary,
+    };
+
+    /// Determine how to connect the given stage to the pipeline at runtime.
+    /// Returns the kind of transport that would ideally be used.
+    fn classifyStageOutputKind(self: *IRCompiler, stage: *ast.Expression) PipeBoundaryKind {
+        const callee = switch (stage.*) {
+            .call => |call| call.callee,
+            else => stage,
+        };
+        const binding = switch (callee.*) {
+            .identifier => |id| self.lookup(id.name, .{ .shallow = false }),
+            else => null,
+        } orelse return .byte_stream;
+
+        const fn_type = switch (binding.type_expr orelse return .byte_stream) {
+            .function => |f| f,
+            else => return .byte_stream,
+        };
+
+        const return_type = fn_type.return_type orelse return .byte_stream;
+        return switch (return_type.*) {
+            .void => .void_boundary,
+            .execution => .byte_stream,
+            else => .exact_typed,
+        };
+    }
+
+    fn classifyStageInputKind(self: *IRCompiler, stage: *ast.Expression) PipeBoundaryKind {
+        const callee = switch (stage.*) {
+            .call => |call| call.callee,
+            else => stage,
+        };
+        const binding = switch (callee.*) {
+            .identifier => |id| self.lookup(id.name, .{ .shallow = false }),
+            else => null,
+        } orelse return .byte_stream;
+
+        const fn_type = switch (binding.type_expr orelse return .byte_stream) {
+            .function => |f| f,
+            else => return .byte_stream,
+        };
+
+        const stdin_type = fn_type.stdin_type orelse return .byte_stream;
+        return switch (stdin_type.*) {
+            .void => .void_boundary,
+            .execution => .byte_stream,
+            else => .exact_typed,
+        };
+    }
+
+    fn classifyBoundary(
+        self: *IRCompiler,
+        upstream: *ast.Expression,
+        downstream: *ast.Expression,
+    ) PipeBoundaryKind {
+        const out_kind = self.classifyStageOutputKind(upstream);
+        const in_kind = self.classifyStageInputKind(downstream);
+
+        if (out_kind == .byte_stream or in_kind == .byte_stream) return .byte_stream;
+        if (out_kind == .void_boundary or in_kind == .void_boundary) return .void_boundary;
+        return .exact_typed;
+    }
+
     fn compilePipeline(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -4085,6 +4229,11 @@ pub const IRCompiler = struct {
             stage_set.* = try self.addInstructionSet();
         }
         const last_set = try self.addInstructionSet();
+
+        for (pipeline.stages[0 .. pipeline.stages.len - 1], pipeline.stages[1..], 0..) |upstream, downstream, i| {
+            const kind = self.classifyBoundary(upstream, downstream);
+            try self.comment("boundary {}: {s}", .{ i, @tagName(kind) });
+        }
 
         try self.comment("first stage", .{});
         const first_spawned = try self.spawnClosure(
@@ -4117,7 +4266,7 @@ pub const IRCompiler = struct {
             self.threadStderr(),
         );
 
-        for (stage_sets, stage_closures, pipeline.stages[0 .. pipeline.stages.len - 1], 0..) |*stage_set, *stage_closure, stage_expr, i| {
+        for (stage_sets, stage_closures, pipeline.stages[0 .. pipeline.stages.len - 1], pipeline.stages[1..], 0..) |*stage_set, *stage_closure, stage_expr, next_expr, i| {
             self.current_instruction_set = stage_set.*;
             try self.scopes.push(self.allocator, .closure);
             const stdout_stream_thread_ref = try self.newRef(source, "pipeline_stdout_stream_thread");
@@ -4126,6 +4275,8 @@ pub const IRCompiler = struct {
                 stdout_stream_thread_ref,
                 .from(try self.forkInherit(source, self.stdoutStreamSet(), .noll)),
             );
+            _ = next_expr;
+
             const result = try self.compileExpression(stage_expr);
 
             if (isWaitable(result)) |loc| {
@@ -4450,6 +4601,12 @@ pub const IRCompiler = struct {
             );
         }
 
+        // Track the enclosing function's declared stdin type so compileIdentifier
+        // can give @stdin the correct type (needed for T→?T / T→E!T coercions).
+        // A stack handles nested function declarations.
+        try self.stdin_type_stack.append(self.allocator, if (fn_decl.stdin_type) |st| st.* else null);
+        defer _ = self.stdin_type_stack.pop();
+
         for (fn_decl.params._non_variadic) |param| {
             switch (param.pattern.*) {
                 .discard => {},
@@ -4534,7 +4691,15 @@ pub const IRCompiler = struct {
         if (isWaitable(result)) |loc| {
             try self.wait(source, loc);
         }
-        if (result.source.isValueTag(.void)) {
+        // A Void-stdout function produces no piped output, so discard the body's
+        // value (which may be a non-void expression such as an assignment) and
+        // exit with success. Without this, a numeric body value would now be
+        // serialized to the stdout pipe by exit_with.
+        const is_void_stdout = if (fn_decl.return_type) |rt|
+            rt.* == .void or typeExprIsNamed(rt.*, "Void")
+        else
+            false;
+        if (is_void_stdout or result.source.isValueTag(.void)) {
             try self.exitWith(source, .fromValue(.fromBoolean(true)));
         } else {
             try self.exitWith(source, result);
@@ -4546,11 +4711,17 @@ pub const IRCompiler = struct {
         self.current_instruction_set = orig_instr_set;
         self.scopes.pop();
         if (fn_decl.name) |name| {
+            const fn_type = ast.TypeExpr{ .function = .{
+                .params = .nonVariadic(&.{}),
+                .stdin_type = fn_decl.stdin_type,
+                .return_type = fn_decl.return_type,
+                .span = fn_decl.span,
+            } };
             try self.scopes.declare(
                 self.allocator,
                 name.name,
                 try .from(fn_ref),
-                null,
+                fn_type,
                 false,
                 .normal,
             );

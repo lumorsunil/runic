@@ -558,8 +558,7 @@ pub const TypeExpr = union(enum) {
     pub const executableType = TypeExpr{
         .function = .{
             .params = .variadic(&executableParameterType),
-            // TODO: implement
-            .stdin_type = null,
+            .stdin_type = &globalStringType,
             .return_type = &executableReturnType,
             .span = .global,
         },
@@ -1234,7 +1233,12 @@ pub const Pipeline = struct {
     ) semantic.Scope.Error!?*const TypeExpr {
         if (self.background) return &globalExecutionType;
         if (self.stages.len == 0) return null;
-        return self.stages[self.stages.len - 1].resolveType(allocator, scope);
+        const last_stage = self.stages[self.stages.len - 1];
+        const stage_type = try last_stage.resolveType(allocator, scope) orelse return null;
+        return switch (stage_type.*) {
+            .function => |function| function.return_type,
+            else => stage_type,
+        };
     }
 };
 

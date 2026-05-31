@@ -36,14 +36,29 @@
   - [x] stdin type
   - [x] parameters
 - [ ] stdin special bindings
-  - `@stdin`
-  - `@stdin | cat`
+  - [x] `@stdin` — reads all bytes from the function's stdin pipe as a String
+  - [ ] `@stdin | cat` — pipe @stdin directly into a command
 - [ ] typed pipes
+  - [x] type-check pipe boundary compatibility (exact match)
+  - [x] reject Void↔non-Void mismatches
+  - [x] enforce function body stdin/stdout contracts
+  - [x] runtime String typed transport via `@stdin` (byte-stream path)
+  - [x] mixed exec/typed pipelines: exec→@stdin, return→exec, return→@stdin
+  - [x] 3-stage pipelines in all combinations
+  - [x] T→?T coercion (accepted + works at runtime via typed `@stdin`)
+  - [x] T→E!T coercion (type checker accepts; runtime blocked on error-union
+    stdin types parsing)
+  - [x] arbitrary typed values (Int) through pipes via canonical-text wire +
+    type-directed `@stdin` parsing
+  - [x] `parseInt` builtin (`fn String parseInt() Int`)
+  - [ ] `parseFloat` / other parse builtins
+  - [ ] in-process typed transport (skip text serialization for large/structured
+    values)
 - [x] exit code
 - [ ] remaining function/runtime gaps
   - stdin semantics
   - stdout/stderr capturing and piping
-  - typed pipes
+  - typed pipes runtime transport
 
 ## expressions
 

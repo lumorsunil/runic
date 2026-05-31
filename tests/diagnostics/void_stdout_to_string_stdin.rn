@@ -1,0 +1,4 @@
+fn Void make_void() Void {}
+fn String need_string() String cat
+
+make_void | need_string

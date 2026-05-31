@@ -1,0 +1,6 @@
+[error]: tests/diagnostics/function_stdout_mismatch.rn:1:19: function stdout type mismatch: expected Int, actual: []Byte
+   1:fn Void bad() Int echo "not an int"
+   2:
+   3:bad
+   4:
+

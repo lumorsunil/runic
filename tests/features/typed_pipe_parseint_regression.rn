@@ -1,0 +1,9 @@
+fn Int doubler() Int {
+    return @stdin * 2
+}
+
+fn Int inc() Int {
+    return @stdin + 1
+}
+
+echo "10" | parseInt | doubler | inc

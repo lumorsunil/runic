@@ -1,0 +1,10 @@
+fn Void produce() String {
+    return "coerced value"
+}
+
+fn ?String consume() String {
+    const received = @stdin orelse "fallback"
+    return "${received}"
+}
+
+produce | consume

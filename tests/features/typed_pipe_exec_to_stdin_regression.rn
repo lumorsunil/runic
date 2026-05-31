@@ -1,0 +1,6 @@
+fn String process() String {
+    const input = @stdin
+    return "${input}"
+}
+
+echo "exec to stdin" | process

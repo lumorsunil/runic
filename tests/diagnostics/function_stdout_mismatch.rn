@@ -1,0 +1,3 @@
+fn Void bad() Int echo "not an int"
+
+bad

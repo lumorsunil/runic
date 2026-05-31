@@ -1,0 +1,6 @@
+fn Void make_string() String {
+    return "typed via return"
+}
+fn String passthrough() String cat
+
+make_string | passthrough
