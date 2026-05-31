@@ -739,18 +739,30 @@ pub const TypeChecker = struct {
             },
         }
 
-        try self.runExpression(fn_scope, fn_decl.body);
+        // Run the body in a scope we keep a handle to. For a block body, run its
+        // statements directly in `body_scope` instead of letting `runExpression`
+        // create and discard an internal child scope. That way the stdin/stdout
+        // type resolution below can see bindings declared in the body (e.g.
+        // `const n = @stdin` referenced from a later `return n * 2`).
+        const body_scope = if (fn_decl.body.* == .block) blk: {
+            const bs = try fn_scope.addChild(self.arena.allocator(), fn_decl.body.block.span);
+            try self.runBlock(bs, &fn_decl.body.block);
+            break :blk bs;
+        } else blk: {
+            try self.runExpression(fn_scope, fn_decl.body);
+            break :blk fn_scope;
+        };
 
         if (fn_decl.stdin_type) |stdin_type| {
             try self.validateFunctionBodyStdin(
-                fn_scope,
+                body_scope,
                 fn_decl.body,
                 try self.resolveTypeExpr(fn_scope, stdin_type),
             );
         }
 
         if (fn_decl.return_type) |return_type| {
-            if (try self.resolveFunctionBodyStdoutType(fn_scope, fn_decl.body)) |body_stdout_type| {
+            if (try self.resolveFunctionBodyStdoutType(body_scope, fn_decl.body)) |body_stdout_type| {
                 try self.validateFunctionStdout(
                     try self.resolveTypeExpr(fn_scope, return_type),
                     body_stdout_type,

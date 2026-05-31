@@ -1,0 +1,13 @@
+// @stdin is usable from inside block expressions, not just directly in a
+// function body. A binding declared in the body (or a nested block) is visible
+// to the function's stdout-type check.
+
+fn Int process() Int {
+    const doubled = {
+        const n = @stdin
+        n * 2
+    }
+    return doubled
+}
+
+echo "21" | parseInt | process

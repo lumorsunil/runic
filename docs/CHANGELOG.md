@@ -48,6 +48,11 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   pipeline expressions report the right value type in assignment contexts.
 
 ### Fixed
+- `@stdin` can now be referenced from block expressions inside a function body
+  (including nested blocks and bindings like `const n = @stdin` used later). The
+  type checker previously resolved a function's stdin/stdout types in a scope
+  that did not contain the body's bindings, producing a spurious stdout-type
+  mismatch once `@stdin` carried a non-`String` type.
 - `exit_with` now correctly serializes heap-allocated strings (produced by
   multi-segment string interpolation like `"${x}!"`) to the stdout pipe, so
   typed functions that build strings via interpolation produce the right output.

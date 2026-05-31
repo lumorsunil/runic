@@ -446,3 +446,22 @@ boundaries, and add a `parseInt` builtin that bridges `String → Int` so that
 - [x] Run the full regression suite (13 unit, 47 smoke, 13 diagnostics, fmt).
 - [x] Update `docs/features.md`, `future/typed-pipes.md`, `todo.md`, and
   `docs/CHANGELOG.md`.
+
+### Follow-up: `@stdin` from block expressions
+
+`@stdin` is now usable from block expressions inside a function body (including
+nested blocks and bindings such as `const n = @stdin` referenced later), not
+just inline in the body's tail expression.
+
+- [x] Root cause: `runFnDecl` resolved the function's stdin/stdout types in
+  `fn_scope`, but the body's bindings live in a child scope that
+  `runExpression`/`runBlockInNewScope` created and discarded. A binding
+  referenced from the `return` expression (e.g. `n`) was therefore not found and
+  fell back to the executable type, producing a spurious stdout mismatch once
+  `@stdin` carried a real (non-`String`) type.
+- [x] Fix: run a block body directly in a `body_scope` that `runFnDecl` keeps a
+  handle to, and resolve stdin/stdout types in that scope. The compiler side
+  already handled `@stdin` in blocks (the function-scoped `stdin_type_stack` is
+  visible to nested blocks), so no codegen change was needed.
+- [x] Fixture: `tests/features/typed_pipe_block_stdin_regression.rn`
+  (`@stdin` inside a nested block, `echo "21" | parseInt | process` → `42`).
