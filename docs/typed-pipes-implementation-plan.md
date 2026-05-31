@@ -484,6 +484,20 @@ made `echo "3" | parseInt | { @stdin * @stdin }` fail at runtime with
   stdin), so `@stdin` there keeps the enclosing context's type or `String`.
 - [x] Fixture: `tests/features/typed_pipe_block_stage_inference_regression.rn`
   (`echo "3" | parseInt | { @stdin * @stdin }` → `9`).
-- [ ] Known gap: a *bare* `@stdin` used as a stage (e.g. `... | @stdin`) is still
-  rejected by the type checker, which resolves a top-level `@stdin` to the
-  executable fallback type. Block stages are the supported form.
+
+### Follow-up: bare `@stdin` as a pipeline stage (identity passthrough)
+
+A bare `@stdin` stage (e.g. `... | parseInt | @stdin`) was rejected by the type
+checker, which resolved a top-level `@stdin` to the executable fallback type
+(stdin `String`) and so reported a mismatch against an `Int` upstream.
+
+- [x] Fix: in `runPipeline`, recognize a bare `@stdin` stage (via `isStdinStage`)
+  and treat it as an identity/passthrough — skip the boundary check (it accepts
+  any type) and keep the upstream's type flowing to the next stage. So
+  `parseInt | @stdin | doubler` validates the `@stdin → doubler` boundary as
+  `Int → Int`, while `echo "x" | @stdin | doubler` still fails (`String → Int`).
+- [x] No compiler change needed: the block-stage inference already types a bare
+  `@stdin` stage from its upstream (`stageStdoutType`), so it parses the value
+  and re-emits it.
+- [x] Fixtures: `typed_pipe_stdin_passthrough_regression.rn`
+  (`echo "5" | parseInt | @stdin | doubler` → `10`).

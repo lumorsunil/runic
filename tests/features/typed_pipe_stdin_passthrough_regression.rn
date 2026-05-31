@@ -1,0 +1,9 @@
+// A bare `@stdin` works as a pipeline stage: it is an identity/passthrough that
+// consumes the upstream value and re-emits it unchanged, preserving its type.
+// Here the Int from parseInt flows through @stdin into doubler.
+
+fn Int doubler() Int {
+    return @stdin * 2
+}
+
+echo "5" | parseInt | @stdin | doubler

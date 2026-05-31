@@ -56,6 +56,10 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 - A block used directly as a pipeline stage now infers its `@stdin` type from
   the upstream stage, so `echo "3" | parseInt | { @stdin * @stdin }` evaluates
   `@stdin` as an `Int` (→ `9`) instead of failing on `String * String`.
+- A bare `@stdin` now works as a pipeline stage, acting as an identity
+  passthrough that preserves the upstream value's type. `echo "5" | parseInt |
+  @stdin | doubler` → `10`; a type-incompatible passthrough such as
+  `echo "x" | @stdin | doubler` is still rejected.
 - `exit_with` now correctly serializes heap-allocated strings (produced by
   multi-segment string interpolation like `"${x}!"`) to the stdout pipe, so
   typed functions that build strings via interpolation produce the right output.
