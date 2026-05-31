@@ -53,6 +53,9 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   type checker previously resolved a function's stdin/stdout types in a scope
   that did not contain the body's bindings, producing a spurious stdout-type
   mismatch once `@stdin` carried a non-`String` type.
+- A block used directly as a pipeline stage now infers its `@stdin` type from
+  the upstream stage, so `echo "3" | parseInt | { @stdin * @stdin }` evaluates
+  `@stdin` as an `Int` (→ `9`) instead of failing on `String * String`.
 - `exit_with` now correctly serializes heap-allocated strings (produced by
   multi-segment string interpolation like `"${x}!"`) to the stdout pipe, so
   typed functions that build strings via interpolation produce the right output.

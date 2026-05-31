@@ -4199,6 +4199,44 @@ pub const IRCompiler = struct {
         return .exact_typed;
     }
 
+    /// Resolves the concrete stdout type a pipeline stage produces, so a
+    /// downstream stage that does not declare its own stdin type (a block or a
+    /// bare expression) can have its `@stdin` typed by inference. Returns null
+    /// when the type is unknown (e.g. an external executable), in which case
+    /// `@stdin` falls back to String.
+    fn stageStdoutType(self: *IRCompiler, stage: *ast.Expression) ?ast.TypeExpr {
+        const callee = switch (stage.*) {
+            .call => |call| call.callee,
+            else => stage,
+        };
+
+        if (callee.* == .identifier) {
+            const name = callee.identifier.name;
+            if (std.mem.eql(u8, name, "parseInt") and
+                self.lookup(name, .{ .shallow = false }) == null)
+            {
+                return .global(.integer);
+            }
+        }
+
+        const binding = switch (callee.*) {
+            .identifier => |id| self.lookup(id.name, .{ .shallow = false }),
+            else => null,
+        } orelse return null;
+
+        const fn_type = switch (binding.type_expr orelse return null) {
+            .function => |f| f,
+            else => return null,
+        };
+
+        const return_type = fn_type.return_type orelse return null;
+        return switch (return_type.*) {
+            // Executables surface ExecutionResult; at a pipe boundary that is bytes.
+            .execution => string_type,
+            else => return_type.*,
+        };
+    }
+
     fn compilePipeline(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -4277,7 +4315,18 @@ pub const IRCompiler = struct {
             );
             _ = next_expr;
 
+            // Infer the stage's @stdin type from the upstream stage's stdout, so
+            // a block/bare-expression stage that does not declare a stdin type
+            // (e.g. `... | parseInt | { @stdin * @stdin }`) reads a typed value.
+            // The first stage has no upstream stage to infer from.
+            const inferred_stdin: ?ast.TypeExpr = if (i > 0)
+                self.stageStdoutType(pipeline.stages[i - 1])
+            else
+                null;
+            const pushed_stdin = i > 0;
+            if (pushed_stdin) try self.stdin_type_stack.append(self.allocator, inferred_stdin);
             const result = try self.compileExpression(stage_expr);
+            if (pushed_stdin) _ = self.stdin_type_stack.pop();
 
             if (isWaitable(result)) |loc| {
                 try self.comment("wait from {s}", .{@src().fn_name});
@@ -4310,7 +4359,14 @@ pub const IRCompiler = struct {
 
         self.current_instruction_set = last_set;
         try self.scopes.push(self.allocator, .closure);
-        const result = try self.compileExpression(pipeline.stages[pipeline.stages.len - 1]);
+        const last_idx = pipeline.stages.len - 1;
+        const last_pushed_stdin = last_idx > 0;
+        if (last_pushed_stdin) try self.stdin_type_stack.append(
+            self.allocator,
+            self.stageStdoutType(pipeline.stages[last_idx - 1]),
+        );
+        const result = try self.compileExpression(pipeline.stages[last_idx]);
+        if (last_pushed_stdin) _ = self.stdin_type_stack.pop();
         if (isWaitable(result)) |loc| {
             try self.comment("wait from {s} (last stage)", .{@src().fn_name});
             try self.wait(source, loc);

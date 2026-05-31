@@ -465,3 +465,25 @@ just inline in the body's tail expression.
   visible to nested blocks), so no codegen change was needed.
 - [x] Fixture: `tests/features/typed_pipe_block_stdin_regression.rn`
   (`@stdin` inside a nested block, `echo "21" | parseInt | process` → `42`).
+
+### Follow-up: infer a block stage's `@stdin` type from its upstream
+
+A block (or bare expression) used directly as a pipeline stage — not a function
+body — has no declared stdin type, so its `@stdin` defaulted to `String`. That
+made `echo "3" | parseInt | { @stdin * @stdin }` fail at runtime with
+`UnsupportedBinaryExpression` (`String * String`).
+
+- [x] Fix: in `compilePipeline`, infer each non-first stage's stdin type from
+  the upstream stage's stdout type and push it onto `stdin_type_stack` while
+  compiling that stage. A new `stageStdoutType` helper resolves the upstream
+  type (handling the `parseInt` builtin, function return types, and mapping an
+  executable's `ExecutionResult` to `String`). `@stdin` inside the stage then
+  picks up the inferred type (e.g. `Int`) and parses accordingly. Function-call
+  stages are unaffected because their bodies are compiled at declaration time.
+- [x] The first stage is not inferred (its input is the program/enclosing
+  stdin), so `@stdin` there keeps the enclosing context's type or `String`.
+- [x] Fixture: `tests/features/typed_pipe_block_stage_inference_regression.rn`
+  (`echo "3" | parseInt | { @stdin * @stdin }` → `9`).
+- [ ] Known gap: a *bare* `@stdin` used as a stage (e.g. `... | @stdin`) is still
+  rejected by the type checker, which resolves a top-level `@stdin` to the
+  executable fallback type. Block stages are the supported form.

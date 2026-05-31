@@ -1,0 +1,5 @@
+// A block used directly as a pipeline stage (not a function body) infers its
+// @stdin type from the upstream stage's stdout. Here parseInt produces an Int,
+// so @stdin inside the block is an Int and the multiplication is arithmetic.
+
+echo "3" | parseInt | { @stdin * @stdin }
