@@ -1,5 +1,7 @@
+// A function pushes its output to stdout with `yield`; the function's value is
+// no longer auto-pushed.
 fn Void make_string() String {
-    return "typed via return"
+    yield "typed via yield"
 }
 fn String passthrough() String cat
 

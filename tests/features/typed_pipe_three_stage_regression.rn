@@ -1,15 +1,15 @@
 fn Void source() String {
-    return "stage"
+    yield "stage"
 }
 
 fn String middle() String {
     const s = @stdin
-    return "three ${s}"
+    yield "three ${s}"
 }
 
 fn String sink() String {
     const s = @stdin
-    return "${s} pipeline"
+    yield "${s} pipeline"
 }
 
 source | middle | sink

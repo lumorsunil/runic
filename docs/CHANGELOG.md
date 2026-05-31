@@ -15,6 +15,12 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 ### Added
 
 #### Typed pipeline boundaries
+- **`yield` keyword for explicit stdout output**: functions and pipeline stages
+  push values to stdout with `yield expr`. A function's `return`/body value is no
+  longer auto-pushed to stdout, so a stage that consumes its input without
+  yielding produces no output (e.g. a function that only runs a side-effecting
+  `echo`). `return` now serves control flow / the function's exit value, and the
+  declared stdout type constrains what may be `yield`ed.
 - **Type checking at every `|`**: the type checker now validates that the
   upstream stdout type matches the downstream stdin type at each pipeline
   boundary. Mismatches are caught before execution with a clear diagnostic

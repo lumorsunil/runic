@@ -36,12 +36,14 @@
   - [x] stdin type
   - [x] parameters
 - [ ] stdin special bindings
-  - [x] `@stdin` — reads all bytes from the function's stdin pipe as a String
+  - [x] `@stdin` — reads the function's stdin pipe as a typed value (String/Int)
   - [ ] `@stdin | cat` — pipe @stdin directly into a command
+- [x] `yield` keyword — explicit stdout output from function/stage bodies
 - [ ] typed pipes
   - [x] type-check pipe boundary compatibility (exact match)
   - [x] reject Void↔non-Void mismatches
   - [x] enforce function body stdin/stdout contracts
+  - [x] explicit stdout output via `yield` (return value no longer auto-pushed)
   - [x] runtime String typed transport via `@stdin` (byte-stream path)
   - [x] mixed exec/typed pipelines: exec→@stdin, return→exec, return→@stdin
   - [x] 3-stage pipelines in all combinations

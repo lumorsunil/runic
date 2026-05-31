@@ -377,6 +377,43 @@ produce | passthrough
 on stdin and forwards it. The type checker validates that these types align
 before the script runs.
 
+### `yield` — pushing values to stdout
+
+Output to a function's (or stage's) stdout is explicit. Use `yield` to push a
+value; a function's `return`/body value is **not** automatically written to
+stdout. A stage that consumes its input without `yield`ing produces no output.
+
+```rn
+fn Int square() Int {
+    yield @stdin * @stdin
+}
+
+echo "4" | parseInt | square   // prints 16
+```
+
+The declared stdout type constrains what may be `yield`ed — `yield "text"` in an
+`Int`-stdout function is a compile-time error. A function may `yield` zero or
+more times; `return` is for control flow / the function's exit value and no
+longer carries output:
+
+```rn
+fn Int consume() Void {
+    const n = @stdin
+    // no yield: this stage produces no stdout output
+}
+
+echo "3" | parseInt | consume   // prints nothing
+```
+
+Commands inside a function body (like `echo`) still write to stdout directly —
+that is independent of `yield`:
+
+```rn
+fn Void greet(name: String) String {
+    echo "Hello, ${name}!"   // echo writes to stdout itself
+}
+```
+
 ### `@stdin` — reading typed stdin as a value
 
 Inside a function body with a typed stdin, the built-in `@stdin` expression
@@ -386,19 +423,20 @@ of relying on executables like `cat`.
 
 ```rn
 fn Void produce() String {
-    return "hello from pipe"
+    yield "hello from pipe"
 }
 
 fn String transform() String {
     const received = @stdin
-    return "${received}!"
+    yield "${received}!"
 }
 
 produce | transform
 ```
 
-**Result:** Prints `hello from pipe!`. `produce` returns the string directly
-(no process involved), `transform` collects it via `@stdin` and appends `"!"`.
+**Result:** Prints `hello from pipe!`. `produce` yields the string directly
+(no process involved), `transform` collects it via `@stdin` and yields it with
+`"!"` appended.
 
 The `@stdin` value has the type declared in the function's stdin position. Using
 it in a function that has `Void` stdin would be a type error.
@@ -412,7 +450,7 @@ that precedes a typed function must match the function's declared stdin type
 ```rn
 fn String process() String {
     const input = @stdin
-    return "${input}!"
+    yield "${input}!"
 }
 
 // executable output → typed function via @stdin
@@ -422,8 +460,8 @@ echo "exec input" | process
 Multi-stage pipelines work in all combinations:
 
 ```rn
-fn Void source() String { return "pipeline" }
-fn String middle() String { const s = @stdin; return "typed ${s}" }
+fn Void source() String { yield "pipeline" }
+fn String middle() String { const s = @stdin; yield "typed ${s}" }
 
 // typed fn → typed fn → executable
 source | middle | cat
@@ -438,11 +476,11 @@ making the type transition explicit:
 
 ```rn
 fn Int doubler() Int {
-    return @stdin * 2
+    yield @stdin * 2
 }
 
 fn Int inc() Int {
-    return @stdin + 1
+    yield @stdin + 1
 }
 
 // String → parseInt → Int → Int : prints 21
@@ -450,7 +488,7 @@ echo "10" | parseInt | doubler | inc
 ```
 
 **Result:** `echo "10"` produces the text `10`; `parseInt` asserts it as an
-`Int`; `doubler` reads `@stdin` as `10` and returns `20`; `inc` returns `21`.
+`Int`; `doubler` reads `@stdin` as `10` and yields `20`; `inc` yields `21`.
 Numeric values travel between stages as their canonical decimal text, and each
 stage's declared type drives how the bytes are interpreted. `parseInt` has the
 type `fn String parseInt() Int`, so a following stage must declare `Int` stdin —
@@ -464,12 +502,12 @@ so `@stdin orelse "default"` reads the piped value when present:
 
 ```rn
 fn Void produce() String {
-    return "coerced value"
+    yield "coerced value"
 }
 
 fn ?String consume() String {
     const received = @stdin orelse "fallback"
-    return "${received}"
+    yield "${received}"
 }
 
 produce | consume

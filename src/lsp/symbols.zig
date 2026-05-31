@@ -41,7 +41,7 @@ pub fn collectSymbols(
             .bash_block, .error_decl, .while_stmt => {
                 // Not Yet Implemented,
             },
-            .return_stmt, .exit_stmt, .expression => {
+            .return_stmt, .exit_stmt, .yield_stmt, .expression => {
                 // Does not produce symbols
             },
             // TODO: implement?

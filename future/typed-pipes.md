@@ -30,19 +30,38 @@ The following rules are enforced as of the current implementation:
 - **Function body stdin contract**: The type checker walks the function body and
   rejects calls to functions whose declared stdin type is incompatible with the
   enclosing function's declared stdin.
-- **Function body stdout contract**: The type checker verifies that the body's
-  last expression type matches the function's declared return type.
+- **`yield` stdout contract**: The type checker verifies that every `yield`ed
+  value matches the declared stdout type.
+
+## yield — pushing values to stdout
+
+Output is explicit. `yield expr` writes `expr` to the function/stage's stdout
+stream; the function's `return`/body value is **not** auto-pushed. A stage that
+consumes its input without `yield`ing produces no stdout output (subprocess
+writes such as `echo` are independent and still go to stdout). `return` is for
+control flow and the function's exit value.
+
+```rn
+fn Int square() Int {
+    yield @stdin * @stdin
+}
+```
+
+Implementation: `yield` compiles to a `pipe_write` to the thread's stdout pipe
+(`materializeString`, then flush). The evaluator's `exit_with` no longer writes
+the return value to stdout — it only sets the exit code (non-coercible values
+exit with success). The pipeline compiler no longer auto-pushes a stage's value.
 
 ## @stdin — reading typed stdin as a value
 
 The `@stdin` built-in expression reads all bytes from the function's stdin pipe
-and returns them as a `String` value. It is available only inside functions that
-declare a non-Void stdin type.
+and returns them as a `String` value (or a parsed `Int` for an `Int` stdin). It
+is available only inside functions that declare a non-Void stdin type.
 
 ```rn
 fn String transform() String {
     const received = @stdin
-    return "${received}!"
+    yield "${received}!"
 }
 ```
 

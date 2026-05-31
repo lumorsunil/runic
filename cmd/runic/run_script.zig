@@ -290,6 +290,7 @@ const StatementExpressionIterator = struct {
             },
             .exit_stmt => |exit_stmt| if (exit_stmt.value) |v| try self.cursor.appendExpr(v),
             .return_stmt => |return_stmt| if (return_stmt.value) |v| try self.cursor.appendExpr(v),
+            .yield_stmt => |yield_stmt| try self.cursor.appendExpr(yield_stmt.value),
             .expression => |expr| try self.cursor.appendExpr(expr.expression),
         }
     }

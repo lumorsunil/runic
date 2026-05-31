@@ -2163,6 +2163,11 @@ pub const Parser = struct {
             return stmt;
         }
 
+        if (try self.parseMaybeYield()) |yield_stmt| {
+            stmt.* = .{ .yield_stmt = yield_stmt };
+            return stmt;
+        }
+
         const expr = try self.parseExpression();
         if (try self.stream.consumeIf(.amp)) {
             try self.markExpressionBackground(expr);
@@ -2670,6 +2675,30 @@ pub const Parser = struct {
         return switch (next.tag) {
             .kw_exit => try self.parseExit(),
             else => null,
+        };
+    }
+
+    fn parseMaybeYield(self: *Self) Error!?ast.YieldStmt {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const next = try self.peekToken();
+        return switch (next.tag) {
+            .kw_yield => try self.parseYield(),
+            else => null,
+        };
+    }
+
+    fn parseYield(self: *Self) Error!ast.YieldStmt {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const start = try self.expectTokenTag(.kw_yield);
+        const value = try self.parseExpression();
+
+        return .{
+            .value = value,
+            .span = start.span.endAt(value.span()),
         };
     }
 

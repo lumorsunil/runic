@@ -1305,6 +1305,7 @@ pub const IRCompiler = struct {
             .binding_decl => |*b| self.compileBindingDecl(stmt, b),
             .return_stmt => |r| self.compileReturn(stmt, r),
             .exit_stmt => |e| self.compileExit(stmt, e),
+            .yield_stmt => |y| self.compileYield(stmt, y),
             .expression => |expr| self.compileExpressionStatement(stmt, expr.expression),
             else => {
                 try self.reportSourceError(stmt, Error.UnsupportedExpression, .@"error", "statement type \"{t}\" not yet supported", .{stmt.*});
@@ -1543,6 +1544,22 @@ pub const IRCompiler = struct {
             else => {},
         }
         try self.exitWith(source, result);
+        return .fromValue(.void);
+    }
+
+    /// `yield expr` writes the value of `expr` to the thread's stdout stream
+    /// (the program stdout, or the inter-stage pipe when used as a pipeline
+    /// stage). Unlike `return`, it does not exit the function.
+    fn compileYield(
+        self: *IRCompiler,
+        source: *ast.Statement,
+        y: ast.YieldStmt,
+    ) Error!Result {
+        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        const value = try self.compileResultSaveR(source, try self.compileExpression(y.value));
+        try self.pipeWrite(source, self.threadStdout(), value.source);
+        try self.consume(source, value);
         return .fromValue(.void);
     }
 
@@ -2734,13 +2751,17 @@ pub const IRCompiler = struct {
         }
 
         // parseInt builtin: a pipeline stage with type `fn String parseInt() Int`.
-        // A user-defined parseInt in scope takes precedence (checked below).
+        // It reads stdin, parses to Int, and yields it to stdout (output is
+        // explicit now that stage values are not auto-pushed). A user-defined
+        // parseInt in scope takes precedence (checked below).
         if (std.mem.eql(u8, identifier.name, "parseInt") and
             self.lookup(identifier.name, .{ .shallow = false }) == null)
         {
             try self.addInstruction(.init(.from(source), .collect_stdin));
             try self.addInstruction(.init(.from(source), .parse_int));
-            return try self.stabilizeRegisterResult(source, "parse_int_value", .global(.integer));
+            const parsed = try self.stabilizeRegisterResult(source, "parse_int_value", .global(.integer));
+            try self.pipeWrite(source, self.threadStdout(), parsed.source);
+            return .fromValue(.void);
         }
 
         const source_binding = self.lookup(identifier.name, .{ .shallow = false }) orelse {
@@ -4328,24 +4349,19 @@ pub const IRCompiler = struct {
             const result = try self.compileExpression(stage_expr);
             if (pushed_stdin) _ = self.stdin_type_stack.pop();
 
+            // A stage's value is no longer auto-pushed to stdout; output is
+            // explicit via `yield` (or subprocess writes). Just wait for a
+            // waitable stage to finish, then signal completion downstream.
             if (isWaitable(result)) |loc| {
                 try self.comment("wait from {s}", .{@src().fn_name});
                 try self.wait(source, loc);
-                try self.pipeOpt(
-                    source,
-                    self.threadStdout(),
-                    .keep_open,
-                    .fromValue(.fromBoolean(false)),
-                );
-            } else {
-                try self.pipeWrite(source, self.threadStdout(), result.source);
-                try self.pipeOpt(
-                    source,
-                    self.threadStdout(),
-                    .keep_open,
-                    .fromValue(.fromBoolean(false)),
-                );
             }
+            try self.pipeOpt(
+                source,
+                self.threadStdout(),
+                .keep_open,
+                .fromValue(.fromBoolean(false)),
+            );
 
             try self.wait(source, stdout_stream_thread_ref.dereference());
 

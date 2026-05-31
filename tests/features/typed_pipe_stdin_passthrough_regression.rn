@@ -1,9 +1,9 @@
-// A bare `@stdin` works as a pipeline stage: it is an identity/passthrough that
-// consumes the upstream value and re-emits it unchanged, preserving its type.
-// Here the Int from parseInt flows through @stdin into doubler.
+// An explicit passthrough stage `{ yield @stdin }` re-emits its input unchanged,
+// preserving its type. Here the Int from parseInt flows through the passthrough
+// into doubler.
 
 fn Int doubler() Int {
-    return @stdin * 2
+    yield @stdin * 2
 }
 
-echo "5" | parseInt | @stdin | doubler
+echo "5" | parseInt | { yield @stdin } | doubler

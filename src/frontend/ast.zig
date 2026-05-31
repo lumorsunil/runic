@@ -1426,6 +1426,7 @@ pub const Statement = union(enum) {
     error_decl: ErrorDecl,
     return_stmt: ReturnStmt,
     exit_stmt: ExitStmt,
+    yield_stmt: YieldStmt,
     while_stmt: WhileStmt,
     bash_block: BashBlock,
 
@@ -1436,6 +1437,7 @@ pub const Statement = union(enum) {
             .error_decl => |err| err.span,
             .return_stmt => |ret| ret.span,
             .exit_stmt => |exit_stmt| exit_stmt.span,
+            .yield_stmt => |yield_stmt| yield_stmt.span,
             // .for_stmt => |loop_stmt| loop_stmt.span,
             .while_stmt => |loop_stmt| loop_stmt.span,
             .bash_block => |bash_block| bash_block.span,
@@ -1628,6 +1630,14 @@ pub const ModulePath = struct {
 
 pub const ReturnStmt = struct {
     value: ?*Expression,
+    span: Span,
+};
+
+/// `yield expr` pushes a value to the enclosing function/stage's stdout stream.
+/// Unlike `return`, it does not exit the function and the value is written to
+/// stdout rather than becoming the function's return/exit value.
+pub const YieldStmt = struct {
+    value: *Expression,
     span: Span,
 };
 

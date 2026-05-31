@@ -1,3 +1,5 @@
-fn Void bad() Int echo "not an int"
+fn Void bad() Int {
+    yield "not an int"
+}
 
 bad

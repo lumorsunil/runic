@@ -501,3 +501,46 @@ checker, which resolved a top-level `@stdin` to the executable fallback type
   and re-emits it.
 - [x] Fixtures: `typed_pipe_stdin_passthrough_regression.rn`
   (`echo "5" | parseInt | @stdin | doubler` → `10`).
+
+### Follow-up: explicit `yield` for stdout output
+
+Previously a function/stage's return (or body) value was automatically pushed to
+stdout. That made a last stage emit output even when it shouldn't (e.g. a stage
+that only consumes its input, or one that runs a side-effecting `echo`). Output
+to stdout is now explicit via a new `yield` keyword.
+
+Semantics:
+- `yield expr` writes `expr` to the function/stage's stdout stream and continues.
+- A function's `return`/body value is the return/exit value and is **not** pushed
+  to stdout. `return` is for control flow / early exit.
+- A stage that does not `yield` produces no stdout output (subprocess writes such
+  as `echo` still write to stdout independently).
+- The declared stdout type constrains `yield`ed values; `yield "x"` in an
+  `Int`-stdout function is a compile-time error.
+
+Implementation:
+- [x] Lexer/token: add the `yield` keyword.
+- [x] AST: add `YieldStmt`; parser: parse `yield expr` as a statement.
+- [x] Type checker: `validateBodyYields` walks the body and checks each `yield`
+  against the declared stdout type (replacing the old body-final-value stdout
+  check, which is removed along with its now-dead resolution chain).
+- [x] Compiler: `compileYield` writes the value to `threadStdout` via
+  `pipe_write` (which now uses `materializeString`, so multi-segment strings are
+  concatenated rather than space-joined).
+- [x] Evaluator: `exit_with` no longer writes the value to stdout — it only sets
+  the exit code (non-coercible values exit with success).
+- [x] `compilePipeline` no longer auto-pushes a non-waitable stage's value;
+  `parseInt` now `yield`s its parsed value internally.
+- [x] Converted all value-producing fixtures/examples from `return`/auto-push to
+  `yield` (typed-pipe fixtures, `return_statement_regression`,
+  `string_interpolation_function_regression`, `return_env_regression`,
+  `examples/error_budget.rn`); updated the `function_stdout_mismatch` diagnostic
+  to a `yield` type mismatch.
+- [x] New fixtures: `tests/features/yield_regression.rn` (yield → output) and
+  `tests/features/yield_no_output_regression.rn` (no yield → no output).
+- [x] Full suite green: 13 unit, 50 smoke, 13 diagnostics, fmt.
+
+Deferred / future:
+- [ ] Rename `@stdin` and introduce a general file-descriptor syntax (e.g. `&0`,
+  `&1`, `&2`) for stdin/stdout/stderr. `yield` could become sugar for writing to
+  `&1`. Not implemented yet.

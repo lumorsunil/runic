@@ -1,0 +1,8 @@
+// Output to stdout is explicit via `yield`. A function pushes its result with
+// `yield`; the function's return/body value is no longer auto-pushed.
+
+fn Int square() Int {
+    yield @stdin * @stdin
+}
+
+echo "4" | parseInt | square

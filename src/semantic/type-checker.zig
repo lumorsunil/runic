@@ -479,6 +479,7 @@ pub const TypeChecker = struct {
             .binding_decl => |*binding_decl| self.runBindingDecl(scope, binding_decl),
             .return_stmt => |*return_stmt| self.runReturn(scope, return_stmt),
             .exit_stmt => |*exit_stmt| self.runExit(scope, exit_stmt),
+            .yield_stmt => |*yield_stmt| self.runYield(scope, yield_stmt),
             .expression => |*expr_stmt| self.runExpressionStatement(scope, expr_stmt),
             else => error.UnsupportedStatement,
         };
@@ -489,6 +490,13 @@ pub const TypeChecker = struct {
         try self.logTypeCheckTrace(@src().fn_name, return_stmt.span);
 
         if (return_stmt.value) |value| try self.runExpression(scope, value);
+    }
+
+    fn runYield(self: *TypeChecker, scope: *Scope, yield_stmt: *ast.YieldStmt) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.logTypeCheckTrace(@src().fn_name, yield_stmt.span);
+
+        try self.runExpression(scope, yield_stmt.value);
     }
 
     fn runExit(self: *TypeChecker, scope: *Scope, exit_stmt: *ast.ExitStmt) Error!void {
@@ -761,14 +769,85 @@ pub const TypeChecker = struct {
             );
         }
 
+        // Output to stdout is now explicit via `yield`. Validate that every
+        // `yield`ed value matches the function's declared stdout type. The
+        // function's `return`/body value is the return/exit value and is no
+        // longer pushed to stdout, so it is not checked here.
         if (fn_decl.return_type) |return_type| {
-            if (try self.resolveFunctionBodyStdoutType(body_scope, fn_decl.body)) |body_stdout_type| {
-                try self.validateFunctionStdout(
-                    try self.resolveTypeExpr(fn_scope, return_type),
-                    body_stdout_type,
-                    fn_decl.body.span(),
+            try self.validateBodyYields(
+                body_scope,
+                fn_decl.body,
+                try self.resolveTypeExpr(fn_scope, return_type),
+            );
+        }
+    }
+
+    /// Walks a function body and validates that every `yield expr` produces a
+    /// value compatible with the declared stdout type.
+    fn validateBodyYields(
+        self: *TypeChecker,
+        scope: *Scope,
+        expr: *ast.Expression,
+        declared_stdout: *const ast.TypeExpr,
+    ) Error!void {
+        switch (expr.*) {
+            .block => |block| for (block.statements) |statement| {
+                try self.validateStatementYields(scope, statement, declared_stdout);
+            },
+            .if_expr => |if_expr| {
+                try self.validateBodyYields(scope, if_expr.then_expr, declared_stdout);
+                if (if_expr.else_branch) |else_branch| switch (else_branch) {
+                    .expr => |else_expr| try self.validateBodyYields(scope, else_expr, declared_stdout),
+                    .if_expr => |else_if| try self.validateBodyYields(
+                        scope,
+                        try self.allocExpression(.{ .if_expr = else_if.* }),
+                        declared_stdout,
+                    ),
+                    .condition => {},
+                };
+            },
+            .for_expr => |for_expr| try self.validateBodyYields(scope, for_expr.body, declared_stdout),
+            .match_expr => |match_expr| for (match_expr.cases) |case| {
+                for (case.body.statements) |statement| {
+                    try self.validateStatementYields(scope, statement, declared_stdout);
+                }
+            },
+            .catch_expr => |catch_expr| {
+                try self.validateBodyYields(scope, catch_expr.subject, declared_stdout);
+                for (catch_expr.handler.body.statements) |statement| {
+                    try self.validateStatementYields(scope, statement, declared_stdout);
+                }
+            },
+            .try_expr => |try_expr| try self.validateBodyYields(scope, try_expr.subject, declared_stdout),
+            .subshell => |subshell| try self.validateBodyYields(scope, subshell.child, declared_stdout),
+            else => {},
+        }
+    }
+
+    fn validateStatementYields(
+        self: *TypeChecker,
+        scope: *Scope,
+        statement: *ast.Statement,
+        declared_stdout: *const ast.TypeExpr,
+    ) Error!void {
+        switch (statement.*) {
+            .yield_stmt => |yield_stmt| {
+                const yielded = try self.resolveExprType(scope, yield_stmt.value) orelse return;
+                const resolved = try self.resolvePipeType(scope, yielded) orelse return;
+                if (self.pipeTypesEqual(resolved, declared_stdout)) return;
+                try self.reportSpanError(
+                    yield_stmt.span,
+                    Error.TypeMismatch,
+                    .@"error",
+                    "yield type mismatch: function yields {f}, but declared stdout type is {f}",
+                    .{ resolved, declared_stdout },
                 );
-            }
+            },
+            .expression => |expr_stmt| try self.validateBodyYields(scope, expr_stmt.expression, declared_stdout),
+            .while_stmt => |while_stmt| for (while_stmt.body.statements) |s| {
+                try self.validateStatementYields(scope, s, declared_stdout);
+            },
+            else => {},
         }
     }
 
@@ -870,6 +949,7 @@ pub const TypeChecker = struct {
             .binding_decl => |binding_decl| try self.validateFunctionBodyStdin(scope, binding_decl.initializer, enclosing_stdin),
             .return_stmt => |return_stmt| if (return_stmt.value) |value| try self.validateFunctionBodyStdin(scope, value, enclosing_stdin),
             .exit_stmt => |exit_stmt| if (exit_stmt.value) |value| try self.validateFunctionBodyStdin(scope, value, enclosing_stdin),
+            .yield_stmt => |yield_stmt| try self.validateFunctionBodyStdin(scope, yield_stmt.value, enclosing_stdin),
             .while_stmt => |while_stmt| try self.validateBlockStdin(scope, while_stmt.body, enclosing_stdin),
             .type_binding_decl, .error_decl, .bash_block => {},
         }
@@ -899,75 +979,6 @@ pub const TypeChecker = struct {
     fn isExecutableFunctionType(_: *TypeChecker, function_type: ast.TypeExpr.FunctionType) bool {
         const return_type = function_type.return_type orelse return false;
         return return_type.* == .execution;
-    }
-
-    fn resolveFunctionBodyStdoutType(
-        self: *TypeChecker,
-        scope: *Scope,
-        body: *ast.Expression,
-    ) Error!?*const ast.TypeExpr {
-        return switch (body.*) {
-            .block => |block| self.resolveBlockStdoutType(scope, block),
-            else => self.resolveExpressionStdoutType(scope, body),
-        };
-    }
-
-    fn resolveBlockStdoutType(
-        self: *TypeChecker,
-        scope: *Scope,
-        block: ast.Block,
-    ) Error!?*const ast.TypeExpr {
-        if (block.background) return try self.resolvePipeType(scope, &ast.TypeExpr.executableType);
-        if (block.statements.len == 0) return try self.allocTypeExpression(.{ .void = .{ .span = block.span } });
-
-        return self.resolveStatementStdoutType(scope, block.statements[block.statements.len - 1]);
-    }
-
-    fn resolveStatementStdoutType(
-        self: *TypeChecker,
-        scope: *Scope,
-        statement: *ast.Statement,
-    ) Error!?*const ast.TypeExpr {
-        return switch (statement.*) {
-            .expression => |expr_stmt| self.resolveExpressionStdoutType(scope, expr_stmt.expression),
-            .return_stmt => |return_stmt| if (return_stmt.value) |value|
-                self.resolveExpressionStdoutType(scope, value)
-            else
-                try self.allocTypeExpression(.{ .void = .{ .span = return_stmt.span } }),
-            .binding_decl, .type_binding_decl, .error_decl, .exit_stmt, .while_stmt, .bash_block => try self.allocTypeExpression(.{ .void = .{ .span = statement.span() } }),
-        };
-    }
-
-    fn resolveExpressionStdoutType(
-        self: *TypeChecker,
-        scope: *Scope,
-        expr: *ast.Expression,
-    ) Error!?*const ast.TypeExpr {
-        return switch (expr.*) {
-            .assignment => try self.allocTypeExpression(.{ .void = .{ .span = expr.span() } }),
-            .binary => |binary| switch (binary.op) {
-                .assign, .add_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign => try self.allocTypeExpression(.{ .void = .{ .span = expr.span() } }),
-                else => self.resolvePipelineStageStdoutType(scope, expr),
-            },
-            else => self.resolvePipelineStageStdoutType(scope, expr),
-        };
-    }
-
-    fn validateFunctionStdout(
-        self: *TypeChecker,
-        expected_stdout: *const ast.TypeExpr,
-        actual_stdout: *const ast.TypeExpr,
-        span: ast.Span,
-    ) Error!void {
-        if (self.pipeTypesEqual(actual_stdout, expected_stdout)) return;
-
-        try self.reportSpanError(
-            span,
-            Error.TypeMismatch,
-            .@"error",
-            "function stdout type mismatch: expected {f}, actual: {f}",
-            .{ expected_stdout, actual_stdout },
-        );
     }
 
     fn runCall(self: *TypeChecker, scope: *Scope, call: *ast.CallExpr) Error!void {

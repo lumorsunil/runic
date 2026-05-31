@@ -944,65 +944,16 @@ pub const IREvaluator = struct {
         return switch (instruction.type) {
             .comment => return .skip,
             .exit_with => |value| {
-                const resolved = try self.resolveValueSource(thread, value);
-                switch (resolved) {
-                    .slice => |slice| {
-                        if (slice.element_size == 1 and thread.private.stack.items.len > 1) {
-                            const stdout_handle = thread.private.stack.items[1].pipe;
-                            const stdout_pipe = try self.context.getPipe(stdout_handle);
-                            const string = try self.getSlice(slice);
-                            var w = stdout_pipe.closeableWriter().writer;
-                            try w.writeAll(string);
-                            try w.flush();
-                        }
-                        return .{ .exit = .success };
-                    },
-                    .zig_string, .stream, .pipe => {
-                        if (thread.private.stack.items.len > 1) {
-                            const stdout_handle = thread.private.stack.items[1].pipe;
-                            const stdout_pipe = try self.context.getPipe(stdout_handle);
-                            var w = stdout_pipe.closeableWriter().writer;
-                            try self.materializeString(thread, resolved, w);
-                            try w.flush();
-                            return .{ .exit = .success };
-                        }
-                        return .{ .exit = try self.coerceExitCode(thread, value) };
-                    },
-                    .addr => |addr_val| {
-                        // Heap-allocated strings (multi-segment string interpolation)
-                        // are heap sequences. Serialize them like other string types.
-                        // Non-string addr values (execution results, etc.) fall
-                        // through to coerceExitCode.
-                        if (try self.maybeHeapSequenceLen(addr_val)) |_| {
-                            if (thread.private.stack.items.len > 1) {
-                                const stdout_handle = thread.private.stack.items[1].pipe;
-                                const stdout_pipe = try self.context.getPipe(stdout_handle);
-                                var w = stdout_pipe.closeableWriter().writer;
-                                try self.materializeString(thread, resolved, w);
-                                try w.flush();
-                                return .{ .exit = .success };
-                            }
-                        }
-                        return .{ .exit = try self.coerceExitCode(thread, value) };
-                    },
-                    .uinteger, .float => {
-                        // Typed numeric pipe values travel as canonical decimal
-                        // text, so an Int/Float-returning stage both prints and
-                        // feeds a downstream typed `@stdin`. (Bool is represented
-                        // as `.exit_code` and is unaffected, keeping match
-                        // predicates exit-code based.)
-                        if (thread.private.stack.items.len > 1) {
-                            const stdout_handle = thread.private.stack.items[1].pipe;
-                            const stdout_pipe = try self.context.getPipe(stdout_handle);
-                            var w = stdout_pipe.closeableWriter().writer;
-                            try self.materializeString(thread, resolved, w);
-                            try w.flush();
-                            return .{ .exit = .success };
-                        }
-                        return .{ .exit = try self.coerceExitCode(thread, value) };
-                    },
-                    else => return .{ .exit = try self.coerceExitCode(thread, value) },
-                }
+                // A function/stage return (or body) value now only sets the exit
+                // code; it is never pushed to stdout. Output is explicit via
+                // `yield` (or direct subprocess writes such as `echo`). Values
+                // with no exit-code representation (strings, void, ...) exit with
+                // success.
+                const code = self.coerceExitCode(thread, value) catch |err| switch (err) {
+                    error.UnsupportedExitCodeType => ExitCode.success,
+                    else => return err,
+                };
+                return .{ .exit = code };
             },
             .resolve_exit_code => |rec| {
                 const exit_code = try self.coerceExitCode(thread, .fromLocation(rec.source));
@@ -1438,7 +1389,9 @@ pub const IREvaluator = struct {
                 const pipe = try self.context.getPipe(pipe_handle);
                 const value = try self.resolveValueSource(thread, pipe_write.source);
                 var w = pipe.closeableWriter().writer;
-                try self.materializePipelineInput(thread, value, w);
+                // `yield`/parseInt write a single value; serialize it as a string
+                // (multi-segment strings are concatenated, not space-joined).
+                try self.materializeString(thread, value, w);
                 // Flush so the bytes reach buffer_writer, where a downstream
                 // @stdin/collect_stdin reads them directly.
                 try w.flush();
