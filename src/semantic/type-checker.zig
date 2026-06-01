@@ -711,7 +711,7 @@ pub const TypeChecker = struct {
             const resolved = try self.resolveTypeExpr(fn_scope, stdin_type);
             try fn_scope.declare(
                 self.arena.allocator(),
-                ast.Identifier.global("@stdin"),
+                ast.Identifier.global(ast.FdExpr.stdin_binding_name),
                 resolved,
                 false,
                 false,
@@ -751,7 +751,7 @@ pub const TypeChecker = struct {
         // statements directly in `body_scope` instead of letting `runExpression`
         // create and discard an internal child scope. That way the stdin/stdout
         // type resolution below can see bindings declared in the body (e.g.
-        // `const n = @stdin` referenced from a later `return n * 2`).
+        // `const n = &0` referenced from a later `yield n * 2`).
         const body_scope = if (fn_decl.body.* == .block) blk: {
             const bs = try fn_scope.addChild(self.arena.allocator(), fn_decl.body.block.span);
             try self.runBlock(bs, &fn_decl.body.block);
@@ -832,6 +832,9 @@ pub const TypeChecker = struct {
     ) Error!void {
         switch (statement.*) {
             .yield_stmt => |yield_stmt| {
+                // Only `yield`s to stdout (&1) are constrained by the declared
+                // stdout type; stderr (&2) carries untyped diagnostic output.
+                if (yield_stmt.fd != 1) return;
                 const yielded = try self.resolveExprType(scope, yield_stmt.value) orelse return;
                 const resolved = try self.resolvePipeType(scope, yielded) orelse return;
                 if (self.pipeTypesEqual(resolved, declared_stdout)) return;
@@ -909,7 +912,7 @@ pub const TypeChecker = struct {
                 try self.validateFunctionBodyStdin(scope, range.start, enclosing_stdin);
                 if (range.end) |end| try self.validateFunctionBodyStdin(scope, end, enclosing_stdin);
             },
-            .fn_decl, .identifier, .env_var, .path, .literal, .pipeline_deprecated, .import_expr, .executable, .builtin => {},
+            .fn_decl, .identifier, .env_var, .path, .literal, .pipeline_deprecated, .import_expr, .executable, .builtin, .fd => {},
         }
     }
 
@@ -1031,8 +1034,37 @@ pub const TypeChecker = struct {
             .fn_decl => |*fn_decl| self.runFnDecl(scope, fn_decl),
             .call => |*call| self.runCall(scope, call),
             .subshell => |*subshell| self.runExpression(scope, subshell.child),
+            .fd => |*fd_expr| self.runFd(scope, fd_expr),
             else => return error.UnsupportedExpression,
         };
+    }
+
+    fn runFd(self: *TypeChecker, scope: *Scope, fd_expr: *ast.FdExpr) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.logTypeCheckTrace(@src().fn_name, fd_expr.span);
+
+        _ = scope;
+        switch (fd_expr.fd) {
+            // `&0` reads stdin. Inside a function it is typed by the declared
+            // stdin (via the `&0` scope binding); as a block/expression pipeline
+            // stage its type is inferred from the upstream by the compiler, so
+            // it is accepted here regardless.
+            0 => {},
+            1, 2 => try self.reportSpanError(
+                fd_expr.span,
+                Error.UnsupportedExpression,
+                .@"error",
+                "&{d} is a write-only stream; use `yield` (or `yield &2 ...`) to write to it",
+                .{fd_expr.fd},
+            ),
+            else => try self.reportSpanError(
+                fd_expr.span,
+                Error.UnsupportedExpression,
+                .@"error",
+                "unknown file descriptor &{d}; only &0, &1, and &2 are supported",
+                .{fd_expr.fd},
+            ),
+        }
     }
 
     fn runTypeExpression(

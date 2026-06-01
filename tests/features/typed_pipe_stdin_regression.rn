@@ -3,7 +3,7 @@ fn Void produce() String {
 }
 
 fn String transform() String {
-    const received = @stdin
+    const received = &0
     yield "${received}!"
 }
 

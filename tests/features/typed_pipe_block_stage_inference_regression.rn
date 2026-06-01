@@ -1,6 +1,6 @@
 // A block used directly as a pipeline stage (not a function body) infers its
-// @stdin type from the upstream stage's stdout. Here parseInt produces an Int,
-// so @stdin inside the block is an Int and the multiplication is arithmetic.
+// &0 type from the upstream stage's stdout. Here parseInt produces an Int,
+// so &0 inside the block is an Int and the multiplication is arithmetic.
 // Output is explicit via `yield`.
 
-echo "3" | parseInt | { yield @stdin * @stdin }
+echo "3" | parseInt | { yield &0 * &0 }

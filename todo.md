@@ -35,23 +35,25 @@
 - [x] function signature
   - [x] stdin type
   - [x] parameters
-- [ ] stdin special bindings
-  - [x] `@stdin` — reads the function's stdin pipe as a typed value (String/Int)
-  - [ ] `@stdin | cat` — pipe @stdin directly into a command
-- [x] `yield` keyword — explicit stdout output from function/stage bodies
+- [x] file-descriptor stream syntax `&0`/`&1`/`&2` (stdin/stdout/stderr),
+  replacing `@stdin`
+  - [x] `&0` — reads the function's stdin as a typed value (String/Int)
+  - [x] `yield &2 expr` — write to stderr
+  - [ ] `&0 | cat` — pipe stdin directly into a command
+- [x] `yield` keyword — explicit output (stdout by default, `yield &2` for stderr)
 - [ ] typed pipes
   - [x] type-check pipe boundary compatibility (exact match)
   - [x] reject Void↔non-Void mismatches
   - [x] enforce function body stdin/stdout contracts
   - [x] explicit stdout output via `yield` (return value no longer auto-pushed)
-  - [x] runtime String typed transport via `@stdin` (byte-stream path)
-  - [x] mixed exec/typed pipelines: exec→@stdin, return→exec, return→@stdin
+  - [x] runtime String typed transport via `&0` (byte-stream path)
+  - [x] mixed exec/typed pipelines: exec→&0, yield→exec, yield→&0
   - [x] 3-stage pipelines in all combinations
-  - [x] T→?T coercion (accepted + works at runtime via typed `@stdin`)
+  - [x] T→?T coercion (accepted + works at runtime via typed `&0`)
   - [x] T→E!T coercion (type checker accepts; runtime blocked on error-union
     stdin types parsing)
   - [x] arbitrary typed values (Int) through pipes via canonical-text wire +
-    type-directed `@stdin` parsing
+    type-directed `&0` parsing
   - [x] `parseInt` builtin (`fn String parseInt() Int`)
   - [ ] `parseFloat` / other parse builtins
   - [ ] in-process typed transport (skip text serialization for large/structured

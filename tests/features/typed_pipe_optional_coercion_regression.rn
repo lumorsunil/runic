@@ -3,7 +3,7 @@ fn Void produce() String {
 }
 
 fn ?String consume() String {
-    const received = @stdin orelse "fallback"
+    const received = &0 orelse "fallback"
     yield "${received}"
 }
 

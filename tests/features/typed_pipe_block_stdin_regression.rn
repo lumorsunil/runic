@@ -1,10 +1,10 @@
-// @stdin is usable from inside block expressions, not just directly in a
+// &0 is usable from inside block expressions, not just directly in a
 // function body. A binding declared in a nested block is visible to the
 // enclosing function.
 
 fn Int process() Int {
     const doubled = {
-        const n = @stdin
+        const n = &0
         n * 2
     }
     yield doubled

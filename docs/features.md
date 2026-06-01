@@ -377,32 +377,50 @@ produce | passthrough
 on stdin and forwards it. The type checker validates that these types align
 before the script runs.
 
-### `yield` — pushing values to stdout
+### Standard streams: `&0`, `&1`, `&2`
 
-Output to a function's (or stage's) stdout is explicit. Use `yield` to push a
-value; a function's `return`/body value is **not** automatically written to
-stdout. A stage that consumes its input without `yield`ing produces no output.
+The three standard streams are referenced with file-descriptor syntax: `&0`
+(stdin), `&1` (stdout), `&2` (stderr).
+
+- `&0` is a value expression that reads the function's (or stage's) stdin.
+- `&1` / `&2` are write streams; you write to them with `yield` (see below).
+
+### `yield` — pushing values to a stream
+
+Output is explicit. `yield expr` writes a value to stdout (`&1`); `yield &2 expr`
+writes to stderr. A function's `return`/body value is **not** automatically
+written to stdout, so a stage that consumes its input without `yield`ing
+produces no stdout output.
 
 ```rn
 fn Int square() Int {
-    yield @stdin * @stdin
+    yield &0 * &0
 }
 
 echo "4" | parseInt | square   // prints 16
 ```
 
-The declared stdout type constrains what may be `yield`ed — `yield "text"` in an
-`Int`-stdout function is a compile-time error. A function may `yield` zero or
-more times; `return` is for control flow / the function's exit value and no
-longer carries output:
+The declared stdout type constrains what may be `yield`ed to `&1` — `yield "text"`
+in an `Int`-stdout function is a compile-time error. (`yield &2` carries untyped
+diagnostic output and is not constrained.) A function may `yield` zero or more
+times; `return` is for control flow / the function's exit value and no longer
+carries output:
 
 ```rn
 fn Int consume() Void {
-    const n = @stdin
+    const n = &0
     // no yield: this stage produces no stdout output
 }
 
 echo "3" | parseInt | consume   // prints nothing
+```
+
+```rn
+fn Int tee() Int {
+    const n = &0
+    yield &2 "log: received ${n}"   // diagnostic, goes to stderr
+    yield n * 10                    // result, goes to stdout
+}
 ```
 
 Commands inside a function body (like `echo`) still write to stdout directly —
@@ -414,12 +432,11 @@ fn Void greet(name: String) String {
 }
 ```
 
-### `@stdin` — reading typed stdin as a value
+### `&0` — reading typed stdin as a value
 
-Inside a function body with a typed stdin, the built-in `@stdin` expression
-reads all bytes from the function's stdin pipe and returns them as a `String`
-value. This lets you process pipeline input with pure Runic expressions instead
-of relying on executables like `cat`.
+Inside a function body with a typed stdin, `&0` reads the function's stdin pipe
+and returns it as a value. This lets you process pipeline input with pure Runic
+expressions instead of relying on executables like `cat`.
 
 ```rn
 fn Void produce() String {
@@ -427,7 +444,7 @@ fn Void produce() String {
 }
 
 fn String transform() String {
-    const received = @stdin
+    const received = &0
     yield "${received}!"
 }
 
@@ -435,10 +452,10 @@ produce | transform
 ```
 
 **Result:** Prints `hello from pipe!`. `produce` yields the string directly
-(no process involved), `transform` collects it via `@stdin` and yields it with
+(no process involved), `transform` collects it via `&0` and yields it with
 `"!"` appended.
 
-The `@stdin` value has the type declared in the function's stdin position. Using
+The `&0` value has the type declared in the function's stdin position. Using
 it in a function that has `Void` stdin would be a type error.
 
 ### Mixed executable and typed-function pipelines
@@ -449,11 +466,11 @@ that precedes a typed function must match the function's declared stdin type
 
 ```rn
 fn String process() String {
-    const input = @stdin
+    const input = &0
     yield "${input}!"
 }
 
-// executable output → typed function via @stdin
+// executable output → typed function via &0
 echo "exec input" | process
 ```
 
@@ -461,7 +478,7 @@ Multi-stage pipelines work in all combinations:
 
 ```rn
 fn Void source() String { yield "pipeline" }
-fn String middle() String { const s = @stdin; yield "typed ${s}" }
+fn String middle() String { const s = &0; yield "typed ${s}" }
 
 // typed fn → typed fn → executable
 source | middle | cat
@@ -470,17 +487,17 @@ source | middle | cat
 ### Non-string typed values and `parseInt`
 
 Pipelines are not limited to strings. A function whose stdin type is `Int`
-receives `@stdin` already parsed into an `Int`, so it can do arithmetic on it
+receives `&0` already parsed into an `Int`, so it can do arithmetic on it
 directly. The `parseInt` builtin bridges a `String` stage to an `Int` stage,
 making the type transition explicit:
 
 ```rn
 fn Int doubler() Int {
-    yield @stdin * 2
+    yield &0 * 2
 }
 
 fn Int inc() Int {
-    yield @stdin + 1
+    yield &0 + 1
 }
 
 // String → parseInt → Int → Int : prints 21
@@ -488,7 +505,7 @@ echo "10" | parseInt | doubler | inc
 ```
 
 **Result:** `echo "10"` produces the text `10`; `parseInt` asserts it as an
-`Int`; `doubler` reads `@stdin` as `10` and yields `20`; `inc` yields `21`.
+`Int`; `doubler` reads `&0` as `10` and yields `20`; `inc` yields `21`.
 Numeric values travel between stages as their canonical decimal text, and each
 stage's declared type drives how the bytes are interpreted. `parseInt` has the
 type `fn String parseInt() Int`, so a following stage must declare `Int` stdin —
@@ -498,7 +515,7 @@ feeding its output into a `String` stage is a compile-time mismatch.
 
 A stage that outputs `T` can feed a downstream stage whose stdin is `?T`. The
 value flows through unchanged and the downstream sees it as the non-null case,
-so `@stdin orelse "default"` reads the piped value when present:
+so `&0 orelse "default"` reads the piped value when present:
 
 ```rn
 fn Void produce() String {
@@ -506,7 +523,7 @@ fn Void produce() String {
 }
 
 fn ?String consume() String {
-    const received = @stdin orelse "fallback"
+    const received = &0 orelse "fallback"
     yield "${received}"
 }
 
@@ -514,7 +531,7 @@ produce | consume
 ```
 
 **Result:** Prints `coerced value`. The `?String` stdin of `consume` accepts the
-`String` produced upstream (a `T → ?T` coercion), and `@stdin` is typed as
+`String` produced upstream (a `T → ?T` coercion), and `&0` is typed as
 `?String` so the `orelse` fallback type-checks.
 
 ### Void boundaries and rejected mismatches

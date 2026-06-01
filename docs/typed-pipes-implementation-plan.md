@@ -547,3 +547,31 @@ Deferred / future:
 - [ ] Rename `@stdin` and introduce a general file-descriptor syntax (e.g. `&0`,
   `&1`, `&2`) for stdin/stdout/stderr. `yield` could become sugar for writing to
   `&1`. Not implemented yet.
+
+### Follow-up: file-descriptor stream syntax (`&0`/`&1`/`&2`)
+
+Replaced the `@`-prefixed `@stdin` with a uniform file-descriptor syntax for the
+three standard streams: `&0` (stdin), `&1` (stdout), `&2` (stderr). `yield` is
+the write verb (sugar for writing to `&1`, with `yield &2 expr` for stderr).
+
+- [x] Lexer: `&` followed by a digit lexes as a new `.fd` token. (`>&` for
+  redirects is consumed by `lexGreater`, so this never collides.)
+- [x] AST: `FdExpr { fd: u8, span }`; `YieldStmt` gains a `fd: u8 = 1` target.
+- [x] Parser: `.fd` parses as a `FdExpr` atom (in both the primary and
+  binary-component paths); `parseYield` consumes a leading `&1`/`&2` as the
+  target (a leading `&0` is read as the value, since stdin is not writable).
+- [x] Type checker: `&0` is accepted as a read (typed by the enclosing function's
+  stdin binding, now keyed by `FdExpr.stdin_binding_name = "&0"`, or inferred for
+  block stages); `&1`/`&2` as read expressions are rejected. Only `yield &1` is
+  checked against the declared stdout type; `yield &2` is unconstrained.
+- [x] Compiler: `compileFd` emits the stdin-read path for `&0` (the former
+  `@stdin` logic); `compileYield` writes to the target fd's pipe (stack slot 1
+  or 2).
+- [x] Migrated all fixtures, examples, and docs from `@stdin` to `&0`; removed
+  the `@stdin` special-case from `compileIdentifier`.
+- [x] New fixture `tests/features/fd_stderr_regression.rn` exercises `&0`,
+  `yield`, and `yield &2` (stdout `40`, stderr `log: received 4`).
+- [x] Full suite green: 13 unit, 53 smoke, 13 diagnostics, fmt.
+
+Still future: a `&0 | cmd` form (piping the stdin value straight into a command),
+and whether `&1`/`&2` should also be first-class redirect targets.

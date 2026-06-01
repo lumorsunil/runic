@@ -9,12 +9,12 @@ const ERROR_BUDGET = 50
 
 // String in (the count text from `grep -c`) -> Int out: errors still allowed.
 fn Int remaining_budget() Int {
-    yield ERROR_BUDGET - @stdin
+    yield ERROR_BUDGET - &0
 }
 
 // Int in -> String out: render a human-readable status line.
 fn Int format_report() String {
-    const left = @stdin
+    const left = &0
     yield "error budget: ${left}/${ERROR_BUDGET} remaining"
 }
 

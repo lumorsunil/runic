@@ -3,12 +3,12 @@ fn Void source() String {
 }
 
 fn String middle() String {
-    const s = @stdin
+    const s = &0
     yield "three ${s}"
 }
 
 fn String sink() String {
-    const s = @stdin
+    const s = &0
     yield "${s} pipeline"
 }
 

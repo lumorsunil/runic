@@ -685,6 +685,7 @@ pub const Expression = union(enum) {
     executable: ExecutableExpr,
     builtin: BuiltinExpr,
     subshell: SubshellExpr,
+    fd: FdExpr,
 
     pub fn span(self: Expression) Span {
         return switch (self) {
@@ -751,6 +752,28 @@ pub const EnvVarExpr = struct {
         } };
 
         return optional_type;
+    }
+};
+
+/// A file-descriptor reference: `&0` (stdin), `&1` (stdout), `&2` (stderr).
+/// As a value expression only `&0` is meaningful (it reads the function's
+/// stdin); `&1`/`&2` are write targets used with `yield`.
+pub const FdExpr = struct {
+    fd: u8,
+    span: Span,
+
+    /// Internal scope-binding name carrying the enclosing function's stdin type,
+    /// looked up when resolving `&0`.
+    pub const stdin_binding_name = "&0";
+
+    pub fn resolveType(
+        self: *@This(),
+        _: std.mem.Allocator,
+        scope: *semantic.Scope,
+    ) semantic.Scope.Error!?*const TypeExpr {
+        if (self.fd != 0) return null;
+        const binding = scope.lookup(stdin_binding_name) orelse return null;
+        return binding.type_expr;
     }
 };
 
@@ -1633,11 +1656,14 @@ pub const ReturnStmt = struct {
     span: Span,
 };
 
-/// `yield expr` pushes a value to the enclosing function/stage's stdout stream.
-/// Unlike `return`, it does not exit the function and the value is written to
-/// stdout rather than becoming the function's return/exit value.
+/// `yield expr` pushes a value to a stream of the enclosing function/stage.
+/// `yield &2 expr` targets a specific file descriptor (`&1` = stdout (default),
+/// `&2` = stderr). Unlike `return`, it does not exit the function and the value
+/// is written to the stream rather than becoming the function's return value.
 pub const YieldStmt = struct {
     value: *Expression,
+    /// Target file descriptor: 1 = stdout (default), 2 = stderr.
+    fd: u8 = 1,
     span: Span,
 };
 

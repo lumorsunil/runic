@@ -3,7 +3,7 @@
 // echo prints.
 
 fn Int consume() Void {
-    const n = @stdin
+    const n = &0
 }
 
 echo "3" | parseInt | consume

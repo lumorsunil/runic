@@ -197,6 +197,8 @@ pub const Tag = enum {
     caret,
     amp,
     amp_amp,
+    /// File-descriptor reference: `&0` (stdin), `&1` (stdout), `&2` (stderr).
+    fd,
     kw_and,
     /// Stage separator for pipelines.
     pipe,

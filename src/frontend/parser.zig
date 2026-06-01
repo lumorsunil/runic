@@ -803,6 +803,20 @@ pub const Parser = struct {
                             });
                             continue;
                         },
+                        .fd => {
+                            const breadcrumbInner = try self.createBreadcrumb("PBE:fd");
+                            defer breadcrumbInner.end();
+                            _ = try self.nextToken();
+                            try components.append(self.allocator, .{
+                                .expr = try self.allocExpression(.{
+                                    .fd = .{
+                                        .fd = next.lexeme[1] - '0',
+                                        .span = next.span,
+                                    },
+                                }),
+                            });
+                            continue;
+                        },
                         .question => {
                             if (components.items.len == 0 or components.items[components.items.len - 1] != .op or components.items[components.items.len - 1].op.payload != .member) {
                                 try self.reportParseError(Error.UnexpectedToken, next.span, "expected value, actual: {t}", .{next.tag});
@@ -2274,6 +2288,12 @@ pub const Parser = struct {
                     },
                 });
             },
+            .fd => self.allocExpression(.{
+                .fd = .{
+                    .fd = tok.lexeme[1] - '0',
+                    .span = tok.span,
+                },
+            }),
             .kw_null => self.allocExpression(.{
                 .literal = .{ .null = .{ .span = tok.span } },
             }),
@@ -2694,10 +2714,22 @@ pub const Parser = struct {
         defer breadcrumb.end();
 
         const start = try self.expectTokenTag(.kw_yield);
+
+        // Optional target fd: `yield &2 expr` writes to stderr. A leading `&1`
+        // or `&2` is the target; `&0` is read as the value (you cannot yield to
+        // stdin), so it is left for parseExpression.
+        var fd: u8 = 1;
+        const next = try self.peekToken();
+        if (next.tag == .fd and (next.lexeme[1] == '1' or next.lexeme[1] == '2')) {
+            _ = try self.nextToken();
+            fd = next.lexeme[1] - '0';
+        }
+
         const value = try self.parseExpression();
 
         return .{
             .value = value,
+            .fd = fd,
             .span = start.span.endAt(value.span()),
         };
     }

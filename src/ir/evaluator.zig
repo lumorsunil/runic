@@ -1058,7 +1058,7 @@ pub const IREvaluator = struct {
                 if (stdin_value != .pipe) return Error.MissingPipeHandle;
                 const stdin_pipe = try self.context.getPipe(stdin_value.pipe);
 
-                // Mark the pipe as having a virtual consumer (@stdin). This lets
+                // Mark the pipe as having a virtual consumer (&0). This lets
                 // the upstream stage's stream thread see has_been_connected=true
                 // and exit cleanly once keep_open=false is set (rather than
                 // looping on .no_source forever).
@@ -1393,7 +1393,7 @@ pub const IREvaluator = struct {
                 // (multi-segment strings are concatenated, not space-joined).
                 try self.materializeString(thread, value, w);
                 // Flush so the bytes reach buffer_writer, where a downstream
-                // @stdin/collect_stdin reads them directly.
+                // &0/collect_stdin reads them directly.
                 try w.flush();
                 return .cont;
             },

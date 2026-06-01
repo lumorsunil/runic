@@ -1,5 +1,5 @@
 fn String process() String {
-    const input = @stdin
+    const input = &0
     yield "${input}"
 }
 

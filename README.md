@@ -74,12 +74,14 @@ A working parser, type checker, and IR-based runtime are in place. The following
   upstream stdout type matches the downstream stdin type at every `|` boundary.
   Mismatches are caught before execution. Function bodies are also checked
   against their declared stdin/stdout contracts.
-- **`@stdin` access**: inside a function with a typed stdin, `@stdin` reads the
-  function's stdin pipe as a typed value (a `String`, or a parsed `Int`),
-  enabling pure Runic processing without relying on executables like `cat`.
-- **`yield` for explicit output**: functions push values to stdout with `yield`;
-  a function's `return`/body value is not auto-pushed, so a stage that consumes
-  its input without yielding produces no output.
+- **File-descriptor streams (`&0`/`&1`/`&2`)**: `&0` reads the function's stdin
+  as a typed value (a `String`, or a parsed `Int`), enabling pure Runic
+  processing without relying on executables like `cat`. `&1`/`&2` are stdout and
+  stderr.
+- **`yield` for explicit output**: functions push values with `yield` (to stdout
+  by default, or `yield &2 ...` for stderr); a function's `return`/body value is
+  not auto-pushed, so a stage that consumes its input without yielding produces
+  no output.
 - String interpolation (`${ }`) and block capture
 - Process handle access (`.stdout`, `.stderr`, `.status.ok`, `.status.exit_code`)
 - File redirection (`>`, `>>`) and stream capture (`1>var`, `2>var`)

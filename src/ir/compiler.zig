@@ -251,7 +251,7 @@ fn stableResultSource(result: Result) ir.ValueSource {
 
 /// Returns true when `type_expr` denotes the given primitive type name, whether
 /// it is already a resolved primitive tag or an unresolved `.identifier`/`.alias`
-/// referring to that name (e.g. `Int`). Used for type-directed `@stdin` parsing
+/// referring to that name (e.g. `Int`). Used for type-directed `&0` parsing
 /// where the compiler only has the raw declared stdin type.
 fn typeExprIsNamed(type_expr: ast.TypeExpr, name: []const u8) bool {
     return switch (type_expr) {
@@ -566,7 +566,7 @@ pub const IRCompiler = struct {
     allow_simple_exec: bool = false,
     compiled_modules: std.StringHashMapUnmanaged(usize) = .empty,
     loading_set: std.StringHashMapUnmanaged(void) = .empty,
-    /// Stack of enclosing functions' declared stdin types, so `@stdin` can be
+    /// Stack of enclosing functions' declared stdin types, so `&0` can be
     /// typed correctly for coercions. Top is the innermost function.
     stdin_type_stack: std.ArrayList(?ast.TypeExpr) = .empty,
 
@@ -1557,8 +1557,17 @@ pub const IRCompiler = struct {
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
+        const target = switch (y.fd) {
+            1 => self.threadStdout(),
+            2 => self.threadStderr(),
+            else => {
+                try self.reportSourceError(source, Error.UnsupportedExpression, .@"error", "cannot yield to &{d}; only &1 (stdout) and &2 (stderr) are writable", .{y.fd});
+                return .fromValue(.void);
+            },
+        };
+
         const value = try self.compileResultSaveR(source, try self.compileExpression(y.value));
-        try self.pipeWrite(source, self.threadStdout(), value.source);
+        try self.pipeWrite(source, target, value.source);
         try self.consume(source, value);
         return .fromValue(.void);
     }
@@ -1816,11 +1825,45 @@ pub const IRCompiler = struct {
             .array => |array| self.compileArray(expr, array),
             .for_expr => |for_expr| self.compileForLoop(expr, for_expr),
             .subshell => |subshell| self.compileSubshell(expr, subshell),
+            .fd => |fd_expr| self.compileFd(expr, fd_expr),
             else => {
                 try self.reportSourceError(expr, Error.UnsupportedExpression, .@"error", "expression type \"{t}\" not yet supported", .{expr.*});
                 return .fromValue(.void);
             },
         };
+    }
+
+    /// `&0` reads the function's stdin as a typed value (the former `@stdin`).
+    /// `&1`/`&2` are write-only streams and are not readable here.
+    fn compileFd(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        fd_expr: ast.FdExpr,
+    ) Error!Result {
+        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        if (fd_expr.fd != 0) {
+            try self.reportSourceError(source, Error.UnsupportedExpression, .@"error", "&{d} is a write-only stream; use `yield`", .{fd_expr.fd});
+            return .fromValue(.void);
+        }
+
+        // Type the read with the enclosing function's declared stdin type so
+        // coercions like T→?T work (e.g. `&0 orelse "default"` in a ?String
+        // function). Fall back to String when no declared type is available.
+        const declared_type: ?ast.TypeExpr = if (self.stdin_type_stack.items.len > 0)
+            self.stdin_type_stack.items[self.stdin_type_stack.items.len - 1]
+        else
+            null;
+        try self.addInstruction(.init(.from(source), .collect_stdin));
+        // Type-directed parsing: an Int-typed stdin parses the collected bytes
+        // into an Int value so arithmetic on `&0` works.
+        if (declared_type) |dt| {
+            if (typeExprIsNamed(dt, "Int")) {
+                try self.addInstruction(.init(.from(source), .parse_int));
+                return try self.stabilizeRegisterResult(source, "stdin_value", .global(.integer));
+            }
+        }
+        return try self.stabilizeRegisterResult(source, "stdin_value", declared_type orelse string_type);
     }
 
     fn evalComptimeLiteral(self: *IRCompiler, literal: ast.Literal) Error!?Result {
@@ -2701,7 +2744,7 @@ pub const IRCompiler = struct {
     }
 
     /// Copies the value currently in `%r` into a fresh ref slot and returns a
-    /// dereferenced location for it. Value-producing builtins (`@stdin`,
+    /// dereferenced location for it. Value-producing builtins (`&0`,
     /// `parseInt`) leave their result directly in `%r`, but the rest of the
     /// compiler expects value expressions to yield a `ref.dereference()`
     /// location (so callers like arithmetic operands can `.dereference()` it).
@@ -2727,27 +2770,6 @@ pub const IRCompiler = struct {
             const path = self.script.span.start.file;
             const value = try self.addSlice(1, path);
             return .fromValue(value);
-        }
-
-        if (std.mem.eql(u8, identifier.name, "@stdin")) {
-            // Type @stdin with the enclosing function's declared stdin type so
-            // coercions like T→?T work (e.g. @stdin in a ?String function is
-            // ?String, so `@stdin orelse "default"` type-checks). Fall back to
-            // String when no declared type is available.
-            const declared_type: ?ast.TypeExpr = if (self.stdin_type_stack.items.len > 0)
-                self.stdin_type_stack.items[self.stdin_type_stack.items.len - 1]
-            else
-                null;
-            try self.addInstruction(.init(.from(source), .collect_stdin));
-            // Type-directed parsing: an Int-typed stdin parses the collected
-            // bytes into an Int value so arithmetic on @stdin works.
-            if (declared_type) |dt| {
-                if (typeExprIsNamed(dt, "Int")) {
-                    try self.addInstruction(.init(.from(source), .parse_int));
-                    return try self.stabilizeRegisterResult(source, "stdin_value", .global(.integer));
-                }
-            }
-            return try self.stabilizeRegisterResult(source, "stdin_value", declared_type orelse string_type);
         }
 
         // parseInt builtin: a pipeline stage with type `fn String parseInt() Int`.
@@ -4150,7 +4172,7 @@ pub const IRCompiler = struct {
     const PipeBoundaryKind = enum {
         /// Both stages carry a matching non-void, non-execution typed value.
         /// Currently still compiled with byte pipes; will use direct value
-        /// passing once @stdin is supported.
+        /// passing once &0 (stdin) is supported.
         exact_typed,
         /// At least one stage is an external executable whose return type is
         /// ExecutionResult (mapped to String at boundaries). Byte pipes required.
@@ -4222,9 +4244,9 @@ pub const IRCompiler = struct {
 
     /// Resolves the concrete stdout type a pipeline stage produces, so a
     /// downstream stage that does not declare its own stdin type (a block or a
-    /// bare expression) can have its `@stdin` typed by inference. Returns null
+    /// bare expression) can have its `&0` typed by inference. Returns null
     /// when the type is unknown (e.g. an external executable), in which case
-    /// `@stdin` falls back to String.
+    /// `&0` falls back to String.
     fn stageStdoutType(self: *IRCompiler, stage: *ast.Expression) ?ast.TypeExpr {
         const callee = switch (stage.*) {
             .call => |call| call.callee,
@@ -4336,9 +4358,9 @@ pub const IRCompiler = struct {
             );
             _ = next_expr;
 
-            // Infer the stage's @stdin type from the upstream stage's stdout, so
+            // Infer the stage's &0 type from the upstream stage's stdout, so
             // a block/bare-expression stage that does not declare a stdin type
-            // (e.g. `... | parseInt | { @stdin * @stdin }`) reads a typed value.
+            // (e.g. `... | parseInt | { yield &0 * &0 }`) reads a typed value.
             // The first stage has no upstream stage to infer from.
             const inferred_stdin: ?ast.TypeExpr = if (i > 0)
                 self.stageStdoutType(pipeline.stages[i - 1])
@@ -4674,7 +4696,7 @@ pub const IRCompiler = struct {
         }
 
         // Track the enclosing function's declared stdin type so compileIdentifier
-        // can give @stdin the correct type (needed for T→?T / T→E!T coercions).
+        // can give &0 the correct type (needed for T→?T / T→E!T coercions).
         // A stack handles nested function declarations.
         try self.stdin_type_stack.append(self.allocator, if (fn_decl.stdin_type) |st| st.* else null);
         defer _ = self.stdin_type_stack.pop();

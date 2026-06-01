@@ -15,19 +15,24 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 ### Added
 
 #### Typed pipeline boundaries
-- **`yield` keyword for explicit stdout output**: functions and pipeline stages
-  push values to stdout with `yield expr`. A function's `return`/body value is no
-  longer auto-pushed to stdout, so a stage that consumes its input without
-  yielding produces no output (e.g. a function that only runs a side-effecting
-  `echo`). `return` now serves control flow / the function's exit value, and the
-  declared stdout type constrains what may be `yield`ed.
+- **File-descriptor stream syntax (`&0`/`&1`/`&2`)**: the three standard streams
+  are referenced with `&0` (stdin), `&1` (stdout), `&2` (stderr). `&0` is a value
+  expression that reads stdin (replacing the previous `@stdin`); `&1`/`&2` are
+  write streams. `&` followed by a digit lexes as a file-descriptor token.
+- **`yield` keyword for explicit output**: functions and pipeline stages push
+  values with `yield expr` (to stdout, `&1`) or `yield &2 expr` (to stderr). A
+  function's `return`/body value is no longer auto-pushed to stdout, so a stage
+  that consumes its input without yielding produces no output (e.g. a function
+  that only runs a side-effecting `echo`). `return` now serves control flow / the
+  function's exit value, and the declared stdout type constrains what may be
+  `yield`ed to `&1` (`yield &2` carries untyped diagnostics).
 - **Type checking at every `|`**: the type checker now validates that the
   upstream stdout type matches the downstream stdin type at each pipeline
   boundary. Mismatches are caught before execution with a clear diagnostic
   naming both sides.
 - **Arbitrary typed pipe values + `parseInt`**: non-`String` typed values now
-  flow across pipe boundaries. A function with an `Int` stdin receives `@stdin`
-  already parsed into an `Int` (so `@stdin * 2` works), and a stage returning an
+  flow across pipe boundaries. A function with an `Int` stdin receives `&0`
+  already parsed into an `Int` (so `&0 * 2` works), and a stage returning an
   `Int`/`Float` serializes it as canonical decimal text. The new `parseInt`
   builtin (`fn String parseInt() Int`) bridges a `String` stage to an `Int`
   stage, e.g. `echo "10" | parseInt | doubler | inc` → `21`. `Int → String`
@@ -36,7 +41,7 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   declared `StdinType` and `StdoutType`. Calling a function whose stdin type
   is incompatible with the enclosing function's declared stdin produces a
   diagnostic.
-- **`@stdin` access**: the built-in `@stdin` expression reads all bytes from
+- **`&0` access**: the built-in `&0` expression reads all bytes from
   the function's stdin pipe as a `String` value. Available in any function with
   a non-Void stdin type. Implemented via the `collect_stdin` IR instruction.
 - **Mixed exec/typed pipelines**: executable stages and typed Runic functions
@@ -45,8 +50,8 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 - **Multi-stage typed pipelines**: three-or-more-stage pipelines with any
   combination of executable and typed-function stages are fully supported.
 - **`T→?T` pipeline coercion**: a stage producing `T` can feed a downstream
-  stage whose stdin is `?T`. The value flows through unchanged and `@stdin` is
-  typed as `?T`, so `@stdin orelse "default"` type-checks and runs. `T→E!T` is
+  stage whose stdin is `?T`. The value flows through unchanged and `&0` is
+  typed as `?T`, so `&0 orelse "default"` type-checks and runs. `T→E!T` is
   accepted by the type checker as well (runtime exercise pending error-union
   stdin type parsing). Genuinely incompatible boundaries (e.g. `String→Int`,
   `Void→String`, `String→Void`) still produce a clear mismatch diagnostic.
@@ -54,18 +59,18 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   pipeline expressions report the right value type in assignment contexts.
 
 ### Fixed
-- `@stdin` can now be referenced from block expressions inside a function body
-  (including nested blocks and bindings like `const n = @stdin` used later). The
+- `&0` can now be referenced from block expressions inside a function body
+  (including nested blocks and bindings like `const n = &0` used later). The
   type checker previously resolved a function's stdin/stdout types in a scope
   that did not contain the body's bindings, producing a spurious stdout-type
-  mismatch once `@stdin` carried a non-`String` type.
-- A block used directly as a pipeline stage now infers its `@stdin` type from
-  the upstream stage, so `echo "3" | parseInt | { yield @stdin * @stdin }`
-  evaluates `@stdin` as an `Int` (→ `9`) instead of failing on `String * String`.
-- An explicit passthrough stage `{ yield @stdin }` re-emits its input unchanged,
-  preserving its type (`echo "5" | parseInt | { yield @stdin } | doubler` →
-  `10`). A bare `@stdin` used as a stage consumes-and-discards (it does not
-  yield), so a type-incompatible chain like `parseInt | @stdin | doubler` is
+  mismatch once `&0` carried a non-`String` type.
+- A block used directly as a pipeline stage now infers its `&0` type from
+  the upstream stage, so `echo "3" | parseInt | { yield &0 * &0 }`
+  evaluates `&0` as an `Int` (→ `9`) instead of failing on `String * String`.
+- An explicit passthrough stage `{ yield &0 }` re-emits its input unchanged,
+  preserving its type (`echo "5" | parseInt | { yield &0 } | doubler` →
+  `10`). A bare `&0` used as a stage consumes-and-discards (it does not
+  yield), so a type-incompatible chain like `parseInt | &0 | doubler` is
   rejected at compile time.
 - `yield` of a multi-segment string (produced by interpolation like `"${x}!"`)
   serializes correctly — the segments are concatenated rather than space-joined.
