@@ -485,22 +485,25 @@ made `echo "3" | parseInt | { @stdin * @stdin }` fail at runtime with
 - [x] Fixture: `tests/features/typed_pipe_block_stage_inference_regression.rn`
   (`echo "3" | parseInt | { @stdin * @stdin }` → `9`).
 
-### Follow-up: bare `@stdin` as a pipeline stage (identity passthrough)
+### Follow-up: bare `@stdin` as a pipeline stage (superseded by `yield`)
 
-A bare `@stdin` stage (e.g. `... | parseInt | @stdin`) was rejected by the type
-checker, which resolved a top-level `@stdin` to the executable fallback type
-(stdin `String`) and so reported a mismatch against an `Int` upstream.
+An earlier iteration treated a bare `@stdin` stage (`... | @stdin`) as an
+identity passthrough (a `runPipeline` special-case, `isStdinStage`) that skipped
+the boundary check and kept the upstream's type flowing.
 
-- [x] Fix: in `runPipeline`, recognize a bare `@stdin` stage (via `isStdinStage`)
-  and treat it as an identity/passthrough — skip the boundary check (it accepts
-  any type) and keep the upstream's type flowing to the next stage. So
-  `parseInt | @stdin | doubler` validates the `@stdin → doubler` boundary as
-  `Int → Int`, while `echo "x" | @stdin | doubler` still fails (`String → Int`).
-- [x] No compiler change needed: the block-stage inference already types a bare
-  `@stdin` stage from its upstream (`stageStdoutType`), so it parses the value
-  and re-emits it.
-- [x] Fixtures: `typed_pipe_stdin_passthrough_regression.rn`
-  (`echo "5" | parseInt | @stdin | doubler` → `10`).
+Once stages stopped auto-pushing their value (see the `yield` follow-up below),
+this became a footgun: a bare `@stdin` stage reads-and-discards (it does not
+`yield`), so `parseInt | @stdin | doubler` would type-check but fail at runtime
+with `InvalidInt` (the downstream got no input).
+
+- [x] Removed the `isStdinStage` passthrough special-case. A bare `@stdin` stage
+  is now type-checked like any expression stage (its stdin is the executable
+  fallback `String`), so `parseInt | @stdin | doubler` is rejected at compile
+  time (`Int → String`) instead of failing at runtime.
+- [x] The explicit passthrough idiom is `{ yield @stdin }`, which infers its
+  `@stdin` type from the upstream and re-emits it. Fixture:
+  `typed_pipe_stdin_passthrough_regression.rn`
+  (`echo "5" | parseInt | { yield @stdin } | doubler` → `10`).
 
 ### Follow-up: explicit `yield` for stdout output
 

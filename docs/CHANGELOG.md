@@ -60,15 +60,15 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   that did not contain the body's bindings, producing a spurious stdout-type
   mismatch once `@stdin` carried a non-`String` type.
 - A block used directly as a pipeline stage now infers its `@stdin` type from
-  the upstream stage, so `echo "3" | parseInt | { @stdin * @stdin }` evaluates
-  `@stdin` as an `Int` (→ `9`) instead of failing on `String * String`.
-- A bare `@stdin` now works as a pipeline stage, acting as an identity
-  passthrough that preserves the upstream value's type. `echo "5" | parseInt |
-  @stdin | doubler` → `10`; a type-incompatible passthrough such as
-  `echo "x" | @stdin | doubler` is still rejected.
-- `exit_with` now correctly serializes heap-allocated strings (produced by
-  multi-segment string interpolation like `"${x}!"`) to the stdout pipe, so
-  typed functions that build strings via interpolation produce the right output.
+  the upstream stage, so `echo "3" | parseInt | { yield @stdin * @stdin }`
+  evaluates `@stdin` as an `Int` (→ `9`) instead of failing on `String * String`.
+- An explicit passthrough stage `{ yield @stdin }` re-emits its input unchanged,
+  preserving its type (`echo "5" | parseInt | { yield @stdin } | doubler` →
+  `10`). A bare `@stdin` used as a stage consumes-and-discards (it does not
+  yield), so a type-incompatible chain like `parseInt | @stdin | doubler` is
+  rejected at compile time.
+- `yield` of a multi-segment string (produced by interpolation like `"${x}!"`)
+  serializes correctly — the segments are concatenated rather than space-joined.
 - Chained fd redirects now preserve left-to-right shell semantics, so forms like `echo "hello" 1>&2 2>"/dev/null"` keep writing to the original stderr stream before the later redirect replaces fd `2`.
 - Direct top-level executable calls now preserve TTY-aware stdout/stderr behavior when Runic itself is attached to a terminal, so scripts can keep color/ANSI output without breaking redirected or captured output paths.
 

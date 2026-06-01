@@ -1509,11 +1509,6 @@ pub const TypeChecker = struct {
 
         var upstream_stdout = try self.resolvePipelineStageStdoutType(scope, pipeline.stages[0]);
         for (pipeline.stages[1..]) |stage| {
-            // A bare `@stdin` stage is an identity/passthrough: it consumes the
-            // upstream value and re-emits it unchanged. It accepts any type, so
-            // skip the boundary check and keep the same type flowing downstream.
-            if (isStdinStage(stage)) continue;
-
             const downstream_stdin = try self.resolvePipelineStageStdinType(scope, stage);
             if (upstream_stdout) |stdout_type| {
                 if (downstream_stdin) |stdin_type| {
@@ -1522,17 +1517,6 @@ pub const TypeChecker = struct {
             }
             upstream_stdout = try self.resolvePipelineStageStdoutType(scope, stage);
         }
-    }
-
-    /// True when a pipeline stage is the bare `@stdin` builtin (optionally
-    /// wrapped in a zero-argument call, as the parser produces for a bareword
-    /// stage).
-    fn isStdinStage(stage: *ast.Expression) bool {
-        const expr = switch (stage.*) {
-            .call => |call| if (call.arguments.len == 0) call.callee else return false,
-            else => stage,
-        };
-        return expr.* == .identifier and std.mem.eql(u8, expr.identifier.name, "@stdin");
     }
 
     fn resolvePipelineStageStdoutType(
