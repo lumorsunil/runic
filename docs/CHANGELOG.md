@@ -37,6 +37,12 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   builtin (`fn String parseInt() Int`) bridges a `String` stage to an `Int`
   stage, e.g. `echo "10" | parseInt | doubler | inc` → `21`. `Int → String`
   remains a compile-time mismatch.
+- **In-process typed transport**: an exact boundary carrying a by-value scalar
+  (`Int`/`Float`, no executable on either side) now passes the value in-process
+  instead of serializing it to text and re-parsing. The inter-stage pipe is
+  marked `typed`; `yield` stores the value in a side-channel keyed by the pipe
+  handle (writing no bytes) and `&0` reads it back directly. `String`/executable
+  boundaries keep the byte path.
 - **Function body contracts**: function bodies are checked against their
   declared `StdinType` and `StdoutType`. Calling a function whose stdin type
   is incompatible with the enclosing function's declared stdin produces a

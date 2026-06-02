@@ -461,6 +461,7 @@ pub const Instruction = struct {
             close_source,
             disconnect_source,
             complete_after_source_closed,
+            typed,
         };
 
         pub fn format(self: @This(), w: *std.Io.Writer) !void {

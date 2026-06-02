@@ -90,6 +90,11 @@ pub const IRProgramContext = struct {
 
     pipes: std.AutoArrayHashMapUnmanaged(PipeHandle, *ReaderWriterStream) = .empty,
     pipe_handle_counter: usize = 0,
+    /// In-process typed transport: for a pipe marked `typed` (an exact non-String
+    /// pipeline boundary), the upstream stage stores its yielded value here
+    /// instead of serializing it to bytes, and the downstream reads it back
+    /// directly. Keyed by the inter-stage pipe handle.
+    typed_pipe_values: std.AutoArrayHashMapUnmanaged(PipeHandle, Value) = .empty,
     closeables: std.AutoArrayHashMapUnmanaged(CloseableHandle, *Closeable(ExitCode)) = .empty,
     closeable_handle_counter: usize = 0,
     file_sinks: std.ArrayList(*FileSink) = .empty,
@@ -126,6 +131,7 @@ pub const IRProgramContext = struct {
             pipe.deinitParent();
         }
         self.pipes.deinit(self.allocator);
+        self.typed_pipe_values.deinit(self.allocator);
 
         for (self.closeables.values()) |closeable| {
             if (!closeable.isClosed()) _ = closeable.close();
@@ -337,6 +343,16 @@ pub const IRProgramContext = struct {
 
     pub fn getPipe(self: *@This(), handle: PipeHandle) Error!*ReaderWriterStream {
         return self.pipes.get(handle) orelse Error.MissingPipeHandle;
+    }
+
+    /// Stores a yielded value on a typed pipe for in-process transport.
+    pub fn putTypedPipeValue(self: *@This(), handle: PipeHandle, value: Value) !void {
+        try self.typed_pipe_values.put(self.allocator, handle, value);
+    }
+
+    /// Returns the value stored on a typed pipe, if any.
+    pub fn getTypedPipeValue(self: *@This(), handle: PipeHandle) ?Value {
+        return self.typed_pipe_values.get(handle);
     }
 
     pub fn addCloseable(

@@ -4188,6 +4188,15 @@ pub const IRCompiler = struct {
             .call => |call| call.callee,
             else => stage,
         };
+
+        // The parseInt builtin produces an Int (it is not a scope binding).
+        if (callee.* == .identifier and
+            std.mem.eql(u8, callee.identifier.name, "parseInt") and
+            self.lookup(callee.identifier.name, .{ .shallow = false }) == null)
+        {
+            return .exact_typed;
+        }
+
         const binding = switch (callee.*) {
             .identifier => |id| self.lookup(id.name, .{ .shallow = false }),
             else => null,
@@ -4280,6 +4289,20 @@ pub const IRCompiler = struct {
         };
     }
 
+    /// Whether the boundary between two stages should use in-process typed
+    /// transport: an exact boundary carrying a by-value scalar (`Int`/`Float`).
+    /// String/byte boundaries and any boundary touching an executable keep the
+    /// byte-pipe path.
+    fn boundaryUsesTypedTransport(
+        self: *IRCompiler,
+        upstream: *ast.Expression,
+        downstream: *ast.Expression,
+    ) bool {
+        if (self.classifyBoundary(upstream, downstream) != .exact_typed) return false;
+        const out_type = self.stageStdoutType(upstream) orelse return false;
+        return typeExprIsNamed(out_type, "Int") or typeExprIsNamed(out_type, "Float");
+    }
+
     fn compilePipeline(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -4290,7 +4313,7 @@ pub const IRCompiler = struct {
         const refs = try self.allocator.alloc(ir.Location, pipeline.stages.len - 1);
         defer self.allocator.free(refs);
 
-        for (refs) |*ref| {
+        for (refs, 0..) |*ref, i| {
             ref.* = try self.newRef(source, "pipe");
             try self.pipe(source, ref.dereference());
             try self.pipeOpt(
@@ -4299,6 +4322,19 @@ pub const IRCompiler = struct {
                 .keep_open,
                 .fromValue(.fromBoolean(true)),
             );
+
+            // In-process typed transport: when an exact boundary carries a
+            // by-value scalar (Int/Float), mark the inter-stage pipe `typed` so
+            // the upstream `yield` stores the value directly and the downstream
+            // `&0` reads it back, skipping the text serialize/re-parse round-trip.
+            if (self.boundaryUsesTypedTransport(pipeline.stages[i], pipeline.stages[i + 1])) {
+                try self.pipeOpt(
+                    source,
+                    ref.dereference(),
+                    .typed,
+                    .fromValue(.fromBoolean(true)),
+                );
+            }
         }
 
         const orig_instr_set = self.current_instruction_set;

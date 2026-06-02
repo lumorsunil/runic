@@ -575,3 +575,32 @@ the write verb (sugar for writing to `&1`, with `yield &2 expr` for stderr).
 
 Still future: a `&0 | cmd` form (piping the stdin value straight into a command),
 and whether `&1`/`&2` should also be first-class redirect targets.
+
+### Follow-up: in-process typed transport (no serialization)
+
+The "skip serialization" optimization noted earlier is now implemented for
+by-value scalars. An exact boundary carrying an `Int`/`Float` (no executable on
+either side) passes the value in-process instead of serializing it to text and
+re-parsing downstream.
+
+- [x] Context: `IRProgramContext.typed_pipe_values` (a `PipeHandle → Value` map)
+  with `putTypedPipeValue` / `getTypedPipeValue`.
+- [x] Stream `Config.typed` flag + `PipeOption.typed` so a pipe can be marked
+  typed via `pipe_opt`.
+- [x] Compiler: `boundaryUsesTypedTransport` marks the inter-stage pipe `typed`
+  when `classifyBoundary == .exact_typed` and the upstream stdout type is
+  `Int`/`Float`. `classifyStageOutputKind` now recognizes the `parseInt` builtin
+  so `parseInt → typed-fn` is classified `exact_typed`.
+- [x] Evaluator:
+  - `pipe_write` (yield) to a `typed` pipe stores the value (no bytes).
+  - `collect_stdin` (`&0`) on a `typed` pipe returns the stored value directly;
+    it stays in the map so `&0` is re-readable (`&0 * &0`).
+  - `parse_int` passes a value through when it is already an `Int`.
+- [x] `String`/executable boundaries keep the byte path unchanged.
+- [x] Fixture: `tests/features/typed_pipe_inprocess_regression.rn`
+  (`echo "6" | parseInt | { yield &0 * &0 } | add_one` → `37`); existing Int
+  pipelines (e.g. `typed_pipe_parseint_regression`) now route through it.
+- [x] Full suite green: 13 unit, 54 smoke, 13 diagnostics, fmt.
+
+Still future: in-process transport for structured values (arrays/structs), and a
+`parseFloat` builtin to make `Float` pipelines exercisable end-to-end.

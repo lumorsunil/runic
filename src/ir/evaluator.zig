@@ -1067,6 +1067,15 @@ pub const IREvaluator = struct {
                 // Wait until the upstream signals "done" by setting keep_open=false.
                 if (stdin_pipe.config.keep_open) return .cont_no_instr_counter_inc;
 
+                // In-process typed transport: if the upstream stored a typed
+                // value on this pipe, return it directly (no byte re-parse).
+                if (stdin_pipe.config.typed) {
+                    if (self.context.getTypedPipeValue(stdin_value.pipe)) |typed_value| {
+                        thread.private.result_register = typed_value;
+                        return .cont;
+                    }
+                }
+
                 // All data is buffered in buffer_writer. Collect it.
                 const bytes = stdin_pipe.buffer_writer.written();
                 const owned = try self.allocator.dupe(u8, bytes);
@@ -1074,7 +1083,10 @@ pub const IREvaluator = struct {
                 return .cont;
             },
             .parse_int => {
-                // Parse the string currently in %r into an Int (uinteger).
+                // Ensure %r holds an Int. When it already does (e.g. an in-process
+                // typed value received via `&0`), pass it through unchanged;
+                // otherwise parse the string representation.
+                if (thread.private.result_register == .uinteger) return .cont;
                 var text_writer = std.Io.Writer.Allocating.init(self.allocator);
                 defer text_writer.deinit();
                 try self.materializeString(thread, thread.private.result_register, &text_writer.writer);
@@ -1388,6 +1400,16 @@ pub const IREvaluator = struct {
                 const pipe_handle = (try self.resolveLocation(thread, pipe_write.pipe)).pipe;
                 const pipe = try self.context.getPipe(pipe_handle);
                 const value = try self.resolveValueSource(thread, pipe_write.source);
+
+                // In-process typed transport: on an exact non-String boundary the
+                // pipe is marked `typed`, so store the value directly and skip
+                // byte serialization. The downstream `&0`/collect_stdin reads it
+                // back from the same handle.
+                if (pipe.config.typed) {
+                    try self.context.putTypedPipeValue(pipe_handle, value);
+                    return .cont;
+                }
+
                 var w = pipe.closeableWriter().writer;
                 // `yield`/parseInt write a single value; serialize it as a string
                 // (multi-segment strings are concatenated, not space-joined).

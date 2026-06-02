@@ -56,8 +56,9 @@
     type-directed `&0` parsing
   - [x] `parseInt` builtin (`fn String parseInt() Int`)
   - [ ] `parseFloat` / other parse builtins
-  - [ ] in-process typed transport (skip text serialization for large/structured
-    values)
+  - [x] in-process typed transport for scalars (Int/Float pass between stages
+    without text serialize/re-parse; pipe marked `typed`)
+  - [ ] in-process transport for structured values (arrays/structs)
 - [x] exit code
 - [ ] remaining function/runtime gaps
   - stdin semantics

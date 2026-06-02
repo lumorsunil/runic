@@ -1,0 +1,10 @@
+// In-process typed transport: `Int` values pass between pipeline stages without
+// a text serialize/re-parse round-trip (the inter-stage pipe is marked `typed`,
+// so `yield` stores the value and `&0` reads it back directly). The block
+// re-reads `&0` twice from the typed channel.
+
+fn Int add_one() Int {
+    yield &0 + 1
+}
+
+echo "6" | parseInt | { yield &0 * &0 } | add_one

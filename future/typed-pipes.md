@@ -133,12 +133,30 @@ now; optional/error-union return types depend on error-declaration parsing.
 
 ## runtime transport
 
-All pipeline boundaries use the byte-pipe path: values travel as canonical text
-through the pipe's `buffer_writer`, and `&0`/`collect_stdin` reads them after
-the upstream signals completion via `keep_open=false`. A non-waitable typed
-stage (such as `parseInt`) writes via `pipe_write`, which flushes so the bytes
-are visible to the downstream `collect_stdin`.
+Boundaries that touch an executable (or carry a `String`) use the byte-pipe
+path: values travel as canonical text through the pipe's `buffer_writer`, and
+`&0`/`collect_stdin` reads them after the upstream signals completion via
+`keep_open=false`. A non-waitable typed stage (such as `parseInt`) writes via
+`pipe_write`, which flushes so the bytes are visible to the downstream
+`collect_stdin`.
 
-A "skip serialization" optimization (passing in-process `Value`s directly
-without text conversion) remains future work; it would mainly benefit large or
-structured values where decimal/utf-8 round-tripping is wasteful.
+### in-process typed transport
+
+An exact boundary that carries a by-value scalar (`Int`/`Float`, no executable on
+either side) skips serialization entirely. `compilePipeline` marks the
+inter-stage pipe `typed` (`pipe_opt ... typed`). At runtime:
+
+- `yield` to a `typed` pipe stores the value in `context.typed_pipe_values`
+  (keyed by the pipe handle) and writes **no** bytes.
+- `&0`/`collect_stdin` on a `typed` pipe returns that value directly (no parse).
+  The value stays in the map, so `&0` is re-readable (e.g. `&0 * &0`).
+- `parse_int` passes a value through unchanged when it is already an `Int`, so
+  an `Int`-stdin function works whether it received bytes (from `parseInt`/an
+  executable) or an in-process `Int`.
+
+So `echo "10" | parseInt | doubler | inc` byte-transports only `echo → parseInt`;
+the `parseInt → doubler → inc` boundaries pass `Int`s in-process.
+
+`String` boundaries keep the byte path (a `String` is already bytes). Extending
+in-process transport to structured values (arrays, structs) is future work, as
+is a `parseFloat` builtin to make `Float` pipelines exercisable end-to-end.
