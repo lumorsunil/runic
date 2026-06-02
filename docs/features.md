@@ -423,6 +423,19 @@ fn Int tee() Int {
 }
 ```
 
+A stage that `yield`s more than once emits each value as it happens (streamed,
+not buffered to the end), so one input value can produce several outputs:
+
+```rn
+// one input (6) -> two outputs: 36 now, 12 after the sleep
+echo "6" | parseInt | {
+    const in = &0
+    yield in * in
+    sleep "2"
+    yield in + in
+}
+```
+
 Commands inside a function body (like `echo`) still write to stdout directly —
 that is independent of `yield`:
 
