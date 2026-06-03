@@ -4197,6 +4197,16 @@ pub const IRCompiler = struct {
             return .exact_typed;
         }
 
+        // A block stage's output kind comes from what it yields (see
+        // `inferBlockStdoutType`): a scalar yield enables typed transport.
+        if (callee.* == .block) {
+            const inferred = self.inferBlockStdoutType(callee.block) orelse return .byte_stream;
+            return switch (inferred) {
+                .void => .void_boundary,
+                else => .exact_typed,
+            };
+        }
+
         const binding = switch (callee.*) {
             .identifier => |id| self.lookup(id.name, .{ .shallow = false }),
             else => null,
@@ -4220,6 +4230,11 @@ pub const IRCompiler = struct {
             .call => |call| call.callee,
             else => stage,
         };
+        // A block stage declares no stdin type — it adapts to the upstream
+        // stage (its `&0` is typed by inference). Treat it as permissive so the
+        // upstream's output kind decides the boundary; an executable upstream
+        // still forces the byte path via its own output kind.
+        if (callee.* == .block) return .exact_typed;
         const binding = switch (callee.*) {
             .identifier => |id| self.lookup(id.name, .{ .shallow = false }),
             else => null,
@@ -4271,6 +4286,13 @@ pub const IRCompiler = struct {
             }
         }
 
+        // A block/bare-expression stage has no signature; infer its stdout type
+        // from what it `yield`s to stdout (&1), so a `{ yield 1; ... }` producer
+        // is recognized as an `Int` stage and gets in-process typed transport.
+        if (callee.* == .block) {
+            return self.inferBlockStdoutType(callee.block);
+        }
+
         const binding = switch (callee.*) {
             .identifier => |id| self.lookup(id.name, .{ .shallow = false }),
             else => null,
@@ -4286,6 +4308,53 @@ pub const IRCompiler = struct {
             // Executables surface ExecutionResult; at a pipe boundary that is bytes.
             .execution => string_type,
             else => return_type.*,
+        };
+    }
+
+    /// Infers a block stage's stdout type from the first value it `yield`s to
+    /// stdout (`&1`). Returns null when no stdout `yield` is found or its type
+    /// cannot be determined, in which case the caller falls back to the byte
+    /// path. Only confident scalar inferences (`Int`/`Float`) enable typed
+    /// transport; anything else stays null.
+    fn inferBlockStdoutType(self: *IRCompiler, block: ast.Block) ?ast.TypeExpr {
+        for (block.statements) |statement| {
+            const yield_stmt = switch (statement.*) {
+                .yield_stmt => |y| y,
+                else => continue,
+            };
+            if (yield_stmt.fd != 1) continue;
+            return self.inferYieldValueType(yield_stmt.value);
+        }
+        return null;
+    }
+
+    /// Best-effort, pre-compilation type inference for a `yield`ed expression.
+    /// Handles the cases that matter for transport classification (literals,
+    /// arithmetic on them, `&0`, and simple bindings); returns null otherwise.
+    fn inferYieldValueType(self: *IRCompiler, expr: *ast.Expression) ?ast.TypeExpr {
+        return switch (expr.*) {
+            .literal => |literal| switch (literal) {
+                .integer => ast.TypeExpr.global(.integer),
+                .float => ast.TypeExpr.global(.float),
+                .string => string_type,
+                else => null,
+            },
+            // Arithmetic preserves the operand's numeric type.
+            .binary => |binary| switch (binary.op) {
+                .add, .subtract, .multiply, .divide, .remainder => self.inferYieldValueType(binary.left),
+                else => null,
+            },
+            // `&0` carries the stage's inferred stdin type (pushed by the
+            // pipeline compiler before the stage is classified/compiled).
+            .fd => |fd_expr| if (fd_expr.fd == 0 and self.stdin_type_stack.items.len > 0)
+                self.stdin_type_stack.items[self.stdin_type_stack.items.len - 1]
+            else
+                null,
+            .identifier => |id| blk: {
+                const binding = self.lookup(id.name, .{ .shallow = false }) orelse break :blk null;
+                break :blk binding.type_expr;
+            },
+            else => null,
         };
     }
 
@@ -5531,6 +5600,14 @@ pub const IRCompiler = struct {
         for_expr: ast.ForExpr,
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        // A single `&0` source is a live stream, not a finite sequence: iterate
+        // by reading one value per turn and stop at EOF. This is the consumer
+        // half of multi-value typed pipes (`producer | for (&0) |v| { ... }`).
+        if (for_expr.sources.len == 1 and for_expr.sources[0].* == .fd) {
+            return self.compileFdForLoop(source, for_expr);
+        }
+
         const for_sources = try self.allocator.alloc(ForSource, for_expr.sources.len);
         defer self.allocator.free(for_sources);
         for (for_expr.sources, 0..) |for_source_expr, i| {
@@ -5638,6 +5715,95 @@ pub const IRCompiler = struct {
         try self.setLabel(after_label.local_addr.label, .abs);
 
         // TODO: return something like the block compilation is doing
+        return .fromValue(.void);
+    }
+
+    /// Lowers `for (&0) |v| body` — a loop over the live stdin stream. Each
+    /// iteration reads the next value with `collect_stdin` (the evaluator blocks
+    /// the green thread until a value arrives or the producer closes). EOF is
+    /// reported as `.null`, which ends the loop. Unlike the counted for-loop,
+    /// there is no precomputed iteration count.
+    fn compileFdForLoop(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        for_expr: ast.ForExpr,
+    ) Error!Result {
+        const fd_expr = for_expr.sources[0].fd;
+        if (fd_expr.fd != 0) {
+            try self.reportSourceError(source, Error.UnsupportedExpression, .@"error", "&{d} is a write-only stream; iterate over &0", .{fd_expr.fd});
+            return .fromValue(.void);
+        }
+
+        const capture = for_expr.capture.bindings[0];
+
+        // The element type matches the enclosing function's declared stdin type
+        // (the stream carries one such value per turn). An `Int` stdin parses
+        // the collected bytes; everything else stays a `String`.
+        const declared_type: ?ast.TypeExpr = if (self.stdin_type_stack.items.len > 0)
+            self.stdin_type_stack.items[self.stdin_type_stack.items.len - 1]
+        else
+            null;
+        const reads_int = if (declared_type) |dt| typeExprIsNamed(dt, "Int") else false;
+        const value_type: ?ast.TypeExpr = if (reads_int)
+            ast.TypeExpr.global(.integer)
+        else
+            declared_type orelse string_type;
+
+        // Refs allocated once and overwritten each iteration so the runtime
+        // stack does not grow per turn.
+        const value_ref = try self.newRef(source, "for_fd_value");
+        const is_eof_ref = try self.newRef(source, "for_fd_is_eof");
+
+        const after_label = try self.newLabel("for_fd_after", .unknown);
+        const for_label = try self.newLabel("for_fd", .abs);
+
+        // Read the next value off the stream into value_ref.
+        try self.addInstruction(.init(.from(source), .collect_stdin));
+        if (reads_int) try self.addInstruction(.init(.from(source), .parse_int));
+        try self.set(source, value_ref, .fromLocation(.initRegister(.r)));
+
+        // EOF (`.null`) ends the loop.
+        try self.cmp(source, .equal, .from(value_ref.dereference()), .fromValue(.null), is_eof_ref);
+        try self.jmp(source, try .from(is_eof_ref.dereference()), true, after_label);
+
+        try self.scopes.push(self.allocator, .lexical);
+
+        switch (capture.*) {
+            .discard => {},
+            .identifier => |identifier| try self.compileIdentifierBinding(
+                source,
+                identifier,
+                .from(value_ref.dereference().typed(value_type)),
+                null,
+                false,
+                .normal,
+            ),
+            .tuple, .record => {
+                try self.reportSourceError(
+                    source,
+                    Error.UnsupportedBindingPattern,
+                    .@"error",
+                    "for-loop destructuring captures are not yet supported in IR",
+                    .{},
+                );
+                return .fromValue(.void);
+            },
+        }
+
+        const stack_before_body = self.currentFrame().rel_stack_counter;
+        const body_result = try self.compileExpressionAsStatement(source, for_expr.body);
+        if (isWaitable(body_result)) |loc| try self.wait(source, loc);
+
+        const body_extra_refs = self.currentFrame().rel_stack_counter - stack_before_body;
+        for (0..body_extra_refs) |_| {
+            _ = try self.pop(source);
+        }
+
+        self.scopes.pop();
+
+        try self.jmp(source, null, true, for_label);
+        try self.setLabel(after_label.local_addr.label, .abs);
+
         return .fromValue(.void);
     }
 

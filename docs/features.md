@@ -486,6 +486,37 @@ fn Int consume_once() Int {
 echo "7" | parseInt | consume_once   // prints 7
 ```
 
+#### Consuming a live stream with `for (&0)`
+
+When the upstream stage `yield`s many values over its lifetime, the downstream
+stage drains them with a `for` loop over `&0`. Each iteration reads the next
+value off the live stream (blocking the stage until a value arrives or the
+producer closes), so a consumer transforms an unbounded number of values
+without knowing the count ahead of time. The producer closing its stdout is
+reported as EOF, which ends the loop:
+
+```rn
+fn Void produce() Int {
+    yield 1
+    yield 2
+    yield 3
+}
+
+fn Int double_each() Int {
+    for (&0) |v| {
+        yield v * 2
+    }
+}
+
+produce | double_each   // prints 246 (2, 4, 6 as they arrive)
+```
+
+Each value is delivered as the producer emits it — if `produce` slept between
+yields, `double_each` would emit each result with the same spacing rather than
+all at once. Per-value iteration applies to in-process typed streams
+(`Int`/`Float`); a `String`/byte stream has no message framing, so `for (&0)`
+over one reads the whole accumulated input as a single value (one iteration).
+
 ### Mixed executable and typed-function pipelines
 
 Executable stages and typed Runic functions can be freely mixed. An executable

@@ -18,6 +18,13 @@ pub const TypeChecker = struct {
     document_store: *DocumentStore,
     modules: std.StringArrayHashMapUnmanaged(*Scope),
     env: ?*const std.process.EnvMap = null,
+    /// Stack of the enclosing functions' declared stdout types. Pushed when a
+    /// function body is type-checked and consulted by `runYield` so that every
+    /// `yield &1` is validated in the scope where it actually appears (e.g.
+    /// inside a `for (&0) |v| { yield v }` loop, where `v` is only bound in the
+    /// loop's child scope). A null entry means the enclosing function declared
+    /// no stdout type, so its yields are unconstrained.
+    stdout_type_stack: std.ArrayListUnmanaged(?*const ast.TypeExpr) = .empty,
 
     pub const Error = Scope.Error ||
         std.fs.File.OpenError ||
@@ -497,6 +504,25 @@ pub const TypeChecker = struct {
         try self.logTypeCheckTrace(@src().fn_name, yield_stmt.span);
 
         try self.runExpression(scope, yield_stmt.value);
+
+        // Only `yield`s to stdout (&1) are constrained by the enclosing
+        // function's declared stdout type; stderr (&2) carries untyped
+        // diagnostic output. Validating here (rather than in a separate body
+        // walk) means the yielded expression is resolved in the exact scope it
+        // appears in, including loop-capture bindings like `for (&0) |v|`.
+        if (yield_stmt.fd != 1) return;
+        if (self.stdout_type_stack.items.len == 0) return;
+        const declared_stdout = self.stdout_type_stack.items[self.stdout_type_stack.items.len - 1] orelse return;
+        const yielded = try self.resolveExprType(scope, yield_stmt.value) orelse return;
+        const resolved = try self.resolvePipeType(scope, yielded) orelse return;
+        if (self.pipeTypesEqual(resolved, declared_stdout)) return;
+        try self.reportSpanError(
+            yield_stmt.span,
+            Error.TypeMismatch,
+            .@"error",
+            "yield type mismatch: function yields {f}, but declared stdout type is {f}",
+            .{ resolved, declared_stdout },
+        );
     }
 
     fn runExit(self: *TypeChecker, scope: *Scope, exit_stmt: *ast.ExitStmt) Error!void {
@@ -747,6 +773,18 @@ pub const TypeChecker = struct {
             },
         }
 
+        // Make the declared stdout type visible to every `yield` in the body
+        // (including yields nested in loops/blocks/matches) via the stack. Each
+        // `runYield` validates against the top entry in the scope it runs in.
+        try self.stdout_type_stack.append(
+            self.arena.allocator(),
+            if (fn_decl.return_type) |return_type|
+                try self.resolveTypeExpr(fn_scope, return_type)
+            else
+                null,
+        );
+        defer _ = self.stdout_type_stack.pop();
+
         // Run the body in a scope we keep a handle to. For a block body, run its
         // statements directly in `body_scope` instead of letting `runExpression`
         // create and discard an internal child scope. That way the stdin/stdout
@@ -769,89 +807,10 @@ pub const TypeChecker = struct {
             );
         }
 
-        // Output to stdout is now explicit via `yield`. Validate that every
-        // `yield`ed value matches the function's declared stdout type. The
-        // function's `return`/body value is the return/exit value and is no
-        // longer pushed to stdout, so it is not checked here.
-        if (fn_decl.return_type) |return_type| {
-            try self.validateBodyYields(
-                body_scope,
-                fn_decl.body,
-                try self.resolveTypeExpr(fn_scope, return_type),
-            );
-        }
-    }
-
-    /// Walks a function body and validates that every `yield expr` produces a
-    /// value compatible with the declared stdout type.
-    fn validateBodyYields(
-        self: *TypeChecker,
-        scope: *Scope,
-        expr: *ast.Expression,
-        declared_stdout: *const ast.TypeExpr,
-    ) Error!void {
-        switch (expr.*) {
-            .block => |block| for (block.statements) |statement| {
-                try self.validateStatementYields(scope, statement, declared_stdout);
-            },
-            .if_expr => |if_expr| {
-                try self.validateBodyYields(scope, if_expr.then_expr, declared_stdout);
-                if (if_expr.else_branch) |else_branch| switch (else_branch) {
-                    .expr => |else_expr| try self.validateBodyYields(scope, else_expr, declared_stdout),
-                    .if_expr => |else_if| try self.validateBodyYields(
-                        scope,
-                        try self.allocExpression(.{ .if_expr = else_if.* }),
-                        declared_stdout,
-                    ),
-                    .condition => {},
-                };
-            },
-            .for_expr => |for_expr| try self.validateBodyYields(scope, for_expr.body, declared_stdout),
-            .match_expr => |match_expr| for (match_expr.cases) |case| {
-                for (case.body.statements) |statement| {
-                    try self.validateStatementYields(scope, statement, declared_stdout);
-                }
-            },
-            .catch_expr => |catch_expr| {
-                try self.validateBodyYields(scope, catch_expr.subject, declared_stdout);
-                for (catch_expr.handler.body.statements) |statement| {
-                    try self.validateStatementYields(scope, statement, declared_stdout);
-                }
-            },
-            .try_expr => |try_expr| try self.validateBodyYields(scope, try_expr.subject, declared_stdout),
-            .subshell => |subshell| try self.validateBodyYields(scope, subshell.child, declared_stdout),
-            else => {},
-        }
-    }
-
-    fn validateStatementYields(
-        self: *TypeChecker,
-        scope: *Scope,
-        statement: *ast.Statement,
-        declared_stdout: *const ast.TypeExpr,
-    ) Error!void {
-        switch (statement.*) {
-            .yield_stmt => |yield_stmt| {
-                // Only `yield`s to stdout (&1) are constrained by the declared
-                // stdout type; stderr (&2) carries untyped diagnostic output.
-                if (yield_stmt.fd != 1) return;
-                const yielded = try self.resolveExprType(scope, yield_stmt.value) orelse return;
-                const resolved = try self.resolvePipeType(scope, yielded) orelse return;
-                if (self.pipeTypesEqual(resolved, declared_stdout)) return;
-                try self.reportSpanError(
-                    yield_stmt.span,
-                    Error.TypeMismatch,
-                    .@"error",
-                    "yield type mismatch: function yields {f}, but declared stdout type is {f}",
-                    .{ resolved, declared_stdout },
-                );
-            },
-            .expression => |expr_stmt| try self.validateBodyYields(scope, expr_stmt.expression, declared_stdout),
-            .while_stmt => |while_stmt| for (while_stmt.body.statements) |s| {
-                try self.validateStatementYields(scope, s, declared_stdout);
-            },
-            else => {},
-        }
+        // Output to stdout is now explicit via `yield`; each `yield &1` was
+        // already validated against the declared stdout type in `runYield`
+        // (using the `stdout_type_stack` entry pushed above), so the body value
+        // / `return` value is left unchecked here.
     }
 
     fn validateFunctionBodyStdin(

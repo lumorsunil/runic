@@ -59,9 +59,10 @@
   - [x] in-process typed transport for scalars (Int/Float pass between stages
     without text serialize/re-parse; pipe marked `typed`)
   - [x] consuming `&0` reads (each read consumes; EOF after producer closes)
-  - [ ] multi-value streaming reads (a stage yields N values, downstream reads
-    them one at a time as they arrive — needs a per-pipe value queue + live reads
-    rather than read-all-after-close)
+  - [x] multi-value streaming reads (a stage yields N values, downstream reads
+    them one at a time as they arrive via `for (&0) |v|` — per-pipe FIFO value
+    queue + live blocking reads; covers in-process typed Int/Float streams.
+    String/byte streams still read as a single value — needs message framing)
   - [ ] in-process transport for structured values (arrays/structs)
 - [x] exit code
 - [ ] remaining function/runtime gaps

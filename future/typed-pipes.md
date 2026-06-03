@@ -91,6 +91,39 @@ re-reading. `parse_int` passes `.null` through, and `yield` of a `.null` value
 emits nothing. So `&0` read once per value; reuse a value with `const n = &0`.
 (`&0 * &0` reads two values — the second is EOF for a single-value producer.)
 
+### consuming a live stream — `for (&0) |v|`
+
+A producer that `yield`s N values over its lifetime is drained by the consumer
+with `for (&0) |v| body`. Each iteration reads one value (the green thread
+blocks until a value arrives or the producer closes); EOF (`.null`) ends the
+loop. There is no precomputed iteration count, unlike the counted array/range
+for-loop.
+
+```rn
+fn Void produce() Int { yield 1; yield 2; yield 3 }
+fn Int double_each() Int { for (&0) |v| { yield v * 2 } }
+produce | double_each   // 246
+```
+
+Implementation: `compileForLoop` detects a single `&0` source and delegates to
+`compileFdForLoop`, which emits a read-test-bind loop — `collect_stdin`
+(`+ parse_int` for an `Int` stdin) into a reused ref, `cmp .equal … null` to
+detect EOF and `jmp` past the body, bind the capture, compile the body, and
+`jmp` back. The capture's element type comes from `IRCompiler.stdin_type_stack`
+(the enclosing function's stdin type).
+
+Type-checking: `runForExpr` types the capture from the for-source. Yield
+validation no longer walks the body separately — `runYield` validates each
+`yield &1` against `TypeChecker.stdout_type_stack` (pushed per function body),
+so a `yield` inside the loop resolves the capture `v` in the loop's child scope
+rather than the function scope.
+
+Per-value iteration applies to in-process typed streams (`Int`/`Float`). A
+`String`/byte stream has no message framing, so `collect_stdin` returns the
+whole accumulated buffer on the first read — `for (&0)` over a byte stream runs
+a single iteration with the entire input. Framed `String` streaming is future
+work.
+
 ## executable boundary
 
 Runic cannot infer each executable's real signature. The catch-all type used at
@@ -170,3 +203,17 @@ the `parseInt → doubler → inc` boundaries pass `Int`s in-process.
 `String` boundaries keep the byte path (a `String` is already bytes). Extending
 in-process transport to structured values (arrays, structs) is future work, as
 is a `parseFloat` builtin to make `Float` pipelines exercisable end-to-end.
+
+#### block stages and transport classification
+
+A boundary is classified by `classifyBoundary` → `classifyStageOutputKind` /
+`classifyStageInputKind`. Named functions report their kind from the declared
+signature; a **block** stage (`{ ... }`) has no signature, so the output kind is
+inferred from what it `yield`s to `&1` (`inferBlockStdoutType` →
+`inferYieldValueType`, handling literals, arithmetic, `&0`, and bindings) and the
+input kind is treated as permissive (a block adapts its `&0` to the upstream).
+So `{ yield 1; ... } | { yield &0 }` is recognized as an `Int` boundary and gets
+the typed queue path (per-value framing + live reads), the same as
+`producer | consumer` between named typed functions. An executable on either
+side still forces the byte path. When a block's yield type cannot be inferred,
+the boundary falls back to the byte path.

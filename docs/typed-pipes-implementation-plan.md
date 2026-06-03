@@ -629,7 +629,49 @@ Decision (user): "consume per read". To reuse a value, bind it (`const n = &0`);
   emits the value at the first yield and nothing at the second.
 - [x] Full suite green: 13 unit, 56 smoke, 13 diagnostics, fmt.
 
-Still future: true multi-value streaming, where a producer yields N values and
-the downstream reads them one at a time *as they arrive* (today a stage reads
-the whole input after the producer closes — a single value per byte/typed pipe).
-That needs a per-pipe value queue and live (pre-close) reads.
+## multi-value live streaming — `for (&0) |v|` (done)
+
+A producer that `yield`s N values is drained by the downstream stage one value
+at a time *as they arrive*, via a `for` loop over `&0`.
+
+- [x] Context: replaced the single-value `typed_pipe_values` map with a per-pipe
+  FIFO queue (`typed_pipe_queues`) + `enqueueTypedPipeValue` /
+  `dequeueTypedPipeValue`. `yield` to a typed pipe enqueues; `consumed_pipes`
+  stays for the byte path.
+- [x] `collect_stdin` (typed pipe): dequeue the next value if present; if the
+  queue is empty and the pipe is still `keep_open`, return
+  `cont_no_instr_counter_inc` to block the green thread until a value arrives or
+  the producer closes; once closed-and-empty, return `.null` (EOF).
+- [x] Compiler: `compileForLoop` detects a single `&0` source and delegates to
+  `compileFdForLoop` — a read-test-bind loop (`collect_stdin` `+ parse_int` for
+  `Int`, `cmp .equal … null` → `jmp` past body on EOF, bind capture, body, `jmp`
+  back). Reused refs so the runtime stack does not grow per turn.
+- [x] Type checker: yield validation moved off the separate body walk onto a
+  `stdout_type_stack` consulted in `runYield`, so a `yield` inside the loop
+  validates the capture `v` in the loop's child scope (the old walk used the
+  function scope and missed `v`). `runForExpr` types the capture from the
+  for-source.
+- [x] Fixture `tests/features/typed_pipe_for_stream_regression.rn`
+  (`produce` yields 1,2,3; `double_each` is `for (&0) |v| { yield v * 2 }`;
+  `produce | double_each` → `246`). Verified out of band that a sleeping
+  producer's values arrive one at a time (~1s apart), confirming live (not
+  buffered) delivery.
+- [x] Full suite green: 13 unit, 57 smoke, 13 diagnostics, fmt.
+- [x] Block stages get typed transport. `classifyStageOutputKind` /
+  `classifyStageInputKind` / `stageStdoutType` previously only understood named
+  functions, so a `{ ... } | { ... }` boundary was always byte-classified — the
+  producer's yields were buffered into one blob and read after close (no live
+  streaming, no per-value framing). The compiler now infers a block stage's
+  stdout type from its first `yield &1` (`inferBlockStdoutType` /
+  `inferYieldValueType`) and treats a block's input as permissive, so a scalar
+  block boundary uses the typed queue path. Fixture
+  `tests/features/typed_pipe_block_stream_regression.rn`
+  (`{ yield 1; yield 2; yield 3; } | { yield &0; yield &0 }` → `12`: reads two of
+  three framed values; byte path would have returned `123` on one read).
+
+Still future: per-value `String` streaming. The byte pipe has no message
+framing, so `collect_stdin` on a `String`/byte stream returns the whole
+accumulated buffer on the first read — `for (&0)` over a byte stream runs a
+single iteration with the entire input. In-process typed (`Int`/`Float`)
+streams iterate per value. Also future: in-process transport for structured
+values (arrays/structs).

@@ -91,12 +91,14 @@ pub const IRProgramContext = struct {
     pipes: std.AutoArrayHashMapUnmanaged(PipeHandle, *ReaderWriterStream) = .empty,
     pipe_handle_counter: usize = 0,
     /// In-process typed transport: for a pipe marked `typed` (an exact non-String
-    /// pipeline boundary), the upstream stage stores its yielded value here
-    /// instead of serializing it to bytes, and the downstream reads it back
-    /// directly. Keyed by the inter-stage pipe handle.
-    typed_pipe_values: std.AutoArrayHashMapUnmanaged(PipeHandle, Value) = .empty,
-    /// Pipes whose stdin value has already been consumed by a `&0` read. Reading
-    /// `&0` consumes the value; a subsequent read on a closed pipe yields EOF.
+    /// pipeline boundary), the upstream stage enqueues each yielded value here
+    /// instead of serializing it to bytes, and the downstream dequeues them one
+    /// at a time (a FIFO queue per inter-stage pipe handle). This carries
+    /// multiple values for live streaming.
+    typed_pipe_queues: std.AutoArrayHashMapUnmanaged(PipeHandle, std.ArrayListUnmanaged(Value)) = .empty,
+    /// Byte pipes whose (single) stdin value has already been consumed by a `&0`
+    /// read. A subsequent read on a closed byte pipe yields EOF. (Typed pipes use
+    /// the queue above instead; an empty closed queue is EOF.)
     consumed_pipes: std.AutoArrayHashMapUnmanaged(PipeHandle, void) = .empty,
     closeables: std.AutoArrayHashMapUnmanaged(CloseableHandle, *Closeable(ExitCode)) = .empty,
     closeable_handle_counter: usize = 0,
@@ -134,7 +136,8 @@ pub const IRProgramContext = struct {
             pipe.deinitParent();
         }
         self.pipes.deinit(self.allocator);
-        self.typed_pipe_values.deinit(self.allocator);
+        for (self.typed_pipe_queues.values()) |*queue| queue.deinit(self.allocator);
+        self.typed_pipe_queues.deinit(self.allocator);
         self.consumed_pipes.deinit(self.allocator);
 
         for (self.closeables.values()) |closeable| {
@@ -349,22 +352,26 @@ pub const IRProgramContext = struct {
         return self.pipes.get(handle) orelse Error.MissingPipeHandle;
     }
 
-    /// Stores a yielded value on a typed pipe for in-process transport.
-    pub fn putTypedPipeValue(self: *@This(), handle: PipeHandle, value: Value) !void {
-        try self.typed_pipe_values.put(self.allocator, handle, value);
+    /// Enqueues a yielded value on a typed pipe for in-process transport.
+    pub fn enqueueTypedPipeValue(self: *@This(), handle: PipeHandle, value: Value) !void {
+        const gop = try self.typed_pipe_queues.getOrPut(self.allocator, handle);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(self.allocator, value);
     }
 
-    /// Returns the value stored on a typed pipe, if any.
-    pub fn getTypedPipeValue(self: *@This(), handle: PipeHandle) ?Value {
-        return self.typed_pipe_values.get(handle);
+    /// Dequeues the next value off a typed pipe, if any (FIFO).
+    pub fn dequeueTypedPipeValue(self: *@This(), handle: PipeHandle) ?Value {
+        const queue = self.typed_pipe_queues.getPtr(handle) orelse return null;
+        if (queue.items.len == 0) return null;
+        return queue.orderedRemove(0);
     }
 
-    /// Marks a pipe's stdin value as consumed by a `&0` read.
+    /// Marks a byte pipe's (single) stdin value as consumed by a `&0` read.
     pub fn markPipeConsumed(self: *@This(), handle: PipeHandle) !void {
         try self.consumed_pipes.put(self.allocator, handle, {});
     }
 
-    /// Whether a pipe's stdin value has already been consumed.
+    /// Whether a byte pipe's stdin value has already been consumed.
     pub fn isPipeConsumed(self: *@This(), handle: PipeHandle) bool {
         return self.consumed_pipes.contains(handle);
     }

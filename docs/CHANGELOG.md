@@ -55,6 +55,16 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   (`.null`) and `yield`ing an EOF value emits nothing. So a stage can read once
   per value and `yield` multiple times over its lifetime; to reuse a value, bind
   it (`const n = &0`).
+- **Multi-value live streaming with `for (&0) |v|`**: a producer that `yield`s
+  many values is drained by the downstream stage with a `for` loop over `&0`.
+  Each iteration reads one value off the live stream (blocking until it arrives
+  or the producer closes), so a consumer transforms an unbounded number of
+  values as they arrive — `produce | double_each` where `double_each` is
+  `for (&0) |v| { yield v * 2 }` emits each doubled value with the producer's
+  timing. EOF ends the loop. Per-value iteration covers in-process typed
+  (`Int`/`Float`) streams; a `String`/byte stream (no message framing) reads as
+  a single value. Yield type-checking moved onto a stdout-type stack so a
+  `yield` inside the loop validates the capture in its own scope.
 - **Mixed exec/typed pipelines**: executable stages and typed Runic functions
   can be freely combined. The type checker enforces that an executable followed
   by a typed function must have `String` stdin (since executables output bytes).
@@ -70,6 +80,16 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   pipeline expressions report the right value type in assignment contexts.
 
 ### Fixed
+- Block pipeline stages carrying a scalar (`{ yield 1; ... } | { yield &0 }`)
+  now use in-process typed transport with per-value framing, like named typed
+  functions do. Previously a block stage was always classified as a byte stream,
+  so the boundary buffered every `yield` into one text blob read after the
+  producer closed — breaking live streaming (`{ yield 1; sleep "1"; yield 2 } |
+  { yield &0; yield &0 }` waited a second and emitted `12` together instead of
+  `1` immediately then `2`) and per-value framing (a single `&0` read returned
+  the whole buffer instead of one value). The compiler now infers a block
+  stage's stdout type from its first `yield &1` so the boundary is recognized as
+  `Int`/`Float` typed transport.
 - `&0` can now be referenced from block expressions inside a function body
   (including nested blocks and bindings like `const n = &0` used later). The
   type checker previously resolved a function's stdin/stdout types in a scope

@@ -1,0 +1,23 @@
+// Multi-value live streaming: a producer `yield`s several values over its
+// lifetime, and the consumer drains them with `for (&0) |v| { ... }`. Each
+// iteration reads one value off the live stream (blocking until it arrives or
+// the producer closes), so the consumer can transform an unbounded number of
+// values without knowing the count ahead of time. EOF (the producer closing)
+// ends the loop.
+//
+// Here `produce` yields 1, 2, 3 and `double_each` yields each doubled, so the
+// pipeline emits 2, 4, 6 (concatenated as `246`).
+
+fn Void produce() Int {
+    yield 1
+    yield 2
+    yield 3
+}
+
+fn Int double_each() Int {
+    for (&0) |v| {
+        yield v * 2
+    }
+}
+
+produce | double_each

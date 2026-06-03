@@ -1050,40 +1050,40 @@ pub const IREvaluator = struct {
                 return .cont;
             },
             .collect_stdin => {
-                // `&0` reads (and consumes) the input value. A second read on a
-                // closed pipe yields EOF (`.null`) rather than re-reading.
+                // `&0` reads (and consumes) the next input value. EOF (`.null`)
+                // is returned once the producer has closed with nothing left.
                 if (thread.private.stack.items.len < 1) return Error.MissingPipeHandle;
                 const stdin_value = thread.private.stack.items[0];
                 if (stdin_value != .pipe) return Error.MissingPipeHandle;
                 const stdin_pipe = try self.context.getPipe(stdin_value.pipe);
 
-                // Already consumed: the value reached an earlier read, so this
-                // read sees the closed stream and returns EOF immediately.
-                if (self.context.isPipeConsumed(stdin_value.pipe)) {
+                // Mark the pipe as having a virtual consumer (&0). This lets
+                // the upstream stage's stream thread see has_been_connected=true
+                // and exit cleanly once keep_open=false is set.
+                stdin_pipe.has_been_connected = true;
+
+                if (stdin_pipe.config.typed) {
+                    // Typed pipe: dequeue the next value. Live streaming — return
+                    // a value as soon as one is available (even while the
+                    // producer is still running); block (retry) when the queue is
+                    // empty but the producer is live; EOF when empty and closed.
+                    if (self.context.dequeueTypedPipeValue(stdin_value.pipe)) |typed_value| {
+                        thread.private.result_register = typed_value;
+                        return .cont;
+                    }
+                    if (stdin_pipe.config.keep_open) return .cont_no_instr_counter_inc;
                     thread.private.result_register = .null;
                     return .cont;
                 }
 
-                // Mark the pipe as having a virtual consumer (&0). This lets
-                // the upstream stage's stream thread see has_been_connected=true
-                // and exit cleanly once keep_open=false is set (rather than
-                // looping on .no_source forever).
-                stdin_pipe.has_been_connected = true;
-
-                // Wait until the upstream signals "done" by setting keep_open=false.
-                if (stdin_pipe.config.keep_open) return .cont_no_instr_counter_inc;
-
-                // In-process typed transport: if the upstream stored a typed
-                // value on this pipe, return it directly (no byte re-parse).
-                if (stdin_pipe.config.typed) {
-                    if (self.context.getTypedPipeValue(stdin_value.pipe)) |typed_value| {
-                        try self.context.markPipeConsumed(stdin_value.pipe);
-                        thread.private.result_register = typed_value;
-                        return .cont;
-                    }
+                // Byte pipe: one value = the whole buffered input. Wait until the
+                // producer closes, read it all, then consume (a second read is
+                // EOF).
+                if (self.context.isPipeConsumed(stdin_value.pipe)) {
+                    thread.private.result_register = .null;
+                    return .cont;
                 }
-
-                // All data is buffered in buffer_writer. Collect it (and consume).
+                if (stdin_pipe.config.keep_open) return .cont_no_instr_counter_inc;
                 const bytes = stdin_pipe.buffer_writer.written();
                 const owned = try self.allocator.dupe(u8, bytes);
                 try self.context.markPipeConsumed(stdin_value.pipe);
@@ -1415,11 +1415,11 @@ pub const IREvaluator = struct {
                 if (value == .null) return .cont;
 
                 // In-process typed transport: on an exact non-String boundary the
-                // pipe is marked `typed`, so store the value directly and skip
-                // byte serialization. The downstream `&0`/collect_stdin reads it
-                // back from the same handle.
+                // pipe is marked `typed`, so enqueue the value directly and skip
+                // byte serialization. The downstream `&0`/collect_stdin dequeues
+                // it from the same handle (multiple yields stream as a queue).
                 if (pipe.config.typed) {
-                    try self.context.putTypedPipeValue(pipe_handle, value);
+                    try self.context.enqueueTypedPipeValue(pipe_handle, value);
                     return .cont;
                 }
 
