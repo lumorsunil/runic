@@ -58,6 +58,10 @@
   - [ ] `parseFloat` / other parse builtins
   - [x] in-process typed transport for scalars (Int/Float pass between stages
     without text serialize/re-parse; pipe marked `typed`)
+  - [x] consuming `&0` reads (each read consumes; EOF after producer closes)
+  - [ ] multi-value streaming reads (a stage yields N values, downstream reads
+    them one at a time as they arrive — needs a per-pipe value queue + live reads
+    rather than read-all-after-close)
   - [ ] in-process transport for structured values (arrays/structs)
 - [x] exit code
 - [ ] remaining function/runtime gaps

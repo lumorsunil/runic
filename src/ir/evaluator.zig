@@ -1050,13 +1050,19 @@ pub const IREvaluator = struct {
                 return .cont;
             },
             .collect_stdin => {
-                // Reads all bytes from the thread's stdin pipe into a zig_string.
-                // Blocks (retries without advancing the instruction counter) until
-                // the upstream stage signals completion by setting keep_open=false.
+                // `&0` reads (and consumes) the input value. A second read on a
+                // closed pipe yields EOF (`.null`) rather than re-reading.
                 if (thread.private.stack.items.len < 1) return Error.MissingPipeHandle;
                 const stdin_value = thread.private.stack.items[0];
                 if (stdin_value != .pipe) return Error.MissingPipeHandle;
                 const stdin_pipe = try self.context.getPipe(stdin_value.pipe);
+
+                // Already consumed: the value reached an earlier read, so this
+                // read sees the closed stream and returns EOF immediately.
+                if (self.context.isPipeConsumed(stdin_value.pipe)) {
+                    thread.private.result_register = .null;
+                    return .cont;
+                }
 
                 // Mark the pipe as having a virtual consumer (&0). This lets
                 // the upstream stage's stream thread see has_been_connected=true
@@ -1071,22 +1077,25 @@ pub const IREvaluator = struct {
                 // value on this pipe, return it directly (no byte re-parse).
                 if (stdin_pipe.config.typed) {
                     if (self.context.getTypedPipeValue(stdin_value.pipe)) |typed_value| {
+                        try self.context.markPipeConsumed(stdin_value.pipe);
                         thread.private.result_register = typed_value;
                         return .cont;
                     }
                 }
 
-                // All data is buffered in buffer_writer. Collect it.
+                // All data is buffered in buffer_writer. Collect it (and consume).
                 const bytes = stdin_pipe.buffer_writer.written();
                 const owned = try self.allocator.dupe(u8, bytes);
+                try self.context.markPipeConsumed(stdin_value.pipe);
                 thread.private.result_register = .{ .zig_string = owned };
                 return .cont;
             },
             .parse_int => {
                 // Ensure %r holds an Int. When it already does (e.g. an in-process
-                // typed value received via `&0`), pass it through unchanged;
-                // otherwise parse the string representation.
+                // typed value received via `&0`), pass it through unchanged; an
+                // EOF read (`.null`, stream consumed/closed) also passes through.
                 if (thread.private.result_register == .uinteger) return .cont;
+                if (thread.private.result_register == .null) return .cont;
                 var text_writer = std.Io.Writer.Allocating.init(self.allocator);
                 defer text_writer.deinit();
                 try self.materializeString(thread, thread.private.result_register, &text_writer.writer);
@@ -1400,6 +1409,10 @@ pub const IREvaluator = struct {
                 const pipe_handle = (try self.resolveLocation(thread, pipe_write.pipe)).pipe;
                 const pipe = try self.context.getPipe(pipe_handle);
                 const value = try self.resolveValueSource(thread, pipe_write.source);
+
+                // Yielding an EOF value (e.g. `yield &0` after the stream is
+                // consumed) emits nothing.
+                if (value == .null) return .cont;
 
                 // In-process typed transport: on an exact non-String boundary the
                 // pipe is marked `typed`, so store the value directly and skip

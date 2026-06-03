@@ -1,6 +1,6 @@
 // A block used directly as a pipeline stage (not a function body) infers its
-// &0 type from the upstream stage's stdout. Here parseInt produces an Int,
-// so &0 inside the block is an Int and the multiplication is arithmetic.
-// Output is explicit via `yield`.
+// &0 type from the upstream stage's stdout. Here parseInt produces an Int, so
+// `&0` inside the block is an Int and the arithmetic is integer arithmetic.
+// `&0` is a consuming read, so the single input is bound once and reused.
 
-echo "3" | parseInt | { yield &0 * &0 }
+echo "3" | parseInt | { const n = &0; yield n * n }

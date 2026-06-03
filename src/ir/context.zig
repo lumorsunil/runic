@@ -95,6 +95,9 @@ pub const IRProgramContext = struct {
     /// instead of serializing it to bytes, and the downstream reads it back
     /// directly. Keyed by the inter-stage pipe handle.
     typed_pipe_values: std.AutoArrayHashMapUnmanaged(PipeHandle, Value) = .empty,
+    /// Pipes whose stdin value has already been consumed by a `&0` read. Reading
+    /// `&0` consumes the value; a subsequent read on a closed pipe yields EOF.
+    consumed_pipes: std.AutoArrayHashMapUnmanaged(PipeHandle, void) = .empty,
     closeables: std.AutoArrayHashMapUnmanaged(CloseableHandle, *Closeable(ExitCode)) = .empty,
     closeable_handle_counter: usize = 0,
     file_sinks: std.ArrayList(*FileSink) = .empty,
@@ -132,6 +135,7 @@ pub const IRProgramContext = struct {
         }
         self.pipes.deinit(self.allocator);
         self.typed_pipe_values.deinit(self.allocator);
+        self.consumed_pipes.deinit(self.allocator);
 
         for (self.closeables.values()) |closeable| {
             if (!closeable.isClosed()) _ = closeable.close();
@@ -353,6 +357,16 @@ pub const IRProgramContext = struct {
     /// Returns the value stored on a typed pipe, if any.
     pub fn getTypedPipeValue(self: *@This(), handle: PipeHandle) ?Value {
         return self.typed_pipe_values.get(handle);
+    }
+
+    /// Marks a pipe's stdin value as consumed by a `&0` read.
+    pub fn markPipeConsumed(self: *@This(), handle: PipeHandle) !void {
+        try self.consumed_pipes.put(self.allocator, handle, {});
+    }
+
+    /// Whether a pipe's stdin value has already been consumed.
+    pub fn isPipeConsumed(self: *@This(), handle: PipeHandle) bool {
+        return self.consumed_pipes.contains(handle);
     }
 
     pub fn addCloseable(

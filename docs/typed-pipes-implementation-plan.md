@@ -604,3 +604,32 @@ re-parsing downstream.
 
 Still future: in-process transport for structured values (arrays/structs), and a
 `parseFloat` builtin to make `Float` pipelines exercisable end-to-end.
+
+### Follow-up: consuming `&0` reads (with EOF)
+
+`&0` is now a *consuming* read rather than a re-readable snapshot: each read
+takes the next value off the input stream, and once the producer has closed,
+reading `&0` again returns EOF.
+
+Decision (user): "consume per read". To reuse a value, bind it (`const n = &0`);
+`&0 * &0` reads two values (the second is EOF for a single-value producer).
+
+- [x] Context: `consumed_pipes` set + `markPipeConsumed` / `isPipeConsumed`.
+- [x] `collect_stdin`: returns `.null` (EOF) immediately if the pipe is already
+  consumed; otherwise reads the value (typed or bytes) and marks it consumed.
+- [x] `parse_int` passes `.null` through (so an EOF read of an `Int` stays EOF).
+- [x] `pipe_write` (yield) of a `.null` value is a no-op (emits nothing).
+- [x] Updated the `&0 * &0` fixtures (`yield_regression`,
+  `typed_pipe_inprocess_regression`, `typed_pipe_block_stage_inference_regression`)
+  to the `const n = &0; ... n * n` form.
+- [x] Fixture `tests/features/fd_consume_regression.rn`
+  (`fn Int consume_once() Int { yield &0; yield &0 }`, `echo "7" | parseInt |
+  consume_once` → `7` — the second read is EOF and emits nothing).
+- [x] Verified the user's intent: `... | { yield &0; sleep "2"; yield &0 }`
+  emits the value at the first yield and nothing at the second.
+- [x] Full suite green: 13 unit, 56 smoke, 13 diagnostics, fmt.
+
+Still future: true multi-value streaming, where a producer yields N values and
+the downstream reads them one at a time *as they arrive* (today a stage reads
+the whole input after the producer closes — a single value per byte/typed pipe).
+That needs a per-pipe value queue and live (pre-close) reads.

@@ -47,9 +47,14 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   declared `StdinType` and `StdoutType`. Calling a function whose stdin type
   is incompatible with the enclosing function's declared stdin produces a
   diagnostic.
-- **`&0` access**: the built-in `&0` expression reads all bytes from
-  the function's stdin pipe as a `String` value. Available in any function with
-  a non-Void stdin type. Implemented via the `collect_stdin` IR instruction.
+- **`&0` access**: the built-in `&0` expression reads the function's stdin pipe
+  as a typed value. Available in any function with a non-Void stdin type.
+  Implemented via the `collect_stdin` IR instruction.
+- **Consuming `&0` reads**: each `&0` read takes (consumes) the next value off
+  the input stream; once the producer has closed, reading `&0` again yields EOF
+  (`.null`) and `yield`ing an EOF value emits nothing. So a stage can read once
+  per value and `yield` multiple times over its lifetime; to reuse a value, bind
+  it (`const n = &0`).
 - **Mixed exec/typed pipelines**: executable stages and typed Runic functions
   can be freely combined. The type checker enforces that an executable followed
   by a typed function must have `String` stdin (since executables output bytes).

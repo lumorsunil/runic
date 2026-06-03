@@ -79,7 +79,17 @@ fn String transform() String {
 
 Implementation: `collect_stdin` IR instruction — marks the stdin pipe as
 `has_been_connected=true` (letting the upstream stream thread exit) then
-reads `buffer_writer.written()` once `keep_open=false` is set.
+reads `buffer_writer.written()` (or the in-process typed value) once
+`keep_open=false` is set.
+
+### consuming reads
+
+`&0` is a consuming read: each read takes the next value off the stream. The
+context tracks consumed pipe handles (`consumed_pipes`); after the first read,
+a subsequent `collect_stdin` on a closed pipe returns EOF (`.null`) instead of
+re-reading. `parse_int` passes `.null` through, and `yield` of a `.null` value
+emits nothing. So `&0` read once per value; reuse a value with `const n = &0`.
+(`&0 * &0` reads two values — the second is EOF for a single-value producer.)
 
 ## executable boundary
 

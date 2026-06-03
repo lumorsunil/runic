@@ -471,6 +471,21 @@ produce | transform
 The `&0` value has the type declared in the function's stdin position. Using
 it in a function that has `Void` stdin would be a type error.
 
+`&0` is a **consuming** read: each read takes the next value off the input
+stream. To use a value more than once, bind it with `const` — `&0 * &0` would
+read *two* values, but `const n = &0; n * n` reads one and reuses it. Once the
+producer has closed, reading `&0` again yields EOF, and `yield`ing an EOF value
+emits nothing:
+
+```rn
+fn Int consume_once() Int {
+    yield &0    // emits the value
+    yield &0    // EOF: the producer is closed, so this emits nothing
+}
+
+echo "7" | parseInt | consume_once   // prints 7
+```
+
 ### Mixed executable and typed-function pipelines
 
 Executable stages and typed Runic functions can be freely mixed. An executable
