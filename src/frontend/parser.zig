@@ -1662,7 +1662,7 @@ pub const Parser = struct {
 
         if (capture.bindings.len != sources.len) return Error.ForCapturesMustMatchSources;
 
-        const body = try self.parseExpression();
+        const body = try self.parseControlFlowBody();
 
         return self.allocExpression(.{
             .for_expr = .{
@@ -1672,6 +1672,45 @@ pub const Parser = struct {
                 .span = for_tok.span.endAt(body.span()),
             },
         });
+    }
+
+    /// Parses the body of a control-flow construct (e.g. a `for` loop). The body
+    /// may be a block (`{ ... }`) or a bare expression (`echo "${i}"`) — both
+    /// handled by `parseExpression` — or a single bare statement such as
+    /// `yield`/`return`/`exit`, which is desugared into a one-statement block so
+    /// the construct is not forced to wrap a single statement in `{ }`.
+    fn parseControlFlowBody(self: *Self) Error!*ast.Expression {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const next = try self.peekToken();
+        const stmt: *ast.Statement = switch (next.tag) {
+            .kw_yield, .kw_return, .kw_exit => try self.parseSingleBodyStatement(),
+            else => return self.parseExpression(),
+        };
+
+        const statements = try self.arena.allocator().alloc(*ast.Statement, 1);
+        statements[0] = stmt;
+        return self.allocExpression(.{ .block = ast.Block{
+            .statements = statements,
+            .span = stmt.span(),
+        } });
+    }
+
+    /// Parses a single `yield`/`return`/`exit` statement for use as a bare
+    /// control-flow body. The caller guarantees the next token is one of these.
+    fn parseSingleBodyStatement(self: *Self) Error!*ast.Statement {
+        const stmt = try self.arena.allocator().create(ast.Statement);
+        if (try self.parseMaybeYield()) |yield_stmt| {
+            stmt.* = .{ .yield_stmt = yield_stmt };
+        } else if (try self.parseMaybeReturn()) |return_stmt| {
+            stmt.* = .{ .return_stmt = return_stmt };
+        } else if (try self.parseMaybeExit()) |exit_stmt| {
+            stmt.* = .{ .exit_stmt = exit_stmt };
+        } else {
+            unreachable;
+        }
+        return stmt;
     }
 
     fn parseMatchExpression(self: *Self) Error!*ast.Expression {

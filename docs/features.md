@@ -237,6 +237,14 @@ for (fruits, 0..) |fruit, idx| {
 
 **Result:** Iteration works uniformly across arrays and ranges without manual indexing, and the capture clause makes loop variables explicit without leaking bindings outside the block.
 
+A `for` body does not have to be a block. It may be a bare expression or a single
+`yield`/`return`/`exit` statement, which avoids `{ }` for one-line loops:
+
+```rn
+for (0..3) |i| echo "${i}"          // bare command
+{ for (0..5) |i| yield i } | square // bare yield as a pipeline producer
+```
+
 ## Command vs. expression separation
 
 Runic distinguishes between invoking external commands and evaluating expressions, reducing quoting issues by making intent explicit.
