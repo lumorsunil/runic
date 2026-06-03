@@ -1100,7 +1100,24 @@ pub const IREvaluator = struct {
                 defer text_writer.deinit();
                 try self.materializeString(thread, thread.private.result_register, &text_writer.writer);
                 const trimmed = std.mem.trim(u8, text_writer.written(), " \t\r\n");
-                const parsed = std.fmt.parseInt(usize, trimmed, 10) catch return Error.InvalidInt;
+                const parsed = std.fmt.parseInt(usize, trimmed, 10) catch {
+                    // Report a precise diagnostic here (naming the offending
+                    // input and source location); the runner suppresses its
+                    // generic "Error evaluating" line for InvalidInt so the
+                    // user sees a single clear message.
+                    if (instruction.source) |src| {
+                        const span = src.span();
+                        std.log.err("[error]: {s}:{}:{}: cannot parse \"{s}\" as Int", .{
+                            span.start.file,
+                            span.start.line,
+                            span.start.column,
+                            trimmed,
+                        });
+                    } else {
+                        std.log.err("[error]: cannot parse \"{s}\" as Int", .{trimmed});
+                    }
+                    return Error.InvalidInt;
+                };
                 thread.private.result_register = .{ .uinteger = parsed };
                 return .cont;
             },

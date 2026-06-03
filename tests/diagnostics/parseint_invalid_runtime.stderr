@@ -1,0 +1,1 @@
+[error]: __RUNIC_PWD__/tests/diagnostics/parseint_invalid_runtime.rn:4:14: cannot parse "abc" as Int

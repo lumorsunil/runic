@@ -13,7 +13,12 @@ pub const std_options = std.Options{
 pub fn main() !void {
     signals.init(std.heap.page_allocator);
     const exit_code = mainImpl() catch |err| {
-        std.log.err("runic exited with error: {t}", .{err});
+        // Errors that already printed a precise, user-facing message at the
+        // point of failure (e.g. InvalidInt names the offending input and
+        // location) skip the generic footer so the user sees one clean line.
+        if (err != error.InvalidInt) {
+            std.log.err("runic exited with error: {t}", .{err});
+        }
         std.process.exit(1);
     };
     if (exit_code != .success) {

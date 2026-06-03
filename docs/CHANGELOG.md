@@ -79,6 +79,13 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 - **`Pipeline.resolveType`** now correctly unwraps function return types so
   pipeline expressions report the right value type in assignment contexts.
 
+### Changed
+- `parseInt` (and an `Int`-typed `&0`) on non-numeric input now fails with a
+  single, source-located diagnostic naming the offending value —
+  `[error]: <file>:<line>:<col>: cannot parse "abc" as Int` — instead of dumping
+  a raw `Error evaluating … error.InvalidInt` plus a generic CLI footer. The
+  redundant generic lines are suppressed for this case.
+
 ### Fixed
 - `yield <binding>` (e.g. `for (&0) |v| { yield v }`, or any `yield v` where `v`
   is a loop capture or local) no longer crashes the compiler with an

@@ -170,9 +170,13 @@ downstream stage how to interpret the bytes:
 
 Example: `echo "10" | parseInt | doubler | inc` evaluates to `21`.
 
-Failure modes: `parseInt` / `Int`-typed `&0` on non-numeric input raises a
-runtime `InvalidInt` error. `parseInt` returns `Int` (not `?Int` / `E!Int`) for
-now; optional/error-union return types depend on error-declaration parsing.
+Failure modes: `parseInt` / `Int`-typed `&0` on non-numeric input fails at
+runtime with a single, source-located diagnostic naming the offending value
+(`[error]: <file>:<line>:<col>: cannot parse "abc" as Int`) and a non-zero exit;
+the generic runtime/CLI error footers are suppressed for this case so the user
+sees one clean message. `parseInt` returns `Int` (not `?Int` / `E!Int`) for now,
+so the failure aborts rather than producing a recoverable optional/error value;
+optional/error-union return types depend on error-declaration parsing.
 
 ## runtime transport
 

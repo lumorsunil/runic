@@ -105,6 +105,11 @@ pub const IRRunner = struct {
             const current_thread = evaluator.context.getCurrentThreadPtr() orelse unreachable;
             const current_instr = current_thread.currentInstruction();
 
+            // Some errors are reported with a precise, user-facing message at
+            // the point they occur (e.g. InvalidInt names the offending input);
+            // don't also emit the generic "Error evaluating" line for those.
+            if (err == error.InvalidInt) return err;
+
             if (current_instr) |ci| {
                 if (ci.source) |source| {
                     const span = source.span();
