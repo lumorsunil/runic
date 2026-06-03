@@ -59,7 +59,9 @@
   - [x] `lines` builtin (`fn String lines() String`) — frames a byte stream into
     per-line values (splits on `\n`, emits each onto a typed queue) so a
     downstream `for (&0)` / `parseInt` processes one line at a time
-  - [ ] `parseFloat` / other parse builtins
+  - [x] `parseFloat` builtin (`fn String parseFloat() Float`); maps per value
+    like `parseInt`, shares `compileParseMapStage`
+  - [ ] other parse builtins (e.g. `parseBool`)
   - [ ] streaming `lines` (currently buffers all input before splitting) and
     other framers / custom delimiters
   - [x] in-process typed transport for scalars (Int/Float pass between stages

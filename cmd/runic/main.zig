@@ -14,9 +14,10 @@ pub fn main() !void {
     signals.init(std.heap.page_allocator);
     const exit_code = mainImpl() catch |err| {
         // Errors that already printed a precise, user-facing message at the
-        // point of failure (e.g. InvalidInt names the offending input and
-        // location) skip the generic footer so the user sees one clean line.
-        if (err != error.InvalidInt) {
+        // point of failure (e.g. InvalidInt/InvalidFloat name the offending
+        // input and location) skip the generic footer so the user sees one
+        // clean line.
+        if (err != error.InvalidInt and err != error.InvalidFloat) {
             std.log.err("runic exited with error: {t}", .{err});
         }
         std.process.exit(1);

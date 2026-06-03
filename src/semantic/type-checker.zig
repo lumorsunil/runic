@@ -2495,6 +2495,18 @@ const parse_int_fn_type = ast.TypeExpr{ .function = .{
     .span = .global,
 } };
 
+/// Stable storage for the `parseFloat` builtin's function type:
+/// `fn String parseFloat() Float`.
+const parse_float_byte_type = ast.TypeExpr{ .byte = .{ .span = .global } };
+const parse_float_string_type = ast.TypeExpr{ .array = .{ .element = &parse_float_byte_type, .span = .global } };
+const parse_float_return_type = ast.TypeExpr{ .float = .{ .span = .global } };
+const parse_float_fn_type = ast.TypeExpr{ .function = .{
+    .params = .nonVariadic(&.{}),
+    .stdin_type = &parse_float_string_type,
+    .return_type = &parse_float_return_type,
+    .span = .global,
+} };
+
 /// Stable storage for the `lines` builtin's function type:
 /// `fn String lines() String` — frames a byte stream into per-line values.
 const lines_byte_type = ast.TypeExpr{ .byte = .{ .span = .global } };
@@ -2520,6 +2532,7 @@ const global_scope_definitions = [_]Definition{
 /// Builtin value bindings (not types) available in every module's global scope.
 const global_value_definitions = [_]Definition{
     .{ .identifier = .{ .name = "parseInt", .span = .global }, .type_expr = &parse_int_fn_type },
+    .{ .identifier = .{ .name = "parseFloat", .span = .global }, .type_expr = &parse_float_fn_type },
     .{ .identifier = .{ .name = "lines", .span = .global }, .type_expr = &lines_fn_type },
 };
 

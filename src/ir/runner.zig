@@ -106,9 +106,10 @@ pub const IRRunner = struct {
             const current_instr = current_thread.currentInstruction();
 
             // Some errors are reported with a precise, user-facing message at
-            // the point they occur (e.g. InvalidInt names the offending input);
-            // don't also emit the generic "Error evaluating" line for those.
-            if (err == error.InvalidInt) return err;
+            // the point they occur (e.g. InvalidInt/InvalidFloat name the
+            // offending input); don't also emit the generic "Error evaluating"
+            // line for those.
+            if (err == error.InvalidInt or err == error.InvalidFloat) return err;
 
             if (current_instr) |ci| {
                 if (ci.source) |source| {

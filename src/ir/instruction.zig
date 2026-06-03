@@ -165,6 +165,10 @@ pub const Instruction = struct {
         /// surrounding whitespace. stores the result in %r. invalid input is a
         /// runtime error.
         parse_int,
+        /// parses the string in %r into a Float value, trimming surrounding
+        /// whitespace. stores the result in %r. invalid input is a runtime
+        /// error. an existing Float (or EOF `.null`) passes through unchanged.
+        parse_float,
         /// splits the string in %r by '\n' and enqueues each non-empty line as a
         /// separate value onto the given pipe's typed queue (framing a byte
         /// stream into per-line values). used by the `lines` builtin.

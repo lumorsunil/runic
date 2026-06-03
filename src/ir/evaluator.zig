@@ -65,6 +65,7 @@ pub const Error =
         MalformedHeapSequence,
         MissingSpawnedThreadContext,
         InvalidInt,
+        InvalidFloat,
     };
 
 pub const Result = union(enum) {
@@ -1119,6 +1120,35 @@ pub const IREvaluator = struct {
                     return Error.InvalidInt;
                 };
                 thread.private.result_register = .{ .uinteger = parsed };
+                return .cont;
+            },
+            .parse_float => {
+                // Ensure %r holds a Float. A value that is already a Float (an
+                // in-process typed value) or an EOF read (`.null`) passes
+                // through unchanged.
+                if (thread.private.result_register == .float) return .cont;
+                if (thread.private.result_register == .null) return .cont;
+                var text_writer = std.Io.Writer.Allocating.init(self.allocator);
+                defer text_writer.deinit();
+                try self.materializeString(thread, thread.private.result_register, &text_writer.writer);
+                const trimmed = std.mem.trim(u8, text_writer.written(), " \t\r\n");
+                const parsed = std.fmt.parseFloat(f64, trimmed) catch {
+                    // Precise, source-located diagnostic (the runner/CLI suppress
+                    // their generic footers for InvalidFloat, as for InvalidInt).
+                    if (instruction.source) |src| {
+                        const span = src.span();
+                        std.log.err("[error]: {s}:{}:{}: cannot parse \"{s}\" as Float", .{
+                            span.start.file,
+                            span.start.line,
+                            span.start.column,
+                            trimmed,
+                        });
+                    } else {
+                        std.log.err("[error]: cannot parse \"{s}\" as Float", .{trimmed});
+                    }
+                    return Error.InvalidFloat;
+                };
+                thread.private.result_register = .{ .float = parsed };
                 return .cont;
             },
             .emit_lines => |pipe_location| {

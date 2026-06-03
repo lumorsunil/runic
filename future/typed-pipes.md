@@ -234,8 +234,16 @@ So `echo "10" | parseInt | doubler | inc` byte-transports only `echo → parseIn
 the `parseInt → doubler → inc` boundaries pass `Int`s in-process.
 
 `String` boundaries keep the byte path (a `String` is already bytes). Extending
-in-process transport to structured values (arrays, structs) is future work, as
-is a `parseFloat` builtin to make `Float` pipelines exercisable end-to-end.
+in-process transport to structured values (arrays, structs) is future work.
+
+`parseFloat` (`fn String parseFloat() Float`) is the `Float` counterpart of
+`parseInt` — same per-value mapping (it shares `compileParseMapStage`, emitting
+`collect_stdin` / EOF-break / `parse_float` / `yield`), so `Float` pipelines run
+end-to-end: `{ echo "1.5"; echo "2.5" } | lines | parseFloat | square` (with a
+`for (&0)` filter) emits `2.256.25`. Bad input fails with the same single,
+source-located diagnostic as `parseInt` (`cannot parse "x" as Float`,
+`Error.InvalidFloat`). Whole-number results serialize without a decimal point
+(`3.0` → `3`), matching Runic's existing `{}` float formatting.
 
 #### block stages and transport classification
 

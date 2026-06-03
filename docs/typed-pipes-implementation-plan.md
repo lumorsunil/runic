@@ -602,8 +602,8 @@ re-parsing downstream.
   pipelines (e.g. `typed_pipe_parseint_regression`) now route through it.
 - [x] Full suite green: 13 unit, 54 smoke, 13 diagnostics, fmt.
 
-Still future: in-process transport for structured values (arrays/structs), and a
-`parseFloat` builtin to make `Float` pipelines exercisable end-to-end.
+Still future: in-process transport for structured values (arrays/structs).
+(`parseFloat` has since landed — see the `lines` / parse-map work below.)
 
 ### Follow-up: consuming `&0` reads (with EOF)
 

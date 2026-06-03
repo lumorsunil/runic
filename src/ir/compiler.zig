@@ -2769,6 +2769,35 @@ pub const IRCompiler = struct {
         return .fromLocation(ref.dereference().typed(type_expr));
     }
 
+    /// Compiles a parsing pipeline builtin (`parseInt`/`parseFloat`) as a stage
+    /// that *maps* over its stdin stream: it reads each value with
+    /// `collect_stdin`, stops at EOF (`.null`), parses it in place with
+    /// `parse_instr`, and yields the typed result — so it composes with both a
+    /// single value and a framed multi-value stream (e.g. `lines | parseInt`).
+    fn compileParseMapStage(
+        self: *IRCompiler,
+        source: anytype,
+        comptime name: []const u8,
+        parse_instr: ir.Instruction.Type,
+        result_type: ast.TypeExpr,
+    ) Error!void {
+        const value_ref = try self.newRef(source, name ++ "_in");
+        const is_eof_ref = try self.newRef(source, name ++ "_eof");
+        const after_label = try self.newLabel(name ++ "_after", .unknown);
+        const loop_label = try self.newLabel(name ++ "_loop", .abs);
+
+        try self.addInstruction(.init(.from(source), .collect_stdin));
+        try self.set(source, value_ref, .fromLocation(.initRegister(.r)));
+        try self.cmp(source, .equal, .from(value_ref.dereference()), .fromValue(.null), is_eof_ref);
+        try self.jmp(source, try .from(is_eof_ref.dereference()), true, after_label);
+
+        // %r still holds the collected value; parse it in place and yield.
+        try self.addInstruction(.init(.from(source), parse_instr));
+        try self.pipeWrite(source, self.threadStdout(), .fromLocation(ir.Location.initRegister(.r).typed(result_type)));
+        try self.jmp(source, null, true, loop_label);
+        try self.setLabel(after_label.local_addr.label, .abs);
+    }
+
     fn compileIdentifier(
         self: *IRCompiler,
         source: anytype,
@@ -2790,21 +2819,16 @@ pub const IRCompiler = struct {
         if (std.mem.eql(u8, identifier.name, "parseInt") and
             self.lookup(identifier.name, .{ .shallow = false }) == null)
         {
-            const value_ref = try self.newRef(source, "parse_int_in");
-            const is_eof_ref = try self.newRef(source, "parse_int_eof");
-            const after_label = try self.newLabel("parse_int_after", .unknown);
-            const loop_label = try self.newLabel("parse_int_loop", .abs);
+            try self.compileParseMapStage(source, "parse_int", .parse_int, ast.TypeExpr.global(.integer));
+            return .fromValue(.void);
+        }
 
-            try self.addInstruction(.init(.from(source), .collect_stdin));
-            try self.set(source, value_ref, .fromLocation(.initRegister(.r)));
-            try self.cmp(source, .equal, .from(value_ref.dereference()), .fromValue(.null), is_eof_ref);
-            try self.jmp(source, try .from(is_eof_ref.dereference()), true, after_label);
-
-            // %r still holds the collected value; parse it in place and yield.
-            try self.addInstruction(.init(.from(source), .parse_int));
-            try self.pipeWrite(source, self.threadStdout(), .fromLocation(ir.Location.initRegister(.r).typed(ast.TypeExpr.global(.integer))));
-            try self.jmp(source, null, true, loop_label);
-            try self.setLabel(after_label.local_addr.label, .abs);
+        // parseFloat builtin (`fn String parseFloat() Float`): like parseInt but
+        // produces a Float per input value.
+        if (std.mem.eql(u8, identifier.name, "parseFloat") and
+            self.lookup(identifier.name, .{ .shallow = false }) == null)
+        {
+            try self.compileParseMapStage(source, "parse_float", .parse_float, ast.TypeExpr.global(.float));
             return .fromValue(.void);
         }
 
@@ -4235,9 +4259,12 @@ pub const IRCompiler = struct {
             else => stage,
         };
 
-        // The parseInt builtin produces an Int; the lines builtin produces a
-        // framed stream of String values. Both use typed (queue) transport.
-        if (self.isBuiltinStage(stage, "parseInt") or self.isBuiltinStage(stage, "lines")) {
+        // parseInt/parseFloat produce a scalar; lines produces a framed stream
+        // of String values. All use typed (queue) transport.
+        if (self.isBuiltinStage(stage, "parseInt") or
+            self.isBuiltinStage(stage, "parseFloat") or
+            self.isBuiltinStage(stage, "lines"))
+        {
             return .exact_typed;
         }
 
@@ -4274,11 +4301,11 @@ pub const IRCompiler = struct {
             .call => |call| call.callee,
             else => stage,
         };
-        // parseInt maps over its input stream value-by-value, so it accepts a
-        // typed (framed) stream from `lines`. (An executable/byte upstream still
-        // forces the byte path via the upstream's output kind, where parseInt
-        // reads the whole blob as a single value.)
-        if (self.isBuiltinStage(stage, "parseInt")) return .exact_typed;
+        // parseInt/parseFloat map over their input stream value-by-value, so
+        // they accept a typed (framed) stream from `lines`. (An executable/byte
+        // upstream still forces the byte path via the upstream's output kind,
+        // where they read the whole blob as a single value.)
+        if (self.isBuiltinStage(stage, "parseInt") or self.isBuiltinStage(stage, "parseFloat")) return .exact_typed;
         // A block stage declares no stdin type — it adapts to the upstream
         // stage (its `&0` is typed by inference). Treat it as permissive so the
         // upstream's output kind decides the boundary; an executable upstream
@@ -4327,6 +4354,7 @@ pub const IRCompiler = struct {
         };
 
         if (self.isBuiltinStage(stage, "parseInt")) return .global(.integer);
+        if (self.isBuiltinStage(stage, "parseFloat")) return .global(.float);
         // `lines` frames its byte input into per-line String values.
         if (self.isBuiltinStage(stage, "lines")) return string_type;
 

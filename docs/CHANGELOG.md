@@ -15,6 +15,11 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 ### Added
 
 #### Typed pipeline boundaries
+- **`parseFloat` builtin**: `parseFloat` (`fn String parseFloat() Float`) is the
+  `Float` counterpart of `parseInt` — it maps each input value to a `Float`, so
+  `Float` pipelines run end-to-end (`{ echo "1.5"; echo "2.5" } | lines |
+  parseFloat | square` → `2.256.25`). Non-numeric input fails with the same
+  single, source-located diagnostic style (`cannot parse "x" as Float`).
 - **`lines` builtin + per-value `parseInt`**: `lines` (`fn String lines() String`)
   reads its whole byte stdin, splits on `\n`, and emits each non-empty line as a
   separate framed value onto its (typed-queue) stdout — turning a newline-
