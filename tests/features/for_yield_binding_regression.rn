@@ -1,0 +1,21 @@
+// Regression: `yield <binding>` inside a loop body. A bare `yield v` (where `v`
+// is a loop capture) returns a *borrowed* stack reference, not a freshly pushed
+// temporary. `yield` must not pop it — doing so corrupted the frame and, since
+// the loop body is compiled once and re-run, underflowed the compiler's
+// per-iteration ref accounting (an `integer overflow` panic at compile time).
+// This covers the live-stream (`for (&0)`) form; the counted array/range forms
+// hit the same bug and are exercised by the unit/CLI suites.
+
+fn Void produce() Int {
+    yield 10
+    yield 20
+    yield 30
+}
+
+fn Int passthrough() Int {
+    for (&0) |v| {
+        yield v
+    }
+}
+
+produce | passthrough

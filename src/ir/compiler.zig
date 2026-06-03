@@ -1566,9 +1566,19 @@ pub const IRCompiler = struct {
             },
         };
 
+        // Clean up only the temporaries that compiling the yielded value
+        // pushed. A bare `yield v` where `v` is a binding/loop capture returns a
+        // *borrowed* reference and pushes nothing, so there is nothing to pop;
+        // popping it (as the old `consume`'s isStackLocation check did) would
+        // corrupt the stack and, inside a loop, make the body net-pop each
+        // iteration — underflowing the per-iteration ref accounting. Measuring
+        // the frame counter across compilation distinguishes owned temporaries
+        // from borrowed references regardless of where they sit in the frame.
+        const stack_before_value = self.currentFrame().rel_stack_counter;
         const value = try self.compileResultSaveR(source, try self.compileExpression(y.value));
         try self.pipeWrite(source, target, value.source);
-        try self.consume(source, value);
+        const pushed = self.currentFrame().rel_stack_counter -| stack_before_value;
+        for (0..pushed) |_| _ = try self.pop(source);
         return .fromValue(.void);
     }
 

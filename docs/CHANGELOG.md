@@ -80,6 +80,14 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   pipeline expressions report the right value type in assignment contexts.
 
 ### Fixed
+- `yield <binding>` (e.g. `for (&0) |v| { yield v }`, or any `yield v` where `v`
+  is a loop capture or local) no longer crashes the compiler with an
+  `integer overflow` panic. `yield` previously popped its value unconditionally
+  when it looked like a stack location, but a bare binding yields a *borrowed*
+  reference that must not be popped; doing so corrupted the frame and underflowed
+  the loop compilers' per-iteration ref accounting. `yield` now pops only the
+  temporaries that compiling its value actually pushed. Affected all three
+  for-loop forms (live `for (&0)`, counted array, and range).
 - Block pipeline stages carrying a scalar (`{ yield 1; ... } | { yield &0 }`)
   now use in-process typed transport with per-value framing, like named typed
   functions do. Previously a block stage was always classified as a byte stream,
