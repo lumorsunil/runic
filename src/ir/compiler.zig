@@ -4383,27 +4383,110 @@ pub const IRCompiler = struct {
         };
     }
 
+    /// A loop capture in scope during block-stdout inference, mapping the
+    /// capture name to the element type its source iterates (e.g. `i` -> `Int`
+    /// for `for (0..5) |i|`). Needed because a producer block often yields a
+    /// capture (`{ for (0..5) |i| { yield i } }`) that is not yet a compile-time
+    /// binding when the boundary is classified.
+    const InferCapture = struct { name: []const u8, type_expr: ast.TypeExpr };
+
     /// Infers a block stage's stdout type from the first value it `yield`s to
-    /// stdout (`&1`). Returns null when no stdout `yield` is found or its type
-    /// cannot be determined, in which case the caller falls back to the byte
-    /// path. Only confident scalar inferences (`Int`/`Float`) enable typed
-    /// transport; anything else stays null.
+    /// stdout (`&1`), recursing into nested `for`/`while`/`if`/`match`/block
+    /// bodies (a yield inside a loop still determines the block's output type).
+    /// Returns null when no stdout `yield` is found or its type cannot be
+    /// determined, in which case the caller falls back to the byte path.
     fn inferBlockStdoutType(self: *IRCompiler, block: ast.Block) ?ast.TypeExpr {
-        for (block.statements) |statement| {
-            const yield_stmt = switch (statement.*) {
-                .yield_stmt => |y| y,
-                else => continue,
+        return self.findStdoutYieldType(block.statements, &.{});
+    }
+
+    fn findStdoutYieldType(
+        self: *IRCompiler,
+        statements: []const *ast.Statement,
+        captures: []const InferCapture,
+    ) ?ast.TypeExpr {
+        for (statements) |statement| {
+            const found = switch (statement.*) {
+                .yield_stmt => |y| if (y.fd == 1) self.inferYieldValueType(y.value, captures) else null,
+                .expression => |e| self.findStdoutYieldTypeInExpr(e.expression, captures),
+                .while_stmt => |w| self.findStdoutYieldType(w.body.statements, captures),
+                else => null,
             };
-            if (yield_stmt.fd != 1) continue;
-            return self.inferYieldValueType(yield_stmt.value);
+            if (found) |t| return t;
         }
         return null;
     }
 
+    fn findStdoutYieldTypeInExpr(
+        self: *IRCompiler,
+        expr: *ast.Expression,
+        captures: []const InferCapture,
+    ) ?ast.TypeExpr {
+        return switch (expr.*) {
+            .block => |b| self.findStdoutYieldType(b.statements, captures),
+            .for_expr => |f| self.findForBodyYieldType(f, captures),
+            .if_expr => |i| self.findStdoutYieldTypeInIf(i, captures),
+            .match_expr => |m| blk: {
+                for (m.cases) |case| {
+                    if (self.findStdoutYieldType(case.body.statements, captures)) |t| break :blk t;
+                }
+                break :blk null;
+            },
+            else => null,
+        };
+    }
+
+    fn findStdoutYieldTypeInIf(
+        self: *IRCompiler,
+        if_expr: ast.IfExpr,
+        captures: []const InferCapture,
+    ) ?ast.TypeExpr {
+        if (self.findStdoutYieldTypeInExpr(if_expr.then_expr, captures)) |t| return t;
+        const else_branch = if_expr.else_branch orelse return null;
+        return switch (else_branch) {
+            .expr => |e| self.findStdoutYieldTypeInExpr(e, captures),
+            .if_expr => |ei| self.findStdoutYieldTypeInIf(ei.*, captures),
+            .condition => null,
+        };
+    }
+
+    /// Recurses into a `for` body with the loop's captures added to scope, so a
+    /// `yield <capture>` (or arithmetic on one) resolves to the source's element
+    /// type. Only ranges (always `Int`) are resolved for now; other sources
+    /// leave the capture unknown (inference falls back to the byte path).
+    fn findForBodyYieldType(
+        self: *IRCompiler,
+        for_expr: ast.ForExpr,
+        captures: []const InferCapture,
+    ) ?ast.TypeExpr {
+        var buf: [8]InferCapture = undefined;
+        var n: usize = 0;
+        for (captures) |c| {
+            if (n >= buf.len) break;
+            buf[n] = c;
+            n += 1;
+        }
+        const count = @min(for_expr.sources.len, for_expr.capture.bindings.len);
+        for (for_expr.sources[0..count], for_expr.capture.bindings[0..count]) |src, pat| {
+            const elem_type: ast.TypeExpr = switch (src.*) {
+                .range => ast.TypeExpr.global(.integer),
+                else => continue,
+            };
+            const name = switch (pat.*) {
+                .identifier => |id| id.name,
+                else => continue,
+            };
+            if (n >= buf.len) break;
+            buf[n] = .{ .name = name, .type_expr = elem_type };
+            n += 1;
+        }
+        return self.findStdoutYieldTypeInExpr(for_expr.body, buf[0..n]);
+    }
+
     /// Best-effort, pre-compilation type inference for a `yield`ed expression.
     /// Handles the cases that matter for transport classification (literals,
-    /// arithmetic on them, `&0`, and simple bindings); returns null otherwise.
-    fn inferYieldValueType(self: *IRCompiler, expr: *ast.Expression) ?ast.TypeExpr {
+    /// arithmetic on them, `&0`, loop captures, and simple bindings); returns
+    /// null otherwise.
+    fn inferYieldValueType(self: *IRCompiler, expr: *ast.Expression, captures: []const InferCapture) ?ast.TypeExpr {
         return switch (expr.*) {
             .literal => |literal| switch (literal) {
                 .integer => ast.TypeExpr.global(.integer),
@@ -4413,7 +4496,7 @@ pub const IRCompiler = struct {
             },
             // Arithmetic preserves the operand's numeric type.
             .binary => |binary| switch (binary.op) {
-                .add, .subtract, .multiply, .divide, .remainder => self.inferYieldValueType(binary.left),
+                .add, .subtract, .multiply, .divide, .remainder => self.inferYieldValueType(binary.left, captures),
                 else => null,
             },
             // `&0` carries the stage's inferred stdin type (pushed by the
@@ -4422,12 +4505,24 @@ pub const IRCompiler = struct {
                 self.stdin_type_stack.items[self.stdin_type_stack.items.len - 1]
             else
                 null,
-            .identifier => |id| blk: {
-                const binding = self.lookup(id.name, .{ .shallow = false }) orelse break :blk null;
-                break :blk binding.type_expr;
-            },
+            .identifier => |id| self.inferNamedValueType(id.name, captures),
+            // A bare value reference parses as a zero-arg call (`yield i` →
+            // call `i()`). Resolve it like an identifier; a real call (with
+            // args) is left unknown.
+            .call => |call| if (call.arguments.len == 0 and call.callee.* == .identifier)
+                self.inferNamedValueType(call.callee.identifier.name, captures)
+            else
+                null,
             else => null,
         };
+    }
+
+    fn inferNamedValueType(self: *IRCompiler, name: []const u8, captures: []const InferCapture) ?ast.TypeExpr {
+        for (captures) |c| {
+            if (std.mem.eql(u8, c.name, name)) return c.type_expr;
+        }
+        const binding = self.lookup(name, .{ .shallow = false }) orelse return null;
+        return binding.type_expr;
     }
 
     /// Whether the boundary between two stages should use in-process typed

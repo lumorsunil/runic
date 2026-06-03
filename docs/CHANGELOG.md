@@ -102,6 +102,15 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   redundant generic lines are suppressed for this case.
 
 ### Fixed
+- A producer block whose `yield` is nested inside a loop/`if`/`match`
+  (`{ for (0..5) |i| { yield i } } | square`) is now correctly recognized as a
+  scalar stage and gets framed (per-value) typed transport. Previously the
+  stdout-type inference only looked at top-level `yield`s, so the boundary fell
+  back to the byte path: the producer's values were concatenated into one blob
+  and the consumer saw a single value (e.g. `0 1 2 3 4` became `01234` → parsed
+  as `1234`, so `square` returned `1522756` instead of `0 1 4 9 16`). Inference
+  now recurses into nested bodies and resolves loop captures (and the bare
+  `yield i` value, which parses as a zero-arg call).
 - `yield <binding>` (e.g. `for (&0) |v| { yield v }`, or any `yield v` where `v`
   is a loop capture or local) no longer crashes the compiler with an
   `integer overflow` panic. `yield` previously popped its value unconditionally

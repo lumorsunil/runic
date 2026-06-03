@@ -250,11 +250,20 @@ source-located diagnostic as `parseInt` (`cannot parse "x" as Float`,
 A boundary is classified by `classifyBoundary` → `classifyStageOutputKind` /
 `classifyStageInputKind`. Named functions report their kind from the declared
 signature; a **block** stage (`{ ... }`) has no signature, so the output kind is
-inferred from what it `yield`s to `&1` (`inferBlockStdoutType` →
-`inferYieldValueType`, handling literals, arithmetic, `&0`, and bindings) and the
-input kind is treated as permissive (a block adapts its `&0` to the upstream).
-So `{ yield 1; ... } | { yield &0 }` is recognized as an `Int` boundary and gets
+inferred from what it `yield`s to `&1` (`inferBlockStdoutType`) and the input
+kind is treated as permissive (a block adapts its `&0` to the upstream). So
+`{ yield 1; ... } | { yield &0 }` is recognized as an `Int` boundary and gets
 the typed queue path (per-value framing + live reads), the same as
 `producer | consumer` between named typed functions. An executable on either
 side still forces the byte path. When a block's yield type cannot be inferred,
 the boundary falls back to the byte path.
+
+The inference **recurses** into nested `for`/`while`/`if`/`match`/block bodies
+(via `findStdoutYieldType`), so a `yield` inside a loop still determines the
+block's output type — `{ for (0..5) |i| { yield i } }` is an `Int` stage. It
+also tracks the in-scope loop captures (`InferCapture`): a range source iterates
+`Int`, so `yield i` (which parses as a zero-arg call to `i`) and arithmetic on it
+(`yield i * i`) resolve to `Int`. Captures over non-range sources are left
+unknown (byte fallback). `inferYieldValueType` handles literals, numeric
+arithmetic, `&0`, identifiers/zero-arg calls (captures and bindings); anything
+else is unknown.
