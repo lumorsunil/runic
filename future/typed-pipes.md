@@ -121,8 +121,37 @@ rather than the function scope.
 Per-value iteration applies to in-process typed streams (`Int`/`Float`). A
 `String`/byte stream has no message framing, so `collect_stdin` returns the
 whole accumulated buffer on the first read — `for (&0)` over a byte stream runs
-a single iteration with the entire input. Framed `String` streaming is future
-work.
+a single iteration with the entire input. The `lines` builtin (below) frames a
+byte stream into per-line values for explicit per-value processing.
+
+## `lines` — framing a byte stream into per-line values
+
+`lines` (`fn String lines() String`) reads its whole byte stdin, splits on `\n`,
+and emits each non-empty line as a separate value onto its stdout, so a
+downstream `for (&0)` / mapping stage processes one line at a time. The
+`lines → downstream` boundary is forced to the typed (queue) path even though it
+carries `String`s (`boundaryUsesTypedTransport` special-cases `lines`), so each
+line is a distinct framed value rather than re-concatenated bytes.
+
+Implementation: `lines` compiles to `collect_stdin` (read the whole byte blob)
+followed by the `emit_lines` IR instruction, which splits `%r` on `\n` and
+`enqueueTypedPipeValue`s each non-empty line (trimming a trailing `\r`) onto the
+stdout pipe. No compiler-side loop is needed — the split + multi-enqueue happens
+in the one instruction.
+
+`parseInt` now **maps** over its input rather than reading a single value: it
+compiles to an EOF-terminated loop (`collect_stdin`; break on `.null`;
+`parse_int`; `yield`), so it works on a single value (`echo "10" | parseInt`)
+*and* a framed stream (`… | lines | parseInt`, one `Int` per line). Custom
+per-value filters use `for (&0) |v| { ... }`.
+
+So `{ for (0..5) |i| echo i } | lines | parseInt | square` (with
+`square = fn Int square() Int { for (&0) |in| { yield in * in } }`) emits
+`0 1 4 9 16`.
+
+Still future: streaming `lines` (it currently buffers all input before
+splitting, since it waits for the byte stream to close) and other framers /
+delimiters (e.g. split on a custom separator).
 
 ## executable boundary
 

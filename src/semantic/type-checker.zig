@@ -2495,6 +2495,17 @@ const parse_int_fn_type = ast.TypeExpr{ .function = .{
     .span = .global,
 } };
 
+/// Stable storage for the `lines` builtin's function type:
+/// `fn String lines() String` — frames a byte stream into per-line values.
+const lines_byte_type = ast.TypeExpr{ .byte = .{ .span = .global } };
+const lines_string_type = ast.TypeExpr{ .array = .{ .element = &lines_byte_type, .span = .global } };
+const lines_fn_type = ast.TypeExpr{ .function = .{
+    .params = .nonVariadic(&.{}),
+    .stdin_type = &lines_string_type,
+    .return_type = &lines_string_type,
+    .span = .global,
+} };
+
 const global_scope_definitions = [_]Definition{
     .init("Void", GlobalTypes.Void),
     .init("Int", GlobalTypes.Int),
@@ -2509,6 +2520,7 @@ const global_scope_definitions = [_]Definition{
 /// Builtin value bindings (not types) available in every module's global scope.
 const global_value_definitions = [_]Definition{
     .{ .identifier = .{ .name = "parseInt", .span = .global }, .type_expr = &parse_int_fn_type },
+    .{ .identifier = .{ .name = "lines", .span = .global }, .type_expr = &lines_fn_type },
 };
 
 fn addGlobalScope(allocator: std.mem.Allocator, scope: *Scope) !*Scope {

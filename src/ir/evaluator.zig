@@ -1121,6 +1121,26 @@ pub const IREvaluator = struct {
                 thread.private.result_register = .{ .uinteger = parsed };
                 return .cont;
             },
+            .emit_lines => |pipe_location| {
+                // `lines`: frame a byte stream into per-line values. Split the
+                // collected input in %r by '\n' and enqueue each non-empty line
+                // as its own value onto the (typed) stdout pipe, so a downstream
+                // `for (&0)` / mapping stage reads one line at a time. EOF
+                // (`.null`, empty stdin) emits nothing.
+                if (thread.private.result_register == .null) return .cont;
+                const pipe_handle = (try self.resolveLocation(thread, pipe_location)).pipe;
+                var text_writer = std.Io.Writer.Allocating.init(self.allocator);
+                defer text_writer.deinit();
+                try self.materializeString(thread, thread.private.result_register, &text_writer.writer);
+                var it = std.mem.splitScalar(u8, text_writer.written(), '\n');
+                while (it.next()) |line| {
+                    const trimmed = std.mem.trimRight(u8, line, "\r");
+                    if (trimmed.len == 0) continue;
+                    const owned = try self.allocator.dupe(u8, trimmed);
+                    try self.context.enqueueTypedPipeValue(pipe_handle, .{ .zig_string = owned });
+                }
+                return .cont;
+            },
             .fwd_stdio => {
                 const stdin = try self.context.addPipe(self.config.stdin);
                 const stdout = try self.context.addPipe(self.config.stdout);

@@ -517,6 +517,32 @@ all at once. Per-value iteration applies to in-process typed streams
 (`Int`/`Float`); a `String`/byte stream has no message framing, so `for (&0)`
 over one reads the whole accumulated input as a single value (one iteration).
 
+#### Framing a byte stream with `lines`
+
+Executable (and other byte) output is unframed — `&0` over it reads the entire
+buffer at once. The `lines` builtin turns a newline-delimited byte stream into a
+multi-value stream: it reads its whole stdin, splits on `\n`, and emits each
+non-empty line as a separate value. A downstream `for (&0)` filter (or the
+`parseInt` builtin, which maps each input value to an `Int`) then processes one
+line at a time:
+
+```rn
+fn Int square() Int {
+    for (&0) |in| {
+        yield in * in
+    }
+}
+
+// echo prints 0..4 on their own lines; lines frames them; parseInt maps each
+// to an Int; square squares each.
+{ for (0..5) |i| echo i } | lines | parseInt | square   // prints 014916
+```
+
+`parseInt` maps per value, so it works on a single value (`echo "10" | parseInt`)
+or a framed stream (`… | lines | parseInt`). A custom stage that should process
+every value uses the `for (&0) |v| { ... }` form — a stage that reads `&0` once
+(e.g. `const n = &0`) consumes only the first value.
+
 ### Mixed executable and typed-function pipelines
 
 Executable stages and typed Runic functions can be freely mixed. An executable

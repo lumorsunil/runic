@@ -2783,16 +2783,40 @@ pub const IRCompiler = struct {
         }
 
         // parseInt builtin: a pipeline stage with type `fn String parseInt() Int`.
-        // It reads stdin, parses to Int, and yields it to stdout (output is
-        // explicit now that stage values are not auto-pushed). A user-defined
-        // parseInt in scope takes precedence (checked below).
+        // It maps each input value on stdin to an `Int` and yields it, so it
+        // composes with a framed multi-value stream (e.g. `lines | parseInt`)
+        // as well as a single value. Output is explicit (stage values are not
+        // auto-pushed). A user-defined parseInt in scope takes precedence.
         if (std.mem.eql(u8, identifier.name, "parseInt") and
             self.lookup(identifier.name, .{ .shallow = false }) == null)
         {
+            const value_ref = try self.newRef(source, "parse_int_in");
+            const is_eof_ref = try self.newRef(source, "parse_int_eof");
+            const after_label = try self.newLabel("parse_int_after", .unknown);
+            const loop_label = try self.newLabel("parse_int_loop", .abs);
+
             try self.addInstruction(.init(.from(source), .collect_stdin));
+            try self.set(source, value_ref, .fromLocation(.initRegister(.r)));
+            try self.cmp(source, .equal, .from(value_ref.dereference()), .fromValue(.null), is_eof_ref);
+            try self.jmp(source, try .from(is_eof_ref.dereference()), true, after_label);
+
+            // %r still holds the collected value; parse it in place and yield.
             try self.addInstruction(.init(.from(source), .parse_int));
-            const parsed = try self.stabilizeRegisterResult(source, "parse_int_value", .global(.integer));
-            try self.pipeWrite(source, self.threadStdout(), parsed.source);
+            try self.pipeWrite(source, self.threadStdout(), .fromLocation(ir.Location.initRegister(.r).typed(ast.TypeExpr.global(.integer))));
+            try self.jmp(source, null, true, loop_label);
+            try self.setLabel(after_label.local_addr.label, .abs);
+            return .fromValue(.void);
+        }
+
+        // lines builtin (`fn String lines() String`): reads the whole byte
+        // stdin and frames it into per-line values — each non-empty line is
+        // enqueued as a separate value onto the (typed) stdout pipe, so a
+        // downstream `for (&0)` / mapping stage processes one line at a time.
+        if (std.mem.eql(u8, identifier.name, "lines") and
+            self.lookup(identifier.name, .{ .shallow = false }) == null)
+        {
+            try self.addInstruction(.init(.from(source), .collect_stdin));
+            try self.addInstruction(.init(.from(source), .{ .emit_lines = self.threadStdout() }));
             return .fromValue(.void);
         }
 
@@ -4191,6 +4215,18 @@ pub const IRCompiler = struct {
         void_boundary,
     };
 
+    /// Whether `stage` is the unshadowed builtin pipeline stage named `name`
+    /// (e.g. `parseInt`, `lines`), which has no scope binding.
+    fn isBuiltinStage(self: *IRCompiler, stage: *ast.Expression, name: []const u8) bool {
+        const callee = switch (stage.*) {
+            .call => |call| call.callee,
+            else => stage,
+        };
+        return callee.* == .identifier and
+            std.mem.eql(u8, callee.identifier.name, name) and
+            self.lookup(callee.identifier.name, .{ .shallow = false }) == null;
+    }
+
     /// Determine how to connect the given stage to the pipeline at runtime.
     /// Returns the kind of transport that would ideally be used.
     fn classifyStageOutputKind(self: *IRCompiler, stage: *ast.Expression) PipeBoundaryKind {
@@ -4199,11 +4235,9 @@ pub const IRCompiler = struct {
             else => stage,
         };
 
-        // The parseInt builtin produces an Int (it is not a scope binding).
-        if (callee.* == .identifier and
-            std.mem.eql(u8, callee.identifier.name, "parseInt") and
-            self.lookup(callee.identifier.name, .{ .shallow = false }) == null)
-        {
+        // The parseInt builtin produces an Int; the lines builtin produces a
+        // framed stream of String values. Both use typed (queue) transport.
+        if (self.isBuiltinStage(stage, "parseInt") or self.isBuiltinStage(stage, "lines")) {
             return .exact_typed;
         }
 
@@ -4240,6 +4274,11 @@ pub const IRCompiler = struct {
             .call => |call| call.callee,
             else => stage,
         };
+        // parseInt maps over its input stream value-by-value, so it accepts a
+        // typed (framed) stream from `lines`. (An executable/byte upstream still
+        // forces the byte path via the upstream's output kind, where parseInt
+        // reads the whole blob as a single value.)
+        if (self.isBuiltinStage(stage, "parseInt")) return .exact_typed;
         // A block stage declares no stdin type — it adapts to the upstream
         // stage (its `&0` is typed by inference). Treat it as permissive so the
         // upstream's output kind decides the boundary; an executable upstream
@@ -4287,14 +4326,9 @@ pub const IRCompiler = struct {
             else => stage,
         };
 
-        if (callee.* == .identifier) {
-            const name = callee.identifier.name;
-            if (std.mem.eql(u8, name, "parseInt") and
-                self.lookup(name, .{ .shallow = false }) == null)
-            {
-                return .global(.integer);
-            }
-        }
+        if (self.isBuiltinStage(stage, "parseInt")) return .global(.integer);
+        // `lines` frames its byte input into per-line String values.
+        if (self.isBuiltinStage(stage, "lines")) return string_type;
 
         // A block/bare-expression stage has no signature; infer its stdout type
         // from what it `yield`s to stdout (&1), so a `{ yield 1; ... }` producer
@@ -4369,15 +4403,18 @@ pub const IRCompiler = struct {
     }
 
     /// Whether the boundary between two stages should use in-process typed
-    /// transport: an exact boundary carrying a by-value scalar (`Int`/`Float`).
-    /// String/byte boundaries and any boundary touching an executable keep the
-    /// byte-pipe path.
+    /// transport: an exact boundary carrying a by-value scalar (`Int`/`Float`),
+    /// or a `lines` stage's framed per-line String stream. String/byte
+    /// boundaries and any boundary touching an executable keep the byte path.
     fn boundaryUsesTypedTransport(
         self: *IRCompiler,
         upstream: *ast.Expression,
         downstream: *ast.Expression,
     ) bool {
         if (self.classifyBoundary(upstream, downstream) != .exact_typed) return false;
+        // `lines` enqueues each line as a distinct value; the framed stream
+        // needs the typed (queue) path even though it carries String values.
+        if (self.isBuiltinStage(upstream, "lines")) return true;
         const out_type = self.stageStdoutType(upstream) orelse return false;
         return typeExprIsNamed(out_type, "Int") or typeExprIsNamed(out_type, "Float");
     }

@@ -54,15 +54,21 @@
     stdin types parsing)
   - [x] arbitrary typed values (Int) through pipes via canonical-text wire +
     type-directed `&0` parsing
-  - [x] `parseInt` builtin (`fn String parseInt() Int`)
+  - [x] `parseInt` builtin (`fn String parseInt() Int`); maps per input value so
+    it composes with a framed stream (`lines | parseInt`)
+  - [x] `lines` builtin (`fn String lines() String`) — frames a byte stream into
+    per-line values (splits on `\n`, emits each onto a typed queue) so a
+    downstream `for (&0)` / `parseInt` processes one line at a time
   - [ ] `parseFloat` / other parse builtins
+  - [ ] streaming `lines` (currently buffers all input before splitting) and
+    other framers / custom delimiters
   - [x] in-process typed transport for scalars (Int/Float pass between stages
     without text serialize/re-parse; pipe marked `typed`)
   - [x] consuming `&0` reads (each read consumes; EOF after producer closes)
   - [x] multi-value streaming reads (a stage yields N values, downstream reads
     them one at a time as they arrive via `for (&0) |v|` — per-pipe FIFO value
     queue + live blocking reads; covers in-process typed Int/Float streams.
-    String/byte streams still read as a single value — needs message framing)
+    Byte streams are framed explicitly with the `lines` builtin)
   - [ ] in-process transport for structured values (arrays/structs)
 - [x] exit code
 - [ ] remaining function/runtime gaps

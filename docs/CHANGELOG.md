@@ -15,6 +15,16 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 ### Added
 
 #### Typed pipeline boundaries
+- **`lines` builtin + per-value `parseInt`**: `lines` (`fn String lines() String`)
+  reads its whole byte stdin, splits on `\n`, and emits each non-empty line as a
+  separate framed value onto its (typed-queue) stdout — turning a newline-
+  delimited byte stream into a multi-value stream. `parseInt` now *maps* over its
+  input (one `Int` per input value) instead of reading a single value, so it
+  composes with a framed stream. Combined with a `for (&0)` filter, a whole
+  stream flows through the pipeline: `{ for (0..5) |i| echo i } | lines |
+  parseInt | square` (where `square` is `fn Int square() Int { for (&0) |in| {
+  yield in * in } }`) emits `0 1 4 9 16`. Custom per-value filters use the
+  `for (&0) |v| { ... }` form.
 - **File-descriptor stream syntax (`&0`/`&1`/`&2`)**: the three standard streams
   are referenced with `&0` (stdin), `&1` (stdout), `&2` (stderr). `&0` is a value
   expression that reads stdin (replacing the previous `@stdin`); `&1`/`&2` are
