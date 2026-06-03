@@ -237,12 +237,14 @@ for (fruits, 0..) |fruit, idx| {
 
 **Result:** Iteration works uniformly across arrays and ranges without manual indexing, and the capture clause makes loop variables explicit without leaking bindings outside the block.
 
-A `for` body does not have to be a block. It may be a bare expression or a single
-`yield`/`return`/`exit` statement, which avoids `{ }` for one-line loops:
+A `for` or `if`/`else` body does not have to be a block. It may be a bare
+expression or a single `yield`/`return`/`exit` statement, which avoids `{ }` for
+one-liners:
 
 ```rn
-for (0..3) |i| echo "${i}"          // bare command
-{ for (0..5) |i| yield i } | square // bare yield as a pipeline producer
+for (0..3) |i| echo "${i}"           // bare command
+{ for (0..5) |i| yield i } | square  // bare yield as a pipeline producer
+if (ready) yield value else yield 0  // bare branches
 ```
 
 ## Command vs. expression separation

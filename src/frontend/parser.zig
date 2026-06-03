@@ -1600,7 +1600,7 @@ pub const Parser = struct {
             condition = try self.rewriteBareIdentifierCallForIfCapture(condition);
         }
         // const then_block = try self.parseBlock();
-        const then_expr = try self.parseExpression();
+        const then_expr = try self.parseControlFlowBody();
 
         var else_branch: ?ast.IfExpr.ElseBranch = null;
         var end_span = then_expr.span();
@@ -1618,7 +1618,7 @@ pub const Parser = struct {
                 end_span = nested_if.span;
                 else_branch = .{ .if_expr = nested_if };
             } else {
-                const else_expr = try self.parseExpression();
+                const else_expr = try self.parseControlFlowBody();
                 end_span = else_expr.span();
                 else_branch = .{ .expr = else_expr };
             }

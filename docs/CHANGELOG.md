@@ -95,11 +95,11 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   pipeline expressions report the right value type in assignment contexts.
 
 ### Changed
-- A `for` loop body may now be a bare statement without `{ }` — a single
-  `yield`/`return`/`exit` (in addition to a bare expression, which already
-  worked) is allowed directly: `for (&0) |in| yield in * in`. A single such
-  statement is desugared into a one-statement block. (`if`/`while` bodies still
-  require `{ }` for statements.)
+- A `for` loop and `if`/`else` body may now be a bare statement without `{ }` —
+  a single `yield`/`return`/`exit` (in addition to a bare expression, which
+  already worked) is allowed directly: `for (&0) |in| yield in * in`,
+  `if (cond) yield a else yield b`. A single such statement is desugared into a
+  one-statement block. (`while` is not yet parsed at all, so it is unaffected.)
 - `parseInt` (and an `Int`-typed `&0`) on non-numeric input now fails with a
   single, source-located diagnostic naming the offending value —
   `[error]: <file>:<line>:<col>: cannot parse "abc" as Int` — instead of dumping
