@@ -290,13 +290,16 @@ echo "${async_proc.stdout}"
 Runic supports explicit stdout/stderr redirects for commands and preserves shell-style left-to-right redirect ordering when fd duplication is involved.
 
 ```rn
-echo "saved output" 1>"out.log"
+echo "out" > "out.log"      // truncate stdout to a file
+echo "more" >> "out.log"    // append stdout to a file
 echo "saved error" 2>"err.log"
 
 echo "hello" 1>&2 2>"/dev/null"
 ```
 
-**Result:** `1>...` redirects stdout, `2>...` redirects stderr, and `1>&2` duplicates stdout onto the current stderr target. Because redirects are applied left to right, `echo "hello" 1>&2 2>"/dev/null"` still writes `hello` to the original stderr stream instead of discarding it.
+**Result:** `>` / `>>` redirect stdout (truncate / append), `2>...` redirects stderr, and `1>&2` duplicates stdout onto the current stderr target. Because redirects are applied left to right, `echo "hello" 1>&2 2>"/dev/null"` still writes `hello` to the original stderr stream instead of discarding it. A Runic function call can be redirected like any command — `myFn > "file"` sends the function's stdout to a file.
+
+**`>` is overloaded.** Since `>` is also the greater-than operator, Runic resolves it by the left operand: a **command** (an external executable call, a function call, a block, or a subshell) makes `>` an output redirect, while a **value** makes it the comparison. So `echo "x" > "f"` and `myFn > "f"` redirect, but `n > 2` and `count > limit` compare. `>>` and `>&` are always redirects. To compare a function's return value instead of redirecting it, bind it first: `const r = myFn; if (r > 2) ...`.
 
 ## Error-aware pipelines
 
@@ -370,6 +373,9 @@ echo "${math.exit_code}"
 **Result:** Importing a module runs it, exposes its `pub` declarations, and also leaves the module execution result available for inspection.
 
 ## Typed pipeline boundaries
+
+> See [`examples/typed_pipelines.rn`](../examples/typed_pipelines.rn) for a
+> runnable tour of this section (`zig build run -- examples/typed_pipelines.rn`).
 
 Function signatures carry explicit stdin and stdout types using the form
 `fn StdinType name(params) StdoutType`. The pipe operator `|` enforces that the
