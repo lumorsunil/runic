@@ -112,16 +112,15 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   parsed as "redirect `n` to a file named `2`", so the condition was the value
   `n` and the runtime panicked (`access of union field 'exit_code' while field
   'uinteger' is active`). The parser now leaves `>` as an unresolved
-  `.binary{.greater}` and the IR compiler decides from the **left operand**: an
-  external command (an executable call, block, or subshell) makes it an output
-  redirect; anything else — values and in-scope function calls — makes it the
-  greater-than comparison. So `echo "x" > "f"` redirects, while `n > 2`,
-  `count > limit`, and `produce > 2` compare, in any context (condition, binding
-  RHS, `yield`/`return` value, …). `>>` and `>&` are unaffected (they have no
-  comparison meaning and always redirect). A Runic *function* call counts as a
-  command too, so `myFn > "file"` redirects the function's stdout (truncate) and
-  `myFn >> "file"` appends; to compare a function's return value instead, bind
-  it first (`const r = myFn; if (r > 2) ...`).
+  `.binary{.greater}` and the IR compiler decides from the **left operand**: a
+  command (an external executable call, a Runic function call, a block, or a
+  subshell) makes it an output redirect; a value or an in-scope value binding
+  makes it the greater-than comparison. So `echo "x" > "f"` and `myFn > "file"`
+  redirect, while `n > 2` and `count > limit` compare, in any context
+  (condition, binding RHS, `yield`/`return` value, …). `>>` and `>&` are
+  unaffected (they have no comparison meaning and always redirect). To compare a
+  function's return value instead of redirecting it, bind it first
+  (`const r = myFn; if (r > 2) ...`).
 - A producer block whose `yield` is nested inside a loop/`if`/`match`
   (`{ for (0..5) |i| { yield i } } | square`) is now correctly recognized as a
   scalar stage and gets framed (per-value) typed transport. Previously the
