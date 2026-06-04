@@ -12,6 +12,10 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.2.0] — 2026-06-04
+
 > The **typed pipes** work below is summarized narratively in
 > [typed-pipes-update.md](./typed-pipes-update.md).
 

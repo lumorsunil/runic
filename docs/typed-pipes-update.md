@@ -1,5 +1,7 @@
 # Typed pipes — update summary
 
+_Shipped in **0.2.0**._
+
 This document is a narrative overview of the **typed pipes** work. It complements
 the per-change list in [`CHANGELOG.md`](./CHANGELOG.md), the language-surface
 reference in [`features.md`](./features.md), and the design/implementation notes
