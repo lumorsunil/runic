@@ -803,6 +803,20 @@ pub const Parser = struct {
                             });
                             continue;
                         },
+                        .fd => {
+                            const breadcrumbInner = try self.createBreadcrumb("PBE:fd");
+                            defer breadcrumbInner.end();
+                            _ = try self.nextToken();
+                            try components.append(self.allocator, .{
+                                .expr = try self.allocExpression(.{
+                                    .fd = .{
+                                        .fd = next.lexeme[1] - '0',
+                                        .span = next.span,
+                                    },
+                                }),
+                            });
+                            continue;
+                        },
                         .question => {
                             if (components.items.len == 0 or components.items[components.items.len - 1] != .op or components.items[components.items.len - 1].op.payload != .member) {
                                 try self.reportParseError(Error.UnexpectedToken, next.span, "expected value, actual: {t}", .{next.tag});
@@ -986,11 +1000,16 @@ pub const Parser = struct {
                     },
                 },
             },
-            .greater, .append_redirect, .fd_source_truncate_redirect, .fd_source_append_redirect => redirect: {
+            // Note: `.greater` (`>`) is intentionally NOT folded here. It is
+            // ambiguous with the greater-than comparison, so it stays a
+            // `.binary{.greater}` and the IR compiler decides — based on whether
+            // the left operand is a command — whether it is a redirect or a
+            // comparison. The explicit redirect operators below are never
+            // comparisons, so they always fold.
+            .append_redirect, .fd_source_truncate_redirect, .fd_source_append_redirect => redirect: {
                 const mode: ast.RedirectionMode = switch (binary.binary.op) {
                     .fd_source_truncate_redirect => .truncate,
                     .fd_source_append_redirect => .append,
-                    .greater => .truncate,
                     .append_redirect => .append,
                     else => unreachable,
                 };
@@ -1586,7 +1605,7 @@ pub const Parser = struct {
             condition = try self.rewriteBareIdentifierCallForIfCapture(condition);
         }
         // const then_block = try self.parseBlock();
-        const then_expr = try self.parseExpression();
+        const then_expr = try self.parseControlFlowBody();
 
         var else_branch: ?ast.IfExpr.ElseBranch = null;
         var end_span = then_expr.span();
@@ -1604,7 +1623,7 @@ pub const Parser = struct {
                 end_span = nested_if.span;
                 else_branch = .{ .if_expr = nested_if };
             } else {
-                const else_expr = try self.parseExpression();
+                const else_expr = try self.parseControlFlowBody();
                 end_span = else_expr.span();
                 else_branch = .{ .expr = else_expr };
             }
@@ -1648,7 +1667,7 @@ pub const Parser = struct {
 
         if (capture.bindings.len != sources.len) return Error.ForCapturesMustMatchSources;
 
-        const body = try self.parseExpression();
+        const body = try self.parseControlFlowBody();
 
         return self.allocExpression(.{
             .for_expr = .{
@@ -1658,6 +1677,45 @@ pub const Parser = struct {
                 .span = for_tok.span.endAt(body.span()),
             },
         });
+    }
+
+    /// Parses the body of a control-flow construct (e.g. a `for` loop). The body
+    /// may be a block (`{ ... }`) or a bare expression (`echo "${i}"`) — both
+    /// handled by `parseExpression` — or a single bare statement such as
+    /// `yield`/`return`/`exit`, which is desugared into a one-statement block so
+    /// the construct is not forced to wrap a single statement in `{ }`.
+    fn parseControlFlowBody(self: *Self) Error!*ast.Expression {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const next = try self.peekToken();
+        const stmt: *ast.Statement = switch (next.tag) {
+            .kw_yield, .kw_return, .kw_exit => try self.parseSingleBodyStatement(),
+            else => return self.parseExpression(),
+        };
+
+        const statements = try self.arena.allocator().alloc(*ast.Statement, 1);
+        statements[0] = stmt;
+        return self.allocExpression(.{ .block = ast.Block{
+            .statements = statements,
+            .span = stmt.span(),
+        } });
+    }
+
+    /// Parses a single `yield`/`return`/`exit` statement for use as a bare
+    /// control-flow body. The caller guarantees the next token is one of these.
+    fn parseSingleBodyStatement(self: *Self) Error!*ast.Statement {
+        const stmt = try self.arena.allocator().create(ast.Statement);
+        if (try self.parseMaybeYield()) |yield_stmt| {
+            stmt.* = .{ .yield_stmt = yield_stmt };
+        } else if (try self.parseMaybeReturn()) |return_stmt| {
+            stmt.* = .{ .return_stmt = return_stmt };
+        } else if (try self.parseMaybeExit()) |exit_stmt| {
+            stmt.* = .{ .exit_stmt = exit_stmt };
+        } else {
+            unreachable;
+        }
+        return stmt;
     }
 
     fn parseMatchExpression(self: *Self) Error!*ast.Expression {
@@ -2163,6 +2221,11 @@ pub const Parser = struct {
             return stmt;
         }
 
+        if (try self.parseMaybeYield()) |yield_stmt| {
+            stmt.* = .{ .yield_stmt = yield_stmt };
+            return stmt;
+        }
+
         const expr = try self.parseExpression();
         if (try self.stream.consumeIf(.amp)) {
             try self.markExpressionBackground(expr);
@@ -2269,6 +2332,12 @@ pub const Parser = struct {
                     },
                 });
             },
+            .fd => self.allocExpression(.{
+                .fd = .{
+                    .fd = tok.lexeme[1] - '0',
+                    .span = tok.span,
+                },
+            }),
             .kw_null => self.allocExpression(.{
                 .literal = .{ .null = .{ .span = tok.span } },
             }),
@@ -2670,6 +2739,42 @@ pub const Parser = struct {
         return switch (next.tag) {
             .kw_exit => try self.parseExit(),
             else => null,
+        };
+    }
+
+    fn parseMaybeYield(self: *Self) Error!?ast.YieldStmt {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const next = try self.peekToken();
+        return switch (next.tag) {
+            .kw_yield => try self.parseYield(),
+            else => null,
+        };
+    }
+
+    fn parseYield(self: *Self) Error!ast.YieldStmt {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const start = try self.expectTokenTag(.kw_yield);
+
+        // Optional target fd: `yield &2 expr` writes to stderr. A leading `&1`
+        // or `&2` is the target; `&0` is read as the value (you cannot yield to
+        // stdin), so it is left for parseExpression.
+        var fd: u8 = 1;
+        const next = try self.peekToken();
+        if (next.tag == .fd and (next.lexeme[1] == '1' or next.lexeme[1] == '2')) {
+            _ = try self.nextToken();
+            fd = next.lexeme[1] - '0';
+        }
+
+        const value = try self.parseExpression();
+
+        return .{
+            .value = value,
+            .fd = fd,
+            .span = start.span.endAt(value.span()),
         };
     }
 

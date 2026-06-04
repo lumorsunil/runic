@@ -1,0 +1,6 @@
+[error]: tests/diagnostics/void_stdout_to_string_stdin.rn:4:13: pipeline type mismatch: upstream stdout is Void, downstream stdin expects String
+   2:fn String need_string() String cat
+   3:
+   4:make_void | need_string
+   5:
+

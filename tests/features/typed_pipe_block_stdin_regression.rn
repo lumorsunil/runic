@@ -1,0 +1,13 @@
+// &0 is usable from inside block expressions, not just directly in a
+// function body. A binding declared in a nested block is visible to the
+// enclosing function.
+
+fn Int process() Int {
+    const doubled = {
+        const n = &0
+        n * 2
+    }
+    yield doubled
+}
+
+echo "21" | parseInt | process

@@ -1,0 +1,13 @@
+// A producer block whose `yield` is nested inside a loop
+// (`{ for (0..5) |i| { yield i } }`) must still be recognized as an Int stage
+// so its values are framed (each yielded value a distinct typed-queue entry),
+// not concatenated into one byte blob. The downstream filter squares each
+// value: framed -> 0,1,4,9,16 ("014916"); the old byte path concatenated
+// "01234" and parsed it as a single 1234, squaring once to 1522756.
+fn Int square() Int {
+    for (&0) |in| {
+        yield in * in
+    }
+}
+
+{ for (0..5) |i| { yield i } } | square

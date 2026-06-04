@@ -1,0 +1,10 @@
+// A pipeline stage that consumes its input without `yield`ing produces no
+// stdout output (previously the stage value was auto-pushed). Only the trailing
+// echo prints.
+
+fn Int consume() Void {
+    const n = &0
+}
+
+echo "3" | parseInt | consume
+echo "after"

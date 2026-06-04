@@ -1,0 +1,14 @@
+// `>` is overloaded by its left operand: a command (external executable, block,
+// or subshell) on the left makes it an output redirect; a value or in-scope
+// binding makes it the greater-than comparison. So these all compare, in any
+// context (condition, binding RHS, loop body). (`>>` and `>&` always redirect;
+// `>=`/`<`/`<=` are always comparisons.)
+const a = 7
+const b = 3
+
+if (a > b) echo "a-greater" else echo "a-not-greater"
+
+const c = b > a
+if (c) echo "c-true" else echo "c-false"
+
+for (1..4) |i| if (i > 2) echo "hi-${i}" else echo "lo-${i}"

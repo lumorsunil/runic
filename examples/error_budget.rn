@@ -1,0 +1,27 @@
+// error_budget.rn — an SRE error-budget monitor built from typed pipeline stages.
+//
+// Each deploy window allows a fixed number of errors. This counts the ERROR
+// lines in today's service log and reports how much of that budget is left.
+// Every stage declares the type it consumes and produces, so the compiler
+// rejects the pipeline if the data shape drifts.
+
+const ERROR_BUDGET = 50
+
+// String in (the count text from `grep -c`) -> Int out: errors still allowed.
+fn Int remaining_budget() Int {
+    yield ERROR_BUDGET - &0
+}
+
+// Int in -> String out: render a human-readable status line.
+fn Int format_report() String {
+    const left = &0
+    yield "error budget: ${left}/${ERROR_BUDGET} remaining"
+}
+
+// In production: `cat "/var/log/app/today.log"`. Inlined here to stay runnable.
+const sample_log = "GET /  200\nGET /x ERROR\nPOST /y 201\nGET /z ERROR\nERROR db timeout\n"
+
+// extract --------> parse -------> compute --------> render
+//   grep -c          parseInt       remaining         format
+//   (exec → String)  (String→Int)   (Int → Int)       (Int → String)
+printf "${sample_log}" | grep "-c" "ERROR" | parseInt | remaining_budget | format_report

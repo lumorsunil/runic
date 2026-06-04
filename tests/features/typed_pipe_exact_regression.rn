@@ -1,0 +1,4 @@
+fn Void produce() String echo "typed pipe exact"
+fn String passthrough() String cat
+
+produce | passthrough

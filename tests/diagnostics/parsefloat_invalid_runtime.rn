@@ -1,0 +1,3 @@
+// Runtime diagnostic: parseFloat on non-numeric input names the offending value
+// and source location, then aborts with a single clean message.
+echo "xyz" | parseFloat | { for (&0) |x| { yield x } }

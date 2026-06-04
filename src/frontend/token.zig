@@ -165,6 +165,7 @@ pub const Tag = enum {
     kw_match,
     kw_return,
     kw_exit,
+    kw_yield,
 
     // Module/interop keywords
     /// Module import keyword.
@@ -196,6 +197,8 @@ pub const Tag = enum {
     caret,
     amp,
     amp_amp,
+    /// File-descriptor reference: `&0` (stdin), `&1` (stdout), `&2` (stderr).
+    fd,
     kw_and,
     /// Stage separator for pipelines.
     pipe,
@@ -252,6 +255,7 @@ pub const Tag = enum {
             .kw_match => "match",
             .kw_return => "return",
             .kw_exit => "exit",
+            .kw_yield => "yield",
             .kw_import => "import",
             .kw_try => "try",
             .kw_catch => "catch",
@@ -294,6 +298,7 @@ const keyword_map = std.StaticStringMap(Tag).initComptime(.{
     .{ "match", .kw_match },
     .{ "return", .kw_return },
     .{ "exit", .kw_exit },
+    .{ "yield", .kw_yield },
     .{ "import", .kw_import },
     .{ "try", .kw_try },
     .{ "catch", .kw_catch },

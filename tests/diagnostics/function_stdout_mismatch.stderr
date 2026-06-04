@@ -1,0 +1,8 @@
+[error]: tests/diagnostics/function_stdout_mismatch.rn:2:5: yield type mismatch: function yields []Byte, but declared stdout type is Int
+   1:fn Void bad() Int {
+   2:    yield "not an int"
+   3:}
+   4:
+   5:bad
+   6:
+

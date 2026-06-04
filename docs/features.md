@@ -237,6 +237,16 @@ for (fruits, 0..) |fruit, idx| {
 
 **Result:** Iteration works uniformly across arrays and ranges without manual indexing, and the capture clause makes loop variables explicit without leaking bindings outside the block.
 
+A `for` or `if`/`else` body does not have to be a block. It may be a bare
+expression or a single `yield`/`return`/`exit` statement, which avoids `{ }` for
+one-liners:
+
+```rn
+for (0..3) |i| echo "${i}"           // bare command
+{ for (0..5) |i| yield i } | square  // bare yield as a pipeline producer
+if (ready) yield value else yield 0  // bare branches
+```
+
 ## Command vs. expression separation
 
 Runic distinguishes between invoking external commands and evaluating expressions, reducing quoting issues by making intent explicit.
@@ -280,13 +290,16 @@ echo "${async_proc.stdout}"
 Runic supports explicit stdout/stderr redirects for commands and preserves shell-style left-to-right redirect ordering when fd duplication is involved.
 
 ```rn
-echo "saved output" 1>"out.log"
+echo "out" > "out.log"      // truncate stdout to a file
+echo "more" >> "out.log"    // append stdout to a file
 echo "saved error" 2>"err.log"
 
 echo "hello" 1>&2 2>"/dev/null"
 ```
 
-**Result:** `1>...` redirects stdout, `2>...` redirects stderr, and `1>&2` duplicates stdout onto the current stderr target. Because redirects are applied left to right, `echo "hello" 1>&2 2>"/dev/null"` still writes `hello` to the original stderr stream instead of discarding it.
+**Result:** `>` / `>>` redirect stdout (truncate / append), `2>...` redirects stderr, and `1>&2` duplicates stdout onto the current stderr target. Because redirects are applied left to right, `echo "hello" 1>&2 2>"/dev/null"` still writes `hello` to the original stderr stream instead of discarding it. A Runic function call can be redirected like any command — `myFn > "file"` sends the function's stdout to a file.
+
+**`>` is overloaded.** Since `>` is also the greater-than operator, Runic resolves it by the left operand: a **command** (an external executable call, a function call, a block, or a subshell) makes `>` an output redirect, while a **value** makes it the comparison. So `echo "x" > "f"` and `myFn > "f"` redirect, but `n > 2` and `count > limit` compare. `>>` and `>&` are always redirects. To compare a function's return value instead of redirecting it, bind it first: `const r = myFn; if (r > 2) ...`.
 
 ## Error-aware pipelines
 
@@ -359,6 +372,298 @@ echo "${math.exit_code}"
 
 **Result:** Importing a module runs it, exposes its `pub` declarations, and also leaves the module execution result available for inspection.
 
+## Typed pipeline boundaries
+
+> See [`examples/typed_pipelines.rn`](../examples/typed_pipelines.rn) for a
+> runnable tour of this section (`zig build run -- examples/typed_pipelines.rn`).
+
+Function signatures carry explicit stdin and stdout types using the form
+`fn StdinType name(params) StdoutType`. The pipe operator `|` enforces that the
+upstream stdout type matches the downstream stdin type at every boundary. A
+mismatch is a compile-time error.
+
+```rn
+fn Void produce() String echo "typed output"
+fn String passthrough() String cat
+
+produce | passthrough
+```
+
+**Result:** `produce` outputs `String` to stdout; `passthrough` accepts `String`
+on stdin and forwards it. The type checker validates that these types align
+before the script runs.
+
+### Standard streams: `&0`, `&1`, `&2`
+
+The three standard streams are referenced with file-descriptor syntax: `&0`
+(stdin), `&1` (stdout), `&2` (stderr).
+
+- `&0` is a value expression that reads the function's (or stage's) stdin.
+- `&1` / `&2` are write streams; you write to them with `yield` (see below).
+
+### `yield` — pushing values to a stream
+
+Output is explicit. `yield expr` writes a value to stdout (`&1`); `yield &2 expr`
+writes to stderr. A function's `return`/body value is **not** automatically
+written to stdout, so a stage that consumes its input without `yield`ing
+produces no stdout output.
+
+```rn
+fn Int square() Int {
+    yield &0 * &0
+}
+
+echo "4" | parseInt | square   // prints 16
+```
+
+The declared stdout type constrains what may be `yield`ed to `&1` — `yield "text"`
+in an `Int`-stdout function is a compile-time error. (`yield &2` carries untyped
+diagnostic output and is not constrained.) A function may `yield` zero or more
+times; `return` is for control flow / the function's exit value and no longer
+carries output:
+
+```rn
+fn Int consume() Void {
+    const n = &0
+    // no yield: this stage produces no stdout output
+}
+
+echo "3" | parseInt | consume   // prints nothing
+```
+
+```rn
+fn Int tee() Int {
+    const n = &0
+    yield &2 "log: received ${n}"   // diagnostic, goes to stderr
+    yield n * 10                    // result, goes to stdout
+}
+```
+
+A stage that `yield`s more than once emits each value as it happens (streamed,
+not buffered to the end), so one input value can produce several outputs:
+
+```rn
+// one input (6) -> two outputs: 36 now, 12 after the sleep
+echo "6" | parseInt | {
+    const in = &0
+    yield in * in
+    sleep "2"
+    yield in + in
+}
+```
+
+Commands inside a function body (like `echo`) still write to stdout directly —
+that is independent of `yield`:
+
+```rn
+fn Void greet(name: String) String {
+    echo "Hello, ${name}!"   // echo writes to stdout itself
+}
+```
+
+### `&0` — reading typed stdin as a value
+
+Inside a function body with a typed stdin, `&0` reads the function's stdin pipe
+and returns it as a value. This lets you process pipeline input with pure Runic
+expressions instead of relying on executables like `cat`.
+
+```rn
+fn Void produce() String {
+    yield "hello from pipe"
+}
+
+fn String transform() String {
+    const received = &0
+    yield "${received}!"
+}
+
+produce | transform
+```
+
+**Result:** Prints `hello from pipe!`. `produce` yields the string directly
+(no process involved), `transform` collects it via `&0` and yields it with
+`"!"` appended.
+
+The `&0` value has the type declared in the function's stdin position. Using
+it in a function that has `Void` stdin would be a type error.
+
+`&0` is a **consuming** read: each read takes the next value off the input
+stream. To use a value more than once, bind it with `const` — `&0 * &0` would
+read *two* values, but `const n = &0; n * n` reads one and reuses it. Once the
+producer has closed, reading `&0` again yields EOF, and `yield`ing an EOF value
+emits nothing:
+
+```rn
+fn Int consume_once() Int {
+    yield &0    // emits the value
+    yield &0    // EOF: the producer is closed, so this emits nothing
+}
+
+echo "7" | parseInt | consume_once   // prints 7
+```
+
+#### Consuming a live stream with `for (&0)`
+
+When the upstream stage `yield`s many values over its lifetime, the downstream
+stage drains them with a `for` loop over `&0`. Each iteration reads the next
+value off the live stream (blocking the stage until a value arrives or the
+producer closes), so a consumer transforms an unbounded number of values
+without knowing the count ahead of time. The producer closing its stdout is
+reported as EOF, which ends the loop:
+
+```rn
+fn Void produce() Int {
+    yield 1
+    yield 2
+    yield 3
+}
+
+fn Int double_each() Int {
+    for (&0) |v| {
+        yield v * 2
+    }
+}
+
+produce | double_each   // prints 246 (2, 4, 6 as they arrive)
+```
+
+Each value is delivered as the producer emits it — if `produce` slept between
+yields, `double_each` would emit each result with the same spacing rather than
+all at once. Per-value iteration applies to in-process typed streams
+(`Int`/`Float`); a `String`/byte stream has no message framing, so `for (&0)`
+over one reads the whole accumulated input as a single value (one iteration).
+
+#### Framing a byte stream with `lines`
+
+Executable (and other byte) output is unframed — `&0` over it reads the entire
+buffer at once. The `lines` builtin turns a newline-delimited byte stream into a
+multi-value stream: it reads its whole stdin, splits on `\n`, and emits each
+non-empty line as a separate value. A downstream `for (&0)` filter (or the
+`parseInt` builtin, which maps each input value to an `Int`) then processes one
+line at a time:
+
+```rn
+fn Int square() Int {
+    for (&0) |in| {
+        yield in * in
+    }
+}
+
+// echo prints 0..4 on their own lines; lines frames them; parseInt maps each
+// to an Int; square squares each.
+{ for (0..5) |i| echo i } | lines | parseInt | square   // prints 014916
+```
+
+`parseInt` maps per value, so it works on a single value (`echo "10" | parseInt`)
+or a framed stream (`… | lines | parseInt`). `parseFloat`
+(`fn String parseFloat() Float`) is the `Float` counterpart and behaves the same
+way. A custom stage that should process every value uses the `for (&0) |v| {
+... }` form — a stage that reads `&0` once (e.g. `const n = &0`) consumes only
+the first value.
+
+### Mixed executable and typed-function pipelines
+
+Executable stages and typed Runic functions can be freely mixed. An executable
+that precedes a typed function must match the function's declared stdin type
+(which must be `String`, since executables always output bytes):
+
+```rn
+fn String process() String {
+    const input = &0
+    yield "${input}!"
+}
+
+// executable output → typed function via &0
+echo "exec input" | process
+```
+
+Multi-stage pipelines work in all combinations:
+
+```rn
+fn Void source() String { yield "pipeline" }
+fn String middle() String { const s = &0; yield "typed ${s}" }
+
+// typed fn → typed fn → executable
+source | middle | cat
+```
+
+### Non-string typed values and `parseInt`
+
+Pipelines are not limited to strings. A function whose stdin type is `Int`
+receives `&0` already parsed into an `Int`, so it can do arithmetic on it
+directly. The `parseInt` builtin bridges a `String` stage to an `Int` stage,
+making the type transition explicit:
+
+```rn
+fn Int doubler() Int {
+    yield &0 * 2
+}
+
+fn Int inc() Int {
+    yield &0 + 1
+}
+
+// String → parseInt → Int → Int : prints 21
+echo "10" | parseInt | doubler | inc
+```
+
+**Result:** `echo "10"` produces the text `10`; `parseInt` asserts it as an
+`Int`; `doubler` reads `&0` as `10` and yields `20`; `inc` yields `21`.
+Numeric values travel between stages as their canonical decimal text, and each
+stage's declared type drives how the bytes are interpreted. `parseInt` has the
+type `fn String parseInt() Int`, so a following stage must declare `Int` stdin —
+feeding its output into a `String` stage is a compile-time mismatch.
+
+### Optional coercion at pipe boundaries
+
+A stage that outputs `T` can feed a downstream stage whose stdin is `?T`. The
+value flows through unchanged and the downstream sees it as the non-null case,
+so `&0 orelse "default"` reads the piped value when present:
+
+```rn
+fn Void produce() String {
+    yield "coerced value"
+}
+
+fn ?String consume() String {
+    const received = &0 orelse "fallback"
+    yield "${received}"
+}
+
+produce | consume
+```
+
+**Result:** Prints `coerced value`. The `?String` stdin of `consume` accepts the
+`String` produced upstream (a `T → ?T` coercion), and `&0` is typed as
+`?String` so the `orelse` fallback type-checks.
+
+### Void boundaries and rejected mismatches
+
+A `Void` stdin type means the function does not read from the pipeline; a `Void`
+stdout type means nothing is written. Connecting a stage with `Void` output to a
+stage that expects a non-`Void` input is rejected:
+
+```rn
+fn Void make_void() Void {}
+fn String need_string() String cat
+
+// rejected: upstream stdout is Void, downstream stdin expects String
+make_void | need_string
+```
+
+The type checker also enforces that calls made inside a function body are
+compatible with the enclosing function's declared stdin type. Calling a function
+with a different stdin contract from within another function is an error:
+
+```rn
+fn Void hello() String echo "hello"
+// rejected: greetings declares String stdin but calls hello which expects Void stdin
+fn String greetings() String hello
+```
+
+External executables use the catch-all boundary `fn String @(...String) ExecutionResult`,
+so a typed function that follows an executable stage must declare `String` stdin.
+
 ## Structs
 
 Structs are a collection of fields, each with their own type.
@@ -389,7 +694,7 @@ fn Void add(x: Float, y: Float) Float {
 
 const lib = import("lib")
 
-echo "${lib.add(3, 5)}"
+echo "${lib.add 3 5}"
 ```
 
 **Result:** `lib.rn` will become a struct type with a function `add` declared on it. `main.rn` is importing `lib.rn` and binding it to the identifier `lib`. `lib` is of the type `struct { fn add(x: Float, y: Float) }`.

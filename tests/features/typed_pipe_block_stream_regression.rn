@@ -1,0 +1,11 @@
+// Block stages carrying scalars use in-process typed transport with a per-pipe
+// value queue, so each `yield`ed value is a distinct framed message — not bytes
+// concatenated into one buffer. A consumer block that reads `&0` a fixed number
+// of times therefore consumes exactly that many values and discards the rest.
+//
+// Here the producer yields three Ints but the consumer reads `&0` only twice,
+// so the pipeline emits the first two values (1, 2) as `12`. Under the old
+// byte-pipe path this boundary buffered "123" and a single `&0` read returned
+// the whole thing; per-value framing is what makes this print `12`.
+
+{ yield 1; yield 2; yield 3; } | { yield &0; yield &0 }

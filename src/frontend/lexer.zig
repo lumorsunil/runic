@@ -574,6 +574,15 @@ pub const Lexer = struct {
         if (self.match('&')) {
             return self.finish(.startAt(start), .amp_amp);
         }
+        // `&0`/`&1`/`&2` — a file-descriptor reference (stdin/stdout/stderr).
+        // (`>&` for redirects is handled by lexGreater, so the `&` here is never
+        // part of a redirect.)
+        if (self.peek()) |c| {
+            if (std.ascii.isDigit(c)) {
+                _ = self.advance();
+                return self.finish(.startAt(start), .fd);
+            }
+        }
         return self.finish(.startAt(start), .amp);
     }
 

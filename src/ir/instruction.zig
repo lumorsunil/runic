@@ -157,6 +157,22 @@ pub const Instruction = struct {
         get_module_cache: []const u8,
         /// stores %r (heap addr) in module cache under path
         set_module_cache: []const u8,
+        /// reads all bytes from the thread's stdin pipe into a zig_string value.
+        /// blocks (retries) until the stdin pipe signals completion (keep_open=false).
+        /// stores the result in %r.
+        collect_stdin,
+        /// parses the string in %r into an Int (uinteger) value, trimming
+        /// surrounding whitespace. stores the result in %r. invalid input is a
+        /// runtime error.
+        parse_int,
+        /// parses the string in %r into a Float value, trimming surrounding
+        /// whitespace. stores the result in %r. invalid input is a runtime
+        /// error. an existing Float (or EOF `.null`) passes through unchanged.
+        parse_float,
+        /// splits the string in %r by '\n' and enqueues each non-empty line as a
+        /// separate value onto the given pipe's typed queue (framing a byte
+        /// stream into per-line values). used by the `lines` builtin.
+        emit_lines: Location,
 
         pub fn push_(value: ValueSource) @This() {
             return .{ .push = value };
@@ -198,7 +214,7 @@ pub const Instruction = struct {
 
         pub fn format(self: @This(), w: *std.Io.Writer) !void {
             switch (self) {
-                inline .push, .exit, .exit_with, .jmp, .fork, .set, .pipe_fwd, .pipe_file, .pipe_write, .wait, .stream, .pipe, .pipe_opt, .ath, .log, .cmp, .resolve_exit_code, .cd, .get_env, .set_env => |t| try w.print("{t} {f}", .{ self, t }),
+                inline .push, .exit, .exit_with, .jmp, .fork, .set, .pipe_fwd, .pipe_file, .pipe_write, .wait, .stream, .pipe, .pipe_opt, .ath, .log, .cmp, .resolve_exit_code, .cd, .get_env, .set_env, .emit_lines => |t| try w.print("{t} {f}", .{ self, t }),
                 inline .ref, .comment, .get_module_cache, .set_module_cache => |t| try w.print("{t} {s}", .{ self, t }),
                 inline .alloc => |t| try w.print("{t} {}", .{ self, t }),
                 else => try w.print("{t}", .{self}),
@@ -453,6 +469,7 @@ pub const Instruction = struct {
             close_source,
             disconnect_source,
             complete_after_source_closed,
+            typed,
         };
 
         pub fn format(self: @This(), w: *std.Io.Writer) !void {

@@ -64,6 +64,8 @@ pub const Error =
         MissingHeapValue,
         MalformedHeapSequence,
         MissingSpawnedThreadContext,
+        InvalidInt,
+        InvalidFloat,
     };
 
 pub const Result = union(enum) {
@@ -943,32 +945,16 @@ pub const IREvaluator = struct {
         return switch (instruction.type) {
             .comment => return .skip,
             .exit_with => |value| {
-                const resolved = try self.resolveValueSource(thread, value);
-                switch (resolved) {
-                    .slice => |slice| {
-                        if (slice.element_size == 1 and thread.private.stack.items.len > 1) {
-                            const stdout_handle = thread.private.stack.items[1].pipe;
-                            const stdout_pipe = try self.context.getPipe(stdout_handle);
-                            const string = try self.getSlice(slice);
-                            var w = stdout_pipe.closeableWriter().writer;
-                            try w.writeAll(string);
-                            try w.flush();
-                        }
-                        return .{ .exit = .success };
-                    },
-                    .zig_string, .stream, .pipe => {
-                        if (thread.private.stack.items.len > 1) {
-                            const stdout_handle = thread.private.stack.items[1].pipe;
-                            const stdout_pipe = try self.context.getPipe(stdout_handle);
-                            var w = stdout_pipe.closeableWriter().writer;
-                            try self.materializeString(thread, resolved, w);
-                            try w.flush();
-                            return .{ .exit = .success };
-                        }
-                        return .{ .exit = try self.coerceExitCode(thread, value) };
-                    },
-                    else => return .{ .exit = try self.coerceExitCode(thread, value) },
-                }
+                // A function/stage return (or body) value now only sets the exit
+                // code; it is never pushed to stdout. Output is explicit via
+                // `yield` (or direct subprocess writes such as `echo`). Values
+                // with no exit-code representation (strings, void, ...) exit with
+                // success.
+                const code = self.coerceExitCode(thread, value) catch |err| switch (err) {
+                    error.UnsupportedExitCodeType => ExitCode.success,
+                    else => return err,
+                };
+                return .{ .exit = code };
             },
             .resolve_exit_code => |rec| {
                 const exit_code = try self.coerceExitCode(thread, .fromLocation(rec.source));
@@ -1062,6 +1048,146 @@ pub const IREvaluator = struct {
             .set_module_cache => |path| {
                 const path_owned = try self.allocator.dupe(u8, path);
                 try self.context.module_cache.put(self.allocator, path_owned, thread.private.result_register);
+                return .cont;
+            },
+            .collect_stdin => {
+                // `&0` reads (and consumes) the next input value. EOF (`.null`)
+                // is returned once the producer has closed with nothing left.
+                if (thread.private.stack.items.len < 1) return Error.MissingPipeHandle;
+                const stdin_value = thread.private.stack.items[0];
+                if (stdin_value != .pipe) return Error.MissingPipeHandle;
+                const stdin_pipe = try self.context.getPipe(stdin_value.pipe);
+
+                // Mark the pipe as having a virtual consumer (&0). This lets
+                // the upstream stage's stream thread see has_been_connected=true
+                // and exit cleanly once keep_open=false is set.
+                stdin_pipe.has_been_connected = true;
+
+                if (stdin_pipe.config.typed) {
+                    // Typed pipe: dequeue the next value. Live streaming — return
+                    // a value as soon as one is available (even while the
+                    // producer is still running); block (retry) when the queue is
+                    // empty but the producer is live; EOF when empty and closed.
+                    if (self.context.dequeueTypedPipeValue(stdin_value.pipe)) |typed_value| {
+                        thread.private.result_register = typed_value;
+                        return .cont;
+                    }
+                    if (stdin_pipe.config.keep_open) return .cont_no_instr_counter_inc;
+                    thread.private.result_register = .null;
+                    return .cont;
+                }
+
+                // Byte pipe: one value = the whole buffered input. Wait until the
+                // producer closes, read it all, then consume (a second read is
+                // EOF).
+                if (self.context.isPipeConsumed(stdin_value.pipe)) {
+                    thread.private.result_register = .null;
+                    return .cont;
+                }
+                if (stdin_pipe.config.keep_open) return .cont_no_instr_counter_inc;
+                const bytes = stdin_pipe.buffer_writer.written();
+                const owned = try self.allocator.dupe(u8, bytes);
+                try self.context.markPipeConsumed(stdin_value.pipe);
+                thread.private.result_register = .{ .zig_string = owned };
+                return .cont;
+            },
+            .parse_int => {
+                // Ensure %r holds an Int. When it already does (e.g. an in-process
+                // typed value received via `&0`), pass it through unchanged; an
+                // EOF read (`.null`, stream consumed/closed) also passes through.
+                if (thread.private.result_register == .uinteger) return .cont;
+                if (thread.private.result_register == .null) return .cont;
+                var text_writer = std.Io.Writer.Allocating.init(self.allocator);
+                defer text_writer.deinit();
+                try self.materializeString(thread, thread.private.result_register, &text_writer.writer);
+                const trimmed = std.mem.trim(u8, text_writer.written(), " \t\r\n");
+                const parsed = std.fmt.parseInt(usize, trimmed, 10) catch {
+                    // Report a precise diagnostic here (naming the offending
+                    // input and source location); the runner suppresses its
+                    // generic "Error evaluating" line for InvalidInt so the
+                    // user sees a single clear message.
+                    if (instruction.source) |src| {
+                        const span = src.span();
+                        std.log.err("[error]: {s}:{}:{}: cannot parse \"{s}\" as Int", .{
+                            span.start.file,
+                            span.start.line,
+                            span.start.column,
+                            trimmed,
+                        });
+                    } else {
+                        std.log.err("[error]: cannot parse \"{s}\" as Int", .{trimmed});
+                    }
+                    return Error.InvalidInt;
+                };
+                thread.private.result_register = .{ .uinteger = parsed };
+                return .cont;
+            },
+            .parse_float => {
+                // Ensure %r holds a Float. A value that is already a Float (an
+                // in-process typed value) or an EOF read (`.null`) passes
+                // through unchanged.
+                if (thread.private.result_register == .float) return .cont;
+                if (thread.private.result_register == .null) return .cont;
+                var text_writer = std.Io.Writer.Allocating.init(self.allocator);
+                defer text_writer.deinit();
+                try self.materializeString(thread, thread.private.result_register, &text_writer.writer);
+                const trimmed = std.mem.trim(u8, text_writer.written(), " \t\r\n");
+                const parsed = std.fmt.parseFloat(f64, trimmed) catch {
+                    // Precise, source-located diagnostic (the runner/CLI suppress
+                    // their generic footers for InvalidFloat, as for InvalidInt).
+                    if (instruction.source) |src| {
+                        const span = src.span();
+                        std.log.err("[error]: {s}:{}:{}: cannot parse \"{s}\" as Float", .{
+                            span.start.file,
+                            span.start.line,
+                            span.start.column,
+                            trimmed,
+                        });
+                    } else {
+                        std.log.err("[error]: cannot parse \"{s}\" as Float", .{trimmed});
+                    }
+                    return Error.InvalidFloat;
+                };
+                thread.private.result_register = .{ .float = parsed };
+                return .cont;
+            },
+            .emit_lines => |pipe_location| {
+                // `lines`: frame a byte stream into per-line values. Split the
+                // collected input in %r by '\n' and emit each non-empty line.
+                // On a `typed` stdout pipe (a framing-aware downstream such as
+                // `for (&0)` or `parseInt`) each line is enqueued as its own
+                // value so the consumer reads one line at a time. On a byte pipe
+                // (an executable or other byte consumer, e.g. `lines | cat`)
+                // each line is written back as `line\n` so the downstream sees a
+                // normal newline-delimited stream. EOF (`.null`, empty stdin)
+                // emits nothing.
+                if (thread.private.result_register == .null) return .cont;
+                const pipe_handle = (try self.resolveLocation(thread, pipe_location)).pipe;
+                const pipe = try self.context.getPipe(pipe_handle);
+                var text_writer = std.Io.Writer.Allocating.init(self.allocator);
+                defer text_writer.deinit();
+                try self.materializeString(thread, thread.private.result_register, &text_writer.writer);
+
+                if (pipe.config.typed) {
+                    var it = std.mem.splitScalar(u8, text_writer.written(), '\n');
+                    while (it.next()) |line| {
+                        const trimmed = std.mem.trimRight(u8, line, "\r");
+                        if (trimmed.len == 0) continue;
+                        const owned = try self.allocator.dupe(u8, trimmed);
+                        try self.context.enqueueTypedPipeValue(pipe_handle, .{ .zig_string = owned });
+                    }
+                    return .cont;
+                }
+
+                var w = pipe.closeableWriter().writer;
+                var it = std.mem.splitScalar(u8, text_writer.written(), '\n');
+                while (it.next()) |line| {
+                    const trimmed = std.mem.trimRight(u8, line, "\r");
+                    if (trimmed.len == 0) continue;
+                    try w.writeAll(trimmed);
+                    try w.writeByte('\n');
+                }
+                try w.flush();
                 return .cont;
             },
             .fwd_stdio => {
@@ -1369,7 +1495,27 @@ pub const IREvaluator = struct {
                 const pipe_handle = (try self.resolveLocation(thread, pipe_write.pipe)).pipe;
                 const pipe = try self.context.getPipe(pipe_handle);
                 const value = try self.resolveValueSource(thread, pipe_write.source);
-                try self.materializePipelineInput(thread, value, pipe.closeableWriter().writer);
+
+                // Yielding an EOF value (e.g. `yield &0` after the stream is
+                // consumed) emits nothing.
+                if (value == .null) return .cont;
+
+                // In-process typed transport: on an exact non-String boundary the
+                // pipe is marked `typed`, so enqueue the value directly and skip
+                // byte serialization. The downstream `&0`/collect_stdin dequeues
+                // it from the same handle (multiple yields stream as a queue).
+                if (pipe.config.typed) {
+                    try self.context.enqueueTypedPipeValue(pipe_handle, value);
+                    return .cont;
+                }
+
+                var w = pipe.closeableWriter().writer;
+                // `yield`/parseInt write a single value; serialize it as a string
+                // (multi-segment strings are concatenated, not space-joined).
+                try self.materializeString(thread, value, w);
+                // Flush so the bytes reach buffer_writer, where a downstream
+                // &0/collect_stdin reads them directly.
+                try w.flush();
                 return .cont;
             },
             .pipe_fwd => |pipe_fwd| {

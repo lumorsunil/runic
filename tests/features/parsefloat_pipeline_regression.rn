@@ -1,0 +1,10 @@
+// parseFloat (`fn String parseFloat() Float`) maps each input value to a Float,
+// like parseInt does for Int, so it composes with a framed `lines` stream. Here
+// two floats are squared: 1.5^2 = 2.25 and 2.5^2 = 6.25 (concatenated 2.256.25).
+fn Float square() Float {
+    for (&0) |x| {
+        yield x * x
+    }
+}
+
+{ echo "1.5"; echo "2.5" } | lines | parseFloat | square

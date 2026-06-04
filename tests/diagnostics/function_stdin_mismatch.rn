@@ -1,0 +1,4 @@
+fn Void hello() String echo "hello"
+fn String greetings() String hello
+
+greetings

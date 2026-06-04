@@ -1,0 +1,10 @@
+fn Void produce() String {
+    yield "coerced value"
+}
+
+fn ?String consume() String {
+    const received = &0 orelse "fallback"
+    yield "${received}"
+}
+
+produce | consume

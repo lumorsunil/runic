@@ -18,6 +18,13 @@ pub const TypeChecker = struct {
     document_store: *DocumentStore,
     modules: std.StringArrayHashMapUnmanaged(*Scope),
     env: ?*const std.process.EnvMap = null,
+    /// Stack of the enclosing functions' declared stdout types. Pushed when a
+    /// function body is type-checked and consulted by `runYield` so that every
+    /// `yield &1` is validated in the scope where it actually appears (e.g.
+    /// inside a `for (&0) |v| { yield v }` loop, where `v` is only bound in the
+    /// loop's child scope). A null entry means the enclosing function declared
+    /// no stdout type, so its yields are unconstrained.
+    stdout_type_stack: std.ArrayListUnmanaged(?*const ast.TypeExpr) = .empty,
 
     pub const Error = Scope.Error ||
         std.fs.File.OpenError ||
@@ -479,6 +486,7 @@ pub const TypeChecker = struct {
             .binding_decl => |*binding_decl| self.runBindingDecl(scope, binding_decl),
             .return_stmt => |*return_stmt| self.runReturn(scope, return_stmt),
             .exit_stmt => |*exit_stmt| self.runExit(scope, exit_stmt),
+            .yield_stmt => |*yield_stmt| self.runYield(scope, yield_stmt),
             .expression => |*expr_stmt| self.runExpressionStatement(scope, expr_stmt),
             else => error.UnsupportedStatement,
         };
@@ -489,6 +497,32 @@ pub const TypeChecker = struct {
         try self.logTypeCheckTrace(@src().fn_name, return_stmt.span);
 
         if (return_stmt.value) |value| try self.runExpression(scope, value);
+    }
+
+    fn runYield(self: *TypeChecker, scope: *Scope, yield_stmt: *ast.YieldStmt) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.logTypeCheckTrace(@src().fn_name, yield_stmt.span);
+
+        try self.runExpression(scope, yield_stmt.value);
+
+        // Only `yield`s to stdout (&1) are constrained by the enclosing
+        // function's declared stdout type; stderr (&2) carries untyped
+        // diagnostic output. Validating here (rather than in a separate body
+        // walk) means the yielded expression is resolved in the exact scope it
+        // appears in, including loop-capture bindings like `for (&0) |v|`.
+        if (yield_stmt.fd != 1) return;
+        if (self.stdout_type_stack.items.len == 0) return;
+        const declared_stdout = self.stdout_type_stack.items[self.stdout_type_stack.items.len - 1] orelse return;
+        const yielded = try self.resolveExprType(scope, yield_stmt.value) orelse return;
+        const resolved = try self.resolvePipeType(scope, yielded) orelse return;
+        if (self.pipeTypesEqual(resolved, declared_stdout)) return;
+        try self.reportSpanError(
+            yield_stmt.span,
+            Error.TypeMismatch,
+            .@"error",
+            "yield type mismatch: function yields {f}, but declared stdout type is {f}",
+            .{ resolved, declared_stdout },
+        );
     }
 
     fn runExit(self: *TypeChecker, scope: *Scope, exit_stmt: *ast.ExitStmt) Error!void {
@@ -699,6 +733,17 @@ pub const TypeChecker = struct {
 
         const fn_scope = try scope.addChild(self.arena.allocator(), fn_decl.span);
 
+        if (fn_decl.stdin_type) |stdin_type| {
+            const resolved = try self.resolveTypeExpr(fn_scope, stdin_type);
+            try fn_scope.declare(
+                self.arena.allocator(),
+                ast.Identifier.global(ast.FdExpr.stdin_binding_name),
+                resolved,
+                false,
+                false,
+            );
+        }
+
         switch (fn_decl.params) {
             ._non_variadic => |params| for (params) |param| {
                 const param_type = try self.resolveExprType(
@@ -728,7 +773,174 @@ pub const TypeChecker = struct {
             },
         }
 
-        try self.runExpression(fn_scope, fn_decl.body);
+        // Make the declared stdout type visible to every `yield` in the body
+        // (including yields nested in loops/blocks/matches) via the stack. Each
+        // `runYield` validates against the top entry in the scope it runs in.
+        try self.stdout_type_stack.append(
+            self.arena.allocator(),
+            if (fn_decl.return_type) |return_type|
+                try self.resolveTypeExpr(fn_scope, return_type)
+            else
+                null,
+        );
+        defer _ = self.stdout_type_stack.pop();
+
+        // Run the body in a scope we keep a handle to. For a block body, run its
+        // statements directly in `body_scope` instead of letting `runExpression`
+        // create and discard an internal child scope. That way the stdin/stdout
+        // type resolution below can see bindings declared in the body (e.g.
+        // `const n = &0` referenced from a later `yield n * 2`).
+        const body_scope = if (fn_decl.body.* == .block) blk: {
+            const bs = try fn_scope.addChild(self.arena.allocator(), fn_decl.body.block.span);
+            try self.runBlock(bs, &fn_decl.body.block);
+            break :blk bs;
+        } else blk: {
+            try self.runExpression(fn_scope, fn_decl.body);
+            break :blk fn_scope;
+        };
+
+        if (fn_decl.stdin_type) |stdin_type| {
+            try self.validateFunctionBodyStdin(
+                body_scope,
+                fn_decl.body,
+                try self.resolveTypeExpr(fn_scope, stdin_type),
+            );
+        }
+
+        // Output to stdout is now explicit via `yield`; each `yield &1` was
+        // already validated against the declared stdout type in `runYield`
+        // (using the `stdout_type_stack` entry pushed above), so the body value
+        // / `return` value is left unchecked here.
+    }
+
+    fn validateFunctionBodyStdin(
+        self: *TypeChecker,
+        scope: *Scope,
+        expr: *ast.Expression,
+        enclosing_stdin: *const ast.TypeExpr,
+    ) Error!void {
+        switch (expr.*) {
+            .call => |call| try self.validateCallStdin(scope, call, enclosing_stdin),
+            .pipeline => |pipeline| {
+                if (pipeline.stages.len > 0) {
+                    try self.validateFunctionBodyStdin(scope, pipeline.stages[0], enclosing_stdin);
+                }
+            },
+            .block => |block| {
+                for (block.statements) |statement| {
+                    try self.validateStatementStdin(scope, statement, enclosing_stdin);
+                }
+            },
+            .if_expr => |if_expr| {
+                try self.validateFunctionBodyStdin(scope, if_expr.then_expr, enclosing_stdin);
+                if (if_expr.else_branch) |else_branch| switch (else_branch) {
+                    .expr => |else_expr| try self.validateFunctionBodyStdin(scope, else_expr, enclosing_stdin),
+                    .if_expr => |else_if| try self.validateIfExprStdin(scope, else_if, enclosing_stdin),
+                    .condition => {},
+                };
+            },
+            .for_expr => |for_expr| try self.validateFunctionBodyStdin(scope, for_expr.body, enclosing_stdin),
+            .match_expr => |match_expr| for (match_expr.cases) |case| {
+                try self.validateBlockStdin(scope, case.body, enclosing_stdin);
+            },
+            .try_expr => |try_expr| try self.validateFunctionBodyStdin(scope, try_expr.subject, enclosing_stdin),
+            .catch_expr => |catch_expr| {
+                try self.validateFunctionBodyStdin(scope, catch_expr.subject, enclosing_stdin);
+                try self.validateBlockStdin(scope, catch_expr.handler.body, enclosing_stdin);
+            },
+            .unary => |unary| try self.validateFunctionBodyStdin(scope, unary.operand, enclosing_stdin),
+            .binary => |binary| {
+                try self.validateFunctionBodyStdin(scope, binary.left, enclosing_stdin);
+                try self.validateFunctionBodyStdin(scope, binary.right, enclosing_stdin);
+            },
+            .member => |member| try self.validateFunctionBodyStdin(scope, member.object, enclosing_stdin),
+            .index => |index| {
+                try self.validateFunctionBodyStdin(scope, index.target, enclosing_stdin);
+                try self.validateFunctionBodyStdin(scope, index.index, enclosing_stdin);
+            },
+            .assignment => |assignment| try self.validateFunctionBodyStdin(scope, assignment.expr, enclosing_stdin),
+            .subshell => |subshell| try self.validateFunctionBodyStdin(scope, subshell.child, enclosing_stdin),
+            .array => |array| for (array.elements) |element| {
+                try self.validateFunctionBodyStdin(scope, element, enclosing_stdin);
+            },
+            .map => |map| for (map.entries) |entry| {
+                try self.validateFunctionBodyStdin(scope, entry.key, enclosing_stdin);
+                try self.validateFunctionBodyStdin(scope, entry.value, enclosing_stdin);
+            },
+            .range => |range| {
+                try self.validateFunctionBodyStdin(scope, range.start, enclosing_stdin);
+                if (range.end) |end| try self.validateFunctionBodyStdin(scope, end, enclosing_stdin);
+            },
+            .fn_decl, .identifier, .env_var, .path, .literal, .pipeline_deprecated, .import_expr, .executable, .builtin, .fd => {},
+        }
+    }
+
+    fn validateIfExprStdin(
+        self: *TypeChecker,
+        scope: *Scope,
+        if_expr: *ast.IfExpr,
+        enclosing_stdin: *const ast.TypeExpr,
+    ) Error!void {
+        try self.validateFunctionBodyStdin(scope, if_expr.then_expr, enclosing_stdin);
+        if (if_expr.else_branch) |else_branch| switch (else_branch) {
+            .expr => |else_expr| try self.validateFunctionBodyStdin(scope, else_expr, enclosing_stdin),
+            .if_expr => |else_if| try self.validateIfExprStdin(scope, else_if, enclosing_stdin),
+            .condition => {},
+        };
+    }
+
+    fn validateBlockStdin(
+        self: *TypeChecker,
+        scope: *Scope,
+        block: ast.Block,
+        enclosing_stdin: *const ast.TypeExpr,
+    ) Error!void {
+        for (block.statements) |statement| {
+            try self.validateStatementStdin(scope, statement, enclosing_stdin);
+        }
+    }
+
+    fn validateStatementStdin(
+        self: *TypeChecker,
+        scope: *Scope,
+        statement: *ast.Statement,
+        enclosing_stdin: *const ast.TypeExpr,
+    ) Error!void {
+        switch (statement.*) {
+            .expression => |expr_stmt| try self.validateFunctionBodyStdin(scope, expr_stmt.expression, enclosing_stdin),
+            .binding_decl => |binding_decl| try self.validateFunctionBodyStdin(scope, binding_decl.initializer, enclosing_stdin),
+            .return_stmt => |return_stmt| if (return_stmt.value) |value| try self.validateFunctionBodyStdin(scope, value, enclosing_stdin),
+            .exit_stmt => |exit_stmt| if (exit_stmt.value) |value| try self.validateFunctionBodyStdin(scope, value, enclosing_stdin),
+            .yield_stmt => |yield_stmt| try self.validateFunctionBodyStdin(scope, yield_stmt.value, enclosing_stdin),
+            .while_stmt => |while_stmt| try self.validateBlockStdin(scope, while_stmt.body, enclosing_stdin),
+            .type_binding_decl, .error_decl, .bash_block => {},
+        }
+    }
+
+    fn validateCallStdin(
+        self: *TypeChecker,
+        scope: *Scope,
+        call: ast.CallExpr,
+        enclosing_stdin: *const ast.TypeExpr,
+    ) Error!void {
+        const callee_type = try self.resolvePipeType(scope, try self.resolveExprType(scope, call.callee)) orelse return;
+        if (callee_type.* != .function) return;
+        if (self.isExecutableFunctionType(callee_type.function)) return;
+        const callee_stdin = try self.resolvePipeType(scope, callee_type.function.stdin_type) orelse return;
+        if (self.pipeTypesEqual(enclosing_stdin, callee_stdin)) return;
+
+        try self.reportSpanError(
+            call.span,
+            Error.TypeMismatch,
+            .@"error",
+            "function stdin type mismatch: enclosing stdin is {f}, callee stdin expects {f}",
+            .{ enclosing_stdin, callee_stdin },
+        );
+    }
+
+    fn isExecutableFunctionType(_: *TypeChecker, function_type: ast.TypeExpr.FunctionType) bool {
+        const return_type = function_type.return_type orelse return false;
+        return return_type.* == .execution;
     }
 
     fn runCall(self: *TypeChecker, scope: *Scope, call: *ast.CallExpr) Error!void {
@@ -781,8 +993,37 @@ pub const TypeChecker = struct {
             .fn_decl => |*fn_decl| self.runFnDecl(scope, fn_decl),
             .call => |*call| self.runCall(scope, call),
             .subshell => |*subshell| self.runExpression(scope, subshell.child),
+            .fd => |*fd_expr| self.runFd(scope, fd_expr),
             else => return error.UnsupportedExpression,
         };
+    }
+
+    fn runFd(self: *TypeChecker, scope: *Scope, fd_expr: *ast.FdExpr) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.logTypeCheckTrace(@src().fn_name, fd_expr.span);
+
+        _ = scope;
+        switch (fd_expr.fd) {
+            // `&0` reads stdin. Inside a function it is typed by the declared
+            // stdin (via the `&0` scope binding); as a block/expression pipeline
+            // stage its type is inferred from the upstream by the compiler, so
+            // it is accepted here regardless.
+            0 => {},
+            1, 2 => try self.reportSpanError(
+                fd_expr.span,
+                Error.UnsupportedExpression,
+                .@"error",
+                "&{d} is a write-only stream; use `yield` (or `yield &2 ...`) to write to it",
+                .{fd_expr.fd},
+            ),
+            else => try self.reportSpanError(
+                fd_expr.span,
+                Error.UnsupportedExpression,
+                .@"error",
+                "unknown file descriptor &{d}; only &0, &1, and &2 are supported",
+                .{fd_expr.fd},
+            ),
+        }
     }
 
     fn runTypeExpression(
@@ -1254,6 +1495,200 @@ pub const TypeChecker = struct {
         for (pipeline.stages) |stage| {
             try self.runExpression(scope, stage);
         }
+
+        if (pipeline.stages.len < 2) return;
+
+        var upstream_stdout = try self.resolvePipelineStageStdoutType(scope, pipeline.stages[0]);
+        for (pipeline.stages[1..]) |stage| {
+            const downstream_stdin = try self.resolvePipelineStageStdinType(scope, stage);
+            if (upstream_stdout) |stdout_type| {
+                if (downstream_stdin) |stdin_type| {
+                    try self.validatePipeBoundary(stdout_type, stdin_type, stage.span());
+                }
+            }
+            upstream_stdout = try self.resolvePipelineStageStdoutType(scope, stage);
+        }
+    }
+
+    fn resolvePipelineStageStdoutType(
+        self: *TypeChecker,
+        scope: *Scope,
+        stage: *ast.Expression,
+    ) Error!?*const ast.TypeExpr {
+        if (stage.* == .call) {
+            const call = stage.call;
+            const callee_type = try self.resolvePipeType(scope, try self.resolveExprType(scope, call.callee));
+            if (callee_type) |resolved_callee_type| {
+                if (resolved_callee_type.* == .function) {
+                    const return_type = try self.resolvePipeType(scope, resolved_callee_type.function.return_type);
+                    if (return_type) |resolved_return_type| {
+                        if (resolved_return_type.* == .execution) return try self.allocStringType();
+                        return resolved_return_type;
+                    }
+                }
+            }
+        }
+
+        const stage_type = try self.resolvePipeType(scope, try self.resolveExprType(scope, stage));
+        const resolved_stage_type = stage_type orelse return null;
+
+        return switch (resolved_stage_type.*) {
+            .function => |function| try self.resolvePipeType(scope, function.return_type),
+            else => resolved_stage_type,
+        };
+    }
+
+    fn resolvePipelineStageStdinType(
+        self: *TypeChecker,
+        scope: *Scope,
+        stage: *ast.Expression,
+    ) Error!?*const ast.TypeExpr {
+        const target = switch (stage.*) {
+            .call => |call| call.callee,
+            else => stage,
+        };
+
+        const target_type = try self.resolvePipeType(scope, try self.resolveExprType(scope, target));
+        const resolved_target_type = target_type orelse return null;
+
+        return switch (resolved_target_type.*) {
+            .function => |function| try self.resolvePipeType(scope, function.stdin_type),
+            else => null,
+        };
+    }
+
+    fn resolvePipeType(
+        self: *TypeChecker,
+        scope: *Scope,
+        maybe_type: ?*const ast.TypeExpr,
+    ) Error!?*const ast.TypeExpr {
+        const type_expr = maybe_type orelse return null;
+        return try self.resolveTypeExpr(scope, type_expr);
+    }
+
+    /// Describes how adjacent pipeline stages are connected at a boundary.
+    pub const PipeBoundaryKind = enum {
+        /// Both sides agree on the same non-void, non-execution type.
+        /// Value can be passed directly once runtime typed transport is in place.
+        exact_typed,
+        /// Upstream provides T, downstream expects ?T.  The value is forwarded
+        /// unchanged; the downstream treats it as the non-null case.
+        coerced_optional,
+        /// Upstream provides T, downstream expects E!T.  The value is forwarded
+        /// unchanged; the downstream treats it as the success case.
+        coerced_error_union,
+        /// At least one side carries an ExecutionResult-returning function (an
+        /// external executable). The current implementation always uses byte pipes
+        /// for this case.
+        byte_stream,
+        /// One side is Void; no value is transported.
+        void_boundary,
+        /// Types differ and a diagnostic has been emitted.
+        incompatible,
+    };
+
+    /// Classify a pipe boundary without emitting any diagnostic. Useful for the
+    /// compiler to decide the execution path.
+    pub fn classifyPipeBoundary(
+        self: *TypeChecker,
+        upstream_stdout: *const ast.TypeExpr,
+        downstream_stdin: *const ast.TypeExpr,
+    ) PipeBoundaryKind {
+        const up = self.unaliasType(upstream_stdout);
+        const down = self.unaliasType(downstream_stdin);
+
+        if (up.* == .void or down.* == .void) return .void_boundary;
+
+        if (up.* == .execution or down.* == .execution) return .byte_stream;
+
+        if (self.pipeTypesEqual(upstream_stdout, downstream_stdin)) return .exact_typed;
+
+        // T → ?T
+        if (down.* == .optional) {
+            const inner = self.unaliasType(down.optional.child);
+            if (self.pipeTypesEqual(up, inner)) return .coerced_optional;
+        }
+
+        // T → E!T
+        if (down.* == .error_union) {
+            const payload = self.unaliasType(down.error_union.payload);
+            if (self.pipeTypesEqual(up, payload)) return .coerced_error_union;
+        }
+
+        return .incompatible;
+    }
+
+    fn validatePipeBoundary(
+        self: *TypeChecker,
+        upstream_stdout: *const ast.TypeExpr,
+        downstream_stdin: *const ast.TypeExpr,
+        span: ast.Span,
+    ) Error!void {
+        // Exact match (including Void→Void) is always valid.
+        if (self.pipeTypesEqual(upstream_stdout, downstream_stdin)) return;
+
+        const up = self.unaliasType(upstream_stdout);
+        const down = self.unaliasType(downstream_stdin);
+
+        // A Void boundary that is not an exact Void→Void match is a mismatch:
+        // Void→non-Void and non-Void→Void are both rejected.
+        if (up.* == .void or down.* == .void) {
+            try self.reportSpanError(
+                span,
+                Error.TypeMismatch,
+                .@"error",
+                "pipeline type mismatch: upstream stdout is {f}, downstream stdin expects {f}",
+                .{ upstream_stdout, downstream_stdin },
+            );
+            return;
+        }
+
+        // Accepted coercions: T→?T and T→E!T. The value flows through unchanged;
+        // the downstream treats it as the non-null / success case.
+        if (down.* == .optional) {
+            const inner = self.unaliasType(down.optional.child);
+            if (self.pipeTypesEqual(up, inner)) return;
+        }
+        if (down.* == .error_union) {
+            const payload = self.unaliasType(down.error_union.payload);
+            if (self.pipeTypesEqual(up, payload)) return;
+        }
+
+        try self.reportSpanError(
+            span,
+            Error.TypeMismatch,
+            .@"error",
+            "pipeline type mismatch: upstream stdout is {f}, downstream stdin expects {f}",
+            .{ upstream_stdout, downstream_stdin },
+        );
+    }
+
+    fn pipeTypesEqual(
+        self: *TypeChecker,
+        left: *const ast.TypeExpr,
+        right: *const ast.TypeExpr,
+    ) bool {
+        const resolved_left = self.unaliasType(left);
+        const resolved_right = self.unaliasType(right);
+
+        if (std.meta.activeTag(resolved_left.*) != std.meta.activeTag(resolved_right.*)) return false;
+
+        return switch (resolved_left.*) {
+            .array => |left_array| self.pipeTypesEqual(left_array.element, resolved_right.array.element),
+            .optional => |left_optional| self.pipeTypesEqual(left_optional.child, resolved_right.optional.child),
+            .promise => |left_promise| self.pipeTypesEqual(left_promise.child, resolved_right.promise.child),
+            .error_union => |left_error_union| self.pipeTypesEqual(left_error_union.err_set, resolved_right.error_union.err_set) and
+                self.pipeTypesEqual(left_error_union.payload, resolved_right.error_union.payload),
+            .void, .integer, .float, .boolean, .byte, .null, .execution, .thread => true,
+            else => std.meta.eql(resolved_left.*, resolved_right.*),
+        };
+    }
+
+    fn unaliasType(self: *TypeChecker, type_expr: *const ast.TypeExpr) *const ast.TypeExpr {
+        return switch (type_expr.*) {
+            .alias => |*alias| self.unaliasType(self.resolveAliasType(alias)),
+            else => type_expr,
+        };
     }
 
     pub fn runPipelineStage(
@@ -2048,6 +2483,41 @@ const GlobalTypes = struct {
     }
 };
 
+/// Stable storage for the `parseInt` builtin's function type:
+/// `fn String parseInt() Int`.
+const parse_int_byte_type = ast.TypeExpr{ .byte = .{ .span = .global } };
+const parse_int_string_type = ast.TypeExpr{ .array = .{ .element = &parse_int_byte_type, .span = .global } };
+const parse_int_return_type = ast.TypeExpr{ .integer = .{ .span = .global } };
+const parse_int_fn_type = ast.TypeExpr{ .function = .{
+    .params = .nonVariadic(&.{}),
+    .stdin_type = &parse_int_string_type,
+    .return_type = &parse_int_return_type,
+    .span = .global,
+} };
+
+/// Stable storage for the `parseFloat` builtin's function type:
+/// `fn String parseFloat() Float`.
+const parse_float_byte_type = ast.TypeExpr{ .byte = .{ .span = .global } };
+const parse_float_string_type = ast.TypeExpr{ .array = .{ .element = &parse_float_byte_type, .span = .global } };
+const parse_float_return_type = ast.TypeExpr{ .float = .{ .span = .global } };
+const parse_float_fn_type = ast.TypeExpr{ .function = .{
+    .params = .nonVariadic(&.{}),
+    .stdin_type = &parse_float_string_type,
+    .return_type = &parse_float_return_type,
+    .span = .global,
+} };
+
+/// Stable storage for the `lines` builtin's function type:
+/// `fn String lines() String` — frames a byte stream into per-line values.
+const lines_byte_type = ast.TypeExpr{ .byte = .{ .span = .global } };
+const lines_string_type = ast.TypeExpr{ .array = .{ .element = &lines_byte_type, .span = .global } };
+const lines_fn_type = ast.TypeExpr{ .function = .{
+    .params = .nonVariadic(&.{}),
+    .stdin_type = &lines_string_type,
+    .return_type = &lines_string_type,
+    .span = .global,
+} };
+
 const global_scope_definitions = [_]Definition{
     .init("Void", GlobalTypes.Void),
     .init("Int", GlobalTypes.Int),
@@ -2059,10 +2529,21 @@ const global_scope_definitions = [_]Definition{
     .init("String", GlobalTypes.Array(GlobalTypes.Byte)),
 };
 
+/// Builtin value bindings (not types) available in every module's global scope.
+const global_value_definitions = [_]Definition{
+    .{ .identifier = .{ .name = "parseInt", .span = .global }, .type_expr = &parse_int_fn_type },
+    .{ .identifier = .{ .name = "parseFloat", .span = .global }, .type_expr = &parse_float_fn_type },
+    .{ .identifier = .{ .name = "lines", .span = .global }, .type_expr = &lines_fn_type },
+};
+
 fn addGlobalScope(allocator: std.mem.Allocator, scope: *Scope) !*Scope {
     const global_scope = try scope.addChild(allocator, scope.span);
 
     for (global_scope_definitions) |definition| {
+        try global_scope.declare(allocator, definition.identifier, definition.type_expr, true, false);
+    }
+
+    for (global_value_definitions) |definition| {
         try global_scope.declare(allocator, definition.identifier, definition.type_expr, true, false);
     }
 
