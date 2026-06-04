@@ -1153,22 +1153,41 @@ pub const IREvaluator = struct {
             },
             .emit_lines => |pipe_location| {
                 // `lines`: frame a byte stream into per-line values. Split the
-                // collected input in %r by '\n' and enqueue each non-empty line
-                // as its own value onto the (typed) stdout pipe, so a downstream
-                // `for (&0)` / mapping stage reads one line at a time. EOF
-                // (`.null`, empty stdin) emits nothing.
+                // collected input in %r by '\n' and emit each non-empty line.
+                // On a `typed` stdout pipe (a framing-aware downstream such as
+                // `for (&0)` or `parseInt`) each line is enqueued as its own
+                // value so the consumer reads one line at a time. On a byte pipe
+                // (an executable or other byte consumer, e.g. `lines | cat`)
+                // each line is written back as `line\n` so the downstream sees a
+                // normal newline-delimited stream. EOF (`.null`, empty stdin)
+                // emits nothing.
                 if (thread.private.result_register == .null) return .cont;
                 const pipe_handle = (try self.resolveLocation(thread, pipe_location)).pipe;
+                const pipe = try self.context.getPipe(pipe_handle);
                 var text_writer = std.Io.Writer.Allocating.init(self.allocator);
                 defer text_writer.deinit();
                 try self.materializeString(thread, thread.private.result_register, &text_writer.writer);
+
+                if (pipe.config.typed) {
+                    var it = std.mem.splitScalar(u8, text_writer.written(), '\n');
+                    while (it.next()) |line| {
+                        const trimmed = std.mem.trimRight(u8, line, "\r");
+                        if (trimmed.len == 0) continue;
+                        const owned = try self.allocator.dupe(u8, trimmed);
+                        try self.context.enqueueTypedPipeValue(pipe_handle, .{ .zig_string = owned });
+                    }
+                    return .cont;
+                }
+
+                var w = pipe.closeableWriter().writer;
                 var it = std.mem.splitScalar(u8, text_writer.written(), '\n');
                 while (it.next()) |line| {
                     const trimmed = std.mem.trimRight(u8, line, "\r");
                     if (trimmed.len == 0) continue;
-                    const owned = try self.allocator.dupe(u8, trimmed);
-                    try self.context.enqueueTypedPipeValue(pipe_handle, .{ .zig_string = owned });
+                    try w.writeAll(trimmed);
+                    try w.writeByte('\n');
                 }
+                try w.flush();
                 return .cont;
             },
             .fwd_stdio => {

@@ -1,0 +1,6 @@
+// `lines` framing must also work when the downstream is an external command (a
+// byte consumer), not just a typed stage like `parseInt`. The boundary is a
+// byte pipe there, so `lines` writes each line back as `line\n` (rather than
+// enqueuing typed values) — otherwise the executable reads an empty stdin and
+// silently produces nothing. Here `lines | cat` round-trips the three lines.
+{ echo "alpha"; echo "beta"; echo "gamma" } | lines | cat

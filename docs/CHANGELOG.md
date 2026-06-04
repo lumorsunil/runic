@@ -105,8 +105,16 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   `[error]: <file>:<line>:<col>: cannot parse "abc" as Int` — instead of dumping
   a raw `Error evaluating … error.InvalidInt` plus a generic CLI footer. The
   redundant generic lines are suppressed for this case.
+- Bound command expressions now preserve execution-result data more consistently across `&&`, `||`, and `;`, so `.stdout`, `.stderr`, and `.exit_code` remain available after sequencing command-producing expressions.
+- `scripts/run_ci.sh` is now the preferred CI entrypoint. It wraps `scripts/run_ci.rn`, checks for expected progress output, and falls back to the direct shell stages if the Runic-driven CI path regresses.
 
 ### Fixed
+- `lines` followed by an external command (or any byte consumer) — e.g.
+  `printf "a\nb\n" | lines | cat`, `… | lines | grep` — no longer silently
+  produces empty output. `lines`/`emit_lines` only wrote to the in-process typed
+  queue, so a downstream that reads bytes saw nothing. It now mirrors `yield`:
+  on a `typed` boundary it enqueues framed values (so `lines | parseInt` keeps
+  per-line framing), and on a byte boundary it writes each line back as `line\n`.
 - `>` is now overloaded by operand rather than always being parsed as an output
   redirect. Previously `if (n > 2) { ... }` (and any `>` between values) was
   parsed as "redirect `n` to a file named `2`", so the condition was the value
@@ -165,10 +173,6 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   serializes correctly — the segments are concatenated rather than space-joined.
 - Chained fd redirects now preserve left-to-right shell semantics, so forms like `echo "hello" 1>&2 2>"/dev/null"` keep writing to the original stderr stream before the later redirect replaces fd `2`.
 - Direct top-level executable calls now preserve TTY-aware stdout/stderr behavior when Runic itself is attached to a terminal, so scripts can keep color/ANSI output without breaking redirected or captured output paths.
-
-### Changed
-- Bound command expressions now preserve execution-result data more consistently across `&&`, `||`, and `;`, so `.stdout`, `.stderr`, and `.exit_code` remain available after sequencing command-producing expressions.
-- `scripts/run_ci.sh` is now the preferred CI entrypoint. It wraps `scripts/run_ci.rn`, checks for expected progress output, and falls back to the direct shell stages if the Runic-driven CI path regresses.
 
 ## [0.1.0] — 2026-03-22
 
