@@ -12,6 +12,9 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ## [Unreleased]
 
+> The **typed pipes** work below is summarized narratively in
+> [typed-pipes-update.md](./typed-pipes-update.md).
+
 ### Added
 
 #### Typed pipeline boundaries
