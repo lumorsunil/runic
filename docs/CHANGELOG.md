@@ -118,9 +118,10 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   greater-than comparison. So `echo "x" > "f"` redirects, while `n > 2`,
   `count > limit`, and `produce > 2` compare, in any context (condition, binding
   RHS, `yield`/`return` value, …). `>>` and `>&` are unaffected (they have no
-  comparison meaning and always redirect). Note: redirecting a Runic *function*
-  call's stdout via `>` is not supported (it compares); use a block,
-  `{ myFn } > "file"`.
+  comparison meaning and always redirect). A Runic *function* call counts as a
+  command too, so `myFn > "file"` redirects the function's stdout (truncate) and
+  `myFn >> "file"` appends; to compare a function's return value instead, bind
+  it first (`const r = myFn; if (r > 2) ...`).
 - A producer block whose `yield` is nested inside a loop/`if`/`match`
   (`{ for (0..5) |i| { yield i } } | square`) is now correctly recognized as a
   scalar stage and gets framed (per-value) typed transport. Previously the

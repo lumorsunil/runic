@@ -1362,7 +1362,7 @@ pub const IRCompiler = struct {
         // fn declarations and identifier references are not inadvertently called.
         const is_member_access = expr.* == .binary and expr.binary.op == .member;
         if (is_member_access and result.source == .value and result.source.value == .fn_ref) {
-            const call_result = try self.compileFunctionCall(expr, result.source.value, &.{});
+            const call_result = try self.compileFunctionCall(expr, result.source.value, &.{}, &.{});
             try self.finalizeStatementResult(source, call_result);
             return .fromValue(.void);
         }
@@ -2972,7 +2972,7 @@ pub const IRCompiler = struct {
         return switch (callee.source) {
             .value => |v| switch (v) {
                 .executable => self.compileExecutableCall(source, v, call.arguments, call.redirects),
-                .fn_ref => self.compileFunctionCall(source, v, call.arguments),
+                .fn_ref => self.compileFunctionCall(source, v, call.arguments, call.redirects),
                 .slice, .stream, .addr, .void, .null, .uinteger, .float, .strct, .exit_code, .pipe, .thread, .closeable => .from(v),
                 .zig_string => Error.UnsupportedValueType,
             },
@@ -2980,19 +2980,18 @@ pub const IRCompiler = struct {
         };
     }
 
-    fn compileBlockCallWithRedirects(
+    const RedirectStreams = struct { stdout: ir.Location, stderr: ir.Location };
+
+    /// Compiles a list of redirects into the stdout/stderr stream locations a
+    /// command should run with (defaulting to the thread's own streams). A
+    /// `path` redirect opens a pipe-to-file; an `fd` redirect points the stream
+    /// at another descriptor. Shared by block and function call redirection.
+    fn compileRedirectStreams(
         self: *IRCompiler,
-        source: *ast.Expression,
-        block: ast.Block,
+        source: anytype,
         redirects: []const ast.Redirection,
-    ) Error!Result {
-        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
-
-        const block_instr_set = try self.addInstructionSet();
-
-        var exec_stdout = self.threadStdout();
-        var exec_stderr = self.threadStderr();
-
+    ) Error!RedirectStreams {
+        var streams = RedirectStreams{ .stdout = self.threadStdout(), .stderr = self.threadStderr() };
         for (redirects) |redirect| {
             switch (redirect.target) {
                 .path => |path_target| {
@@ -3006,8 +3005,8 @@ pub const IRCompiler = struct {
                         redirect.mode,
                     );
                     switch (redirect.stream) {
-                        .stdout => exec_stdout = redirect_pipe_ref.dereference(),
-                        .stderr => exec_stderr = redirect_pipe_ref.dereference(),
+                        .stdout => streams.stdout = redirect_pipe_ref.dereference(),
+                        .stderr => streams.stderr = redirect_pipe_ref.dereference(),
                         else => {},
                     }
                 },
@@ -3019,20 +3018,34 @@ pub const IRCompiler = struct {
                         else => continue,
                     };
                     switch (redirect.stream) {
-                        .stdout => exec_stdout = target_loc,
-                        .stderr => exec_stderr = target_loc,
+                        .stdout => streams.stdout = target_loc,
+                        .stderr => streams.stderr = target_loc,
                         else => {},
                     }
                 },
             }
         }
+        return streams;
+    }
+
+    fn compileBlockCallWithRedirects(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        block: ast.Block,
+        redirects: []const ast.Redirection,
+    ) Error!Result {
+        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        const block_instr_set = try self.addInstructionSet();
+
+        const streams = try self.compileRedirectStreams(source, redirects);
 
         const spawned = try self.spawnClosure(
             source,
             .initAbs(block_instr_set, 0),
             self.threadStdin(),
-            exec_stdout,
-            exec_stderr,
+            streams.stdout,
+            streams.stderr,
         );
 
         const prev_instr_set = self.current_instruction_set;
@@ -3603,6 +3616,7 @@ pub const IRCompiler = struct {
         source: *ast.Expression,
         fn_ref_value: ir.Value,
         arguments: []const *ast.Expression,
+        redirects: []const ast.Redirection,
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
@@ -3678,10 +3692,19 @@ pub const IRCompiler = struct {
             }
         }
 
-        const handle = try self.forkInherit(
+        // Honor any output redirects (e.g. `myFn > "file"`): the function runs
+        // with its stdout/stderr pointed at the redirect targets instead of
+        // inheriting the caller's. With no redirects this is the same as
+        // `forkInherit`.
+        const streams = try self.compileRedirectStreams(source, redirects);
+        const handle = try self.fork(
             source,
             fn_addr,
+            self.threadStdin(),
+            streams.stdout,
+            streams.stderr,
             closure_ref.dereference(),
+            .inherit,
         );
 
         const pub_exports = self.instruction_sets.items[fn_ref.fn_addr.instr_set].pub_exports;
@@ -5150,22 +5173,29 @@ pub const IRCompiler = struct {
     /// which only the compiler can classify (a bare `n` and a bare external
     /// command both parse as zero-arg calls — the scope tells them apart).
     ///
-    /// A command is an external executable (an unresolved identifier call), a
-    /// block, a subshell, or a call that already carries redirects. Everything
-    /// else — values *and* in-scope function calls — is a comparison, so
-    /// `n > 2`, `count > limit`, and `produce > 2` all compare. (Redirecting a
-    /// Runic function's stdout via `>` is not supported; use a block.)
+    /// A command is a call to an external executable (an unresolved identifier)
+    /// or a Runic function, a block, a subshell, or a call that already carries
+    /// redirects. A call to a value binding, or any non-call value, is a
+    /// comparison — so `echo "x" > "f"` and `myFn > "f"` redirect, while
+    /// `n > 2` and `count > limit` compare. To compare a function's return
+    /// value, bind it first: `const r = myFn; if (r > 2) ...`.
     fn greaterLeftIsCommand(self: *IRCompiler, left: *ast.Expression) bool {
         return switch (left.*) {
             .block, .subshell => true,
-            .call => |call| {
-                if (call.redirects.len > 0) return true;
-                return switch (call.callee.*) {
-                    .identifier => |id| self.lookup(id.name, .{ .shallow = false }) == null,
-                    .block, .subshell => true,
-                    else => false,
-                };
+            .call => |call| call.redirects.len > 0 or self.calleeIsCommand(call.callee),
+            else => false,
+        };
+    }
+
+    fn calleeIsCommand(self: *IRCompiler, callee: *ast.Expression) bool {
+        return switch (callee.*) {
+            // Not in scope: an external executable. In scope: a command only if
+            // it is a function reference; a value binding is compared.
+            .identifier => |id| blk: {
+                const binding = self.lookup(id.name, .{ .shallow = false }) orelse break :blk true;
+                break :blk binding.result.isFunctionRef();
             },
+            .block, .subshell => true,
             else => false,
         };
     }
