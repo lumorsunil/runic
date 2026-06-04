@@ -107,6 +107,16 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   redundant generic lines are suppressed for this case.
 
 ### Fixed
+- `>` in a value context is now the greater-than comparison instead of being
+  unconditionally parsed as an output redirect. Previously `if (n > 2) { ... }`
+  (and any `>` in a condition, binding RHS, or `yield`/`return` value) was parsed
+  as "redirect `n` to a file named `2`", so the condition was the value `n` and
+  the runtime panicked (`access of union field 'exit_code' while field
+  'uinteger' is active`). Redirects belong to commands, which only appear in
+  statement position, so `>` only redirects there (and inside a block or `$()`,
+  whose statements are command position); everywhere else it compares. `>>` and
+  `>&` are unaffected (they have no comparison meaning). A redirected command on
+  a binding RHS can be written with a block: `const b = { cmd > "file" }`.
 - A producer block whose `yield` is nested inside a loop/`if`/`match`
   (`{ for (0..5) |i| { yield i } } | square`) is now correctly recognized as a
   scalar stage and gets framed (per-value) typed transport. Previously the

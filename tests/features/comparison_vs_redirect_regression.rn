@@ -1,0 +1,13 @@
+// `>` is an output redirect only in command position (a statement). In a value
+// context — an `if`/`for`/`match` head, a binding RHS, a yield/return value —
+// `>` is the greater-than comparison instead. (`>>` and `>&` always redirect;
+// `>=`/`<`/`<=` are always comparisons.)
+const a = 7
+const b = 3
+
+if (a > b) echo "a-greater" else echo "a-not-greater"
+
+const c = b > a
+if (c) echo "c-true" else echo "c-false"
+
+for (1..4) |i| if (i > 2) echo "hi-${i}" else echo "lo-${i}"
