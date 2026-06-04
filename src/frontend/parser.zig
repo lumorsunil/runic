@@ -46,12 +46,6 @@ pub const Parser = struct {
     interp_counter: usize = 0,
     diagnostics: std.ArrayList(Diagnostic) = .empty,
     logging_enabled: bool = false,
-    /// Whether a `>` may be parsed as an output redirect. Redirects belong to
-    /// commands, which only appear in statement/command position; inside a value
-    /// context (an `if`/`for`/`match` head, a binding's RHS, a `yield`/`return`
-    /// value) a `>` is the greater-than comparison instead. Only `>` is
-    /// ambiguous — `>>` and `>&` have no comparison meaning and always redirect.
-    redirects_enabled: bool = true,
 
     const Self = @This();
 
@@ -500,15 +494,6 @@ pub const Parser = struct {
                 return self.parsePrimaryExpression();
             },
         };
-    }
-
-    /// Parses an expression in a value context, where a `>` is the greater-than
-    /// comparison rather than an output redirect (see `redirects_enabled`).
-    fn parseValueExpression(self: *Self) Error!*ast.Expression {
-        const prev = self.redirects_enabled;
-        self.redirects_enabled = false;
-        defer self.redirects_enabled = prev;
-        return self.parseExpression();
     }
 
     fn ParserPayload(comptime T: type) type {
@@ -1015,15 +1000,16 @@ pub const Parser = struct {
                     },
                 },
             },
-            .greater, .append_redirect, .fd_source_truncate_redirect, .fd_source_append_redirect => redirect: {
-                // `>` is only a redirect in command position; in a value context
-                // it is the greater-than comparison, so keep the binary as-is.
-                // The explicit redirect operators are never comparisons.
-                if (binary.binary.op == .greater and !self.redirects_enabled) break :redirect binary;
+            // Note: `.greater` (`>`) is intentionally NOT folded here. It is
+            // ambiguous with the greater-than comparison, so it stays a
+            // `.binary{.greater}` and the IR compiler decides — based on whether
+            // the left operand is a command — whether it is a redirect or a
+            // comparison. The explicit redirect operators below are never
+            // comparisons, so they always fold.
+            .append_redirect, .fd_source_truncate_redirect, .fd_source_append_redirect => redirect: {
                 const mode: ast.RedirectionMode = switch (binary.binary.op) {
                     .fd_source_truncate_redirect => .truncate,
                     .fd_source_append_redirect => .append,
-                    .greater => .truncate,
                     .append_redirect => .append,
                     else => unreachable,
                 };
@@ -1612,7 +1598,7 @@ pub const Parser = struct {
 
         const if_tok = try self.expect(.kw_if);
         _ = try self.expect(.l_paren);
-        var condition = try self.parseValueExpression();
+        var condition = try self.parseExpression();
         _ = try self.expect(.r_paren);
         const capture = try self.parseOptionalCaptureClause();
         if (capture != null) {
@@ -1675,11 +1661,7 @@ pub const Parser = struct {
 
         const for_tok = try self.expect(.kw_for);
         _ = try self.expect(.l_paren);
-        // The source list is a value context (`>` is comparison, not redirect).
-        const prev_redirects = self.redirects_enabled;
-        self.redirects_enabled = false;
         const sources = try self.parseForSources();
-        self.redirects_enabled = prev_redirects;
         _ = try self.expect(.r_paren);
         const capture = try self.parseCaptureClause();
 
@@ -1742,7 +1724,7 @@ pub const Parser = struct {
 
         const match_tok = try self.expect(.kw_match);
         _ = try self.expect(.l_paren);
-        const subject = try self.parseValueExpression();
+        const subject = try self.parseExpression();
         _ = try self.expect(.r_paren);
         _ = try self.expect(.l_brace);
         self.skipNewlines();
@@ -2189,12 +2171,7 @@ pub const Parser = struct {
         defer breadcrumb.end();
 
         const open = try self.expect(.dollar_l_paren);
-        // A subshell runs commands, so `>` redirects again even when the
-        // subshell appears inside a value context.
-        const prev_redirects = self.redirects_enabled;
-        self.redirects_enabled = true;
         const child = try self.parseExpression();
-        self.redirects_enabled = prev_redirects;
         const close = try self.expect(.r_paren);
 
         return self.allocExpression(.{ .subshell = .{
@@ -2219,14 +2196,6 @@ pub const Parser = struct {
     fn parseStatement(self: *Self) Error!*ast.Statement {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
-
-        // Every statement is command position, so `>` may redirect here (and
-        // inside nested blocks, whose statements re-enter this function). Value
-        // sub-contexts (conditions, binding RHS, yield/return values) turn it
-        // off so `>` is a comparison there.
-        const prev_redirects = self.redirects_enabled;
-        self.redirects_enabled = true;
-        defer self.redirects_enabled = prev_redirects;
 
         self.skipNewlines();
         const stmt = try self.arena.allocator().create(ast.Statement);
@@ -2716,9 +2685,7 @@ pub const Parser = struct {
         const pattern = try self.parseBindingPattern();
         const annotation = try self.parseMaybeTypeAnnotation();
         _ = try self.expectTokenTag(.assign);
-        // The RHS is a value context (`a > b` is a comparison). A command with a
-        // redirect on the RHS can be written with a block: `const b = { cmd > f }`.
-        var initializer = try self.parseValueExpression();
+        var initializer = try self.parseExpression();
 
         // If the initializer is a command-producing expression, allow `;` to sequence
         // additional commands under the same capture (e.g. `const b = cmd1; cmd2`).
@@ -2802,7 +2769,7 @@ pub const Parser = struct {
             fd = next.lexeme[1] - '0';
         }
 
-        const value = try self.parseValueExpression();
+        const value = try self.parseExpression();
 
         return .{
             .value = value,
@@ -2825,7 +2792,7 @@ pub const Parser = struct {
             };
         }
 
-        const value = try self.parseValueExpression();
+        const value = try self.parseExpression();
 
         return .{
             .value = value,
@@ -2847,7 +2814,7 @@ pub const Parser = struct {
             };
         }
 
-        const value = try self.parseValueExpression();
+        const value = try self.parseExpression();
 
         return .{
             .value = value,

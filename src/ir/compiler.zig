@@ -1330,6 +1330,13 @@ pub const IRCompiler = struct {
         switch (expr.*) {
             .binary => |binary| switch (binary.op) {
                 .logical_and, .logical_or, .sequence => return self.compileLogicalBinary(source, binary, .statement),
+                // A command-left `>` is a redirect; rewrite to the redirected
+                // call here so it takes the normal command-statement path
+                // (direct-executable handling, etc.) rather than being compiled
+                // as an expression.
+                .greater => if (try self.greaterRedirectCall(binary)) |call_expr| {
+                    return self.compileExpressionAsStatement(source, call_expr);
+                },
                 else => {},
             },
             else => {},
@@ -5137,6 +5144,78 @@ pub const IRCompiler = struct {
         }
     }
 
+    /// `>` is overloaded: an output redirect when the left operand is a command,
+    /// the greater-than comparison when it is a value. The parser leaves it as a
+    /// `.binary{.greater}`; this resolves the meaning from the left operand,
+    /// which only the compiler can classify (a bare `n` and a bare external
+    /// command both parse as zero-arg calls — the scope tells them apart).
+    ///
+    /// A command is an external executable (an unresolved identifier call), a
+    /// block, a subshell, or a call that already carries redirects. Everything
+    /// else — values *and* in-scope function calls — is a comparison, so
+    /// `n > 2`, `count > limit`, and `produce > 2` all compare. (Redirecting a
+    /// Runic function's stdout via `>` is not supported; use a block.)
+    fn greaterLeftIsCommand(self: *IRCompiler, left: *ast.Expression) bool {
+        return switch (left.*) {
+            .block, .subshell => true,
+            .call => |call| {
+                if (call.redirects.len > 0) return true;
+                return switch (call.callee.*) {
+                    .identifier => |id| self.lookup(id.name, .{ .shallow = false }) == null,
+                    .block, .subshell => true,
+                    else => false,
+                };
+            },
+            else => false,
+        };
+    }
+
+    /// Builds the redirected call for a command-left `>` (e.g. `echo "x" > "f"`),
+    /// folding a truncate-stdout redirect onto the command. Returns null when the
+    /// left is not a command, so `>` stays the greater-than comparison.
+    fn greaterRedirectCall(self: *IRCompiler, binary: ast.BinaryExpr) Error!?*ast.Expression {
+        if (binary.op != .greater or !self.greaterLeftIsCommand(binary.left)) return null;
+
+        const target = coerceRedirectTargetExpr(binary.right);
+        const redirect = ast.Redirection{
+            .stream = .stdout,
+            .mode = .truncate,
+            .target = .{ .path = .{ .value = target, .span = target.span() } },
+            .span = binary.left.span().endAt(binary.right.span()),
+        };
+
+        const new_expr = try self.allocator.create(ast.Expression);
+        switch (binary.left.*) {
+            .call => |call| new_expr.* = .{ .call = .{
+                .callee = call.callee,
+                .arguments = call.arguments,
+                .redirects = try std.mem.concat(self.allocator, ast.Redirection, &.{ call.redirects, &.{redirect} }),
+                .background = call.background,
+                .span = call.span.endAt(binary.right.span()),
+            } },
+            else => new_expr.* = .{ .call = .{
+                .callee = binary.left,
+                .arguments = &.{},
+                .redirects = try self.allocator.dupe(ast.Redirection, &.{redirect}),
+                .background = false,
+                .span = binary.left.span().endAt(binary.right.span()),
+            } },
+        }
+        return new_expr;
+    }
+
+    /// Unwraps a bare zero-arg call (`> file`) to its identifier callee so the
+    /// redirect target is the path expression, mirroring the parser.
+    fn coerceRedirectTargetExpr(expr: *ast.Expression) *ast.Expression {
+        return switch (expr.*) {
+            .call => |call| if (call.arguments.len == 0 and call.redirects.len == 0 and call.callee.* == .identifier)
+                call.callee
+            else
+                expr,
+            else => expr,
+        };
+    }
+
     fn compileBinary(
         self: *IRCompiler,
         source: anytype,
@@ -5166,6 +5245,11 @@ pub const IRCompiler = struct {
                 return self.compileOrelseBinary(source, binary);
             },
             .greater, .greater_equal, .less, .less_equal, .equal, .not_equal => {
+                // A command-left `>` is an output redirect, not a comparison.
+                if (try self.greaterRedirectCall(binary)) |call_expr| {
+                    return self.compileExpression(call_expr);
+                }
+
                 const left = try self.compileExpression(binary.left);
                 const right = try self.compileExpression(binary.right);
 

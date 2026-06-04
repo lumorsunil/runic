@@ -1,6 +1,7 @@
-// `>` is an output redirect only in command position (a statement). In a value
-// context — an `if`/`for`/`match` head, a binding RHS, a yield/return value —
-// `>` is the greater-than comparison instead. (`>>` and `>&` always redirect;
+// `>` is overloaded by its left operand: a command (external executable, block,
+// or subshell) on the left makes it an output redirect; a value or in-scope
+// binding makes it the greater-than comparison. So these all compare, in any
+// context (condition, binding RHS, loop body). (`>>` and `>&` always redirect;
 // `>=`/`<`/`<=` are always comparisons.)
 const a = 7
 const b = 3
