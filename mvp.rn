@@ -98,5 +98,4 @@ for (my_array, my_array_2, 0..) |a, b, i| {
 }
 
 // functions with pipelines
-// TO BE SUPPORTED (maybe?)
-// hello "I'm runic with a pipeline." | cat
+hello "I'm runic with a pipeline." | cat
