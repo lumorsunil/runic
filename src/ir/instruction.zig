@@ -258,8 +258,9 @@ pub const Instruction = struct {
             writer: *std.Io.Writer,
         ) std.Io.Writer.Error!void {
             const span_ = self.span();
-            var cwd_buffer: [512]u8 = undefined;
-            const cwd = std.process.getCwd(&cwd_buffer) catch "";
+            // Stripping the cwd prefix would require an `std.Io` instance, which
+            // is not available inside `format`; leave paths absolute instead.
+            const cwd: []const u8 = "";
             var file_name: []const u8 = span_.start.file;
             if (std.mem.startsWith(u8, span_.start.file, cwd)) {
                 file_name = file_name[cwd.len..];

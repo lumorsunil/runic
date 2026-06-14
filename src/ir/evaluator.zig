@@ -29,10 +29,11 @@ const MaterializedExecArgv = struct {
 
 pub const Error =
     Allocator.Error ||
-    std.process.Child.SpawnError ||
+    std.process.SpawnError ||
     std.process.Child.WaitError ||
-    std.fs.File.OpenError ||
-    std.fs.File.SeekError ||
+    std.Io.File.OpenError ||
+    std.Io.File.SeekError ||
+    std.Io.File.StatError ||
     std.Io.Reader.Error ||
     runic.stream.StreamError ||
     ir.Value.DeserializeError ||
@@ -84,6 +85,7 @@ pub const IREvaluator = struct {
     context: *ir.context.IRProgramContext,
 
     pub const Config = struct {
+        io: std.Io,
         verbose: bool,
         stdin: *ReaderWriterStream,
         stdout: *ReaderWriterStream,
@@ -379,14 +381,14 @@ pub const IREvaluator = struct {
         defer self.allocator.free(owned_flags);
 
         const ctx = self.context.getSubshellContextPtr(thread.private.subshell_context);
-        var child = std.process.Child.init(try argv.argv.toOwnedSlice(self.allocator), self.allocator);
+        const io = self.config.io;
+        const argv_slice = try argv.argv.toOwnedSlice(self.allocator);
         defer {
-            for (child.argv, owned_flags) |arg, is_owned| {
+            for (argv_slice, owned_flags) |arg, is_owned| {
                 if (is_owned) self.allocator.free(arg);
             }
-            self.allocator.free(child.argv);
+            self.allocator.free(argv_slice);
         }
-        child.env_map = ctx.env;
         const stdin_handle = thread.private.stack.items[0].pipe;
         const stdout_handle = thread.private.stack.items[1].pipe;
         const stderr_handle = thread.private.stack.items[2].pipe;
@@ -395,36 +397,43 @@ pub const IREvaluator = struct {
         const stdout_pipe = try self.context.getPipe(stdout_handle);
         const stderr_pipe = try self.context.getPipe(stderr_handle);
 
-        child.stdin_behavior = self.childStdinBehavior();
-        child.stdout_behavior = try self.childStdIoBehavior(stdout_pipe, self.config.stdout, self.config.stdout_is_tty);
-        child.stderr_behavior = try self.childStdIoBehavior(stderr_pipe, self.config.stderr, self.config.stderr_is_tty);
-        child.cwd = ctx.cwd;
-        try flushInheritedChildOutput(stdout_pipe, child.stdout_behavior);
-        try flushInheritedChildOutput(stderr_pipe, child.stderr_behavior);
-        try child.spawn();
+        const stdin_behavior = self.childStdinBehavior();
+        const stdout_behavior = try self.childStdIoBehavior(stdout_pipe, self.config.stdout, self.config.stdout_is_tty);
+        const stderr_behavior = try self.childStdIoBehavior(stderr_pipe, self.config.stderr, self.config.stderr_is_tty);
+        try flushInheritedChildOutput(stdout_pipe, stdout_behavior);
+        try flushInheritedChildOutput(stderr_pipe, stderr_behavior);
+
+        const child = try std.process.spawn(io, .{
+            .argv = argv_slice,
+            .environ_map = &ctx.env,
+            .cwd = if (ctx.cwd) |c| .{ .path = c } else .inherit,
+            .stdin = stdin_behavior,
+            .stdout = stdout_behavior,
+            .stderr = stderr_behavior,
+        });
 
         const child_ptr = try self.allocator.create(std.process.Child);
         child_ptr.* = child;
 
         const process_io = try self.allocator.create(CloseableProcessIo);
-        process_io.* = .init(child_ptr, self.config.tracer);
+        process_io.* = .init(io, child_ptr, argv_slice[0], self.config.tracer);
         process_io.connect();
 
         try stdin_pipe.connectDestination(process_io.closeableStdin());
-        if (child.stdout_behavior == .Pipe) try stdout_pipe.connectSource(process_io.closeableStdout());
-        if (child.stderr_behavior == .Pipe) try stderr_pipe.connectSource(process_io.closeableStderr());
+        if (std.meta.activeTag(stdout_behavior) == .pipe) try stdout_pipe.connectSource(process_io.closeableStdout());
+        if (std.meta.activeTag(stderr_behavior) == .pipe) try stderr_pipe.connectSource(process_io.closeableStderr());
 
-        const exit_code: ExitCode = switch (try child_ptr.wait()) {
-            .Exited => |code| .fromByte(@intCast(code)),
-            .Signal => |sig| .fromByte(@intCast(128 + sig)),
+        const exit_code: ExitCode = switch (try child_ptr.wait(io)) {
+            .exited => |code| .fromByte(@intCast(code)),
+            .signal => |sig| .fromByte(@intCast(128 + @intFromEnum(sig))),
             else => .fromByte(1),
         };
 
-        if (child.stdout_behavior == .Pipe) while (true) {
+        if (std.meta.activeTag(stdout_behavior) == .pipe) while (true) {
             const event = try stdout_pipe.forward(.unlimited);
             if (event != .not_done) break;
         };
-        if (child.stderr_behavior == .Pipe) while (true) {
+        if (std.meta.activeTag(stderr_behavior) == .pipe) while (true) {
             const event = try stderr_pipe.forward(.unlimited);
             if (event != .not_done) break;
         };
@@ -437,18 +446,18 @@ pub const IREvaluator = struct {
         pipe: *ReaderWriterStream,
         root_pipe: *ReaderWriterStream,
         root_is_tty: bool,
-    ) Error!std.process.Child.StdIo {
+    ) Error!std.process.SpawnOptions.StdIo {
         _ = self;
-        return if (root_is_tty and pipe == root_pipe) .Inherit else .Pipe;
+        return if (root_is_tty and pipe == root_pipe) .inherit else .pipe;
     }
 
-    fn childStdinBehavior(self: *IREvaluator) std.process.Child.StdIo {
+    fn childStdinBehavior(self: *IREvaluator) std.process.SpawnOptions.StdIo {
         _ = self;
-        return .Pipe;
+        return .pipe;
     }
 
-    fn flushInheritedChildOutput(pipe: *ReaderWriterStream, behavior: std.process.Child.StdIo) Error!void {
-        if (behavior != .Inherit) return;
+    fn flushInheritedChildOutput(pipe: *ReaderWriterStream, behavior: std.process.SpawnOptions.StdIo) Error!void {
+        if (std.meta.activeTag(behavior) != .inherit) return;
         if (pipe.destination) |destination| {
             try destination.writer.flush();
         }
@@ -966,12 +975,10 @@ pub const IREvaluator = struct {
                 const resolved = try self.resolveValueSource(thread, path_source);
                 const path: []const u8 = if (resolved == .void) blk: {
                     // cd with no argument: go to HOME
-                    if (ctx.env) |env_map| {
-                        if (env_map.get("HOME")) |home| {
-                            break :blk try self.allocator.dupe(u8, home);
-                        }
+                    if (ctx.env.get("HOME")) |home| {
+                        break :blk try self.allocator.dupe(u8, home);
                     }
-                    break :blk std.process.getEnvVarOwned(self.allocator, "HOME") catch "/";
+                    break :blk try self.allocator.dupe(u8, "/");
                 } else blk: {
                     var path_writer = std.Io.Writer.Allocating.init(self.allocator);
                     try self.materializeString(thread, resolved, &path_writer.writer);
@@ -984,19 +991,20 @@ pub const IREvaluator = struct {
                 // current subshell context's cwd (or the OS process cwd if none is set yet).
                 // std.fs.path.resolve must NOT be used here — on POSIX it does not prepend
                 // the cwd, so it leaves relative paths relative.
-                const abs_path: []const u8 = blk: {
+                const io = self.config.io;
+                const abs_path = blk: {
                     if (ctx.cwd) |base| {
-                        var base_dir = std.fs.openDirAbsolute(base, .{}) catch {
+                        var base_dir = std.Io.Dir.openDirAbsolute(io, base, .{}) catch {
                             thread.private.result_register = .{ .exit_code = .fromByte(1) };
                             return .cont;
                         };
-                        defer base_dir.close();
-                        break :blk base_dir.realpathAlloc(self.allocator, path) catch {
+                        defer base_dir.close(io);
+                        break :blk base_dir.realPathFileAlloc(io, path, self.allocator) catch {
                             thread.private.result_register = .{ .exit_code = .fromByte(1) };
                             return .cont;
                         };
                     } else {
-                        break :blk std.fs.cwd().realpathAlloc(self.allocator, path) catch {
+                        break :blk std.Io.Dir.cwd().realPathFileAlloc(io, path, self.allocator) catch {
                             thread.private.result_register = .{ .exit_code = .fromByte(1) };
                             return .cont;
                         };
@@ -1004,12 +1012,12 @@ pub const IREvaluator = struct {
                 };
                 defer self.allocator.free(abs_path);
 
-                // Verify abs_path is a directory (realpathAlloc verifies existence but not type).
-                var target_dir = std.fs.openDirAbsolute(abs_path, .{}) catch {
+                // Verify abs_path is a directory (realpath verifies existence but not type).
+                var target_dir = std.Io.Dir.openDirAbsolute(io, abs_path, .{}) catch {
                     thread.private.result_register = .{ .exit_code = .fromByte(1) };
                     return .cont;
                 };
-                target_dir.close();
+                target_dir.close(io);
 
                 // Update the subshell context's cwd (do NOT call chdir — each subshell context
                 // tracks its own directory; child processes receive it via child.cwd).
@@ -1171,7 +1179,7 @@ pub const IREvaluator = struct {
                 if (pipe.config.typed) {
                     var it = std.mem.splitScalar(u8, text_writer.written(), '\n');
                     while (it.next()) |line| {
-                        const trimmed = std.mem.trimRight(u8, line, "\r");
+                        const trimmed = std.mem.trimEnd(u8, line, "\r");
                         if (trimmed.len == 0) continue;
                         const owned = try self.allocator.dupe(u8, trimmed);
                         try self.context.enqueueTypedPipeValue(pipe_handle, .{ .zig_string = owned });
@@ -1182,7 +1190,7 @@ pub const IREvaluator = struct {
                 var w = pipe.closeableWriter().writer;
                 var it = std.mem.splitScalar(u8, text_writer.written(), '\n');
                 while (it.next()) |line| {
-                    const trimmed = std.mem.trimRight(u8, line, "\r");
+                    const trimmed = std.mem.trimEnd(u8, line, "\r");
                     if (trimmed.len == 0) continue;
                     try w.writeAll(trimmed);
                     try w.writeByte('\n');
@@ -1226,7 +1234,7 @@ pub const IREvaluator = struct {
                 const operand = try self.resolveLocation(thread, neg.operand);
                 const negated = switch (operand) {
                     .exit_code => |exit_code| exit_code.negate(),
-                    .addr => |_| if (neg.operand.isType(compiler.execution_result_struct_type))
+                    .addr => if (neg.operand.isType(compiler.execution_result_struct_type))
                         (try self.resolveExecutionResultExitCode(thread, neg.operand)).negate()
                     else
                         return Error.UnsupportedNegOperand,
@@ -1283,10 +1291,9 @@ pub const IREvaluator = struct {
                     argv.appendAssumeCapacity(try arg_writer.toOwnedSlice());
                 }
 
-                const child = try self.allocator.create(std.process.Child);
-                child.* = std.process.Child.init(try argv.toOwnedSlice(self.allocator), self.allocator);
+                const argv_slice = try argv.toOwnedSlice(self.allocator);
                 const ctx = self.context.getSubshellContextPtr(thread.private.subshell_context);
-                child.env_map = ctx.env;
+                const io = self.config.io;
                 const stdin_handle = thread.private.stack.items[0].pipe;
                 const stdout_handle = thread.private.stack.items[1].pipe;
                 const stderr_handle = thread.private.stack.items[2].pipe;
@@ -1295,24 +1302,31 @@ pub const IREvaluator = struct {
                 const stdout_pipe = try self.context.getPipe(stdout_handle);
                 const stderr_pipe = try self.context.getPipe(stderr_handle);
 
-                child.stdin_behavior = self.childStdinBehavior();
-                child.stdout_behavior = try self.childStdIoBehavior(stdout_pipe, self.config.stdout, self.config.stdout_is_tty);
-                child.stderr_behavior = try self.childStdIoBehavior(stderr_pipe, self.config.stderr, self.config.stderr_is_tty);
-                child.cwd = ctx.cwd;
-                try flushInheritedChildOutput(stdout_pipe, child.stdout_behavior);
-                try flushInheritedChildOutput(stderr_pipe, child.stderr_behavior);
-                try child.spawn();
-                try child.waitForSpawn();
+                const stdin_behavior = self.childStdinBehavior();
+                const stdout_behavior = try self.childStdIoBehavior(stdout_pipe, self.config.stdout, self.config.stdout_is_tty);
+                const stderr_behavior = try self.childStdIoBehavior(stderr_pipe, self.config.stderr, self.config.stderr_is_tty);
+                try flushInheritedChildOutput(stdout_pipe, stdout_behavior);
+                try flushInheritedChildOutput(stderr_pipe, stderr_behavior);
+
+                const child = try self.allocator.create(std.process.Child);
+                child.* = try std.process.spawn(io, .{
+                    .argv = argv_slice,
+                    .environ_map = &ctx.env,
+                    .cwd = if (ctx.cwd) |c| .{ .path = c } else .inherit,
+                    .stdin = stdin_behavior,
+                    .stdout = stdout_behavior,
+                    .stderr = stderr_behavior,
+                });
                 thread.private.process = child;
 
                 // TODO: memory management
                 const process_io = try self.allocator.create(CloseableProcessIo);
-                process_io.* = .init(child, self.config.tracer);
+                process_io.* = .init(io, child, argv_slice[0], self.config.tracer);
                 process_io.connect();
 
                 try stdin_pipe.connectDestination(process_io.closeableStdin());
-                if (child.stdout_behavior == .Pipe) try stdout_pipe.connectSource(process_io.closeableStdout());
-                if (child.stderr_behavior == .Pipe) try stderr_pipe.connectSource(process_io.closeableStderr());
+                if (std.meta.activeTag(stdout_behavior) == .pipe) try stdout_pipe.connectSource(process_io.closeableStdout());
+                if (std.meta.activeTag(stderr_behavior) == .pipe) try stderr_pipe.connectSource(process_io.closeableStderr());
 
                 const handle = try self.context.addCloseable(process_io.closeable());
                 thread.private.result_register = .{ .closeable = handle };
@@ -1417,8 +1431,8 @@ pub const IREvaluator = struct {
             },
             .get_env => |get_env| {
                 const ctx = self.context.getSubshellContextPtr(thread.private.subshell_context);
-                const value: ir.Value = if (ctx.env) |env_map|
-                    if (env_map.get(get_env.name)) |text| .{ .zig_string = text } else .null
+                const value: ir.Value = if (ctx.env.get(get_env.name)) |text|
+                    .{ .zig_string = text }
                 else
                     .null;
                 try self.setLocation(thread, get_env.result, value);
@@ -1429,7 +1443,7 @@ pub const IREvaluator = struct {
                 const env_map = try self.getOrCreateSubshellEnv(ctx);
                 const value = try self.resolveValueSource(thread, set_env.value);
                 if (value == .null) {
-                    _ = env_map.remove(set_env.name);
+                    _ = env_map.swapRemove(set_env.name);
                     return .cont;
                 }
                 const text = try self.materializeOwnedString(thread, value);
@@ -1472,20 +1486,17 @@ pub const IREvaluator = struct {
                 );
                 const path = try path_writer.toOwnedSlice();
 
+                const io = self.config.io;
                 const file = switch (pipe_file.mode) {
-                    .truncate => try std.fs.cwd().createFile(path, .{}),
-                    .append => append: {
-                        var f = std.fs.cwd().openFile(path, .{ .mode = .read_write }) catch |err| switch (err) {
-                            error.FileNotFound => try std.fs.cwd().createFile(path, .{}),
-                            else => return err,
-                        };
-                        try f.seekFromEnd(0);
-                        break :append f;
+                    .truncate => try std.Io.Dir.cwd().createFile(io, path, .{}),
+                    .append => std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write }) catch |err| switch (err) {
+                        error.FileNotFound => try std.Io.Dir.cwd().createFile(io, path, .{}),
+                        else => return err,
                     },
                 };
 
                 const file_sink = try self.allocator.create(FileSink);
-                file_sink.* = .init(file, path, pipe_file.mode == .append);
+                try file_sink.init(io, file, path, pipe_file.mode == .append);
                 try self.context.addFileSink(file_sink);
                 try pipe.connectDestination(file_sink.closeableWriter());
 
@@ -1943,14 +1954,9 @@ pub const IREvaluator = struct {
     fn getOrCreateSubshellEnv(
         self: *IREvaluator,
         ctx: *ir.context.SubshellContext,
-    ) Allocator.Error!*std.process.EnvMap {
-        if (ctx.env) |env| return env;
-
-        const env = try self.allocator.create(std.process.EnvMap);
-        errdefer self.allocator.destroy(env);
-        env.* = std.process.EnvMap.init(self.allocator);
-        ctx.env = env;
-        return env;
+    ) Allocator.Error!*std.process.Environ.Map {
+        _ = self;
+        return &ctx.env;
     }
 
     pub const MaterializeStringError =
@@ -2075,6 +2081,20 @@ pub const IREvaluator = struct {
     }
 };
 
+// Lazily-initialized, process-wide `std.Io` for the unit tests. The backing
+// `Threaded` instance is intentionally leaked: the test process tears it down on
+// exit, and sharing one instance keeps the test fixtures simple.
+var test_threaded: std.Io.Threaded = undefined;
+var test_threaded_ready = false;
+
+fn testIo() std.Io {
+    if (!test_threaded_ready) {
+        test_threaded = .init(std.heap.page_allocator, .{});
+        test_threaded_ready = true;
+    }
+    return test_threaded.io();
+}
+
 fn initTestEvaluator(
     allocator: Allocator,
 ) !struct {
@@ -2084,11 +2104,11 @@ fn initTestEvaluator(
     stderr_stream: *ReaderWriterStream,
     context: ir.context.IRProgramContext,
 } {
-    var tracer = Tracer.init(allocator, .{ .echo_to_stdout = false });
+    var tracer = Tracer.init(testIo(), allocator, .{ .echo_to_stdout = false });
     const stdin_stream = try Stream(u8).initReaderWriter(allocator, "test-stdin", .{}, &tracer);
     const stdout_stream = try Stream(u8).initReaderWriter(allocator, "test-stdout", .{}, &tracer);
     const stderr_stream = try Stream(u8).initReaderWriter(allocator, "test-stderr", .{}, &tracer);
-    const context = ir.context.IRProgramContext.init(allocator, .{
+    const context = ir.context.IRProgramContext.init(testIo(), allocator, .{
         .data = &.{},
         .instructions = &.{},
         .labels = .init(),
@@ -2115,6 +2135,7 @@ test "evaluator step reports missing current thread" {
     defer fixture.tracer.deinit();
 
     var evaluator = IREvaluator.init(allocator, .{
+        .io = testIo(),
         .verbose = false,
         .stdin = fixture.stdin_stream,
         .stdout = fixture.stdout_stream,
@@ -2137,6 +2158,7 @@ test "evaluator tty regression inherits direct root stdout and stderr" {
     defer fixture.tracer.deinit();
 
     var evaluator = IREvaluator.init(allocator, .{
+        .io = testIo(),
         .verbose = false,
         .stdin = fixture.stdin_stream,
         .stdout = fixture.stdout_stream,
@@ -2147,11 +2169,11 @@ test "evaluator tty regression inherits direct root stdout and stderr" {
     }, &fixture.context);
 
     try std.testing.expectEqual(
-        std.process.Child.StdIo.Inherit,
+        std.process.SpawnOptions.StdIo.inherit,
         try evaluator.childStdIoBehavior(fixture.stdout_stream, fixture.stdout_stream, true),
     );
     try std.testing.expectEqual(
-        std.process.Child.StdIo.Inherit,
+        std.process.SpawnOptions.StdIo.inherit,
         try evaluator.childStdIoBehavior(fixture.stderr_stream, fixture.stderr_stream, true),
     );
 }
@@ -2169,6 +2191,7 @@ test "evaluator tty regression keeps redirected output on pipes" {
     defer redirected_stdout.deinitParent();
 
     var evaluator = IREvaluator.init(allocator, .{
+        .io = testIo(),
         .verbose = false,
         .stdin = fixture.stdin_stream,
         .stdout = fixture.stdout_stream,
@@ -2179,11 +2202,11 @@ test "evaluator tty regression keeps redirected output on pipes" {
     }, &fixture.context);
 
     try std.testing.expectEqual(
-        std.process.Child.StdIo.Pipe,
+        std.process.SpawnOptions.StdIo.pipe,
         try evaluator.childStdIoBehavior(redirected_stdout, fixture.stdout_stream, true),
     );
     try std.testing.expectEqual(
-        std.process.Child.StdIo.Pipe,
+        std.process.SpawnOptions.StdIo.pipe,
         try evaluator.childStdIoBehavior(fixture.stdout_stream, fixture.stdout_stream, false),
     );
 }
@@ -2198,6 +2221,7 @@ test "evaluator tty regression keeps stdin piped" {
     defer fixture.tracer.deinit();
 
     var evaluator = IREvaluator.init(allocator, .{
+        .io = testIo(),
         .verbose = false,
         .stdin = fixture.stdin_stream,
         .stdout = fixture.stdout_stream,
@@ -2208,7 +2232,7 @@ test "evaluator tty regression keeps stdin piped" {
     }, &fixture.context);
 
     try std.testing.expectEqual(
-        std.process.Child.StdIo.Pipe,
+        std.process.SpawnOptions.StdIo.pipe,
         evaluator.childStdinBehavior(),
     );
 }
@@ -2223,6 +2247,7 @@ test "evaluator materializeString reports missing pipe handle" {
     defer fixture.tracer.deinit();
 
     var evaluator = IREvaluator.init(allocator, .{
+        .io = testIo(),
         .verbose = false,
         .stdin = fixture.stdin_stream,
         .stdout = fixture.stdout_stream,
@@ -2251,6 +2276,7 @@ test "evaluator fast arithmetic path updates ref destination" {
     defer fixture.tracer.deinit();
 
     var evaluator = IREvaluator.init(allocator, .{
+        .io = testIo(),
         .verbose = false,
         .stdin = fixture.stdin_stream,
         .stdout = fixture.stdout_stream,
@@ -2289,6 +2315,7 @@ test "evaluator fast arithmetic path updates closure destination" {
     defer fixture.tracer.deinit();
 
     var evaluator = IREvaluator.init(allocator, .{
+        .io = testIo(),
         .verbose = false,
         .stdin = fixture.stdin_stream,
         .stdout = fixture.stdout_stream,
@@ -2334,6 +2361,7 @@ test "evaluator fast compare path updates register destination" {
     defer fixture.tracer.deinit();
 
     var evaluator = IREvaluator.init(allocator, .{
+        .io = testIo(),
         .verbose = false,
         .stdin = fixture.stdin_stream,
         .stdout = fixture.stdout_stream,
@@ -2372,6 +2400,7 @@ test "evaluator fast compare path reads dereferenced refs" {
     defer fixture.tracer.deinit();
 
     var evaluator = IREvaluator.init(allocator, .{
+        .io = testIo(),
         .verbose = false,
         .stdin = fixture.stdin_stream,
         .stdout = fixture.stdout_stream,
@@ -2412,6 +2441,7 @@ test "evaluator fused range loop updates accumulator and exits loop" {
     defer fixture.tracer.deinit();
 
     var evaluator = IREvaluator.init(allocator, .{
+        .io = testIo(),
         .verbose = false,
         .stdin = fixture.stdin_stream,
         .stdout = fixture.stdout_stream,

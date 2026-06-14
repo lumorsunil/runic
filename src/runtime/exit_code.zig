@@ -7,13 +7,13 @@ pub const ExitCode = union(enum) {
 
     pub fn fromByte(byte: u8) ExitCode {
         if (byte == 0) return .success;
-        return .{ .term = .{ .Exited = byte } };
+        return .{ .term = .{ .exited = byte } };
     }
 
-    pub fn fromTerm(term: std.process.Child.SpawnError!std.process.Child.Term) ExitCode {
+    pub fn fromTerm(term: anyerror!std.process.Child.Term) ExitCode {
         if (term) |t| {
             return switch (t) {
-                .Exited => |exit_code| fromByte(exit_code),
+                .exited => |exit_code| fromByte(exit_code),
                 else => .{ .term = t },
             };
         } else |err| {
@@ -37,7 +37,7 @@ pub const ExitCode = union(enum) {
         return switch (self) {
             .success => 0,
             .term => |term| switch (term) {
-                .Exited => |exit_code| exit_code,
+                .exited => |exit_code| exit_code,
                 else => 1,
             },
             .err => 1,

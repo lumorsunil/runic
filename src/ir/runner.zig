@@ -15,10 +15,11 @@ const span_color = rainbow.beginBgColor(.red) ++ rainbow.beginColor(.black);
 const end_color = rainbow.endColor();
 
 pub const IRConfig = struct {
+    io: std.Io,
     verbose: bool,
     dry_run: bool,
     script_args: []const []const u8 = &.{},
-    env: ?*std.process.EnvMap = null,
+    env: *std.process.Environ.Map,
     stdin: *ReaderWriterStream,
     stdout: *ReaderWriterStream,
     stderr: *ReaderWriterStream,
@@ -72,6 +73,7 @@ pub const IRRunner = struct {
 
     pub fn compile(self: *IRRunner) !CompilationResult {
         var compiler = try ir.compiler.IRCompiler.init(
+            self.config.io,
             self.allocator,
             self.document_store,
             self.script,
@@ -82,7 +84,7 @@ pub const IRRunner = struct {
 
         return switch (result) {
             .err => |err| .err_(err.diagnostics()),
-            .success => |shared| .{ .success = .init(self.allocator, shared) },
+            .success => |shared| .{ .success = .init(self.config.io, self.allocator, shared) },
         };
     }
 
@@ -90,6 +92,7 @@ pub const IRRunner = struct {
         var evaluator = ir.evaluator.IREvaluator.init(
             self.allocator,
             .{
+                .io = self.config.io,
                 .verbose = self.config.verbose,
                 .stdin = self.config.stdin,
                 .stdout = self.config.stdout,
@@ -217,7 +220,9 @@ pub fn runIR(
 }
 
 pub fn debugIR(
+    io: std.Io,
     allocator: Allocator,
+    env_map: *std.process.Environ.Map,
     script: *ast.Script,
     document_store: *DocumentStore,
     stdin: *ReaderWriterStream,
@@ -232,7 +237,7 @@ pub fn debugIR(
 ) !RunResult {
     var arena = std.heap.ArenaAllocator.init(allocator);
     const arena_allocator = arena.allocator();
-    var compiler = try ir.compiler.IRCompiler.init(arena_allocator, document_store, script, &.{}, null);
+    var compiler = try ir.compiler.IRCompiler.init(io, arena_allocator, document_store, script, &.{}, env_map);
     const result = try compiler.compile();
 
     tracer.config.echo_to_stdout = true;
@@ -241,12 +246,13 @@ pub fn debugIR(
     defer arena.deinit();
     const shared = result.success;
 
-    var context = ir.context.IRProgramContext.init(arena_allocator, shared);
+    var context = ir.context.IRProgramContext.init(io, arena_allocator, shared);
     defer context.deinit();
-    try context.addMainThread(null);
+    try context.addMainThread(env_map);
     var debugger = try ir.debugger.IRDebugger.init(
         arena_allocator,
         .{
+            .io = io,
             .verbose = false,
             .stdin = stdin,
             .stdout = stdout,

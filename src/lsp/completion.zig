@@ -75,7 +75,9 @@ const CompletionKind = enum {
 };
 
 pub const CollectMatchesContext = struct {
+    io: std.Io,
     allocator: Allocator,
+    env_map: *std.process.Environ.Map,
     file: []const u8,
     text_slice: []const u8,
     line_index: usize,
@@ -102,7 +104,13 @@ fn determineCompletionKind(context: CollectMatchesContext) !CompletionKind {
     const line_index = 1;
     const char_index = context.char_index + 1;
     const line_slice = getLine(context);
-    var lexer = try runic.lexer.Stream.init(context.allocator, context.file, line_slice);
+    var lexer = try runic.lexer.Stream.init(
+        context.io,
+        context.allocator,
+        context.env_map,
+        context.file,
+        line_slice,
+    );
     defer lexer.deinit();
 
     while (true) {
@@ -182,7 +190,13 @@ fn appendImportedModuleMembersFromText(
     _: *runic.semantic.TypeChecker,
     object_name: []const u8,
 ) !void {
-    var lexer = try runic.lexer.Lexer.init(context.allocator, context.file, context.text_slice);
+    var lexer = try runic.lexer.Lexer.init(
+        context.io,
+        context.allocator,
+        context.env_map,
+        context.file,
+        context.text_slice,
+    );
     defer lexer.deinit();
 
     while (true) {
@@ -205,6 +219,7 @@ fn appendImportedModuleMembersFromText(
                 if (string_text.tag != .string_text) continue;
 
                 const module_path = runic.document.resolveModulePath(
+                    context.io,
                     context.allocator,
                     context.file,
                     string_text.lexeme,
@@ -216,7 +231,7 @@ fn appendImportedModuleMembersFromText(
                     .span = string_text.span,
                 };
                 _ = module_type;
-                try appendPubModuleDeclsFromFile(matches, context.allocator, module_path);
+                try appendPubModuleDeclsFromFile(matches, context.io, context.allocator, context.env_map, module_path);
                 try appendExecutionMembers(matches, context.allocator, object_name);
                 return;
             },
@@ -259,15 +274,19 @@ fn isLikelyExecutableInitializer(first: runic.token.Token, second: runic.token.T
 
 fn appendPubModuleDeclsFromFile(
     matches: *MatchList,
+    io: std.Io,
     allocator: Allocator,
+    env_map: *std.process.Environ.Map,
     module_path: []const u8,
 ) !void {
-    const file = std.fs.openFileAbsolute(module_path, .{}) catch return;
-    defer file.close();
-    const source = file.readToEndAlloc(allocator, 4 * 1024 * 1024) catch return;
+    const file = std.Io.Dir.openFileAbsolute(io, module_path, .{}) catch return;
+    defer file.close(io);
+    var buffer: [1024]u8 = undefined;
+    var reader = file.reader(io, &buffer);
+    const source = try reader.interface.allocRemaining(allocator, .limited(4 * 1024 * 1024));
     defer allocator.free(source);
 
-    var lexer = try runic.lexer.Lexer.init(allocator, module_path, source);
+    var lexer = try runic.lexer.Lexer.init(io, allocator, env_map, module_path, source);
     defer lexer.deinit();
 
     while (true) {
@@ -456,13 +475,13 @@ fn collectModuleMatches(context: CollectMatchesContext) !MatchList {
     const dirname = try std.fs.path.join(context.allocator, &.{ script_dirname, module_path_prefix });
     defer context.allocator.free(dirname);
 
-    var dir = try std.fs.openDirAbsolute(dirname, .{ .iterate = true });
-    defer dir.close();
+    var dir = try std.Io.Dir.openDirAbsolute(context.io, dirname, .{ .iterate = true });
+    defer dir.close(context.io);
     var it = dir.iterate();
 
     var matches = MatchList.init(context.allocator);
 
-    while (try it.next()) |entry| {
+    while (try it.next(context.io)) |entry| {
         switch (entry.kind) {
             .file, .directory => {
                 if (entry.kind == .file and !std.mem.endsWith(u8, entry.name, ".rn")) continue;

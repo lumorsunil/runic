@@ -10,14 +10,23 @@ const DocumentStore = runic.DocumentStore;
 const reportErrors = @import("reporter.zig").reportErrors;
 
 pub const LspDocumentStore = struct {
+    io: std.Io,
     allocator: Allocator,
+    environ_map: *std.process.Environ.Map,
     document_store: DocumentStore = .{ .vtable = vtable },
     map: std.StringHashMap(*Document),
     workspace: *workspace_mod.Workspace,
 
-    pub fn init(allocator: Allocator, workspace: *workspace_mod.Workspace) LspDocumentStore {
+    pub fn init(
+        io: std.Io,
+        allocator: Allocator,
+        environ_map: *std.process.Environ.Map,
+        workspace: *workspace_mod.Workspace,
+    ) LspDocumentStore {
         return .{
+            .io = io,
             .allocator = allocator,
+            .environ_map = environ_map,
             .map = .init(allocator),
             .workspace = workspace,
         };
@@ -135,7 +144,9 @@ pub const LspDocumentStore = struct {
     ) !void {
         if (options.shouldRebuildSymbols()) {
             try document.rebuildSymbols(
+                self.io,
                 self.allocator,
+                self.environ_map,
                 &self.document_store,
                 self.workspace.describePath(document.path),
             );
@@ -180,13 +191,13 @@ pub const LspDocumentStore = struct {
     }
 
     fn readDocumentFile(self: *LspDocumentStore, path: []const u8) ![]const u8 {
-        const file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
+        const file = std.Io.Dir.cwd().openFile(self.io, path, .{}) catch |err| switch (err) {
             error.FileNotFound => return DocumentStore.Error.DocumentNotFound,
             else => return err,
         };
-        defer file.close();
+        defer file.close(self.io);
         var file_buffer: [512]u8 = undefined;
-        var file_reader = file.reader(&file_buffer);
+        var file_reader = file.reader(self.io, &file_buffer);
         const reader = &file_reader.interface;
 
         var alloc_writer = std.Io.Writer.Allocating.init(self.allocator);
@@ -228,7 +239,9 @@ pub const LspDocumentStore = struct {
         try doc.setText(self.allocator, text, version);
         self.allocator.free(text);
         try doc.rebuildSymbols(
+            self.io,
             self.allocator,
+            self.environ_map,
             &self.document_store,
             workspace.describePath(doc.path),
         );
@@ -289,8 +302,13 @@ pub const LspDocumentStore = struct {
     pub fn resolveUri(self: LspDocumentStore, path: []const u8) ![]const u8 {
         const absolutePath = if (std.fs.path.isAbsolute(path))
             try self.allocator.dupe(u8, path)
-        else
-            try std.fs.cwd().realpathAlloc(self.allocator, path);
+        else blk: {
+            // `realPathFileAlloc` returns a sentinel-terminated `[:0]u8`; re-dupe it
+            // into a plain slice so the free below matches the allocation size.
+            const real = try std.Io.Dir.cwd().realPathFileAlloc(self.io, path, self.allocator);
+            defer self.allocator.free(real);
+            break :blk try self.allocator.dupe(u8, real);
+        };
         defer self.allocator.free(absolutePath);
         return std.fmt.allocPrint(self.allocator, "file://{s}", .{absolutePath});
     }
@@ -360,7 +378,9 @@ const Document = struct {
 
     fn rebuildSymbols(
         self: *Document,
+        io: std.Io,
         allocator: Allocator,
+        environ_map: *std.process.Environ.Map,
         document_store: *DocumentStore,
         detail: []const u8,
     ) !void {
@@ -373,7 +393,7 @@ const Document = struct {
         if (self.parser) |*p| p.deinit();
 
         self.ast = null;
-        self.parser = runic.parser.Parser.init(allocator, document_store);
+        self.parser = runic.parser.Parser.init(io, allocator, environ_map, document_store);
 
         const lsp_doc_store: *LspDocumentStore = @fieldParentPtr(
             "document_store",

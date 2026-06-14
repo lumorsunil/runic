@@ -32,6 +32,7 @@ pub const Identifier = struct {
 
     pub fn resolveType(
         self: *@This(),
+        _: std.Io,
         _: std.mem.Allocator,
         scope: *semantic.Scope,
     ) ?*const TypeExpr {
@@ -47,6 +48,7 @@ pub const Path = struct {
 
     pub fn resolveType(
         _: *@This(),
+        _: std.Io,
         _: std.mem.Allocator,
         _: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
@@ -64,6 +66,7 @@ pub const Block = struct {
 
     pub fn resolveType(
         self: *@This(),
+        _: std.Io,
         _: std.mem.Allocator,
         _: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
@@ -78,6 +81,7 @@ pub const SubshellExpr = struct {
 
     pub fn resolveType(
         _: *@This(),
+        _: std.Io,
         _: std.mem.Allocator,
         _: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
@@ -441,6 +445,7 @@ pub const TypeExpr = union(enum) {
 
         pub fn resolveType(
             self: *@This(),
+            _: std.Io,
             _: std.mem.Allocator,
             _: *semantic.Scope,
         ) semantic.Scope.Error!?*const TypeExpr {
@@ -599,6 +604,7 @@ pub const Literal = union(enum) {
 
     pub fn resolveType(
         self: *@This(),
+        _: std.Io,
         allocator: std.mem.Allocator,
         _: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
@@ -635,6 +641,7 @@ pub const IntegerLiteral = struct {
 
     pub fn resolveType(
         self: *@This(),
+        _: std.Io,
         _: std.mem.Allocator,
         _: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
@@ -706,11 +713,12 @@ pub const Expression = union(enum) {
 
     pub fn resolveType(
         self: *@This(),
+        io: std.Io,
         allocator: std.mem.Allocator,
         scope: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
         return switch (self.*) {
-            inline else => |*expr| expr.resolveType(allocator, scope),
+            inline else => |*expr| expr.resolveType(io, allocator, scope),
         };
     }
 
@@ -736,6 +744,7 @@ pub const EnvVarExpr = struct {
 
     pub fn resolveType(
         self: *@This(),
+        _: std.Io,
         allocator: std.mem.Allocator,
         _: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
@@ -768,6 +777,7 @@ pub const FdExpr = struct {
 
     pub fn resolveType(
         self: *@This(),
+        _: std.Io,
         _: std.mem.Allocator,
         scope: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
@@ -783,6 +793,7 @@ pub const ArrayLiteral = struct {
 
     pub fn resolveType(
         _: *@This(),
+        _: std.Io,
         _: std.mem.Allocator,
         _: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
@@ -802,6 +813,7 @@ pub const MapLiteral = struct {
 
     pub fn resolveType(
         _: *@This(),
+        _: std.Io,
         _: std.mem.Allocator,
         _: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
@@ -817,6 +829,7 @@ pub const RangeLiteral = struct {
 
     pub fn resolveType(
         _: *@This(),
+        _: std.Io,
         _: std.mem.Allocator,
         _: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
@@ -833,12 +846,13 @@ pub const CallExpr = struct {
 
     pub fn resolveType(
         self: *@This(),
+        io: std.Io,
         allocator: std.mem.Allocator,
         scope: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
         if (self.background) return &globalExecutionType;
 
-        const callee_type = try self.callee.resolveType(allocator, scope) orelse return null;
+        const callee_type = try self.callee.resolveType(io, allocator, scope) orelse return null;
 
         return switch (callee_type.*) {
             .function => |function| function.return_type orelse &globalExecutionType,
@@ -854,10 +868,11 @@ pub const MemberExpr = struct {
 
     pub fn resolveType(
         self: *@This(),
+        io: std.Io,
         allocator: std.mem.Allocator,
         scope: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
-        const object_type = try self.object.resolveType(allocator, scope) orelse return null;
+        const object_type = try self.object.resolveType(io, allocator, scope) orelse return null;
 
         if (std.mem.eql(u8, self.member.name, "?")) {
             return switch (object_type.*) {
@@ -893,6 +908,7 @@ pub const IndexExpr = struct {
 
     pub fn resolveType(
         _: *@This(),
+        _: std.Io,
         _: std.mem.Allocator,
         _: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
@@ -907,6 +923,7 @@ pub const UnaryExpr = struct {
 
     pub fn resolveType(
         _: *@This(),
+        _: std.Io,
         _: std.mem.Allocator,
         _: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
@@ -933,11 +950,12 @@ pub const BinaryExpr = struct {
 
     pub fn resolveType(
         self: *@This(),
+        io: std.Io,
         allocator: std.mem.Allocator,
         scope: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
-        const left_type = try self.left.resolveType(allocator, scope);
-        const right_type = try self.right.resolveType(allocator, scope);
+        const left_type = try self.left.resolveType(io, allocator, scope);
+        const right_type = try self.right.resolveType(io, allocator, scope);
 
         return switch (self.op) {
             .assign, .add_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign => left_type,
@@ -1111,6 +1129,7 @@ pub const FunctionLiteral = struct {
 
     pub fn resolveType(
         _: *@This(),
+        _: std.Io,
         _: std.mem.Allocator,
         _: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
@@ -1142,6 +1161,7 @@ pub const IfExpr = struct {
 
     pub fn resolveType(
         _: *@This(),
+        _: std.Io,
         _: std.mem.Allocator,
         _: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
@@ -1156,6 +1176,7 @@ pub const MatchExpr = struct {
 
     pub fn resolveType(
         _: *@This(),
+        _: std.Io,
         _: std.mem.Allocator,
         _: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
@@ -1194,6 +1215,7 @@ pub const TryExpr = struct {
 
     pub fn resolveType(
         _: *@This(),
+        _: std.Io,
         _: std.mem.Allocator,
         _: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
@@ -1208,6 +1230,7 @@ pub const CatchExpr = struct {
 
     pub fn resolveType(
         _: *@This(),
+        _: std.Io,
         _: std.mem.Allocator,
         _: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
@@ -1229,10 +1252,12 @@ pub const ImportExpr = struct {
 
     pub fn resolveType(
         self: *@This(),
+        io: std.Io,
         allocator: std.mem.Allocator,
         _: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
         const module_path = resolveModulePath(
+            io,
             allocator,
             self.importer,
             self.module_name,
@@ -1251,13 +1276,14 @@ pub const Pipeline = struct {
 
     pub fn resolveType(
         self: *@This(),
+        io: std.Io,
         allocator: std.mem.Allocator,
         scope: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
         if (self.background) return &globalExecutionType;
         if (self.stages.len == 0) return null;
         const last_stage = self.stages[self.stages.len - 1];
-        const stage_type = try last_stage.resolveType(allocator, scope) orelse return null;
+        const stage_type = try last_stage.resolveType(io, allocator, scope) orelse return null;
         return switch (stage_type.*) {
             .function => |function| function.return_type,
             else => stage_type,
@@ -1274,6 +1300,7 @@ pub const Pipeline_deprecated = struct {
 
     pub fn resolveType(
         self: *@This(),
+        io: std.Io,
         allocator: std.mem.Allocator,
         scope: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
@@ -1281,7 +1308,7 @@ pub const Pipeline_deprecated = struct {
             const stage = self.stages[0];
 
             return switch (stage.payload) {
-                .expression => |expr| return expr.resolveType(allocator, scope),
+                .expression => |expr| return expr.resolveType(io, allocator, scope),
                 .command => |command| switch (command.name) {
                     .word => |word| {
                         const binding = scope.lookup(
@@ -1422,6 +1449,7 @@ pub const Script = struct {
 
     pub fn resolveType(
         _: *@This(),
+        _: std.Io,
         _: std.mem.Allocator,
         _: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
@@ -1470,11 +1498,12 @@ pub const Statement = union(enum) {
 
     pub fn resolveType(
         self: *@This(),
+        io: std.Io,
         allocator: std.mem.Allocator,
         scope: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
         return switch (self) {
-            inline else => |s| s.resolveType(allocator, scope),
+            inline else => |s| s.resolveType(io, allocator, scope),
         };
     }
 };
@@ -1487,6 +1516,7 @@ pub const TypeBindingDecl = struct {
 
     pub fn resolveType(
         _: *@This(),
+        _: std.Io,
         _: std.mem.Allocator,
         _: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
@@ -1504,10 +1534,11 @@ pub const BindingDecl = struct {
 
     pub fn resolveType(
         self: *@This(),
+        io: std.Io,
         allocator: std.mem.Allocator,
         scope: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
-        return self.annotation orelse self.initializer.resolveType(allocator, scope);
+        return self.annotation orelse self.initializer.resolveType(io, allocator, scope);
     }
 };
 
@@ -1520,11 +1551,13 @@ pub const Parameter = struct {
 
     pub fn resolveType(
         self: *@This(),
+        io: std.Io,
         allocator: std.mem.Allocator,
         scope: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
         if (self.type_annotation) |type_annot| return type_annot;
         if (self.default_value) |def_val| return def_val.resolveType(
+            io,
             allocator,
             scope,
         );
@@ -1558,6 +1591,7 @@ pub const FunctionDecl = struct {
 
     pub fn resolveType(
         self: *@This(),
+        io: std.Io,
         allocator: std.mem.Allocator,
         scope: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
@@ -1566,12 +1600,12 @@ pub const FunctionDecl = struct {
                 const params_types = try allocator.alloc(?*const TypeExpr, params.len);
 
                 for (params_types, params) |*param_type, param| {
-                    param_type.* = try param.resolveType(allocator, scope);
+                    param_type.* = try param.resolveType(io, allocator, scope);
                 }
 
                 break :brk .nonVariadic(params_types);
             },
-            ._variadic => |params| .variadic(try params.resolveType(allocator, scope)),
+            ._variadic => |params| .variadic(try params.resolveType(io, allocator, scope)),
         };
 
         const fn_type = try allocator.create(TypeExpr);
@@ -1592,6 +1626,7 @@ pub const ExecutableExpr = struct {
 
     pub fn resolveType(
         _: *@This(),
+        _: std.Io,
         _: std.mem.Allocator,
         _: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
@@ -1607,6 +1642,7 @@ pub const BuiltinExpr = struct {
 
     pub fn resolveType(
         _: *@This(),
+        _: std.Io,
         _: std.mem.Allocator,
         _: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
@@ -1680,6 +1716,7 @@ pub const ForExpr = struct {
 
     pub fn resolveType(
         _: *@This(),
+        _: std.Io,
         _: std.mem.Allocator,
         _: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
@@ -1701,10 +1738,11 @@ pub const Assignment = struct {
 
     pub fn resolveType(
         self: *@This(),
+        io: std.Io,
         allocator: std.mem.Allocator,
         scope: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
-        return self.expr.resolveType(allocator, scope);
+        return self.expr.resolveType(io, allocator, scope);
     }
 };
 
@@ -1714,9 +1752,10 @@ pub const ExpressionStmt = struct {
 
     pub fn resolveType(
         self: *@This(),
+        io: std.Io,
         allocator: std.mem.Allocator,
         scope: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
-        return self.expression.resolveType(allocator, scope);
+        return self.expression.resolveType(io, allocator, scope);
     }
 };

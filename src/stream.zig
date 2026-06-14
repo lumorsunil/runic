@@ -522,7 +522,7 @@ pub const ReaderWriterStream = struct {
 
     fn writer_sendFile(
         self: *std.Io.Writer,
-        file_reader: *std.fs.File.Reader,
+        file_reader: *std.Io.File.Reader,
         limit: std.Io.Limit,
     ) std.Io.Writer.FileError!usize {
         const destination = writer_getDestination(self);

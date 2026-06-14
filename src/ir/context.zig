@@ -24,51 +24,28 @@ pub const SubshellContextHandle = usize;
 pub const SubshellContext = struct {
     /// null = inherit the OS process's working directory (no cd has been issued)
     cwd: ?[]const u8 = null,
-    env: ?*std.process.EnvMap = null,
+    env: std.process.Environ.Map,
 
     pub fn initOwned(
         allocator: Allocator,
         cwd: ?[]const u8,
-        env: ?*const std.process.EnvMap,
+        env: *const std.process.Environ.Map,
     ) Allocator.Error!@This() {
         return .{
             .cwd = if (cwd) |path| try allocator.dupe(u8, path) else null,
-            .env = if (env) |env_map| blk: {
-                const env_clone = try allocator.create(std.process.EnvMap);
-                errdefer allocator.destroy(env_clone);
-                env_clone.* = try cloneEnvMap(allocator, env_map);
-                break :blk env_clone;
-            } else null,
+            .env = try env.clone(allocator),
         };
     }
 
     pub fn clone(self: @This(), allocator: Allocator) Allocator.Error!@This() {
-        return initOwned(allocator, self.cwd, self.env);
+        return initOwned(allocator, self.cwd, &self.env);
     }
 
     pub fn deinit(self: *@This(), allocator: Allocator) void {
         if (self.cwd) |cwd| allocator.free(cwd);
-        if (self.env) |env| {
-            env.deinit();
-            allocator.destroy(env);
-        }
+        self.env.deinit();
     }
 };
-
-fn cloneEnvMap(
-    allocator: Allocator,
-    env: *const std.process.EnvMap,
-) Allocator.Error!std.process.EnvMap {
-    var clone = std.process.EnvMap.init(allocator);
-    errdefer clone.deinit();
-
-    var it = env.iterator();
-    while (it.next()) |entry| {
-        try clone.put(entry.key_ptr.*, entry.value_ptr.*);
-    }
-
-    return clone;
-}
 
 pub const Error = error{
     MissingThreadContext,
@@ -78,6 +55,7 @@ pub const Error = error{
 };
 
 pub const IRProgramContext = struct {
+    io: std.Io,
     allocator: Allocator,
     shared: IRSharedContext,
     threads: std.ArrayList(IRThreadContext) = .empty,
@@ -108,8 +86,8 @@ pub const IRProgramContext = struct {
     subshell_context_handle_counter: SubshellContextHandle = 0,
     module_cache: std.StringHashMapUnmanaged(Value) = .empty,
 
-    pub fn init(allocator: Allocator, shared: IRSharedContext) @This() {
-        return .{ .allocator = allocator, .shared = shared };
+    pub fn init(io: std.Io, allocator: Allocator, shared: IRSharedContext) @This() {
+        return .{ .io = io, .allocator = allocator, .shared = shared };
     }
 
     pub fn deinit(self: *@This()) void {
@@ -168,7 +146,7 @@ pub const IRProgramContext = struct {
 
     pub fn addMainThread(
         self: *@This(),
-        env: ?*const std.process.EnvMap,
+        env: *std.process.Environ.Map,
     ) Allocator.Error!void {
         const initial_ctx = try self.addSubshellContext(try .initOwned(self.allocator, null, env));
         _ = try self.spawnThread(initial_ctx);
@@ -251,7 +229,7 @@ pub const IRProgramContext = struct {
         exit_code: ?ExitCode,
     ) (Allocator.Error || Error || std.process.Child.WaitError)!void {
         const thread = self.getThreadContext(id) orelse return Error.MissingThreadContext;
-        const wait_exit_code = try thread.wait();
+        const wait_exit_code = try thread.wait(self.io);
         const exit_code_ = exit_code orelse wait_exit_code;
         try self.thread_exit_codes.put(self.allocator, id, exit_code_);
         try self.threads_to_remove.put(self.allocator, id, {});
@@ -447,10 +425,16 @@ pub const IRThreadContext = struct {
         self.private.waiting_for = id;
     }
 
-    pub fn wait(self: @This()) std.process.Child.WaitError!ExitCode {
+    pub fn wait(self: @This(), io: std.Io) std.process.Child.WaitError!ExitCode {
         defer self.private.process = null;
         // TODO: translate wait error to exit code
-        if (self.private.process) |p| return .fromTerm(try p.wait());
+        if (self.private.process) |p| {
+            // A process may also be reaped through its `ProcessCloseable` (the
+            // canonical exit-code source). `Child.wait` is one-shot and asserts
+            // `id != null`, so skip the wait if it was already reaped there.
+            if (p.id == null) return .success;
+            return .fromTerm(try p.wait(io));
+        }
         return .success;
     }
 
@@ -555,7 +539,7 @@ pub const IRPrivateContext = struct {
 
 test "context reports missing handles and exit code explicitly" {
     const allocator = std.testing.allocator;
-    var context = IRProgramContext.init(allocator, .{
+    var context = IRProgramContext.init(std.testing.io, allocator, .{
         .data = &.{},
         .instructions = &.{},
         .labels = .init(),

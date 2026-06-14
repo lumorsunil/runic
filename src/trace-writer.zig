@@ -78,7 +78,7 @@ pub const TraceWriter = struct {
 
     fn sendFile(
         w: *std.Io.Writer,
-        file_reader: *std.fs.File.Reader,
+        file_reader: *std.Io.File.Reader,
         limit: std.Io.Limit,
     ) std.Io.Writer.FileError!usize {
         log(w, @src().fn_name ++ " ({*}, limit={})", .{ &file_reader.interface, limit });
