@@ -48,6 +48,7 @@ fn keywordSymbols(allocator: Allocator) ![]const symbols.Symbol {
 }
 
 pub const Workspace = struct {
+    io: std.Io,
     allocator: Allocator,
     roots: std.ArrayList([]const u8) = .empty,
     index: std.ArrayList(symbols.Symbol) = .empty,
@@ -57,14 +58,21 @@ pub const Workspace = struct {
 
     const self_dirs = [_][]const u8{ "src", "examples", "tests" };
 
-    pub fn init(allocator: Allocator, documentStore: *LspDocumentStore) !Workspace {
+    pub fn init(
+        io: std.Io,
+        allocator: Allocator,
+        env_map: *std.process.Environ.Map,
+        documentStore: *LspDocumentStore,
+    ) !Workspace {
         var workspace = Workspace{
+            .io = io,
             .allocator = allocator,
             .documents = documentStore,
             .type_checker = .init(
+                io,
                 allocator,
                 &documentStore.document_store,
-                null,
+                env_map,
             ),
         };
 
@@ -156,14 +164,14 @@ pub const Workspace = struct {
     }
 
     fn walkDir(self: *Workspace, absolute_path: []const u8, rel_path: []const u8) !void {
-        var dir = std.fs.openDirAbsolute(absolute_path, .{ .iterate = true }) catch |err| switch (err) {
+        var dir = std.Io.Dir.openDirAbsolute(self.io, absolute_path, .{ .iterate = true }) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
-        defer dir.close();
+        defer dir.close(self.io);
 
         var it = dir.iterate();
-        while (try it.next()) |entry| {
+        while (try it.next(self.io)) |entry| {
             const child_abs = try std.fs.path.join(self.allocator, &.{ absolute_path, entry.name });
             defer self.allocator.free(child_abs);
             const rel_child = try joinRelative(self.allocator, rel_path, entry.name);
@@ -178,13 +186,14 @@ pub const Workspace = struct {
     }
 
     fn indexFile(self: *Workspace, absolute_path: []const u8, detail: []const u8) !void {
-        const file = std.fs.openFileAbsolute(absolute_path, .{}) catch |err| switch (err) {
+        const file = std.Io.Dir.openFileAbsolute(self.io, absolute_path, .{}) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
-        defer file.close();
-        const contents = file.readToEndAlloc(self.allocator, max_source_bytes) catch |err| switch (err) {
-            error.FileTooBig => return error.SourceTooLarge,
+        defer file.close(self.io);
+        var file_reader = file.reader(self.io, &.{});
+        const contents = file_reader.interface.allocRemaining(self.allocator, .limited(max_source_bytes)) catch |err| switch (err) {
+            error.StreamTooLong => return error.SourceTooLarge,
             else => return err,
         };
         defer self.allocator.free(contents);

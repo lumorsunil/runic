@@ -612,13 +612,13 @@ test "lsp member completion shows execution result members" {
 const TestFixture = struct {
     allocator: Allocator,
     tmp_dir: std.testing.TmpDir,
-    root_path: []const u8,
+    root_path: [:0]const u8,
 
     fn init(allocator: Allocator) !TestFixture {
         var tmp_dir = std.testing.tmpDir(.{});
         const relative_root_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp_dir.sub_path[0..] });
         defer allocator.free(relative_root_path);
-        const root_path = try std.fs.cwd().realpathAlloc(allocator, relative_root_path);
+        const root_path = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, relative_root_path, allocator);
         return .{
             .allocator = allocator,
             .tmp_dir = tmp_dir,
@@ -632,7 +632,7 @@ const TestFixture = struct {
     }
 
     fn writeDocument(self: *TestFixture, name: []const u8, text: []const u8) ![]u8 {
-        try self.tmp_dir.dir.writeFile(.{ .sub_path = name, .data = text });
+        try self.tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = text });
         const path = try std.fs.path.join(self.allocator, &.{ self.root_path, name });
         defer self.allocator.free(path);
         return try std.fmt.allocPrint(self.allocator, "file://{s}", .{path});
@@ -656,32 +656,39 @@ fn runServerWithMessagesDetailed(allocator: Allocator, messages: []const []const
     const error_path = try std.fs.path.join(allocator, &.{ fixture.root_path, "stderr.log" });
     defer allocator.free(error_path);
 
-    var input_file = try std.fs.createFileAbsolute(input_path, .{ .read = true, .truncate = true });
-    defer input_file.close();
-    var output_file = try std.fs.createFileAbsolute(output_path, .{ .read = true, .truncate = true });
-    defer output_file.close();
-    var error_file = try std.fs.createFileAbsolute(error_path, .{ .read = true, .truncate = true });
-    defer error_file.close();
+    const io = std.testing.io;
+    var input_file = try std.Io.Dir.createFileAbsolute(io, input_path, .{ .read = true, .truncate = true });
+    defer input_file.close(io);
+    var output_file = try std.Io.Dir.createFileAbsolute(io, output_path, .{ .read = true, .truncate = true });
+    defer output_file.close(io);
+    var error_file = try std.Io.Dir.createFileAbsolute(io, error_path, .{ .read = true, .truncate = true });
+    defer error_file.close(io);
 
     {
-        var writer = input_file.writer(&.{});
+        // Positional writer: pwrite leaves the OS file offset at 0, so the
+        // server's streaming reader still sees the messages from the start.
+        var write_buffer: [4096]u8 = undefined;
+        var writer = input_file.writer(io, &write_buffer);
         for (messages) |message| {
             try writer.interface.print("Content-Length: {d}\r\n\r\n{s}", .{ message.len, message });
         }
         try writer.interface.flush();
     }
 
-    try input_file.seekTo(0);
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
 
-    var server = try lsp.server.Server.init(allocator, input_file, output_file, error_file);
+    var server = try lsp.server.Server.init(io, allocator, &env_map, input_file, output_file, error_file);
     defer server.deinit();
     server.initInterface();
     try server.run();
 
-    try output_file.seekTo(0);
-    const stdout = try output_file.readToEndAlloc(allocator, 1024 * 1024);
-    try error_file.seekTo(0);
-    const stderr = try error_file.readToEndAlloc(allocator, 1024 * 1024);
+    // Positional readers pread from offset 0, regardless of where the server
+    // left the shared OS file offset after writing.
+    var output_reader = output_file.reader(io, &.{});
+    const stdout = try output_reader.interface.allocRemaining(allocator, .unlimited);
+    var error_reader = error_file.reader(io, &.{});
+    const stderr = try error_reader.interface.allocRemaining(allocator, .unlimited);
     return .{
         .stdout = stdout,
         .stderr = stderr,

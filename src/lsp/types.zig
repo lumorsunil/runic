@@ -420,10 +420,15 @@ pub const InitializeResult = struct {
 };
 
 pub fn Either(comptime types: anytype) type {
-    var fields: []const std.builtin.Type.UnionField = &.{};
-    var tags: []const std.builtin.Type.EnumField = &.{};
+    const types_fields: []const std.builtin.Type.StructField = std.meta.fields(@TypeOf(types));
 
-    for (std.meta.fields(@TypeOf(types))) |f| {
+    var field_names: [types_fields.len][]const u8 = undefined;
+    var field_types: [types_fields.len]type = undefined;
+    var field_attrs: [types_fields.len]std.builtin.Type.UnionField.Attributes = undefined;
+    var tag_names: [types_fields.len][]const u8 = undefined;
+    var tag_values: [types_fields.len]usize = undefined;
+
+    for (types_fields, 0..) |f, i| {
         const T = @field(types, f.name);
         var tName: []const u8 = @typeName(T);
         const name: []const u8 = brk: {
@@ -437,40 +442,16 @@ pub fn Either(comptime types: anytype) type {
             break :brk [_]u8{c} ++ tName[1..];
         };
 
-        fields = fields ++ [_]std.builtin.Type.UnionField{
-            std.builtin.Type.UnionField{
-                .type = @field(types, f.name),
-                .name = @ptrCast(name),
-                .alignment = @alignOf(T),
-            },
-        };
+        field_names[i] = @ptrCast(name);
+        field_types[i] = @field(types, f.name);
+        field_attrs[i] = .{};
 
-        const i = tags.len;
-        tags = tags ++ [_]std.builtin.Type.EnumField{
-            .{
-                .name = @ptrCast(name),
-                .value = i,
-            },
-        };
+        tag_names[i] = @ptrCast(name);
+        tag_values[i] = i;
     }
 
-    const Enum = @Type(.{
-        .@"enum" = .{
-            .tag_type = usize,
-            .decls = &.{},
-            .fields = tags,
-            .is_exhaustive = true,
-        },
-    });
-
-    const Payload = @Type(.{
-        .@"union" = .{
-            .fields = fields,
-            .decls = &.{},
-            .layout = .auto,
-            .tag_type = Enum,
-        },
-    });
+    const Enum = @Enum(usize, .exhaustive, &tag_names, &tag_values);
+    const Payload = @Union(.auto, Enum, &field_names, &field_types, &field_attrs);
 
     return struct {
         payload: Payload,

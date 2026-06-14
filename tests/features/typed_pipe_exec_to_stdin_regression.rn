@@ -1,0 +1,6 @@
+fn String process() String {
+    const input = &0
+    yield "${input}"
+}
+
+echo "exec to stdin" | process

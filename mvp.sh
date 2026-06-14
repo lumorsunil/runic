@@ -102,4 +102,4 @@ for i in "${!my_array[@]}"; do
 done
 
 # functions with pipelines
-# hello "I'm runic with a pipeline." | cat
+hello "I'm runic with a pipeline." | cat

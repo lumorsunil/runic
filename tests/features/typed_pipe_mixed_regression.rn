@@ -1,0 +1,10 @@
+fn Void source() String {
+    yield "mixed"
+}
+
+fn String middle() String {
+    const s = &0
+    yield "${s} typed"
+}
+
+source | middle | cat

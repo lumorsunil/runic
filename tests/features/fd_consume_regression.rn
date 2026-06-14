@@ -1,0 +1,11 @@
+// `&0` is a *consuming* read: the first read takes the input value; once the
+// producer has closed, a second read sees the closed stream (EOF) and yields
+// nothing. So this stage emits the value once even though it `yield`s `&0`
+// twice. To use a value more than once, bind it: `const n = &0`.
+
+fn Int consume_once() Int {
+    yield &0
+    yield &0
+}
+
+echo "7" | parseInt | consume_once

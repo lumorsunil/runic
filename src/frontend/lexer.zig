@@ -7,7 +7,6 @@ const MAX_CONTEXT_STACK: usize = 100;
 pub const Error =
     std.mem.Allocator.Error ||
     std.Io.Writer.Error ||
-    std.process.GetEnvVarOwnedError ||
     error{
         UnexpectedCharacter,
         UnterminatedString,
@@ -19,6 +18,7 @@ pub const Error =
     };
 
 pub const Lexer = struct {
+    io: std.Io,
     file: []const u8,
     source: []const u8,
     index: usize = 0,
@@ -71,14 +71,17 @@ pub const Lexer = struct {
         }
     };
 
-    pub fn init(allocator_: std.mem.Allocator, file: []const u8, source: []const u8) !Lexer {
-        const logging_enabled_s = std.process.getEnvVarOwned(allocator_, "RUNIC_LOG_LEXER") catch |err| switch (err) {
-            error.EnvironmentVariableNotFound => null,
-            else => return err,
-        };
-        defer if (logging_enabled_s) |le| allocator_.free(le);
+    pub fn init(
+        io: std.Io,
+        allocator_: std.mem.Allocator,
+        environ_map: *std.process.Environ.Map,
+        file: []const u8,
+        source: []const u8,
+    ) !Lexer {
+        const logging_enabled_s = environ_map.get("RUNIC_LOG_LEXER") orelse null;
 
         return .{
+            .io = io,
             .file = file,
             .arena = .init(allocator_),
             .source = source,
@@ -150,7 +153,7 @@ pub const Lexer = struct {
 
     pub fn log(self: Lexer, comptime fmt: []const u8, args: anytype) !void {
         if (!self.logging_enabled) return;
-        var stdout = std.fs.File.stderr().writer(&.{});
+        var stdout = std.Io.File.stderr().writer(self.io, &.{});
         try stdout.interface.print("[lexer:{}:{}:{}]: ", .{ self.index, self.line, self.column });
         try stdout.interface.print(fmt ++ "\n", args);
     }
@@ -574,6 +577,15 @@ pub const Lexer = struct {
         if (self.match('&')) {
             return self.finish(.startAt(start), .amp_amp);
         }
+        // `&0`/`&1`/`&2` — a file-descriptor reference (stdin/stdout/stderr).
+        // (`>&` for redirects is handled by lexGreater, so the `&` here is never
+        // part of a redirect.)
+        if (self.peek()) |c| {
+            if (std.ascii.isDigit(c)) {
+                _ = self.advance();
+                return self.finish(.startAt(start), .fd);
+            }
+        }
         return self.finish(.startAt(start), .amp);
     }
 
@@ -795,8 +807,14 @@ pub const Stream = struct {
 
     pub const max_guard_depth: usize = max_token_consumption_depth;
 
-    pub fn init(allocator: std.mem.Allocator, file: []const u8, source: []const u8) !Stream {
-        return .{ .lexer = try .init(allocator, file, source) };
+    pub fn init(
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        environ_map: *std.process.Environ.Map,
+        file: []const u8,
+        source: []const u8,
+    ) !Stream {
+        return .{ .lexer = try .init(io, allocator, environ_map, file, source) };
     }
 
     pub fn deinit(self: *Stream) void {

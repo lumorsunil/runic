@@ -14,6 +14,7 @@ pub const BasicTrace = struct {
     };
 
     pub fn init(
+        io: std.Io,
         message: []const u8,
         tags: []const []const u8,
         severity: Severity,
@@ -23,7 +24,7 @@ pub const BasicTrace = struct {
             .message = message,
             .trace = .{
                 .vtable = &vtable,
-                .timestamp = std.time.timestamp(),
+                .timestamp = std.Io.Timestamp.now(io, .real).toMilliseconds(),
                 .severity = severity,
                 .tags = tags,
                 .span = span,
@@ -52,7 +53,7 @@ pub const Trace = struct {
     };
 
     pub fn format(self: *@This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        try writer.print("[{D}] {t}: ", .{ self.timestamp, self.severity });
+        try writer.print("[{d}] {t}: ", .{ self.timestamp, self.severity });
         return self.vtable.format(self, writer);
     }
 
@@ -160,23 +161,25 @@ pub const TraceFilter = union(enum) {
 pub const Tracer = struct {
     start_time: i64,
     full_log: std.ArrayList(*Trace) = .empty,
+    io: std.Io,
     arena: std.heap.ArenaAllocator,
     config: Config,
-    stdout_writer: std.fs.File.Writer,
+    stdout_writer: std.Io.File.Writer,
 
     pub const Config = struct {
         echo_to_stdout: bool = true,
     };
 
-    pub fn init(allocator: Allocator, config: Config) @This() {
+    pub fn init(io: std.Io, allocator: Allocator, config: Config) @This() {
         var arena = std.heap.ArenaAllocator.init(allocator);
         const stdout_buffer = arena.allocator().alloc(u8, 1024) catch @panic("out of memory");
 
         return .{
-            .start_time = std.time.timestamp(),
+            .start_time = std.Io.Timestamp.now(io, .real).toMilliseconds(),
+            .io = io,
             .arena = arena,
             .config = config,
-            .stdout_writer = std.fs.File.stdout().writer(stdout_buffer),
+            .stdout_writer = std.Io.File.stdout().writer(io, stdout_buffer),
         };
     }
 
@@ -194,7 +197,7 @@ pub const Tracer = struct {
     ) Allocator.Error!*Trace {
         const basic_trace = try self.arena.allocator().create(BasicTrace);
         const message = try std.fmt.allocPrint(self.arena.allocator(), fmt, args);
-        basic_trace.* = .init(message, tags, severity, span);
+        basic_trace.* = .init(self.io, message, tags, severity, span);
         return &basic_trace.trace;
     }
 

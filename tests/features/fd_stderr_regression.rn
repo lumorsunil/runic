@@ -1,0 +1,10 @@
+// `&0` reads stdin; `yield expr` writes stdout (`&1`); `yield &2 expr` writes
+// stderr. The two output streams are independent.
+
+fn Int tee() Int {
+    const n = &0
+    yield &2 "log: received ${n}"
+    yield n * 10
+}
+
+echo "4" | parseInt | tee

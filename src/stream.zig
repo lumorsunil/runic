@@ -303,6 +303,10 @@ pub const ReaderWriterStream = struct {
         /// on the terminal closes child-process stdin. Must NOT be set on pipeline
         /// intermediate pipes, which manage their own lifecycle via pipeOpt.
         propagate_eof_on_source_close: bool = false,
+        /// Marks an exact non-String pipeline boundary that carries typed values
+        /// in-process (via the context's typed_pipe_values) instead of serializing
+        /// to bytes. `yield` to such a pipe stores the value; `&0` reads it back.
+        typed: bool = false,
 
         pub fn format(
             self: @This(),
@@ -518,7 +522,7 @@ pub const ReaderWriterStream = struct {
 
     fn writer_sendFile(
         self: *std.Io.Writer,
-        file_reader: *std.fs.File.Reader,
+        file_reader: *std.Io.File.Reader,
         limit: std.Io.Limit,
     ) std.Io.Writer.FileError!usize {
         const destination = writer_getDestination(self);

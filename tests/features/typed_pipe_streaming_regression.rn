@@ -1,0 +1,14 @@
+// Streaming: a stage may yield multiple times per input value, and each yield is
+// emitted to stdout as it happens (not buffered to the end). Here the block
+// binds the single Int from parseInt once, then yields twice — `in * in`
+// immediately, then `in + in` after a 2s sleep — so one input (6) produces two
+// outputs (36 then 12).
+//
+// (Verified out of band that `36` is flushed at ~0s and `12` at ~2s.)
+
+echo "6" | parseInt | {
+    const in = &0
+    yield in * in
+    sleep "2"
+    yield in + in
+}

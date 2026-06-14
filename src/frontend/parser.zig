@@ -25,7 +25,9 @@ const max_expected_tokens = 8;
 const max_breadcrumbs = 32;
 
 pub const Parser = struct {
+    io: std.Io,
     allocator: std.mem.Allocator,
+    environ_map: *std.process.Environ.Map,
     arena: std.heap.ArenaAllocator,
     document_store: *DocumentStore,
     path: []const u8 = undefined,
@@ -133,13 +135,17 @@ pub const Parser = struct {
 
     // pub fn init(allocator: std.mem.Allocator, source: []const u8) Parser {
     pub fn init(
+        io: std.Io,
         allocator: std.mem.Allocator,
+        environ_map: *std.process.Environ.Map,
         document_store: *DocumentStore,
         // getCachedAst: *const fn (path: []const u8) ?ast.Script,
         // getSource: *const fn (path: []const u8) []const u8,
     ) Self {
         return .{
+            .io = io,
             .allocator = allocator,
+            .environ_map = environ_map,
             .arena = std.heap.ArenaAllocator.init(allocator),
             .document_store = document_store,
             // .getCachedAst = getCachedAst,
@@ -210,7 +216,7 @@ pub const Parser = struct {
 
     pub fn log(self: Self, comptime fmt: []const u8, args: anytype) !void {
         if (!self.logging_enabled) return;
-        var stdout = std.fs.File.stderr().writer(&.{});
+        var stdout = std.Io.File.stderr().writer(self.io, &.{});
         const writer = &stdout.interface;
         try self.writeLogPrefix(writer);
         const maxColors = std.meta.tags(rainbow.RainbowColor).len;
@@ -225,7 +231,7 @@ pub const Parser = struct {
 
     pub fn logWithoutPrefix(self: Self, comptime fmt: []const u8, args: anytype) !void {
         if (!self.logging_enabled) return;
-        var stdout = std.fs.File.stderr().writer(&.{});
+        var stdout = std.Io.File.stderr().writer(self.io, &.{});
         const writer = &stdout.interface;
         try writer.print(fmt, args);
         try writer.flush();
@@ -270,7 +276,7 @@ pub const Parser = struct {
                 tok.span.end.line,
                 tok.lexeme.len,
                 tok.lexeme.ptr,
-                    // if (std.ascii.isPrint(tok.lexeme[0])) tok.lexeme[0..32] else "<invalid>",
+                // if (std.ascii.isPrint(tok.lexeme[0])) tok.lexeme[0..32] else "<invalid>",
             });
             return;
         }
@@ -391,7 +397,7 @@ pub const Parser = struct {
         while (idx < source.len) : (idx += 1) {
             if (source[idx] == '\n') {
                 if (current_line == target_line) {
-                    return std.mem.trimRight(u8, source[line_start..idx], "\r");
+                    return std.mem.trimEnd(u8, source[line_start..idx], "\r");
                 }
                 current_line += 1;
                 line_start = idx + 1;
@@ -399,7 +405,7 @@ pub const Parser = struct {
         }
 
         if (current_line == target_line and line_start <= source.len) {
-            return std.mem.trimRight(u8, source[line_start..source.len], "\r");
+            return std.mem.trimEnd(u8, source[line_start..source.len], "\r");
         }
         return null;
     }
@@ -415,13 +421,15 @@ pub const Parser = struct {
         const duped_path = try self.arena.allocator().dupe(u8, path);
         self.path = duped_path;
         self.source = try self.document_store.getSource(duped_path);
-        self.stream = try .init(self.arena.allocator(), duped_path, self.source);
+        self.stream = try .init(
+            self.io,
+            self.arena.allocator(),
+            self.environ_map,
+            duped_path,
+            self.source,
+        );
 
-        const logging_enabled = std.process.getEnvVarOwned(self.allocator, "RUNIC_LOG_PARSER") catch |err| switch (err) {
-            error.EnvironmentVariableNotFound => null,
-            else => return err,
-        };
-        defer if (logging_enabled) |le| self.allocator.free(le);
+        const logging_enabled = self.environ_map.get("RUNIC_LOG_PARSER") orelse null;
         if (logging_enabled) |le| self.logging_enabled = std.mem.eql(u8, le, "1");
 
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
@@ -506,27 +514,20 @@ pub const Parser = struct {
     // .{ parseInt, parseString } == .{ .@"0" = parseInt, .@"1" = parseString }
     // union enum { @"0": i64, @"1": []const u8 }
     fn OneOf(comptime Parsers: type) type {
-        var fields: []const std.builtin.Type.UnionField = &.{};
+        const parsers: []const std.builtin.Type.StructField = std.meta.fields(Parsers);
+        var field_names: [parsers.len][]const u8 = undefined;
+        var field_types: [parsers.len]type = undefined;
+        var field_attrs: [parsers.len]std.builtin.Type.StructField.Attributes = undefined;
+        // var fields: []const std.builtin.Type.UnionField = &.{};
 
-        for (std.meta.fields(Parsers)) |field| {
+        for (parsers, 0..) |field, i| {
             const Payload = ParserPayload(field.type);
-            fields = fields ++ [_]std.builtin.Type.UnionField{
-                .{
-                    .type = Payload,
-                    .name = field.name,
-                    .alignment = @alignOf(Payload),
-                },
-            };
+            field_names[i] = field.name;
+            field_types[i] = Payload;
+            field_attrs[i] = .{};
         }
 
-        return @Type(.{
-            .@"union" = .{
-                .layout = .auto,
-                .tag_type = std.meta.FieldEnum(Parsers),
-                .fields = fields,
-                .decls = &.{},
-            },
-        });
+        return @Union(.auto, null, &field_names, &field_types, &field_attrs);
     }
 
     // TODO: error handling
@@ -631,7 +632,7 @@ pub const Parser = struct {
         pub fn format(self: BinaryComponent, writer: *std.Io.Writer) !void {
             try switch (self) {
                 .op => |op| writer.writeAll(@tagName(op.payload)),
-                .expr => |_| writer.writeAll("(expr)"),
+                .expr => writer.writeAll("(expr)"),
                 .identifier => |iden| writer.print("ident:{s}", .{iden.name}),
                 .literal => |lit| switch (lit) {
                     inline .int, .float => |l| writer.writeAll(l.text),
@@ -798,6 +799,20 @@ pub const Parser = struct {
                                     .env_var = .{
                                         .identifier = .fromToken(identifier),
                                         .span = next.span.endAt(identifier.span),
+                                    },
+                                }),
+                            });
+                            continue;
+                        },
+                        .fd => {
+                            const breadcrumbInner = try self.createBreadcrumb("PBE:fd");
+                            defer breadcrumbInner.end();
+                            _ = try self.nextToken();
+                            try components.append(self.allocator, .{
+                                .expr = try self.allocExpression(.{
+                                    .fd = .{
+                                        .fd = next.lexeme[1] - '0',
+                                        .span = next.span,
                                     },
                                 }),
                             });
@@ -986,11 +1001,16 @@ pub const Parser = struct {
                     },
                 },
             },
-            .greater, .append_redirect, .fd_source_truncate_redirect, .fd_source_append_redirect => redirect: {
+            // Note: `.greater` (`>`) is intentionally NOT folded here. It is
+            // ambiguous with the greater-than comparison, so it stays a
+            // `.binary{.greater}` and the IR compiler decides — based on whether
+            // the left operand is a command — whether it is a redirect or a
+            // comparison. The explicit redirect operators below are never
+            // comparisons, so they always fold.
+            .append_redirect, .fd_source_truncate_redirect, .fd_source_append_redirect => redirect: {
                 const mode: ast.RedirectionMode = switch (binary.binary.op) {
                     .fd_source_truncate_redirect => .truncate,
                     .fd_source_append_redirect => .append,
-                    .greater => .truncate,
                     .append_redirect => .append,
                     else => unreachable,
                 };
@@ -1586,7 +1606,7 @@ pub const Parser = struct {
             condition = try self.rewriteBareIdentifierCallForIfCapture(condition);
         }
         // const then_block = try self.parseBlock();
-        const then_expr = try self.parseExpression();
+        const then_expr = try self.parseControlFlowBody();
 
         var else_branch: ?ast.IfExpr.ElseBranch = null;
         var end_span = then_expr.span();
@@ -1604,7 +1624,7 @@ pub const Parser = struct {
                 end_span = nested_if.span;
                 else_branch = .{ .if_expr = nested_if };
             } else {
-                const else_expr = try self.parseExpression();
+                const else_expr = try self.parseControlFlowBody();
                 end_span = else_expr.span();
                 else_branch = .{ .expr = else_expr };
             }
@@ -1648,7 +1668,7 @@ pub const Parser = struct {
 
         if (capture.bindings.len != sources.len) return Error.ForCapturesMustMatchSources;
 
-        const body = try self.parseExpression();
+        const body = try self.parseControlFlowBody();
 
         return self.allocExpression(.{
             .for_expr = .{
@@ -1658,6 +1678,45 @@ pub const Parser = struct {
                 .span = for_tok.span.endAt(body.span()),
             },
         });
+    }
+
+    /// Parses the body of a control-flow construct (e.g. a `for` loop). The body
+    /// may be a block (`{ ... }`) or a bare expression (`echo "${i}"`) — both
+    /// handled by `parseExpression` — or a single bare statement such as
+    /// `yield`/`return`/`exit`, which is desugared into a one-statement block so
+    /// the construct is not forced to wrap a single statement in `{ }`.
+    fn parseControlFlowBody(self: *Self) Error!*ast.Expression {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const next = try self.peekToken();
+        const stmt: *ast.Statement = switch (next.tag) {
+            .kw_yield, .kw_return, .kw_exit => try self.parseSingleBodyStatement(),
+            else => return self.parseExpression(),
+        };
+
+        const statements = try self.arena.allocator().alloc(*ast.Statement, 1);
+        statements[0] = stmt;
+        return self.allocExpression(.{ .block = ast.Block{
+            .statements = statements,
+            .span = stmt.span(),
+        } });
+    }
+
+    /// Parses a single `yield`/`return`/`exit` statement for use as a bare
+    /// control-flow body. The caller guarantees the next token is one of these.
+    fn parseSingleBodyStatement(self: *Self) Error!*ast.Statement {
+        const stmt = try self.arena.allocator().create(ast.Statement);
+        if (try self.parseMaybeYield()) |yield_stmt| {
+            stmt.* = .{ .yield_stmt = yield_stmt };
+        } else if (try self.parseMaybeReturn()) |return_stmt| {
+            stmt.* = .{ .return_stmt = return_stmt };
+        } else if (try self.parseMaybeExit()) |exit_stmt| {
+            stmt.* = .{ .exit_stmt = exit_stmt };
+        } else {
+            unreachable;
+        }
+        return stmt;
     }
 
     fn parseMatchExpression(self: *Self) Error!*ast.Expression {
@@ -2163,6 +2222,11 @@ pub const Parser = struct {
             return stmt;
         }
 
+        if (try self.parseMaybeYield()) |yield_stmt| {
+            stmt.* = .{ .yield_stmt = yield_stmt };
+            return stmt;
+        }
+
         const expr = try self.parseExpression();
         if (try self.stream.consumeIf(.amp)) {
             try self.markExpressionBackground(expr);
@@ -2269,6 +2333,12 @@ pub const Parser = struct {
                     },
                 });
             },
+            .fd => self.allocExpression(.{
+                .fd = .{
+                    .fd = tok.lexeme[1] - '0',
+                    .span = tok.span,
+                },
+            }),
             .kw_null => self.allocExpression(.{
                 .literal = .{ .null = .{ .span = tok.span } },
             }),
@@ -2670,6 +2740,42 @@ pub const Parser = struct {
         return switch (next.tag) {
             .kw_exit => try self.parseExit(),
             else => null,
+        };
+    }
+
+    fn parseMaybeYield(self: *Self) Error!?ast.YieldStmt {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const next = try self.peekToken();
+        return switch (next.tag) {
+            .kw_yield => try self.parseYield(),
+            else => null,
+        };
+    }
+
+    fn parseYield(self: *Self) Error!ast.YieldStmt {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const start = try self.expectTokenTag(.kw_yield);
+
+        // Optional target fd: `yield &2 expr` writes to stderr. A leading `&1`
+        // or `&2` is the target; `&0` is read as the value (you cannot yield to
+        // stdin), so it is left for parseExpression.
+        var fd: u8 = 1;
+        const next = try self.peekToken();
+        if (next.tag == .fd and (next.lexeme[1] == '1' or next.lexeme[1] == '2')) {
+            _ = try self.nextToken();
+            fd = next.lexeme[1] - '0';
+        }
+
+        const value = try self.parseExpression();
+
+        return .{
+            .value = value,
+            .fd = fd,
+            .span = start.span.endAt(value.span()),
         };
     }
 

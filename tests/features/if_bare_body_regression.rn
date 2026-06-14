@@ -1,0 +1,8 @@
+// An `if`/`else` body may be a bare statement (no `{ }`): a single `yield`
+// (or `return`/`exit`, or a bare expression) is allowed directly, like `for`.
+// Each branch here yields directly; nested `else if` chains work too.
+fn String classify() String {
+    if (false) yield "first" else if (true) yield "second" else yield "third"
+}
+
+classify

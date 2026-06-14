@@ -35,15 +35,48 @@
 - [x] function signature
   - [x] stdin type
   - [x] parameters
-- [ ] stdin special bindings
-  - `@stdin`
-  - `@stdin | cat`
+- [x] file-descriptor stream syntax `&0`/`&1`/`&2` (stdin/stdout/stderr),
+  replacing `@stdin`
+  - [x] `&0` — reads the function's stdin as a typed value (String/Int)
+  - [x] `yield &2 expr` — write to stderr
+  - [ ] `&0 | cat` — pipe stdin directly into a command
+- [x] `yield` keyword — explicit output (stdout by default, `yield &2` for stderr)
 - [ ] typed pipes
+  - [x] type-check pipe boundary compatibility (exact match)
+  - [x] reject Void↔non-Void mismatches
+  - [x] enforce function body stdin/stdout contracts
+  - [x] explicit stdout output via `yield` (return value no longer auto-pushed)
+  - [x] runtime String typed transport via `&0` (byte-stream path)
+  - [x] mixed exec/typed pipelines: exec→&0, yield→exec, yield→&0
+  - [x] 3-stage pipelines in all combinations
+  - [x] T→?T coercion (accepted + works at runtime via typed `&0`)
+  - [x] T→E!T coercion (type checker accepts; runtime blocked on error-union
+    stdin types parsing)
+  - [x] arbitrary typed values (Int) through pipes via canonical-text wire +
+    type-directed `&0` parsing
+  - [x] `parseInt` builtin (`fn String parseInt() Int`); maps per input value so
+    it composes with a framed stream (`lines | parseInt`)
+  - [x] `lines` builtin (`fn String lines() String`) — frames a byte stream into
+    per-line values (splits on `\n`, emits each onto a typed queue) so a
+    downstream `for (&0)` / `parseInt` processes one line at a time
+  - [x] `parseFloat` builtin (`fn String parseFloat() Float`); maps per value
+    like `parseInt`, shares `compileParseMapStage`
+  - [ ] other parse builtins (e.g. `parseBool`)
+  - [ ] streaming `lines` (currently buffers all input before splitting) and
+    other framers / custom delimiters
+  - [x] in-process typed transport for scalars (Int/Float pass between stages
+    without text serialize/re-parse; pipe marked `typed`)
+  - [x] consuming `&0` reads (each read consumes; EOF after producer closes)
+  - [x] multi-value streaming reads (a stage yields N values, downstream reads
+    them one at a time as they arrive via `for (&0) |v|` — per-pipe FIFO value
+    queue + live blocking reads; covers in-process typed Int/Float streams.
+    Byte streams are framed explicitly with the `lines` builtin)
+  - [ ] in-process transport for structured values (arrays/structs)
 - [x] exit code
 - [ ] remaining function/runtime gaps
   - stdin semantics
   - stdout/stderr capturing and piping
-  - typed pipes
+  - typed pipes runtime transport
 
 ## expressions
 

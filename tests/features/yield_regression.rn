@@ -1,0 +1,10 @@
+// Output to stdout is explicit via `yield`. A function pushes its result with
+// `yield`; the function's return/body value is no longer auto-pushed. `&0` is a
+// consuming read, so the single input is bound once and reused.
+
+fn Int square() Int {
+    const n = &0
+    yield n * n
+}
+
+echo "4" | parseInt | square

@@ -49,13 +49,15 @@ const ParseResult = union(enum) {
 };
 
 pub fn printScriptTokens(
+    io: std.Io,
     allocator: Allocator,
+    env_map: *std.process.Environ.Map,
     stdout: *std.Io.Writer,
     script_path: []const u8,
     source: []const u8,
 ) (LexerError || std.Io.Writer.Error)!void {
     try stdout.print("Tokens {s}\n", .{script_path});
-    var stream = try lexer_pkg.Stream.init(allocator, script_path, source);
+    var stream = try lexer_pkg.Stream.init(io, allocator, env_map, script_path, source);
     defer stream.deinit();
     var index: usize = 0;
     while (true) {
@@ -574,13 +576,13 @@ fn printSpanInline(writer: *std.Io.Writer, span: ast.Span) !void {
     );
 }
 
-pub fn applyEnvOverridesToMap(env_map: *std.process.EnvMap, overrides: []const CliConfig.EnvOverride) !void {
+pub fn applyEnvOverridesToMap(env_map: *std.process.Environ.Map, overrides: []const CliConfig.EnvOverride) !void {
     for (overrides) |override| {
         try env_map.put(override.key, override.value);
     }
 }
 
-pub fn exposeScriptMetadata(env_map: *std.process.EnvMap, script: CliConfig.ScriptInvocation) !void {
+pub fn exposeScriptMetadata(env_map: *std.process.Environ.Map, script: CliConfig.ScriptInvocation) !void {
     try env_map.put("RUNIC_SCRIPT_PATH", script.path);
 
     var count_buf: [32]u8 = undefined;
@@ -612,7 +614,7 @@ pub fn computeScriptDirectory(allocator: Allocator, script_path: []const u8) ![]
     return allocator.dupe(u8, ".");
 }
 
-pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseResult {
+pub fn parseCommandLine(allocator: Allocator, args: std.process.Args) !ParseResult {
     const trace_prefix = "--trace=";
     const env_prefix = "--env=";
 
@@ -640,8 +642,8 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
     var parsing_options = true;
     var idx: usize = 1;
 
-    while (idx < argv.len) {
-        const arg = argv[idx];
+    while (idx < args.vector.len) {
+        const arg = std.mem.span(args.vector[idx]);
         idx += 1;
 
         if (parsing_options and std.mem.eql(u8, arg, "--")) {
@@ -673,10 +675,11 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
                 continue;
             }
             if (argEqual(arg, "--eval") or argEqual(arg, "-c")) {
-                if (idx >= argv.len) return usageError(allocator, "{s} requires source text", .{arg});
+                if (idx >= args.vector.len) return usageError(allocator, "{s} requires source text", .{arg});
                 if (script_path != null) return usageError(allocator, "Cannot combine {s} with a script path.", .{arg});
                 script_path = try allocator.dupe(u8, ":inline");
-                script_source = try allocator.dupe(u8, argv[idx]);
+                const arg_script_source = std.mem.span(args.vector[idx]);
+                script_source = try allocator.dupe(u8, arg_script_source);
                 idx += 1;
                 parsing_options = false;
                 continue;
@@ -700,8 +703,8 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
                 continue;
             }
             if (argEqual(arg, "--trace")) {
-                if (idx >= argv.len) return usageError(allocator, "--trace requires a topic name", .{});
-                const value = argv[idx];
+                if (idx >= args.vector.len) return usageError(allocator, "--trace requires a topic name", .{});
+                const value = std.mem.span(args.vector[idx]);
                 idx += 1;
                 if (value.len == 0) return usageError(allocator, "--trace requires a topic name", .{});
                 try trace_topics.append(try allocator.dupe(u8, value));
@@ -717,8 +720,8 @@ pub fn parseCommandLine(allocator: Allocator, argv: []const []const u8) !ParseRe
                 continue;
             }
             if (argEqual(arg, "--env")) {
-                if (idx >= argv.len) return usageError(allocator, "--env requires KEY=VALUE", .{});
-                const raw = argv[idx];
+                if (idx >= args.vector.len) return usageError(allocator, "--env requires KEY=VALUE", .{});
+                const raw = std.mem.span(args.vector[idx]);
                 idx += 1;
                 const override = parseEnvOverride(allocator, raw) catch {
                     return usageError(allocator, "Environment overrides must look like KEY=VALUE (got '{s}')", .{raw});
@@ -878,8 +881,12 @@ fn freeEnvOverrides(allocator: Allocator, overrides: []CliConfig.EnvOverride) vo
     allocator.free(overrides);
 }
 
-pub fn ensureExecutableDirOnPath(allocator: Allocator, env_map: *std.process.EnvMap) !void {
-    const exe_path = std.fs.selfExePathAlloc(allocator) catch return;
+pub fn ensureExecutableDirOnPath(
+    io: std.Io,
+    allocator: Allocator,
+    env_map: *std.process.Environ.Map,
+) !void {
+    const exe_path = std.process.executablePathAlloc(io, allocator) catch return;
     defer allocator.free(exe_path);
 
     const exe_dir = computeScriptDirectory(allocator, exe_path) catch return;

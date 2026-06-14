@@ -24,51 +24,28 @@ pub const SubshellContextHandle = usize;
 pub const SubshellContext = struct {
     /// null = inherit the OS process's working directory (no cd has been issued)
     cwd: ?[]const u8 = null,
-    env: ?*std.process.EnvMap = null,
+    env: std.process.Environ.Map,
 
     pub fn initOwned(
         allocator: Allocator,
         cwd: ?[]const u8,
-        env: ?*const std.process.EnvMap,
+        env: *const std.process.Environ.Map,
     ) Allocator.Error!@This() {
         return .{
             .cwd = if (cwd) |path| try allocator.dupe(u8, path) else null,
-            .env = if (env) |env_map| blk: {
-                const env_clone = try allocator.create(std.process.EnvMap);
-                errdefer allocator.destroy(env_clone);
-                env_clone.* = try cloneEnvMap(allocator, env_map);
-                break :blk env_clone;
-            } else null,
+            .env = try env.clone(allocator),
         };
     }
 
     pub fn clone(self: @This(), allocator: Allocator) Allocator.Error!@This() {
-        return initOwned(allocator, self.cwd, self.env);
+        return initOwned(allocator, self.cwd, &self.env);
     }
 
     pub fn deinit(self: *@This(), allocator: Allocator) void {
         if (self.cwd) |cwd| allocator.free(cwd);
-        if (self.env) |env| {
-            env.deinit();
-            allocator.destroy(env);
-        }
+        self.env.deinit();
     }
 };
-
-fn cloneEnvMap(
-    allocator: Allocator,
-    env: *const std.process.EnvMap,
-) Allocator.Error!std.process.EnvMap {
-    var clone = std.process.EnvMap.init(allocator);
-    errdefer clone.deinit();
-
-    var it = env.iterator();
-    while (it.next()) |entry| {
-        try clone.put(entry.key_ptr.*, entry.value_ptr.*);
-    }
-
-    return clone;
-}
 
 pub const Error = error{
     MissingThreadContext,
@@ -78,6 +55,7 @@ pub const Error = error{
 };
 
 pub const IRProgramContext = struct {
+    io: std.Io,
     allocator: Allocator,
     shared: IRSharedContext,
     threads: std.ArrayList(IRThreadContext) = .empty,
@@ -90,6 +68,16 @@ pub const IRProgramContext = struct {
 
     pipes: std.AutoArrayHashMapUnmanaged(PipeHandle, *ReaderWriterStream) = .empty,
     pipe_handle_counter: usize = 0,
+    /// In-process typed transport: for a pipe marked `typed` (an exact non-String
+    /// pipeline boundary), the upstream stage enqueues each yielded value here
+    /// instead of serializing it to bytes, and the downstream dequeues them one
+    /// at a time (a FIFO queue per inter-stage pipe handle). This carries
+    /// multiple values for live streaming.
+    typed_pipe_queues: std.AutoArrayHashMapUnmanaged(PipeHandle, std.ArrayListUnmanaged(Value)) = .empty,
+    /// Byte pipes whose (single) stdin value has already been consumed by a `&0`
+    /// read. A subsequent read on a closed byte pipe yields EOF. (Typed pipes use
+    /// the queue above instead; an empty closed queue is EOF.)
+    consumed_pipes: std.AutoArrayHashMapUnmanaged(PipeHandle, void) = .empty,
     closeables: std.AutoArrayHashMapUnmanaged(CloseableHandle, *Closeable(ExitCode)) = .empty,
     closeable_handle_counter: usize = 0,
     file_sinks: std.ArrayList(*FileSink) = .empty,
@@ -98,8 +86,8 @@ pub const IRProgramContext = struct {
     subshell_context_handle_counter: SubshellContextHandle = 0,
     module_cache: std.StringHashMapUnmanaged(Value) = .empty,
 
-    pub fn init(allocator: Allocator, shared: IRSharedContext) @This() {
-        return .{ .allocator = allocator, .shared = shared };
+    pub fn init(io: std.Io, allocator: Allocator, shared: IRSharedContext) @This() {
+        return .{ .io = io, .allocator = allocator, .shared = shared };
     }
 
     pub fn deinit(self: *@This()) void {
@@ -126,6 +114,9 @@ pub const IRProgramContext = struct {
             pipe.deinitParent();
         }
         self.pipes.deinit(self.allocator);
+        for (self.typed_pipe_queues.values()) |*queue| queue.deinit(self.allocator);
+        self.typed_pipe_queues.deinit(self.allocator);
+        self.consumed_pipes.deinit(self.allocator);
 
         for (self.closeables.values()) |closeable| {
             if (!closeable.isClosed()) _ = closeable.close();
@@ -155,7 +146,7 @@ pub const IRProgramContext = struct {
 
     pub fn addMainThread(
         self: *@This(),
-        env: ?*const std.process.EnvMap,
+        env: *std.process.Environ.Map,
     ) Allocator.Error!void {
         const initial_ctx = try self.addSubshellContext(try .initOwned(self.allocator, null, env));
         _ = try self.spawnThread(initial_ctx);
@@ -238,7 +229,7 @@ pub const IRProgramContext = struct {
         exit_code: ?ExitCode,
     ) (Allocator.Error || Error || std.process.Child.WaitError)!void {
         const thread = self.getThreadContext(id) orelse return Error.MissingThreadContext;
-        const wait_exit_code = try thread.wait();
+        const wait_exit_code = try thread.wait(self.io);
         const exit_code_ = exit_code orelse wait_exit_code;
         try self.thread_exit_codes.put(self.allocator, id, exit_code_);
         try self.threads_to_remove.put(self.allocator, id, {});
@@ -339,6 +330,30 @@ pub const IRProgramContext = struct {
         return self.pipes.get(handle) orelse Error.MissingPipeHandle;
     }
 
+    /// Enqueues a yielded value on a typed pipe for in-process transport.
+    pub fn enqueueTypedPipeValue(self: *@This(), handle: PipeHandle, value: Value) !void {
+        const gop = try self.typed_pipe_queues.getOrPut(self.allocator, handle);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(self.allocator, value);
+    }
+
+    /// Dequeues the next value off a typed pipe, if any (FIFO).
+    pub fn dequeueTypedPipeValue(self: *@This(), handle: PipeHandle) ?Value {
+        const queue = self.typed_pipe_queues.getPtr(handle) orelse return null;
+        if (queue.items.len == 0) return null;
+        return queue.orderedRemove(0);
+    }
+
+    /// Marks a byte pipe's (single) stdin value as consumed by a `&0` read.
+    pub fn markPipeConsumed(self: *@This(), handle: PipeHandle) !void {
+        try self.consumed_pipes.put(self.allocator, handle, {});
+    }
+
+    /// Whether a byte pipe's stdin value has already been consumed.
+    pub fn isPipeConsumed(self: *@This(), handle: PipeHandle) bool {
+        return self.consumed_pipes.contains(handle);
+    }
+
     pub fn addCloseable(
         self: *@This(),
         closeable: *Closeable(ExitCode),
@@ -410,10 +425,16 @@ pub const IRThreadContext = struct {
         self.private.waiting_for = id;
     }
 
-    pub fn wait(self: @This()) std.process.Child.WaitError!ExitCode {
+    pub fn wait(self: @This(), io: std.Io) std.process.Child.WaitError!ExitCode {
         defer self.private.process = null;
         // TODO: translate wait error to exit code
-        if (self.private.process) |p| return .fromTerm(try p.wait());
+        if (self.private.process) |p| {
+            // A process may also be reaped through its `ProcessCloseable` (the
+            // canonical exit-code source). `Child.wait` is one-shot and asserts
+            // `id != null`, so skip the wait if it was already reaped there.
+            if (p.id == null) return .success;
+            return .fromTerm(try p.wait(io));
+        }
         return .success;
     }
 
@@ -518,7 +539,7 @@ pub const IRPrivateContext = struct {
 
 test "context reports missing handles and exit code explicitly" {
     const allocator = std.testing.allocator;
-    var context = IRProgramContext.init(allocator, .{
+    var context = IRProgramContext.init(std.testing.io, allocator, .{
         .data = &.{},
         .instructions = &.{},
         .labels = .init(),

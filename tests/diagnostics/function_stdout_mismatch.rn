@@ -1,0 +1,5 @@
+fn Void bad() Int {
+    yield "not an int"
+}
+
+bad

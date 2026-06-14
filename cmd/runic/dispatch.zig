@@ -5,7 +5,9 @@ const runScript = @import("run_script.zig").runScript;
 const runic = @import("runic");
 
 pub fn dispatch(
+    io: std.Io,
     allocator: Allocator,
+    env_map: *std.process.Environ.Map,
     config: utils.CliConfig,
     stdin: *std.Io.Reader,
     stdout: *std.Io.Writer,
@@ -13,7 +15,9 @@ pub fn dispatch(
     tracer: *runic.trace.Tracer,
 ) !runic.ExitCode {
     return try runScript(
+        io,
         allocator,
+        env_map,
         config.script,
         config,
         stdin,

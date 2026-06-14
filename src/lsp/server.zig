@@ -15,14 +15,16 @@ const MAX_FILE = 4 * 1024 * 1024;
 const MAX_OUT_CONTENT = 4 * 1024 * 1024;
 
 pub const Server = struct {
+    io: std.Io,
     allocator: Allocator,
-    stdin_file: std.fs.File,
-    stdout_file: std.fs.File,
-    stderr_file: std.fs.File,
-    stdin_reader: std.fs.File.Reader,
+    env_map: *std.process.Environ.Map,
+    stdin_file: std.Io.File,
+    stdout_file: std.Io.File,
+    stderr_file: std.Io.File,
+    stdin_reader: std.Io.File.Reader,
     reader: *std.Io.Reader,
     reader_buffer: [4096]u8 = undefined,
-    stdout_writer: std.fs.File.Writer,
+    stdout_writer: std.Io.File.Writer,
     writer: *std.Io.Writer,
     workspace: *workspace_mod.Workspace,
     documents: *document_mod.LspDocumentStore,
@@ -31,27 +33,31 @@ pub const Server = struct {
     log_enabled: bool = false,
 
     pub fn init(
+        io: std.Io,
         allocator: Allocator,
-        stdin_file: std.fs.File,
-        stdout_file: std.fs.File,
-        stderr_file: std.fs.File,
+        environ_map: *std.process.Environ.Map,
+        stdin_file: std.Io.File,
+        stdout_file: std.Io.File,
+        stderr_file: std.Io.File,
     ) !Server {
         var log_enabled = false;
-        if (std.process.getEnvVarOwned(allocator, "RUNIC_LSP_LOG")) |value| {
-            defer allocator.free(value);
+
+        if (environ_map.get("RUNIC_LSP_LOG")) |value| {
             if (value.len != 0 and !std.mem.eql(u8, value, "0")) {
                 log_enabled = true;
             }
-        } else |_| {}
+        }
 
         const workspace = try allocator.create(workspace_mod.Workspace);
         const document_store = try allocator.create(document_mod.LspDocumentStore);
 
-        workspace.* = try .init(allocator, document_store);
-        document_store.* = .init(allocator, workspace);
+        workspace.* = try .init(io, allocator, environ_map, document_store);
+        document_store.* = .init(io, allocator, environ_map, workspace);
 
         return .{
+            .io = io,
             .allocator = allocator,
+            .env_map = environ_map,
             .stdin_file = stdin_file,
             .stdout_file = stdout_file,
             .stderr_file = stderr_file,
@@ -73,9 +79,9 @@ pub const Server = struct {
     }
 
     pub fn initInterface(self: *Server) void {
-        self.stdin_reader = self.stdin_file.readerStreaming(&self.reader_buffer);
+        self.stdin_reader = self.stdin_file.readerStreaming(self.io, &self.reader_buffer);
         self.reader = &self.stdin_reader.interface;
-        self.stdout_writer = self.stdout_file.writerStreaming(&.{});
+        self.stdout_writer = self.stdout_file.writerStreaming(self.io, &.{});
         self.writer = &self.stdout_writer.interface;
     }
 
@@ -210,7 +216,7 @@ pub const Server = struct {
 
     fn groupDocumentsDiagnostics(
         self: *Server,
-        groups: *std.StringArrayHashMap(DiagnosticPacket),
+        groups: *std.hash_map.StringHashMap(DiagnosticPacket),
     ) !void {
         var docIt = self.documents.map.iterator();
         while (docIt.next()) |docEntry| {
@@ -233,7 +239,7 @@ pub const Server = struct {
     }
 
     fn flushDiagnostics(self: *Server) !void {
-        var groups: std.StringArrayHashMap(DiagnosticPacket) = .init(self.allocator);
+        var groups: std.hash_map.StringHashMap(DiagnosticPacket) = .init(self.allocator);
         defer {
             var gIt = groups.iterator();
             while (gIt.next()) |entry| {
@@ -264,7 +270,7 @@ pub const Server = struct {
             return;
         }
 
-        var roots = std.ArrayList([]const u8){};
+        var roots = std.ArrayList([]const u8).empty;
         defer {
             for (roots.items) |root| self.allocator.free(root);
             roots.deinit(self.allocator);
@@ -289,7 +295,11 @@ pub const Server = struct {
         }
 
         if (roots.items.len == 0) {
-            try roots.append(self.allocator, try std.fs.cwd().realpathAlloc(self.allocator, "."));
+            // `realPathFileAlloc` returns a sentinel-terminated `[:0]u8`; re-dupe it
+            // into a plain slice so the workspace frees it with a matching size.
+            const root = try std.Io.Dir.cwd().realPathFileAlloc(self.io, ".", self.allocator);
+            defer self.allocator.free(root);
+            try roots.append(self.allocator, try self.allocator.dupe(u8, root));
         }
 
         try self.workspace.resetRoots(roots.items);
@@ -339,7 +349,7 @@ pub const Server = struct {
 
         const text_slice: []const u8 = blk: {
             if (doc) |existing| break :blk existing.text;
-            fallback_text = try readWholeFile(self.allocator, owned_path);
+            fallback_text = try readWholeFile(self.io, self.allocator, owned_path);
             break :blk fallback_text.?;
         };
 
@@ -365,7 +375,9 @@ pub const Server = struct {
         const workspace_symbols = self.workspace.symbolSlice();
 
         var matches = try completion.collectMatches(.{
+            .io = self.io,
             .allocator = self.allocator,
+            .env_map = self.env_map,
             .file = owned_path,
             .text_slice = text_slice,
             .line_index = line_index,
@@ -464,7 +476,7 @@ pub const Server = struct {
         var ranges = std.ArrayList(types.Range).empty;
         if (name.len == 0) return ranges;
 
-        var lexer = try runic.lexer.Lexer.init(self.allocator, "", text);
+        var lexer = try runic.lexer.Lexer.init(self.io, self.allocator, self.env_map, "", text);
         defer lexer.deinit();
 
         while (true) {
@@ -500,7 +512,7 @@ pub const Server = struct {
 
         if (!runic.lexer.isIdentifierStart(text[start])) start += 1;
 
-        var lexer = runic.lexer.Lexer.init(self.allocator, loc.file, text[start..]) catch return null;
+        var lexer = runic.lexer.Lexer.init(self.io, self.allocator, self.env_map, loc.file, text[start..]) catch return null;
         defer lexer.deinit();
         const tok = lexer.next() catch return null;
 
@@ -1050,7 +1062,7 @@ pub const Server = struct {
         while (true) {
             const line = try readLine(self.allocator, self.reader);
             defer self.allocator.free(line);
-            const trimmed = std.mem.trimRight(u8, line, "\r");
+            const trimmed = std.mem.trimEnd(u8, line, "\r");
             if (trimmed.len == 0) break;
             if (std.mem.startsWith(u8, trimmed, "Content-Length")) {
                 const sep = std.mem.indexOfScalar(u8, trimmed, ':') orelse return error.ProtocolError;
@@ -1076,7 +1088,7 @@ pub const Server = struct {
 
     fn log(self: *Server, comptime fmt: []const u8, args: anytype) !void {
         if (!self.log_enabled) return;
-        var stderr = self.stderr_file.writer(&.{});
+        var stderr = self.stderr_file.writer(self.io, &.{});
         try stderr.interface.print("[runic-lsp] ", .{});
         try stderr.interface.print(fmt, args);
         try stderr.interface.writeByte('\n');
@@ -1097,14 +1109,20 @@ pub const Server = struct {
         if (std.fs.path.isAbsolute(path)) {
             return try self.allocator.dupe(u8, path);
         }
-        return try std.fs.cwd().realpathAlloc(self.allocator, path);
+        // `realPathFileAlloc` returns a sentinel-terminated `[:0]u8`; re-dupe it
+        // into a plain slice so callers can free it with a matching size.
+        const real = try std.Io.Dir.cwd().realPathFileAlloc(self.io, path, self.allocator);
+        defer self.allocator.free(real);
+        return try self.allocator.dupe(u8, real);
     }
 };
 
 fn readLine(allocator: Allocator, reader: *std.Io.Reader) ![]u8 {
-    const line = try reader.takeDelimiterExclusive('\n');
+    // `takeDelimiterInclusive` consumes and returns the trailing '\n'; drop it so
+    // callers see the bare line (they still trim the '\r').
+    const line = try reader.takeDelimiterInclusive('\n');
     if (line.len > MAX_LINE) return error.ProtocolError;
-    return try allocator.dupe(u8, line);
+    return try allocator.dupe(u8, line[0 .. line.len - 1]);
 }
 
 fn percentDecode(allocator: Allocator, text: []const u8) ![]u8 {
@@ -1134,8 +1152,10 @@ fn parseHexDigit(ch: u8) ?u8 {
     return null;
 }
 
-fn readWholeFile(allocator: Allocator, path: []const u8) ![]u8 {
-    const file = try std.fs.openFileAbsolute(path, .{});
-    defer file.close();
-    return try file.readToEndAlloc(allocator, MAX_FILE);
+fn readWholeFile(io: std.Io, allocator: Allocator, path: []const u8) ![]u8 {
+    const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer file.close(io);
+    var buffer: [1024]u8 = undefined;
+    var reader = file.reader(io, &buffer);
+    return reader.interface.allocRemaining(allocator, .limited(MAX_FILE));
 }

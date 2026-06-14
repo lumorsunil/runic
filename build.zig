@@ -1,11 +1,12 @@
 const std = @import("std");
+const zon = @import("build.zig.zon");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
     const build_options = b.addOptions();
-    build_options.addOption([]const u8, "version", "0.1.0");
+    build_options.addOption([]const u8, "version", zon.version);
 
     const runtime = b.addModule("runic", .{
         .root_source_file = b.path("src/root.zig"),

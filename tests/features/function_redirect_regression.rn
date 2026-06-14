@@ -1,0 +1,14 @@
+// A Runic function call's stdout can be redirected to a file, like an external
+// command — `>` (truncate) and `>>` (append) both work. (`myFn > "f"` is a
+// redirect because a function call is a command; to compare a function's return
+// value, bind it first.)
+fn Void greet() String {
+    yield "hello"
+}
+
+const path = "/tmp/runic-fn-redirect-regression.txt"
+
+greet > "${path}"
+cat "${path}"
+greet >> "${path}"
+cat "${path}"

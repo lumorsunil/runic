@@ -1,0 +1,9 @@
+fn Int doubler() Int {
+    yield &0 * 2
+}
+
+fn Int inc() Int {
+    yield &0 + 1
+}
+
+echo "10" | parseInt | doubler | inc

@@ -1,0 +1,7 @@
+[error]: tests/diagnostics/function_stdin_mismatch.rn:2:30: function stdin type mismatch: enclosing stdin is String, callee stdin expects Void
+   1:fn Void hello() String echo "hello"
+   2:fn String greetings() String hello
+   3:
+   4:greetings
+   5:
+

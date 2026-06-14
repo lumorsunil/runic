@@ -49,13 +49,13 @@ pub fn consume(sig: u8) bool {
     return signals.untrip(sig);
 }
 
-fn handler(sig: c_int) callconv(.c) void {
-    signals.trip(@intCast(sig));
+fn handler(sig: std.posix.SIG) callconv(.c) void {
+    signals.trip(@intCast(@intFromEnum(sig)));
 }
 
 pub fn trap(sig: u8) void {
     var original_handler: std.posix.Sigaction = undefined;
-    std.posix.sigaction(sig, &sig_action, &original_handler);
+    std.posix.sigaction(@enumFromInt(sig), &sig_action, &original_handler);
     signals.trap(sig);
     signals.trop(sig, original_handler);
 }
@@ -63,5 +63,5 @@ pub fn trap(sig: u8) void {
 pub fn untrap(sig: u8) void {
     signals.untrap(sig);
     const original_handler = signals.untrop(sig);
-    std.posix.sigaction(sig, &original_handler, null);
+    std.posix.sigaction(@enumFromInt(sig), &original_handler, null);
 }

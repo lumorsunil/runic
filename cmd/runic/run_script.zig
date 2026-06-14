@@ -21,7 +21,9 @@ fn log(comptime fmt: []const u8, args: anytype) void {
 }
 
 pub fn runScript(
+    io: std.Io,
     allocator: Allocator,
+    env_map: *std.process.Environ.Map,
     script: utils.CliConfig.ScriptInvocation,
     config: utils.CliConfig,
     stdin: *std.Io.Reader,
@@ -29,15 +31,9 @@ pub fn runScript(
     stderr: *std.Io.Writer,
     tracer: *Tracer,
 ) !ExitCode {
-    var env_map = std.process.getEnvMap(allocator) catch |err| {
-        try stderr.print("error: unable to capture environment: {s}\n", .{@errorName(err)});
-        return .fromByte(1);
-    };
-    defer env_map.deinit();
-
-    try utils.applyEnvOverridesToMap(&env_map, config.env_overrides);
-    try utils.exposeScriptMetadata(&env_map, script);
-    try utils.ensureExecutableDirOnPath(allocator, &env_map);
+    try utils.applyEnvOverridesToMap(env_map, config.env_overrides);
+    try utils.exposeScriptMetadata(env_map, script);
+    try utils.ensureExecutableDirOnPath(io, allocator, env_map);
 
     const script_dir = utils.computeScriptDirectory(allocator, script.path) catch |err| {
         try stderr.print("error: unable to resolve script directory: {s}\n", .{@errorName(err)});
@@ -47,7 +43,7 @@ pub fn runScript(
 
     if (config.print_tokens) {
         if (script.source) |source| {
-            utils.printScriptTokens(allocator, stdout, script.path, source) catch |err| {
+            utils.printScriptTokens(io, allocator, env_map, stdout, script.path, source) catch |err| {
                 try stderr.print(
                     "error: failed to print tokens for inline script '{s}': {s}\n",
                     .{ script.path, @errorName(err) },
@@ -56,10 +52,10 @@ pub fn runScript(
             };
             return .success;
         }
-        return .fromByte(try printTokens(allocator, stdout, stderr, script.path));
+        return .fromByte(try printTokens(io, allocator, env_map, stdout, stderr, script.path));
     }
 
-    var document_store = FrontendDocumentStore.init(allocator);
+    var document_store = FrontendDocumentStore.init(io, allocator, env_map);
     defer document_store.deinit();
     const entryDocument = if (script.source) |source|
         try document_store.putDocument(script.path, source)
@@ -67,9 +63,10 @@ pub fn runScript(
         try document_store.requestDocument(script.path);
     const resolvedPath = entryDocument.path;
     const parser_result = entryDocument.parser.parseScript(resolvedPath);
-    const script_ast = try processResult(&document_store.document_store, stderr, parser_result) orelse return .fromByte(1);
+    const script_ast = try processResult(io, &document_store.document_store, stderr, parser_result) orelse return .fromByte(1);
 
     const parse_imports_result = try parseImports(
+        io,
         allocator,
         stderr,
         &document_store.document_store,
@@ -96,7 +93,7 @@ pub fn runScript(
     }
 
     if (!config.skip_type_check) {
-        var type_checker = TypeChecker.init(allocator, &document_store.document_store, &env_map);
+        var type_checker = TypeChecker.init(io, allocator, &document_store.document_store, env_map);
         defer type_checker.deinit();
 
         const type_checker_result = type_checker.typeCheck(resolvedPath) catch |err| {
@@ -104,14 +101,14 @@ pub fn runScript(
             return .fromByte(1);
         };
 
-        if (try processResult(&document_store.document_store, stderr, type_checker_result)) |_| {
+        if (try processResult(io, &document_store.document_store, stderr, type_checker_result)) |_| {
             if (config.type_check_only) return .success;
         } else {
             return .fromByte(1);
         }
     }
 
-    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
     defer allocator.free(cwd);
 
     const stdin_stream = try Stream(u8).initReaderWriter(allocator, "<<<stdin_pipe>>>", .{
@@ -174,14 +171,16 @@ pub fn runScript(
 
     if (config.debug_ir) {
         result = try ir.runner.debugIR(
+            io,
             allocator,
+            env_map,
             &entryDocument.ast.?,
             &document_store.document_store,
             stdin_stream,
             stdout_stream,
             stderr_stream,
-            std.fs.File.stdout().isTty(),
-            std.fs.File.stderr().isTty(),
+            try std.Io.File.stdout().isTty(io),
+            try std.Io.File.stderr().isTty(io),
             tracer,
         );
     } else {
@@ -190,21 +189,22 @@ pub fn runScript(
             &document_store.document_store,
             &entryDocument.ast.?,
             .{
+                .io = io,
                 .verbose = config.verbose,
                 .dry_run = config.dry_run,
                 .script_args = script.args,
-                .env = &env_map,
+                .env = env_map,
                 .stdin = stdin_stream,
                 .stdout = stdout_stream,
                 .stderr = stderr_stream,
-                .stdout_is_tty = std.fs.File.stdout().isTty(),
-                .stderr_is_tty = std.fs.File.stderr().isTty(),
+                .stdout_is_tty = try std.Io.File.stdout().isTty(io),
+                .stderr_is_tty = try std.Io.File.stderr().isTty(io),
                 .tracer = tracer,
             },
         );
     }
 
-    return try processResult(&document_store.document_store, stdout, result) orelse .fromByte(1);
+    return try processResult(io, &document_store.document_store, stdout, result) orelse .fromByte(1);
 }
 
 const StatementExpressionIterator = struct {
@@ -290,6 +290,7 @@ const StatementExpressionIterator = struct {
             },
             .exit_stmt => |exit_stmt| if (exit_stmt.value) |v| try self.cursor.appendExpr(v),
             .return_stmt => |return_stmt| if (return_stmt.value) |v| try self.cursor.appendExpr(v),
+            .yield_stmt => |yield_stmt| try self.cursor.appendExpr(yield_stmt.value),
             .expression => |expr| try self.cursor.appendExpr(expr.expression),
         }
     }
@@ -297,7 +298,7 @@ const StatementExpressionIterator = struct {
     fn populateStackExpr(self: *StatementExpressionIterator, expr: *runic.ast.Expression) !void {
         const cursor = &self.cursor;
         switch (expr.*) {
-            .identifier, .env_var, .path, .literal, .map, .import_expr, .pipeline_deprecated, .builtin => {},
+            .identifier, .env_var, .path, .literal, .map, .import_expr, .pipeline_deprecated, .builtin, .fd => {},
             .array => |array| try cursor.appendExpressions(array.elements),
             .range => |range| {
                 try cursor.appendExpr(range.start);
@@ -353,6 +354,7 @@ const StatementExpressionIterator = struct {
 };
 
 fn processResult(
+    io: std.Io,
     document_store: *runic.DocumentStore,
     writer: *std.Io.Writer,
     result: anytype,
@@ -368,7 +370,7 @@ fn processResult(
                     break :brk null;
                 } else null;
                 try writer.print("[{s}]: ", .{d.severity()});
-                if (maybe_span) |span| logFileLineAndCol(writer, span) catch |err| {
+                if (maybe_span) |span| logFileLineAndCol(io, writer, span) catch |err| {
                     try writer.print("<error logging file path : {}>", .{err});
                 };
                 try writer.print(" {s}\n", .{d.message});
@@ -381,6 +383,7 @@ fn processResult(
 }
 
 fn parseImports(
+    io: std.Io,
     allocator: Allocator,
     writer: *std.Io.Writer,
     document_store: *runic.DocumentStore,
@@ -394,6 +397,7 @@ fn parseImports(
         switch (expr.*) {
             .import_expr => |import_expr| {
                 const module_path = try runic.document.resolveModulePath(
+                    io,
                     allocator,
                     import_expr.importer,
                     import_expr.module_name,
@@ -403,8 +407,8 @@ fn parseImports(
                 if ((document_store.getAst(module_path) catch null) != null) continue;
                 const parser = try document_store.getParser(module_path);
                 const result = parser.parseScript(module_path);
-                const import_script = try processResult(document_store, writer, result) orelse return .fromByte(1);
-                _ = try parseImports(allocator, writer, document_store, import_script);
+                const import_script = try processResult(io, document_store, writer, result) orelse return .fromByte(1);
+                _ = try parseImports(io, allocator, writer, document_store, import_script);
             },
             else => {},
         }
@@ -413,20 +417,29 @@ fn parseImports(
     return .success;
 }
 
-fn printTokens(allocator: Allocator, stdout: *std.Io.Writer, stderr: *std.Io.Writer, path: []const u8) !u8 {
-    var file = std.fs.cwd().openFile(path, .{}) catch |err| {
+fn printTokens(
+    io: std.Io,
+    allocator: Allocator,
+    env_map: *std.process.Environ.Map,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+    path: []const u8,
+) !u8 {
+    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| {
         try stderr.print("error: failed to open script '{s}': {s}\n", .{ path, @errorName(err) });
         return 1;
     };
-    defer file.close();
+    defer file.close(io);
 
-    const contents = file.readToEndAlloc(allocator, std.math.maxInt(usize)) catch |err| {
+    var buffer: [1024]u8 = undefined;
+    var reader = file.reader(io, &buffer);
+    const contents = reader.interface.allocRemaining(allocator, .unlimited) catch |err| {
         try stderr.print("error: failed to read script '{s}': {s}\n", .{ path, @errorName(err) });
         return 1;
     };
     defer allocator.free(contents);
 
-    utils.printScriptTokens(allocator, stdout, path, contents) catch |err| {
+    utils.printScriptTokens(io, allocator, env_map, stdout, path, contents) catch |err| {
         try stderr.print(
             "error: failed to lex script '{s}': {s}\n",
             .{ path, @errorName(err) },
@@ -440,13 +453,13 @@ fn printTokens(allocator: Allocator, stdout: *std.Io.Writer, stderr: *std.Io.Wri
 const span_color = rainbow.beginBgColor(.red) ++ rainbow.beginColor(.black);
 const end_color = rainbow.endColor();
 
-fn logFileLineAndCol(writer: *std.Io.Writer, span: ast.Span) !void {
+fn logFileLineAndCol(io: std.Io, writer: *std.Io.Writer, span: ast.Span) !void {
     var fix_allocator = std.heap.FixedBufferAllocator.init(&.{});
     var buf_allocator = std.heap.stackFallback(1024, fix_allocator.allocator());
     const allocator = buf_allocator.get();
 
-    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
-    const relative = try std.fs.path.relative(allocator, cwd, span.start.file);
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
+    const relative = try std.fs.path.relative(allocator, cwd, null, cwd, span.start.file);
 
     try writer.print("{s}:{}:{}:", .{ relative, span.start.line, span.start.column });
 }

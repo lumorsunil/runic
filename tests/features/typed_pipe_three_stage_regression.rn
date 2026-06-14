@@ -1,0 +1,15 @@
+fn Void source() String {
+    yield "stage"
+}
+
+fn String middle() String {
+    const s = &0
+    yield "three ${s}"
+}
+
+fn String sink() String {
+    const s = &0
+    yield "${s} pipeline"
+}
+
+source | middle | sink

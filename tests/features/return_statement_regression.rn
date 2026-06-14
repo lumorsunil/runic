@@ -1,13 +1,15 @@
 fn Void classify(value: Int) String {
   if (value < 0) {
-    return "negative"
+    yield "negative"
+    return
   }
 
   if (value == 0) {
-    return "zero"
+    yield "zero"
+    return
   }
 
-  return "positive"
+  yield "positive"
 }
 
 echo "${classify(1)}"

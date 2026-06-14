@@ -1,0 +1,12 @@
+// The `lines` builtin frames a byte stream into per-line values: it reads the
+// whole stdin, splits on '\n', and emits each non-empty line as a separate
+// value onto its (typed) stdout. Downstream stages then process one line at a
+// time. `parseInt` maps each line to an Int, and a `for (&0)` filter squares
+// each. So echoing 0..4 yields 0, 1, 4, 9, 16 (concatenated as `014916`).
+fn Int square() Int {
+    for (&0) |in| {
+        yield in * in
+    }
+}
+
+{ for (0..5) |i| echo i } | lines | parseInt | square

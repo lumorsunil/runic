@@ -1,0 +1,4 @@
+fn Void produce() String echo "hello"
+fn Void consume() Void {}
+
+produce | consume
