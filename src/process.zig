@@ -14,28 +14,11 @@ fn log(comptime fmt: []const u8, args: anytype) void {
     std.log.debug(fmt, args);
 }
 
-fn spawn(
-    argv: []const []const u8,
-    stdin_behavior: std.process.Child.StdIo,
-    stdout_behavior: std.process.Child.StdIo,
-    stderr_behavior: std.process.Child.StdIo,
-    tracer: *Tracer,
-) !std.process.Child {
-    tracer.trace(.information, &.{ "process", @src().fn_name }, null, "Child.init {s}", .{argv[0]});
-    var child = std.process.Child.init(argv, std.heap.page_allocator);
-    child.stdin_behavior = stdin_behavior;
-    child.stdout_behavior = stdout_behavior;
-    child.stderr_behavior = stderr_behavior;
-    tracer.trace(.information, &.{ "process", @src().fn_name }, null, "Child.spawn {s}", .{argv[0]});
-    try child.spawn();
-    tracer.trace(.information, &.{ "process", @src().fn_name }, null, "Child.waitForSpawn {s}", .{argv[0]});
-    try child.waitForSpawn();
-    return child;
-}
-
 pub const ProcessCloseable = struct {
+    io: std.Io,
     process: *std.process.Child,
-    waited: bool = false,
+    label: []const u8,
+    term: ?ExitCode = null,
     closeable: Closeable(ExitCode) = .{ .vtable = &vtable },
     stdin: Closeable(ExitCode) = .{ .vtable = &stdin_vtable },
     stdin_term: ?ExitCode = null,
@@ -69,14 +52,16 @@ pub const ProcessCloseable = struct {
         .getLabel = stderr_getLabel,
     };
 
-    pub fn init(process: *std.process.Child, tracer: *Tracer) @This() {
-        tracer.trace(.information, &.{ "process", @src().fn_name }, null, @typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{process.argv[0]});
-        tracer.trace(.information, &.{ "process", @src().fn_name }, null, "{s}: stdin: {}", .{ process.argv[0], process.stdin != null });
-        tracer.trace(.information, &.{ "process", @src().fn_name }, null, "{s}: stdout: {}", .{ process.argv[0], process.stdout != null });
-        tracer.trace(.information, &.{ "process", @src().fn_name }, null, "{s}: stderr: {}", .{ process.argv[0], process.stderr != null });
+    pub fn init(io: std.Io, process: *std.process.Child, label: []const u8, tracer: *Tracer) @This() {
+        tracer.trace(.information, &.{ "process", @src().fn_name }, null, @typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{label});
+        tracer.trace(.information, &.{ "process", @src().fn_name }, null, "{s}: stdin: {}", .{ label, process.stdin != null });
+        tracer.trace(.information, &.{ "process", @src().fn_name }, null, "{s}: stdout: {}", .{ label, process.stdout != null });
+        tracer.trace(.information, &.{ "process", @src().fn_name }, null, "{s}: stderr: {}", .{ label, process.stderr != null });
 
         return .{
+            .io = io,
             .process = process,
+            .label = label,
             .stdin_term = if (process.stdin) |_| null else .success,
             .stdout_term = if (process.stdout) |_| null else .success,
             .stderr_term = if (process.stderr) |_| null else .success,
@@ -86,13 +71,20 @@ pub const ProcessCloseable = struct {
 
     fn close(self: *Closeable(ExitCode)) ExitCode {
         const parent: *@This() = @fieldParentPtr("closeable", self);
-        parent.tracer.trace(.information, &.{ "process", @src().fn_name }, null, @typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{parent.process.argv[0]});
-        parent.tracer.trace(.information, &.{ "process", @src().fn_name }, null, "closing {s}", .{parent.process.argv[0]});
-        if (parent.waited) return .fromTerm(parent.process.term.?);
-        parent.waited = true;
-        parent.tracer.trace(.information, &.{ "process", @src().fn_name }, null, "waiting for {s} to terminate", .{parent.process.argv[0]});
-        const exit_code: ExitCode = .fromTerm(parent.process.wait());
-        parent.tracer.trace(.information, &.{ "process", @src().fn_name }, null, "{s} exited with {any}", .{ parent.process.argv[0], exit_code });
+        parent.tracer.trace(.information, &.{ "process", @src().fn_name }, null, @typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{parent.label});
+        parent.tracer.trace(.information, &.{ "process", @src().fn_name }, null, "closing {s}", .{parent.label});
+        if (parent.term) |term| return term;
+        // `Child.wait` is one-shot and asserts `id != null`. If the process was
+        // already reaped elsewhere (e.g. the owning thread's cleanup wait), don't
+        // wait again — fall back to success.
+        if (parent.process.id == null) {
+            parent.term = .success;
+            return .success;
+        }
+        parent.tracer.trace(.information, &.{ "process", @src().fn_name }, null, "waiting for {s} to terminate", .{parent.label});
+        const exit_code: ExitCode = .fromTerm(parent.process.wait(parent.io));
+        parent.term = exit_code;
+        parent.tracer.trace(.information, &.{ "process", @src().fn_name }, null, "{s} exited with {any}", .{ parent.label, exit_code });
         return exit_code;
     }
 
@@ -104,11 +96,10 @@ pub const ProcessCloseable = struct {
 
     fn getResult(self: *Closeable(ExitCode)) ?ExitCode {
         const parent: *@This() = @fieldParentPtr("closeable", self);
-        log(@typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{parent.process.argv[0]});
-        if (parent.process.term) |term| {
-            const exit_code: ExitCode = .fromTerm(term);
-            log("result: {f}", .{exit_code});
-            return exit_code;
+        log(@typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{parent.label});
+        if (parent.term) |term| {
+            log("result: {f}", .{term});
+            return term;
         } else {
             log("result: null", .{});
             return null;
@@ -117,11 +108,11 @@ pub const ProcessCloseable = struct {
 
     pub fn getLabel(self: *Closeable(ExitCode)) []const u8 {
         const parent: *@This() = @fieldParentPtr("closeable", self);
-        return parent.process.argv[0];
+        return parent.label;
     }
 
     fn check_close_parent(self: *@This()) ?ExitCode {
-        log(@typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{self.process.argv[0]});
+        log(@typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{self.label});
 
         log("stdin: {}, stdout: {}, stderr: {}", .{
             self.stdin.isClosed(), self.stdout.isClosed(), self.stderr.isClosed(),
@@ -140,10 +131,10 @@ pub const ProcessCloseable = struct {
 
     fn stdin_close(self: *Closeable(ExitCode)) ExitCode {
         const parent: *@This() = @fieldParentPtr("stdin", self);
-        log(@typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{parent.process.argv[0]});
-        log("closing stdin of {s}", .{parent.process.argv[0]});
+        log(@typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{parent.label});
+        log("closing stdin of {s}", .{parent.label});
         if (parent.process.stdin) |stdin| {
-            stdin.close();
+            stdin.close(parent.io);
             parent.process.stdin = null;
         }
         if (parent.stdin_term) |term| return term;
@@ -154,7 +145,7 @@ pub const ProcessCloseable = struct {
 
     fn stdin_getResult(self: *Closeable(ExitCode)) ?ExitCode {
         const parent: *@This() = @fieldParentPtr("stdin", self);
-        log(@typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{parent.process.argv[0]});
+        log(@typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{parent.label});
         return parent.closeable.getResult() orelse parent.stdin_term orelse {
             if (parent.process.stdin) |stdin| {
                 const revents = poll(stdin, std.posix.POLL.OUT, parent.tracer);
@@ -175,10 +166,10 @@ pub const ProcessCloseable = struct {
 
     fn stdout_close(self: *Closeable(ExitCode)) ExitCode {
         const parent: *@This() = @fieldParentPtr("stdout", self);
-        log(@typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{parent.process.argv[0]});
-        log("closing stdout of {s}", .{parent.process.argv[0]});
+        log(@typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{parent.label});
+        log("closing stdout of {s}", .{parent.label});
         if (parent.process.stdout) |stdout| {
-            stdout.close();
+            stdout.close(parent.io);
             parent.process.stdout = null;
         }
         if (parent.stdout_term) |term| return term;
@@ -189,7 +180,7 @@ pub const ProcessCloseable = struct {
 
     fn stdout_getResult(self: *Closeable(ExitCode)) ?ExitCode {
         const parent: *@This() = @fieldParentPtr("stdout", self);
-        log(@typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{parent.process.argv[0]});
+        log(@typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{parent.label});
         return parent.closeable.getResult() orelse parent.stdout_term orelse {
             if (parent.process.stdout) |stdout| {
                 const revents = poll(stdout, std.posix.POLL.IN, parent.tracer);
@@ -210,10 +201,10 @@ pub const ProcessCloseable = struct {
 
     fn stderr_close(self: *Closeable(ExitCode)) ExitCode {
         const parent: *@This() = @fieldParentPtr("stderr", self);
-        log(@typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{parent.process.argv[0]});
-        log("closing stderr of {s}", .{parent.process.argv[0]});
+        log(@typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{parent.label});
+        log("closing stderr of {s}", .{parent.label});
         if (parent.process.stderr) |stderr| {
-            stderr.close();
+            stderr.close(parent.io);
             parent.process.stderr = null;
         }
         if (parent.stderr_term) |term| return term;
@@ -224,7 +215,7 @@ pub const ProcessCloseable = struct {
 
     fn stderr_getResult(self: *Closeable(ExitCode)) ?ExitCode {
         const parent: *@This() = @fieldParentPtr("stderr", self);
-        log(@typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{parent.process.argv[0]});
+        log(@typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{parent.label});
         return parent.closeable.getResult() orelse parent.stderr_term orelse {
             if (parent.process.stderr) |stderr| {
                 const revents = poll(stderr, std.posix.POLL.IN, parent.tracer);
@@ -244,7 +235,7 @@ pub const ProcessCloseable = struct {
     }
 };
 
-fn poll(file: std.fs.File, events: i16, tracer: *Tracer) i16 {
+fn poll(file: std.Io.File, events: i16, tracer: *Tracer) i16 {
     var poll_fds = [_]std.posix.pollfd{
         .{
             .fd = file.handle,
@@ -268,11 +259,10 @@ fn poll(file: std.fs.File, events: i16, tracer: *Tracer) i16 {
 }
 
 pub const FileSink = struct {
-    file: std.fs.File,
-    writer: std.Io.Writer = .{ .vtable = &writer_vtable, .buffer = &.{}, .end = 0 },
+    io: std.Io,
+    file_writer: std.Io.File.Writer,
     closeable: Closeable(ExitCode) = .{ .vtable = &vtable },
     path: []const u8,
-    append_mode: bool,
     result: ?ExitCode = null,
 
     const vtable = Closeable(ExitCode).VTable{
@@ -281,20 +271,28 @@ pub const FileSink = struct {
         .getLabel = getLabel,
     };
 
-    const writer_vtable = std.Io.Writer.VTable{
-        .drain = drain,
-    };
-
-    pub fn init(file: std.fs.File, path: []const u8, append_mode: bool) @This() {
-        return .{
-            .file = file,
+    /// Initializes in place: the file writer keeps a pointer into `self`, so the
+    /// `FileSink` must already live at its final address (e.g. heap allocated).
+    pub fn init(
+        self: *@This(),
+        io: std.Io,
+        file: std.Io.File,
+        path: []const u8,
+        append_mode: bool,
+    ) !void {
+        self.* = .{
+            .io = io,
+            .file_writer = file.writer(io, &.{}),
             .path = path,
-            .append_mode = append_mode,
         };
+        if (append_mode) {
+            const stat = try file.stat(io);
+            try self.file_writer.seekTo(stat.size);
+        }
     }
 
     pub fn writerPtr(self: *@This()) *std.Io.Writer {
-        return &self.writer;
+        return &self.file_writer.interface;
     }
 
     pub fn closeableWriter(self: *@This()) CloseableWriter(ExitCode) {
@@ -310,7 +308,8 @@ pub const FileSink = struct {
         const parent: *@This() = @fieldParentPtr("closeable", self);
         if (parent.result) |result| return result;
 
-        parent.file.close();
+        parent.file_writer.interface.flush() catch {};
+        parent.file_writer.file.close(parent.io);
         parent.result = .success;
         return parent.result.?;
     }
@@ -324,43 +323,11 @@ pub const FileSink = struct {
         const parent: *@This() = @fieldParentPtr("closeable", self);
         return parent.path;
     }
-
-    fn getParent(writer: *std.Io.Writer) *@This() {
-        return @fieldParentPtr("writer", writer);
-    }
-
-    fn drain(
-        writer: *std.Io.Writer,
-        data: []const []const u8,
-        splat: usize,
-    ) std.Io.Writer.Error!usize {
-        const parent = getParent(writer);
-        var written: usize = 0;
-
-        if (parent.append_mode) {
-            parent.file.seekFromEnd(0) catch return error.WriteFailed;
-        }
-
-        if (writer.buffered().len > 0) {
-            parent.file.writeAll(writer.buffered()) catch return error.WriteFailed;
-            written += writer.buffered().len;
-            writer.end = 0;
-        }
-
-        for (0..splat) |_| {
-            for (data) |chunk| {
-                parent.file.writeAll(chunk) catch return error.WriteFailed;
-                written += chunk.len;
-            }
-        }
-
-        return written;
-    }
 };
 
 const PipeWriter = struct {
-    file: ?std.fs.File,
-    file_writer: ?std.fs.File.Writer,
+    file: ?std.Io.File,
+    file_writer: ?std.Io.File.Writer,
     trace_file_writer: TraceWriter = undefined,
     writer: std.Io.Writer = .{ .vtable = &vtable, .buffer = &.{}, .end = 0 },
     tracer: *Tracer,
@@ -369,10 +336,10 @@ const PipeWriter = struct {
         .drain = drain,
     };
 
-    pub fn init(file: ?std.fs.File, buffer: []u8, tracer: *Tracer) PipeWriter {
+    pub fn init(io: std.Io, file: ?std.Io.File, buffer: []u8, tracer: *Tracer) PipeWriter {
         return .{
             .file = file,
-            .file_writer = if (file) |f| f.writer(buffer) else null,
+            .file_writer = if (file) |f| f.writerStreaming(io, buffer) else null,
             .tracer = tracer,
         };
     }
@@ -419,8 +386,8 @@ const PipeWriter = struct {
 };
 
 pub const PipeReader = struct {
-    file: ?std.fs.File,
-    file_reader: ?std.fs.File.Reader,
+    file: ?std.Io.File,
+    file_reader: ?std.Io.File.Reader,
     reader: std.Io.Reader = .{ .vtable = &vtable, .buffer = &.{}, .seek = 0, .end = 0 },
     tracer: *Tracer,
 
@@ -428,10 +395,10 @@ pub const PipeReader = struct {
         .stream = stream,
     };
 
-    pub fn init(file: ?std.fs.File, buffer: []u8, tracer: *Tracer) PipeReader {
+    pub fn init(io: std.Io, file: ?std.Io.File, buffer: []u8, tracer: *Tracer) PipeReader {
         return .{
             .file = file,
-            .file_reader = if (file) |f| f.readerStreaming(buffer) else null,
+            .file_reader = if (file) |f| f.readerStreaming(io, buffer) else null,
             .tracer = tracer,
         };
     }
@@ -447,7 +414,6 @@ pub const PipeReader = struct {
     ) std.Io.Reader.StreamError!usize {
         const parent = getParent(r);
         const file = parent.file orelse return 0;
-        const file_reader = if (parent.file_reader) |*fr| fr else return 0;
 
         var revents = poll(file, std.posix.POLL.IN, parent.tracer);
 
@@ -457,7 +423,7 @@ pub const PipeReader = struct {
             var buffer: [256]u8 = undefined;
             var bytes_read: usize = 0;
             while (bytes_read < buffer.len) {
-                const n = try file_reader.read(buffer[bytes_read .. bytes_read + 1]);
+                const n = std.posix.read(file.handle, buffer[bytes_read .. bytes_read + 1]) catch return error.ReadFailed;
                 if (n == 0) {
                     if (bytes_read == 0) return error.EndOfStream;
                     break;
@@ -482,7 +448,9 @@ pub const PipeReader = struct {
 };
 
 pub const CloseableProcessIo = struct {
+    io: std.Io,
     process: *std.process.Child,
+    label: []const u8,
     stdin_buffer: [1024]u8 = undefined,
     stdin_trace_buffer: [1024]u8 = undefined,
     stdin_writer: ?PipeWriter = null,
@@ -496,13 +464,13 @@ pub const CloseableProcessIo = struct {
     process_closeable: ProcessCloseable = undefined,
     tracer: *Tracer,
 
-    pub fn init(process: *std.process.Child, tracer: *Tracer) @This() {
-        return .{ .process = process, .tracer = tracer };
+    pub fn init(io: std.Io, process: *std.process.Child, label: []const u8, tracer: *Tracer) @This() {
+        return .{ .io = io, .process = process, .label = label, .tracer = tracer };
     }
 
     pub fn connect(self: *@This()) void {
         if (self.process.stdin) |f| {
-            self.stdin_writer = .init(f, &self.stdin_buffer, self.tracer);
+            self.stdin_writer = .init(self.io, f, &self.stdin_buffer, self.tracer);
             self.stdin_writer.?.trace_file_writer = .init(
                 &self.stdin_trace_buffer,
                 &self.stdin_writer.?.file_writer.?.interface,
@@ -510,10 +478,9 @@ pub const CloseableProcessIo = struct {
                 "process_stdin",
             );
         }
-        // if (self.process.stdin) |f| self.stdin_writer = f.writer(&self.stdin_buffer);
-        if (self.process.stdout) |f| self.stdout_reader = .init(f, &self.stdout_buffer, self.tracer);
-        if (self.process.stderr) |f| self.stderr_reader = .init(f, &self.stderr_buffer, self.tracer);
-        self.process_closeable = .init(self.process, self.tracer);
+        if (self.process.stdout) |f| self.stdout_reader = .init(self.io, f, &self.stdout_buffer, self.tracer);
+        if (self.process.stderr) |f| self.stderr_reader = .init(self.io, f, &self.stderr_buffer, self.tracer);
+        self.process_closeable = .init(self.io, self.process, self.label, self.tracer);
     }
 
     pub fn stdin(self: *@This()) *std.Io.Writer {

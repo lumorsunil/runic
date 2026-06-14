@@ -33,8 +33,8 @@ pub const Error =
 pub const IRDebugger = struct {
     allocator: Allocator,
     evaluator: IREvaluator,
-    stdout_file_writer: std.fs.File.Writer,
-    stdin_file_reader: std.fs.File.Reader,
+    stdout_file_writer: std.Io.File.Writer,
+    stdin_file_reader: std.Io.File.Reader,
     document_store: *DocumentStore,
     command_history: std.ArrayList(Command) = .empty,
     command_history_cursor: ?usize = null,
@@ -58,8 +58,8 @@ pub const IRDebugger = struct {
         return .{
             .allocator = allocator,
             .evaluator = .init(allocator, config, context),
-            .stdout_file_writer = std.fs.File.stdout().writer(try allocator.alloc(u8, 1024)),
-            .stdin_file_reader = std.fs.File.stdin().reader(try allocator.alloc(u8, 1024)),
+            .stdout_file_writer = std.Io.File.stdout().writer(config.io, try allocator.alloc(u8, 1024)),
+            .stdin_file_reader = std.Io.File.stdin().reader(config.io, try allocator.alloc(u8, 1024)),
             .document_store = document_store,
             .command_writer = .init(allocator),
             .reusable_allocating_writer = .init(allocator),
@@ -101,7 +101,7 @@ pub const IRDebugger = struct {
     }
 
     pub fn cont(self: *IRDebugger) Error!RunningEvent {
-        signals.trap(std.posix.SIG.INT);
+        signals.trap(@intFromEnum(std.posix.SIG.INT));
         self.is_continuing = true;
         return .cont;
     }
@@ -173,9 +173,9 @@ pub const IRDebugger = struct {
         try self.updateCommand("");
 
         if (self.is_continuing) {
-            if (signals.consume(std.posix.SIG.INT)) {
+            if (signals.consume(@intFromEnum(std.posix.SIG.INT))) {
                 try self.writeAll("\nReceived interrupt signal.\n\n");
-                signals.untrap(std.posix.SIG.INT);
+                signals.untrap(@intFromEnum(std.posix.SIG.INT));
                 self.is_continuing = false;
                 return .cont;
             }

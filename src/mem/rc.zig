@@ -35,7 +35,9 @@ pub const RCInitOptions = struct {
 };
 
 fn isLoggingEnabled() bool {
-    return std.process.hasEnvVar(std.heap.page_allocator, "RUNIC_LOG_RC") catch false;
+    return false;
+    // TODO: how to fix this without polluting everything with a pointer to env_map?
+    // return std.process.hasEnvVar(std.heap.page_allocator, "RUNIC_LOG_RC") catch false;
 }
 
 pub fn RC(comptime T: type) type {
@@ -78,9 +80,9 @@ pub fn RC(comptime T: type) type {
             }
 
             pub fn log(self: Ref, comptime fmt: []const u8, args: anytype) !void {
-                if (!isLoggingEnabled()) return;
+                if (comptime !isLoggingEnabled()) return;
 
-                var stderr = std.fs.File.stderr().writer(&.{});
+                var stderr = std.Io.File.stderr().writer(&.{});
                 const writer = &stderr.interface;
 
                 if (self.options.label) |label| {
@@ -223,9 +225,9 @@ pub fn RC(comptime T: type) type {
         }
 
         pub fn log(self: *RC(T), comptime fmt: []const u8, args: anytype) !void {
-            if (!isLoggingEnabled()) return;
+            if (comptime !isLoggingEnabled()) return;
 
-            var stderr = std.fs.File.stderr().writer(&.{});
+            var stderr = std.Io.File.stderr().writer(&.{});
             const writer = &stderr.interface;
 
             try writer.print("{s}{*}{s}:\n", .{ prefix_color, self, end_color });

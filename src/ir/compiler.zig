@@ -439,7 +439,7 @@ const Scope = struct {
         self: *Scope,
         depth: usize,
     ) GetFrameError!*Frame {
-        if (depth >= self.frames.items.len) return Error.FrameStartDepthTooHigh;
+        if (depth >= self.frames.items.len) return GetFrameError.FrameStartDepthTooHigh;
         const index = self.frames.items.len - 1 - depth;
         const frame = &self.frames.items[index];
         return frame;
@@ -549,10 +549,11 @@ fn internalStructTypes(
 }
 
 pub const IRCompiler = struct {
+    io: std.Io,
     allocator: Allocator,
     script: *ast.Script,
     script_args: []const []const u8,
-    env: ?*const std.process.EnvMap = null,
+    env_map: *std.process.Environ.Map,
     scopes: Scope = .init(),
     data: IRData = .init(),
     instruction_sets: std.ArrayList(InstructionSet) = .empty,
@@ -571,20 +572,22 @@ pub const IRCompiler = struct {
     stdin_type_stack: std.ArrayList(?ast.TypeExpr) = .empty,
 
     pub fn init(
+        io: std.Io,
         allocator: Allocator,
         document_store: *DocumentStore,
         script: *ast.Script,
         script_args: []const []const u8,
-        env: ?*const std.process.EnvMap,
+        env_map: *std.process.Environ.Map,
     ) Allocator.Error!@This() {
-        const logging_enabled_s = std.process.getEnvVarOwned(allocator, "RUNIC_LOG_" ++ logging_name) catch null;
+        const logging_enabled_s = env_map.get("RUNIC_LOG_" ++ logging_name) orelse null;
         const logging_enabled = if (logging_enabled_s) |le| std.mem.eql(u8, le, "1") else false;
 
         return .{
+            .io = io,
             .allocator = allocator,
             .script = script,
             .script_args = script_args,
-            .env = env,
+            .env_map = env_map,
             .struct_types = .fromOwnedSlice(try internalStructTypes(allocator)),
             .document_store = document_store,
             .logging_enabled = logging_enabled,
@@ -4766,6 +4769,7 @@ pub const IRCompiler = struct {
 
         // 1. Resolve module path
         const module_path = resolveModulePath(
+            self.io,
             self.allocator,
             import_expr.importer,
             import_expr.module_name,
@@ -4807,7 +4811,7 @@ pub const IRCompiler = struct {
             // Pub-export epilogue: write each pub binding to a closure slot
             const module_frame = try self.scopes.getFrame(0);
             const pub_slot_base = module_frame.closure_bindings.items.len;
-            var pub_exports_list = std.ArrayListUnmanaged(InstructionSet.PubExport){};
+            var pub_exports_list = std.ArrayListUnmanaged(InstructionSet.PubExport).empty;
             {
                 var frame_iter = module_frame.bindings.iterator();
                 while (frame_iter.next()) |entry| {
@@ -5064,7 +5068,7 @@ pub const IRCompiler = struct {
         // caller can read it after the fork completes.
         const current_frame = try self.scopes.getFrame(0);
         const pub_slot_base = current_frame.closure_bindings.items.len;
-        var pub_exports_list = std.ArrayListUnmanaged(InstructionSet.PubExport){};
+        var pub_exports_list = std.ArrayListUnmanaged(InstructionSet.PubExport).empty;
         var frame_iter = current_frame.bindings.iterator();
         while (frame_iter.next()) |entry| {
             if (!entry.value_ptr.is_pub) continue;
@@ -6242,7 +6246,7 @@ pub const IRCompiler = struct {
                 break :brk result;
             },
             .unary => |unary| self.analyzeExpressionEffects(unary.operand),
-            .array => |_| .{ .needs_stdio_capture = false },
+            .array => .{ .needs_stdio_capture = false },
             else => .{},
         };
     }
@@ -6297,7 +6301,7 @@ pub const IRCompiler = struct {
             if (!self.logging_enabled) return;
         }
 
-        var stderr = std.fs.File.stderr().writer(&.{});
+        var stderr = std.Io.File.stderr().writer(self.io, &.{});
         const writer = &stderr.interface;
 
         try writer.print("[{s}{*}{s}]\n", .{ prefix_color, self, end_color });
@@ -6310,7 +6314,7 @@ pub const IRCompiler = struct {
             if (!self.logging_enabled) return;
         }
 
-        var stderr = std.fs.File.stderr().writer(&.{});
+        var stderr = std.Io.File.stderr().writer(self.io, &.{});
         const writer = &stderr.interface;
 
         try writer.print(fmt, args);

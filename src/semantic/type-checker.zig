@@ -12,12 +12,13 @@ const span_color = rainbow.beginBgColor(.green) ++ rainbow.beginColor(.black);
 const end_color = rainbow.endColor();
 
 pub const TypeChecker = struct {
+    io: std.Io,
     arena: std.heap.ArenaAllocator,
     diagnostics: std.ArrayList(Diagnostic) = .empty,
     logging_enabled: bool,
     document_store: *DocumentStore,
     modules: std.StringArrayHashMapUnmanaged(*Scope),
-    env: ?*const std.process.EnvMap = null,
+    env: ?*std.process.Environ.Map = null,
     /// Stack of the enclosing functions' declared stdout types. Pushed when a
     /// function body is type-checked and consulted by `runYield` so that every
     /// `yield &1` is validated in the scope where it actually appears (e.g.
@@ -27,9 +28,9 @@ pub const TypeChecker = struct {
     stdout_type_stack: std.ArrayListUnmanaged(?*const ast.TypeExpr) = .empty,
 
     pub const Error = Scope.Error ||
-        std.fs.File.OpenError ||
-        std.fs.File.ReadError ||
-        std.fs.File.StatError ||
+        std.Io.File.OpenError ||
+        std.Io.File.Reader.Error ||
+        std.Io.File.StatError ||
         std.Io.Writer.Error ||
         DocumentStore.Error ||
         error{
@@ -90,15 +91,16 @@ pub const TypeChecker = struct {
     };
 
     pub fn init(
+        io: std.Io,
         allocator: std.mem.Allocator,
         document_store: *DocumentStore,
-        env: ?*const std.process.EnvMap,
+        env: *std.process.Environ.Map,
     ) TypeChecker {
-        const logging_enabled_s = std.process.getEnvVarOwned(allocator, "RUNIC_LOG_" ++ logging_name) catch "";
-        defer allocator.free(logging_enabled_s);
+        const logging_enabled_s = env.get("RUNIC_LOG_" ++ logging_name) orelse "";
         const logging_enabled = std.mem.eql(u8, logging_enabled_s, "1");
 
         return .{
+            .io = io,
             .arena = .init(allocator),
             .logging_enabled = logging_enabled,
             .document_store = document_store,
@@ -188,7 +190,7 @@ pub const TypeChecker = struct {
     pub fn log(self: *@This(), comptime fmt: []const u8, args: anytype) Error!void {
         if (!self.logging_enabled) return;
 
-        var stderr = std.fs.File.stderr().writer(&.{});
+        var stderr = std.Io.File.stderr().writer(self.io, &.{});
         const writer = &stderr.interface;
 
         try writer.print("[{s}{*}{s}]\n", .{ prefix_color, self, end_color });
@@ -199,7 +201,7 @@ pub const TypeChecker = struct {
     pub fn logWithoutPrefix(self: *@This(), comptime fmt: []const u8, args: anytype) !void {
         if (!self.logging_enabled) return;
 
-        var stderr = std.fs.File.stderr().writer(&.{});
+        var stderr = std.Io.File.stderr().writer(self.io, &.{});
         const writer = &stderr.interface;
 
         try writer.print(fmt, args);
@@ -1813,7 +1815,7 @@ pub const TypeChecker = struct {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, import.span);
 
-        const raw_module_type = try import.resolveType(self.arena.allocator(), scope) orelse {
+        const raw_module_type = try import.resolveType(self.io, self.arena.allocator(), scope) orelse {
             try self.reportSpanError(
                 import.span,
                 Error.ModuleNotFound,
@@ -1890,10 +1892,7 @@ pub const TypeChecker = struct {
         };
         try self.logTypeCheckTrace(alloc_writer.written(), span);
 
-        const result = try expr.resolveType(
-            self.arena.allocator(),
-            scope,
-        );
+        const result = try expr.resolveType(self.io, self.arena.allocator(), scope);
 
         if (T == *ast.ImportExpr) {
             if (result) |resolved| switch (resolved.*) {

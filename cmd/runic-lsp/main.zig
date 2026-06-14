@@ -2,23 +2,22 @@ const std = @import("std");
 const lsp = @import("runic_lsp");
 const build_options = @import("build_options");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const allocator = init.gpa;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = init.minimal.args;
+    const args_len = args.vector.len;
 
     const Mode = enum { stdio, tcp };
     var mode: Mode = .stdio;
     var tcp_port: ?u16 = null;
 
     var i: usize = 1;
-    while (i < args.len) {
-        const arg = args[i];
+    while (i < args_len) {
+        const arg = std.mem.span(args.vector[i]);
         if (std.mem.eql(u8, arg, "--version")) {
-            try printVersion();
+            try printVersion(io);
             return;
         }
         if (std.mem.eql(u8, arg, "--stdio")) {
@@ -28,23 +27,24 @@ pub fn main() !void {
             continue;
         }
         if (std.mem.eql(u8, arg, "--tcp")) {
-            if (i + 1 >= args.len) return error.MissingTcpPort;
-            tcp_port = try std.fmt.parseInt(u16, args[i + 1], 10);
+            if (i + 1 >= args_len) return error.MissingTcpPort;
+            const port_arg = std.mem.span(args.vector[i + 1]);
+            tcp_port = try std.fmt.parseInt(u16, port_arg, 10);
             mode = .tcp;
             i += 2;
             continue;
         }
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            try printUsage();
+            try printUsage(io);
             return;
         }
-        var stderr = std.fs.File.stderr().writer(&.{});
+        var stderr = std.Io.File.stderr().writer(io, &.{});
         try stderr.interface.print("unknown flag: {s}\n", .{arg});
         try stderr.interface.flush();
         return error.InvalidArguments;
     }
 
-    const stdin = std.fs.File.stdin();
+    const stdin = std.Io.File.stdin();
     // var oldattr: std.c.termios = undefined;
 
     mode_init: switch (mode) {
@@ -68,7 +68,7 @@ pub fn main() !void {
         },
         .tcp => {
             // _ = tcp_port; // reserved for future debugging sessions.
-            var stderr = std.fs.File.stderr().writer(&.{});
+            var stderr = std.Io.File.stderr().writer(io, &.{});
             try stderr.interface.print("--tcp transport is not implemented yet; use --stdio\n", .{});
             try stderr.interface.flush();
             return error.TcpTransportUnavailable;
@@ -85,15 +85,22 @@ pub fn main() !void {
         else => {},
     };
 
-    var server = try lsp.server.Server.init(allocator, stdin, std.fs.File.stdout(), std.fs.File.stderr());
+    var server = try lsp.server.Server.init(
+        io,
+        allocator,
+        init.environ_map,
+        stdin,
+        std.Io.File.stdout(),
+        std.Io.File.stderr(),
+    );
     server.initInterface();
     defer server.deinit();
 
     try server.run();
 }
 
-fn printUsage() !void {
-    var writer = std.fs.File.stdout().writer(&.{});
+fn printUsage(io: std.Io) !void {
+    var writer = std.Io.File.stdout().writer(io, &.{});
     try writer.interface.writeAll(
         "Runic language server\n" ++
             "\n" ++
@@ -104,8 +111,8 @@ fn printUsage() !void {
     try writer.interface.flush();
 }
 
-fn printVersion() !void {
-    var writer = std.fs.File.stdout().writer(&.{});
+fn printVersion(io: std.Io) !void {
+    var writer = std.Io.File.stdout().writer(io, &.{});
     try writer.interface.print("{s}\n", .{build_options.version});
     try writer.interface.flush();
 }

@@ -18,14 +18,22 @@ pub const Document = struct {
 
 /// Made to be used by an arena allocator
 pub const FrontendDocumentStore = struct {
+    io: std.Io,
     allocator: Allocator,
+    env_map: *std.process.Environ.Map,
     arena: std.heap.ArenaAllocator,
     document_store: DocumentStore = .{ .vtable = vtable },
     map: std.StringArrayHashMapUnmanaged(*Document) = .empty,
 
-    pub fn init(allocator: Allocator) FrontendDocumentStore {
+    pub fn init(
+        io: std.Io,
+        allocator: Allocator,
+        env_map: *std.process.Environ.Map,
+    ) FrontendDocumentStore {
         return .{
+            .io = io,
             .allocator = allocator,
+            .env_map = env_map,
             .arena = .init(allocator),
         };
     }
@@ -107,7 +115,7 @@ pub const FrontendDocumentStore = struct {
             document.* = .{
                 .path = owned_path,
                 .source = try self.arena.allocator().dupe(u8, source),
-                .parser = .init(self.allocator, &self.document_store),
+                .parser = .init(self.io, self.allocator, self.env_map, &self.document_store),
             };
             entry.value_ptr.* = document;
         }
@@ -121,17 +129,17 @@ pub const FrontendDocumentStore = struct {
     }
 
     fn loadDocument(self: *FrontendDocumentStore, path: []const u8) !*Document {
-        const file = try std.fs.openFileAbsolute(path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.openFileAbsolute(self.io, path, .{});
+        defer file.close(self.io);
         var buffer: [512]u8 = undefined;
-        var reader = file.reader(&buffer);
+        var reader = file.reader(self.io, &buffer);
         var contentBuffer = try self.arena.allocator().alloc(u8, MAX_DOCUMENT_LEN);
         const bytesRead = try reader.interface.readSliceShort(contentBuffer);
         const document = try self.arena.allocator().create(Document);
         document.* = .{
             .path = path,
             .source = contentBuffer[0..bytesRead],
-            .parser = .init(self.allocator, &self.document_store),
+            .parser = .init(self.io, self.allocator, self.env_map, &self.document_store),
         };
 
         return document;
@@ -140,7 +148,7 @@ pub const FrontendDocumentStore = struct {
     pub fn resolvePath(self: *FrontendDocumentStore, path: []const u8) ![]const u8 {
         if (path.len > 0 and path[0] == ':') return self.arena.allocator().dupe(u8, path);
         if (std.fs.path.isAbsolute(path)) return self.arena.allocator().dupe(u8, path);
-        return std.fs.cwd().realpathAlloc(self.arena.allocator(), path) catch |err| {
+        return std.Io.Dir.cwd().realPathFileAlloc(self.io, path, self.arena.allocator()) catch |err| {
             switch (err) {
                 error.FileNotFound => {
                     std.log.debug("File not found: {s}", .{path});
@@ -153,6 +161,7 @@ pub const FrontendDocumentStore = struct {
 };
 
 pub fn resolveModulePath(
+    io: std.Io,
     allocator: Allocator,
     importer: []const u8,
     moduleName: []const u8,
@@ -160,7 +169,9 @@ pub fn resolveModulePath(
     const dirname = std.fs.path.dirname(importer) orelse "./";
     const relative = try std.fs.path.join(allocator, &.{ dirname, moduleName });
     defer allocator.free(relative);
-    return std.fs.cwd().realpathAlloc(allocator, relative) catch |err| {
+    // `realPathFileAlloc` returns a sentinel-terminated `[:0]u8`; re-dupe it into a
+    // plain slice so callers can free it with a size matching the allocation.
+    const real = std.Io.Dir.cwd().realPathFileAlloc(io, relative, allocator) catch |err| {
         switch (err) {
             error.FileNotFound => {
                 std.log.debug("File not found: {s}", .{relative});
@@ -169,4 +180,6 @@ pub fn resolveModulePath(
         }
         return err;
     };
+    defer allocator.free(real);
+    return try allocator.dupe(u8, real);
 }

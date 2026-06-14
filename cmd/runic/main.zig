@@ -10,9 +10,9 @@ pub const std_options = std.Options{
     .logFn = log,
 };
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     signals.init(std.heap.page_allocator);
-    const exit_code = mainImpl() catch |err| {
+    const exit_code = mainImpl(init) catch |err| {
         // Errors that already printed a precise, user-facing message at the
         // point of failure (e.g. InvalidInt/InvalidFloat name the offending
         // input and location) skip the generic footer so the user sees one
@@ -27,35 +27,30 @@ pub fn main() !void {
     }
 }
 
-fn mainImpl() !runic.ExitCode {
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .stack_trace_frames = 24 }){};
-    defer {
-        const status = gpa.deinit();
-        if (status == .leak) std.log.err("runic CLI leaked memory", .{});
-    }
+fn mainImpl(init: std.process.Init) !runic.ExitCode {
+    const io = init.io;
+    const allocator = init.gpa;
+    const env_map = init.environ_map;
 
-    const allocator = gpa.allocator();
-
-    var tracer = runic.trace.Tracer.init(allocator, .{ .echo_to_stdout = false });
+    var tracer = runic.trace.Tracer.init(io, allocator, .{ .echo_to_stdout = false });
     defer tracer.deinit();
 
     var stdin_buffer: [1024]u8 = undefined;
     var stdout_buffer: [1024]u8 = undefined;
     var stderr_buffer: [1024]u8 = undefined;
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
+    const args = init.minimal.args;
 
     // var stdin_reader = std.fs.File.stdin().reader(&stdin_buffer);
-    var stdin_reader = PipeReader.init(std.fs.File.stdin(), &stdin_buffer, &tracer);
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
+    var stdin_reader = PipeReader.init(io, std.Io.File.stdin(), &stdin_buffer, &tracer);
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
+    var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
     const stdin = &stdin_reader.reader;
     const stdout = &stdout_writer.interface;
     const stderr = &stderr_writer.interface;
     defer stdout.flush() catch {};
     defer stderr.flush() catch {};
 
-    const result = try utils.parseCommandLine(allocator, argv);
+    const result = try utils.parseCommandLine(allocator, args);
     switch (result) {
         .show_help => {
             try utils.printUsage(stdout);
@@ -78,13 +73,15 @@ fn mainImpl() !runic.ExitCode {
                 cfg.deinit(allocator);
             }
 
-            const orig_termios = if (config.debug_ir) try enableRawMode() else null;
-            defer if (orig_termios) |t| restoreTermios(t) catch |err| {
+            const orig_termios = if (config.debug_ir) try enableRawMode(io) else null;
+            defer if (orig_termios) |t| restoreTermios(io, t) catch |err| {
                 std.log.err("Couldn't restore terminal attributes: {}", .{err});
             };
 
             return try dispatch(
+                io,
                 allocator,
+                env_map,
                 config,
                 stdin,
                 stdout,
@@ -97,9 +94,9 @@ fn mainImpl() !runic.ExitCode {
     return .success;
 }
 
-fn enableRawMode() !?std.posix.termios {
-    const stdin = std.fs.File.stdin();
-    const is_tty = stdin.isTty();
+fn enableRawMode(io: std.Io) !?std.posix.termios {
+    const stdin = std.Io.File.stdin();
+    const is_tty = try stdin.isTty(io);
     if (!is_tty) return null;
     if (@import("builtin").os.tag != .linux) return;
     var raw = try std.posix.tcgetattr(stdin.handle);
@@ -125,9 +122,9 @@ fn enableRawMode() !?std.posix.termios {
     return orig;
 }
 
-fn restoreTermios(termios: std.posix.termios) !void {
-    const stdin = std.fs.File.stdin();
-    const is_tty = stdin.isTty();
+fn restoreTermios(io: std.Io, termios: std.posix.termios) !void {
+    const stdin = std.Io.File.stdin();
+    const is_tty = try stdin.isTty(io);
     if (!is_tty) return;
     if (@import("builtin").os.tag != .linux) return;
     try std.posix.tcsetattr(stdin.handle, .FLUSH, termios);
@@ -135,12 +132,16 @@ fn restoreTermios(termios: std.posix.termios) !void {
 
 pub fn log(
     comptime _: std.log.Level,
-    comptime _: @Type(.enum_literal),
+    comptime _: @EnumLiteral(),
     comptime format: []const u8,
     args: anytype,
 ) void {
+    const io = std.Options.debug_io;
+    const prev = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(prev);
     var buffer: [64]u8 = undefined;
-    const stderr = std.debug.lockStderrWriter(&buffer);
-    defer std.debug.unlockStderrWriter();
-    nosuspend stderr.print(format ++ "\n", args) catch return;
+    const stderr = std.debug.lockStderr(&buffer).terminal();
+    defer std.debug.unlockStderr();
+    // return defaultLogFileTerminal(level, scope, format, args, stderr) catch {};
+    stderr.writer.print(format ++ "\n", args) catch {};
 }
