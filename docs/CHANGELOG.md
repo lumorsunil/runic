@@ -14,6 +14,49 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 _Nothing yet._
 
+## [0.3.0] — 2026-06-14
+
+### Changed
+
+#### Zig 0.16.0 migration
+- **Minimum Zig version is now 0.16.0** (`build.zig.zon` `minimum_zig_version`).
+  The migration is internal — no language, syntax, or CLI behavior changes — but
+  it touches the entire I/O core.
+- **`std.Io` threading**: Zig 0.16 moved the filesystem (`std.fs.File`/`Dir` →
+  `std.Io.File`/`Dir`), process, and reader/writer APIs under `std.Io`, and every
+  side effect (opening/reading/writing/closing files, spawning and waiting on
+  processes, `realpath`, `isTty`, terminal mode) now requires an `std.Io`
+  instance. An `io` value obtained from `std.process.Init` is threaded from the
+  CLI/LSP entry points down through the runner, evaluator, IR context, process
+  layer (`FileSink`, `PipeReader`/`PipeWriter`, `ProcessCloseable`,
+  `CloseableProcessIo`), and the LSP server/workspace.
+- **Process spawning rewritten**: `std.process.Child.init`/`spawn`/`waitForSpawn`
+  and the `argv`/`env_map`/`cwd`/`term` fields were removed. Command execution now
+  uses `std.process.spawn(io, .{ ... })` with `SpawnOptions` (the `Child.Cwd`
+  union, `environ_map`, and the lowercase `.pipe`/`.inherit` `StdIo` variants) and
+  reaps via `Child.wait(io)` with the new lowercase `Term` (`.exited`/`.signal`).
+- **Environment map**: `std.process.EnvMap` became `std.process.Environ.Map`, now
+  carried by value (no longer optional) on each subshell context.
+- **Assorted std renames**: `std.mem.trimRight`/`trimLeft` → `trimEnd`/`trimStart`,
+  `File.Reader`/`File.Writer`-based seeking and reading, and `std.posix.SIG` /
+  `Sigaction` handlers becoming enum-typed.
+
+### Fixed
+- **Double-wait panic**: `Child.wait` is now single-shot and asserts the process
+  has not already been reaped, so the thread-cleanup wait and a process's
+  `ProcessCloseable` could no longer both reap the same child. Both paths now skip
+  the wait when the process has already exited.
+- **LSP message framing**: header lines are read with `takeDelimiterInclusive` so
+  the trailing newline is consumed; the previous exclusive read left the delimiter
+  in the stream, misaligning the request body and breaking every LSP request.
+- **`realpath` allocation sizes**: results of `realPathFileAlloc` (sentinel-
+  terminated `[:0]u8`) are re-duped into plain slices before being stored/freed,
+  fixing allocator free-size mismatches in the LSP server, document store, and
+  module-path resolution.
+- **Diagnostic file paths**: corrected the `std.fs.path.relative` argument order so
+  source locations again render relative to the working directory instead of
+  `../../..`.
+
 ## [0.2.0] — 2026-06-04
 
 > The **typed pipes** work below is summarized narratively in
