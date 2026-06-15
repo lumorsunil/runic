@@ -2922,8 +2922,36 @@ pub const Parser = struct {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
-        // TODO: implement
+        const next = try self.peekToken();
 
+        if (isTypeExprTerminator(next.tag)) return null;
+
+        // Leading `!T` — an error union with an inferred error set (the error
+        // set is filled in later by inference; see Phase 6).
+        if (next.tag == .bang) {
+            return try self.parseInferredErrorUnionTypeExpr();
+        }
+
+        const primary = (try self.parseMaybePrimaryTypeExpr()) orelse return null;
+
+        // Postfix `E!T` — an error union with an explicit error set `E`.
+        const after = try self.peekToken();
+        if (after.tag == .bang) {
+            _ = try self.nextToken();
+            const payload = try self.parseTypeExpr();
+            return try self.allocTypeExpression(.{
+                .error_union = .{
+                    .err_set = primary,
+                    .payload = payload,
+                    .span = primary.span().endAt(payload.span()),
+                },
+            });
+        }
+
+        return primary;
+    }
+
+    fn parseMaybePrimaryTypeExpr(self: *Self) Error!?*const ast.TypeExpr {
         const next = try self.peekToken();
 
         if (isTypeExprTerminator(next.tag)) return null;
@@ -2945,6 +2973,27 @@ pub const Parser = struct {
             },
             else => null,
         };
+    }
+
+    /// Parses a leading-`!` error union (`!T`). The error set is left empty as
+    /// an "infer me" placeholder; inference (Phase 6) replaces it with the
+    /// concrete set derived from the value/body.
+    fn parseInferredErrorUnionTypeExpr(self: *Self) Error!*const ast.TypeExpr {
+        const bang = try self.expectTokenTag(.bang);
+        const payload = try self.parseTypeExpr();
+        const err_set = try self.allocTypeExpression(.{
+            .error_set = .{
+                .variants = &.{},
+                .span = bang.span,
+            },
+        });
+        return self.allocTypeExpression(.{
+            .error_union = .{
+                .err_set = err_set,
+                .payload = payload,
+                .span = bang.span.endAt(payload.span()),
+            },
+        });
     }
 
     fn parseOptionalTypeExpr(self: *Self) Error!*const ast.TypeExpr {

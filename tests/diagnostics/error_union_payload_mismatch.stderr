@@ -1,0 +1,6 @@
+[error]: tests/diagnostics/error_union_payload_mismatch.rn:2:27: expected type String, actual: Int
+   1:const MyError = error { Bad }
+   2:const x: MyError!String = 5
+   3:echo "should not reach"
+   4:
+

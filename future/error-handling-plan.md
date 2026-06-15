@@ -92,14 +92,16 @@ Goal: `const MyError = error { UnknownError, ErrorWithMessage: String }` parses,
 
 **Status / Notes:** ✅ Complete. Caveats deferred to later phases: (1) variant **payload types are not deeply validated** — `runTypeIdentifier` is a no-op across the whole type checker, so an unknown payload type name isn't yet caught (consistent with existing behavior). (2) `resolveTypeExpr` returns `error_set` via its `else` branch, so variant payloads are **not alias-resolved** yet (fine for primitive payloads; revisit in Phase 3). (3) The dead `Statement.error_decl`/`EnumBody`/`UnionBody` nodes were left untouched — candidates for removal in Phase 9.
 
-### Phase 2 — Error union type syntax
+### Phase 2 — Error union type syntax ✅ COMPLETE
 Goal: `MyError!String`, and bare `!String`, parse as `ast.TypeExpr.error_union`.
-- [ ] In `parseMaybeTypeExpr`/`parseTypeExpr`, handle postfix `!`: after parsing a type, if next token is `bang`, wrap into `error_union { err_set = <parsed>, payload = <parse next type> }`.
-- [ ] Handle leading `!T` (no explicit error set) → `error_union` with an inferred/placeholder error set (ties into Phase 6).
-- [ ] Type checker already resolves `error_union` recursively (`resolveTypeExpr`/`runTypeExpression`) and has assignment validation (`validateTypeAssignmentErrorUnion` et al.) — verify these actually fire once the parser produces the nodes; fix the pointer-equality variant matching (needs interning, see Phase 1).
-- [ ] Test: `const x: MyError!String = ...` annotation parses & resolves.
+- [x] Split `parseMaybeTypeExpr` into a primary parser (`parseMaybePrimaryTypeExpr`) + postfix `!` handling: after a primary type, if next is `bang`, wrap into `error_union { err_set = primary, payload = parseTypeExpr() }`. (`src/frontend/parser.zig`)
+- [x] Leading `!T` → `parseInferredErrorUnionTypeExpr`: builds an `error_union` whose `err_set` is an **empty `error_set` placeholder** (`variants = &.{}`) meaning "infer me" (Phase 6 fills it in).
+- [x] Verified the type checker resolves + validates these once produced: `const x: MyError!String = "hi"` and `const y: !String = "hi"` type-check & run; error-union fn return types parse (`fn Void getOne() MyError!Int { return 1 }`); payload type mismatch (`MyError!String = 5`) is rejected with a good diagnostic. Name-based membership (from Phase 1) is in place — no interning needed.
+- [x] Tests: `tests/features/error_union_types_regression.rn` (+`.stdout`); `tests/diagnostics/error_union_payload_mismatch.rn` (+`.status`/`.stderr`). Full suite green (69 smoke + 17 diagnostic).
 
-**Status / Notes:** _not started — note: assignment validation is pre-built but unreachable/untested today; this phase is the first that can exercise it._
+**Status / Notes:** ✅ Complete (type **syntax + assignment** only). Important caveats for Phase 3:
+- **Runtime error-union values don't work yet.** A fn returning `E!Int` does not unwrap its ok value — `${getOne}` interpolates empty. That's the Phase 3 runtime representation (D2).
+- **Latent panic in `validateTypeAssignmentErrorUnion`:** the `.error_union`/`.err` arms access `assignee.err_set.error_set` directly, but after resolution `err_set` is often an `.alias` (or `.identifier`) wrapping the set, not a raw `.error_set` — accessing the wrong union field will panic. Not hit in Phase 2 (plain-value assignment uses the `else` branch only), but **must unalias before `.error_set` access in Phase 3** when error/union values start flowing.
 
 ### Phase 3 — Error value construction + runtime representation
 Goal: construct error values and represent them at runtime.

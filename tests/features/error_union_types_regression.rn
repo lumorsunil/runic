@@ -1,0 +1,17 @@
+const MyError = error {
+    UnknownError,
+    ErrorWithMessage: String,
+}
+
+// Explicit error set on the union.
+const explicit: MyError!String = "explicit ok"
+
+// Leading `!` — error set inferred (Phase 6); parses and resolves today.
+const inferred: !String = "inferred ok"
+
+// Error union as a function return type.
+fn Void getOne() MyError!Int { return 1 }
+getOne
+
+echo "${explicit}"
+echo "${inferred}"
