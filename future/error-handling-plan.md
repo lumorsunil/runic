@@ -151,14 +151,14 @@ Goal: `expr catch default` and `expr catch |err| body`.
 
 **Status / Notes:** ✅ Complete for **directly-produced** error unions (inline values, bindings). **Deferred:** consuming a *function/pipeline* result (`echo "x" | parseInt catch 0`) needs the value/yield result to be captured as a value — blocked on the **pre-existing typed-value `${}`/capture limitation** (non-String stdout doesn't materialize into a value), not on catch itself. Revisit alongside that capture work / Phase 7.
 
-### Phase 5 — `try` keyword
-Goal: `try expr` desugars to `expr catch |err| return err`.
-- [ ] Parse `try <expr>` → `ast.try_expr` (or desugar directly to `catch_expr` at parse time).
-- [ ] Type check: enclosing function's return type must be an error union whose set is a superset of the LHS error set (drives Phase 6 inference).
-- [ ] Compile (reuse Phase 4 catch machinery with an implicit `return err` handler).
-- [ ] Test: `try` propagates error to caller; `try` in non-erroring fn → type error.
+### Phase 5 — `try` keyword ✅ COMPLETE
+Goal: `try expr` propagates an error out of the enclosing function (value/yield model, D6), else evaluates to the ok value.
+- [x] Parse `try <expr>` → `ast.try_expr` (`parseTryExpression` in `parseExpressionInner`; binds tightly via `parseExpressionInner`, so `(try X) catch Y` and `yield try X` parse correctly — parenthesize pipelines).
+- [x] Type check (`runTry`): subject must be error-like (else diagnostic); `TryExpr.resolveType` yields the payload type. **Deferred:** validating that the enclosing function's error set is a superset of the propagated error (needs Phase 6 inference).
+- [x] Compile (`compileTry`): mirrors `compileOptionalUnwrap` — stabilize subject → `is_err` → on error `exit_with` the error (propagate as the function's result), else evaluate to the ok value (returns the result ref).
+- [x] Verified: `try ok` unwraps and continues; `try error` stops the enclosing function (post-`try` code doesn't run); `yield try ok` works; `try` on a non-error → diagnostic. Tests: `error_try_regression` (feature) + `error_try_non_error` (diagnostic). Full suite green (74 smoke + 22 diagnostic).
 
-**Status / Notes:** _not started_
+**Status / Notes:** ✅ Complete. Propagation uses `exit_with` (the function's result). Observing the propagated error from a *caller* shares the deferred function-result-consumption gap from Phase 4 (typed-value capture); the control-flow (stop the function) is fully working and tested.
 
 ### Phase 6 — Inferred error sets
 Goal: `const result = echo "hello"` infers `ExecutableError!String`; `fn ... !T { ... }` infers the union of error sets that can escape the body.

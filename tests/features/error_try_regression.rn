@@ -1,0 +1,20 @@
+const E = error { Bad }
+
+// try on an ok value unwraps it and continues.
+fn Void okPath() E!String {
+    const ok: E!String = "value"
+    yield "ok=${try ok}"
+}
+
+// try on an error propagates out of the function, so the code after it
+// (the second yield) never runs.
+fn Void errPath() E!String {
+    const bad: E!String = E.Bad
+    const v = try bad
+    yield "unreachable ${v}"
+}
+
+okPath
+echo "|"
+errPath
+echo "after-errPath"

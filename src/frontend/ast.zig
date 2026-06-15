@@ -1272,12 +1272,18 @@ pub const TryExpr = struct {
     span: Span,
 
     pub fn resolveType(
-        _: *@This(),
-        _: std.Io,
-        _: std.mem.Allocator,
-        _: *semantic.Scope,
+        self: *@This(),
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        scope: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
-        return null;
+        // `try expr` evaluates to the error union's payload type (the error
+        // case is propagated out of the enclosing function).
+        const subject_type = try self.subject.resolveType(io, allocator, scope) orelse return null;
+        return switch (subject_type.*) {
+            .error_union => |error_union| error_union.payload,
+            else => subject_type,
+        };
     }
 };
 

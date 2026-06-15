@@ -1861,6 +1861,7 @@ pub const IRCompiler = struct {
             .array => |array| self.compileArray(expr, array),
             .struct_literal => |struct_literal| self.compileStructLiteral(expr, struct_literal),
             .catch_expr => |catch_expr| self.compileCatch(expr, catch_expr),
+            .try_expr => |try_expr| self.compileTry(expr, try_expr),
             .for_expr => |for_expr| self.compileForLoop(expr, for_expr),
             .subshell => |subshell| self.compileSubshell(expr, subshell),
             .fd => |fd_expr| self.compileFd(expr, fd_expr),
@@ -2446,6 +2447,38 @@ pub const IRCompiler = struct {
             break :blk handler.typeExpr();
         };
         return .from(result.dereference().typed(result_type));
+    }
+
+    /// `try expr` — if the subject is an error, propagate it out of the
+    /// enclosing function (`exit_with`); otherwise evaluate to the ok value.
+    fn compileTry(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        try_expr: ast.TryExpr,
+    ) Error!Result {
+        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        const subject_ref = try self.newRef(source, "try_subject");
+        const subject = try self.compileStableExpressionIntoRef(source, try_expr.subject, subject_ref);
+
+        const is_err_ref = try self.newRef(source, "try_is_err");
+        try self.addInstruction(.init(.from(source), .{ .is_err = .{
+            .operand = subject_ref.dereference(),
+            .result = is_err_ref,
+        } }));
+
+        const after_addr = try self.newLabel("try_after", .unknown);
+        // Skip propagation when the subject is not an error.
+        try self.jmp(source, try .from(is_err_ref.dereference()), false, after_addr);
+        // Error: propagate it as the enclosing function's result.
+        try self.exitWith(source, try .from(subject_ref.dereference()));
+        try self.setLabel(after_addr.local_addr.label, .abs);
+
+        const payload_type: ?ast.TypeExpr = switch (subject.typeExpr() orelse @as(ast.TypeExpr, .global(.void))) {
+            .error_union => |error_union| error_union.payload.*,
+            else => null,
+        };
+        return .from(subject_ref.dereference().typed(payload_type));
     }
 
     fn compileCatchHandler(

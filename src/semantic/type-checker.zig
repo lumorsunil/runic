@@ -1026,6 +1026,7 @@ pub const TypeChecker = struct {
             .for_expr => |*for_expr| self.runForExpr(scope, for_expr),
             .match_expr => |*match_expr| self.runMatchExpr(scope, match_expr),
             .catch_expr => |*catch_expr| self.runCatch(scope, catch_expr),
+            .try_expr => |*try_expr| self.runTry(scope, try_expr),
             .import_expr => |*import_expr| self.runImportExpr(scope, import_expr),
             .fn_decl => |*fn_decl| self.runFnDecl(scope, fn_decl),
             .call => |*call| self.runCall(scope, call),
@@ -1406,6 +1407,29 @@ pub const TypeChecker = struct {
                 Error.TypeMismatch,
                 .@"error",
                 "catch requires an error union or error value on the left-hand side, found {f}",
+                .{st},
+            ),
+        };
+    }
+
+    pub fn runTry(self: *TypeChecker, scope: *Scope, try_expr: *ast.TryExpr) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.logTypeCheckTrace(@src().fn_name, try_expr.span);
+
+        try self.runExpression(scope, try_expr.subject);
+        const subject_raw = try self.resolveExprType(scope, try_expr.subject);
+        const subject_type = if (subject_raw) |t| self.unaliasType(t) else null;
+
+        // The subject must be error-like; the error case is propagated out of
+        // the enclosing function. (Validating that the enclosing function's
+        // error set accepts the propagated error is deferred to Phase 6.)
+        if (subject_type) |st| switch (st.*) {
+            .error_union, .error_set, .err, .failed => {},
+            else => try self.reportSpanError(
+                try_expr.subject.span(),
+                Error.TypeMismatch,
+                .@"error",
+                "try requires an error union or error value, found {f}",
                 .{st},
             ),
         };

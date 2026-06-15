@@ -488,6 +488,21 @@ pub const Parser = struct {
         return self.parseMaybeCatch(subject);
     }
 
+    /// `try <expr>` — propagates an error out of the enclosing function, else
+    /// evaluates to the ok value. Binds tightly (parenthesize pipelines, e.g.
+    /// `try (echo "x" | parseInt)`).
+    fn parseTryExpression(self: *Self) Error!*ast.Expression {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const start = try self.expectTokenTag(.kw_try);
+        const subject = try self.parseExpressionInner();
+        return self.allocExpression(.{ .try_expr = .{
+            .subject = subject,
+            .span = start.span.endAt(subject.span()),
+        } });
+    }
+
     /// `expr catch <default>` / `expr catch |err| <handler>`. `catch` binds
     /// looser than pipelines, so the whole inner expression is its subject.
     fn parseMaybeCatch(self: *Self, subject: *ast.Expression) Error!*ast.Expression {
@@ -523,6 +538,7 @@ pub const Parser = struct {
             .kw_if => self.parseIfExpression(),
             .kw_for => self.parseForExpression(),
             .kw_match => self.parseMatchExpression(),
+            .kw_try => self.parseTryExpression(),
             else => {
                 if (try self.parseMaybeUnaryExpression()) |unary_expr| return unary_expr;
                 if (try self.parseMaybeBinaryExpression()) |binary_expr| return binary_expr;
