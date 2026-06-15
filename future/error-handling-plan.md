@@ -68,8 +68,9 @@ Resolve these as we go; record the choice + rationale inline.
 
   Implies a new **error-set type registry** (parallel to the struct-type table) so `set_id` resolves to a set and `variant_index` to a variant — to be built in Phase 1/3.
 - **D3 — `ExecutableError` definition.** Spec says all executable calls have stdout type `ExecutableError!String`. Where is `ExecutableError` defined — a builtin error set injected into the prelude/global scope, or a synthetic compiler type? **Recommendation:** define it as a builtin error set in global scope so it participates in inference and switch. Decision: _TBD_.
-- **D4 — Error set member access vs payload struct literal.** `E.Variant` (no payload) reads like member/path access; `E{ .Variant = x }` reads like a struct literal. Confirm parser can disambiguate from existing struct-literal / member parsing. Decision: _TBD_.
-- **D5 — Inferred error-set representation.** For `!String` and `fn ... !T`, how is the inferred set stored during checking (open set accumulated from body, then frozen)? Decision: _TBD_.
+- **D4 — Error set member access vs payload struct literal.** ✅ **RESOLVED (Phase 3a/3b).** `E.Variant` rides member access; `E{ .Variant = x }` is a new struct-literal node, disambiguated by an **uppercase identifier immediately followed by `{`** (lowercase command parsing untouched). Both implemented.
+- **D5 — Inferred error-set representation.** For `!String` and `fn ... !T`, how is the inferred set stored during checking (open set accumulated from body, then frozen)? Decision: _TBD (Phase 6)._
+- **D6 — Error propagation model.** ✅ **RESOLVED (2026-06-15): value/yield-based.** `catch`/`try` operate on the error union a function/pipeline **produces** (via `yield`→stdout), not on `return`. `try` re-yields the error to propagate. See the Phase 3c notes for full rationale. `catch` on directly-produced error unions is model-independent and is built first.
 
 ---
 
@@ -135,7 +136,7 @@ Goal: construct error values and represent them at runtime. Split into 3a/3b/3c 
 
 **Findings that reframed this phase:**
 - The Phase 2 "empty `${getOne}`" was **not** an error bug. Two orthogonal causes: (1) `return` is control-flow/exit (`exitWith`), not output — functions emit their value via **`yield` → stdout**, consumed by `${fn}`/pipes; (2) `${fn}` command-substitution capture of **typed (non-String) stdout** is a **pre-existing** limitation — plain `fn Void f() Int { yield 1 }` also leaks `1` to program stdout instead of being captured. Error-union stdout inherits this. Fixing typed-value `${}` capture is general typed-pipe machinery, **out of scope** for error handling.
-- **Open design question for Phase 4/5:** the spec uses `return` to produce/propagate error values (`return ParseIntError.ExpectedNumber`; `try` desugars to `catch |err| return err`), but the language produces function output via `yield`. Need to decide whether error propagation rides `yield`→stdout (consistent with the language) or `return` (consistent with the spec) — this shapes how `catch`/`try` consume a function's error union.
+- **Propagation model — ✅ RESOLVED (2026-06-15): value/yield-based.** Errors are ordinary output values. A function with an `E!T` stdout type produces its ok-or-error value via `yield` (already enabled in 3c); `catch`/`try` operate on the **produced value** (binding / pipeline / `${}` substitution), not on `return`. `try` propagates by re-yielding the error. This is consistent with the language's value-production model and builds directly on 3c, at the cost of diverging from the spec's `return ...` wording (the spec's `return` is treated as aspirational phrasing; functionally the error is the stage's output). Note: `catch` on a *directly-produced* error union (inline `E.Bad`, a binding) is model-independent and can be built first; the value/yield decision only governs how function/pipeline results are consumed.
 
 **Status / Notes:** Phase 3 ✅ COMPLETE (3a ✅ · 3b ✅ · 3c ✅).
 
