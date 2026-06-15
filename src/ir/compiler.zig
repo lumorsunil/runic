@@ -1860,6 +1860,7 @@ pub const IRCompiler = struct {
             .unary => |unary| self.compileUnary(expr, unary),
             .array => |array| self.compileArray(expr, array),
             .struct_literal => |struct_literal| self.compileStructLiteral(expr, struct_literal),
+            .catch_expr => |catch_expr| self.compileCatch(expr, catch_expr),
             .for_expr => |for_expr| self.compileForLoop(expr, for_expr),
             .subshell => |subshell| self.compileSubshell(expr, subshell),
             .fd => |fd_expr| self.compileFd(expr, fd_expr),
@@ -2397,6 +2398,92 @@ pub const IRCompiler = struct {
             .variant = field.name.name,
             .payload = boxed,
         } });
+    }
+
+    /// `expr catch <default>` / `expr catch |err| <handler>`. Evaluates the
+    /// subject; if it is an error value, runs the handler (with `|err|` bound to
+    /// the error), otherwise uses the subject's ok value.
+    fn compileCatch(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        catch_expr: ast.CatchExpr,
+    ) Error!Result {
+        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        const subject_ref = try self.newRef(source, "catch_subject");
+        const subject = try self.compileStableExpressionIntoRef(source, catch_expr.subject, subject_ref);
+
+        const is_err_ref = try self.newRef(source, "catch_is_err");
+        try self.addInstruction(.init(.from(source), .{ .is_err = .{
+            .operand = subject_ref.dereference(),
+            .result = is_err_ref,
+        } }));
+
+        const result = try self.newRef(source, "catch_result");
+        const handler_addr = try self.newLabel("catch_handler", .unknown);
+        const after_addr = try self.newLabel("catch_after", .unknown);
+
+        // Jump to the handler when the subject is an error.
+        try self.jmp(source, try .from(is_err_ref.dereference()), true, handler_addr);
+
+        // Ok path: the result is the subject's ok value.
+        try self.set(source, result, .from(subject_ref.dereference()));
+        try self.jmp(source, null, false, after_addr);
+
+        // Error path: run the handler (with the optional `|err|` capture).
+        try self.setLabel(handler_addr.local_addr.label, .abs);
+        const handler = try self.compileCatchHandler(source, catch_expr, subject_ref);
+        try self.set(source, result, stableResultSource(handler));
+
+        try self.setLabel(after_addr.local_addr.label, .abs);
+
+        // Result type: the error union's payload when known, else the handler's
+        // type (a pure error value always yields the handler).
+        const result_type: ?ast.TypeExpr = blk: {
+            if (subject.typeExpr()) |subject_type| {
+                if (subject_type == .error_union) break :blk subject_type.error_union.payload.*;
+            }
+            break :blk handler.typeExpr();
+        };
+        return .from(result.dereference().typed(result_type));
+    }
+
+    fn compileCatchHandler(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        catch_expr: ast.CatchExpr,
+        subject_ref: ir.Location,
+    ) Error!Result {
+        try self.scopes.push(self.allocator, .lexical);
+        defer self.scopes.pop();
+
+        if (catch_expr.capture) |capture| {
+            if (capture.bindings.len == 1) {
+                switch (capture.bindings[0].*) {
+                    .discard => {},
+                    .identifier => |identifier| try self.compileIdentifierBinding(
+                        source,
+                        identifier,
+                        .from(subject_ref.dereference()),
+                        null,
+                        false,
+                        .normal,
+                    ),
+                    else => {
+                        try self.reportSourceError(
+                            source,
+                            Error.UnsupportedBindingPattern,
+                            .@"error",
+                            "catch capture binding pattern not yet supported",
+                            .{},
+                        );
+                        return .fromValue(.void);
+                    },
+                }
+            }
+        }
+
+        return self.compileExpression(catch_expr.handler);
     }
 
     fn compileMember(
@@ -6339,7 +6426,7 @@ pub const IRCompiler = struct {
     fn instructionSetIsCountedLoopSafe(self: *IRCompiler, instr_set: usize) bool {
         for (self.instruction_sets.items[instr_set].instructions.items) |instr| {
             switch (instr.type) {
-                .comment, .set, .ath, .cmp, .neg, .get_env, .set_env, .simple_exec => {},
+                .comment, .set, .ath, .cmp, .neg, .is_err, .get_env, .set_env, .simple_exec => {},
                 else => return false,
             }
         }

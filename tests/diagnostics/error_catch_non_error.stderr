@@ -1,0 +1,5 @@
+[error]: tests/diagnostics/error_catch_non_error.rn:1:11: catch requires an error union or error value on the left-hand side, found []Byte
+   1:const x = "success" catch "fallback"
+   2:echo "${x}"
+   3:
+

@@ -484,6 +484,33 @@ pub const Parser = struct {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
+        const subject = try self.parseExpressionInner();
+        return self.parseMaybeCatch(subject);
+    }
+
+    /// `expr catch <default>` / `expr catch |err| <handler>`. `catch` binds
+    /// looser than pipelines, so the whole inner expression is its subject.
+    fn parseMaybeCatch(self: *Self, subject: *ast.Expression) Error!*ast.Expression {
+        var result = subject;
+        while (true) {
+            const next = try self.peekToken();
+            if (next.tag != .kw_catch) break;
+            _ = try self.nextToken(); // consume `catch`
+
+            const capture = try self.parseOptionalCaptureClause();
+            const handler = try self.parseControlFlowBody();
+
+            result = try self.allocExpression(.{ .catch_expr = .{
+                .subject = result,
+                .capture = capture,
+                .handler = handler,
+                .span = result.span().endAt(handler.span()),
+            } });
+        }
+        return result;
+    }
+
+    fn parseExpressionInner(self: *Self) Error!*ast.Expression {
         self.clearExpectedTokens();
 
         const next = try self.peekToken();
@@ -1426,7 +1453,7 @@ pub const Parser = struct {
 
     fn isExprTerminator(tag: token.Tag) bool {
         return switch (tag) {
-            .r_paren, .r_bracket, .r_brace, .comma, .pipe, .pipe_pipe, .amp_amp, .amp, .string_interp_end, .newline, .semicolon, .l_brace, .range, .dot_l_brace, .kw_else => true,
+            .r_paren, .r_bracket, .r_brace, .comma, .pipe, .pipe_pipe, .amp_amp, .amp, .string_interp_end, .newline, .semicolon, .l_brace, .range, .dot_l_brace, .kw_else, .kw_catch => true,
             else => false,
         };
     }

@@ -1283,23 +1283,25 @@ pub const TryExpr = struct {
 
 pub const CatchExpr = struct {
     subject: *Expression,
-    handler: CatchClause,
+    /// Optional `|err|` binding for the error value (e.g. `catch |err| ...`).
+    capture: ?CaptureClause,
+    /// The default value / handler expression (may itself be a block).
+    handler: *Expression,
     span: Span,
 
     pub fn resolveType(
-        _: *@This(),
-        _: std.Io,
-        _: std.mem.Allocator,
-        _: *semantic.Scope,
+        self: *@This(),
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        scope: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
-        return null;
+        // `expr catch ...` evaluates to the error union's payload type.
+        const subject_type = try self.subject.resolveType(io, allocator, scope) orelse return null;
+        return switch (subject_type.*) {
+            .error_union => |error_union| error_union.payload,
+            else => subject_type,
+        };
     }
-};
-
-pub const CatchClause = struct {
-    binding: ?*BindingPattern,
-    body: Block,
-    span: Span,
 };
 
 pub const ImportExpr = struct {

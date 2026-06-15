@@ -878,7 +878,7 @@ pub const TypeChecker = struct {
             .try_expr => |try_expr| try self.validateFunctionBodyStdin(scope, try_expr.subject, enclosing_stdin),
             .catch_expr => |catch_expr| {
                 try self.validateFunctionBodyStdin(scope, catch_expr.subject, enclosing_stdin);
-                try self.validateBlockStdin(scope, catch_expr.handler.body, enclosing_stdin);
+                try self.validateFunctionBodyStdin(scope, catch_expr.handler, enclosing_stdin);
             },
             .unary => |unary| try self.validateFunctionBodyStdin(scope, unary.operand, enclosing_stdin),
             .binary => |binary| {
@@ -1025,6 +1025,7 @@ pub const TypeChecker = struct {
             .if_expr => |*if_expr| self.runIfExpr(scope, if_expr),
             .for_expr => |*for_expr| self.runForExpr(scope, for_expr),
             .match_expr => |*match_expr| self.runMatchExpr(scope, match_expr),
+            .catch_expr => |*catch_expr| self.runCatch(scope, catch_expr),
             .import_expr => |*import_expr| self.runImportExpr(scope, import_expr),
             .fn_decl => |*fn_decl| self.runFnDecl(scope, fn_decl),
             .call => |*call| self.runCall(scope, call),
@@ -1362,6 +1363,62 @@ pub const TypeChecker = struct {
             .expr => |expr| try self.runExpression(scope, expr),
             .condition => {},
         }
+    }
+
+    pub fn runCatch(self: *TypeChecker, scope: *Scope, catch_expr: *ast.CatchExpr) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.logTypeCheckTrace(@src().fn_name, catch_expr.span);
+
+        try self.runExpression(scope, catch_expr.subject);
+        const subject_raw = try self.resolveExprType(scope, catch_expr.subject);
+        const subject_type = if (subject_raw) |t| self.unaliasType(t) else null;
+
+        // The handler runs in a child scope so the optional `|err|` capture is
+        // visible only inside it.
+        const handler_scope = try scope.addChild(self.arena.allocator(), catch_expr.span);
+        if (catch_expr.capture) |capture| {
+            if (capture.bindings.len != 1) {
+                try self.reportSpanError(
+                    capture.span,
+                    Error.BindingPatternNotSupported,
+                    .@"error",
+                    "catch capture clauses currently require exactly one binding",
+                    .{},
+                );
+            } else {
+                try self.runBindingPattern(
+                    handler_scope,
+                    capture.bindings[0],
+                    self.catchErrorSetType(subject_type),
+                    false,
+                    false,
+                );
+            }
+        }
+        try self.runExpression(handler_scope, catch_expr.handler);
+
+        // The left-hand side must be error-like (per the spec, `catch` on a
+        // non-error value is a type error).
+        if (subject_type) |st| switch (st.*) {
+            .error_union, .error_set, .err, .failed => {},
+            else => try self.reportSpanError(
+                catch_expr.subject.span(),
+                Error.TypeMismatch,
+                .@"error",
+                "catch requires an error union or error value on the left-hand side, found {f}",
+                .{st},
+            ),
+        };
+    }
+
+    /// The error set type bound to a `catch |err|` capture: the union's error
+    /// set, or the subject itself when it is already an error value.
+    fn catchErrorSetType(self: *TypeChecker, subject_type: ?*const ast.TypeExpr) ?*const ast.TypeExpr {
+        const st = subject_type orelse return null;
+        return switch (st.*) {
+            .error_union => |error_union| self.unaliasType(error_union.err_set),
+            else => st,
+        };
     }
 
     pub fn runUnary(self: *TypeChecker, scope: *Scope, unary: *ast.UnaryExpr) Error!void {
@@ -2352,25 +2409,36 @@ pub const TypeChecker = struct {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, assignment_type.span());
 
+        // The union's error set may be referenced by name (alias/identifier);
+        // unalias it before inspecting variants (avoids a wrong-field access).
+        const union_err_set: ?ast.TypeExpr.ErrorSet = blk: {
+            const unaliased = self.unaliasType(assignee.err_set);
+            break :blk if (unaliased.* == .error_set) unaliased.error_set else null;
+        };
+
         switch (assignment_type.*) {
             .error_union => |error_union| {
-                try self.validateTypeAssignmentErrorSet(
-                    assignee.err_set.error_set,
-                    error_union.err_set,
-                    options,
-                );
+                if (union_err_set) |us| {
+                    try self.validateTypeAssignmentErrorSet(us, error_union.err_set, options);
+                }
                 try self.validateTypeAssignment(
                     assignee.payload,
                     error_union.payload,
                     options,
                 );
             },
-            .err => |err| try self.validateErrorInSet(
-                assignee.err_set.error_set,
-                err.name.name,
-                assignment_type.span(),
-                options,
-            ),
+            // A bare error value / error set coerces into the union when its
+            // variants are all members of the union's error set.
+            .error_set => {
+                if (union_err_set) |us| {
+                    try self.validateTypeAssignmentErrorSet(us, assignment_type, options);
+                }
+            },
+            .err => |err| {
+                if (union_err_set) |us| {
+                    try self.validateErrorInSet(us, err.name.name, assignment_type.span(), options);
+                }
+            },
             else => try self.validateTypeAssignment(assignee.payload, assignment_type, options),
         }
     }
@@ -2385,8 +2453,14 @@ pub const TypeChecker = struct {
         try self.logTypeCheckTrace(@src().fn_name, assignment_type.span());
 
         // Every variant of the assigned set must be present in the expected set
-        // (the assigned set is a subset of the expected set).
-        for (assignment_type.error_set.variants) |variant| {
+        // (the assigned set is a subset of the expected set). The assigned set
+        // may be referenced by name, so unalias before reading its variants.
+        const assigned = self.unaliasType(assignment_type);
+        if (assigned.* != .error_set) {
+            try self.reportAssignmentError(error_set, assignment_type, options);
+            return;
+        }
+        for (assigned.error_set.variants) |variant| {
             try self.validateErrorInSet(error_set, variant.name.name, variant.span, options);
         }
     }

@@ -140,14 +140,16 @@ Goal: construct error values and represent them at runtime. Split into 3a/3b/3c 
 
 **Status / Notes:** Phase 3 ✅ COMPLETE (3a ✅ · 3b ✅ · 3c ✅).
 
-### Phase 4 — `catch` operator
+### Phase 4 — `catch` operator ✅ COMPLETE (direct values; function consumption deferred)
 Goal: `expr catch default` and `expr catch |err| body`.
-- [ ] Parse `catch` as a postfix/binary operator on an expression, producing `ast.catch_expr`. Support both default-value and `|capture| block` forms (`CatchClause` already models `binding` + `body`).
-- [ ] Type check: LHS must be an error union `E!T`; result type is `T`; default branch must be assignable to `T`; capture binds `err` to error-set type `E`. Non-error LHS → type error (per spec).
-- [ ] Compile `compileCatch`: branch on is-error; if error, evaluate handler (with capture bound); else use payload.
-- [ ] Test: `parseInt catch 0`; capture form; type error on non-error LHS.
+- [x] Reshaped `ast.CatchExpr` to `{ subject, capture: ?CaptureClause, handler: *Expression }` (mirrors `IfExpr`; removed the unused `CatchClause`). Parsing: `catch` binds looser than pipelines — `parseExpression` now wraps an inner expression via `parseMaybeCatch`; added `kw_catch` to `isExprTerminator` so the binary parser stops before it. Handler uses `parseControlFlowBody` (so `catch 0`, `catch |err| match ...`, `catch |err| { ... }` all work).
+- [x] Type check (`runCatch`): runs subject + handler (handler in a child scope with the optional `|err|` bound to the error-set type via `catchErrorSetType`); LHS must be error-like (`error_union`/`error_set`/`err`/`failed`) else a "catch requires an error union or error value" diagnostic. `CatchExpr.resolveType` yields the payload type.
+- [x] New runtime primitive: **`is_err` instruction** (a `Neg`/UnaryOperation that sets a bool = `value == .err`) — `cmp` couldn't test an error (not a singleton like `null`). Wired through evaluator + effects analysis.
+- [x] Compile (`compileCatch`): stabilize subject into a ref → `is_err` → jump to handler when error, else use the subject's ok value; returns the **result ref** (not `r2`, so const-bindings get stable storage). Capture binds `|err|` to the subject in the handler scope.
+- [x] Fixed the **latent err_set-aliasing panic** flagged in Phase 2: `validateTypeAssignmentErrorUnion`/`ErrorSet` now unalias the error set before reading variants, and a new `.error_set` arm lets an error value coerce into `E!T` (`const bad: E!String = E.Bad`).
+- [x] Verified: pure-error `catch` default, ok-path + err-path via `E!String` bindings, capture form (`|err|` materializes), non-error LHS → diagnostic. Tests: `error_catch_regression` (feature) + `error_catch_non_error` (diagnostic). Full suite green (72 smoke + 20 diagnostic).
 
-**Status / Notes:** _not started_
+**Status / Notes:** ✅ Complete for **directly-produced** error unions (inline values, bindings). **Deferred:** consuming a *function/pipeline* result (`echo "x" | parseInt catch 0`) needs the value/yield result to be captured as a value — blocked on the **pre-existing typed-value `${}`/capture limitation** (non-String stdout doesn't materialize into a value), not on catch itself. Revisit alongside that capture work / Phase 7.
 
 ### Phase 5 — `try` keyword
 Goal: `try expr` desugars to `expr catch |err| return err`.

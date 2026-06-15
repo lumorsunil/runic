@@ -105,6 +105,8 @@ pub const Instruction = struct {
         log: Log,
         /// performs logical negation
         neg: Neg,
+        /// sets result to a boolean: whether operand is an error value (`.err`)
+        is_err: Neg,
         /// declares a new ref (basically a labeled push)
         ref: []const u8,
         /// sets a Location to a Value from a Location

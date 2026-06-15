@@ -1247,6 +1247,11 @@ pub const IREvaluator = struct {
                 try self.setLocation(thread, neg.result, .{ .exit_code = negated });
                 return .cont;
             },
+            .is_err => |is_err| {
+                const operand = try self.resolveLocation(thread, is_err.operand);
+                try self.setLocation(thread, is_err.result, .fromBoolean(operand == .err));
+                return .cont;
+            },
             .exec => |exec| {
                 _ = exec;
 
