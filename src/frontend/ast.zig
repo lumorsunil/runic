@@ -683,6 +683,32 @@ pub const FloatLiteral = struct {
     span: Span,
 };
 
+/// `Name{ .field = expr, ... }` — struct-literal syntax. Currently the only
+/// consumer is error value construction (`MyError{ .ErrorWithMessage = "..." }`,
+/// exactly one field naming a payload-carrying variant); general struct support
+/// can reuse this node later.
+pub const StructLiteral = struct {
+    name: Identifier,
+    fields: []const FieldInit,
+    span: Span,
+
+    pub const FieldInit = struct {
+        name: Identifier,
+        value: *Expression,
+        span: Span,
+    };
+
+    pub fn resolveType(
+        self: *@This(),
+        _: std.Io,
+        _: std.mem.Allocator,
+        scope: *semantic.Scope,
+    ) semantic.Scope.Error!?*const TypeExpr {
+        const binding = scope.lookup(self.name.name) orelse return null;
+        return binding.type_expr;
+    }
+};
+
 pub const BoolLiteral = struct {
     value: bool,
     span: Span,
@@ -702,6 +728,7 @@ pub const Expression = union(enum) {
     array: ArrayLiteral,
     map: MapLiteral,
     range: RangeLiteral,
+    struct_literal: StructLiteral,
     pipeline: Pipeline,
     pipeline_deprecated: Pipeline_deprecated,
     call: CallExpr,

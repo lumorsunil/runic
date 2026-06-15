@@ -572,6 +572,52 @@ pub const Parser = struct {
         }
     }
 
+    /// Parses `{ .field = expr, ... }` following an already-consumed type-like
+    /// identifier `name`. Commas and/or newlines separate fields; a trailing
+    /// comma is allowed. Used for error value construction (and future structs).
+    fn parseStructLiteral(self: *Self, name: ast.Identifier) Error!*ast.Expression {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        _ = try self.expectTokenTag(.l_brace);
+
+        var fields = std.ArrayList(ast.StructLiteral.FieldInit).empty;
+        defer fields.deinit(self.allocator);
+
+        while (true) {
+            self.skipNewlines();
+            const next = try self.peekToken();
+            if (next.tag == .r_brace) break;
+
+            const dot = try self.expectTokenTag(.dot);
+            const field_name = try self.parseIdentifier();
+            _ = try self.expectTokenTag(.assign);
+            const value = try self.parseExpression();
+
+            try fields.append(self.allocator, .{
+                .name = field_name,
+                .value = value,
+                .span = dot.span.endAt(value.span()),
+            });
+
+            self.skipNewlines();
+            const delimiter = try self.peekToken();
+            if (delimiter.tag == .comma) {
+                _ = try self.nextToken();
+            }
+        }
+
+        const close = try self.expectTokenTag(.r_brace);
+
+        return self.allocExpression(.{
+            .struct_literal = .{
+                .name = name,
+                .fields = try self.copyToArena(ast.StructLiteral.FieldInit, fields.items),
+                .span = name.span.endAt(close.span),
+            },
+        });
+    }
+
     const BinaryComponent = union(enum) {
         identifier: ast.Identifier,
         op: token.Spanned(ast.BinaryOp),
@@ -785,8 +831,22 @@ pub const Parser = struct {
                         .identifier => {
                             const breadcrumbInner = try self.createBreadcrumb("PBE:identifier");
                             defer breadcrumbInner.end();
+
+                            // `Name{ .field = expr }` — struct-literal syntax for a
+                            // type-like (uppercase) identifier. Currently used for
+                            // error value construction.
+                            const id = ast.Identifier.fromToken(next);
+                            const ahead = try self.peekSlice(2);
+                            if (id.isTypeIdentifier() and ahead[1].tag == .l_brace) {
+                                _ = try self.nextToken(); // consume the identifier
+                                try components.append(self.allocator, .{
+                                    .expr = try self.parseStructLiteral(id),
+                                });
+                                continue;
+                            }
+
                             try components.append(self.allocator, .{
-                                .identifier = .fromToken(next),
+                                .identifier = id,
                             });
                         },
                         .dollar => {

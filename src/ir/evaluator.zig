@@ -2060,7 +2060,14 @@ pub const IREvaluator = struct {
                 }
             },
             .null => try w.writeAll("null"),
-            .err => |e| try w.print("{f}", .{e}),
+            .err => |e| {
+                try w.print("{s}.{s}", .{ e.set, e.variant });
+                if (e.payload) |payload| {
+                    try w.writeAll("(");
+                    try self.materializeString(thread, payload.*, w);
+                    try w.writeAll(")");
+                }
+            },
             .void, .strct, .thread, .closeable, .fn_ref => {},
         }
     }

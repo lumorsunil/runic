@@ -1,0 +1,14 @@
+const E = error {
+    Bad,
+    WithMsg: String,
+}
+
+// Payloaded error value construction, bound and inline.
+const e = E{ .WithMsg = "boom" }
+echo "bound: ${e}"
+echo "inline: ${E{ .WithMsg = "direct" }}"
+
+// Constructed and yielded into an error-union stdout type.
+fn Void f() E!String { yield E{ .WithMsg = "yielded" } }
+f
+echo "|"

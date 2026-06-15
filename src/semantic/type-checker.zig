@@ -903,6 +903,9 @@ pub const TypeChecker = struct {
                 try self.validateFunctionBodyStdin(scope, range.start, enclosing_stdin);
                 if (range.end) |end| try self.validateFunctionBodyStdin(scope, end, enclosing_stdin);
             },
+            .struct_literal => |struct_literal| for (struct_literal.fields) |field| {
+                try self.validateFunctionBodyStdin(scope, field.value, enclosing_stdin);
+            },
             .fn_decl, .identifier, .env_var, .path, .literal, .pipeline_deprecated, .import_expr, .executable, .builtin, .fd => {},
         }
     }
@@ -1012,6 +1015,7 @@ pub const TypeChecker = struct {
             .env_var => {},
             .literal => |*literal| self.runLiteral(scope, literal),
             .array => |*array| self.runArray(scope, array),
+            .struct_literal => |*struct_literal| self.runStructLiteral(scope, struct_literal),
             .range => |*range| self.runRange(scope, range),
             .pipeline => |*pipeline| self.runPipeline(scope, pipeline),
             .member => |*member| self.runMember(scope, member),
@@ -1828,6 +1832,81 @@ pub const TypeChecker = struct {
         try self.logTypeCheckTrace(@src().fn_name, array.span);
 
         for (array.elements) |expr| try self.runExpression(scope, expr);
+    }
+
+    pub fn runStructLiteral(self: *TypeChecker, scope: *Scope, struct_literal: *ast.StructLiteral) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.logTypeCheckTrace(@src().fn_name, struct_literal.span);
+
+        for (struct_literal.fields) |field| try self.runExpression(scope, field.value);
+
+        const binding = scope.lookup(struct_literal.name.name) orelse {
+            try self.reportSpanError(
+                struct_literal.name.span,
+                Error.IdentifierNotFound,
+                .@"error",
+                "type '{s}' is not declared",
+                .{struct_literal.name.name},
+            );
+            return;
+        };
+
+        const type_expr = self.unaliasType(binding.type_expr orelse return);
+        switch (type_expr.*) {
+            .error_set => |error_set| try self.runErrorValueLiteral(scope, error_set, struct_literal),
+            else => try self.reportSpanError(
+                struct_literal.name.span,
+                Error.UnsupportedExpression,
+                .@"error",
+                "'{s}' is not an error set; struct literal construction is only supported for error values",
+                .{struct_literal.name.name},
+            ),
+        }
+    }
+
+    fn runErrorValueLiteral(
+        self: *TypeChecker,
+        scope: *Scope,
+        error_set: ast.TypeExpr.ErrorSet,
+        struct_literal: *ast.StructLiteral,
+    ) Error!void {
+        if (struct_literal.fields.len != 1) {
+            try self.reportSpanError(
+                struct_literal.span,
+                Error.UnsupportedExpression,
+                .@"error",
+                "error value construction requires exactly one variant field",
+                .{},
+            );
+            return;
+        }
+
+        const field = struct_literal.fields[0];
+        const variant = error_set.variant(field.name.name) orelse {
+            try self.reportSpanError(
+                field.name.span,
+                Error.ErrorNotInErrorSet,
+                .@"error",
+                "error set has no variant '{s}'",
+                .{field.name.name},
+            );
+            return;
+        };
+
+        const payload = variant.payload orelse {
+            try self.reportSpanError(
+                field.name.span,
+                Error.TypeMismatch,
+                .@"error",
+                "error variant '{s}' has no payload; use {s}.{s} instead",
+                .{ field.name.name, struct_literal.name.name, field.name.name },
+            );
+            return;
+        };
+
+        const resolved_payload = try self.resolveTypeExpr(scope, payload);
+        const value_type = try self.resolveExprType(scope, field.value) orelse return;
+        try self.validateTypeAssignment(resolved_payload, value_type, .{ .span = field.value.span() });
     }
 
     pub fn runLiteral(self: *TypeChecker, scope: *Scope, literal: *ast.Literal) Error!void {

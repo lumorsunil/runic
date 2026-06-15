@@ -1859,6 +1859,7 @@ pub const IRCompiler = struct {
             .binary => |binary| self.compileBinary(expr, binary),
             .unary => |unary| self.compileUnary(expr, unary),
             .array => |array| self.compileArray(expr, array),
+            .struct_literal => |struct_literal| self.compileStructLiteral(expr, struct_literal),
             .for_expr => |for_expr| self.compileForLoop(expr, for_expr),
             .subshell => |subshell| self.compileSubshell(expr, subshell),
             .fd => |fd_expr| self.compileFd(expr, fd_expr),
@@ -2340,6 +2341,62 @@ pub const IRCompiler = struct {
         }
 
         return .fromValue(.{ .err = .{ .set = set_name, .variant = variant_ident.name } });
+    }
+
+    /// Compiles `MyError{ .Variant = payload }` into an error value carrying a
+    /// boxed payload. Phase 3b currently supports constant payloads (the
+    /// compiled value must be a `.value` source).
+    fn compileStructLiteral(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        struct_literal: ast.StructLiteral,
+    ) Error!Result {
+        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        const error_set = self.error_sets.get(struct_literal.name.name) orelse {
+            try self.reportSourceError(
+                source,
+                Error.NotImplemented,
+                .@"error",
+                "'{s}' is not an error set; struct literal construction is only supported for error values",
+                .{struct_literal.name.name},
+            );
+            return .fromValue(.void);
+        };
+
+        if (struct_literal.fields.len != 1) {
+            try self.reportSourceError(source, Error.NotImplemented, .@"error", "error value construction requires exactly one variant field", .{});
+            return .fromValue(.void);
+        }
+
+        const field = struct_literal.fields[0];
+        const variant = error_set.variant(field.name.name) orelse {
+            try self.reportSourceError(source, Error.NotImplemented, .@"error", "error set '{s}' has no variant '{s}'", .{ struct_literal.name.name, field.name.name });
+            return .fromValue(.void);
+        };
+
+        if (variant.payload == null) {
+            try self.reportSourceError(source, Error.NotImplemented, .@"error", "error variant '{s}.{s}' has no payload; use {s}.{s}", .{ struct_literal.name.name, field.name.name, struct_literal.name.name, field.name.name });
+            return .fromValue(.void);
+        }
+
+        const payload_result = try self.compileExpression(field.value);
+        const payload_value = switch (payload_result.source) {
+            .value => |v| v,
+            .location => {
+                try self.reportSourceError(source, Error.NotImplemented, .@"error", "error payloads must currently be constant values", .{});
+                return .fromValue(.void);
+            },
+        };
+
+        const boxed = try self.allocator.create(ir.Value);
+        boxed.* = payload_value;
+
+        return .fromValue(.{ .err = .{
+            .set = struct_literal.name.name,
+            .variant = field.name.name,
+            .payload = boxed,
+        } });
     }
 
     fn compileMember(

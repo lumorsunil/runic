@@ -300,6 +300,7 @@ const StatementExpressionIterator = struct {
         switch (expr.*) {
             .identifier, .env_var, .path, .literal, .map, .import_expr, .pipeline_deprecated, .builtin, .fd => {},
             .array => |array| try cursor.appendExpressions(array.elements),
+            .struct_literal => |struct_literal| for (struct_literal.fields) |field| try cursor.appendExpr(field.value),
             .range => |range| {
                 try cursor.appendExpr(range.start);
                 if (range.end) |end| try cursor.appendExpr(end);

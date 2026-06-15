@@ -118,11 +118,15 @@ Goal: construct error values and represent them at runtime. Split into 3a/3b/3c 
 - [x] Observable: `MyError.UnknownError` constructs, binds, and prints as `MyError.UnknownError` (both bound and inline).
 - [x] Tests: `tests/features/error_value_construction_regression.rn` (+`.stdout`); `tests/diagnostics/error_unknown_variant.rn` (+`.stdout`/`.status`). Full suite green (70 smoke + 18 diagnostic).
 
-#### Phase 3b — Payloaded `E{ .Variant = payload }` construction
-- [ ] **Needs new parsing** — no struct-literal syntax exists today. Add parsing for `Identifier{ .Field = expr, ... }` (at least for error sets).
-- [ ] Type-check payload type against the variant's declared payload.
-- [ ] Compile to a `.err` value with a boxed payload.
-- [ ] Test: construct + observe a payloaded error.
+#### Phase 3b — Payloaded `E{ .Variant = payload }` construction ✅ COMPLETE
+- [x] **New struct-literal parsing.** Added `ast.Expression.struct_literal: StructLiteral{ name, fields: []FieldInit{name, value} }`. The binary-expression parser intercepts an **uppercase (type-like) identifier immediately followed by `{`** → `parseStructLiteral` parses `{ .field = expr, ... }` (commas/newlines, trailing comma OK). Uppercase gating keeps lowercase command parsing untouched. Threaded the new variant through the two exhaustive expr walks (`run_script.zig` `populateStackExpr`, `type-checker.zig` `validateFunctionBodyStdin`).
+- [x] Type checker: `runStructLiteral` → for error-set names, `runErrorValueLiteral` validates exactly one field, the variant exists, the variant has a payload, and the value type matches the variant's (resolved) payload type. `StructLiteral.resolveType` returns the error-set type. (Non-error-set names → clear "only supported for error values" diagnostic.)
+- [x] Compiler: `compileStructLiteral` looks up the name in `error_sets`, validates the variant/payload, compiles the payload expression, and boxes its `.value` into a heap `*const Value` on the `.err` arm. Constant payloads only for now (`.location` source → "payloads must currently be constant values"); runtime-valued payloads deferred.
+- [x] Evaluator: `materializeString`'s `.err` arm recurses into the payload so it prints `E.WithMsg(boom)` (resolving slices via the evaluator, not static format).
+- [x] Observable: `E{ .WithMsg = "boom" }` → `E.WithMsg(boom)` bound, inline (`${...}`), and yielded into an error union. Negative cases (type mismatch, payload on payload-less variant, unknown variant, here all caught at **type-check → stderr**).
+- [x] Tests: `tests/features/error_payload_construction_regression.rn` (+`.stdout`); `tests/diagnostics/error_payload_type_mismatch.rn` (+`.stderr`/`.status`). Full suite green (72 smoke + 20 diagnostic).
+
+**Note:** payloaded construction's runtime payload is a compile-time-boxed constant `*const Value`. Runtime-valued payloads (`E{ .Msg = someVar }`) need runtime construction (an instruction that captures a stack value) — deferred until a use case needs it (likely alongside Phase 8 payload capture).
 
 #### Phase 3c — Ok/error value coercion into an error-union stdout type ✅ COMPLETE
 - [x] `runYield` now coerces into an `E!T` declared stdout type: a bare ok payload value (`T`) **or** an error value (an error set whose variants are all in `E`) both satisfy it (new `yieldCoercesToErrorUnion` helper, mirroring the existing `coerced_error_union` pipe boundary). Before this, a function with an error-union stdout type could not `yield` *anything*.
@@ -133,7 +137,7 @@ Goal: construct error values and represent them at runtime. Split into 3a/3b/3c 
 - The Phase 2 "empty `${getOne}`" was **not** an error bug. Two orthogonal causes: (1) `return` is control-flow/exit (`exitWith`), not output — functions emit their value via **`yield` → stdout**, consumed by `${fn}`/pipes; (2) `${fn}` command-substitution capture of **typed (non-String) stdout** is a **pre-existing** limitation — plain `fn Void f() Int { yield 1 }` also leaks `1` to program stdout instead of being captured. Error-union stdout inherits this. Fixing typed-value `${}` capture is general typed-pipe machinery, **out of scope** for error handling.
 - **Open design question for Phase 4/5:** the spec uses `return` to produce/propagate error values (`return ParseIntError.ExpectedNumber`; `try` desugars to `catch |err| return err`), but the language produces function output via `yield`. Need to decide whether error propagation rides `yield`→stdout (consistent with the language) or `return` (consistent with the spec) — this shapes how `catch`/`try` consume a function's error union.
 
-**Status / Notes:** 3a ✅ · 3c ✅ · 3b (payloaded `E{ .V = payload }`, needs new struct-literal parsing) not started.
+**Status / Notes:** Phase 3 ✅ COMPLETE (3a ✅ · 3b ✅ · 3c ✅).
 
 ### Phase 4 — `catch` operator
 Goal: `expr catch default` and `expr catch |err| body`.
