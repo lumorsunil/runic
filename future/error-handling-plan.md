@@ -69,7 +69,7 @@ Resolve these as we go; record the choice + rationale inline.
   Implies a new **error-set type registry** (parallel to the struct-type table) so `set_id` resolves to a set and `variant_index` to a variant — to be built in Phase 1/3.
 - **D3 — `ExecutableError` definition.** Spec says all executable calls have stdout type `ExecutableError!String`. Where is `ExecutableError` defined — a builtin error set injected into the prelude/global scope, or a synthetic compiler type? **Recommendation:** define it as a builtin error set in global scope so it participates in inference and switch. Decision: _TBD_.
 - **D4 — Error set member access vs payload struct literal.** ✅ **RESOLVED (Phase 3a/3b).** `E.Variant` rides member access; `E{ .Variant = x }` is a new struct-literal node, disambiguated by an **uppercase identifier immediately followed by `{`** (lowercase command parsing untouched). Both implemented.
-- **D5 — Inferred error-set representation.** For `!String` and `fn ... !T`, how is the inferred set stored during checking (open set accumulated from body, then frozen)? Decision: _TBD (Phase 6)._
+- **D5 — Inferred error-set representation.** ✅ **RESOLVED (Phase 6): empty error set = inferred.** A leading-`!T` parses to an `error_union` whose `err_set` is an empty `error_set` (`variants.len == 0`); `isInferredErrorSet` treats that as "inferred", and yield validation accepts any error into it (**open-set** model). Concrete accumulation of the body's exact union (and propagation to callers, for `match` exhaustiveness) is deferred until Phase 8 needs it.
 - **D6 — Error propagation model.** ✅ **RESOLVED (2026-06-15): value/yield-based.** `catch`/`try` operate on the error union a function/pipeline **produces** (via `yield`→stdout), not on `return`. `try` re-yields the error to propagate. See the Phase 3c notes for full rationale. `catch` on directly-produced error unions is model-independent and is built first.
 
 ---
@@ -160,13 +160,14 @@ Goal: `try expr` propagates an error out of the enclosing function (value/yield 
 
 **Status / Notes:** ✅ Complete. Propagation uses `exit_with` (the function's result). Observing the propagated error from a *caller* shares the deferred function-result-consumption gap from Phase 4 (typed-value capture); the control-flow (stop the function) is fully working and tested.
 
-### Phase 6 — Inferred error sets
-Goal: `const result = echo "hello"` infers `ExecutableError!String`; `fn ... !T { ... }` infers the union of error sets that can escape the body.
-- [ ] Inference for bindings without annotation from an error-union RHS.
-- [ ] Inference for fn return type `!T`: accumulate error sets from `try`/returned errors in the body, freeze into a concrete set (resolve D5).
-- [ ] Test: examples from spec lines 42-49.
+### Phase 6 — Inferred error sets ✅ COMPLETE (open-set model; concrete collection deferred)
+Goal: `const result = ...` infers an error-union type from the RHS; `fn ... !T { ... }` accepts errors inferred from the body.
+- [x] **Binding inference** already works via `resolveExprType(initializer)` — `const b = a` where `a: E!String` gives `b: E!String`; `const e = E.Bad` gives `e: <error set>`. Verified `b catch ...` / `e catch ...`.
+- [x] **Leading-`!T` inference (open-set model, D5):** an empty error set (the placeholder produced by parsing `!T` in Phase 2) marks an *inferred* set. `yieldCoercesToErrorUnion` now treats an inferred (empty) union set as accepting **any** error value (new `isInferredErrorSet` helper). So `fn Void f() !String { yield E.Bad }` and `{ yield "ok" }` and `{ yield try bad }` all type-check and run.
+- [x] Verified explicit (non-empty) error sets are **unaffected**: `fn Void f() E!String { yield F.Other }` is still rejected; `yield E.Bad` accepted.
+- [x] Test: `error_inferred_set_regression` (feature). Full suite green (75 smoke + 22 diagnostic).
 
-**Status / Notes:** _not started_
+**Status / Notes:** ✅ Complete as an **open-set** model: a leading-`!T` set accepts any body-produced error, but its *concrete* members are not yet collected into the function's recorded type. **Deferred (D5 follow-up):** accumulating the exact union of body error sets and propagating it to callers — needed for Phase 8 `match` exhaustiveness and for the spec's executable-inference examples (which also need Phase 7's `ExecutableError`). The spec's `const result = echo "hello"` / `grep "--invalid-flag"` examples specifically depend on Phase 7.
 
 ### Phase 7 — Executable calls carry inherent error unions
 Goal: every executable call's stdout type is `ExecutableError!String`; non-zero exit becomes an error value at runtime.

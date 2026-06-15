@@ -551,10 +551,19 @@ pub const TypeChecker = struct {
         if (yielded_unaliased.* != .error_set) return false;
         const union_set = self.unaliasType(error_union.err_set);
         if (union_set.* != .error_set) return false;
+        // An inferred error set (leading `!T`, empty placeholder) accepts any
+        // error — its concrete members are inferred from what the body produces.
+        if (isInferredErrorSet(union_set.error_set)) return true;
         for (yielded_unaliased.error_set.variants) |variant| {
             if (union_set.error_set.variant(variant.name.name) == null) return false;
         }
         return true;
+    }
+
+    /// An empty error set marks an inferred set (produced by leading-`!T` return
+    /// types); its members are derived from the function body rather than written.
+    fn isInferredErrorSet(error_set: ast.TypeExpr.ErrorSet) bool {
+        return error_set.variants.len == 0;
     }
 
     fn runExit(self: *TypeChecker, scope: *Scope, exit_stmt: *ast.ExitStmt) Error!void {
