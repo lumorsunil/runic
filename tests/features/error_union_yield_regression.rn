@@ -1,0 +1,15 @@
+const E = error {
+    Bad,
+    WithMsg: String,
+}
+
+// A bare ok payload value coerces into the E!String stdout type.
+fn Void okFn() E!String { yield "ok value" }
+
+// An error value also satisfies the same E!String stdout type.
+fn Void errFn() E!String { yield E.Bad }
+
+okFn
+echo "|"
+errFn
+echo "|"

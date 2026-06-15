@@ -519,6 +519,13 @@ pub const TypeChecker = struct {
         const yielded = try self.resolveExprType(scope, yield_stmt.value) orelse return;
         const resolved = try self.resolvePipeType(scope, yielded) orelse return;
         if (self.pipeTypesEqual(resolved, declared_stdout)) return;
+
+        // Coerce into an error-union stdout type: a bare ok payload value (`T`)
+        // or an error value both satisfy `E!T`.
+        const declared_unaliased = self.unaliasType(declared_stdout);
+        if (declared_unaliased.* == .error_union and
+            self.yieldCoercesToErrorUnion(resolved, declared_unaliased.error_union)) return;
+
         try self.reportSpanError(
             yield_stmt.span,
             Error.TypeMismatch,
@@ -526,6 +533,28 @@ pub const TypeChecker = struct {
             "yield type mismatch: function yields {f}, but declared stdout type is {f}",
             .{ resolved, declared_stdout },
         );
+    }
+
+    /// True if `yielded` (a resolved type) satisfies an `E!T` stdout type either
+    /// as a bare ok payload value (`T`) or as an error value (an error set whose
+    /// variants are all members of `E`).
+    fn yieldCoercesToErrorUnion(
+        self: *TypeChecker,
+        yielded: *const ast.TypeExpr,
+        error_union: ast.TypeExpr.ErrorUnion,
+    ) bool {
+        // Ok value: matches the payload type.
+        if (self.pipeTypesEqual(yielded, error_union.payload)) return true;
+
+        // Error value: an error set whose variants are all in the union's set.
+        const yielded_unaliased = self.unaliasType(yielded);
+        if (yielded_unaliased.* != .error_set) return false;
+        const union_set = self.unaliasType(error_union.err_set);
+        if (union_set.* != .error_set) return false;
+        for (yielded_unaliased.error_set.variants) |variant| {
+            if (union_set.error_set.variant(variant.name.name) == null) return false;
+        }
+        return true;
     }
 
     fn runExit(self: *TypeChecker, scope: *Scope, exit_stmt: *ast.ExitStmt) Error!void {

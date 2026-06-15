@@ -1,0 +1,3 @@
+const E = error { Bad }
+fn Void f() E!Int { yield "str" }
+f

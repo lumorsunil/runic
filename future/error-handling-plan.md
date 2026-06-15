@@ -124,11 +124,16 @@ Goal: construct error values and represent them at runtime. Split into 3a/3b/3c 
 - [ ] Compile to a `.err` value with a boxed payload.
 - [ ] Test: construct + observe a payloaded error.
 
-#### Phase 3c — Ok-value coercion / unwrapping
-- [ ] A plain value assigned/returned where `E!T` is expected stays the bare ok value at runtime (no wrapping needed under D2). **Fix the Phase 2 gap:** a fn returning `E!T` currently yields empty for `${getOne}` — make the ok value flow through.
-- [ ] Test: `fn ... E!Int { return 1 }` → caller sees `1`.
+#### Phase 3c — Ok/error value coercion into an error-union stdout type ✅ COMPLETE
+- [x] `runYield` now coerces into an `E!T` declared stdout type: a bare ok payload value (`T`) **or** an error value (an error set whose variants are all in `E`) both satisfy it (new `yieldCoercesToErrorUnion` helper, mirroring the existing `coerced_error_union` pipe boundary). Before this, a function with an error-union stdout type could not `yield` *anything*.
+- [x] Verified: `fn Void okFn() E!String { yield "ok value" }` and `fn Void errFn() E!String { yield E.Bad }` both type-check and print (`ok value` / `E.Bad`) via bare calls / pipelines. Wrong type (`yield "str"` into `E!Int`) is rejected.
+- [x] Tests: `tests/features/error_union_yield_regression.rn` (+`.stdout`); `tests/diagnostics/error_union_yield_mismatch.rn` (+`.stderr`/`.status`). Full suite green (71 smoke + 19 diagnostic).
 
-**Status / Notes:** 3a ✅ complete. 3b/3c not started.
+**Findings that reframed this phase:**
+- The Phase 2 "empty `${getOne}`" was **not** an error bug. Two orthogonal causes: (1) `return` is control-flow/exit (`exitWith`), not output — functions emit their value via **`yield` → stdout**, consumed by `${fn}`/pipes; (2) `${fn}` command-substitution capture of **typed (non-String) stdout** is a **pre-existing** limitation — plain `fn Void f() Int { yield 1 }` also leaks `1` to program stdout instead of being captured. Error-union stdout inherits this. Fixing typed-value `${}` capture is general typed-pipe machinery, **out of scope** for error handling.
+- **Open design question for Phase 4/5:** the spec uses `return` to produce/propagate error values (`return ParseIntError.ExpectedNumber`; `try` desugars to `catch |err| return err`), but the language produces function output via `yield`. Need to decide whether error propagation rides `yield`→stdout (consistent with the language) or `return` (consistent with the spec) — this shapes how `catch`/`try` consume a function's error union.
+
+**Status / Notes:** 3a ✅ · 3c ✅ · 3b (payloaded `E{ .V = payload }`, needs new struct-literal parsing) not started.
 
 ### Phase 4 — `catch` operator
 Goal: `expr catch default` and `expr catch |err| body`.
