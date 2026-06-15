@@ -1424,7 +1424,8 @@ pub const TypeChecker = struct {
             .array => |array| try self.runArrayMemberAccess(array, &member.member),
             .thread => try self.runThreadMemberAccess(&member.member),
             .struct_type => |struct_type| try self.runStructMemberAccess(struct_type, &member.member),
-            .null, .promise, .error_union, .error_set, .err, .tuple, .function, .fn_ref_type, .integer, .float, .boolean, .byte, .alias, .void => return error.UnsupportedMemberAccess,
+            .error_set => |error_set| try self.runErrorSetMemberAccess(error_set, &member.member),
+            .null, .promise, .error_union, .err, .tuple, .function, .fn_ref_type, .integer, .float, .boolean, .byte, .alias, .void => return error.UnsupportedMemberAccess,
             .module => |module| try self.runModuleMemberAccess(module, &member.member),
             .execution => |execution| try self.runExecutionMemberAccess(execution, &member.member),
             // .lazy => {
@@ -1447,6 +1448,25 @@ pub const TypeChecker = struct {
         }
 
         return error.MemberNotFound;
+    }
+
+    pub fn runErrorSetMemberAccess(
+        self: *TypeChecker,
+        error_set: ast.TypeExpr.ErrorSet,
+        identifier: *ast.Identifier,
+    ) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.logTypeCheckTrace(@src().fn_name, identifier.span);
+
+        if (error_set.variant(identifier.name) != null) return;
+
+        try self.reportSpanError(
+            identifier.span,
+            Error.ErrorNotInErrorSet,
+            .@"error",
+            "error set has no variant '{s}'",
+            .{identifier.name},
+        );
     }
 
     pub fn runStructMemberAccess(

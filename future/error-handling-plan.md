@@ -43,24 +43,28 @@ Resolve these as we go; record the choice + rationale inline.
 - **D1 — `switch` vs `match` for error dispatch.** ✅ **RESOLVED: reuse `match`.** No `switch` keyword will be introduced; error dispatch uses `catch |err| match err { ... }`. The spec (`future/error-handling.md`) has been updated to match. `match` already handles path patterns, captures, and exhaustiveness scaffolding.
 - **D2 — Runtime representation of an error union.** ✅ **RESOLVED.** There is *no* dedicated runtime error-union object — the type `E!T` is erased at runtime to a **single `Value` slot** holding whichever case occurred, discriminated by the `Value`'s own tag (mirrors how optionals use `.null`). Confirmed: `Value` is already a uniform tagged union with heap indirection (`Struct` holds `fields: []const Value`, `String` is a `slice` addr/len), so big payloads are already boxed and `slotSize(error_union) == 1` stays correct — no layout/max-size math needed.
 
-  Add one arm to the `Value` union(enum) in `src/ir/value.zig`:
+  **Identification is NAME-BASED** (revised 2026-06-15 after auditing the IR layer; the original index-based scheme was rejected because the compiler has no type/scope access and treats all type decls as no-ops, so a global registry would be extra machinery — and Phases 1-2 type-checking is already name-based). Add one arm to the `Value` union(enum) in `src/ir/value.zig`:
   ```zig
   err: Err,
 
   pub const Err = struct {
-      set_id: usize,        // indexes the error-set type registry (cf. Struct.type: usize)
-      variant_index: usize, // indexes the set's variant list
-      payload: ?*Value,     // boxed; null for payload-less variants
+      set: []const u8,        // error set name, e.g. "MyError"
+      variant: []const u8,    // variant name, e.g. "UnknownError"
+      payload: ?*const Value, // boxed; null for payload-less variants
   };
   ```
+  Names are arena/Zig-side strings (consistent with `zig_string`/`fn_ref`). No global error-set registry needed; `match`/`catch` compare strings, resolved statically by the compiler.
+
   **Discrimination rule:** tag is `.err` ⟹ error branch; any other tag ⟹ the ok payload. Stays unambiguous for nested cases like `MyError!?String` (`.err`, `.null`, `.slice` are distinct tags).
 
   Runtime examples for `const x: MyError!String`:
   - ok `"hello"` → `Value{ .slice = … }` (just the String — its error-union type is known only statically).
-  - `MyError.UnknownError` → `Value{ .err = .{ .set_id = <MyError>, .variant_index = 0, .payload = null } }`.
-  - `MyError{ .ErrorWithMessage = "boom" }` → `Value{ .err = .{ .set_id = <MyError>, .variant_index = 1, .payload = &Value{ .slice = "boom" } } }`.
+  - `MyError.UnknownError` → `Value{ .err = .{ .set = "MyError", .variant = "UnknownError", .payload = null } }`.
+  - `MyError{ .ErrorWithMessage = "boom" }` → `Value{ .err = .{ .set = "MyError", .variant = "ErrorWithMessage", .payload = &Value{ .slice = "boom" } } }`.
 
-  Consumers: `catch`/`try` test `value == .err`; `match err { MyError.X => … }` compares `err.set_id` + `err.variant_index`; payload capture `|m|` dereferences `err.payload`. `Value.deinit` gains an `.err` arm to free the boxed payload.
+  Consumers: `catch`/`try` test `value == .err`; `match err { MyError.X => … }` compares `err.set`/`err.variant`; payload capture `|m|` dereferences `err.payload`. `Value.deinit` gains an `.err` arm to free the boxed payload.
+
+  **Serialization caveat:** the dead `Value.serialize`/`deserialize`/`deinit` methods reference non-existent variants (`.location`, `.register`) and are not analyzed by Zig (never called), so they don't block adding `.err`. If error values ever need to cross a pipe/process boundary, `.err` serialization must be implemented then.
 
   Implies a new **error-set type registry** (parallel to the struct-type table) so `set_id` resolves to a set and `variant_index` to a variant — to be built in Phase 1/3.
 - **D3 — `ExecutableError` definition.** Spec says all executable calls have stdout type `ExecutableError!String`. Where is `ExecutableError` defined — a builtin error set injected into the prelude/global scope, or a synthetic compiler type? **Recommendation:** define it as a builtin error set in global scope so it participates in inference and switch. Decision: _TBD_.
@@ -104,15 +108,27 @@ Goal: `MyError!String`, and bare `!String`, parse as `ast.TypeExpr.error_union`.
 - **Latent panic in `validateTypeAssignmentErrorUnion`:** the `.error_union`/`.err` arms access `assignee.err_set.error_set` directly, but after resolution `err_set` is often an `.alias` (or `.identifier`) wrapping the set, not a raw `.error_set` — accessing the wrong union field will panic. Not hit in Phase 2 (plain-value assignment uses the `else` branch only), but **must unalias before `.error_set` access in Phase 3** when error/union values start flowing.
 
 ### Phase 3 — Error value construction + runtime representation
-Goal: construct error values and represent them at runtime.
-- [ ] Define the runtime `Value` error representation per D2 in `src/ir/value.zig` (add variant; update `deinit`, `slotSize` assumptions, serialize/deserialize as needed).
-- [ ] Parse + compile `E.Variant` (payload-less) construction.
-- [ ] Parse + compile `E{ .Variant = payload }` construction (resolve D4).
-- [ ] Type-check that variant exists in the set and payload type matches.
-- [ ] Compile "ok" values implicitly coercing into an error union when assigned to `E!T`.
-- [ ] Test: construct each form; round-trip through a binding.
+Goal: construct error values and represent them at runtime. Split into 3a/3b/3c (decided 2026-06-15).
 
-**Status / Notes:** _not started_
+#### Phase 3a — Payload-less `E.Variant` construction + runtime `Value.err` ✅ COMPLETE
+- [x] Added `Value.err: Err{ set, variant, payload: ?*const Value = null }` (name-based, per D2) with a `format` method. Only **two** analyzed switches needed `.err`: `compiler.zig` call-callee (pass-through via `.from(v)`, like other non-callable values) and `evaluator.zig` `materializeString` (prints `Set.Variant`); plus an explicit `.err` arm in `Value.format`. (The dead `deinit`/`serialize`/`deserialize` aren't analyzed, so untouched.)
+- [x] Compiler: added `error_sets: StringHashMapUnmanaged(ErrorSet)` + `registerErrorSets()` pre-pass over top-level `type_binding_decl`s with `error_set` type_expr.
+- [x] Compiler: `compileMember` special-cases `member.object` = identifier in `error_sets` → `compileErrorVariant` emits `Result.fromValue(.{ .err = ... })`. Validates the variant exists (else diagnostic) and rejects payload variants with a "use `E{ .V = ... }` (3b)" message.
+- [x] Type checker: added `runErrorSetMemberAccess` + an `.error_set` arm in `MemberExpr.resolveType` (so `MyError.Variant` has the error-set type). **Caveat:** for `const e = MyError.Nope` this type-check path doesn't currently fire — the **compiler** catches unknown variants first (diagnostic on **stdout**, like other compiler errors). Type-check member typing for error sets is wired and correct-by-construction for when consumed (Phases 4/8); the resolve path that bypasses it is unexplained and deferred.
+- [x] Observable: `MyError.UnknownError` constructs, binds, and prints as `MyError.UnknownError` (both bound and inline).
+- [x] Tests: `tests/features/error_value_construction_regression.rn` (+`.stdout`); `tests/diagnostics/error_unknown_variant.rn` (+`.stdout`/`.status`). Full suite green (70 smoke + 18 diagnostic).
+
+#### Phase 3b — Payloaded `E{ .Variant = payload }` construction
+- [ ] **Needs new parsing** — no struct-literal syntax exists today. Add parsing for `Identifier{ .Field = expr, ... }` (at least for error sets).
+- [ ] Type-check payload type against the variant's declared payload.
+- [ ] Compile to a `.err` value with a boxed payload.
+- [ ] Test: construct + observe a payloaded error.
+
+#### Phase 3c — Ok-value coercion / unwrapping
+- [ ] A plain value assigned/returned where `E!T` is expected stays the bare ok value at runtime (no wrapping needed under D2). **Fix the Phase 2 gap:** a fn returning `E!T` currently yields empty for `${getOne}` — make the ok value flow through.
+- [ ] Test: `fn ... E!Int { return 1 }` → caller sees `1`.
+
+**Status / Notes:** 3a ✅ complete. 3b/3c not started.
 
 ### Phase 4 — `catch` operator
 Goal: `expr catch default` and `expr catch |err| body`.

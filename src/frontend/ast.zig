@@ -921,6 +921,8 @@ pub const MemberExpr = struct {
 
         return switch (object_type.*) {
             .struct_type => |struct_type| struct_type.memberType(self.member.name),
+            // `MyError.Variant` has the error set's type when the variant exists.
+            .error_set => |error_set| if (error_set.variant(self.member.name) != null) object_type else null,
             else => null,
         };
     }

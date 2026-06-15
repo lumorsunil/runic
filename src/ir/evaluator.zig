@@ -2060,6 +2060,7 @@ pub const IREvaluator = struct {
                 }
             },
             .null => try w.writeAll("null"),
+            .err => |e| try w.print("{f}", .{e}),
             .void, .strct, .thread, .closeable, .fn_ref => {},
         }
     }

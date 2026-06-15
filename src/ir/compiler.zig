@@ -560,6 +560,9 @@ pub const IRCompiler = struct {
     current_instruction_set: usize = 0,
     labels: ir.Labels = .init(),
     struct_types: std.ArrayList(ir.Value.Struct.Type) = .empty,
+    /// Top-level error set declarations, keyed by name, so `compileMember` can
+    /// recognize `MyError.Variant` as error-value construction.
+    error_sets: std.StringHashMapUnmanaged(ast.TypeExpr.ErrorSet) = .empty,
     document_store: *DocumentStore,
     logging_enabled: bool,
     diagnostics: std.ArrayList(Diagnostic) = .empty,
@@ -1140,7 +1143,20 @@ pub const IRCompiler = struct {
         };
     }
 
+    /// Records every top-level `const Name = error { ... }` declaration so that
+    /// `MyError.Variant` member access can be compiled as error-value construction.
+    fn registerErrorSets(self: *IRCompiler) Allocator.Error!void {
+        for (self.script.statements) |stmt| {
+            if (stmt.* != .type_binding_decl) continue;
+            const decl = stmt.type_binding_decl;
+            if (decl.type_expr.* != .error_set) continue;
+            try self.error_sets.put(self.allocator, decl.identifier.name, decl.type_expr.error_set);
+        }
+    }
+
     pub fn compile(self: *IRCompiler) Error!CompilationResult {
+        try self.registerErrorSets();
+
         self.current_instruction_set = try self.addInstructionSetNoPushFrame();
 
         try self.scopes.push(self.allocator, .closure);
@@ -2292,6 +2308,40 @@ pub const IRCompiler = struct {
         };
     }
 
+    /// Compiles `MyError.Variant` into a payload-less error value. Payloaded
+    /// construction (`MyError{ .Variant = payload }`) is Phase 3b.
+    fn compileErrorVariant(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        set_name: []const u8,
+        error_set: ast.TypeExpr.ErrorSet,
+        variant_ident: ast.Identifier,
+    ) Error!Result {
+        const variant = error_set.variant(variant_ident.name) orelse {
+            try self.reportSourceError(
+                source,
+                Error.NotImplemented,
+                .@"error",
+                "error set '{s}' has no variant '{s}'",
+                .{ set_name, variant_ident.name },
+            );
+            return .fromValue(.void);
+        };
+
+        if (variant.payload != null) {
+            try self.reportSourceError(
+                source,
+                Error.NotImplemented,
+                .@"error",
+                "error variant '{s}.{s}' requires a payload; use {s}{{ .{s} = <value> }} (not yet implemented)",
+                .{ set_name, variant_ident.name, set_name, variant_ident.name },
+            );
+            return .fromValue(.void);
+        }
+
+        return .fromValue(.{ .err = .{ .set = set_name, .variant = variant_ident.name } });
+    }
+
     fn compileMember(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -2305,6 +2355,19 @@ pub const IRCompiler = struct {
 
         if (std.mem.eql(u8, member.member.name, "wait")) {
             return self.compileWaitMember(source, member.object);
+        }
+
+        // `MyError.Variant` — construct a (payload-less) error value when the
+        // object is an identifier naming a known error set.
+        if (member.object.* == .identifier) {
+            if (self.error_sets.get(member.object.identifier.name)) |error_set| {
+                return self.compileErrorVariant(
+                    source,
+                    member.object.identifier.name,
+                    error_set,
+                    member.member,
+                );
+            }
         }
 
         const object = try self.compileExpression(member.object);
@@ -2976,7 +3039,7 @@ pub const IRCompiler = struct {
             .value => |v| switch (v) {
                 .executable => self.compileExecutableCall(source, v, call.arguments, call.redirects),
                 .fn_ref => self.compileFunctionCall(source, v, call.arguments, call.redirects),
-                .slice, .stream, .addr, .void, .null, .uinteger, .float, .strct, .exit_code, .pipe, .thread, .closeable => .from(v),
+                .slice, .stream, .addr, .void, .null, .uinteger, .float, .strct, .exit_code, .pipe, .thread, .closeable, .err => .from(v),
                 .zig_string => Error.UnsupportedValueType,
             },
             .location => |loc| .from(loc),

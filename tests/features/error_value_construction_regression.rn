@@ -1,0 +1,11 @@
+const MyError = error {
+    UnknownError,
+    ErrorWithMessage: String,
+}
+
+// Payload-less error value construction via member access.
+const e = MyError.UnknownError
+echo "bound: ${e}"
+
+// Constructed inline.
+echo "direct: ${MyError.UnknownError}"
