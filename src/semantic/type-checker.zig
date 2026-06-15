@@ -36,6 +36,7 @@ pub const TypeChecker = struct {
         error{
             BindingPatternNotSupported,
             DocumentNotParsed,
+            DuplicateErrorVariant,
             ErrorNotInErrorSet,
             FileTooBig,
             ForSourcesAndBindingsNeedToBeTheSameLength,
@@ -1048,10 +1049,41 @@ pub const TypeChecker = struct {
                 try self.runTypeExpression(scope, error_union.err_set);
                 try self.runTypeExpression(scope, error_union.payload);
             },
-            .error_set, .err => {},
+            .error_set => |error_set| self.runErrorSet(scope, error_set),
+            .err => {},
             .array => |*array| self.runTypeArray(scope, array),
             .struct_type, .module, .tuple, .function, .fn_ref_type => {},
         };
+    }
+
+    /// Validates an error set declaration: resolves each variant's payload type
+    /// and reports duplicate variant names.
+    fn runErrorSet(
+        self: *TypeChecker,
+        scope: *Scope,
+        error_set: ast.TypeExpr.ErrorSet,
+    ) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.logTypeCheckTrace(@src().fn_name, error_set.span);
+
+        for (error_set.variants, 0..) |variant, i| {
+            if (variant.payload) |payload| {
+                try self.runTypeExpression(scope, payload);
+            }
+
+            for (error_set.variants[0..i]) |prev| {
+                if (std.mem.eql(u8, prev.name.name, variant.name.name)) {
+                    try self.reportSpanError(
+                        variant.name.span,
+                        Error.DuplicateErrorVariant,
+                        .@"error",
+                        "duplicate error variant {s}",
+                        .{variant.name.name},
+                    );
+                    break;
+                }
+            }
+        }
     }
 
     fn runTypeIdentifier(
@@ -2205,7 +2237,12 @@ pub const TypeChecker = struct {
                     options,
                 );
             },
-            .err => try self.validateErrorInSet(assignee.err_set.error_set, assignment_type, options),
+            .err => |err| try self.validateErrorInSet(
+                assignee.err_set.error_set,
+                err.name.name,
+                assignment_type.span(),
+                options,
+            ),
             else => try self.validateTypeAssignment(assignee.payload, assignment_type, options),
         }
     }
@@ -2219,30 +2256,31 @@ pub const TypeChecker = struct {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, assignment_type.span());
 
-        for (assignment_type.error_set.error_types) |error_set_type| {
-            try self.validateErrorInSet(error_set, error_set_type, options);
+        // Every variant of the assigned set must be present in the expected set
+        // (the assigned set is a subset of the expected set).
+        for (assignment_type.error_set.variants) |variant| {
+            try self.validateErrorInSet(error_set, variant.name.name, variant.span, options);
         }
     }
 
     pub fn validateErrorInSet(
         self: *TypeChecker,
         error_set: ast.TypeExpr.ErrorSet,
-        err: *const ast.TypeExpr,
+        variant_name: []const u8,
+        span: ast.Span,
         _: ValidateTypeAssignmentOptions,
     ) Error!void {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
-        try self.logTypeCheckTrace(@src().fn_name, err.span());
+        try self.logTypeCheckTrace(@src().fn_name, span);
 
-        for (error_set.error_types) |error_set_type| {
-            if (error_set_type == err) return;
-        }
+        if (error_set.variant(variant_name) != null) return;
 
         try self.reportSpanError(
-            err.span(),
+            span,
             Error.ErrorNotInErrorSet,
             .@"error",
-            "error not in expected error set",
-            .{},
+            "error '{s}' not in expected error set",
+            .{variant_name},
         );
     }
 
@@ -2255,9 +2293,10 @@ pub const TypeChecker = struct {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, assignment_type.span());
 
-        // TODO: see if we need to have a resolve type on assignment_type here
-        if (error_type.error_payload == assignment_type) {
-            return;
+        // TODO(error-handling Phase 3): validate a value being assigned to a
+        // single error-variant type against that variant's payload.
+        if (error_type.payload) |payload| {
+            if (payload == assignment_type) return;
         }
 
         try self.reportAssignmentError(

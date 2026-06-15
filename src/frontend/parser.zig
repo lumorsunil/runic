@@ -2933,7 +2933,7 @@ pub const Parser = struct {
             // .kw_enum => self.parseEnumTypeExpr(),
             // .kw_union => self.parseUnionTypeExpr(),
             // .kw_struct => self.parseStructTypeExpr(),
-            // .kw_error => self.parseErrorTypeExpr(),
+            .kw_error => self.parseErrorTypeExpr(),
             .l_bracket => self.parseArrayTypeExpr(),
             // .caret => self.parsePromiseTypeExpr(),
             .question => self.parseOptionalTypeExpr(),
@@ -2958,6 +2958,60 @@ pub const Parser = struct {
             },
         };
         return type_expr;
+    }
+
+    /// Parses an error set type expression:
+    ///   error { UnknownError, ErrorWithMessage: String }
+    /// Each variant is a name with an optional `: PayloadType`. Commas and
+    /// newlines both separate variants; a trailing comma is allowed.
+    fn parseErrorTypeExpr(self: *Self) Error!*const ast.TypeExpr {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const start = try self.expectTokenTag(.kw_error);
+        _ = try self.expectTokenTag(.l_brace);
+
+        var variants = std.ArrayList(ast.TypeExpr.ErrorSet.Variant).empty;
+        defer variants.deinit(self.allocator);
+
+        while (true) {
+            self.skipNewlines();
+            const next = try self.peekToken();
+            if (next.tag == .r_brace) break;
+
+            const name = try self.parseIdentifier();
+
+            var payload: ?*const ast.TypeExpr = null;
+            var variant_end = name.span;
+            const after = try self.peekToken();
+            if (after.tag == .colon) {
+                _ = try self.nextToken();
+                const payload_type = try self.parseTypeExpr();
+                payload = payload_type;
+                variant_end = payload_type.span();
+            }
+
+            try variants.append(self.allocator, .{
+                .name = name,
+                .payload = payload,
+                .span = name.span.endAt(variant_end),
+            });
+
+            self.skipNewlines();
+            const delimiter = try self.peekToken();
+            if (delimiter.tag == .comma) {
+                _ = try self.nextToken();
+            }
+        }
+
+        const close = try self.expectTokenTag(.r_brace);
+
+        return self.allocTypeExpression(.{
+            .error_set = .{
+                .variants = try self.copyToArena(ast.TypeExpr.ErrorSet.Variant, variants.items),
+                .span = start.span.endAt(close.span),
+            },
+        });
     }
 
     fn parseTypeExpr(self: *Self) Error!*const ast.TypeExpr {

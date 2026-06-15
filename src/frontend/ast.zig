@@ -225,14 +225,37 @@ pub const TypeExpr = union(enum) {
     };
 
     pub const ErrorSet = struct {
-        error_types: []*const TypeExpr,
+        variants: []const Variant,
         span: Span,
+
+        /// A single named error variant, optionally carrying a payload type
+        /// (`UnknownError` vs `ErrorWithMessage: String`).
+        pub const Variant = struct {
+            name: Identifier,
+            payload: ?*const TypeExpr,
+            span: Span,
+
+            pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+                try writer.writeAll(self.name.name);
+                if (self.payload) |payload| {
+                    try writer.print(": {f}", .{payload});
+                }
+            }
+        };
+
+        /// Returns the variant with the given name, or null if absent.
+        pub fn variant(self: @This(), name: []const u8) ?Variant {
+            for (self.variants) |v| {
+                if (std.mem.eql(u8, v.name.name, name)) return v;
+            }
+            return null;
+        }
 
         pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
             try writer.writeAll("error{");
-            for (self.error_types, 0..) |err, i| {
-                try err.format(writer);
-                if (i < self.error_types.len - 1) {
+            for (self.variants, 0..) |v, i| {
+                try v.format(writer);
+                if (i < self.variants.len - 1) {
                     try writer.writeByte(',');
                 }
             }
@@ -240,12 +263,18 @@ pub const TypeExpr = union(enum) {
         }
     };
 
+    /// The type of a single error variant value (e.g. the type of
+    /// `MyError.UnknownError` before it is widened into an error set).
     pub const ErrorType = struct {
-        error_payload: *const TypeExpr,
+        name: Identifier,
+        payload: ?*const TypeExpr,
         span: Span,
 
         pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
-            try writer.print("Error({f})", .{self.error_payload});
+            try writer.writeAll(self.name.name);
+            if (self.payload) |payload| {
+                try writer.print(": {f}", .{payload});
+            }
         }
     };
 

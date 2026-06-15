@@ -47,3 +47,34 @@ fn Void thisCouldError() !String { infers to ExecutableError!String
   grep "--invalid-flag"
 }
 ```
+
+## errors with values
+
+An error can also be defined with arbitrary payload types:
+
+```runic
+const MyError = error {
+    UnknownError,
+    ErrorWithMessage: String,
+}
+```
+
+Essentially MyError becomes a union(enum)-like type (like in zig), and you can define a value of the type MyError using the same syntax.
+Here is an example of how we can construct an error value with a payload:
+
+```runic
+fn Void givesError() MyError!Void {
+    return MyError{ .ErrorWithMessage = "This is the error message." }
+}
+```
+
+And then the error payload can be accessed like so:
+
+```runic
+fn Void program() Void {
+    givesError catch |err| match err {
+        MyError.UnknownError => echo "Error: Unknown error" >&2,
+        MyError.ErrorWithMessage => |message| echo "Error: ${message}" >&2,
+    }
+}
+```
