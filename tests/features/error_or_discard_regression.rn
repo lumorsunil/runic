@@ -1,0 +1,15 @@
+const E = error { Bad }
+
+// `||` discards the error and uses the fallback.
+const a = E.Bad || "fallback"
+echo "a=${a}"
+
+// An ok value passes through unchanged.
+const ok: E!String = "kept"
+const b = ok || "fallback"
+echo "b=${b}"
+
+// An error union holding an error falls back.
+const bad: E!String = E.Bad
+const c = bad || "recovered"
+echo "c=${c}"

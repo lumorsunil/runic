@@ -199,7 +199,7 @@ This phase was redesigned with the user (2026-06-16) into something larger and m
 **Staged sub-plan (each step must keep the suite green):**
 - [ ] 7c-i: type-checker coercion `.execution` → `ExecutableError!String` (and `String`) at binding/assignment/yield sites.
 - [ ] 7c-ii: runtime — at such a coercion site, reuse capture to get stdout, `resolve_exit_code`, then branch: exit 0 → ok String value; non-zero → `ExecutableError.NonZeroExit(code)` / `.Signalled` / `.SpawnFailed` (`src/runtime/exit_code.zig` maps the `ExitCode` union → variant).
-- [ ] 7c-iii: `||` as error-discard on error-union values (additive branch in the `||` path for error-union LHS; reuse the `is_err` branch from `compileCatch`).
+- [x] 7c-iii: `||` as error-discard on error-union values ✅ — `errUnion || fallback` / `E.Bad || fallback` yields the ok value, or the fallback when the LHS is an error. Value mode, non-capture operands: `BinaryExpr.resolveType` types `logical_or` over an error-like LHS as the payload (so 7b treats it as handled); `compileLogicalOrValue` does the `is_err` branch (mirrors `compileOrelseBinary`), detecting error-like LHS by type **or** a constant `.err` value source. Exit-code `||` unchanged; suite green (77 smoke). Test: `error_or_discard_regression`. (Statement-mode and capture-operand `||`-discard deferred.)
 - [ ] 7c-iv: reinterpret `if`/`&&`/`||` onto ok-vs-error (success=ok, error=false), keeping exit-code values working as today for non-error operands.
 - [ ] Keep `ExecutionResult` as the explicit handle (`.stdout`/`.stderr`/`.wait`/background) — coexists with the value view.
 

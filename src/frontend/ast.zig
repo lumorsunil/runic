@@ -1039,6 +1039,16 @@ pub const BinaryExpr = struct {
                 };
                 break :blk right_type;
             },
+            // `errorUnion || fallback` discards the error: the result is the
+            // error union's payload type.
+            .logical_or => blk: {
+                if (left_type) |lt| switch (lt.*) {
+                    .error_union => |error_union| break :blk error_union.payload,
+                    .error_set, .err => break :blk right_type,
+                    else => {},
+                };
+                break :blk left_type;
+            },
             else => left_type,
         };
     }

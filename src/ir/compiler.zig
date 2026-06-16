@@ -5516,6 +5516,15 @@ pub const IRCompiler = struct {
                 return .from(ref.dereference());
             },
             .logical_and, .logical_or, .sequence => {
+                // `errorUnion || fallback` discards the error. Handle the
+                // non-capture case here as catch-discard; everything else keeps
+                // the existing exit-code logical lowering.
+                if (binary.op == .logical_or and
+                    !self.analyzeExpressionEffects(binary.left).needs_stdio_capture and
+                    !self.analyzeExpressionEffects(binary.right).needs_stdio_capture)
+                {
+                    return self.compileLogicalOrValue(source, binary);
+                }
                 return self.compileLogicalBinary(source, binary, .value);
             },
             .@"orelse" => {
@@ -5971,6 +5980,66 @@ pub const IRCompiler = struct {
         const result = try self.compileExpression(expr);
         try self.finalizeStatementResult(source, result);
         return .fromValue(.void);
+    }
+
+    /// Non-capture `a || b`. If `a` is an error union, this is error-discard:
+    /// the error union's ok value, or `b` when `a` is an error. Otherwise it is
+    /// the ordinary exit-code logical-or.
+    fn compileLogicalOrValue(
+        self: *IRCompiler,
+        source: anytype,
+        binary: ast.BinaryExpr,
+    ) Error!Result {
+        const left = try self.compileExpression(binary.left);
+
+        const left_type_opt = left.typeExpr();
+        const is_error_like = left.source.isValueTag(.err) or
+            (left_type_opt != null and switch (left_type_opt.?) {
+                .error_union, .error_set, .err => true,
+                else => false,
+            });
+
+        if (is_error_like) {
+            const result_ref = try self.newRef(source, "logical_or_result");
+            try self.set(source, result_ref, stableResultSource(left));
+
+            const is_err_ref = try self.newRef(source, "logical_or_is_err");
+            try self.addInstruction(.init(.from(source), .{ .is_err = .{
+                .operand = result_ref.dereference(),
+                .result = is_err_ref,
+            } }));
+
+            const after_addr = try self.newLabel("logical_or_after", .unknown);
+            // Not an error: keep the ok value already in result_ref.
+            try self.jmp(source, try .from(is_err_ref.dereference()), false, after_addr);
+            // Error: discard it and use the fallback.
+            const right = try self.compileStableExpressionIntoRef(source, binary.right, result_ref);
+            try self.setLabel(after_addr.local_addr.label, .abs);
+
+            const result_type: ?ast.TypeExpr = if (left_type_opt) |left_type| switch (left_type) {
+                .error_union => |error_union| error_union.payload.*,
+                else => right.typeExpr(),
+            } else right.typeExpr();
+            return .from(result_ref.dereference().typed(result_type));
+        }
+
+        // Ordinary exit-code logical-or (mirrors the non-capture value path).
+        if (evaluateLogical(.from(binary.op), left.source)) |comptime_result| {
+            return switch (comptime_result) {
+                .left => left,
+                .right => try self.compileExpression(binary.right),
+            };
+        }
+
+        const right = try self.compileExpression(binary.right);
+        const ref = try self.newRef(source, "logical_result");
+        try self.addInstruction(.init(.from(source), .{ .log = .{
+            .op = .from(binary.op),
+            .a = left.source,
+            .b = right.source,
+            .result = ref,
+        } }));
+        return .from(ref.dereference());
     }
 
     fn compileOrelseBinary(
