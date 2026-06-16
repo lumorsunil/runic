@@ -191,9 +191,19 @@ This phase was redesigned with the user (2026-06-16) into something larger and m
 - [ ] **Moved to 7c:** `||` as error-discard (pairs with the boolean→ok/error reinterpretation).
 
 #### Phase 7c — command value = `ExecutableError!String` (touches execution core)
-- [ ] Type command/executable call value as `ExecutableError!String`; keep `ExecutionResult` as the explicit handle.
-- [ ] Runtime: map exit code → ok(String) vs `ExecutableError` value (`src/runtime/exit_code.zig`, process/stream).
-- [ ] Reinterpret `if`/`&&`/`||` onto ok-vs-error.
+**Investigation (2026-06-16):** this is a deep refactor, not a retype. Findings:
+- Commands have **no value-as-string form today** — even `const r: String = echo "hi"` fails ("expected String, actual ExecutionResult"). A command is an `ExecutionResult` struct (`execution_result_struct_type`); stdout is only reachable via `${cmd}` substitution or `.stdout`/`.exit_code`.
+- The capture path is `compileExpressionWithCapture` (`compiler.zig:2074`, ~120 lines of pipe/fork/wait) → produces the `ExecutionResult`; `${cmd}` materializes the stdout pipe to a string (evaluator `materializeString`).
+- `if`/`&&`/`||` are built throughout on `exit_code.toBoolean()` (`compileLogicalBinary` ~5822, `compileIfCondition` ~4175, unary-not ~1991/5409, comptime fold ~1942/1971).
+
+**Staged sub-plan (each step must keep the suite green):**
+- [ ] 7c-i: type-checker coercion `.execution` → `ExecutableError!String` (and `String`) at binding/assignment/yield sites.
+- [ ] 7c-ii: runtime — at such a coercion site, reuse capture to get stdout, `resolve_exit_code`, then branch: exit 0 → ok String value; non-zero → `ExecutableError.NonZeroExit(code)` / `.Signalled` / `.SpawnFailed` (`src/runtime/exit_code.zig` maps the `ExitCode` union → variant).
+- [ ] 7c-iii: `||` as error-discard on error-union values (additive branch in the `||` path for error-union LHS; reuse the `is_err` branch from `compileCatch`).
+- [ ] 7c-iv: reinterpret `if`/`&&`/`||` onto ok-vs-error (success=ok, error=false), keeping exit-code values working as today for non-error operands.
+- [ ] Keep `ExecutionResult` as the explicit handle (`.stdout`/`.stderr`/`.wait`/background) — coexists with the value view.
+
+**Note:** best tackled as a dedicated focused session (ideally a git worktree) — it's the riskiest, most-embedded change in the whole feature.
 
 #### Phase 7d — pipeline error short-circuit + trailing `catch`/`||`
 - [ ] A stage error aborts the pipeline and propagates to the nearest trailing `catch`/`||` (or function error return).
