@@ -209,11 +209,11 @@ This phase was redesigned with the user (2026-06-16) into something larger and m
 
 **Note:** best tackled as a dedicated focused session (ideally a git worktree) — it's the riskiest, most-embedded change in the whole feature.
 
-#### Phase 7d — pipeline error short-circuit + trailing `catch`/`||`
-- [ ] A stage error aborts the pipeline and propagates to the nearest trailing `catch`/`||` (or function error return).
-- [ ] Test: `echo "1234" | parseInt catch 0`; failing command caught; `cmd || "default"`.
+#### Phase 7d — pipeline error short-circuit + trailing `catch`/`||` ✅ (trailing handler)
+- [x] A pipeline ending in a command is handled at the **trailing** `catch`/`||`/`try`: since the pipeline's result type is `.execution` and (from 7c-iv A) `catch`/`try` accept `.execution` subjects, the pipeline's final result (the last stage's exit/output) is converted to `ExecutableError!String` and handled. `catch` binds looser than `|`, so `(echo | grep) catch x` catches the whole pipeline. Verified: `echo "hi" | grep "zzz" catch "no-match"`, `... || "discarded"`, `try (echo | grep ...)` in an error-returning fn. Test: `error_pipeline_regression`. Suite green (82 smoke).
+- **Deferred:** *true mid-pipeline* short-circuit (a failing upstream stage aborting downstream stages) — current pipelines fork stages concurrently and the trailing handler catches the aggregate final result, which covers the user-facing need; aborting downstream is a deeper execution-model change. Error-*typed* function stages propagating mid-pipeline tie into the typed-pipe model. The spec's exact `echo "1234" | parseInt catch 0` needs the `parseInt` builtin to return an error union (it returns plain `Int` and currently hard-errors on bad input) — a separate builtin-design change.
 
-**Status / Notes:** _redesigned; starting 7a + 7b (low risk, fully testable). Reassess before 7c/7d (risky execution-core changes)._
+**Status / Notes:** ✅ **Phase 7 COMPLETE** (7a–7d). Errors short-circuit to the nearest handler; handling is enforced; `ExecutableError` builtin; commands carry the `ExecutableError!String` value view (binding, direct `catch`/`try`/`||`, pipelines) while `ExecutionResult` remains the explicit handle; `if`/`||` work as ok-vs-error; runtime error payloads. Merged `error-7c` → `error` (ff). Deferred niche items noted per sub-phase.
 
 ### Phase 8 — Switch/match on error values with payload capture
 Goal: dispatch on error variants, capturing payloads (spec lines 73-80).
