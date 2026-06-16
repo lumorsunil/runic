@@ -4290,6 +4290,49 @@ pub const IRCompiler = struct {
                     } else null,
                 };
             },
+            // `if (errorUnion)` is true when the value is ok (not an error);
+            // an `|value|` capture binds the ok payload.
+            .error_union, .error_set, .err => {
+                const cond_ref = try self.newRef(source, "if_error_cond");
+                try self.set(source, cond_ref, stableResultSource(condition));
+
+                const is_err_ref = try self.newRef(source, "if_is_err");
+                try self.addInstruction(.init(.from(source), .{ .is_err = .{
+                    .operand = cond_ref.dereference(),
+                    .result = is_err_ref,
+                } }));
+                const is_ok_ref = try self.newRef(source, "if_is_ok");
+                try self.addInstruction(.init(.from(source), .{ .neg = .{
+                    .operand = is_err_ref.dereference(),
+                    .result = is_ok_ref,
+                } }));
+
+                return .{
+                    .condition = try .from(is_ok_ref.dereference()),
+                    .capture_binding = if (capture) |capture_clause| blk: {
+                        if (capture_clause.bindings.len != 1) {
+                            try self.reportSourceError(
+                                source,
+                                Error.UnsupportedBindingPattern,
+                                .@"error",
+                                "if capture clauses currently require exactly one binding",
+                                .{},
+                            );
+                            return .{ .condition = .fromValue(.void) };
+                        }
+
+                        var capture_value: ir.ValueSource = .fromLocation(cond_ref.dereference());
+                        if (condition_type_ == .error_union) {
+                            capture_value.location = capture_value.location.typed(condition_type_.error_union.payload.*);
+                        }
+
+                        break :blk .{
+                            .pattern = capture_clause.bindings[0],
+                            .value = capture_value,
+                        };
+                    } else null,
+                };
+            },
             else => {},
         };
 

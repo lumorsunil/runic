@@ -1371,6 +1371,14 @@ pub const TypeChecker = struct {
                 false,
                 false,
             ),
+            // `if (errorUnion) |value|` binds the ok payload.
+            .error_union => |error_union| try self.runBindingPattern(
+                then_scope,
+                capture.bindings[0],
+                error_union.payload,
+                false,
+                false,
+            ),
             else => try self.runBindingPattern(
                 then_scope,
                 capture.bindings[0],

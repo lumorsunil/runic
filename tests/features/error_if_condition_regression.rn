@@ -1,0 +1,12 @@
+const E = error { Bad }
+
+// `if (errorUnion)` is true when the value is ok (not an error).
+const ok: E!String = "good"
+if (ok) echo "ok-then" else echo "ok-else"
+
+const bad: E!String = E.Bad
+if (bad) echo "bad-then" else echo "bad-else"
+
+// An `|value|` capture binds the ok payload.
+const ok2: E!String = "captured-value"
+if (ok2) |v| echo "got ${v}" else echo "no"
