@@ -2495,6 +2495,12 @@ pub const TypeChecker = struct {
                     try self.validateErrorInSet(us, err.name.name, assignment_type.span(), options);
                 }
             },
+            // A command coerces into an error union: its ok value is its
+            // captured String output; failure yields an ExecutableError.
+            .execution => {
+                const string_type = try self.allocStringType();
+                try self.validateTypeAssignment(assignee.payload, string_type, options);
+            },
             else => try self.validateTypeAssignment(assignee.payload, assignment_type, options),
         }
     }

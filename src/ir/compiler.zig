@@ -1671,7 +1671,14 @@ pub const IRCompiler = struct {
                 return .fromValue(.void);
             },
             .identifier => |identifier| {
-                const result = try self.compileExpressionWithCapture(source, expr);
+                var result = try self.compileExpressionWithCapture(source, expr);
+                // A command bound where an error union is expected becomes
+                // `ExecutableError!String`: exit 0 → output, else an error.
+                if (annotation) |ann| {
+                    if (ann.* == .error_union and result.isType(execution_result_struct_type)) {
+                        result = try self.compileExecutionToErrorUnion(source, result, ann.*);
+                    }
+                }
                 try self.compileIdentifierBinding(
                     source,
                     identifier,
@@ -2396,6 +2403,53 @@ pub const IRCompiler = struct {
             .result = result_ref,
         } }));
         return .from(result_ref.dereference());
+    }
+
+    /// Converts a finished command (`ExecutionResult`) into an
+    /// `ExecutableError!String` value: exit 0 → the captured output (ok), any
+    /// other exit → `ExecutableError.NonZeroExit(code)`.
+    fn compileExecutionToErrorUnion(
+        self: *IRCompiler,
+        source: anytype,
+        exec: Result,
+        result_type: ?ast.TypeExpr,
+    ) Error!Result {
+        const exec_ref = try self.newRef(source, "exec_value");
+        try self.set(source, exec_ref, stableResultSource(exec));
+
+        const exit_code_ref = try self.newRef(source, "exec_exit_code");
+        try self.addInstruction(.init(.from(source), .{ .resolve_exit_code = .{
+            .source = exec_ref.dereference().typed(execution_result_struct_type),
+            .result = exit_code_ref,
+        } }));
+
+        const result_ref = try self.newRef(source, "exec_error_union");
+        const err_addr = try self.newLabel("exec_error", .unknown);
+        const after_addr = try self.newLabel("exec_after", .unknown);
+
+        // Non-zero exit (falsy exit code) → error branch.
+        try self.jmp(source, try .from(exit_code_ref.dereference()), false, err_addr);
+
+        // Success: the ok value is the captured (merged) output.
+        try self.set(source, .initRegister(.r2), .from(exec_ref.dereference()));
+        try self.set(source, result_ref, .fromLocation(.initAdd(
+            .{ .register = .r2 },
+            executionResultFieldOffset(.merged),
+            .{ .dereference = true },
+        )));
+        try self.jmp(source, null, false, after_addr);
+
+        // Failure: ExecutableError.NonZeroExit(code).
+        try self.setLabel(err_addr.local_addr.label, .abs);
+        try self.addInstruction(.init(.from(source), .{ .make_err = .{
+            .set = "ExecutableError",
+            .variant = "NonZeroExit",
+            .payload = .from(exit_code_ref.dereference()),
+            .result = result_ref,
+        } }));
+
+        try self.setLabel(after_addr.local_addr.label, .abs);
+        return .from(result_ref.dereference().typed(result_type));
     }
 
     /// `expr catch <default>` / `expr catch |err| <handler>`. Evaluates the
