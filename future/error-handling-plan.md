@@ -67,7 +67,8 @@ Resolve these as we go; record the choice + rationale inline.
   **Serialization caveat:** the dead `Value.serialize`/`deserialize`/`deinit` methods reference non-existent variants (`.location`, `.register`) and are not analyzed by Zig (never called), so they don't block adding `.err`. If error values ever need to cross a pipe/process boundary, `.err` serialization must be implemented then.
 
   Implies a new **error-set type registry** (parallel to the struct-type table) so `set_id` resolves to a set and `variant_index` to a variant — to be built in Phase 1/3.
-- **D3 — `ExecutableError` definition.** Spec says all executable calls have stdout type `ExecutableError!String`. Where is `ExecutableError` defined — a builtin error set injected into the prelude/global scope, or a synthetic compiler type? **Recommendation:** define it as a builtin error set in global scope so it participates in inference and switch. Decision: _TBD_.
+- **D3 — `ExecutableError` definition.** ✅ **RESOLVED (Phase 7a): builtin error set in global/prelude scope** (`NonZeroExit: Int`, `Signalled: Int`, `SpawnFailed`), so it participates in checking like a user error set.
+- **D7 — Execution error model.** ✅ **RESOLVED (2026-06-16).** Errors short-circuit (not stream data); handling is enforced (catch/`||`/propagate, else compile error); booleans-as-exit-codes reinterpreted as ok-vs-error (`||` = catch-and-discard); command value view is `ExecutableError!String` while `ExecutionResult` remains the explicit handle. Full model + staging in the Phase 7 section.
 - **D4 — Error set member access vs payload struct literal.** ✅ **RESOLVED (Phase 3a/3b).** `E.Variant` rides member access; `E{ .Variant = x }` is a new struct-literal node, disambiguated by an **uppercase identifier immediately followed by `{`** (lowercase command parsing untouched). Both implemented.
 - **D5 — Inferred error-set representation.** ✅ **RESOLVED (Phase 6): empty error set = inferred.** A leading-`!T` parses to an `error_union` whose `err_set` is an empty `error_set` (`variants.len == 0`); `isInferredErrorSet` treats that as "inferred", and yield validation accepts any error into it (**open-set** model). Concrete accumulation of the body's exact union (and propagation to callers, for `match` exhaustiveness) is deferred until Phase 8 needs it.
 - **D6 — Error propagation model.** ✅ **RESOLVED (2026-06-15): value/yield-based.** `catch`/`try` operate on the error union a function/pipeline **produces** (via `yield`→stdout), not on `return`. `try` re-yields the error to propagate. See the Phase 3c notes for full rationale. `catch` on directly-produced error unions is model-independent and is built first.
@@ -169,14 +170,34 @@ Goal: `const result = ...` infers an error-union type from the RHS; `fn ... !T {
 
 **Status / Notes:** ✅ Complete as an **open-set** model: a leading-`!T` set accepts any body-produced error, but its *concrete* members are not yet collected into the function's recorded type. **Deferred (D5 follow-up):** accumulating the exact union of body error sets and propagating it to callers — needed for Phase 8 `match` exhaustiveness and for the spec's executable-inference examples (which also need Phase 7's `ExecutableError`). The spec's `const result = echo "hello"` / `grep "--invalid-flag"` examples specifically depend on Phase 7.
 
-### Phase 7 — Executable calls carry inherent error unions
-Goal: every executable call's stdout type is `ExecutableError!String`; non-zero exit becomes an error value at runtime.
-- [ ] Define `ExecutableError` builtin error set (resolve D3).
-- [ ] Type checker: give executable/pipeline call expressions stdout type `ExecutableError!String`.
-- [ ] Runtime: map process exit code → ok(String) vs error value. Coordinate with `src/runtime/exit_code.zig` and process/stream layers.
-- [ ] Test: `echo "1234" | parseInt catch 0`; failing command caught.
+### Phase 7 — Executable error unions + error short-circuit/enforcement (REDESIGNED)
+This phase was redesigned with the user (2026-06-16) into something larger and more principled than the spec. Model decisions recorded as **D7** below. Staged 7a–7d to de-risk; reassess between stages.
 
-**Status / Notes:** _not started — touches process/stream/exit_code; likely the riskiest phase._
+**Model (D7):**
+- **Errors short-circuit; they are not stream data.** A stage's output stream is `T`; an error is a terminal event that aborts the stage and propagates outward. The type crossing `|` is always `T`, never `E!T` — errors skip *past* remaining stages to the nearest handler.
+- **Handling is enforced (Zig-like):** an expression that can error must be `catch`'d / `||`'d or propagated (function declares `E!T` + `try`/yield), else a compile error. Uncaught at top level → program exit code.
+- **Booleans-as-exit-codes are reinterpreted as ok-vs-error:** `if (cmd)` = "cmd ok"; `cmd && next` = run next if ok; `cmd || fallback` = **catch-and-discard** (fallback if error). `success = ok`, `nonzero = error(code)`.
+- **`ExecutableError`** covers today's `ExitCode` variants: `NonZeroExit: Int`, `Signalled: Int`, `SpawnFailed`. A command's *value view* is `ExecutableError!String`; **`ExecutionResult` stays** as the explicit detailed handle (`.stdout`/`.stderr`/`.wait`/background) — the two coexist.
+
+#### Phase 7a — `ExecutableError` builtin error set
+- [ ] Define `ExecutableError` (the set above) in global/prelude scope so it participates in checking like a user error set (resolves D3).
+- [ ] Test: reference `ExecutableError`/its variants; construct + `catch`.
+
+#### Phase 7b — error short-circuit + enforcement (on existing machinery, no execution changes)
+- [ ] Enforce "an error must be handled or propagated" — unhandled error union in a non-error-returning context → diagnostic.
+- [ ] `||` as error-discard for error unions (alongside its current exit-code role).
+- [ ] Test with **user** error sets (provable without touching the execution core).
+
+#### Phase 7c — command value = `ExecutableError!String` (touches execution core)
+- [ ] Type command/executable call value as `ExecutableError!String`; keep `ExecutionResult` as the explicit handle.
+- [ ] Runtime: map exit code → ok(String) vs `ExecutableError` value (`src/runtime/exit_code.zig`, process/stream).
+- [ ] Reinterpret `if`/`&&`/`||` onto ok-vs-error.
+
+#### Phase 7d — pipeline error short-circuit + trailing `catch`/`||`
+- [ ] A stage error aborts the pipeline and propagates to the nearest trailing `catch`/`||` (or function error return).
+- [ ] Test: `echo "1234" | parseInt catch 0`; failing command caught; `cmd || "default"`.
+
+**Status / Notes:** _redesigned; starting 7a + 7b (low risk, fully testable). Reassess before 7c/7d (risky execution-core changes)._
 
 ### Phase 8 — Switch/match on error values with payload capture
 Goal: dispatch on error variants, capturing payloads (spec lines 73-80).

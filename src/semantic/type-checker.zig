@@ -2800,6 +2800,7 @@ const global_scope_definitions = [_]Definition{
     .init("Boolean", GlobalTypes.Boole),
     .init("Byte", GlobalTypes.Byte),
     .init("String", GlobalTypes.Array(GlobalTypes.Byte)),
+    .init("ExecutableError", ast.TypeExpr.executableErrorType),
 };
 
 /// Builtin value bindings (not types) available in every module's global scope.

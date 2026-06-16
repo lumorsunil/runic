@@ -1146,6 +1146,9 @@ pub const IRCompiler = struct {
     /// Records every top-level `const Name = error { ... }` declaration so that
     /// `MyError.Variant` member access can be compiled as error-value construction.
     fn registerErrorSets(self: *IRCompiler) Allocator.Error!void {
+        // Builtin error sets available in every script.
+        try self.error_sets.put(self.allocator, "ExecutableError", ast.TypeExpr.executableErrorSet);
+
         for (self.script.statements) |stmt| {
             if (stmt.* != .type_binding_decl) continue;
             const decl = stmt.type_binding_decl;

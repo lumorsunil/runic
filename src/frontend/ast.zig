@@ -597,6 +597,20 @@ pub const TypeExpr = union(enum) {
             .span = .global,
         },
     };
+
+    /// Builtin `ExecutableError` error set: a command's failure modes. Its value
+    /// view is `ExecutableError!String` (see the error-handling plan, D7).
+    const executableErrorIntType = TypeExpr{ .integer = .{ .span = .global } };
+    pub const executableErrorVariants = [_]ErrorSet.Variant{
+        .{ .name = Identifier.global("NonZeroExit"), .payload = &executableErrorIntType, .span = .global },
+        .{ .name = Identifier.global("Signalled"), .payload = &executableErrorIntType, .span = .global },
+        .{ .name = Identifier.global("SpawnFailed"), .payload = null, .span = .global },
+    };
+    pub const executableErrorSet = ErrorSet{
+        .variants = &executableErrorVariants,
+        .span = .global,
+    };
+    pub const executableErrorType = TypeExpr{ .error_set = executableErrorSet };
 };
 
 /// StringLiteral supports interpolation segments so command arguments and
