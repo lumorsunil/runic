@@ -2463,7 +2463,13 @@ pub const IRCompiler = struct {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
         const subject_ref = try self.newRef(source, "catch_subject");
-        const subject = try self.compileStableExpressionIntoRef(source, catch_expr.subject, subject_ref);
+        var subject = try self.compileStableExpressionIntoRef(source, catch_expr.subject, subject_ref);
+        // A command subject is treated as `ExecutableError!String`.
+        if (subject.isType(execution_result_struct_type)) {
+            const error_union = try self.compileExecutionToErrorUnion(source, subject, null);
+            try self.set(source, subject_ref, stableResultSource(error_union));
+            subject = try .from(subject_ref.dereference().typed(error_union.typeExpr()));
+        }
 
         const is_err_ref = try self.newRef(source, "catch_is_err");
         try self.addInstruction(.init(.from(source), .{ .is_err = .{
@@ -2510,7 +2516,13 @@ pub const IRCompiler = struct {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
         const subject_ref = try self.newRef(source, "try_subject");
-        const subject = try self.compileStableExpressionIntoRef(source, try_expr.subject, subject_ref);
+        var subject = try self.compileStableExpressionIntoRef(source, try_expr.subject, subject_ref);
+        // A command subject is treated as `ExecutableError!String`.
+        if (subject.isType(execution_result_struct_type)) {
+            const error_union = try self.compileExecutionToErrorUnion(source, subject, null);
+            try self.set(source, subject_ref, stableResultSource(error_union));
+            subject = try .from(subject_ref.dereference().typed(error_union.typeExpr()));
+        }
 
         const is_err_ref = try self.newRef(source, "try_is_err");
         try self.addInstruction(.init(.from(source), .{ .is_err = .{

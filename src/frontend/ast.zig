@@ -1332,7 +1332,9 @@ pub const CatchExpr = struct {
             return self.handler.resolveType(io, allocator, scope);
         return switch (subject_type.*) {
             .error_union => |error_union| error_union.payload,
-            .error_set, .err => self.handler.resolveType(io, allocator, scope),
+            // A bare error value or a command (treated as `ExecutableError!String`)
+            // yields the handler / ok-string; use the handler's type.
+            .error_set, .err, .execution => self.handler.resolveType(io, allocator, scope),
             else => subject_type,
         };
     }

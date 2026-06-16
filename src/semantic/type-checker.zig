@@ -1431,9 +1431,10 @@ pub const TypeChecker = struct {
         try self.runExpression(handler_scope, catch_expr.handler);
 
         // The left-hand side must be error-like (per the spec, `catch` on a
-        // non-error value is a type error).
+        // non-error value is a type error). A command (`execution`) is accepted:
+        // it is treated as `ExecutableError!String`.
         if (subject_type) |st| switch (st.*) {
-            .error_union, .error_set, .err, .failed => {},
+            .error_union, .error_set, .err, .failed, .execution => {},
             else => try self.reportSpanError(
                 catch_expr.subject.span(),
                 Error.TypeMismatch,
@@ -1454,9 +1455,10 @@ pub const TypeChecker = struct {
 
         // The subject must be error-like; the error case is propagated out of
         // the enclosing function. (Validating that the enclosing function's
-        // error set accepts the propagated error is deferred to Phase 6.)
+        // error set accepts the propagated error is deferred to Phase 6.) A
+        // command (`execution`) is accepted as `ExecutableError!String`.
         if (subject_type) |st| switch (st.*) {
-            .error_union, .error_set, .err, .failed => {},
+            .error_union, .error_set, .err, .failed, .execution => {},
             else => try self.reportSpanError(
                 try_expr.subject.span(),
                 Error.TypeMismatch,

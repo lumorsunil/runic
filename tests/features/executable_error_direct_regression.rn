@@ -1,0 +1,15 @@
+// `catch` directly on a command (no annotation binding needed): a failing
+// command is caught, a successful one yields its output.
+const a = grep "zzz" "/dev/null" catch "no-match"
+echo "a=${a}"
+
+// `catch` directly inside an interpolation.
+echo "b=${grep "zzz" "/dev/null" catch "caught"}"
+
+// `try` on a command: ok continues; a failure would propagate.
+fn Void f() ExecutableError!String {
+    const out = try echo "from-try"
+    yield "ok=${out}"
+}
+f
+echo "|end"
