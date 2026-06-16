@@ -236,6 +236,25 @@ Goal: dispatch on error variants, capturing payloads (spec lines 73-80).
 
 ---
 
+## Deferred / Follow-ups (backlog)
+
+Niche or risky items intentionally deferred along the way, collected here so they can be picked up later. Each notes where it came from.
+
+1. **`catch |err| …${err}…` on a command-converted binding prints nothing** (7c). Capture-context interaction; works for user errors and static/non-interpolating handlers. Likely a nested-capture issue in `compileCatchHandler` + command conversion.
+2. **`try` superset check** (5/6): `runTry` doesn't yet verify the enclosing function's error set is a superset of the propagated error (needs concrete inference, item 3).
+3. **Concrete inferred error sets** (6): leading-`!T` uses an *open-set* model (accepts any error). The exact union of body errors isn't collected into the function's recorded type — needed for **Phase 8 `match` exhaustiveness** on inferred returns and for caller visibility.
+4. **`errorUnion && x`** (7c-iv): not implemented — semantically muddy (would propagate the error). Decide semantics first.
+5. **`cmd ||`/`cmd &&` as a value yielding output** (7c-iv): commands in `||`/`&&` still use exit-code logical lowering (capture path), not output-or-fallback value semantics. Needs the capture-path logical lowering reworked.
+6. **True mid-pipeline short-circuit** (7d): a failing upstream stage aborting downstream stages. Pipelines fork stages concurrently; only the trailing handler catches the aggregate result today.
+7. **Error-typed function stages mid-pipeline** (7d): tie into the typed-pipe model.
+8. **`parseInt` (and other builtins) returning an error union** (7d): the spec's `echo "1234" | parseInt catch 0` needs `parseInt` to be `…!Int` (it returns plain `Int` and hard-errors on bad input). Builtin-design change.
+9. **Unknown-variant diagnostic location** (3a): caught by the **compiler** (stdout) rather than the type checker (stderr); `runMember`'s error-set arm doesn't fire for `const e = MyError.Nope`. Investigate the resolve path.
+10. **Variant payload type validation** (1): `runTypeIdentifier` is a no-op codebase-wide, so an unknown payload type name in a variant isn't caught; variant payloads aren't alias-resolved (`resolveTypeExpr` returns `error_set` via its `else`).
+11. **Dead `Statement.error_decl` / `EnumBody` / `UnionBody` AST nodes** (1): superseded by the type-expr `error_set`; candidates for removal (Phase 9).
+12. **`.err` serialization across process/pipe boundaries** (D2): not implemented; needed if error values must cross a process boundary.
+
+---
+
 ## Key Files Reference
 
 - `src/frontend/token.zig` — tokens (all needed keywords already present)
