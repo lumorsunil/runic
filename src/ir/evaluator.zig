@@ -1252,6 +1252,20 @@ pub const IREvaluator = struct {
                 try self.setLocation(thread, is_err.result, .fromBoolean(operand == .err));
                 return .cont;
             },
+            .make_err => |make_err| {
+                const payload_ptr: ?*const ir.Value = if (make_err.payload) |payload| blk: {
+                    const value = try self.resolveValueSource(thread, payload);
+                    const boxed = try self.allocator.create(ir.Value);
+                    boxed.* = value;
+                    break :blk boxed;
+                } else null;
+                try self.setLocation(thread, make_err.result, .{ .err = .{
+                    .set = make_err.set,
+                    .variant = make_err.variant,
+                    .payload = payload_ptr,
+                } });
+                return .cont;
+            },
             .exec => |exec| {
                 _ = exec;
 

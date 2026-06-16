@@ -2385,23 +2385,17 @@ pub const IRCompiler = struct {
             return .fromValue(.void);
         }
 
+        // Construct the error value at runtime so the payload may be any value
+        // (constant or runtime), boxed by the `make_err` instruction.
         const payload_result = try self.compileExpression(field.value);
-        const payload_value = switch (payload_result.source) {
-            .value => |v| v,
-            .location => {
-                try self.reportSourceError(source, Error.NotImplemented, .@"error", "error payloads must currently be constant values", .{});
-                return .fromValue(.void);
-            },
-        };
-
-        const boxed = try self.allocator.create(ir.Value);
-        boxed.* = payload_value;
-
-        return .fromValue(.{ .err = .{
+        const result_ref = try self.newRef(source, "error_value");
+        try self.addInstruction(.init(.from(source), .{ .make_err = .{
             .set = struct_literal.name.name,
             .variant = field.name.name,
-            .payload = boxed,
-        } });
+            .payload = payload_result.source,
+            .result = result_ref,
+        } }));
+        return .from(result_ref.dereference());
     }
 
     /// `expr catch <default>` / `expr catch |err| <handler>`. Evaluates the
@@ -6531,7 +6525,7 @@ pub const IRCompiler = struct {
     fn instructionSetIsCountedLoopSafe(self: *IRCompiler, instr_set: usize) bool {
         for (self.instruction_sets.items[instr_set].instructions.items) |instr| {
             switch (instr.type) {
-                .comment, .set, .ath, .cmp, .neg, .is_err, .get_env, .set_env, .simple_exec => {},
+                .comment, .set, .ath, .cmp, .neg, .is_err, .make_err, .get_env, .set_env, .simple_exec => {},
                 else => return false,
             }
         }

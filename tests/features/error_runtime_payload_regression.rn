@@ -1,0 +1,18 @@
+const E = error {
+    Msg: String,
+    Code: Int,
+}
+
+// Payload from a runtime binding.
+const m = "runtime message"
+const a = E{ .Msg = m }
+echo "a=${a}"
+
+// Payload computed at runtime (interpolation).
+const name = "world"
+const b = E{ .Msg = "hello ${name}" }
+echo "b=${b}"
+
+// A constant payload still works.
+const c = E{ .Msg = "constant" }
+echo "c=${c}"

@@ -107,6 +107,8 @@ pub const Instruction = struct {
         neg: Neg,
         /// sets result to a boolean: whether operand is an error value (`.err`)
         is_err: Neg,
+        /// constructs an error value (boxing the runtime payload, if any)
+        make_err: MakeErr,
         /// declares a new ref (basically a labeled push)
         ref: []const u8,
         /// sets a Location to a Value from a Location
@@ -286,6 +288,15 @@ pub const Instruction = struct {
 
     pub const UnaryOperation = struct {
         operand: Location,
+        result: Location,
+    };
+
+    /// Constructs an error value. `payload` (if present) is resolved at runtime
+    /// and boxed, so both constant and runtime payloads are supported.
+    pub const MakeErr = struct {
+        set: []const u8,
+        variant: []const u8,
+        payload: ?ValueSource,
         result: Location,
     };
 
