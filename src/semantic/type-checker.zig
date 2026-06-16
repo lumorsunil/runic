@@ -46,6 +46,7 @@ pub const TypeChecker = struct {
             MemberNotFound,
             ModuleNotFound,
             TypeMismatch,
+            UnhandledError,
             UnresolvedTypeLiteral,
             UnsupportedExpression,
             UnsupportedMemberAccess,
@@ -1007,6 +1008,28 @@ pub const TypeChecker = struct {
         try self.logTypeCheckTrace(@src().fn_name, expr_stmt.span);
 
         try self.runExpression(scope, expr_stmt.expression);
+
+        // Enforce error handling: a bare statement whose value is an error
+        // union or error value discards it without handling. `catch`/`try`
+        // (and `||`, once it discards errors) consume the error, so skip those.
+        // `call`/`pipeline` enforcement is tied to the execution model and is
+        // handled in Phase 7c/7d, so they are skipped here.
+        switch (expr_stmt.expression.*) {
+            .catch_expr, .try_expr, .call, .pipeline, .pipeline_deprecated => {},
+            else => {
+                const expr_type = try self.resolveExprType(scope, expr_stmt.expression) orelse return;
+                switch (self.unaliasType(expr_type).*) {
+                    .error_union, .error_set, .err => try self.reportSpanError(
+                        expr_stmt.expression.span(),
+                        Error.UnhandledError,
+                        .@"error",
+                        "error is not handled; use catch (or || to discard) or propagate it",
+                        .{},
+                    ),
+                    else => {},
+                }
+            },
+        }
     }
 
     fn runExpression(

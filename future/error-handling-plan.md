@@ -183,10 +183,12 @@ This phase was redesigned with the user (2026-06-16) into something larger and m
 - [ ] Define `ExecutableError` (the set above) in global/prelude scope so it participates in checking like a user error set (resolves D3).
 - [ ] Test: reference `ExecutableError`/its variants; construct + `catch`.
 
-#### Phase 7b — error short-circuit + enforcement (on existing machinery, no execution changes)
-- [ ] Enforce "an error must be handled or propagated" — unhandled error union in a non-error-returning context → diagnostic.
-- [ ] `||` as error-discard for error unions (alongside its current exit-code role).
-- [ ] Test with **user** error sets (provable without touching the execution core).
+#### Phase 7b — error-handling enforcement ✅ COMPLETE (bare error values)
+- [x] Enforce "an error must be handled": a **bare expression statement** whose value is an error union / error value (and isn't `catch`/`try`) → `UnhandledError` diagnostic ("use catch (or || to discard) or propagate it"). Implemented in `runExpressionStatement`.
+- [x] Scoped to error **values** (`E.Bad`, `E{...}`); `call`/`pipeline` statements are skipped — their error enforcement is tied to the execution model and lands in 7c/7d. (The error→non-error *coercion* rejections in yields/assignments are already enforced via existing type-mismatch checks.)
+- [x] Fixed `CatchExpr.resolveType` to return the handler's type for pure-error subjects (so `const x = E.Bad catch "y"` types `x` as the handler type, not the error set).
+- [x] Test: `error_unhandled` (diagnostic). Full suite green (76 smoke + 23 diagnostic).
+- [ ] **Moved to 7c:** `||` as error-discard (pairs with the boolean→ok/error reinterpretation).
 
 #### Phase 7c — command value = `ExecutableError!String` (touches execution core)
 - [ ] Type command/executable call value as `ExecutableError!String`; keep `ExecutionResult` as the explicit handle.

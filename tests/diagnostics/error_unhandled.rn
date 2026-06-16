@@ -1,0 +1,3 @@
+const E = error { Bad }
+E.Bad
+echo "should not reach"

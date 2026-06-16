@@ -1315,10 +1315,14 @@ pub const CatchExpr = struct {
         allocator: std.mem.Allocator,
         scope: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
-        // `expr catch ...` evaluates to the error union's payload type.
-        const subject_type = try self.subject.resolveType(io, allocator, scope) orelse return null;
+        // `expr catch ...` evaluates to the error union's payload type; when the
+        // subject is a bare error value (no payload), it always yields the
+        // handler, so the handler's type is the result type.
+        const subject_type = try self.subject.resolveType(io, allocator, scope) orelse
+            return self.handler.resolveType(io, allocator, scope);
         return switch (subject_type.*) {
             .error_union => |error_union| error_union.payload,
+            .error_set, .err => self.handler.resolveType(io, allocator, scope),
             else => subject_type,
         };
     }
