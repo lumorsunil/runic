@@ -15,6 +15,12 @@ const invalid = ConfigError{ .Invalid = "port must be a number" }
 echo "catch:    ${missing catch "using defaults"}"
 echo "catch2:   ${invalid catch "using defaults"}"
 
+// `match` dispatches on the variant and captures the payload.
+match (invalid) {
+    ConfigError.Missing => { echo "config missing" },
+    ConfigError.Invalid => |reason| { echo "config invalid: ${reason}" },
+}
+
 // An error union holding an ok value: `if` is true and `|port|` binds it.
 const ok: ConfigError!String = "8080"
 if (ok) |port| {
@@ -30,9 +36,3 @@ echo "found:    ${present}"
 // `||` discards a command failure and uses the fallback.
 const fallback = echo "alpha beta" | grep "zzz" || "default value"
 echo "fallback: ${fallback}"
-
-// `match` dispatches on the variant and captures the payload.
-match (invalid) {
-    ConfigError.Missing => { echo "config missing" },
-    ConfigError.Invalid => |reason| { echo "config invalid: ${reason}" },
-}

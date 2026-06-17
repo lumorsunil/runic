@@ -1,0 +1,15 @@
+const E = error { A, B: String }
+
+// A match with a payload-capture case, then further error constructs in the
+// same scope (regression: this used to drift the stack counter and crash).
+const first = E{ .B = "first" }
+match (first) {
+    E.A => { echo "a" },
+    E.B => |m| { echo "match: ${m}" },
+}
+
+const ok: E!String = "value"
+if (ok) |v| { echo "if: ${v}" } else { echo "no" }
+
+const second = E{ .B = "second" }
+echo "construct: ${second}"

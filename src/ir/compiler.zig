@@ -4511,7 +4511,12 @@ pub const IRCompiler = struct {
 
         const body_result = try self.compileBlock(source, case.body);
         try self.set(source, .initRegister(.r2), stableResultSource(body_result));
-        self.currentFrame().rel_stack_counter = stack_base;
+        // Pop the payload/binding slots (the result is safe in r2) so the
+        // runtime stack matches the counter — a bare counter reset would leave
+        // the slots on the runtime stack and mis-address later code.
+        while (self.currentFrame().rel_stack_counter > stack_base) {
+            _ = try self.pop(source);
+        }
         return .fromLocation(ir.Location.initRegister(.r2).typed(body_result.typeExpr()));
     }
 
