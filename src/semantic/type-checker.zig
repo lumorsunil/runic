@@ -38,6 +38,7 @@ pub const TypeChecker = struct {
             DocumentNotParsed,
             DuplicateErrorVariant,
             ErrorNotInErrorSet,
+            NonExhaustiveMatch,
             FileTooBig,
             ForSourcesAndBindingsNeedToBeTheSameLength,
             IdentifierNotFound,
@@ -1229,7 +1230,9 @@ pub const TypeChecker = struct {
         match_expr: *ast.MatchExpr,
         error_set: ast.TypeExpr.ErrorSet,
     ) Error!void {
+        var has_wildcard = false;
         for (match_expr.cases) |case| {
+            if (case.pattern == .wildcard) has_wildcard = true;
             const body_scope = try scope.addChild(self.arena.allocator(), case.span);
 
             const variant: ?ast.TypeExpr.ErrorSet.Variant = switch (case.pattern) {
@@ -1291,6 +1294,32 @@ pub const TypeChecker = struct {
             }
 
             try self.runBlock(body_scope, @constCast(&case.body));
+        }
+
+        // Exhaustiveness: without a `_` case, every variant must be covered.
+        // (An inferred/open set has no concrete variants, so nothing to check.)
+        if (!has_wildcard) {
+            for (error_set.variants) |variant| {
+                var covered = false;
+                for (match_expr.cases) |case| {
+                    if (case.pattern == .path) {
+                        const segments = case.pattern.path.segments;
+                        if (std.mem.eql(u8, segments[segments.len - 1].name, variant.name.name)) {
+                            covered = true;
+                            break;
+                        }
+                    }
+                }
+                if (!covered) {
+                    try self.reportSpanError(
+                        match_expr.span,
+                        Error.NonExhaustiveMatch,
+                        .@"error",
+                        "match is not exhaustive: missing variant '{s}' (add it or a `_` case)",
+                        .{variant.name.name},
+                    );
+                }
+            }
         }
     }
 
