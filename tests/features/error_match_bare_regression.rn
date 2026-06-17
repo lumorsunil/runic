@@ -1,0 +1,11 @@
+const MyError = error {
+    UnknownError,
+    ErrorWithMessage: String,
+}
+
+// Paren-less subject + bare-expression case bodies (the spec syntax).
+const e = MyError{ .ErrorWithMessage = "boom" }
+match e {
+    MyError.UnknownError => echo "unknown",
+    MyError.ErrorWithMessage => |message| echo "msg: ${message}",
+}

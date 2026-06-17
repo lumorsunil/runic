@@ -16,9 +16,9 @@ echo "catch:    ${missing catch "using defaults"}"
 echo "catch2:   ${invalid catch "using defaults"}"
 
 // `match` dispatches on the variant and captures the payload.
-match (invalid) {
-    ConfigError.Missing => { echo "config missing" },
-    ConfigError.Invalid => |reason| { echo "config invalid: ${reason}" },
+match invalid {
+    ConfigError.Missing => echo "config missing",
+    ConfigError.Invalid => |reason| echo "config invalid: ${reason}",
 }
 
 // An error union holding an ok value: `if` is true and `|port|` binds it.

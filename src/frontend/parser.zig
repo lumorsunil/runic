@@ -1827,9 +1827,11 @@ pub const Parser = struct {
         defer breadcrumb.end();
 
         const match_tok = try self.expect(.kw_match);
-        _ = try self.expect(.l_paren);
+        // The subject parentheses are optional: `match (x) { … }` or `match x { … }`.
+        const has_paren = (try self.peekToken()).tag == .l_paren;
+        if (has_paren) _ = try self.expect(.l_paren);
         const subject = try self.parseExpression();
-        _ = try self.expect(.r_paren);
+        if (has_paren) _ = try self.expect(.r_paren);
         _ = try self.expect(.l_brace);
         self.skipNewlines();
 
@@ -1867,7 +1869,7 @@ pub const Parser = struct {
         const pattern = try self.parseMatchPattern();
         _ = try self.expect(.fat_arrow);
         const capture = try self.parseOptionalCaptureClause();
-        const body = try self.parseBlock();
+        const body = try self.parseMatchCaseBody();
 
         return .{
             .pattern = pattern,
@@ -1875,6 +1877,19 @@ pub const Parser = struct {
             .body = body,
             .span = pattern.span().endAt(body.span),
         };
+    }
+
+    /// A match case body is either a `{ … }` block or a bare expression (wrapped
+    /// into a single-statement block): `MyError.X => echo "…"`.
+    fn parseMatchCaseBody(self: *Self) Error!ast.Block {
+        if ((try self.peekToken()).tag == .l_brace) return self.parseBlock();
+
+        const expr = try self.parseExpression();
+        const stmt = try self.arena.allocator().create(ast.Statement);
+        stmt.* = .{ .expression = .{ .expression = expr, .span = expr.span() } };
+        const statements = try self.arena.allocator().alloc(*ast.Statement, 1);
+        statements[0] = stmt;
+        return ast.Block{ .statements = statements, .span = expr.span() };
     }
 
     fn parseMatchPattern(self: *Self) Error!ast.MatchPattern {
