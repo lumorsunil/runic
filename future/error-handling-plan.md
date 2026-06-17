@@ -224,14 +224,20 @@ Goal: dispatch on error variants, capturing payloads (spec lines 73-80).
 
 **Status / Notes:** ✅ Complete. **Deferred (backlog):** (a) **exhaustiveness checking** across the set (no-match falls through to runtime exit, as plain `match` does) — also limited by the open-set inference (item 3); (b) the spec's `match err { … }` uses **paren-less** subject + **bare-expression** case bodies, but the current `match` requires `match (err) { … => { … } }` (parens + block bodies) — a general `match`-syntax relaxation, tracked separately.
 
-### Phase 9 — Diagnostics, docs, polish
-- [ ] Good diagnostics: `catch` on non-error, unknown variant, payload type mismatch, non-exhaustive switch, `try` outside erroring fn.
-- [ ] Update `docs/features.md` with the error-handling surface.
-- [ ] Add `examples/` script demonstrating errors end-to-end.
-- [ ] LSP: hover/completion for error sets & variants (`src/lsp/`), if in scope.
-- [ ] Run full CI: `zig build run -- scripts/run_ci.rn`.
+### Phase 9 — Diagnostics, docs, polish ✅ COMPLETE
+- [x] Diagnostics in place: `catch`/`try` on a non-error, unknown variant (construction + match), payload type mismatch, unhandled error value, `try` outside an erroring fn. (Non-exhaustive `match` checking is deferred — backlog 13.)
+- [x] Rewrote `docs/features.md` "Errors as first-class types" + "Error-aware pipelines" to the **actual implemented** syntax (`const E = error {…}`, `E!T`/`!T`, `E.Variant` / `E{ .Variant = … }`, `catch`/`||`/`try`, `match (err) {…}`, command error unions) — the old sections were aspirational/incorrect.
+- [x] Added `examples/error_handling.rn` (runs clean): error sets, `catch`, `if (errorUnion) |v|`, command `catch`/`||`, `match` with payload capture.
+- [ ] LSP hover/completion for error sets & variants — **deferred** (separate subsystem; not required for the language surface).
+- [x] Full CI green: `zig build run -- scripts/run_ci.rn` (formatter, linter, unit tests, 83 CLI smoke scripts).
 
-**Status / Notes:** _not started_
+**Status / Notes:** ✅ Complete (LSP polish deferred). Exposed and documented backlog item 15 (stack-counter drift when sequencing capture-binding error constructs) — a real robustness bug to fix next.
+
+---
+
+## Overall status
+
+**Phases 1–9 COMPLETE.** The error-handling spec (`future/error-handling.md`) is implemented end-to-end and tested: error set declarations, error union types (`E!T`, inferred `!T`), value construction (payload-less + payloaded, runtime payloads), `catch`, `try`, `||`, `if (errorUnion)`, inferred error sets (open-set), `ExecutableError` + commands/pipelines as catchable error unions, and `match` on variants with payload capture. Enforcement requires errors be handled. Full CI green. Remaining work is the **Deferred / Follow-ups** backlog above (notably item 15, the sequencing stack-drift bug).
 
 ---
 
@@ -253,6 +259,7 @@ Niche or risky items intentionally deferred along the way, collected here so the
 12. **`.err` serialization across process/pipe boundaries** (D2): not implemented; needed if error values must cross a process boundary.
 13. **`match` exhaustiveness** (8): no exhaustiveness check on error matches (no-match falls through to a runtime exit, like plain `match`); also limited by open-set inference (item 3).
 14. **Paren-less `match` + bare-expression case bodies** (8): the spec writes `match err { MyError.X => echo "…" }`, but `match` requires `match (err) { MyError.X => { echo "…" } }` (parenthesized subject + block bodies). A general `match`-syntax relaxation.
+15. **⚠️ Stack-counter drift when *sequencing* error constructs** (8/9, higher priority): constructs that bind a capture push runtime slots that aren't popped — the compile-time counter restore (in `compileMatchCaseBody`, `compileIfCondition`'s error case) diverges from the runtime stack, so e.g. a `match` with a payload-capture case **followed by** an `if (errorUnion) |v|` in the same scope mis-addresses and crashes (`UnsupportedDereferenceValueType` / index-out-of-bounds). Each feature works in isolation and in the committed tests; the interaction is the bug. Proper fix: emit balancing `pop`s (or rework the ref/counter model) so the runtime stack matches the counter after a capture body — same discipline `compileIfElse` relies on. (The example `examples/error_handling.rn` is ordered to avoid this until fixed.)
 
 ---
 

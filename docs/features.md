@@ -78,62 +78,92 @@ echo "${nested}"
 
 ### Errors as first-class types
 
-Runic treats `error` the same way Zig does: it is a special type that can be declared as a simple enum when all variants are opaque or as a tagged union when each variant should carry structured data. Functions that can fail return `!T` (an error or a `T`), and callers use `try`/`catch` mechanics to branch on failure paths explicitly.
+Runic treats `error` like Zig: an error set is a type, declared with `const`, whose variants may be opaque or carry a typed payload.
 
 ```rn
-error NetworkError = enum { Timeout, ConnectionLost }
-error FileError = union {
-  NotFound: { path: Str },
-  PermissionDenied: { user: Str },
-}
-
-fn load_config() !Config {
-  return error.FileError.NotFound { path: "/etc/app.conf" }
-}
-
-const config = load_config() catch |err| {
-  echo "load failed: ${err}"
+const NetworkError = error { Timeout, ConnectionLost }
+const FileError = error {
+  NotFound,
+  PermissionDenied: String,   // a variant may carry a payload
 }
 ```
 
-**Result:** Error sets become inspectable data. Authors define lightweight enums for terse cases or unions when extra context matters, and callers can catch failures in a structured way instead of relying on string comparisons or shell exit-code conventions.
+A function that can fail returns an **error union** `E!T` (an error from set `E`, or a value of type `T`). The error set may also be left to inference with a leading `!T`:
+
+```rn
+fn Void parseLevel() FileError!Int { ... }   // FileError or Int
+fn Void mayFail() !String { ... }            // error set inferred from the body
+```
+
+**Constructing error values.** Use `Set.Variant` for a payload-less variant, and `Set{ .Variant = payload }` when it carries one:
+
+```rn
+const e1 = FileError.NotFound
+const e2 = FileError{ .PermissionDenied = "alice" }
+```
+
+**Result:** Error sets are inspectable data. Authors define terse opaque variants or attach a payload when extra context matters, and callers branch on failures structurally instead of comparing strings or shell exit codes.
+
+#### Handling errors: `catch`, `||`, and `try`
+
+`catch` consumes an error union: if it holds an error, the result is the handler; otherwise it is the unwrapped ok value. The handler may bind the error with `|err|`.
+
+```rn
+const level = parseLevel catch 0                    // default on error
+const level2 = parseLevel catch |err| { echo "bad: ${err}"; exit 1 }
+```
+
+`||` is shorthand for "catch and discard the error", yielding the fallback:
+
+```rn
+const name = lookupName || "anonymous"
+```
+
+`try` propagates the error out of the enclosing function (which must return an error union), otherwise evaluates to the ok value:
+
+```rn
+fn Void run() FileError!Int {
+  const cfg = try parseLevel    // on error, run returns it; otherwise cfg is the Int
+  yield cfg * 2
+}
+```
 
 #### Mandatory explicit handling
 
-Every emitted error must be handled explicitly—either propagated with `try` or resolved locally with `catch`—so the compiler guarantees nothing is silently dropped. The syntax mirrors Zig exactly, preserving muscle memory for developers already familiar with its error discipline.
+An error value that is produced but neither handled (`catch`/`||`) nor propagated (`try`/yielded from an error-returning function) is a compile error, so failures are never silently dropped:
 
 ```rn
-fn init() !Void {
-  try bootstrap_network(); // bubbles failures to the caller
+const E = error { Bad }
+E.Bad           // error: error is not handled; use catch (or || to discard) or propagate it
+E.Bad catch 0   // ok
+```
 
-  read_config("/etc/runic.conf") catch |err| {
-    if err == error.FileError.NotFound {
-      return err; // or transform before rethrowing
-    }
-    echo "Recovered from ${err}";
-  }
+#### Inspecting variants with `match`
+
+`match` dispatches on an error's variant and can capture the payload:
+
+```rn
+const FileError = error { NotFound, PermissionDenied: String }
+
+opError catch |err| match (err) {
+  FileError.NotFound => { echo "missing" },
+  FileError.PermissionDenied => |user| { echo "denied for ${user}" },
+  _ => { echo "other failure" },
 }
 ```
 
-**Result:** Callers must either continue propagating errors through `try` or consume them via `catch |err| { ... }`, making failure paths visible in every function signature and block just as they are in Zig.
+#### Commands are error unions
 
-#### Restricting function error sets
-
-If a function can only surface a subset of errors, constrain its return type so callers know exactly which failures to handle.
+Every executable call has the value view `ExecutableError!String`: a zero exit code yields the captured output, any other exit yields an `ExecutableError`. This makes command failures catchable like any other error (while `ExecutionResult` — `.exit_code`, `.wait`, etc. — remains available as the explicit handle):
 
 ```rn
-fn read_config(path: Str) FileError!Config {
-  if !file.exists(path) {
-    return error.FileError.NotFound { path }
-  }
-  try file.ensure_access(path) catch |err| {
-    return error.FileError.PermissionDenied { user: err.user }
-  }
-  return parse_config(path)
-}
+const ExecutableError = error { NonZeroExit: Int, Signalled: Int, SpawnFailed }
+
+const matched = grep "needle" "haystack.txt" catch "no match"
+const out = (build | tee "build.log") catch "build failed"
 ```
 
-**Result:** `read_config` advertises that it can only fail with the specific file-related variants, so callers that already handle `NetworkError` or other families know they never have to match on them when invoking this function.
+**Result:** Commands, user functions, and pipelines all surface failures through the same `catch`/`try`/`||`/`match` mechanics, instead of `set -e` and exit-code conventions.
 
 ### Exact-value `match`
 
@@ -303,17 +333,19 @@ echo "hello" 1>&2 2>"/dev/null"
 
 ## Error-aware pipelines
 
-Pipelines expose per-stage exit codes, enabling guarded chaining without relying on `set -e`.
+A pipeline's result is an error union (its final command's `ExecutableError!String`), so a trailing `catch`/`||` handles failure without relying on `set -e`:
 
 ```rn
-const status = (build | tee "build.log").status
-if !status.ok {
-  echo "Build failed at step ${status.failed_stage}"
+const log = build | tee "build.log" catch "build failed"
+if (build | tee "build.log") |output| {
+  echo "ok: ${output}"
+} else {
+  echo "build failed"
   exit 1
 }
 ```
 
-**Result:** The script reports which stage of the pipeline failed and aborts deterministically rather than silently ignoring intermediate errors.
+**Result:** Pipeline failures are caught at the boundary and handled deterministically rather than silently ignored. (`catch` binds looser than `|`, so it applies to the whole pipeline.)
 
 ## Module system and reuse
 

@@ -1,0 +1,38 @@
+// Run with: zig build run -- examples/error_handling.rn
+// Demonstrates Runic error handling: error sets, error unions, catch / || ,
+// if (errorUnion), catchable command failures, and match on variants.
+
+const ConfigError = error {
+    Missing,
+    Invalid: String,
+}
+
+// Construct error values: payload-less, and carrying a payload.
+const missing = ConfigError.Missing
+const invalid = ConfigError{ .Invalid = "port must be a number" }
+
+// `catch` supplies a default value when the subject is an error.
+echo "catch:    ${missing catch "using defaults"}"
+echo "catch2:   ${invalid catch "using defaults"}"
+
+// An error union holding an ok value: `if` is true and `|port|` binds it.
+const ok: ConfigError!String = "8080"
+if (ok) |port| {
+    echo "listening on ${port}"
+} else {
+    echo "no port configured"
+}
+
+// Commands are error unions too: a non-zero exit is a catchable ExecutableError.
+const present = echo "alpha beta" | grep "beta" catch "no match"
+echo "found:    ${present}"
+
+// `||` discards a command failure and uses the fallback.
+const fallback = echo "alpha beta" | grep "zzz" || "default value"
+echo "fallback: ${fallback}"
+
+// `match` dispatches on the variant and captures the payload.
+match (invalid) {
+    ConfigError.Missing => { echo "config missing" },
+    ConfigError.Invalid => |reason| { echo "config invalid: ${reason}" },
+}
