@@ -1,0 +1,5 @@
+const MyError = error { A }
+const e = MyError.A
+match (e) {
+    MyError.Nonexistent => { echo "nope" },
+}

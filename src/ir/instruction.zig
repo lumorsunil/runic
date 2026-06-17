@@ -109,6 +109,11 @@ pub const Instruction = struct {
         is_err: Neg,
         /// constructs an error value (boxing the runtime payload, if any)
         make_err: MakeErr,
+        /// sets result to a boolean: whether operand is an error value whose
+        /// set+variant match (used by `match` on error variants)
+        match_err: MatchErr,
+        /// extracts an error value's payload into result (void if none)
+        err_payload: Neg,
         /// declares a new ref (basically a labeled push)
         ref: []const u8,
         /// sets a Location to a Value from a Location
@@ -297,6 +302,14 @@ pub const Instruction = struct {
         set: []const u8,
         variant: []const u8,
         payload: ?ValueSource,
+        result: Location,
+    };
+
+    /// Tests whether `operand` is an error value with the given set + variant.
+    pub const MatchErr = struct {
+        operand: Location,
+        set: []const u8,
+        variant: []const u8,
         result: Location,
     };
 

@@ -1208,11 +1208,104 @@ pub const TypeChecker = struct {
         try self.runExpression(for_scope, for_expr.body);
     }
 
+    /// If `subject` is error-like, returns the error set being matched (the
+    /// union's set, or a bare error set); otherwise null.
+    fn matchErrorSet(self: *TypeChecker, scope: *Scope, subject: *ast.Expression) Error!?ast.TypeExpr.ErrorSet {
+        const raw = try self.resolveSubjectType(scope, subject) orelse return null;
+        const subject_type = self.unaliasType(raw);
+        return switch (subject_type.*) {
+            .error_set => |error_set| error_set,
+            .error_union => |error_union| blk: {
+                const set = self.unaliasType(error_union.err_set);
+                break :blk if (set.* == .error_set) set.error_set else null;
+            },
+            else => null,
+        };
+    }
+
+    fn runErrorMatch(
+        self: *TypeChecker,
+        scope: *Scope,
+        match_expr: *ast.MatchExpr,
+        error_set: ast.TypeExpr.ErrorSet,
+    ) Error!void {
+        for (match_expr.cases) |case| {
+            const body_scope = try scope.addChild(self.arena.allocator(), case.span);
+
+            const variant: ?ast.TypeExpr.ErrorSet.Variant = switch (case.pattern) {
+                .wildcard => null,
+                .path => |path| blk: {
+                    const variant_name = path.segments[path.segments.len - 1].name;
+                    const v = error_set.variant(variant_name) orelse {
+                        try self.reportSpanError(
+                            path.span,
+                            Error.ErrorNotInErrorSet,
+                            .@"error",
+                            "error set has no variant '{s}'",
+                            .{variant_name},
+                        );
+                        break :blk null;
+                    };
+                    break :blk v;
+                },
+                else => blk: {
+                    try self.reportSpanError(
+                        case.pattern.span(),
+                        Error.UnsupportedExpression,
+                        .@"error",
+                        "error match patterns must be Set.Variant or _",
+                        .{},
+                    );
+                    break :blk null;
+                },
+            };
+
+            if (case.capture) |capture| {
+                if (capture.bindings.len != 1) {
+                    try self.reportSpanError(
+                        capture.span,
+                        Error.BindingPatternNotSupported,
+                        .@"error",
+                        "match captures require exactly one binding",
+                        .{},
+                    );
+                } else if (variant) |v| {
+                    if (v.payload) |payload| {
+                        try self.runBindingPattern(
+                            body_scope,
+                            capture.bindings[0],
+                            try self.resolveTypeExpr(body_scope, payload),
+                            false,
+                            false,
+                        );
+                    } else {
+                        try self.reportSpanError(
+                            capture.span,
+                            Error.TypeMismatch,
+                            .@"error",
+                            "error variant '{s}' has no payload to capture",
+                            .{v.name.name},
+                        );
+                    }
+                }
+            }
+
+            try self.runBlock(body_scope, @constCast(&case.body));
+        }
+    }
+
     pub fn runMatchExpr(self: *TypeChecker, scope: *Scope, match_expr: *ast.MatchExpr) Error!void {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, match_expr.span);
 
         try self.runExpression(scope, match_expr.subject);
+
+        // Matching on an error value: cases are `Set.Variant` patterns and may
+        // capture the variant's payload.
+        if (try self.matchErrorSet(scope, match_expr.subject)) |error_set| {
+            try self.runErrorMatch(scope, match_expr, error_set);
+            return;
+        }
 
         for (match_expr.cases) |case| {
             if (case.capture != null) {
@@ -1411,7 +1504,7 @@ pub const TypeChecker = struct {
         try self.logTypeCheckTrace(@src().fn_name, catch_expr.span);
 
         try self.runExpression(scope, catch_expr.subject);
-        const subject_raw = try self.resolveExprType(scope, catch_expr.subject);
+        const subject_raw = try self.resolveSubjectType(scope, catch_expr.subject);
         const subject_type = if (subject_raw) |t| self.unaliasType(t) else null;
 
         // The handler runs in a child scope so the optional `|err|` capture is
@@ -1458,7 +1551,7 @@ pub const TypeChecker = struct {
         try self.logTypeCheckTrace(@src().fn_name, try_expr.span);
 
         try self.runExpression(scope, try_expr.subject);
-        const subject_raw = try self.resolveExprType(scope, try_expr.subject);
+        const subject_raw = try self.resolveSubjectType(scope, try_expr.subject);
         const subject_type = if (subject_raw) |t| self.unaliasType(t) else null;
 
         // The subject must be error-like; the error case is propagated out of
@@ -1475,6 +1568,22 @@ pub const TypeChecker = struct {
                 .{st},
             ),
         };
+    }
+
+    /// Resolves the type of a `catch`/`try`/`match` subject, seeing through the
+    /// zero-arg call wrapper a bare identifier parses into — but only when the
+    /// identifier is error-like, so a zero-arg command (`ls catch x`) still
+    /// resolves to its `execution` type.
+    fn resolveSubjectType(self: *TypeChecker, scope: *Scope, subject: *ast.Expression) Error!?*const ast.TypeExpr {
+        if (subject.* == .call and subject.call.arguments.len == 0 and subject.call.callee.* == .identifier) {
+            if (try self.resolveExprType(scope, subject.call.callee)) |callee_type| {
+                switch (self.unaliasType(callee_type).*) {
+                    .error_union, .error_set, .err => return callee_type,
+                    else => {},
+                }
+            }
+        }
+        return self.resolveExprType(scope, subject);
     }
 
     /// The error set type bound to a `catch |err|` capture: the union's error

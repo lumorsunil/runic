@@ -1266,6 +1266,23 @@ pub const IREvaluator = struct {
                 } });
                 return .cont;
             },
+            .match_err => |match_err| {
+                const operand = try self.resolveLocation(thread, match_err.operand);
+                const matches = operand == .err and
+                    std.mem.eql(u8, operand.err.set, match_err.set) and
+                    std.mem.eql(u8, operand.err.variant, match_err.variant);
+                try self.setLocation(thread, match_err.result, .fromBoolean(matches));
+                return .cont;
+            },
+            .err_payload => |err_payload| {
+                const operand = try self.resolveLocation(thread, err_payload.operand);
+                const payload: ir.Value = if (operand == .err and operand.err.payload != null)
+                    operand.err.payload.?.*
+                else
+                    .void;
+                try self.setLocation(thread, err_payload.result, payload);
+                return .cont;
+            },
             .exec => |exec| {
                 _ = exec;
 

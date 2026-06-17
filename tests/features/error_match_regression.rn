@@ -1,0 +1,25 @@
+const MyError = error {
+    UnknownError,
+    ErrorWithMessage: String,
+}
+
+// Dispatch on a payload-less variant.
+const a = MyError.UnknownError
+match (a) {
+    MyError.UnknownError => { echo "matched: unknown" },
+    MyError.ErrorWithMessage => |m| { echo "matched: ${m}" },
+}
+
+// Dispatch on a payloaded variant, capturing the payload.
+const b = MyError{ .ErrorWithMessage = "boom" }
+match (b) {
+    MyError.UnknownError => { echo "matched: unknown" },
+    MyError.ErrorWithMessage => |m| { echo "matched: ${m}" },
+}
+
+// Match the error captured by `catch`, with a wildcard fallback.
+const v: MyError!Void = MyError.UnknownError
+v catch |err| match (err) {
+    MyError.UnknownError => { echo "caught: unknown" },
+    _ => { echo "caught: other" },
+}

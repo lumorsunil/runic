@@ -4463,6 +4463,58 @@ pub const IRCompiler = struct {
         } });
     }
 
+    /// Compiles a match case body, binding the optional error-payload capture
+    /// (`Set.Variant => |payload| ...`) in a fresh scope.
+    fn compileMatchCaseBody(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        case: ast.MatchCase,
+        subject_ref: ir.Location,
+    ) Error!Result {
+        const capture = case.capture orelse return self.compileBlock(source, case.body);
+
+        // The payload binding pushes transient slots; carry the body result in
+        // a register and restore the stack counter so they don't accumulate
+        // (mirrors `compileIfBranchExpression`/`compileIfElse`).
+        const stack_base = self.currentFrame().rel_stack_counter;
+
+        try self.scopes.push(self.allocator, .lexical);
+        defer self.scopes.pop();
+
+        const payload_ref = try self.newRef(source, "match_payload");
+        try self.addInstruction(.init(.from(source), .{ .err_payload = .{
+            .operand = subject_ref.dereference(),
+            .result = payload_ref,
+        } }));
+
+        switch (capture.bindings[0].*) {
+            .discard => {},
+            .identifier => |identifier| try self.compileIdentifierBinding(
+                source,
+                identifier,
+                .from(payload_ref.dereference()),
+                null,
+                false,
+                .normal,
+            ),
+            else => {
+                try self.reportSourceError(
+                    source,
+                    Error.UnsupportedBindingPattern,
+                    .@"error",
+                    "match capture binding pattern not yet supported",
+                    .{},
+                );
+                return .fromValue(.void);
+            },
+        }
+
+        const body_result = try self.compileBlock(source, case.body);
+        try self.set(source, .initRegister(.r2), stableResultSource(body_result));
+        self.currentFrame().rel_stack_counter = stack_base;
+        return .fromLocation(ir.Location.initRegister(.r2).typed(body_result.typeExpr()));
+    }
+
     fn compileMatchPredicate(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -4543,21 +4595,16 @@ pub const IRCompiler = struct {
         var has_wildcard = false;
 
         for (match_expr.cases, 0..) |case, i| {
-            if (case.capture != null) {
-                try self.reportSourceError(
-                    source,
-                    Error.UnsupportedExpression,
-                    .@"error",
-                    "match captures are not yet supported",
-                    .{},
-                );
-                return .fromValue(.void);
-            }
-
             const next_case_addr = try self.newLabel(
                 try std.fmt.allocPrint(self.allocator, "match_case_next_{}", .{i}),
                 .unknown,
             );
+
+            // `Set.Variant` where `Set` is a known error set matches an error value.
+            const is_error_variant = switch (case.pattern) {
+                .path => |path| path.segments.len >= 2 and self.error_sets.get(path.segments[0].name) != null,
+                else => false,
+            };
 
             switch (case.pattern) {
                 .wildcard => {
@@ -4565,24 +4612,53 @@ pub const IRCompiler = struct {
                 },
                 .literal => |literal| {
                     const pattern = try self.compileLiteral(source, literal);
-                    const is_match_ref = try self.newRef(source, "match_case_is_match");
+                    // Use a register for the transient test result so the case
+                    // loop pushes no stack slots (which would drift the counter).
                     try self.cmp(
                         source,
                         .equal,
                         .from(subject_ref.dereference()),
                         pattern.source,
-                        is_match_ref,
+                        .initRegister(.r2),
                     );
-                    try self.jmp(source, .fromLocation(is_match_ref.dereference()), false, next_case_addr);
+                    try self.jmp(source, .fromLocation(.initRegister(.r2)), false, next_case_addr);
                 },
-                .binding, .path => {
+                .path => |path| {
+                    if (is_error_variant) {
+                        try self.addInstruction(.init(.from(source), .{ .match_err = .{
+                            .operand = subject_ref.dereference(),
+                            .set = path.segments[0].name,
+                            .variant = path.segments[path.segments.len - 1].name,
+                            .result = .initRegister(.r2),
+                        } }));
+                        try self.jmp(source, .fromLocation(.initRegister(.r2)), false, next_case_addr);
+                    } else {
+                        const predicate = try self.compileMatchPredicate(source, case.pattern, subject_identifier);
+                        try self.jmp(source, predicate, false, next_case_addr);
+                    }
+                },
+                .binding => {
                     const predicate = try self.compileMatchPredicate(source, case.pattern, subject_identifier);
                     try self.jmp(source, predicate, false, next_case_addr);
                 },
                 else => unreachable,
             }
 
-            const case_result = try self.compileBlock(source, case.body);
+            // A payload capture (`|value|`) is only supported on error variants.
+            if (case.capture) |capture| {
+                if (!is_error_variant or capture.bindings.len != 1) {
+                    try self.reportSourceError(
+                        source,
+                        Error.UnsupportedExpression,
+                        .@"error",
+                        "match captures are only supported for error variants with a single binding",
+                        .{},
+                    );
+                    return .fromValue(.void);
+                }
+            }
+
+            const case_result = try self.compileMatchCaseBody(source, case, subject_ref);
             try self.set(source, result_ref, stableResultSource(case_result));
             result_type = self.mergeResultTypes(result_type, case_result);
             try self.jmp(source, null, false, after_addr);
@@ -6634,7 +6710,7 @@ pub const IRCompiler = struct {
     fn instructionSetIsCountedLoopSafe(self: *IRCompiler, instr_set: usize) bool {
         for (self.instruction_sets.items[instr_set].instructions.items) |instr| {
             switch (instr.type) {
-                .comment, .set, .ath, .cmp, .neg, .is_err, .make_err, .get_env, .set_env, .simple_exec => {},
+                .comment, .set, .ath, .cmp, .neg, .is_err, .make_err, .match_err, .err_payload, .get_env, .set_env, .simple_exec => {},
                 else => return false,
             }
         }

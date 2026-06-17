@@ -215,15 +215,14 @@ This phase was redesigned with the user (2026-06-16) into something larger and m
 
 **Status / Notes:** ✅ **Phase 7 COMPLETE** (7a–7d). Errors short-circuit to the nearest handler; handling is enforced; `ExecutableError` builtin; commands carry the `ExecutableError!String` value view (binding, direct `catch`/`try`/`||`, pipelines) while `ExecutionResult` remains the explicit handle; `if`/`||` work as ok-vs-error; runtime error payloads. Merged `error-7c` → `error` (ff). Deferred niche items noted per sub-phase.
 
-### Phase 8 — Switch/match on error values with payload capture
+### Phase 8 — match on error values with payload capture ✅ COMPLETE
 Goal: dispatch on error variants, capturing payloads (spec lines 73-80).
-- [ ] Extend `match` to match error-set variant paths `MyError.Variant` (D1 resolved: `match`, not `switch`).
-- [ ] Support payload capture in a case: `MyError.ErrorWithMessage => |message| ...`.
-- [ ] Exhaustiveness checking across the error set.
-- [ ] Compile variant test + payload extraction (reuse Phase 3 representation).
-- [ ] Test: full `catch |err| match err { ... }` example.
+- [x] `match` matches error-set variant paths `MyError.Variant`: when the subject is error-like (`matchErrorSet` detects it, seeing through the zero-arg bare-call wrapper via `resolveSubjectType`), each `.path` case is a variant pattern. Compiler emits a new `match_err` instruction (tests set+variant); type-checker `runErrorMatch` validates the variant exists.
+- [x] Payload capture `MyError.ErrorWithMessage => |message| ...`: new `err_payload` instruction extracts the payload; `compileMatchCaseBody` binds it in a fresh scope; `runErrorMatch` binds the capture to the variant's payload type. Wildcard `_` supported.
+- [x] Compile variant test + payload extraction: `match_err` / `err_payload` instructions (name-based, per D2). Per-case test results use a **register** (not a stack ref) so the case loop pushes no transient slots — fixed a stack-counter drift that crashed/mis-addressed subsequent statements; `compileMatchCaseBody` restores the counter after a capture body (carried in r2).
+- [x] Test: `error_match_regression` (payload-less, payload capture, `catch |err| match (err)` + wildcard) and `error_match_unknown_variant` (diagnostic). Full suite green (83 smoke + 24 diagnostic).
 
-**Status / Notes:** _not started_
+**Status / Notes:** ✅ Complete. **Deferred (backlog):** (a) **exhaustiveness checking** across the set (no-match falls through to runtime exit, as plain `match` does) — also limited by the open-set inference (item 3); (b) the spec's `match err { … }` uses **paren-less** subject + **bare-expression** case bodies, but the current `match` requires `match (err) { … => { … } }` (parens + block bodies) — a general `match`-syntax relaxation, tracked separately.
 
 ### Phase 9 — Diagnostics, docs, polish
 - [ ] Good diagnostics: `catch` on non-error, unknown variant, payload type mismatch, non-exhaustive switch, `try` outside erroring fn.
@@ -252,6 +251,8 @@ Niche or risky items intentionally deferred along the way, collected here so the
 10. **Variant payload type validation** (1): `runTypeIdentifier` is a no-op codebase-wide, so an unknown payload type name in a variant isn't caught; variant payloads aren't alias-resolved (`resolveTypeExpr` returns `error_set` via its `else`).
 11. **Dead `Statement.error_decl` / `EnumBody` / `UnionBody` AST nodes** (1): superseded by the type-expr `error_set`; candidates for removal (Phase 9).
 12. **`.err` serialization across process/pipe boundaries** (D2): not implemented; needed if error values must cross a process boundary.
+13. **`match` exhaustiveness** (8): no exhaustiveness check on error matches (no-match falls through to a runtime exit, like plain `match`); also limited by open-set inference (item 3).
+14. **Paren-less `match` + bare-expression case bodies** (8): the spec writes `match err { MyError.X => echo "…" }`, but `match` requires `match (err) { MyError.X => { echo "…" } }` (parenthesized subject + block bodies). A general `match`-syntax relaxation.
 
 ---
 
