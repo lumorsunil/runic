@@ -2491,6 +2491,10 @@ pub const IRCompiler = struct {
         // Error path: run the handler (with the optional `|err|` capture).
         try self.setLabel(handler_addr.local_addr.label, .abs);
         const handler = try self.compileCatchHandler(source, catch_expr, subject_ref);
+        // Drain a forked handler (e.g. `catch |err| echo "…"`) here: the result
+        // is typed as the payload, so the statement-level wait would miss it and
+        // the handler's capture fork could race program exit.
+        if (isWaitable(handler)) |loc| try self.wait(source, loc);
         try self.set(source, result, stableResultSource(handler));
 
         try self.setLabel(after_addr.local_addr.label, .abs);
