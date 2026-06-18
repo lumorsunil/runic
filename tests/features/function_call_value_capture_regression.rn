@@ -1,0 +1,15 @@
+# A zero-arg function call used as a value must capture the function's output.
+# A bare identifier parses as a zero-arg call, so `const a = greeting` runs the
+# function and binds its yielded output. Previously this bound the raw thread
+# handle instead, crashing on use (UnsupportedDereferenceValueType).
+fn Void greeting() String { yield "hello" }
+
+const a = greeting
+echo "a=${a}"
+
+# Inline in an interpolation, too.
+echo "inline=${greeting}"
+
+# A second independent capture of the same function.
+const b = greeting
+echo "b=${b}"

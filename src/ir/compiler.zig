@@ -1557,6 +1557,18 @@ pub const IRCompiler = struct {
         };
     }
 
+    /// Whether a compiled operand is (or may hold) an error value. Used by the
+    /// logical-or lowering to choose error-discard semantics over the exit-code
+    /// path — a `jmp`/`log` on an error value would misread it as an exit code.
+    fn resultIsErrorLike(result: Result) bool {
+        if (result.source.isValueTag(.err)) return true;
+        const result_type = result.typeExpr() orelse return false;
+        return switch (result_type) {
+            .error_union, .error_set, .err => true,
+            else => false,
+        };
+    }
+
     fn compileReturn(
         self: *IRCompiler,
         source: *ast.Statement,
@@ -6037,6 +6049,26 @@ pub const IRCompiler = struct {
                 if (left.source.isRegister(.r) and left.isType(thread_type)) {
                     left = try self.compileResultSaveR(source, left);
                 }
+
+                // `errorUnion || fallback` discards the error: run the fallback
+                // only when left holds an error. A plain exit-code jmp here would
+                // misread the error value as an exit code and crash the runner.
+                if (binary.op == .logical_or and resultIsErrorLike(left)) {
+                    const subject_ref = try self.newRef(source, "logical_or_subject");
+                    try self.set(source, subject_ref, stableResultSource(left));
+                    const is_err_ref = try self.newRef(source, "logical_or_is_err");
+                    try self.addInstruction(.init(.from(source), .{ .is_err = .{
+                        .operand = subject_ref.dereference(),
+                        .result = is_err_ref,
+                    } }));
+                    const after_addr = try self.newLabel("logical_or_after", .unknown);
+                    // Not an error: nothing to do (statement result is discarded).
+                    try self.jmp(source, try .from(is_err_ref.dereference()), false, after_addr);
+                    _ = try self.compileLogicalRightStatement(source, binary.right);
+                    try self.setLabel(after_addr.local_addr.label, .abs);
+                    return .fromValue(.void);
+                }
+
                 try self.finalizeStatementResult(source, left);
 
                 // sequence (;) always runs right — no conditional jump needed
@@ -6084,6 +6116,31 @@ pub const IRCompiler = struct {
                     // leave the outer pipes empty.
                     const result_ref = try self.newRef(source, "logical_result");
                     const left = try self.compileExpression(binary.left);
+
+                    // `errorUnion || fallback` discards the error. We are already
+                    // inside a capture fork, so compile the fallback directly
+                    // (no nested capture) rather than via the exit-code jmp, which
+                    // would misread the error value as an exit code and crash.
+                    if (binary.op == .logical_or and resultIsErrorLike(left)) {
+                        try self.set(source, result_ref, stableResultSource(left));
+                        const is_err_ref = try self.newRef(source, "logical_or_is_err");
+                        try self.addInstruction(.init(.from(source), .{ .is_err = .{
+                            .operand = result_ref.dereference(),
+                            .result = is_err_ref,
+                        } }));
+                        const after_addr = try self.newLabel("logical_or_after", .unknown);
+                        try self.jmp(source, try .from(is_err_ref.dereference()), false, after_addr);
+                        const right = try self.compileExpression(binary.right);
+                        try self.finalizeStatementResult(source, right);
+                        try self.set(source, result_ref, stableResultSource(right));
+                        try self.setLabel(after_addr.local_addr.label, .abs);
+                        const result_type: ?ast.TypeExpr = if (left.typeExpr()) |left_type| switch (left_type) {
+                            .error_union => |error_union| error_union.payload.*,
+                            else => right.typeExpr(),
+                        } else right.typeExpr();
+                        return .from(result_ref.dereference().typed(result_type));
+                    }
+
                     // Wait for left so we can check its exit code (for &&/||)
                     try self.finalizeStatementResult(source, left);
                     try self.set(source, result_ref, stableResultSource(left));
@@ -6190,13 +6247,7 @@ pub const IRCompiler = struct {
         const left = try self.compileExpression(binary.left);
 
         const left_type_opt = left.typeExpr();
-        const is_error_like = left.source.isValueTag(.err) or
-            (left_type_opt != null and switch (left_type_opt.?) {
-                .error_union, .error_set, .err => true,
-                else => false,
-            });
-
-        if (is_error_like) {
+        if (resultIsErrorLike(left)) {
             const result_ref = try self.newRef(source, "logical_or_result");
             try self.set(source, result_ref, stableResultSource(left));
 
@@ -6771,7 +6822,12 @@ pub const IRCompiler = struct {
                 if (std.mem.eql(u8, identifier.name, "cd") and self.lookup(identifier.name, .{ .shallow = false }) == null) {
                     break :blk false;
                 }
-                break :blk self.lookup(identifier.name, .{ .shallow = false }) == null;
+                // A bare identifier parses as a zero-arg call. An unknown name is
+                // an external command whose output must be captured. A known
+                // *function* call also produces output to capture in a value
+                // context; a known *variable* read must NOT be captured.
+                const binding = self.lookup(identifier.name, .{ .shallow = false }) orelse break :blk true;
+                break :blk binding.result.isFunctionRef();
             },
             else => true,
         };

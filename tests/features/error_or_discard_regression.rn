@@ -13,3 +13,12 @@ echo "b=${b}"
 const bad: E!String = E.Bad
 const c = bad || "recovered"
 echo "c=${c}"
+
+// Statement-level `||` with a command fallback. An error runs the command;
+// previously the runner crashed reading the error value as an exit code.
+const d: E!String = E.Bad
+d || echo "ran-on-error"
+
+// An ok value at statement level does NOT run the command fallback.
+const e: E!String = "kept"
+e || echo "should-not-run"
