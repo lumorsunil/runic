@@ -27,6 +27,26 @@ pub const TypeChecker = struct {
     /// no stdout type, so its yields are unconstrained.
     stdout_type_stack: std.ArrayListUnmanaged(?*const ast.TypeExpr) = .empty,
 
+    /// Concrete variants inferred for each leading-`!T` (inferred) error set,
+    /// keyed by the placeholder `error_set` node (shared by pointer between the
+    /// AST and every resolved view of it). Populated while a function body is
+    /// walked; read by `matchErrorSet` so exhaustiveness and callers see the
+    /// real set. Lives in the type-checker arena and is rebuilt each pass, so
+    /// no AST mutation occurs (keeps the cached LSP AST safe across re-checks).
+    inferred_error_sets: std.AutoHashMapUnmanaged(*const ast.TypeExpr, []const ast.TypeExpr.ErrorSet.Variant) = .empty,
+    /// Stack of in-progress inferred-error collectors, one per enclosing
+    /// function. A null entry means the enclosing function's return is not an
+    /// inferred error union, so there is nothing to collect.
+    inferred_collector_stack: std.ArrayListUnmanaged(?*InferredErrorCollector) = .empty,
+
+    /// Accumulates the error variants a single inferred-error function body can
+    /// produce (yielded error values + `try` propagation), deduped by name.
+    pub const InferredErrorCollector = struct {
+        /// The inferred `error_set` placeholder node this collector populates.
+        key: *const ast.TypeExpr,
+        variants: std.ArrayListUnmanaged(ast.TypeExpr.ErrorSet.Variant) = .empty,
+    };
+
     pub const Error = Scope.Error ||
         std.Io.File.OpenError ||
         std.Io.File.Reader.Error ||
@@ -526,7 +546,12 @@ pub const TypeChecker = struct {
         // or an error value both satisfy `E!T`.
         const declared_unaliased = self.unaliasType(declared_stdout);
         if (declared_unaliased.* == .error_union and
-            self.yieldCoercesToErrorUnion(resolved, declared_unaliased.error_union)) return;
+            self.yieldCoercesToErrorUnion(resolved, declared_unaliased.error_union))
+        {
+            // For an inferred set, record any error variants this yield produces.
+            try self.collectInferredFromType(resolved);
+            return;
+        }
 
         try self.reportSpanError(
             yield_stmt.span,
@@ -566,6 +591,60 @@ pub const TypeChecker = struct {
     /// types); its members are derived from the function body rather than written.
     fn isInferredErrorSet(error_set: ast.TypeExpr.ErrorSet) bool {
         return error_set.variants.len == 0;
+    }
+
+    /// The active inferred-error collector for the innermost enclosing function,
+    /// or null when that function has no inferred error union return.
+    fn activeInferredCollector(self: *TypeChecker) ?*InferredErrorCollector {
+        if (self.inferred_collector_stack.items.len == 0) return null;
+        return self.inferred_collector_stack.items[self.inferred_collector_stack.items.len - 1];
+    }
+
+    /// Records one error variant on the active collector, deduped by name.
+    fn collectInferredVariant(
+        self: *TypeChecker,
+        variant: ast.TypeExpr.ErrorSet.Variant,
+    ) Error!void {
+        const collector = self.activeInferredCollector() orelse return;
+        for (collector.variants.items) |existing| {
+            if (std.mem.eql(u8, existing.name.name, variant.name.name)) return;
+        }
+        try collector.variants.append(self.arena.allocator(), variant);
+    }
+
+    /// Records every variant reachable from a resolved error-like type (an error
+    /// set, or the error set of an error union) onto the active collector. A
+    /// non-error type (e.g. an ok payload value, or a command `execution`) is a
+    /// no-op, so this is safe to call on any yielded / propagated type.
+    fn collectInferredFromType(self: *TypeChecker, t: *const ast.TypeExpr) Error!void {
+        if (self.activeInferredCollector() == null) return;
+        const unaliased = self.unaliasType(t);
+        switch (unaliased.*) {
+            .error_set => |error_set| for (error_set.variants) |variant| {
+                try self.collectInferredVariant(variant);
+            },
+            .error_union => |error_union| {
+                const set = self.unaliasType(error_union.err_set);
+                if (set.* == .error_set) for (set.error_set.variants) |variant| {
+                    try self.collectInferredVariant(variant);
+                };
+            },
+            else => {},
+        }
+    }
+
+    /// Resolves an error-set node to its concrete variants, substituting the
+    /// inferred set collected from a function body when the node is an inferred
+    /// (`!T`) placeholder. Returns null when the node is not an error set.
+    fn resolveInferredErrorSet(self: *TypeChecker, set_node: *const ast.TypeExpr) ?ast.TypeExpr.ErrorSet {
+        const set = self.unaliasType(set_node);
+        if (set.* != .error_set) return null;
+        if (isInferredErrorSet(set.error_set)) {
+            if (self.inferred_error_sets.get(set_node)) |variants| {
+                return .{ .variants = variants, .span = set.error_set.span };
+            }
+        }
+        return set.error_set;
     }
 
     fn runExit(self: *TypeChecker, scope: *Scope, exit_stmt: *ast.ExitStmt) Error!void {
@@ -819,14 +898,39 @@ pub const TypeChecker = struct {
         // Make the declared stdout type visible to every `yield` in the body
         // (including yields nested in loops/blocks/matches) via the stack. Each
         // `runYield` validates against the top entry in the scope it runs in.
-        try self.stdout_type_stack.append(
-            self.arena.allocator(),
-            if (fn_decl.return_type) |return_type|
-                try self.resolveTypeExpr(fn_scope, return_type)
-            else
-                null,
-        );
+        const resolved_return: ?*const ast.TypeExpr = if (fn_decl.return_type) |return_type|
+            try self.resolveTypeExpr(fn_scope, return_type)
+        else
+            null;
+        try self.stdout_type_stack.append(self.arena.allocator(), resolved_return);
         defer _ = self.stdout_type_stack.pop();
+
+        // If the return type is a leading-`!T` (inferred) error union, set up a
+        // collector so the body's yielded/propagated errors become the concrete
+        // set. Keyed by the placeholder node (shared by pointer with callers'
+        // resolved views), finalized into `inferred_error_sets` after the walk.
+        const inferred_collector: ?*InferredErrorCollector = blk: {
+            const rr = resolved_return orelse break :blk null;
+            const unaliased = self.unaliasType(rr);
+            if (unaliased.* != .error_union) break :blk null;
+            const set_node = unaliased.error_union.err_set;
+            const set = self.unaliasType(set_node);
+            if (set.* != .error_set or !isInferredErrorSet(set.error_set)) break :blk null;
+            const collector = try self.arena.allocator().create(InferredErrorCollector);
+            collector.* = .{ .key = set_node };
+            break :blk collector;
+        };
+        try self.inferred_collector_stack.append(self.arena.allocator(), inferred_collector);
+        defer {
+            _ = self.inferred_collector_stack.pop();
+            if (inferred_collector) |collector| {
+                self.inferred_error_sets.put(
+                    self.arena.allocator(),
+                    collector.key,
+                    collector.variants.items,
+                ) catch {};
+            }
+        }
 
         // Run the body in a scope we keep a handle to. For a block body, run its
         // statements directly in `body_scope` instead of letting `runExpression`
@@ -1215,11 +1319,8 @@ pub const TypeChecker = struct {
         const raw = try self.resolveSubjectType(scope, subject) orelse return null;
         const subject_type = self.unaliasType(raw);
         return switch (subject_type.*) {
-            .error_set => |error_set| error_set,
-            .error_union => |error_union| blk: {
-                const set = self.unaliasType(error_union.err_set);
-                break :blk if (set.* == .error_set) set.error_set else null;
-            },
+            .error_set => self.resolveInferredErrorSet(subject_type),
+            .error_union => |error_union| self.resolveInferredErrorSet(error_union.err_set),
             else => null,
         };
     }
@@ -1587,16 +1688,62 @@ pub const TypeChecker = struct {
         // the enclosing function. (Validating that the enclosing function's
         // error set accepts the propagated error is deferred to Phase 6.) A
         // command (`execution`) is accepted as `ExecutableError!String`.
-        if (subject_type) |st| switch (st.*) {
-            .error_union, .error_set, .err, .failed, .execution => {},
-            else => try self.reportSpanError(
-                try_expr.subject.span(),
-                Error.TypeMismatch,
-                .@"error",
-                "try requires an error union or error value, found {f}",
-                .{st},
-            ),
+        if (subject_type) |st| {
+            // `try` re-raises the subject's errors out of the enclosing
+            // function, so they belong to its inferred set (if any).
+            try self.collectInferredFromType(st);
+            switch (st.*) {
+                .error_union, .error_set => try self.validateTryPropagation(try_expr, st),
+                .err, .failed, .execution => {},
+                else => try self.reportSpanError(
+                    try_expr.subject.span(),
+                    Error.TypeMismatch,
+                    .@"error",
+                    "try requires an error union or error value, found {f}",
+                    .{st},
+                ),
+            }
+        }
+    }
+
+    /// Verifies the enclosing function's declared error set is a superset of the
+    /// error set `try` propagates: every variant the subject can raise must be a
+    /// member, else propagating it would escape the declared type. Skipped when
+    /// the function declares no concrete error union (an inferred `!T` set is
+    /// collected instead, and a top-level `try` has no enclosing set to check).
+    fn validateTryPropagation(
+        self: *TypeChecker,
+        try_expr: *ast.TryExpr,
+        subject_type: *const ast.TypeExpr,
+    ) Error!void {
+        const propagated_node: *const ast.TypeExpr = switch (subject_type.*) {
+            .error_union => |error_union| error_union.err_set,
+            .error_set => subject_type,
+            else => return,
         };
+        const propagated = self.resolveInferredErrorSet(propagated_node) orelse return;
+
+        if (self.stdout_type_stack.items.len == 0) return;
+        const declared_stdout = self.stdout_type_stack.items[self.stdout_type_stack.items.len - 1] orelse return;
+        const declared = self.unaliasType(declared_stdout);
+        if (declared.* != .error_union) return;
+        const declared_set = self.unaliasType(declared.error_union.err_set);
+        if (declared_set.* != .error_set) return;
+        // An inferred (`!T`) declared set collects what the body raises rather
+        // than constraining it, so there is nothing to enforce here.
+        if (isInferredErrorSet(declared_set.error_set)) return;
+
+        for (propagated.variants) |variant| {
+            if (declared_set.error_set.variant(variant.name.name) == null) {
+                try self.reportSpanError(
+                    try_expr.subject.span(),
+                    Error.ErrorNotInErrorSet,
+                    .@"error",
+                    "try propagates error '{s}', which is not in the enclosing function's error set {f}",
+                    .{ variant.name.name, declared_set },
+                );
+            }
+        }
     }
 
     /// Resolves the type of a `catch`/`try`/`match` subject, seeing through the

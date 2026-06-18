@@ -1,0 +1,11 @@
+const E = error { Bad }
+const F = error { Other }
+
+// `try x` propagates F's errors, but the enclosing function only declares E.
+// Propagating `Other` would escape the declared error set, so this is an error.
+fn Void f() E!String {
+    const x: F!String = F.Other
+    yield "${try x}"
+}
+
+f

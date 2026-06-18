@@ -1,0 +1,8 @@
+[error]: tests/diagnostics/error_inferred_match_non_exhaustive.rn:11:1: match is not exhaustive: missing variant 'Worse' (add it or a `_` case)
+   9:
+  10:const r = mayFail()
+  11:match r {
+  12:    E.Bad => echo "bad"
+  13:}
+  14:
+
