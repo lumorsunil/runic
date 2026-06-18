@@ -1570,7 +1570,6 @@ pub const Statement = union(enum) {
     binding_decl: BindingDecl,
     expression: ExpressionStmt,
 
-    error_decl: ErrorDecl,
     return_stmt: ReturnStmt,
     exit_stmt: ExitStmt,
     yield_stmt: YieldStmt,
@@ -1581,7 +1580,6 @@ pub const Statement = union(enum) {
         return switch (self) {
             .type_binding_decl => |decl| decl.span,
             .binding_decl => |decl| decl.span,
-            .error_decl => |err| err.span,
             .return_stmt => |ret| ret.span,
             .exit_stmt => |exit_stmt| exit_stmt.span,
             .yield_stmt => |yield_stmt| yield_stmt.span,
@@ -1744,38 +1742,6 @@ pub const BuiltinExpr = struct {
     ) semantic.Scope.Error!?*const TypeExpr {
         return null;
     }
-};
-
-pub const ErrorDecl = struct {
-    name: Identifier,
-    definition: ErrorBody,
-    span: Span,
-};
-
-pub const ErrorBody = union(enum) {
-    enumeration: EnumBody,
-    union_type: UnionBody,
-};
-
-pub const EnumBody = struct {
-    variants: []const EnumVariant,
-    span: Span,
-};
-
-pub const EnumVariant = struct {
-    name: Identifier,
-    span: Span,
-};
-
-pub const UnionBody = struct {
-    variants: []const UnionVariant,
-    span: Span,
-};
-
-pub const UnionVariant = struct {
-    name: Identifier,
-    payload: ?*const TypeExpr,
-    span: Span,
 };
 
 pub const ModulePath = struct {

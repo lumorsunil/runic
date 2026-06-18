@@ -38,7 +38,7 @@ pub fn collectSymbols(
 ) !void {
     for (script.statements) |statement| {
         switch (statement.*) {
-            .bash_block, .error_decl, .while_stmt => {
+            .bash_block, .while_stmt => {
                 // Not Yet Implemented,
             },
             .return_stmt, .exit_stmt, .yield_stmt, .expression => {

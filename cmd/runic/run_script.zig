@@ -281,7 +281,7 @@ const StatementExpressionIterator = struct {
 
     fn populateStackStatement(self: *StatementExpressionIterator, statement: *runic.ast.Statement) !void {
         switch (statement.*) {
-            .error_decl, .bash_block => {},
+            .bash_block => {},
             .type_binding_decl => {},
             .binding_decl => |binding_decl| try self.cursor.appendExpr(binding_decl.initializer),
             .while_stmt => |while_stmt| {

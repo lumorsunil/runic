@@ -959,7 +959,7 @@ pub const TypeChecker = struct {
             .exit_stmt => |exit_stmt| if (exit_stmt.value) |value| try self.validateFunctionBodyStdin(scope, value, enclosing_stdin),
             .yield_stmt => |yield_stmt| try self.validateFunctionBodyStdin(scope, yield_stmt.value, enclosing_stdin),
             .while_stmt => |while_stmt| try self.validateBlockStdin(scope, while_stmt.body, enclosing_stdin),
-            .type_binding_decl, .error_decl, .bash_block => {},
+            .type_binding_decl, .bash_block => {},
         }
     }
 
