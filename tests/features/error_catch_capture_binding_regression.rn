@@ -1,0 +1,7 @@
+const E = error { Bad }
+
+// catch with an `|err|` capture on an error-union *binding* subject — the
+// handler used to be skipped (capture-binding stack imbalance).
+const v: E!String = E.Bad
+v catch |err| echo "handled the error"
+echo "after"

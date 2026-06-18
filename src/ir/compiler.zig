@@ -2550,6 +2550,8 @@ pub const IRCompiler = struct {
         catch_expr: ast.CatchExpr,
         subject_ref: ir.Location,
     ) Error!Result {
+        const stack_base = self.currentFrame().rel_stack_counter;
+
         try self.scopes.push(self.allocator, .lexical);
         defer self.scopes.pop();
 
@@ -2579,7 +2581,14 @@ pub const IRCompiler = struct {
             }
         }
 
-        return self.compileExpression(catch_expr.handler);
+        const result = try self.compileExpression(catch_expr.handler);
+        // Balance the capture-binding slot (result carried in r2) so the runtime
+        // stack matches the counter — see the same discipline in compileMatchCaseBody.
+        try self.set(source, .initRegister(.r2), stableResultSource(result));
+        while (self.currentFrame().rel_stack_counter > stack_base) {
+            _ = try self.pop(source);
+        }
+        return .fromLocation(ir.Location.initRegister(.r2).typed(result.typeExpr()));
     }
 
     fn compileMember(

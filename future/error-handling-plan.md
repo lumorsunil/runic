@@ -245,7 +245,7 @@ Goal: dispatch on error variants, capturing payloads (spec lines 73-80).
 
 Niche or risky items intentionally deferred along the way, collected here so they can be picked up later. Each notes where it came from.
 
-1. **`catch |err| …${err}…` on a command-converted binding prints nothing** (7c). Capture-context interaction; works for user errors and static/non-interpolating handlers. Likely a nested-capture issue in `compileCatchHandler` + command conversion.
+1. **Partially fixed — `catch |err|` handler on a binding subject** (7c): `compileCatchHandler` now pop-balances the capture-binding slot (same fix as #15), so `v catch |err| <static handler>` runs (it used to be skipped). **Still open:** a handler that *interpolates* the captured `${err}` on a *binding* subject (`v catch |err| echo "${err}"`) prints nothing — the handler's `${err}` runs in a stdio-capture fork that can't reach the outer-frame `err` binding (a capture-fork/closure frame-access issue). Works for a *direct* error value subject (`E.Bad catch |err| echo "${err}"`). Test: `error_catch_capture_binding_regression`.
 2. **`try` superset check** (5/6): `runTry` doesn't yet verify the enclosing function's error set is a superset of the propagated error (needs concrete inference, item 3).
 3. **Concrete inferred error sets** (6): leading-`!T` uses an *open-set* model (accepts any error). The exact union of body errors isn't collected into the function's recorded type — needed for **Phase 8 `match` exhaustiveness** on inferred returns and for caller visibility.
 4. **`errorUnion && x`** (7c-iv): not implemented — semantically muddy (would propagate the error). Decide semantics first.
