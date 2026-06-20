@@ -1198,6 +1198,16 @@ pub const IREvaluator = struct {
                 try w.flush();
                 return .cont;
             },
+            .pipe_dequeue => |pipe_location| {
+                // Read one structured value back from an in-process typed pipe
+                // (e.g. an error union a function yielded). The producer has
+                // already been waited on, so the value is enqueued; an empty
+                // queue means the function yielded nothing -> `.null`.
+                const pipe_handle = (try self.resolveLocation(thread, pipe_location)).pipe;
+                thread.private.result_register =
+                    self.context.dequeueTypedPipeValue(pipe_handle) orelse .null;
+                return .cont;
+            },
             .fwd_stdio => {
                 const stdin = try self.context.addPipe(self.config.stdin);
                 const stdout = try self.context.addPipe(self.config.stdout);

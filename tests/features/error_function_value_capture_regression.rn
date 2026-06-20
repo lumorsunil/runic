@@ -1,0 +1,35 @@
+# An error-union-returning function yields a structured value (an error value
+# or the ok payload). Capturing the call as a value preserves the error value
+# via in-process typed transport, so catch/match/try/if see the real error
+# instead of its flattened text. (Backlog #12 / #16-Layer-2.)
+const E = error { Bad, Worse }
+fn Void mayFail() E!String { yield E.Bad }
+fn Void mayOk() E!String { yield "ok-value" }
+
+# catch: error -> fallback, ok -> the value
+const c1 = mayFail catch "fb"
+echo "c1=${c1}"
+const c2 = mayOk catch "fb"
+echo "c2=${c2}"
+
+# match: error -> its variant, ok -> the wildcard
+match mayFail {
+    E.Bad => echo "m1=bad"
+    E.Worse => echo "m1=worse"
+    _ => echo "m1=ok"
+}
+match mayOk {
+    E.Bad => echo "m2=bad"
+    _ => echo "m2=ok"
+}
+
+# try: unwraps an ok value
+fn Void useTry() E!String {
+    const v = try mayOk
+    yield "t1=${v}\n"
+}
+useTry
+
+# if (no capture): true when ok, else when error
+if (mayOk) { echo "if1=ok" }
+if (mayFail) { echo "nope" } else { echo "if2=err" }
