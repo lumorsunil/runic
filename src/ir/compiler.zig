@@ -1384,7 +1384,7 @@ pub const IRCompiler = struct {
         // fn declarations and identifier references are not inadvertently called.
         const is_member_access = expr.* == .binary and expr.binary.op == .member;
         if (is_member_access and result.source == .value and result.source.value == .fn_ref) {
-            const call_result = try self.compileFunctionCall(expr, result.source.value, &.{}, &.{});
+            const call_result = try self.compileFunctionCall(expr, result.source.value, &.{}, &.{}, null);
             try self.finalizeStatementResult(source, call_result);
             return .fromValue(.void);
         }
@@ -2090,11 +2090,77 @@ pub const IRCompiler = struct {
         };
     }
 
+    /// In-process typed capture of a function call that returns an error union.
+    /// Such a function `yield`s a structured value (the ok payload or an error
+    /// value); a byte capture would flatten an error to text (`"E.Bad"`) and
+    /// lose it. Instead run the function with a `typed` stdout pipe (so `yield`
+    /// enqueues the value), wait, and dequeue it — returning the value typed as
+    /// the error union so `catch`/`try`/`match` operate on the real error value.
+    /// Returns null (caller falls back to the byte path) when not applicable.
+    fn tryCompileTypedErrorUnionCapture(
+        self: *IRCompiler,
+        source: anytype,
+        expr: *ast.Expression,
+    ) Error!?Result {
+        if (expr.* != .call) return null;
+        const call = expr.call;
+        if (call.background or call.redirects.len != 0) return null;
+        if (call.callee.* != .identifier) return null;
+
+        // The callee must be a known function (a direct fn_ref binding — closure
+        // captured / member-access functions fall back) returning an error union.
+        const binding = self.lookup(call.callee.identifier.name, .{ .shallow = false }) orelse return null;
+        if (!binding.result.isFunctionRef()) return null;
+        const fn_type = binding.type_expr orelse return null;
+        if (fn_type != .function) return null;
+        const return_type_ptr = fn_type.function.return_type orelse return null;
+        if (return_type_ptr.* != .error_union) return null;
+        const fn_ref_value = binding.result.source.value;
+        // pub exports change the call's result shape (a struct, already waited);
+        // keep those on the existing path.
+        if (self.instruction_sets.items[fn_ref_value.fn_ref.fn_addr.instr_set].pub_exports.len != 0) return null;
+
+        // Mirror the byte-capture path's stack contract: leave exactly
+        // `capture_temp_ref_count` temporary refs on top and return the result
+        // in %r, so every caller (pop-5 or binding) stays balanced.
+        const stack_before = self.currentFrame().rel_stack_counter;
+
+        const pipe_ref = try self.newRef(source, "typed_capture_pipe");
+        try self.pipe(source, pipe_ref.dereference());
+        try self.pipeOpt(source, pipe_ref.dereference(), .typed, .fromValue(.fromBoolean(true)));
+
+        const call_result = try self.compileFunctionCall(
+            expr,
+            fn_ref_value,
+            call.arguments,
+            call.redirects,
+            pipe_ref.dereference(),
+        );
+
+        // Wait for the function to finish so its yielded value is enqueued.
+        const thread_ref = try self.newRef(source, "typed_capture_thread");
+        try self.set(source, thread_ref, stableResultSource(call_result));
+        try self.wait(source, thread_ref.dereference().typed(thread_type));
+
+        // Pad so the net refs created here match the byte path's count; the
+        // dequeue (below) runs before the caller pops them, and the result
+        // value lives in %r, which `.ref`/`.pop` never touch.
+        while (self.currentFrame().rel_stack_counter -| stack_before < capture_temp_ref_count) {
+            _ = try self.newRef(source, "typed_capture_pad");
+        }
+
+        // Dequeue the single yielded value (the error union) into %r.
+        try self.addInstruction(.init(.from(source), .{ .pipe_dequeue = pipe_ref.dereference() }));
+        return try .from(ir.Location.initRegister(.r).typed(return_type_ptr.*));
+    }
+
     fn compileExpressionWithCapture(
         self: *IRCompiler,
         source: anytype,
         expr: *ast.Expression,
     ) Error!Result {
+        if (try self.tryCompileTypedErrorUnionCapture(source, expr)) |captured| return captured;
+
         const background_capture = isBackgroundExecutionExpression(expr);
         const expr_effects = self.analyzeExpressionEffects(expr);
         if (expr_effects.needs_stdio_capture or background_capture) {
@@ -3303,7 +3369,7 @@ pub const IRCompiler = struct {
         return switch (callee.source) {
             .value => |v| switch (v) {
                 .executable => self.compileExecutableCall(source, v, call.arguments, call.redirects),
-                .fn_ref => self.compileFunctionCall(source, v, call.arguments, call.redirects),
+                .fn_ref => self.compileFunctionCall(source, v, call.arguments, call.redirects, null),
                 .slice, .stream, .addr, .void, .null, .uinteger, .float, .strct, .exit_code, .pipe, .thread, .closeable, .err => .from(v),
                 .zig_string => Error.UnsupportedValueType,
             },
@@ -3948,6 +4014,9 @@ pub const IRCompiler = struct {
         fn_ref_value: ir.Value,
         arguments: []const *ast.Expression,
         redirects: []const ast.Redirection,
+        // When set, the forked function runs with this stdout instead of the
+        // caller's (used by the in-process typed value capture).
+        stdout_override: ?ir.Location,
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
@@ -4032,7 +4101,7 @@ pub const IRCompiler = struct {
             source,
             fn_addr,
             self.threadStdin(),
-            streams.stdout,
+            stdout_override orelse streams.stdout,
             streams.stderr,
             closure_ref.dereference(),
             .inherit,
