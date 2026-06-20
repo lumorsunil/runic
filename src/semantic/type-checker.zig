@@ -1774,7 +1774,11 @@ pub const TypeChecker = struct {
                 }
             }
         }
-        return self.resolveExprType(scope, subject);
+        // Resolve the result: a function call's return type comes back raw
+        // (e.g. `E!String`'s err_set is an unresolved `identifier`), which
+        // `match`/`catch` capture handling must see through to the error set.
+        const resolved = try self.resolveExprType(scope, subject) orelse return null;
+        return try self.resolveTypeExpr(scope, resolved);
     }
 
     /// Resolves an `if` condition's *value* type. A bare identifier parses as a

@@ -37,3 +37,13 @@ if (mayFail) { echo "nope" } else { echo "if2=err" }
 # if (fn) |v|: binds the ok payload; the error path takes the else branch
 if (mayOk) |v| { echo "if3=${v}" } else { echo "no3" }
 if (mayFail) |v| { echo "no4=${v}" } else { echo "if4=err" }
+
+# match payload-capture on a function call (direct, and through `catch |err|`)
+const P = error { Code: String }
+fn Void withPayload() P!String { yield P{ .Code = "P7" } }
+match withPayload {
+    P.Code => |c| echo "pc1=${c}"
+}
+const pc2 = withPayload catch |err| match err {
+    P.Code => |c| echo "pc2=${c}"
+}
