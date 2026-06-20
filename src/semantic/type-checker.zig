@@ -1813,6 +1813,20 @@ pub const TypeChecker = struct {
         const left_type = maybe_left_type orelse return;
         const right_type = maybe_right_type orelse return;
 
+        // Member access parses as a `.member` binary op (e.g. `MyError.Nope`).
+        // Validate error-set variant access here so an unknown variant is a
+        // type-checker diagnostic (stderr) rather than a later compiler error
+        // (stdout). Other member kinds are typed via `resolveExprType`.
+        if (binary.op == .member) {
+            if (binary.right.* == .identifier) {
+                switch (self.unaliasType(left_type).*) {
+                    .error_set => |error_set| try self.runErrorSetMemberAccess(error_set, &binary.right.identifier),
+                    else => {},
+                }
+            }
+            return;
+        }
+
         if (binary.op == .@"orelse") {
             switch (left_type.*) {
                 .optional => |optional| try self.validateTypeAssignment(

@@ -1,6 +1,0 @@
-[error]: tests/diagnostics/error_unknown_variant.rn:2:11: error set 'MyError' has no variant 'Nope'
-   1:const MyError = error { Bad }
-   2:const e = MyError.Nope
-   3:echo "${e}"
-   4:
-
