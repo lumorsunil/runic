@@ -553,6 +553,11 @@ pub const TypeChecker = struct {
             return;
         }
 
+        // Coerce into an optional stdout type: a bare `T` value or `null`
+        // both satisfy `?T`.
+        if (declared_unaliased.* == .optional and
+            self.yieldCoercesToOptional(resolved, declared_unaliased.optional)) return;
+
         try self.reportSpanError(
             yield_stmt.span,
             Error.TypeMismatch,
@@ -585,6 +590,16 @@ pub const TypeChecker = struct {
             if (union_set.error_set.variant(variant.name.name) == null) return false;
         }
         return true;
+    }
+
+    /// True if `yielded` satisfies a `?T` stdout type: a bare `T` value or `null`.
+    fn yieldCoercesToOptional(
+        self: *TypeChecker,
+        yielded: *const ast.TypeExpr,
+        optional: ast.TypeExpr.PrefixType,
+    ) bool {
+        if (self.unaliasType(yielded).* == .null) return true;
+        return self.pipeTypesEqual(yielded, optional.child);
     }
 
     /// An empty error set marks an inferred set (produced by leading-`!T` return
@@ -1828,9 +1843,12 @@ pub const TypeChecker = struct {
         }
 
         if (binary.op == .@"orelse") {
-            switch (left_type.*) {
+            switch (self.unaliasType(left_type).*) {
+                // Resolve the child: a function call's return type comes back raw
+                // (e.g. `?String`'s child is an unresolved `identifier`), which
+                // `validateTypeAssignment` rejects as an UnresolvedTypeLiteral.
                 .optional => |optional| try self.validateTypeAssignment(
-                    optional.child,
+                    try self.resolveTypeExpr(scope, optional.child),
                     right_type,
                     .{ .span = right_type.span() },
                 ),

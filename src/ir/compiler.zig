@@ -2090,14 +2090,16 @@ pub const IRCompiler = struct {
         };
     }
 
-    /// In-process typed capture of a function call that returns an error union.
-    /// Such a function `yield`s a structured value (the ok payload or an error
-    /// value); a byte capture would flatten an error to text (`"E.Bad"`) and
-    /// lose it. Instead run the function with a `typed` stdout pipe (so `yield`
-    /// enqueues the value), wait, and dequeue it — returning the value typed as
-    /// the error union so `catch`/`try`/`match` operate on the real error value.
-    /// Returns null (caller falls back to the byte path) when not applicable.
-    fn tryCompileTypedErrorUnionCapture(
+    /// In-process typed capture of a function call that returns a structured
+    /// value — an error union (`E!T`) or an optional (`?T`). Such a function
+    /// `yield`s the value (an error value / `null` / the payload); a byte
+    /// capture would flatten an error to text (`"E.Bad"`) or drop `null`,
+    /// losing the discriminant. Instead run the function with a `typed` stdout
+    /// pipe (so `yield` enqueues the value), wait, and dequeue it — returning
+    /// the value typed as the return type so `catch`/`try`/`match`/`if` operate
+    /// on the real value. Returns null (caller falls back to the byte path)
+    /// when not applicable.
+    fn tryCompileTypedValueCapture(
         self: *IRCompiler,
         source: anytype,
         expr: *ast.Expression,
@@ -2108,13 +2110,17 @@ pub const IRCompiler = struct {
         if (call.callee.* != .identifier) return null;
 
         // The callee must be a known function (a direct fn_ref binding — closure
-        // captured / member-access functions fall back) returning an error union.
+        // captured / member-access functions fall back) returning a structured
+        // value (an error union or an optional).
         const binding = self.lookup(call.callee.identifier.name, .{ .shallow = false }) orelse return null;
         if (!binding.result.isFunctionRef()) return null;
         const fn_type = binding.type_expr orelse return null;
         if (fn_type != .function) return null;
         const return_type_ptr = fn_type.function.return_type orelse return null;
-        if (return_type_ptr.* != .error_union) return null;
+        switch (return_type_ptr.*) {
+            .error_union, .optional => {},
+            else => return null,
+        }
         const fn_ref_value = binding.result.source.value;
         // pub exports change the call's result shape (a struct, already waited);
         // keep those on the existing path.
@@ -2159,7 +2165,7 @@ pub const IRCompiler = struct {
         source: anytype,
         expr: *ast.Expression,
     ) Error!Result {
-        if (try self.tryCompileTypedErrorUnionCapture(source, expr)) |captured| return captured;
+        if (try self.tryCompileTypedValueCapture(source, expr)) |captured| return captured;
 
         const background_capture = isBackgroundExecutionExpression(expr);
         const expr_effects = self.analyzeExpressionEffects(expr);
@@ -4349,11 +4355,18 @@ pub const IRCompiler = struct {
 
         if (condition_type) |condition_type_| switch (condition_type_) {
             .optional => |optional| {
+                // Stash into a stable ref first: the condition may be a volatile
+                // register (e.g. an in-process typed capture of an optional-
+                // returning function), which would be clobbered before the
+                // capture binding reads it.
+                const cond_ref = try self.newRef(source, "if_optional_cond");
+                try self.set(source, cond_ref, stableResultSource(condition));
+
                 const is_present_ref = try self.newRef(source, "if_optional_present");
                 try self.cmp(
                     source,
                     .not_equal,
-                    stableResultSource(condition),
+                    .from(cond_ref.dereference()),
                     .fromValue(.null),
                     is_present_ref,
                 );
@@ -4372,14 +4385,9 @@ pub const IRCompiler = struct {
                             return .{ .condition = .fromValue(.void) };
                         }
 
-                        var capture_value = condition.source;
-                        if (capture_value == .location) {
-                            capture_value.location = capture_value.location.typed(optional.child.*);
-                        }
-
                         break :blk .{
                             .pattern = capture_clause.bindings[0],
-                            .value = capture_value,
+                            .value = .fromLocation(cond_ref.dereference().typed(optional.child.*)),
                         };
                     } else null,
                 };

@@ -1,0 +1,19 @@
+# An optional-returning function `yield`s `T` or `null`. Yielding a bare `T`
+# coerces to `?T`; capturing the call preserves null-vs-value via in-process
+# typed transport, so binding / if-capture / orelse all see the real optional.
+fn Void some() ?String { yield "value" }
+fn Void none() ?String { yield null }
+
+# value binding
+const a = some
+echo "a=${a}"
+
+# if-capture: present binds the payload; null takes else
+if (some) |v| { echo "b=${v}" } else { echo "b-none" }
+if (none) |v| { echo "c=${v}" } else { echo "c-none" }
+
+# orelse: null -> default, value -> the value
+const d = none orelse "fallback"
+echo "d=${d}"
+const e = some orelse "fallback"
+echo "e=${e}"
