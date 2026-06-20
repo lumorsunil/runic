@@ -1537,7 +1537,7 @@ pub const TypeChecker = struct {
         try self.logTypeCheckTrace(@src().fn_name, if_expr.span);
 
         try self.runExpression(scope, if_expr.condition);
-        const condition_type = try self.resolveExprType(scope, if_expr.condition);
+        const condition_type = try self.resolveConditionType(scope, if_expr.condition);
         const then_scope = try scope.addChild(self.arena.allocator(), if_expr.span);
         try self.runIfCapture(then_scope, if_expr, condition_type);
         try self.runExpression(then_scope, if_expr.then_expr);
@@ -1760,6 +1760,22 @@ pub const TypeChecker = struct {
             }
         }
         return self.resolveExprType(scope, subject);
+    }
+
+    /// Resolves an `if` condition's *value* type. A bare identifier parses as a
+    /// zero-arg call, so see through it: a variable yields its own type, a
+    /// function yields its return type (so `if (fn) |v|` binds the ok payload of
+    /// an error-union/optional-returning function, like a direct binding would).
+    fn resolveConditionType(self: *TypeChecker, scope: *Scope, condition: *ast.Expression) Error!?*const ast.TypeExpr {
+        if (condition.* == .call and condition.call.arguments.len == 0 and condition.call.callee.* == .identifier) {
+            if (try self.resolveExprType(scope, condition.call.callee)) |callee_type| {
+                return switch (self.unaliasType(callee_type).*) {
+                    .function => |function| function.return_type,
+                    else => callee_type,
+                };
+            }
+        }
+        return self.resolveExprType(scope, condition);
     }
 
     /// The error set type bound to a `catch |err|` capture: the union's error

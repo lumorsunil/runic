@@ -33,3 +33,7 @@ useTry
 # if (no capture): true when ok, else when error
 if (mayOk) { echo "if1=ok" }
 if (mayFail) { echo "nope" } else { echo "if2=err" }
+
+# if (fn) |v|: binds the ok payload; the error path takes the else branch
+if (mayOk) |v| { echo "if3=${v}" } else { echo "no3" }
+if (mayFail) |v| { echo "no4=${v}" } else { echo "if4=err" }
