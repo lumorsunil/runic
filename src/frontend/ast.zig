@@ -926,7 +926,11 @@ pub const CallExpr = struct {
 
         return switch (callee_type.*) {
             .function => |function| function.return_type orelse &globalExecutionType,
-            else => null,
+            // A bare identifier referencing a value parses as a zero-arg call
+            // (`okv` -> `okv()`); its type is just the value's type. (Commands
+            // resolve to `executableType`, which is a `.function`, so they take
+            // the arm above.)
+            else => if (self.arguments.len == 0) callee_type else null,
         };
     }
 };
@@ -1047,6 +1051,29 @@ pub const BinaryExpr = struct {
                     .error_set, .err => break :blk right_type,
                     else => {},
                 };
+                break :blk left_type;
+            },
+            // `errorUnion && next` is a monadic guard: `next` when the left is
+            // ok, the left's error otherwise. The result is an error union
+            // carrying the left's error set with `next`'s value as the payload,
+            // so it must itself be handled.
+            .logical_and => blk: {
+                if (left_type) |lt| {
+                    const err_set: ?*const TypeExpr = switch (lt.*) {
+                        .error_union => |error_union| error_union.err_set,
+                        .error_set => lt,
+                        else => null,
+                    };
+                    if (err_set) |set| {
+                        const result = try allocator.create(TypeExpr);
+                        result.* = .{ .error_union = .{
+                            .err_set = set,
+                            .payload = right_type orelse break :blk lt,
+                            .span = self.span,
+                        } };
+                        break :blk result;
+                    }
+                }
                 break :blk left_type;
             },
             else => left_type,

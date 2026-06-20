@@ -5802,14 +5802,17 @@ pub const IRCompiler = struct {
                 return .from(ref.dereference());
             },
             .logical_and, .logical_or, .sequence => {
-                // `errorUnion || fallback` discards the error. Handle the
-                // non-capture case here as catch-discard; everything else keeps
-                // the existing exit-code logical lowering.
-                if (binary.op == .logical_or and
+                // `errorUnion || fallback` discards the error; `errorUnion && next`
+                // is a monadic guard. Handle the non-capture cases here; everything
+                // else keeps the existing exit-code logical lowering.
+                if (binary.op != .sequence and
                     !self.analyzeExpressionEffects(binary.left).needs_stdio_capture and
                     !self.analyzeExpressionEffects(binary.right).needs_stdio_capture)
                 {
-                    return self.compileLogicalOrValue(source, binary);
+                    return switch (binary.op) {
+                        .logical_or => self.compileLogicalOrValue(source, binary),
+                        else => self.compileLogicalAndValue(source, binary),
+                    };
                 }
                 return self.compileLogicalBinary(source, binary, .value);
             },
@@ -6146,6 +6149,25 @@ pub const IRCompiler = struct {
                     return .fromValue(.void);
                 }
 
+                // `errorUnion && next` monadic guard. A bare `a && b` is rejected
+                // by the type checker (UnhandledError); this guards the compile
+                // path so an error-like left never hits the exit-code jmp below.
+                if (binary.op == .logical_and and resultIsErrorLike(left)) {
+                    const subject_ref = try self.newRef(source, "logical_and_subject");
+                    try self.set(source, subject_ref, stableResultSource(left));
+                    const is_err_ref = try self.newRef(source, "logical_and_is_err");
+                    try self.addInstruction(.init(.from(source), .{ .is_err = .{
+                        .operand = subject_ref.dereference(),
+                        .result = is_err_ref,
+                    } }));
+                    const after_addr = try self.newLabel("logical_and_after", .unknown);
+                    // Error: short-circuit (nothing to do at statement level).
+                    try self.jmp(source, try .from(is_err_ref.dereference()), true, after_addr);
+                    _ = try self.compileLogicalRightStatement(source, binary.right);
+                    try self.setLabel(after_addr.local_addr.label, .abs);
+                    return .fromValue(.void);
+                }
+
                 try self.finalizeStatementResult(source, left);
 
                 // sequence (;) always runs right — no conditional jump needed
@@ -6215,6 +6237,38 @@ pub const IRCompiler = struct {
                             .error_union => |error_union| error_union.payload.*,
                             else => right.typeExpr(),
                         } else right.typeExpr();
+                        return .from(result_ref.dereference().typed(result_type));
+                    }
+
+                    // `errorUnion && next` monadic guard (already inside a capture
+                    // fork, so compile the rhs directly): `next` when left is ok,
+                    // the left's error otherwise. Result is `E!(typeof next)`.
+                    if (binary.op == .logical_and and resultIsErrorLike(left)) {
+                        try self.set(source, result_ref, stableResultSource(left));
+                        const is_err_ref = try self.newRef(source, "logical_and_is_err");
+                        try self.addInstruction(.init(.from(source), .{ .is_err = .{
+                            .operand = result_ref.dereference(),
+                            .result = is_err_ref,
+                        } }));
+                        const after_addr = try self.newLabel("logical_and_after", .unknown);
+                        // Error: short-circuit, keep the error already in result_ref.
+                        try self.jmp(source, try .from(is_err_ref.dereference()), true, after_addr);
+                        const right = try self.compileExpression(binary.right);
+                        try self.finalizeStatementResult(source, right);
+                        try self.set(source, result_ref, stableResultSource(right));
+                        try self.setLabel(after_addr.local_addr.label, .abs);
+                        const result_type: ?ast.TypeExpr = blk: {
+                            const lt = left.typeExpr() orelse break :blk null;
+                            if (lt != .error_union) break :blk lt;
+                            const rt = right.typeExpr() orelse break :blk lt;
+                            const payload_ptr = try self.allocator.create(ast.TypeExpr);
+                            payload_ptr.* = rt;
+                            break :blk ast.TypeExpr{ .error_union = .{
+                                .err_set = lt.error_union.err_set,
+                                .payload = payload_ptr,
+                                .span = lt.error_union.span,
+                            } };
+                        };
                         return .from(result_ref.dereference().typed(result_type));
                     }
 
@@ -6349,6 +6403,71 @@ pub const IRCompiler = struct {
         }
 
         // Ordinary exit-code logical-or (mirrors the non-capture value path).
+        if (evaluateLogical(.from(binary.op), left.source)) |comptime_result| {
+            return switch (comptime_result) {
+                .left => left,
+                .right => try self.compileExpression(binary.right),
+            };
+        }
+
+        const right = try self.compileExpression(binary.right);
+        const ref = try self.newRef(source, "logical_result");
+        try self.addInstruction(.init(.from(source), .{ .log = .{
+            .op = .from(binary.op),
+            .a = left.source,
+            .b = right.source,
+            .result = ref,
+        } }));
+        return .from(ref.dereference());
+    }
+
+    /// Non-capture `a && b`. If `a` is an error union, this is a monadic guard:
+    /// `b` when `a` is ok, otherwise `a`'s error (short-circuit). The result is
+    /// an error union (`E!(typeof b)`) so it must itself be handled. Otherwise
+    /// it is the ordinary exit-code logical-and.
+    fn compileLogicalAndValue(
+        self: *IRCompiler,
+        source: anytype,
+        binary: ast.BinaryExpr,
+    ) Error!Result {
+        const left = try self.compileExpression(binary.left);
+
+        const left_type_opt = left.typeExpr();
+        if (resultIsErrorLike(left)) {
+            const result_ref = try self.newRef(source, "logical_and_result");
+            try self.set(source, result_ref, stableResultSource(left));
+
+            const is_err_ref = try self.newRef(source, "logical_and_is_err");
+            try self.addInstruction(.init(.from(source), .{ .is_err = .{
+                .operand = result_ref.dereference(),
+                .result = is_err_ref,
+            } }));
+
+            const after_addr = try self.newLabel("logical_and_after", .unknown);
+            // Error: short-circuit, keep the error already in result_ref.
+            try self.jmp(source, try .from(is_err_ref.dereference()), true, after_addr);
+            // Ok: evaluate the right-hand side as the result.
+            const right = try self.compileStableExpressionIntoRef(source, binary.right, result_ref);
+            try self.setLabel(after_addr.local_addr.label, .abs);
+
+            // Result is `E!(typeof right)`: the left's error set with the
+            // right's value as the payload, so `catch`/`try` see an error union.
+            const result_type: ?ast.TypeExpr = blk: {
+                const lt = left_type_opt orelse break :blk null;
+                if (lt != .error_union) break :blk lt;
+                const rt = right.typeExpr() orelse break :blk lt;
+                const payload_ptr = try self.allocator.create(ast.TypeExpr);
+                payload_ptr.* = rt;
+                break :blk ast.TypeExpr{ .error_union = .{
+                    .err_set = lt.error_union.err_set,
+                    .payload = payload_ptr,
+                    .span = lt.error_union.span,
+                } };
+            };
+            return .from(result_ref.dereference().typed(result_type));
+        }
+
+        // Ordinary exit-code logical-and (mirrors the non-capture value path).
         if (evaluateLogical(.from(binary.op), left.source)) |comptime_result| {
             return switch (comptime_result) {
                 .left => left,
