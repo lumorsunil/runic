@@ -8,7 +8,7 @@ const e = E{ .WithMsg = "boom" }
 echo "bound: ${e}"
 echo "inline: ${E{ .WithMsg = "direct" }}"
 
-// Constructed and yielded into an error-union stdout type.
+// Constructed and yielded into an error-union stdout type; handled at the call.
 fn Void f() E!String { yield E{ .WithMsg = "yielded" } }
-f
+echo "f: ${f catch |err| match err { E.WithMsg => |m| m, _ => "other" }}"
 echo "|"

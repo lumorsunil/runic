@@ -14,7 +14,10 @@ fn Void errPath() E!String {
     yield "unreachable ${v}"
 }
 
-okPath
+// Both functions return an error union, so the calls are handled. okPath
+// unwraps and yields its value; errPath's `try` propagates the error, which
+// the caller's `catch` now observes.
+echo "${okPath catch "caught"}"
 echo "|"
-errPath
+echo "${errPath catch "caught"}"
 echo "after-errPath"

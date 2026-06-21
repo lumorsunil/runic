@@ -94,15 +94,28 @@ Verified working: `const r = echo "10" | parseInt | doubler | inc` etc.;
   { … yield n*2 } catch 99` → `99`; valid input → the computed value. Tests
   added to `parse_error_union_regression`.
 
+**Resolved (Option A — compile-time enforcement, 2026):**
+- **Unhandled errors are now a compile error**, not a runtime print. A bare
+  statement whose result is a non-`ExecutableError` error (a bare error value, a
+  call to an error-returning function, or a pipeline whose final stage yields an
+  error union) is an `UnhandledError` — it must be `catch`/`try`/`||`'d. At the
+  top level there is nothing to propagate to, so the error must be caught.
+  Commands keep the exit-code model (`ExecutableError` exempt). Implemented in
+  `runExpressionStatement` (`statementHasUnhandledError` / `isUnhandledErrorType`
+  / `isExecutableErrorSet`). Diagnostics: `error_unhandled_call`,
+  `error_unhandled_pipeline`.
+- **Propagated-error observation**: `try` on an error now *yields* the error to
+  the function's stdout (the same channel a yielded error uses) and halts,
+  instead of `exit_with` (which lost the value). So a `try`-propagated error is
+  observable by a capturing caller (`f catch x` / `match f { … }`) and chains
+  through nested propagation and pipeline stages. (`compileTry`.)
+
 **Remaining:**
-- **Uncaught error at top level → non-zero exit (deferred — language-wide
-  decision).** An *unhandled* bad parse (`echo "abc" | parseInt` with no catch,
-  bare statement) flows the `.err` to the program stdout and prints
-  `"ParseError.Invalid"` (exit 0) — **the same as any bare yielded error today**
-  (`fn …() E!String { yield E.Bad }; f` already prints `E.Bad`, exit 0). Making
-  uncaught errors exit non-zero is a consistent improvement but a *language-wide*
-  change (would also change `error_inferred_set_regression` et al.), so it is a
-  separate decision, not part of this cluster.
+- **Mid-pipeline transform exemption.** Enforcement is result-type based, so
+  `echo "abc" | parseInt | doubler` (final result `Int`; the parse error is
+  short-circuited away at the boundary) is *not* flagged — at runtime such an
+  error still flows through to stdout. Flagging "any stage can error" was too
+  aggressive (it required a `catch` on every `… | parseInt | …`). Left as-is.
 - **`||` on a pipeline error union.** `(echo "xyz" | parseInt) || 42` does not
   discard to `42`: `||`'s capture path compiles the pipeline via
   `compileExpression` (not `compileExpressionWithCapture`), bypassing the P3

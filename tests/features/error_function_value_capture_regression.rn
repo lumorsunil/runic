@@ -23,12 +23,13 @@ match mayOk {
     _ => echo "m2=ok"
 }
 
-# try: unwraps an ok value
+# try: unwraps an ok value; the call is handled (it returns an error union)
 fn Void useTry() E!String {
     const v = try mayOk
-    yield "t1=${v}\n"
+    yield "t1=${v}"
 }
-useTry
+const t1 = useTry catch "t1-err"
+echo "${t1}"
 
 # if (no capture): true when ok, else when error
 if (mayOk) { echo "if1=ok" }

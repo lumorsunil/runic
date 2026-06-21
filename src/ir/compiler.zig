@@ -2618,7 +2618,12 @@ pub const IRCompiler = struct {
         const after_addr = try self.newLabel("try_after", .unknown);
         // Skip propagation when the subject is not an error.
         try self.jmp(source, try .from(is_err_ref.dereference()), false, after_addr);
-        // Error: propagate it as the enclosing function's result.
+        // Error: propagate it as the enclosing function's result by yielding the
+        // error value to stdout — the same channel a `yield <error>` uses — so a
+        // capturing caller (`catch`/`try`/`match`) observes the real error and it
+        // chains through nested propagation and pipeline stages. Then halt the
+        // function so the statements after the `try` do not run.
+        try self.pipeWrite(source, self.threadStdout(), stableResultSource(subject));
         try self.exitWith(source, try .from(subject_ref.dereference()));
         try self.setLabel(after_addr.local_addr.label, .abs);
 

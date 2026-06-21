@@ -8,4 +8,5 @@ fn Void f() E!String {
     yield "${try x}"
 }
 
-f
+const r = f catch "fb"
+echo "${r}"

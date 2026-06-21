@@ -130,7 +130,7 @@ fn Void run() FileError!Int {
 
 #### Mandatory explicit handling
 
-An error value that is produced but neither handled (`catch`/`||`) nor propagated (`try`/yielded from an error-returning function) is a compile error, so failures are never silently dropped:
+An error that is produced but neither handled (`catch`/`||`) nor propagated (`try`/yielded from an error-returning function) is a compile error, so failures are never silently dropped. This applies wherever the error escapes as a statement's value — a bare error value, a call to an error-returning function, or a pipeline whose final stage yields an error union. At the top level there is nothing to propagate to, so the error must be caught. (Commands keep the exit-code model: their `ExecutableError` is exempt, so a bare `ls`/`echo "x" | grep "y"` does not require a `catch`.)
 
 ```rn
 const E = error { Bad }

@@ -9,7 +9,9 @@ fn Void okFn() E!String { yield "ok value" }
 // An error value also satisfies the same E!String stdout type.
 fn Void errFn() E!String { yield E.Bad }
 
-okFn
+// The calls return an error union, so they are handled: okFn's ok value passes
+// through, errFn's error takes the fallback.
+echo "${okFn catch "fb"}"
 echo "|"
-errFn
+echo "${errFn catch "fb"}"
 echo "|"

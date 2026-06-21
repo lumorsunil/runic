@@ -4,6 +4,6 @@
    8:    yield "${try x}"
    9:}
   10:
-  11:f
-  12:
+  11:const r = f catch "fb"
+  12:echo "${r}"
 

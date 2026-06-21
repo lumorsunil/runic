@@ -1,2 +1,4 @@
-ok=value|
+ok=value
+|
+caught
 after-errPath

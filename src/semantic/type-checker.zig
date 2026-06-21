@@ -1120,27 +1120,60 @@ pub const TypeChecker = struct {
 
         try self.runExpression(scope, expr_stmt.expression);
 
-        // Enforce error handling: a bare statement whose value is an error
-        // union or error value discards it without handling. `catch`/`try`
-        // (and `||`, once it discards errors) consume the error, so skip those.
-        // `call`/`pipeline` enforcement is tied to the execution model and is
-        // handled in Phase 7c/7d, so they are skipped here.
+        // Enforce error handling: a bare statement whose result is an error
+        // (a value, a call, or a pipeline whose final stage yields an error
+        // union) leaves it unhandled. At the top level there is nothing to
+        // propagate to, so it must be `catch`/`try`'d (or `||`'d to discard).
+        // `catch`/`try` already consume the error. Commands keep the exit-code
+        // model — their `ExecutableError` is exempt (else every bare command
+        // would need a catch).
         switch (expr_stmt.expression.*) {
-            .catch_expr, .try_expr, .call, .pipeline, .pipeline_deprecated => {},
+            .catch_expr, .try_expr => {},
             else => {
-                const expr_type = try self.resolveExprType(scope, expr_stmt.expression) orelse return;
-                switch (self.unaliasType(expr_type).*) {
-                    .error_union, .error_set, .err => try self.reportSpanError(
+                if (try self.statementHasUnhandledError(scope, expr_stmt.expression)) {
+                    try self.reportSpanError(
                         expr_stmt.expression.span(),
                         Error.UnhandledError,
                         .@"error",
                         "error is not handled; use catch (or || to discard) or propagate it",
                         .{},
-                    ),
-                    else => {},
+                    );
                 }
             },
         }
+    }
+
+    /// Whether a bare expression statement's result is an unhandled
+    /// (non-`ExecutableError`) error — the error escapes as the statement's
+    /// value (a bare error value, a call to an error-returning function, or a
+    /// pipeline whose final stage yields an error union). Commands
+    /// (`.execution` / `ExecutableError`) are exempt.
+    fn statementHasUnhandledError(self: *TypeChecker, scope: *Scope, expr: *ast.Expression) Error!bool {
+        const raw = (try self.resolveExprType(scope, expr)) orelse return false;
+        // Resolve so a function call's raw `identifier` err_set (e.g.
+        // `ExecutableError`) becomes an alias `isExecutableErrorSet` can see.
+        const expr_type = try self.resolveTypeExpr(scope, raw);
+        return self.isUnhandledErrorType(expr_type);
+    }
+
+    /// True for an error union or error value whose set is not the builtin
+    /// `ExecutableError` (commands keep the implicit exit-code model).
+    fn isUnhandledErrorType(self: *TypeChecker, t: *const ast.TypeExpr) bool {
+        const unaliased = self.unaliasType(t);
+        return switch (unaliased.*) {
+            .error_union => |error_union| !self.isExecutableErrorSet(error_union.err_set),
+            .error_set => !self.isExecutableErrorSet(unaliased),
+            .err => true,
+            else => false,
+        };
+    }
+
+    /// Recognizes the builtin `ExecutableError` set by its variant signature.
+    fn isExecutableErrorSet(self: *TypeChecker, err_set: *const ast.TypeExpr) bool {
+        const set = self.unaliasType(err_set);
+        if (set.* != .error_set) return false;
+        return set.error_set.variant("NonZeroExit") != null and
+            set.error_set.variant("SpawnFailed") != null;
     }
 
     fn runExpression(

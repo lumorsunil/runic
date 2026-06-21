@@ -1,0 +1,2 @@
+// `parseInt` yields a `ParseError!Int`; a bare pipeline leaves it unhandled.
+echo "abc" | parseInt
