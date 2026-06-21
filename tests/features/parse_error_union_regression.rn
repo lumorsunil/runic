@@ -31,3 +31,18 @@ const g = echo "abc" | parseInt || 7
 echo "g=${g}"
 const h = echo "12" | parseInt || 7
 echo "h=${h}"
+
+# A yielded error aborts the pipeline and it evaluates to the error — even when
+# a downstream stage would *swallow* the value (a comparison) or the final
+# stage's type is plain `T` (a mid-pipeline error producer). The error leads the
+# stream, so the surrounding `catch` sees it.
+const i = echo "abc" | parseInt | { const n = &0; if (n > 5) { yield "big" } else { yield "small" } } catch "caught"
+echo "i=${i}"
+const j = echo "9" | parseInt | { const n = &0; if (n > 5) { yield "big" } else { yield "small" } } catch "caught"
+echo "j=${j}"
+fn Int doubler() Int { yield &0 * 2 }
+fn Int inc() Int { yield &0 + 1 }
+const k = echo "abc" | parseInt | doubler | inc catch 99
+echo "k=${k}"
+const l = echo "10" | parseInt | doubler | inc catch 99
+echo "l=${l}"

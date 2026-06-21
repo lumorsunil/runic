@@ -110,24 +110,37 @@ Verified working: `const r = echo "10" | parseInt | doubler | inc` etc.;
   observable by a capturing caller (`f catch x` / `match f { … }`) and chains
   through nested propagation and pipeline stages. (`compileTry`.)
 
-**Remaining:**
-- **Mid-pipeline transform exemption.** Enforcement is result-type based, so
-  `echo "abc" | parseInt | doubler` (final result `Int`; the parse error is
-  short-circuited away at the boundary) is *not* flagged — at runtime such an
-  error still flows through to stdout. Flagging "any stage can error" was too
-  aggressive (it required a `catch` on every `… | parseInt | …`). Left as-is.
+**Pipeline-abort model (2026 — corrects the earlier "error rides the stream" mistake):**
+- A yielded error now **aborts the pipeline**: the pipeline expression evaluates
+  to that error, handled by a surrounding `catch`/`try`/`match`/`||`. Mechanism:
+  `collect_stdin`, on dequeuing an `.err` from a typed pipe, **forwards it to the
+  stage's stdout** (`thread.private.stack.items[1]`) so the error *leads* the
+  stage's output stream — the consumer/capture reads it first and the whole
+  pipeline evaluates to it, regardless of what the stage body does with the
+  value. (The value is still returned to the body, so a value-op like `&0 * 2`
+  propagates it rather than computing on `null`; `.ath` `.err`-propagation stays
+  for that reason.) This **fixes the former comparison/`if` mis-evaluation** —
+  `echo "abc" | parseInt | { if (&0 > 5) … } catch x` → the error, not a bogus
+  branch. Type side: `resolveSubjectType` reports an error-producing pipeline's
+  type as `E!<final stage's ok type>`, so `(… | parseInt | doubler | inc) catch 0`
+  type-checks even though the final stage is `Int`. Tests in
+  `parse_error_union_regression` (cases `i`–`l`).
 
-- **Mid-pipeline error into a comparison/`if`** (`… | parseInt | { if (&0 > 5) … }`)
-  is *silently mis-evaluated* (the `.err` is string-compared to a bogus bool and a
-  branch runs) — a wrong result, not a crash/hang. Only `.ath` propagates `.err`;
-  `.cmp`/`.log` don't, and their result feeds `jmp`. A correct fix needs the
-  stage to short-circuit (forward the `.err` and jump to its pipe cleanup), but
-  every cheap path is blocked: `exit` mid-stage **hangs** (skips cleanup →
-  downstream deadlock); propagating `.err` through `.cmp` makes `jmp` **panic**
-  (reads it as an exit code); jumping to the cleanup label **diverges the
-  `rel_stack_counter`** (skips the body's pushed slots). The clean fix is a
-  stack-balanced early-jump-to-cleanup — a cross-cutting compiler restructure,
-  not worth it for this niche, untested edge. Left as a known limitation.
+**Remaining:**
+- **Mid-pipeline transform exemption (enforcement).** A *bare* `echo "abc" |
+  parseInt | doubler` statement is still not a compile error (its ordinary result
+  type is `Int`; only the `catch`-subject view is the error union). It prints the
+  error and exits 0. Flagging it would force a `catch` on every `… | parseInt |
+  …` and break the printing idiom (`catch` captures the output) — the trade-off
+  accepted under Option A. Handled pipelines are fully correct.
+- **Stages still run** (not a literal abort): the forwarded error leads the
+  stream, but downstream stage bodies still execute (producing values that land
+  after the error and are ignored by the single-value consumer). Observationally
+  equivalent for pure stages; a downstream *side-effecting* stage would still run.
+- **Streaming mid-stream error**: in a multi-value stream where a *later* value
+  errors, the forwarded error isn't first (earlier outputs precede it), so a
+  single-value capture takes the first normal value. Inherent to single-value
+  capture of a multi-value pipeline.
 
 **Status:** merged to `error` (squashed) and built on since — `return` removed,
 then Option A (compile-time enforcement of unhandled errors + propagated-error

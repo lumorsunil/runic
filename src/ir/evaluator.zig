@@ -1077,6 +1077,20 @@ pub const IREvaluator = struct {
                     // producer is still running); block (retry) when the queue is
                     // empty but the producer is live; EOF when empty and closed.
                     if (self.context.dequeueTypedPipeValue(stdin_value.pipe)) |typed_value| {
+                        // Error short-circuit: a yielded error aborts the
+                        // pipeline. Forward it to this stage's stdout so it leads
+                        // the output stream — the consumer/capture reads the
+                        // error first and the pipeline evaluates to it, regardless
+                        // of what the body does with this value afterwards. (We
+                        // still return it to the body rather than EOF, so a
+                        // value-op like `&0 * 2` propagates it instead of
+                        // computing on `null`.)
+                        if (typed_value == .err and
+                            thread.private.stack.items.len >= 2 and
+                            thread.private.stack.items[1] == .pipe)
+                        {
+                            try self.context.enqueueTypedPipeValue(thread.private.stack.items[1].pipe, typed_value);
+                        }
                         thread.private.result_register = typed_value;
                         return .cont;
                     }

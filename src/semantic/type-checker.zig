@@ -1790,6 +1790,15 @@ pub const TypeChecker = struct {
     /// identifier is error-like, so a zero-arg command (`ls catch x`) still
     /// resolves to its `execution` type.
     fn resolveSubjectType(self: *TypeChecker, scope: *Scope, subject: *ast.Expression) Error!?*const ast.TypeExpr {
+        // A pipeline aborts to an error if any stage can produce one, so as a
+        // `catch`/`try`/`match` subject it is an error union (`E!<last stage>`)
+        // even when the final stage's own type is plain `T` (the error
+        // short-circuits past it at runtime). This is only the *subject* view;
+        // the pipeline's ordinary result type is unchanged, so a bare pipeline
+        // statement still prints rather than being forced to handle.
+        if (subject.* == .pipeline) {
+            if (try self.pipelineErrorResultType(scope, &subject.pipeline)) |t| return t;
+        }
         if (subject.* == .call and subject.call.arguments.len == 0 and subject.call.callee.* == .identifier) {
             if (try self.resolveExprType(scope, subject.call.callee)) |callee_type| {
                 switch (self.unaliasType(callee_type).*) {
@@ -1803,6 +1812,38 @@ pub const TypeChecker = struct {
         // `match`/`catch` capture handling must see through to the error set.
         const resolved = try self.resolveExprType(scope, subject) orelse return null;
         return try self.resolveTypeExpr(scope, resolved);
+    }
+
+    /// If any stage of `pipeline` can produce a (non-`ExecutableError`) error,
+    /// returns the pipeline's error-union result type `E!<final stage's ok type>`
+    /// — the type a surrounding `catch`/`try`/`match` operates on, since such an
+    /// error aborts the pipeline and becomes its value. Returns null when no
+    /// stage can error (or the final stage's type can't be resolved).
+    fn pipelineErrorResultType(self: *TypeChecker, scope: *Scope, pipeline: *ast.Pipeline) Error!?*const ast.TypeExpr {
+        if (pipeline.stages.len == 0) return null;
+        var err_set: ?*const ast.TypeExpr = null;
+        for (pipeline.stages) |stage| {
+            const stage_type = (try self.resolvePipelineStageStdoutType(scope, stage)) orelse continue;
+            const unaliased = self.unaliasType(stage_type);
+            if (unaliased.* == .error_union and !self.isExecutableErrorSet(unaliased.error_union.err_set)) {
+                err_set = unaliased.error_union.err_set;
+                break;
+            }
+        }
+        const set = err_set orelse return null;
+
+        // Payload = the final stage's ok type (unwrap its own error union).
+        const last = pipeline.stages[pipeline.stages.len - 1];
+        const last_type = (try self.resolvePipelineStageStdoutType(scope, last)) orelse return null;
+        const payload = switch (self.unaliasType(last_type).*) {
+            .error_union => |error_union| error_union.payload,
+            else => last_type,
+        };
+        return try self.allocTypeExpression(.{ .error_union = .{
+            .err_set = set,
+            .payload = payload,
+            .span = pipeline.span,
+        } });
     }
 
     /// Resolves an `if` condition's *value* type. A bare identifier parses as a
