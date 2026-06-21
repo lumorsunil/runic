@@ -118,12 +118,13 @@ Verified working: `const r = echo "10" | parseInt | doubler | inc` etc.;
   aggressive (it required a `catch` on every `… | parseInt | …`). Left as-is.
 
 - **`.cmp`/`.log` with an `.err` operand** are not error-propagated (their result
-  feeds `jmp`); only `.ath` is. No demonstrated need yet.
+  feeds `jmp`); only `.ath` is. So a mid-pipeline error flowing into a
+  *comparison* stage (`… | { if (&0 > 5) … }`) still crashes. No demonstrated
+  test; would need control-flow error-awareness.
 
-**Mergeability:** the cluster now delivers the spec example and *all handled*
-parse-error cases — trailing catch/match/try, and mid-pipeline errors flowing
-through downstream stages to the handler — with no crashes; suite green. The one
-behavior change vs. before: an *unhandled* bad parse prints its error text and
-exits 0 (consistent with every other unhandled yielded error in the language)
-instead of parseInt's old bespoke hard-abort. Ready to merge; the uncaught →
-non-zero exit is a separate, language-wide follow-up.
+**Status:** merged to `error` (squashed) and built on since — `return` removed,
+then Option A (compile-time enforcement of unhandled errors + propagated-error
+observation), then `||`/`&&` discard/guard on error-producing calls/pipelines.
+The cluster (#5/#6/#7/#8) is delivered; an *unhandled* error is now a compile
+error (not a runtime print). `catch`/`try`/`match`/`||`/`&&` all observe errors
+from values, calls, and pipelines.
