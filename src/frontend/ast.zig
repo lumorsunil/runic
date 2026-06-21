@@ -1609,7 +1609,6 @@ pub const Statement = union(enum) {
     binding_decl: BindingDecl,
     expression: ExpressionStmt,
 
-    return_stmt: ReturnStmt,
     exit_stmt: ExitStmt,
     yield_stmt: YieldStmt,
     while_stmt: WhileStmt,
@@ -1619,7 +1618,6 @@ pub const Statement = union(enum) {
         return switch (self) {
             .type_binding_decl => |decl| decl.span,
             .binding_decl => |decl| decl.span,
-            .return_stmt => |ret| ret.span,
             .exit_stmt => |exit_stmt| exit_stmt.span,
             .yield_stmt => |yield_stmt| yield_stmt.span,
             // .for_stmt => |loop_stmt| loop_stmt.span,
@@ -1788,15 +1786,10 @@ pub const ModulePath = struct {
     span: Span,
 };
 
-pub const ReturnStmt = struct {
-    value: ?*Expression,
-    span: Span,
-};
-
 /// `yield expr` pushes a value to a stream of the enclosing function/stage.
 /// `yield &2 expr` targets a specific file descriptor (`&1` = stdout (default),
-/// `&2` = stderr). Unlike `return`, it does not exit the function and the value
-/// is written to the stream rather than becoming the function's return value.
+/// `&2` = stderr). It does not halt the function; the value is written to the
+/// stream rather than becoming a return value (there is no `return`).
 pub const YieldStmt = struct {
     value: *Expression,
     /// Target file descriptor: 1 = stdout (default), 2 = stderr.

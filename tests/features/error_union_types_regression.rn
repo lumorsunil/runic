@@ -10,8 +10,8 @@ const explicit: MyError!String = "explicit ok"
 const inferred: !String = "inferred ok"
 
 // Error union as a function return type.
-fn Void getOne() MyError!Int { return 1 }
-getOne
+fn Void getOne() MyError!Int { yield 1 }
+echo "one=${getOne catch 0}"
 
 echo "${explicit}"
 echo "${inferred}"

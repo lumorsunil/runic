@@ -1778,7 +1778,7 @@ pub const Parser = struct {
 
         const next = try self.peekToken();
         const stmt: *ast.Statement = switch (next.tag) {
-            .kw_yield, .kw_return, .kw_exit => try self.parseSingleBodyStatement(),
+            .kw_yield, .kw_exit => try self.parseSingleBodyStatement(),
             else => return self.parseExpression(),
         };
 
@@ -1790,14 +1790,12 @@ pub const Parser = struct {
         } });
     }
 
-    /// Parses a single `yield`/`return`/`exit` statement for use as a bare
-    /// control-flow body. The caller guarantees the next token is one of these.
+    /// Parses a single `yield`/`exit` statement for use as a bare control-flow
+    /// body. The caller guarantees the next token is one of these.
     fn parseSingleBodyStatement(self: *Self) Error!*ast.Statement {
         const stmt = try self.arena.allocator().create(ast.Statement);
         if (try self.parseMaybeYield()) |yield_stmt| {
             stmt.* = .{ .yield_stmt = yield_stmt };
-        } else if (try self.parseMaybeReturn()) |return_stmt| {
-            stmt.* = .{ .return_stmt = return_stmt };
         } else if (try self.parseMaybeExit()) |exit_stmt| {
             stmt.* = .{ .exit_stmt = exit_stmt };
         } else {
@@ -2314,11 +2312,6 @@ pub const Parser = struct {
             return stmt;
         }
 
-        if (try self.parseMaybeReturn()) |return_stmt| {
-            stmt.* = .{ .return_stmt = return_stmt };
-            return stmt;
-        }
-
         if (try self.parseMaybeExit()) |exit_stmt| {
             stmt.* = .{ .exit_stmt = exit_stmt };
             return stmt;
@@ -2823,17 +2816,6 @@ pub const Parser = struct {
         };
     }
 
-    fn parseMaybeReturn(self: *Self) Error!?ast.ReturnStmt {
-        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
-        defer breadcrumb.end();
-
-        const next = try self.peekToken();
-        return switch (next.tag) {
-            .kw_return => try self.parseReturn(),
-            else => null,
-        };
-    }
-
     fn parseMaybeExit(self: *Self) Error!?ast.ExitStmt {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
@@ -2877,28 +2859,6 @@ pub const Parser = struct {
         return .{
             .value = value,
             .fd = fd,
-            .span = start.span.endAt(value.span()),
-        };
-    }
-
-    fn parseReturn(self: *Self) Error!ast.ReturnStmt {
-        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
-        defer breadcrumb.end();
-
-        const start = try self.expectTokenTag(.kw_return);
-        const next = try self.peekToken();
-
-        if (isExprTerminator(next.tag)) {
-            return .{
-                .value = null,
-                .span = start.span,
-            };
-        }
-
-        const value = try self.parseExpression();
-
-        return .{
-            .value = value,
             .span = start.span.endAt(value.span()),
         };
     }

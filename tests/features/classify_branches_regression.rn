@@ -1,0 +1,15 @@
+// Without `return`, a function that should not fall through uses
+// mutually-exclusive `if`/`else if`/`else` branches; each branch yields once.
+fn Void classify(value: Int) String {
+  if (value < 0) {
+    yield "negative"
+  } else if (value == 0) {
+    yield "zero"
+  } else {
+    yield "positive"
+  }
+}
+
+echo "${classify(1)}"
+echo "${classify(0)}"
+echo "${classify(3)}"

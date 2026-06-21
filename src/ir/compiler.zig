@@ -1326,7 +1326,6 @@ pub const IRCompiler = struct {
         return switch (stmt.*) {
             .type_binding_decl => Result.fromValue(.void),
             .binding_decl => |*b| self.compileBindingDecl(stmt, b),
-            .return_stmt => |r| self.compileReturn(stmt, r),
             .exit_stmt => |e| self.compileExit(stmt, e),
             .yield_stmt => |y| self.compileYield(stmt, y),
             .expression => |expr| self.compileExpressionStatement(stmt, expr.expression),
@@ -1568,25 +1567,6 @@ pub const IRCompiler = struct {
             .error_union, .error_set, .err => true,
             else => false,
         };
-    }
-
-    fn compileReturn(
-        self: *IRCompiler,
-        source: *ast.Statement,
-        r: ast.ReturnStmt,
-    ) Error!Result {
-        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
-
-        var result: Result = if (r.value) |value| try self.compileExpression(value) else .fromValue(.void);
-        switch (result.source) {
-            .location => |loc| if (loc.abs == .ref) {
-                try self.set(source, .initRegister(.r2), stableResultSource(result));
-                result = .fromLocation(ir.Location.initRegister(.r2).typed(result.typeExpr()));
-            },
-            else => {},
-        }
-        try self.exitWith(source, result);
-        return .fromValue(.void);
     }
 
     /// `yield expr` writes the value of `expr` to the thread's stdout stream

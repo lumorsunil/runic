@@ -268,7 +268,7 @@ for (fruits, 0..) |fruit, idx| {
 **Result:** Iteration works uniformly across arrays and ranges without manual indexing, and the capture clause makes loop variables explicit without leaking bindings outside the block.
 
 A `for` or `if`/`else` body does not have to be a block. It may be a bare
-expression or a single `yield`/`return`/`exit` statement, which avoids `{ }` for
+expression or a single `yield`/`exit` statement, which avoids `{ }` for
 one-liners:
 
 ```rn
@@ -367,7 +367,7 @@ To define your own module, add a `.rn` file relative to the script that will imp
 fn Void @() Void
 
 pub fn Void add(lhs: Int, rhs: Int) Int {
-  return lhs + rhs
+  yield lhs + rhs
 }
 
 pub const pi = 3.14159
@@ -389,7 +389,7 @@ Example:
 fn Void @() Void
 
 pub fn Void add(lhs: Int, rhs: Int) Int {
-  return lhs + rhs
+  yield lhs + rhs
 }
 
 pub const pi = 3.14159
@@ -436,7 +436,7 @@ The three standard streams are referenced with file-descriptor syntax: `&0`
 ### `yield` — pushing values to a stream
 
 Output is explicit. `yield expr` writes a value to stdout (`&1`); `yield &2 expr`
-writes to stderr. A function's `return`/body value is **not** automatically
+writes to stderr. A function's body value is **not** automatically
 written to stdout, so a stage that consumes its input without `yield`ing
 produces no stdout output.
 
@@ -451,8 +451,8 @@ echo "4" | parseInt | square   // prints 16
 The declared stdout type constrains what may be `yield`ed to `&1` — `yield "text"`
 in an `Int`-stdout function is a compile-time error. (`yield &2` carries untyped
 diagnostic output and is not constrained.) A function may `yield` zero or more
-times; `return` is for control flow / the function's exit value and no longer
-carries output:
+times; there is no `return` — output is carried solely by `yield`, and a
+function halts when it runs out of statements (use `exit` to halt early):
 
 ```rn
 fn Int consume() Void {
@@ -717,7 +717,7 @@ Just like in zig, all files in runic are implicitly structs. All functions or de
 // lib.rn
 
 fn Void add(x: Float, y: Float) Float {
-  return x + y
+  yield x + y
 }
 ```
 

@@ -509,19 +509,11 @@ pub const TypeChecker = struct {
         return switch (statement.*) {
             .type_binding_decl => |*type_binding_decl| self.runTypeBindingDecl(scope, type_binding_decl),
             .binding_decl => |*binding_decl| self.runBindingDecl(scope, binding_decl),
-            .return_stmt => |*return_stmt| self.runReturn(scope, return_stmt),
             .exit_stmt => |*exit_stmt| self.runExit(scope, exit_stmt),
             .yield_stmt => |*yield_stmt| self.runYield(scope, yield_stmt),
             .expression => |*expr_stmt| self.runExpressionStatement(scope, expr_stmt),
             else => error.UnsupportedStatement,
         };
-    }
-
-    fn runReturn(self: *TypeChecker, scope: *Scope, return_stmt: *ast.ReturnStmt) Error!void {
-        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
-        try self.logTypeCheckTrace(@src().fn_name, return_stmt.span);
-
-        if (return_stmt.value) |value| try self.runExpression(scope, value);
     }
 
     fn runYield(self: *TypeChecker, scope: *Scope, yield_stmt: *ast.YieldStmt) Error!void {
@@ -1074,7 +1066,6 @@ pub const TypeChecker = struct {
         switch (statement.*) {
             .expression => |expr_stmt| try self.validateFunctionBodyStdin(scope, expr_stmt.expression, enclosing_stdin),
             .binding_decl => |binding_decl| try self.validateFunctionBodyStdin(scope, binding_decl.initializer, enclosing_stdin),
-            .return_stmt => |return_stmt| if (return_stmt.value) |value| try self.validateFunctionBodyStdin(scope, value, enclosing_stdin),
             .exit_stmt => |exit_stmt| if (exit_stmt.value) |value| try self.validateFunctionBodyStdin(scope, value, enclosing_stdin),
             .yield_stmt => |yield_stmt| try self.validateFunctionBodyStdin(scope, yield_stmt.value, enclosing_stdin),
             .while_stmt => |while_stmt| try self.validateBlockStdin(scope, while_stmt.body, enclosing_stdin),

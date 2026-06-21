@@ -1,5 +1,5 @@
 // A `for` loop body may be a bare statement (no surrounding `{ }`): a single
-// `yield` (or `return`/`exit`, or a bare expression) is allowed directly. Here
+// `yield` (or `exit`, or a bare expression) is allowed directly. Here
 // both the producer and the squaring filter use brace-free `yield` bodies; the
 // pipeline still frames each value, so the squares of 0..4 are 0,1,4,9,16.
 fn Int square() Int {

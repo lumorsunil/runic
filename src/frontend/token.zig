@@ -163,7 +163,6 @@ pub const Tag = enum {
     kw_for,
     kw_while,
     kw_match,
-    kw_return,
     kw_exit,
     kw_yield,
 
@@ -253,7 +252,6 @@ pub const Tag = enum {
             .kw_for => "for",
             .kw_while => "while",
             .kw_match => "match",
-            .kw_return => "return",
             .kw_exit => "exit",
             .kw_yield => "yield",
             .kw_import => "import",
@@ -296,7 +294,6 @@ const keyword_map = std.StaticStringMap(Tag).initComptime(.{
     .{ "for", .kw_for },
     .{ "while", .kw_while },
     .{ "match", .kw_match },
-    .{ "return", .kw_return },
     .{ "exit", .kw_exit },
     .{ "yield", .kw_yield },
     .{ "import", .kw_import },
