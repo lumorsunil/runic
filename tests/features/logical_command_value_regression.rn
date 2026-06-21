@@ -1,0 +1,10 @@
+# A command in `||`/`&&` value position captures its output, including when the
+# other operand is a comptime-known boolean (previously the result type merged
+# to null and the capture was lost). (Backlog #5.)
+const a = false || echo "a-cap"
+echo "a=${a}"
+const b = true && echo "b-cap"
+echo "b=${b}"
+# command || command: the first (successful) command's output is the value
+const c = echo "c-first" || echo "c-second"
+echo "c=${c}"

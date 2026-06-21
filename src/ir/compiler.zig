@@ -6377,7 +6377,13 @@ pub const IRCompiler = struct {
                                 const right = try self.compileExpression(binary.right);
                                 try self.finalizeStatementResult(source, right);
                                 try self.set(source, result_ref, stableResultSource(right));
-                                break :blk .from(result_ref.dereference().typed(mergedResultType(left, right)));
+                                // The result is exactly the right operand (the
+                                // comptime-known left was discarded), so it carries
+                                // the right's type — not a merge with the left,
+                                // which would be null when they differ (e.g.
+                                // `false || echo "x"`: bool vs execution) and lose
+                                // the capture.
+                                break :blk .from(result_ref.dereference().typed(right.typeExpr()));
                             },
                         };
                     }
