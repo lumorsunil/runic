@@ -333,7 +333,7 @@ echo "hello" 1>&2 2>"/dev/null"
 
 ## Error-aware pipelines
 
-A pipeline's result is an error union (its final command's `ExecutableError!String`), so a trailing `catch`/`||` handles failure without relying on `set -e`:
+A pipeline's result is an error union, so a trailing `catch`/`||`/`match`/`try` handles failure without relying on `set -e`. Error propagation is **`pipefail`-style**: if *any* stage yields an error (a failing command's `ExecutableError`, or e.g. `parseInt` producing a `ParseError`), the whole pipeline evaluates to that error — not just the final stage's status. As in bash, the stages run concurrently and a stage erroring doesn't forcibly halt the others (data already in flight is still processed); the error simply becomes the pipeline's value for a surrounding handler to catch:
 
 ```rn
 const log = build | tee "build.log" catch "build failed"

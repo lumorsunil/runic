@@ -127,16 +127,38 @@ Verified working: `const r = echo "10" | parseInt | doubler | inc` etc.;
   `parse_error_union_regression` (cases `i`–`l`).
 
 **Remaining:**
+**Design note — pipeline error semantics are bash `pipefail`-like (by design, not a limitation):**
+bash runs a pipeline's stages **concurrently**; a failing stage does not start/stop
+the others, and data already in flight still gets processed and written. `set -o
+pipefail` makes the pipeline *report* failure if any stage fails, but still runs
+every stage. Runic matches this: any stage that yields an error makes the whole
+pipeline evaluate to that error (the saner `pipefail`-like default rather than
+bash's "only the last stage's status counts"), while the other stages still run.
+
+The only thing Runic *adds* over bash is that a pipeline is also a **value**: bash
+keeps stdout (data) and exit status (error) on separate channels, but a Runic
+pipeline-as-a-value must fold them into one. It does so by position:
+- **value position** (`const r = pipe catch x`): the error *is* the value; the
+  partial downstream output is captured and discarded (you asked for a value, it
+  errored, you handle it).
+- **statement position** (`echo "abc" | parseInt | doubler`): downstream output
+  flows to stdout exactly as in bash (and the error currently prints too — the
+  enforcement exemption below).
+
+Consequences that follow from this (intended, bash-consistent):
+- **Downstream stage bodies still execute** after the error leads the stream — a
+  side-effecting downstream stage runs, just as bash's `pipefail` doesn't stop a
+  downstream `rm`. Forcing producer-error to abort downstream would be a
+  *departure* from bash (and re-introduces the halt/stack-divergence difficulty);
+  not done.
+
+**Remaining (genuine):**
 - **Mid-pipeline transform exemption (enforcement).** A *bare* `echo "abc" |
-  parseInt | doubler` statement is still not a compile error (its ordinary result
-  type is `Int`; only the `catch`-subject view is the error union). It prints the
-  error and exits 0. Flagging it would force a `catch` on every `… | parseInt |
-  …` and break the printing idiom (`catch` captures the output) — the trade-off
-  accepted under Option A. Handled pipelines are fully correct.
-- **Stages still run** (not a literal abort): the forwarded error leads the
-  stream, but downstream stage bodies still execute (producing values that land
-  after the error and are ignored by the single-value consumer). Observationally
-  equivalent for pure stages; a downstream *side-effecting* stage would still run.
+  parseInt | doubler` statement is not a compile error (its ordinary result type
+  is `Int`; only the `catch`-subject view is the error union). It prints the error
+  and exits 0. Flagging it would force a `catch` on every `… | parseInt | …` and
+  break the printing idiom (`catch` captures the output) — the trade-off accepted
+  under Option A. Handled pipelines are fully correct.
 - **Streaming mid-stream error**: in a multi-value stream where a *later* value
   errors, the forwarded error isn't first (earlier outputs precede it), so a
   single-value capture takes the first normal value. Inherent to single-value
