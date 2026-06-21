@@ -116,11 +116,7 @@ Verified working: `const r = echo "10" | parseInt | doubler | inc` etc.;
   short-circuited away at the boundary) is *not* flagged — at runtime such an
   error still flows through to stdout. Flagging "any stage can error" was too
   aggressive (it required a `catch` on every `… | parseInt | …`). Left as-is.
-- **`||` on a pipeline error union.** `(echo "xyz" | parseInt) || 42` does not
-  discard to `42`: `||`'s capture path compiles the pipeline via
-  `compileExpression` (not `compileExpressionWithCapture`), bypassing the P3
-  typed capture. Same family as #5 (capture-path logical value). `catch`/`try`
-  work (they route through `compileStableExpressionIntoRef`).
+
 - **`.cmp`/`.log` with an `.err` operand** are not error-propagated (their result
   feeds `jmp`); only `.ath` is. No demonstrated need yet.
 

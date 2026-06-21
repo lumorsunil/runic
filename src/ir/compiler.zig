@@ -5009,6 +5009,23 @@ pub const IRCompiler = struct {
         } };
     }
 
+    /// Whether capturing `expr` as a value yields an error union — an
+    /// error-union-returning function call or a pipeline with an error stage.
+    /// Such an `||`/`&&` LHS must be captured via `compileExpressionWithCapture`
+    /// (the typed capture) so its error is observed, not via the exit-code path.
+    fn lhsCapturesError(self: *IRCompiler, expr: *ast.Expression) Error!bool {
+        if ((try self.pipelineCaptureErrorUnionType(expr)) != null) return true;
+        if (expr.* != .call) return false;
+        const call = expr.call;
+        if (call.background or call.redirects.len != 0 or call.callee.* != .identifier) return false;
+        const binding = self.lookup(call.callee.identifier.name, .{ .shallow = false }) orelse return false;
+        if (!binding.result.isFunctionRef()) return false;
+        const fn_type = binding.type_expr orelse return false;
+        if (fn_type != .function) return false;
+        const return_type = fn_type.function.return_type orelse return false;
+        return return_type.* == .error_union;
+    }
+
     /// A loop capture in scope during block-stdout inference, mapping the
     /// capture name to the element type its source iterates (e.g. `i` -> `Int`
     /// for `for (0..5) |i|`). Needed because a producer block often yields a
@@ -5869,9 +5886,14 @@ pub const IRCompiler = struct {
                 // `errorUnion || fallback` discards the error; `errorUnion && next`
                 // is a monadic guard. Handle the non-capture cases here; everything
                 // else keeps the existing exit-code logical lowering.
+                // Route to the value paths when neither operand needs capture, or
+                // when the LHS is an error producer (a function call / pipeline
+                // whose error must be observed via the typed capture).
+                const lhs_captures_error = binary.op != .sequence and try self.lhsCapturesError(binary.left);
                 if (binary.op != .sequence and
-                    !self.analyzeExpressionEffects(binary.left).needs_stdio_capture and
-                    !self.analyzeExpressionEffects(binary.right).needs_stdio_capture)
+                    (lhs_captures_error or
+                        (!self.analyzeExpressionEffects(binary.left).needs_stdio_capture and
+                            !self.analyzeExpressionEffects(binary.right).needs_stdio_capture)))
                 {
                     return switch (binary.op) {
                         .logical_or => self.compileLogicalOrValue(source, binary),
@@ -6439,7 +6461,12 @@ pub const IRCompiler = struct {
         source: anytype,
         binary: ast.BinaryExpr,
     ) Error!Result {
-        const left = try self.compileExpression(binary.left);
+        // An error-producing LHS (function call / pipeline) is captured via the
+        // typed capture so its error value is observed (mirrors `catch`).
+        const left = if (try self.lhsCapturesError(binary.left))
+            try self.compileExpressionWithCapture(source, binary.left)
+        else
+            try self.compileExpression(binary.left);
 
         const left_type_opt = left.typeExpr();
         if (resultIsErrorLike(left)) {
@@ -6494,7 +6521,10 @@ pub const IRCompiler = struct {
         source: anytype,
         binary: ast.BinaryExpr,
     ) Error!Result {
-        const left = try self.compileExpression(binary.left);
+        const left = if (try self.lhsCapturesError(binary.left))
+            try self.compileExpressionWithCapture(source, binary.left)
+        else
+            try self.compileExpression(binary.left);
 
         const left_type_opt = left.typeExpr();
         if (resultIsErrorLike(left)) {

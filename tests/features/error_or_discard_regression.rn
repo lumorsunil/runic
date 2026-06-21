@@ -22,3 +22,11 @@ d || echo "ran-on-error"
 // An ok value at statement level does NOT run the command fallback.
 const e: E!String = "kept"
 e || echo "should-not-run"
+
+// `||` on an error-returning function call (captured) discards the error.
+fn Void mayFail() E!String { yield E.Bad }
+fn Void mayOk() E!String { yield "real" }
+const f = mayFail || "fb"
+echo "f=${f}"
+const g = mayOk || "fb"
+echo "g=${g}"

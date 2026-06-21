@@ -25,3 +25,9 @@ const e = echo "abc" | parseInt | { const n = &0; yield n * 2 } catch 99
 echo "e=${e}"
 const f = echo "21" | parseInt | { const n = &0; yield n * 2 } catch 99
 echo "f=${f}"
+
+# `||` discards a pipeline's error and uses the fallback (like `catch`).
+const g = echo "abc" | parseInt || 7
+echo "g=${g}"
+const h = echo "12" | parseInt || 7
+echo "h=${h}"
