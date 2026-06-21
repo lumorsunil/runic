@@ -611,6 +611,18 @@ pub const TypeExpr = union(enum) {
         .span = .global,
     };
     pub const executableErrorType = TypeExpr{ .error_set = executableErrorSet };
+
+    /// Builtin `ParseError` error set: the failure mode of the parse builtins
+    /// (`parseInt`/`parseFloat`), whose value view is `ParseError!Int` /
+    /// `ParseError!Float`. Payload-less for now.
+    pub const parseErrorVariants = [_]ErrorSet.Variant{
+        .{ .name = Identifier.global("Invalid"), .payload = null, .span = .global },
+    };
+    pub const parseErrorSet = ErrorSet{
+        .variants = &parseErrorVariants,
+        .span = .global,
+    };
+    pub const parseErrorType = TypeExpr{ .error_set = parseErrorSet };
 };
 
 /// StringLiteral supports interpolation segments so command arguments and

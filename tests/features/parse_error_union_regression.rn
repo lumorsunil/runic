@@ -1,0 +1,27 @@
+# parseInt / parseFloat are `ParseError!Int` / `ParseError!Float`: a bad parse
+# is a catchable error value, not a hard abort. (Backlog #8.)
+
+# trailing catch: good input unwraps, bad input takes the fallback
+const a = echo "1234" | parseInt catch 0
+echo "a=${a}"
+const b = echo "abc" | parseInt catch 0
+echo "b=${b}"
+const c = echo "2.5" | parseFloat catch 9.9
+echo "c=${c}"
+const d = echo "nope" | parseFloat catch 9.9
+echo "d=${d}"
+
+# match on the error variant through `catch |e|`
+echo "abc" | parseInt catch |e| match e {
+    ParseError.Invalid => echo "got-invalid"
+}
+
+# valid input still flows by-value through a downstream stage
+echo "10" | parseInt | { const n = &0; yield "n2=${n * 2}\n" }
+
+# a mid-pipeline error short-circuits *through* a downstream arithmetic stage
+# (arithmetic on an error propagates it) and surfaces at the trailing catch.
+const e = echo "abc" | parseInt | { const n = &0; yield n * 2 } catch 99
+echo "e=${e}"
+const f = echo "21" | parseInt | { const n = &0; yield n * 2 } catch 99
+echo "f=${f}"

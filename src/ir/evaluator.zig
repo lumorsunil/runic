@@ -1110,22 +1110,14 @@ pub const IREvaluator = struct {
                 try self.materializeString(thread, thread.private.result_register, &text_writer.writer);
                 const trimmed = std.mem.trim(u8, text_writer.written(), " \t\r\n");
                 const parsed = std.fmt.parseInt(usize, trimmed, 10) catch {
-                    // Report a precise diagnostic here (naming the offending
-                    // input and source location); the runner suppresses its
-                    // generic "Error evaluating" line for InvalidInt so the
-                    // user sees a single clear message.
-                    if (instruction.source) |src| {
-                        const span = src.span();
-                        std.log.err("[error]: {s}:{}:{}: cannot parse \"{s}\" as Int", .{
-                            span.start.file,
-                            span.start.line,
-                            span.start.column,
-                            trimmed,
-                        });
-                    } else {
-                        std.log.err("[error]: cannot parse \"{s}\" as Int", .{trimmed});
-                    }
-                    return Error.InvalidInt;
+                    // A bad parse is a catchable `ParseError.Invalid` value
+                    // (`parseInt: ParseError!Int`), not a hard runtime abort.
+                    thread.private.result_register = .{ .err = .{
+                        .set = "ParseError",
+                        .variant = "Invalid",
+                        .payload = null,
+                    } };
+                    return .cont;
                 };
                 thread.private.result_register = .{ .uinteger = parsed };
                 return .cont;
@@ -1141,20 +1133,14 @@ pub const IREvaluator = struct {
                 try self.materializeString(thread, thread.private.result_register, &text_writer.writer);
                 const trimmed = std.mem.trim(u8, text_writer.written(), " \t\r\n");
                 const parsed = std.fmt.parseFloat(f64, trimmed) catch {
-                    // Precise, source-located diagnostic (the runner/CLI suppress
-                    // their generic footers for InvalidFloat, as for InvalidInt).
-                    if (instruction.source) |src| {
-                        const span = src.span();
-                        std.log.err("[error]: {s}:{}:{}: cannot parse \"{s}\" as Float", .{
-                            span.start.file,
-                            span.start.line,
-                            span.start.column,
-                            trimmed,
-                        });
-                    } else {
-                        std.log.err("[error]: cannot parse \"{s}\" as Float", .{trimmed});
-                    }
-                    return Error.InvalidFloat;
+                    // A bad parse is a catchable `ParseError.Invalid` value
+                    // (`parseFloat: ParseError!Float`), not a hard runtime abort.
+                    thread.private.result_register = .{ .err = .{
+                        .set = "ParseError",
+                        .variant = "Invalid",
+                        .payload = null,
+                    } };
+                    return .cont;
                 };
                 thread.private.result_register = .{ .float = parsed };
                 return .cont;
@@ -1695,6 +1681,18 @@ pub const IREvaluator = struct {
 
                 const left = (try self.tryResolveFastValueSource(thread, ath.a)) orelse try self.resolveValueSource(thread, ath.a);
                 const right = (try self.tryResolveFastValueSource(thread, ath.b)) orelse try self.resolveValueSource(thread, ath.b);
+
+                // Error short-circuit: arithmetic on an error value propagates the
+                // error unchanged, so an upstream pipeline error (e.g. a bad
+                // `parseInt`) flows through a downstream `&0 * 2` stage to the
+                // terminus instead of crashing the computation.
+                if (left == .err or right == .err) {
+                    const err_val: ir.Value = if (left == .err) left else right;
+                    if (!try self.setFastLocation(thread, ath.result, err_val)) {
+                        try self.setLocation(thread, ath.result, err_val);
+                    }
+                    return .cont;
+                }
 
                 if (evaluateArithmetic(ath.op, .from(left), .from(right))) |result| {
                     if (!try self.setFastLocation(thread, ath.result, result)) {

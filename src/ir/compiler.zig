@@ -1148,6 +1148,7 @@ pub const IRCompiler = struct {
     fn registerErrorSets(self: *IRCompiler) Allocator.Error!void {
         // Builtin error sets available in every script.
         try self.error_sets.put(self.allocator, "ExecutableError", ast.TypeExpr.executableErrorSet);
+        try self.error_sets.put(self.allocator, "ParseError", ast.TypeExpr.parseErrorSet);
 
         for (self.script.statements) |stmt| {
             if (stmt.* != .type_binding_decl) continue;
@@ -2170,10 +2171,20 @@ pub const IRCompiler = struct {
         const background_capture = isBackgroundExecutionExpression(expr);
         const expr_effects = self.analyzeExpressionEffects(expr);
         if (expr_effects.needs_stdio_capture or background_capture) {
+            // A pipeline whose final stage yields an error union (e.g.
+            // `… | parseInt`) is captured by *value*: mark its stdout pipe
+            // `typed` so the final `yield` enqueues the structured value, then
+            // dequeue it below (instead of flattening it to bytes). `catch`/`try`
+            // then operate on the real error value.
+            const typed_result_type = try self.pipelineCaptureErrorUnionType(expr);
+
             // TODO: We need something that cleans up the pipes because otherwise they will get stuck if they are not used
             // Suggestion: Maybe we can have a nested variable structure for inner threads that will set to true when the thread is done processing. We can then continuously check that variable from the outermost scope (here), and whenever it is set to true, we would set the pipes to be closed.
             const stdout_pipe_ref = try self.newRef(source, "stdout_pipe");
             try self.pipe(source, stdout_pipe_ref);
+            if (typed_result_type != null) {
+                try self.pipeOpt(source, stdout_pipe_ref.dereference(), .typed, .fromValue(.fromBoolean(true)));
+            }
             try self.pipeOpt(source, stdout_pipe_ref.dereference(), .keep_open, .fromValue(.fromBoolean(true)));
             try self.pipeOpt(source, stdout_pipe_ref.dereference(), .close_destination, .fromValue(.fromBoolean(false)));
             try self.pipeOpt(source, stdout_pipe_ref.dereference(), .disconnect_destination, .fromValue(.fromBoolean(false)));
@@ -2221,6 +2232,12 @@ pub const IRCompiler = struct {
                 try self.pipeOpt(source, stderr_pipe_ref.dereference(), .keep_open, .fromValue(.fromBoolean(false)));
                 try self.wait(source, stdout_stream_thread_ref.dereference());
                 try self.wait(source, stderr_stream_thread_ref.dereference());
+            }
+            // Typed value capture: the final stage enqueued its structured value
+            // on the (typed) stdout pipe; dequeue it as the captured result.
+            if (typed_result_type) |t| {
+                try self.addInstruction(.init(.from(source), .{ .pipe_dequeue = stdout_pipe_ref.dereference() }));
+                return .from(ir.Location.initRegister(.r).typed(t));
             }
             if (result.isType(execution_handles_struct_type)) {
                 // alloc 5 # create execution result
@@ -4943,6 +4960,68 @@ pub const IRCompiler = struct {
             .execution => string_type,
             else => return_type.*,
         };
+    }
+
+    /// When `expr` is a pipeline in which *any* stage can produce an error (e.g.
+    /// `… | parseInt → ParseError`), returns the pipeline's value-capture type
+    /// `E!T`: that error set with the final stage's ok output as the payload. An
+    /// upstream error short-circuits through the downstream stages (arithmetic on
+    /// an `.err` propagates it) and surfaces as the result, so the whole pipeline
+    /// is captured via typed transport — letting `catch`/`try` see the real error
+    /// rather than its flattened text. Returns null when no stage can error (the
+    /// byte capture path applies). Mid-pipeline stages keep their `Int`/`Float`
+    /// transport (`stageStdoutType`); this only governs the *final* capture.
+    fn pipelineCaptureErrorUnionType(self: *IRCompiler, expr: *ast.Expression) Error!?ast.TypeExpr {
+        if (expr.* != .pipeline) return null;
+        const stages = expr.pipeline.stages;
+        if (stages.len == 0) return null;
+
+        // Find an error-producing stage anywhere in the pipeline. Track its
+        // error set and natural payload (used as the fallback ok type below).
+        const ErrInfo = struct { set: *const ast.TypeExpr, payload: ast.TypeExpr };
+        const err_info: ErrInfo = blk: {
+            for (stages) |stage| {
+                if (self.isBuiltinStage(stage, "parseInt")) break :blk .{ .set = &ast.TypeExpr.parseErrorType, .payload = .global(.integer) };
+                if (self.isBuiltinStage(stage, "parseFloat")) break :blk .{ .set = &ast.TypeExpr.parseErrorType, .payload = .global(.float) };
+                const callee = switch (stage.*) {
+                    .call => |call| call.callee,
+                    else => stage,
+                };
+                const binding = switch (callee.*) {
+                    .identifier => |id| self.lookup(id.name, .{ .shallow = false }),
+                    else => null,
+                } orelse continue;
+                const fn_type = switch (binding.type_expr orelse continue) {
+                    .function => |f| f,
+                    else => continue,
+                };
+                const return_type = fn_type.return_type orelse continue;
+                if (return_type.* == .error_union) break :blk .{ .set = return_type.error_union.err_set, .payload = return_type.error_union.payload.* };
+            }
+            return null;
+        };
+
+        // Payload = the final stage's ok output type (what flows when no error).
+        // A block final stage infers its output from `&0`, so make the upstream
+        // stage's stdout type visible as the stdin type while inferring it; fall
+        // back to the error producer's payload when inference can't resolve it
+        // (the typed capture must still fire so `catch`/`try` see the error).
+        const last = stages[stages.len - 1];
+        const upstream_stdout: ?ast.TypeExpr = if (stages.len >= 2)
+            self.stageStdoutType(stages[stages.len - 2])
+        else
+            null;
+        if (upstream_stdout) |u| try self.stdin_type_stack.append(self.allocator, u);
+        const payload_opt = self.stageStdoutType(last);
+        if (upstream_stdout != null) _ = self.stdin_type_stack.pop();
+        const payload = payload_opt orelse err_info.payload;
+        const payload_ptr = try self.allocator.create(ast.TypeExpr);
+        payload_ptr.* = payload;
+        return ast.TypeExpr{ .error_union = .{
+            .err_set = err_info.set,
+            .payload = payload_ptr,
+            .span = .global,
+        } };
     }
 
     /// A loop capture in scope during block-stdout inference, mapping the

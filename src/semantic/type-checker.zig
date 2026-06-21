@@ -2124,6 +2124,10 @@ pub const TypeChecker = struct {
         /// Upstream provides T, downstream expects E!T.  The value is forwarded
         /// unchanged; the downstream treats it as the success case.
         coerced_error_union,
+        /// Upstream provides E!T, downstream expects T.  The ok payload crosses
+        /// unchanged; an error short-circuits past the downstream to the nearest
+        /// handler (D7).
+        short_circuit_error,
         /// At least one side carries an ExecutionResult-returning function (an
         /// external executable). The current implementation always uses byte pipes
         /// for this case.
@@ -2160,6 +2164,12 @@ pub const TypeChecker = struct {
         if (down.* == .error_union) {
             const payload = self.unaliasType(down.error_union.payload);
             if (self.pipeTypesEqual(up, payload)) return .coerced_error_union;
+        }
+
+        // E!T → T (the ok payload crosses; an error short-circuits).
+        if (up.* == .error_union) {
+            const payload = self.unaliasType(up.error_union.payload);
+            if (self.pipeTypesEqual(payload, down)) return .short_circuit_error;
         }
 
         return .incompatible;
@@ -2199,6 +2209,11 @@ pub const TypeChecker = struct {
         if (down.* == .error_union) {
             const payload = self.unaliasType(down.error_union.payload);
             if (self.pipeTypesEqual(up, payload)) return;
+        }
+        // E!T → T: the ok payload crosses; an error short-circuits downstream.
+        if (up.* == .error_union) {
+            const payload = self.unaliasType(up.error_union.payload);
+            if (self.pipeTypesEqual(payload, down)) return;
         }
 
         try self.reportSpanError(
@@ -3133,10 +3148,15 @@ const GlobalTypes = struct {
 };
 
 /// Stable storage for the `parseInt` builtin's function type:
-/// `fn String parseInt() Int`.
+/// `fn String parseInt() ParseError!Int` — a bad parse is a catchable error.
 const parse_int_byte_type = ast.TypeExpr{ .byte = .{ .span = .global } };
 const parse_int_string_type = ast.TypeExpr{ .array = .{ .element = &parse_int_byte_type, .span = .global } };
-const parse_int_return_type = ast.TypeExpr{ .integer = .{ .span = .global } };
+const parse_int_payload_type = ast.TypeExpr{ .integer = .{ .span = .global } };
+const parse_int_return_type = ast.TypeExpr{ .error_union = .{
+    .err_set = &ast.TypeExpr.parseErrorType,
+    .payload = &parse_int_payload_type,
+    .span = .global,
+} };
 const parse_int_fn_type = ast.TypeExpr{ .function = .{
     .params = .nonVariadic(&.{}),
     .stdin_type = &parse_int_string_type,
@@ -3145,10 +3165,15 @@ const parse_int_fn_type = ast.TypeExpr{ .function = .{
 } };
 
 /// Stable storage for the `parseFloat` builtin's function type:
-/// `fn String parseFloat() Float`.
+/// `fn String parseFloat() ParseError!Float`.
 const parse_float_byte_type = ast.TypeExpr{ .byte = .{ .span = .global } };
 const parse_float_string_type = ast.TypeExpr{ .array = .{ .element = &parse_float_byte_type, .span = .global } };
-const parse_float_return_type = ast.TypeExpr{ .float = .{ .span = .global } };
+const parse_float_payload_type = ast.TypeExpr{ .float = .{ .span = .global } };
+const parse_float_return_type = ast.TypeExpr{ .error_union = .{
+    .err_set = &ast.TypeExpr.parseErrorType,
+    .payload = &parse_float_payload_type,
+    .span = .global,
+} };
 const parse_float_fn_type = ast.TypeExpr{ .function = .{
     .params = .nonVariadic(&.{}),
     .stdin_type = &parse_float_string_type,
@@ -3177,6 +3202,7 @@ const global_scope_definitions = [_]Definition{
     .init("Byte", GlobalTypes.Byte),
     .init("String", GlobalTypes.Array(GlobalTypes.Byte)),
     .init("ExecutableError", ast.TypeExpr.executableErrorType),
+    .init("ParseError", ast.TypeExpr.parseErrorType),
 };
 
 /// Builtin value bindings (not types) available in every module's global scope.
