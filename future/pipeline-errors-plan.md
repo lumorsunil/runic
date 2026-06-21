@@ -117,10 +117,17 @@ Verified working: `const r = echo "10" | parseInt | doubler | inc` etc.;
   error still flows through to stdout. Flagging "any stage can error" was too
   aggressive (it required a `catch` on every `… | parseInt | …`). Left as-is.
 
-- **`.cmp`/`.log` with an `.err` operand** are not error-propagated (their result
-  feeds `jmp`); only `.ath` is. So a mid-pipeline error flowing into a
-  *comparison* stage (`… | { if (&0 > 5) … }`) still crashes. No demonstrated
-  test; would need control-flow error-awareness.
+- **Mid-pipeline error into a comparison/`if`** (`… | parseInt | { if (&0 > 5) … }`)
+  is *silently mis-evaluated* (the `.err` is string-compared to a bogus bool and a
+  branch runs) — a wrong result, not a crash/hang. Only `.ath` propagates `.err`;
+  `.cmp`/`.log` don't, and their result feeds `jmp`. A correct fix needs the
+  stage to short-circuit (forward the `.err` and jump to its pipe cleanup), but
+  every cheap path is blocked: `exit` mid-stage **hangs** (skips cleanup →
+  downstream deadlock); propagating `.err` through `.cmp` makes `jmp` **panic**
+  (reads it as an exit code); jumping to the cleanup label **diverges the
+  `rel_stack_counter`** (skips the body's pushed slots). The clean fix is a
+  stack-balanced early-jump-to-cleanup — a cross-cutting compiler restructure,
+  not worth it for this niche, untested edge. Left as a known limitation.
 
 **Status:** merged to `error` (squashed) and built on since — `return` removed,
 then Option A (compile-time enforcement of unhandled errors + propagated-error
