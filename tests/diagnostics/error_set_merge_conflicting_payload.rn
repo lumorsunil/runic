@@ -1,0 +1,9 @@
+// Merging two sets that declare the same variant name with *different* payload
+// types is a conflict.
+const A = error { Dup: String }
+const B = error { Dup: Int }
+const M = A || B
+
+fn String f() M!String { yield A.Dup }
+
+echo "${f catch "x"}"

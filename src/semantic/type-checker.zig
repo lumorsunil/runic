@@ -623,20 +623,25 @@ pub const TypeChecker = struct {
     /// set, or the error set of an error union) onto the active collector. A
     /// non-error type (e.g. an ok payload value, or a command `execution`) is a
     /// no-op, so this is safe to call on any yielded / propagated type.
+    ///
+    /// The error set is resolved through `resolveInferredErrorSet`, so when an
+    /// inferred (`!T`) function yields or propagates a call to *another* inferred
+    /// function, it inherits that function's collected variants rather than its
+    /// empty placeholder — cross-function propagation. This works in source
+    /// order (the callee finalizes its set before the caller's body is walked);
+    /// a forward reference or mutual recursion would still see an unfinalized
+    /// (empty) set, which needs a fixpoint pass and remains deferred.
     fn collectInferredFromType(self: *TypeChecker, t: *const ast.TypeExpr) Error!void {
         if (self.activeInferredCollector() == null) return;
         const unaliased = self.unaliasType(t);
-        switch (unaliased.*) {
-            .error_set => |error_set| for (error_set.variants) |variant| {
-                try self.collectInferredVariant(variant);
-            },
-            .error_union => |error_union| {
-                const set = self.unaliasType(error_union.err_set);
-                if (set.* == .error_set) for (set.error_set.variants) |variant| {
-                    try self.collectInferredVariant(variant);
-                };
-            },
-            else => {},
+        const set_node: *const ast.TypeExpr = switch (unaliased.*) {
+            .error_set => unaliased,
+            .error_union => |error_union| error_union.err_set,
+            else => return,
+        };
+        const resolved_set = self.resolveInferredErrorSet(set_node) orelse return;
+        for (resolved_set.variants) |variant| {
+            try self.collectInferredVariant(variant);
         }
     }
 
@@ -773,8 +778,78 @@ pub const TypeChecker = struct {
                     .span = array.span,
                 },
             }),
+            .type_merge => |merge| try self.resolveTypeMerge(scope, merge),
             else => type_expr,
         };
+    }
+
+    /// Resolves a type-level `A || B` merge. Currently only error sets may be
+    /// merged (backlog #18): the result is a single `error_set` whose variants
+    /// are the union (by name) of both operands'. A duplicate variant name must
+    /// carry the same payload type. Nested merges (`A || B || C`) flatten
+    /// naturally via recursion. General sum types over arbitrary member types
+    /// are a separate feature (future/sum-types-plan.md).
+    fn resolveTypeMerge(
+        self: *TypeChecker,
+        scope: *Scope,
+        merge: ast.TypeExpr.TypeMerge,
+    ) Error!*const ast.TypeExpr {
+        const lhs = self.unaliasType(try self.resolveTypeExpr(scope, merge.lhs));
+        const rhs = self.unaliasType(try self.resolveTypeExpr(scope, merge.rhs));
+
+        if (lhs.* != .error_set or rhs.* != .error_set) {
+            try self.reportSpanError(
+                merge.span,
+                Error.TypeMismatch,
+                .@"error",
+                "`||` currently merges only error sets, found {f} || {f} (general sum types are not implemented yet)",
+                .{ lhs, rhs },
+            );
+            return try self.allocTypeExpression(.{ .failed = .{ .span = merge.span } });
+        }
+
+        var variants: std.ArrayListUnmanaged(ast.TypeExpr.ErrorSet.Variant) = .empty;
+        try variants.appendSlice(self.arena.allocator(), lhs.error_set.variants);
+
+        for (rhs.error_set.variants) |rv| {
+            if (lhs.error_set.variant(rv.name.name)) |lv| {
+                // Duplicate variant name: payloads must be compatible.
+                if (!try self.mergeVariantPayloadsCompatible(scope, lv.payload, rv.payload)) {
+                    try self.reportSpanError(
+                        merge.span,
+                        Error.TypeMismatch,
+                        .@"error",
+                        "conflicting payload for variant '{s}' in merged error set",
+                        .{rv.name.name},
+                    );
+                }
+                continue;
+            }
+            try variants.append(self.arena.allocator(), rv);
+        }
+
+        return try self.allocTypeExpression(.{
+            .error_set = .{
+                .variants = try variants.toOwnedSlice(self.arena.allocator()),
+                .span = merge.span,
+            },
+        });
+    }
+
+    /// Two same-named variants from merged error sets are compatible when both
+    /// are payload-less, or both carry the same payload type. Payload type-exprs
+    /// are resolved first (they are written as bare identifiers like `String`).
+    fn mergeVariantPayloadsCompatible(
+        self: *TypeChecker,
+        scope: *Scope,
+        a: ?*const ast.TypeExpr,
+        b: ?*const ast.TypeExpr,
+    ) Error!bool {
+        if (a == null and b == null) return true;
+        if (a == null or b == null) return false;
+        const ra = try self.resolveTypeExpr(scope, a.?);
+        const rb = try self.resolveTypeExpr(scope, b.?);
+        return self.pipeTypesEqual(ra, rb);
     }
 
     fn resolveTypeIdentifierToAlias(
@@ -1168,12 +1243,22 @@ pub const TypeChecker = struct {
         };
     }
 
-    /// Recognizes the builtin `ExecutableError` set by its variant signature.
+    /// Whether an error set is exempt from mandatory handling — i.e. it carries
+    /// *only* command failure modes, so a value of it keeps the implicit
+    /// exit-code model. This is a **subset** test (every variant is one of the
+    /// builtin `ExecutableError`'s), not a signature-presence test: a merged set
+    /// that also carries a user error (e.g. `ExecutableError || MyError`) has
+    /// non-command variants and is therefore *not* exempt — handling it is
+    /// required. An empty/inferred placeholder is not exempt (no concrete
+    /// command-only variants to vouch for).
     fn isExecutableErrorSet(self: *TypeChecker, err_set: *const ast.TypeExpr) bool {
         const set = self.unaliasType(err_set);
         if (set.* != .error_set) return false;
-        return set.error_set.variant("NonZeroExit") != null and
-            set.error_set.variant("SpawnFailed") != null;
+        if (set.error_set.variants.len == 0) return false;
+        for (set.error_set.variants) |v| {
+            if (ast.TypeExpr.executableErrorSet.variant(v.name.name) == null) return false;
+        }
+        return true;
     }
 
     fn runExpression(
@@ -1261,6 +1346,10 @@ pub const TypeChecker = struct {
                 try self.runTypeExpression(scope, error_union.payload);
             },
             .error_set => |error_set| self.runErrorSet(scope, error_set),
+            .type_merge => |merge| {
+                try self.runTypeExpression(scope, merge.lhs);
+                try self.runTypeExpression(scope, merge.rhs);
+            },
             .err => {},
             .array => |*array| self.runTypeArray(scope, array),
             .struct_type, .module, .tuple, .function, .fn_ref_type => {},
@@ -1733,7 +1822,12 @@ pub const TypeChecker = struct {
             try self.collectInferredFromType(st);
             switch (st.*) {
                 .error_union, .error_set => try self.validateTryPropagation(try_expr, st),
-                .err, .failed, .execution => {},
+                // `try cmd` propagates the command's `ExecutableError`; record it
+                // on the enclosing inferred set (#3c). Safe now that the
+                // exemption test is subset-based: a set that mixes these with a
+                // user error is correctly non-exempt.
+                .execution => for (ast.TypeExpr.executableErrorVariants) |v| try self.collectInferredVariant(v),
+                .err, .failed => {},
                 else => try self.reportSpanError(
                     try_expr.subject.span(),
                     Error.TypeMismatch,
@@ -1745,11 +1839,15 @@ pub const TypeChecker = struct {
         }
     }
 
-    /// Verifies the enclosing function's declared error set is a superset of the
-    /// error set `try` propagates: every variant the subject can raise must be a
-    /// member, else propagating it would escape the declared type. Skipped when
-    /// the function declares no concrete error union (an inferred `!T` set is
-    /// collected instead, and a top-level `try` has no enclosing set to check).
+    /// Verifies the enclosing function covers the error set `try` propagates:
+    /// every variant the subject can raise must be in the function's declared
+    /// error set, else propagating it would escape the declared type. A function
+    /// whose return type is not an error union (or which declares no return type)
+    /// covers nothing, so propagating into it is an error — as is a top-level
+    /// `try`, which has no enclosing function to propagate to. `ExecutableError`
+    /// is exempt (commands keep the implicit exit-code model), and an inferred
+    /// (`!T`) declared set collects what the body raises rather than constraining
+    /// it.
     fn validateTryPropagation(
         self: *TypeChecker,
         try_expr: *ast.TryExpr,
@@ -1762,24 +1860,61 @@ pub const TypeChecker = struct {
         };
         const propagated = self.resolveInferredErrorSet(propagated_node) orelse return;
 
-        if (self.stdout_type_stack.items.len == 0) return;
-        const declared_stdout = self.stdout_type_stack.items[self.stdout_type_stack.items.len - 1] orelse return;
-        const declared = self.unaliasType(declared_stdout);
-        if (declared.* != .error_union) return;
-        const declared_set = self.unaliasType(declared.error_union.err_set);
-        if (declared_set.* != .error_set) return;
-        // An inferred (`!T`) declared set collects what the body raises rather
-        // than constraining it, so there is nothing to enforce here.
-        if (isInferredErrorSet(declared_set.error_set)) return;
+        // Commands keep the implicit exit-code model: an `ExecutableError` need
+        // not be declared in the enclosing function's return type to propagate.
+        if (propagated.variant("NonZeroExit") != null and propagated.variant("SpawnFailed") != null) return;
 
+        // Locate the enclosing function's declared error set, if any.
+        const declared_stdout: ?*const ast.TypeExpr = if (self.stdout_type_stack.items.len == 0)
+            null
+        else
+            self.stdout_type_stack.items[self.stdout_type_stack.items.len - 1];
+
+        if (declared_stdout) |stdout| {
+            const declared = self.unaliasType(stdout);
+            if (declared.* == .error_union) {
+                const declared_set = self.unaliasType(declared.error_union.err_set);
+                // An unresolved set can't be enforced yet; an inferred (`!T`) set
+                // collects what the body raises rather than constraining it.
+                if (declared_set.* != .error_set) return;
+                if (isInferredErrorSet(declared_set.error_set)) return;
+
+                for (propagated.variants) |variant| {
+                    if (declared_set.error_set.variant(variant.name.name) == null) {
+                        try self.reportSpanError(
+                            try_expr.subject.span(),
+                            Error.ErrorNotInErrorSet,
+                            .@"error",
+                            "try propagates error '{s}', which is not in the enclosing function's error set {f}",
+                            .{ variant.name.name, declared_set },
+                        );
+                    }
+                }
+                return;
+            }
+        }
+
+        // No enclosing error set to propagate into: either the enclosing
+        // function's return type is not an error union, or there is no enclosing
+        // function at all (a top-level `try`). Every propagated variant escapes
+        // undeclared, so it must be handled here instead.
+        const at_top_level = self.stdout_type_stack.items.len == 0;
         for (propagated.variants) |variant| {
-            if (declared_set.error_set.variant(variant.name.name) == null) {
+            if (at_top_level) {
                 try self.reportSpanError(
                     try_expr.subject.span(),
                     Error.ErrorNotInErrorSet,
                     .@"error",
-                    "try propagates error '{s}', which is not in the enclosing function's error set {f}",
-                    .{ variant.name.name, declared_set },
+                    "try propagates error '{s}', but there is no enclosing function to propagate to; handle it with catch",
+                    .{variant.name.name},
+                );
+            } else {
+                try self.reportSpanError(
+                    try_expr.subject.span(),
+                    Error.ErrorNotInErrorSet,
+                    .@"error",
+                    "try propagates error '{s}', but the enclosing function's return type declares no error set to cover it; handle it with catch or declare it in the return type",
+                    .{variant.name.name},
                 );
             }
         }
@@ -1983,7 +2118,7 @@ pub const TypeChecker = struct {
             .thread => try self.runThreadMemberAccess(&member.member),
             .struct_type => |struct_type| try self.runStructMemberAccess(struct_type, &member.member),
             .error_set => |error_set| try self.runErrorSetMemberAccess(error_set, &member.member),
-            .null, .promise, .error_union, .err, .tuple, .function, .fn_ref_type, .integer, .float, .boolean, .byte, .alias, .void => return error.UnsupportedMemberAccess,
+            .null, .promise, .error_union, .err, .tuple, .function, .fn_ref_type, .integer, .float, .boolean, .byte, .alias, .void, .type_merge => return error.UnsupportedMemberAccess,
             .module => |module| try self.runModuleMemberAccess(module, &member.member),
             .execution => |execution| try self.runExecutionMemberAccess(execution, &member.member),
             // .lazy => {
@@ -2756,6 +2891,9 @@ pub const TypeChecker = struct {
                 options,
             ),
             .fn_ref_type => {},
+            // A `||` merge is resolved to a concrete `error_set` before it is
+            // stored as a binding type, so a raw merge should not reach here.
+            .type_merge => {},
             // .lazy => |lazy| self.validateTypeAssignmentLazy(
             //     lazy,
             //     assignment_type,

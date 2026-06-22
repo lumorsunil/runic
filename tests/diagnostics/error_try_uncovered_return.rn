@@ -1,0 +1,13 @@
+const E = error { Bad }
+
+fn String mayFail() E!String { yield E.Bad }
+
+// `try mayFail` propagates E, but `f`'s return type is plain `String` and so
+// declares no error set to cover it. Propagating would escape the declared
+// type undetected, so this must be handled here (or declared in the return).
+fn String f() String {
+    const r = try mayFail
+    yield r
+}
+
+echo "${f}"

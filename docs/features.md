@@ -102,6 +102,16 @@ const e1 = FileError.NotFound
 const e2 = FileError{ .PermissionDenied = "alice" }
 ```
 
+**Merging error sets.** Combine sets with `||` (as in Zig) to get a set whose variants are the union of both — useful for a function that can fail in several ways, or for merging the builtin `ExecutableError`:
+
+```rn
+const IoError = NetworkError || FileError              // Timeout, ConnectionLost, NotFound, PermissionDenied
+const Merged  = ExecutableError || FileError           // command failures *and* file errors
+fn Void fetch() IoError!String { ... }
+```
+
+Merges chain (`A || B || C`) and dedup a shared variant name (its payload type must match). A merged set that carries any non-command error is *not* exempt from handling — only a set whose variants are all `ExecutableError`'s keeps the implicit exit-code model. (Merging arbitrary non-error types — general sum types like `Int || String` — is not implemented yet.)
+
 **Result:** Error sets are inspectable data. Authors define terse opaque variants or attach a payload when extra context matters, and callers branch on failures structurally instead of comparing strings or shell exit codes.
 
 #### Handling errors: `catch`, `||`, and `try`
@@ -119,7 +129,7 @@ const level2 = parseLevel catch |err| { echo "bad: ${err}"; exit 1 }
 const name = lookupName || "anonymous"
 ```
 
-`try` propagates the error out of the enclosing function (which must return an error union), otherwise evaluates to the ok value:
+`try` propagates the error out of the enclosing function, otherwise evaluates to the ok value:
 
 ```rn
 fn Void run() FileError!Int {
@@ -127,6 +137,8 @@ fn Void run() FileError!Int {
   yield cfg * 2
 }
 ```
+
+The enclosing function **must cover** every error `try` propagates — its return type has to be an error union whose set includes those variants (or an inferred `!T`, which collects them). Propagating an error a function does not declare is a compile error: a `try` in a function whose return type is not an error union, or whose set is missing the variant, is rejected. A top-level `try` has no enclosing function to propagate to, so it must be `catch`'d instead. (`ExecutableError` from a command is exempt — commands keep the exit-code model.)
 
 #### Mandatory explicit handling
 

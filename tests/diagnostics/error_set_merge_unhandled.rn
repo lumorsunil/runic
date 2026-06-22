@@ -1,0 +1,8 @@
+// A merged set that carries a user error is NOT exempt (only command-only sets
+// keep the exit-code model), so a bare statement of it must be handled.
+const MyError = error { Bad }
+const Merged = ExecutableError || MyError
+
+fn String f() Merged!String { yield MyError.Bad }
+
+f

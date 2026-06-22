@@ -1,0 +1,30 @@
+# Cross-function inferred error-set propagation (#3b). An inferred (`!T`)
+# function that propagates a call to another inferred function with `try`
+# inherits that function's collected error set in source order, so a `match`
+# on the result type-checks exhaustively and the real error value still flows.
+const E = error { Bad, Worse }
+
+fn Void inner() !String { yield E.Bad }
+fn Void innerOk() !String { yield "ok-value" }
+
+# `outer` propagates `inner`'s error; on the ok path it yields the payload.
+fn Void outer() !String {
+    const v = try inner
+    yield "unreachable ${v}"
+}
+fn Void outerOk() !String {
+    const v = try innerOk
+    yield "got ${v}"
+}
+
+# The propagated error reaches the caller's match exhaustively over E.
+match outer {
+    E.Bad => echo "m1=bad"
+    E.Worse => echo "m1=worse"
+}
+
+# The ok path propagates the unwrapped value through both functions.
+echo "${outerOk catch "fb"}"
+
+# catch still observes the propagated error value.
+echo "c=${outer catch "caught"}"

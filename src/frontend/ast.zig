@@ -153,6 +153,12 @@ pub const TypeExpr = union(enum) {
     promise: PrefixType,
     error_union: ErrorUnion,
     error_set: ErrorSet,
+    /// A type-level `A || B` merge written in a type position (e.g.
+    /// `const Merged = ExecutableError || MyError`). Resolved by the type
+    /// checker into a concrete type — currently only an `error_set` union of two
+    /// error sets (backlog #18). General sum types over arbitrary member types
+    /// are a separate, larger feature (see `future/sum-types-plan.md`).
+    type_merge: TypeMerge,
     err: ErrorType,
     array: ArrayType,
     struct_type: StructType,
@@ -221,6 +227,16 @@ pub const TypeExpr = union(enum) {
 
         pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
             try writer.print("{f}!{f}", .{ self.err_set, self.payload });
+        }
+    };
+
+    pub const TypeMerge = struct {
+        lhs: *const TypeExpr,
+        rhs: *const TypeExpr,
+        span: Span,
+
+        pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try writer.print("{f} || {f}", .{ self.lhs, self.rhs });
         }
     };
 
@@ -525,6 +541,7 @@ pub const TypeExpr = union(enum) {
             .promise,
             .error_union,
             .error_set,
+            .type_merge,
             .err,
             .alias,
             .identifier,

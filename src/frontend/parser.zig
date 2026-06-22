@@ -2995,22 +2995,52 @@ pub const Parser = struct {
         }
 
         const primary = (try self.parseMaybePrimaryTypeExpr()) orelse return null;
+        var lhs = try self.applyPostfixErrorUnion(primary);
 
-        // Postfix `E!T` — an error union with an explicit error set `E`.
-        const after = try self.peekToken();
-        if (after.tag == .bang) {
+        // Type-level `A || B` merge (left-associative). The type checker
+        // currently accepts only error-set operands (backlog #18); general sum
+        // types over arbitrary members are a separate feature
+        // (future/sum-types-plan.md). Note: in *type* position `||` is the merge
+        // operator; value-position `||` (logical-or) is parsed elsewhere.
+        while ((try self.peekToken()).tag == .pipe_pipe) {
             _ = try self.nextToken();
-            const payload = try self.parseTypeExpr();
-            return try self.allocTypeExpression(.{
-                .error_union = .{
-                    .err_set = primary,
-                    .payload = payload,
-                    .span = primary.span().endAt(payload.span()),
+            const rhs_primary = (try self.parseMaybePrimaryTypeExpr()) orelse {
+                const tok = try self.peekToken();
+                try self.reportParseError(
+                    Error.ExpectedTypeExpr,
+                    tok.span,
+                    "expected type after '||', actual: {s}",
+                    .{tok.lexeme},
+                );
+                return Error.ExpectedTypeExpr;
+            };
+            const rhs = try self.applyPostfixErrorUnion(rhs_primary);
+            lhs = try self.allocTypeExpression(.{
+                .type_merge = .{
+                    .lhs = lhs,
+                    .rhs = rhs,
+                    .span = lhs.span().endAt(rhs.span()),
                 },
             });
         }
 
-        return primary;
+        return lhs;
+    }
+
+    /// Applies a postfix `!T` (explicit error union `E!T`) to an already-parsed
+    /// error-set type expression, or returns it unchanged when no `!` follows.
+    fn applyPostfixErrorUnion(self: *Self, err_set: *const ast.TypeExpr) Error!*const ast.TypeExpr {
+        const after = try self.peekToken();
+        if (after.tag != .bang) return err_set;
+        _ = try self.nextToken();
+        const payload = try self.parseTypeExpr();
+        return try self.allocTypeExpression(.{
+            .error_union = .{
+                .err_set = err_set,
+                .payload = payload,
+                .span = err_set.span().endAt(payload.span()),
+            },
+        });
     }
 
     fn parseMaybePrimaryTypeExpr(self: *Self) Error!?*const ast.TypeExpr {

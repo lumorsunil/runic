@@ -1,0 +1,5 @@
+// `||` in a type position merges error sets. Merging non-error types (general
+// sum types) is not implemented yet, so this is a clear error.
+const IntOrString = Int || String
+
+echo "${IntOrString}"

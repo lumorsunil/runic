@@ -1,0 +1,18 @@
+const E = error { Bad, Worse }
+
+// `inner`'s inferred set is E (yielding `E.Bad` collects all of E's variants).
+fn Void inner() !String {
+    yield E.Bad
+}
+
+// `outer` is also inferred; propagating `inner` with `try` makes `outer`
+// inherit `inner`'s inferred set (cross-function propagation, source order).
+// So a `match` on `outer`'s result must be exhaustive over E.
+fn Void outer() !String {
+    yield try inner
+}
+
+const r = outer()
+match r {
+    E.Bad => echo "bad"
+}

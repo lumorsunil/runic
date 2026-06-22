@@ -1,0 +1,47 @@
+# Error-set merge / sum type (#18): `A || B` unions two error sets (by name)
+# into one. A value of `A || B` can carry any variant of either, and all the
+# normal error machinery (construction, catch, match + exhaustiveness) works on
+# the merged set. Chained `A || B || C` flattens; a duplicate variant name with
+# the same payload dedups.
+fn Void @() Void
+
+const E = error { Bad }
+const F = error { Worse }
+const Merged = E || F
+
+# A function returning the merged set may yield variants of either operand.
+fn String fromE() Merged!String { yield E.Bad }
+fn String fromF() Merged!String { yield F.Worse }
+
+# match over the merged set must cover both operands' variants.
+match fromE {
+    E.Bad => echo "m1=bad"
+    F.Worse => echo "m1=worse"
+}
+match fromF {
+    E.Bad => echo "m2=bad"
+    F.Worse => echo "m2=worse"
+}
+
+# catch on a merged-set function.
+echo "c=${fromF catch "fb"}"
+
+# Merging the builtin ExecutableError with a user set. The result carries a
+# user error, so it is NOT exempt — it must be handled (here, with catch).
+const MyError = error { Oops }
+const WithExec = ExecutableError || MyError
+fn String mayBoth() WithExec!String { yield MyError.Oops }
+echo "w=${mayBoth catch "handled"}"
+
+# Chained merge + compatible-payload dedup.
+const A = error { Dup: String, A1 }
+const B = error { Dup: String, B1 }
+const C = error { C1 }
+const Chain = A || B || C
+fn String chained() Chain!String { yield C.C1 }
+match chained {
+    A.Dup => |d| echo "dup=${d}"
+    A.A1 => echo "a1"
+    B.B1 => echo "b1"
+    C.C1 => echo "c1"
+}
