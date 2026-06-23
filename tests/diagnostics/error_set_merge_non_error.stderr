@@ -1,8 +1,0 @@
-[error]: tests/diagnostics/error_set_merge_non_error.rn:3:21: `||` currently merges only error sets, found Int || []Byte (general sum types are not implemented yet)
-   1:// `||` in a type position merges error sets. Merging non-error types (general
-   2:// sum types) is not implemented yet, so this is a clear error.
-   3:const IntOrString = Int || String
-   4:
-   5:echo "${IntOrString}"
-   6:
-

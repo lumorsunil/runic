@@ -154,11 +154,14 @@ pub const TypeExpr = union(enum) {
     error_union: ErrorUnion,
     error_set: ErrorSet,
     /// A type-level `A || B` merge written in a type position (e.g.
-    /// `const Merged = ExecutableError || MyError`). Resolved by the type
-    /// checker into a concrete type — currently only an `error_set` union of two
-    /// error sets (backlog #18). General sum types over arbitrary member types
-    /// are a separate, larger feature (see `future/sum-types-plan.md`).
+    /// `const Merged = ExecutableError || MyError`). Resolved by the type checker
+    /// into a concrete type: an `error_set` union when both operands are error
+    /// sets (backlog #18), otherwise a structural `sum` (see `future/sum-types-plan.md`).
     type_merge: TypeMerge,
+    /// A structural sum type `A || B (|| …)`: a value is one of the member
+    /// types. Members are normalized (nested sums flattened, duplicates removed).
+    /// See `future/sum-types-plan.md`.
+    sum: SumType,
     err: ErrorType,
     array: ArrayType,
     struct_type: StructType,
@@ -237,6 +240,18 @@ pub const TypeExpr = union(enum) {
 
         pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
             try writer.print("{f} || {f}", .{ self.lhs, self.rhs });
+        }
+    };
+
+    pub const SumType = struct {
+        members: []const *const TypeExpr,
+        span: Span,
+
+        pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            for (self.members, 0..) |member, i| {
+                if (i > 0) try writer.writeAll(" || ");
+                try writer.print("{f}", .{member});
+            }
         }
     };
 
@@ -542,6 +557,7 @@ pub const TypeExpr = union(enum) {
             .error_union,
             .error_set,
             .type_merge,
+            .sum,
             .err,
             .alias,
             .identifier,

@@ -783,12 +783,12 @@ pub const TypeChecker = struct {
         };
     }
 
-    /// Resolves a type-level `A || B` merge. Currently only error sets may be
-    /// merged (backlog #18): the result is a single `error_set` whose variants
-    /// are the union (by name) of both operands'. A duplicate variant name must
-    /// carry the same payload type. Nested merges (`A || B || C`) flatten
-    /// naturally via recursion. General sum types over arbitrary member types
-    /// are a separate feature (future/sum-types-plan.md).
+    /// Resolves a type-level `A || B` merge. When both operands are error sets
+    /// the result is a single merged `error_set` (backlog #18 — see
+    /// `mergeErrorSets`). Otherwise it is a structural `sum` type whose members
+    /// are normalized: nested sums are flattened and duplicates removed (see
+    /// `future/sum-types-plan.md`). Nested merges (`A || B || C`) compose via
+    /// recursion.
     fn resolveTypeMerge(
         self: *TypeChecker,
         scope: *Scope,
@@ -797,26 +797,30 @@ pub const TypeChecker = struct {
         const lhs = self.unaliasType(try self.resolveTypeExpr(scope, merge.lhs));
         const rhs = self.unaliasType(try self.resolveTypeExpr(scope, merge.rhs));
 
-        if (lhs.* != .error_set or rhs.* != .error_set) {
-            try self.reportSpanError(
-                merge.span,
-                Error.TypeMismatch,
-                .@"error",
-                "`||` currently merges only error sets, found {f} || {f} (general sum types are not implemented yet)",
-                .{ lhs, rhs },
-            );
-            return try self.allocTypeExpression(.{ .failed = .{ .span = merge.span } });
+        if (lhs.* == .error_set and rhs.* == .error_set) {
+            return try self.mergeErrorSets(scope, lhs.error_set, rhs.error_set, merge.span);
         }
 
-        var variants: std.ArrayListUnmanaged(ast.TypeExpr.ErrorSet.Variant) = .empty;
-        try variants.appendSlice(self.arena.allocator(), lhs.error_set.variants);
+        return try self.buildSumType(lhs, rhs, merge.span);
+    }
 
-        for (rhs.error_set.variants) |rv| {
-            if (lhs.error_set.variant(rv.name.name)) |lv| {
-                // Duplicate variant name: payloads must be compatible.
+    /// Unions two error sets by name into one `error_set` (#18). A duplicate
+    /// variant name must carry a compatible payload type, else a diagnostic.
+    fn mergeErrorSets(
+        self: *TypeChecker,
+        scope: *Scope,
+        lhs: ast.TypeExpr.ErrorSet,
+        rhs: ast.TypeExpr.ErrorSet,
+        span: ast.Span,
+    ) Error!*const ast.TypeExpr {
+        var variants: std.ArrayListUnmanaged(ast.TypeExpr.ErrorSet.Variant) = .empty;
+        try variants.appendSlice(self.arena.allocator(), lhs.variants);
+
+        for (rhs.variants) |rv| {
+            if (lhs.variant(rv.name.name)) |lv| {
                 if (!try self.mergeVariantPayloadsCompatible(scope, lv.payload, rv.payload)) {
                     try self.reportSpanError(
-                        merge.span,
+                        span,
                         Error.TypeMismatch,
                         .@"error",
                         "conflicting payload for variant '{s}' in merged error set",
@@ -831,9 +835,48 @@ pub const TypeChecker = struct {
         return try self.allocTypeExpression(.{
             .error_set = .{
                 .variants = try variants.toOwnedSlice(self.arena.allocator()),
-                .span = merge.span,
+                .span = span,
             },
         });
+    }
+
+    /// Builds a normalized structural `sum` type from two (already unaliased)
+    /// member types: flattens any operand that is itself a sum, and drops
+    /// members structurally equal to one already present.
+    fn buildSumType(
+        self: *TypeChecker,
+        lhs: *const ast.TypeExpr,
+        rhs: *const ast.TypeExpr,
+        span: ast.Span,
+    ) Error!*const ast.TypeExpr {
+        var members: std.ArrayListUnmanaged(*const ast.TypeExpr) = .empty;
+        try self.appendSumMembers(&members, lhs);
+        try self.appendSumMembers(&members, rhs);
+
+        return try self.allocTypeExpression(.{
+            .sum = .{
+                .members = try members.toOwnedSlice(self.arena.allocator()),
+                .span = span,
+            },
+        });
+    }
+
+    /// Appends `t`'s members to `members`, flattening a nested sum and skipping
+    /// any member already present (structural equality via `pipeTypesEqual`).
+    fn appendSumMembers(
+        self: *TypeChecker,
+        members: *std.ArrayListUnmanaged(*const ast.TypeExpr),
+        t: *const ast.TypeExpr,
+    ) Error!void {
+        const unaliased = self.unaliasType(t);
+        if (unaliased.* == .sum) {
+            for (unaliased.sum.members) |m| try self.appendSumMembers(members, m);
+            return;
+        }
+        for (members.items) |existing| {
+            if (self.pipeTypesEqual(existing, unaliased)) return;
+        }
+        try members.append(self.arena.allocator(), unaliased);
     }
 
     /// Two same-named variants from merged error sets are compatible when both
@@ -1350,6 +1393,7 @@ pub const TypeChecker = struct {
                 try self.runTypeExpression(scope, merge.lhs);
                 try self.runTypeExpression(scope, merge.rhs);
             },
+            .sum => |sum| for (sum.members) |member| try self.runTypeExpression(scope, member),
             .err => {},
             .array => |*array| self.runTypeArray(scope, array),
             .struct_type, .module, .tuple, .function, .fn_ref_type => {},
@@ -2118,7 +2162,7 @@ pub const TypeChecker = struct {
             .thread => try self.runThreadMemberAccess(&member.member),
             .struct_type => |struct_type| try self.runStructMemberAccess(struct_type, &member.member),
             .error_set => |error_set| try self.runErrorSetMemberAccess(error_set, &member.member),
-            .null, .promise, .error_union, .err, .tuple, .function, .fn_ref_type, .integer, .float, .boolean, .byte, .alias, .void, .type_merge => return error.UnsupportedMemberAccess,
+            .null, .promise, .error_union, .err, .tuple, .function, .fn_ref_type, .integer, .float, .boolean, .byte, .alias, .void, .type_merge, .sum => return error.UnsupportedMemberAccess,
             .module => |module| try self.runModuleMemberAccess(module, &member.member),
             .execution => |execution| try self.runExecutionMemberAccess(execution, &member.member),
             // .lazy => {
@@ -2891,9 +2935,14 @@ pub const TypeChecker = struct {
                 options,
             ),
             .fn_ref_type => {},
-            // A `||` merge is resolved to a concrete `error_set` before it is
-            // stored as a binding type, so a raw merge should not reach here.
+            // A `||` merge is resolved to a concrete `error_set` or `sum` before
+            // it is stored as a binding type, so a raw merge should not reach here.
             .type_merge => {},
+            .sum => |sum| self.validateTypeAssignmentSum(
+                sum,
+                assignment_type,
+                options,
+            ),
             // .lazy => |lazy| self.validateTypeAssignmentLazy(
             //     lazy,
             //     assignment_type,
@@ -2982,6 +3031,52 @@ pub const TypeChecker = struct {
             .null => return,
             else => try self.validateTypeAssignment(assignee.child, assignment_type, options),
         }
+    }
+
+    /// Widening into a sum: a value is assignable to `A || B (|| …)` when its
+    /// type is (structurally) one of the members, or itself a sub-sum whose
+    /// members are all present. Narrowing (sum → member) is not allowed here —
+    /// that requires an explicit type-`match` (Phase 3, future/sum-types-plan.md).
+    pub fn validateTypeAssignmentSum(
+        self: *TypeChecker,
+        assignee: ast.TypeExpr.SumType,
+        assignment_type: *const ast.TypeExpr,
+        options: ValidateTypeAssignmentOptions,
+    ) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.logTypeCheckTrace(@src().fn_name, assignment_type.span());
+
+        const actual = self.unaliasType(assignment_type);
+
+        // A sub-sum widens iff every one of its members is in the assignee.
+        if (actual.* == .sum) {
+            for (actual.sum.members) |m| {
+                if (!self.sumHasMember(assignee, m)) {
+                    return try self.reportAssignmentError(
+                        @as(*const ast.TypeExpr, @fieldParentPtr("sum", &assignee)),
+                        assignment_type,
+                        options,
+                    );
+                }
+            }
+            return;
+        }
+
+        if (self.sumHasMember(assignee, actual)) return;
+
+        try self.reportAssignmentError(
+            @as(*const ast.TypeExpr, @fieldParentPtr("sum", &assignee)),
+            assignment_type,
+            options,
+        );
+    }
+
+    /// Whether `t` is structurally equal to one of the sum's members.
+    fn sumHasMember(self: *TypeChecker, sum: ast.TypeExpr.SumType, t: *const ast.TypeExpr) bool {
+        for (sum.members) |member| {
+            if (self.pipeTypesEqual(member, t)) return true;
+        }
+        return false;
     }
 
     pub fn validateTypeAssignmentNull(

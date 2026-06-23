@@ -6,7 +6,7 @@ e.g. `const IntOrString = Int || String`. A value of `A || B` is *either* an
 error-handling backlog (the error-set merge, `future/error-handling-plan.md`
 item 18, is the narrow special case that ships first and independently).
 
-Status: **not started — design doc.** Branch: TBD.
+Status: **Phase 1 done; Phase 2 (widening) started.** Branch: `sum-types` (off `error`).
 
 ## Key architectural fact
 
@@ -54,25 +54,29 @@ work is small: one type-discriminant test op (analogous to the existing
 
 ## Phases
 
-- [ ] **Phase 1 — Parse & represent.** Add `ast.TypeExpr.sum` (a slice of member
-  `*const TypeExpr`). Recognize `A || B` in type-binding position. Two routes:
-  - **(i) type-checker detection** (recommended first): in the binding-decl
-    handler, if the RHS is a `.binary{.logical_or}` chain whose every leaf
-    `resolveExprType`s to a *type* (not a value), synthesize a `.sum` and treat
-    the binding as a type binding. Least invasive; covers the named-binding form.
-  - **(ii) dedicated type-expr parsing**: claim `||` while parsing a type-expr so
-    inline positions work (`(Int || String)` as a param/return type). Needed for
-    inline use; deferred behind (i).
-  - Normalize on construction: flatten nested sums, dedup members by structural
-    equality, define a canonical order for equality.
+- [x] **Phase 1 — Parse & represent. DONE (2026-06-23).** Reused route **(ii)**:
+  the `A || B` type-expr parsing already exists from the error-set merge (#18) as
+  the `ast.TypeExpr.type_merge` node (so `const X = …` works, and inline
+  `(A || B)` via the paren path). Added `ast.TypeExpr.sum` (slice of member
+  `*const TypeExpr`). `resolveTypeMerge` now splits: both operands error sets →
+  merged `error_set` (#18, `mergeErrorSets`); otherwise → a structural `sum`
+  (`buildSumType`). Normalization on construction: `appendSumMembers` flattens a
+  nested sum and dedups members by `pipeTypesEqual`. Exhaustive `TypeExpr`
+  switches got `.sum` arms (`runTypeExpression` recurses into members; member
+  access → `UnsupportedMemberAccess`). Tests: `sum_type_regression`.
+  - Canonical *order* for equality isn't defined yet — equality currently relies
+    on member-wise comparison and would treat `Int || String` and
+    `String || Int` as distinct. Order-insensitive equality is part of Phase 2.
 
-- [ ] **Phase 2 — Type equality & assignability.** `pipeTypesEqual` / the
-  type-compat engine must treat sums as unordered sets. Widening: a value of
-  member type `M` is assignable to a sum `S` iff `M ∈ S` (or `M` is a sub-sum of
-  `S`). Reverse (sum → member) is rejected without narrowing. Thread through
-  `validateTypeAssignment*`, `unaliasType`, param/return/binding typing. **This
-  is the bulk of the work and the main risk** — the compat code is the most
-  intricate in the codebase (pointer-equality matching, existing TODOs).
+- [~] **Phase 2 — Type equality & assignability. STARTED.** **Widening done**:
+  `validateTypeAssignmentSum` accepts a value whose type is one of the members,
+  or a sub-sum whose members are all present (`sumHasMember`); a non-member is a
+  clear "expected type … actual …" mismatch. Tests: `sum_type_regression`
+  (widen Int/String/Float, flatten+dedup), `sum_type_widen_mismatch` (Bool ∉
+  `Int || String`). **Remaining**: order-insensitive sum *equality* in
+  `pipeTypesEqual` (so `Int || String` == `String || Int` and sum-typed params /
+  returns / function signatures compare correctly); reject the reverse (sum →
+  member) consistently everywhere; interactions with optionals/error-unions.
 
 - [ ] **Phase 3 — Narrowing via type-`match`.** Extend `match` (today dispatches
   on error variants) to dispatch on a sum's member type, binding the narrowed
