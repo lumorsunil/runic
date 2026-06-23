@@ -150,10 +150,30 @@ defer `||` / negation composition.
     the pre-existing bool-as-exit_code quirk — `true`→`0`; use it in control flow.)
     Limitation: `typeTagOf` matches builtin primitive names / resolved forms; an
     alias-to-primitive or a non-primitive `T` isn't testable yet.
-  - **3b (todo):** the per-binding **flow-type override** in `Scope` + the
-    condition analyzer that turns a guard into {then-facts, else-facts}, wiring
-    `if`/`else` to install facts per branch and restore/merge at the join.
-    `is`-based narrowing for `const` first (then `T`, else `sum − T`).
+  - **3b (done, 2026-06-23):** `is`-based flow narrowing in `if`/`else`.
+    `collectNarrowingFacts` turns a guard into {then,else} facts (an `x is T`
+    proves `x: T` in the then-branch and `x: sum − T` in the else; `&&` proves
+    both operands in the then-branch); `installNarrowFacts` shadows the binding
+    with the refined type in each branch scope (`sumWithout` collapses a
+    two-member else to the survivor). Implemented as scoped shadow declarations,
+    so leaving the branch restores the declared type. **Immutable bindings only**
+    for now (a `var`'s flow type changes on reassignment — Phase 5). Verified:
+    `const n: Int = x` accepted inside `if (x is Int)` and rejected outside;
+    else narrows to the complement; conjunctions narrow both; 3-member else stays
+    a sum and re-narrows. Test: `sum_narrowing_regression` (direct member use:
+    arithmetic + interpolation of the narrowed binding).
+    - **Discovered (pre-existing, unrelated) codegen bug:** `const n = <binding>`
+      (copying/aliasing another binding) *inside an `if` body* followed by an
+      interpolating `echo` corrupts the IR stack (`error.FileNotFound`). Repros
+      with no sums and no `is` (`const x = 5; if (cond) { const n = x; echo
+      "${n}" }`); top-level and literal-RHS forms are fine. Same class as the
+      error-handling stack-counter drift (#15). It blocks the *copy-then-use*
+      narrowing pattern, so the regression test uses the narrowed binding
+      directly. **Needs a separate IR fix.**
+    - **Phase 2 gap (still open):** arithmetic/operators on a *bare* (un-narrowed)
+      sum aren't rejected yet, so narrowing isn't strictly *required* for those
+      ops — enforcement lands with the Phase 8 "no member-specific ops on a bare
+      sum" work. Assignment widening *is* enforced (`sum_type_widen_mismatch`).
 
 - [ ] **Phase 4 — Comparison & relational narrowing.** Allow `==`/`!=` and
   relational ops between a sum and a member (type check + evaluator: compare

@@ -1706,18 +1706,124 @@ pub const TypeChecker = struct {
         return ptr;
     }
 
+    /// A flow-narrowing fact: within a branch, `name` has the refined type
+    /// `type_expr` (a scoped shadow of its declared type). See
+    /// `future/sum-types-plan.md`.
+    const NarrowFact = struct { name: []const u8, type_expr: *const ast.TypeExpr };
+
     pub fn runIfExpr(self: *TypeChecker, scope: *Scope, if_expr: *ast.IfExpr) Error!void {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, if_expr.span);
 
         try self.runExpression(scope, if_expr.condition);
         const condition_type = try self.resolveConditionType(scope, if_expr.condition);
+
+        // Derive flow-narrowing facts the condition proves about sum-typed
+        // bindings, and install them as scoped shadows so the branch bodies see
+        // the refined types (then: the tested type; else: the rest).
+        var then_facts: std.ArrayListUnmanaged(NarrowFact) = .empty;
+        var else_facts: std.ArrayListUnmanaged(NarrowFact) = .empty;
+        try self.collectNarrowingFacts(scope, if_expr.condition, &then_facts, &else_facts);
+
         const then_scope = try scope.addChild(self.arena.allocator(), if_expr.span);
+        try self.installNarrowFacts(then_scope, then_facts.items);
         try self.runIfCapture(then_scope, if_expr, condition_type);
         try self.runExpression(then_scope, if_expr.then_expr);
+
         if (if_expr.else_branch) |*else_branch| {
-            try self.runElseBranch(scope, else_branch);
+            const else_scope = try scope.addChild(self.arena.allocator(), if_expr.span);
+            try self.installNarrowFacts(else_scope, else_facts.items);
+            try self.runElseBranch(else_scope, else_branch);
         }
+    }
+
+    /// Installs narrowing facts into a branch scope as shadowing bindings, so
+    /// lookups inside the branch resolve to the refined type.
+    fn installNarrowFacts(self: *TypeChecker, branch_scope: *Scope, facts: []const NarrowFact) Error!void {
+        for (facts) |fact| {
+            branch_scope.declare(
+                self.arena.allocator(),
+                ast.Identifier.global(fact.name),
+                fact.type_expr,
+                false,
+                false,
+            ) catch |err| switch (err) {
+                // Already shadowed (e.g. a capture) — leave it.
+                error.IdentifierAlreadyDeclared => {},
+                else => return err,
+            };
+        }
+    }
+
+    /// Extracts the narrowing facts a condition proves: `then_facts` hold inside
+    /// the then-branch, `else_facts` inside the else-branch. Handles `x is T`
+    /// and `&&` conjunctions; other conditions contribute nothing (yet). Only
+    /// immutable bindings are narrowed for now (a `var`'s flow type can change on
+    /// reassignment — a later phase).
+    fn collectNarrowingFacts(
+        self: *TypeChecker,
+        scope: *Scope,
+        condition: *const ast.Expression,
+        then_facts: *std.ArrayListUnmanaged(NarrowFact),
+        else_facts: *std.ArrayListUnmanaged(NarrowFact),
+    ) Error!void {
+        switch (condition.*) {
+            .is_expr => |is_expr| {
+                const name = referencedBindingName(is_expr.subject) orelse return;
+                const binding = scope.lookup(name) orelse return;
+                if (binding.is_mutable) return;
+                const declared = binding.type_expr orelse return;
+                const tested = self.unaliasType(try self.resolveTypeExpr(scope, is_expr.type_expr));
+
+                try then_facts.append(self.arena.allocator(), .{ .name = name, .type_expr = tested });
+                if (try self.sumWithout(declared, tested)) |narrowed| {
+                    try else_facts.append(self.arena.allocator(), .{ .name = name, .type_expr = narrowed });
+                }
+            },
+            // `a && b` proves both in the then-branch; the else-branch can't be
+            // narrowed (only that *some* operand is false).
+            .binary => |binary| if (binary.op == .logical_and) {
+                var discard: std.ArrayListUnmanaged(NarrowFact) = .empty;
+                try self.collectNarrowingFacts(scope, binary.left, then_facts, &discard);
+                try self.collectNarrowingFacts(scope, binary.right, then_facts, &discard);
+            },
+            else => {},
+        }
+    }
+
+    /// The type a sum has after removing `member` (the else-branch of `x is T`):
+    /// the remaining members, collapsed to a single type when one remains. Null
+    /// when `declared` isn't a sum, or nothing remains.
+    fn sumWithout(
+        self: *TypeChecker,
+        declared: *const ast.TypeExpr,
+        member: *const ast.TypeExpr,
+    ) Error!?*const ast.TypeExpr {
+        const d = self.unaliasType(declared);
+        if (d.* != .sum) return null;
+
+        var remaining: std.ArrayListUnmanaged(*const ast.TypeExpr) = .empty;
+        for (d.sum.members) |m| {
+            if (!self.pipeTypesEqual(m, member)) try remaining.append(self.arena.allocator(), m);
+        }
+        if (remaining.items.len == 0) return null;
+        if (remaining.items.len == 1) return remaining.items[0];
+        return try self.allocTypeExpression(.{
+            .sum = .{ .members = try remaining.toOwnedSlice(self.arena.allocator()), .span = d.sum.span },
+        });
+    }
+
+    /// The binding name referenced by an expression (a bare identifier, or the
+    /// zero-arg call a bare identifier parses into), or null.
+    fn referencedBindingName(expr: *const ast.Expression) ?[]const u8 {
+        return switch (expr.*) {
+            .identifier => |identifier| identifier.name,
+            .call => |call| if (call.arguments.len == 0 and call.callee.* == .identifier)
+                call.callee.identifier.name
+            else
+                null,
+            else => null,
+        };
     }
 
     fn runIfCapture(
