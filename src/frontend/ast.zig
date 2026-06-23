@@ -802,6 +802,7 @@ pub const Expression = union(enum) {
     match_expr: MatchExpr,
     try_expr: TryExpr,
     catch_expr: CatchExpr,
+    is_expr: IsExpr,
     import_expr: ImportExpr,
     assignment: Assignment,
     executable: ExecutableExpr,
@@ -1380,6 +1381,28 @@ pub const TryExpr = struct {
             .error_union => |error_union| error_union.payload,
             else => subject_type,
         };
+    }
+};
+
+/// The `Bool` result type shared by every `is` test.
+const is_result_type = TypeExpr{ .boolean = .{ .span = .global } };
+
+/// `x is T` — a runtime type test evaluating to `Bool`. Also the basis for sum
+/// narrowing (the type checker derives narrowing facts from it). See
+/// `future/sum-types-plan.md`.
+pub const IsExpr = struct {
+    subject: *Expression,
+    type_expr: *const TypeExpr,
+    span: Span,
+
+    pub fn resolveType(
+        self: *@This(),
+        _: std.Io,
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*const TypeExpr {
+        _ = self;
+        return &is_result_type;
     }
 };
 

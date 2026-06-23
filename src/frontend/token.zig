@@ -174,6 +174,9 @@ pub const Tag = enum {
     kw_try,
     kw_catch,
 
+    /// `x is T` — a runtime type test (Bool), and the basis for sum narrowing.
+    kw_is,
+
     // Literal keywords
     kw_true,
     kw_false,
@@ -257,6 +260,7 @@ pub const Tag = enum {
             .kw_import => "import",
             .kw_try => "try",
             .kw_catch => "catch",
+            .kw_is => "is",
             .kw_true => "true",
             .kw_false => "false",
             .kw_null => "null",
@@ -299,6 +303,7 @@ const keyword_map = std.StaticStringMap(Tag).initComptime(.{
     .{ "import", .kw_import },
     .{ "try", .kw_try },
     .{ "catch", .kw_catch },
+    .{ "is", .kw_is },
     .{ "true", .kw_true },
     .{ "false", .kw_false },
     .{ "null", .kw_null },

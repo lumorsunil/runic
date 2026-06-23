@@ -107,6 +107,9 @@ pub const Instruction = struct {
         neg: Neg,
         /// sets result to a boolean: whether operand is an error value (`.err`)
         is_err: Neg,
+        /// sets result to a boolean: whether operand's runtime value is of the
+        /// given type tag (the `x is T` operator / sum narrowing)
+        is_type: IsType,
         /// constructs an error value (boxing the runtime payload, if any)
         make_err: MakeErr,
         /// sets result to a boolean: whether operand is an error value whose
@@ -314,6 +317,18 @@ pub const Instruction = struct {
         operand: Location,
         set: []const u8,
         variant: []const u8,
+        result: Location,
+    };
+
+    /// The runtime type categories testable by the `x is T` operator. Each maps
+    /// to one or more `Value` tags (e.g. `string` accepts both `.zig_string` and
+    /// `.slice`); see `Evaluator`'s `is_type` handler.
+    pub const TypeTag = enum { int, float, string, boolean };
+
+    /// Tests whether `operand`'s runtime value matches `tag`.
+    pub const IsType = struct {
+        operand: Location,
+        tag: TypeTag,
         result: Location,
     };
 

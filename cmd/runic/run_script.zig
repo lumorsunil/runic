@@ -324,6 +324,7 @@ const StatementExpressionIterator = struct {
                 try cursor.appendExpr(match_expr.subject);
             },
             .try_expr => |try_expr| try cursor.appendExpr(try_expr.subject),
+            .is_expr => |is_expr| try cursor.appendExpr(is_expr.subject),
             .catch_expr => |catch_expr| {
                 try cursor.appendExpr(catch_expr.handler);
                 try cursor.appendExpr(catch_expr.subject);

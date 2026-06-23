@@ -137,12 +137,23 @@ defer `||` / negation composition.
   returns / function signatures compare correctly); reject the reverse (sum →
   member) consistently everywhere; interactions with optionals/error-unions.
 
-- [ ] **Phase 3 — `is` type test + flow-type infrastructure.** Add the `x is T`
-  operator (parser, type check → `Bool`, IR tag-test op like `is_err`). Build the
-  per-binding **flow-type override** in `Scope` and the condition analyzer that
-  turns a guard into {then-facts, else-facts}. Wire `if`/`else` to install the
-  facts in each branch scope and restore/merge at the join. Covers `is`-based
-  narrowing for `const` first (then-branch `T`, else-branch `sum − T`).
+- [~] **Phase 3 — `is` type test + flow-type infrastructure. 3a DONE (operator);
+  3b TODO (narrowing).**
+  - **3a (done, 2026-06-23):** the `x is T` operator end to end. Token `kw_is`;
+    `ast.IsExpr` (resolves to `Bool`); parser folds `is` as a tight postfix in the
+    binary parser's `.op` state (so `x is Int && y is String` parses correctly);
+    type checker `runIs`; IR `compileIs` + a new `is_type` instruction with a
+    `TypeTag` (`int`/`float`/`string`/`boolean`), evaluated against the runtime
+    `Value` tag (Int=`uinteger`, Float=`float`, Bool=`exit_code`, String=
+    `zig_string`/`slice`). Works on any value, composes with `&&`. Test:
+    `is_operator_regression`. (Note: a bare `is` result printed via `${}` shows
+    the pre-existing bool-as-exit_code quirk — `true`→`0`; use it in control flow.)
+    Limitation: `typeTagOf` matches builtin primitive names / resolved forms; an
+    alias-to-primitive or a non-primitive `T` isn't testable yet.
+  - **3b (todo):** the per-binding **flow-type override** in `Scope` + the
+    condition analyzer that turns a guard into {then-facts, else-facts}, wiring
+    `if`/`else` to install facts per branch and restore/merge at the join.
+    `is`-based narrowing for `const` first (then `T`, else `sum − T`).
 
 - [ ] **Phase 4 — Comparison & relational narrowing.** Allow `==`/`!=` and
   relational ops between a sum and a member (type check + evaluator: compare

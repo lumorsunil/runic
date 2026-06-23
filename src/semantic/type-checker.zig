@@ -1120,6 +1120,7 @@ pub const TypeChecker = struct {
                 try self.validateFunctionBodyStdin(scope, catch_expr.subject, enclosing_stdin);
                 try self.validateFunctionBodyStdin(scope, catch_expr.handler, enclosing_stdin);
             },
+            .is_expr => |is_expr| try self.validateFunctionBodyStdin(scope, is_expr.subject, enclosing_stdin),
             .unary => |unary| try self.validateFunctionBodyStdin(scope, unary.operand, enclosing_stdin),
             .binary => |binary| {
                 try self.validateFunctionBodyStdin(scope, binary.left, enclosing_stdin);
@@ -1331,6 +1332,7 @@ pub const TypeChecker = struct {
             .match_expr => |*match_expr| self.runMatchExpr(scope, match_expr),
             .catch_expr => |*catch_expr| self.runCatch(scope, catch_expr),
             .try_expr => |*try_expr| self.runTry(scope, try_expr),
+            .is_expr => |*is_expr| self.runIs(scope, is_expr),
             .import_expr => |*import_expr| self.runImportExpr(scope, import_expr),
             .fn_decl => |*fn_decl| self.runFnDecl(scope, fn_decl),
             .call => |*call| self.runCall(scope, call),
@@ -1846,6 +1848,17 @@ pub const TypeChecker = struct {
                 .{st},
             ),
         };
+    }
+
+    /// `x is T` — type-check the subject and the tested type. Always evaluates
+    /// to `Bool`. (Narrowing facts derived from it are handled where conditions
+    /// are analyzed; see future/sum-types-plan.md.)
+    pub fn runIs(self: *TypeChecker, scope: *Scope, is_expr: *ast.IsExpr) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.logTypeCheckTrace(@src().fn_name, is_expr.span);
+
+        try self.runExpression(scope, is_expr.subject);
+        try self.runTypeExpression(scope, is_expr.type_expr);
     }
 
     pub fn runTry(self: *TypeChecker, scope: *Scope, try_expr: *ast.TryExpr) Error!void {

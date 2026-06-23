@@ -1262,6 +1262,19 @@ pub const IREvaluator = struct {
                 try self.setLocation(thread, is_err.result, .fromBoolean(operand == .err));
                 return .cont;
             },
+            .is_type => |is_type| {
+                const operand = try self.resolveLocation(thread, is_type.operand);
+                const matches = switch (is_type.tag) {
+                    .int => operand == .uinteger,
+                    .float => operand == .float,
+                    // Bool is carried as an exit code (see the compiler).
+                    .boolean => operand == .exit_code,
+                    // A string is either an interned Zig string or a runtime byte slice.
+                    .string => operand == .zig_string or operand == .slice,
+                };
+                try self.setLocation(thread, is_type.result, .fromBoolean(matches));
+                return .cont;
+            },
             .make_err => |make_err| {
                 const payload_ptr: ?*const ir.Value = if (make_err.payload) |payload| blk: {
                     const value = try self.resolveValueSource(thread, payload);

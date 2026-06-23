@@ -1865,6 +1865,7 @@ pub const IRCompiler = struct {
             .struct_literal => |struct_literal| self.compileStructLiteral(expr, struct_literal),
             .catch_expr => |catch_expr| self.compileCatch(expr, catch_expr),
             .try_expr => |try_expr| self.compileTry(expr, try_expr),
+            .is_expr => |is_expr| self.compileIs(expr, is_expr),
             .for_expr => |for_expr| self.compileForLoop(expr, for_expr),
             .subshell => |subshell| self.compileSubshell(expr, subshell),
             .fd => |fd_expr| self.compileFd(expr, fd_expr),
@@ -2632,6 +2633,57 @@ pub const IRCompiler = struct {
             else => null,
         };
         return .from(subject_ref.dereference().typed(payload_type));
+    }
+
+    /// `x is T` — compile the subject, then test its runtime value's tag against
+    /// `T`. Evaluates to `Bool`.
+    fn compileIs(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        is_expr: ast.IsExpr,
+    ) Error!Result {
+        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        const tag = typeTagOf(is_expr.type_expr) orelse {
+            try self.reportSourceError(source, Error.UnsupportedExpression, .@"error", "`is` is not supported for type \"{f}\" yet", .{is_expr.type_expr});
+            return .fromValue(.fromBoolean(false));
+        };
+
+        const subject_ref = try self.newRef(source, "is_subject");
+        _ = try self.compileStableExpressionIntoRef(source, is_expr.subject, subject_ref);
+
+        const result_ref = try self.newRef(source, "is_result");
+        try self.addInstruction(.init(.from(source), .{ .is_type = .{
+            .operand = subject_ref.dereference(),
+            .tag = tag,
+            .result = result_ref,
+        } }));
+
+        return .from(result_ref.dereference().typed(.{ .boolean = .{ .span = source.span() } }));
+    }
+
+    /// Maps a type expression to its runtime `TypeTag`, or null when the type
+    /// isn't yet testable by `is`. The `is T` operand is unresolved AST, so the
+    /// builtin primitives arrive as identifiers (`Int`, `String`, …); resolved
+    /// primitive forms are also accepted.
+    fn typeTagOf(type_expr: *const ast.TypeExpr) ?ir.Instruction.TypeTag {
+        return switch (type_expr.*) {
+            .identifier => |named| {
+                const name = named.path.segments[named.path.segments.len - 1].name;
+                if (std.mem.eql(u8, name, "Int")) return .int;
+                if (std.mem.eql(u8, name, "Float")) return .float;
+                if (std.mem.eql(u8, name, "Bool")) return .boolean;
+                if (std.mem.eql(u8, name, "String")) return .string;
+                return null;
+            },
+            .integer => .int,
+            .float => .float,
+            .boolean => .boolean,
+            // `String` is `[]Byte`.
+            .array => |array| if (array.element.* == .byte) .string else null,
+            .alias => |alias| typeTagOf(alias.type_expr),
+            else => null,
+        };
     }
 
     fn compileCatchHandler(
