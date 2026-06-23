@@ -162,14 +162,18 @@ defer `||` / negation composition.
     else narrows to the complement; conjunctions narrow both; 3-member else stays
     a sum and re-narrows. Test: `sum_narrowing_regression` (direct member use:
     arithmetic + interpolation of the narrowed binding).
-    - **Discovered (pre-existing, unrelated) codegen bug:** `const n = <binding>`
-      (copying/aliasing another binding) *inside an `if` body* followed by an
-      interpolating `echo` corrupts the IR stack (`error.FileNotFound`). Repros
-      with no sums and no `is` (`const x = 5; if (cond) { const n = x; echo
-      "${n}" }`); top-level and literal-RHS forms are fine. Same class as the
-      error-handling stack-counter drift (#15). It blocks the *copy-then-use*
-      narrowing pattern, so the regression test uses the narrowed binding
-      directly. **Needs a separate IR fix.**
+    - **Correction (2026-06-23): there is NO codegen/stack-drift bug.** An earlier
+      note here claimed `const n = x` inside a branch corrupted the IR stack —
+      that was a misdiagnosis from testing with single-line `;`. Multi-line
+      narrowing works end to end, including `const n: Int = x` copy-then-use
+      (verified). What actually fails is a **pre-existing, general parser quirk**,
+      unrelated to sums/narrowing/codegen: a binding whose initializer is a
+      *command-like bare identifier*, followed by `;` and more statements on the
+      **same line**, swallows those statements as command arguments —
+      `const z = y; echo "hi"` doesn't run the echo, while `const v = 1; echo
+      "hi"` (literal RHS) and `echo "a"; echo "b"` both work, and the
+      newline-separated form always works. Tracked as a separate parser bug; the
+      regression test uses newline-separated statements.
     - **Phase 2 gap (still open):** arithmetic/operators on a *bare* (un-narrowed)
       sum aren't rejected yet, so narrowing isn't strictly *required* for those
       ops — enforcement lands with the Phase 8 "no member-specific ops on a bare
