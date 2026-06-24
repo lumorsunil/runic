@@ -1780,15 +1780,114 @@ pub const TypeChecker = struct {
                     try else_facts.append(self.arena.allocator(), .{ .name = name, .type_expr = narrowed });
                 }
             },
-            // `a && b` proves both in the then-branch; the else-branch can't be
-            // narrowed (only that *some* operand is false).
-            .binary => |binary| if (binary.op == .logical_and) {
-                var discard: std.ArrayListUnmanaged(NarrowFact) = .empty;
-                try self.collectNarrowingFacts(scope, binary.left, then_facts, &discard);
-                try self.collectNarrowingFacts(scope, binary.right, then_facts, &discard);
+            .binary => |binary| switch (binary.op) {
+                // `a && b` proves both in the then-branch; the else-branch can't
+                // be narrowed (only that *some* operand is false).
+                .logical_and => {
+                    var discard: std.ArrayListUnmanaged(NarrowFact) = .empty;
+                    try self.collectNarrowingFacts(scope, binary.left, then_facts, &discard);
+                    try self.collectNarrowingFacts(scope, binary.right, then_facts, &discard);
+                },
+                // `x == v` narrows the then-branch to the members of `x`'s sum
+                // that `v`'s type can be (the intersection); `!=` narrows the
+                // else-branch symmetrically. The other branch can't narrow.
+                .equal => try self.collectEqualityNarrowing(scope, binary, then_facts),
+                .not_equal => try self.collectEqualityNarrowing(scope, binary, else_facts),
+                // Relational ops narrow the then-branch to the members that
+                // *support* the operator (numeric members).
+                .less, .less_equal, .greater, .greater_equal => try self.collectRelationalNarrowing(scope, binary, then_facts),
+                else => {},
             },
             else => {},
         }
+    }
+
+    /// Narrowing for `x == v` / (else of) `x != v`: narrow `x` to the
+    /// intersection of its sum members with `v`'s type. Either operand may be
+    /// the binding.
+    fn collectEqualityNarrowing(
+        self: *TypeChecker,
+        scope: *Scope,
+        binary: ast.BinaryExpr,
+        target: *std.ArrayListUnmanaged(NarrowFact),
+    ) Error!void {
+        const sides = bindingAndValueSides(binary.left, binary.right) orelse return;
+        const binding = scope.lookup(sides.name) orelse return;
+        if (binding.is_mutable) return;
+        const declared = binding.type_expr orelse return;
+        const value_raw = (try self.resolveExprType(scope, sides.value)) orelse return;
+        const value_type = self.unaliasType(try self.resolveTypeExpr(scope, value_raw));
+        if (try self.sumIntersect(declared, value_type)) |narrowed| {
+            try target.append(self.arena.allocator(), .{ .name = sides.name, .type_expr = narrowed });
+        }
+    }
+
+    /// Narrowing for a relational comparison (`<`, `>`, `<=`, `>=`): narrow `x`
+    /// to its numeric members (the ones that support the operator).
+    fn collectRelationalNarrowing(
+        self: *TypeChecker,
+        scope: *Scope,
+        binary: ast.BinaryExpr,
+        target: *std.ArrayListUnmanaged(NarrowFact),
+    ) Error!void {
+        const sides = bindingAndValueSides(binary.left, binary.right) orelse return;
+        const binding = scope.lookup(sides.name) orelse return;
+        if (binding.is_mutable) return;
+        const d = self.unaliasType(binding.type_expr orelse return);
+        if (d.* != .sum) return;
+
+        var numeric: std.ArrayListUnmanaged(*const ast.TypeExpr) = .empty;
+        for (d.sum.members) |m| {
+            switch (m.*) {
+                .integer, .float => try numeric.append(self.arena.allocator(), m),
+                else => {},
+            }
+        }
+        if (numeric.items.len == 0 or numeric.items.len == d.sum.members.len) return;
+        const narrowed = if (numeric.items.len == 1)
+            numeric.items[0]
+        else
+            try self.allocTypeExpression(.{ .sum = .{ .members = try numeric.toOwnedSlice(self.arena.allocator()), .span = d.sum.span } });
+        try target.append(self.arena.allocator(), .{ .name = sides.name, .type_expr = narrowed });
+    }
+
+    const BindingValueSides = struct { name: []const u8, value: *ast.Expression };
+
+    /// For a binary comparison, identifies which operand is a narrowable binding
+    /// reference and which is the compared value (in either order).
+    fn bindingAndValueSides(left: *ast.Expression, right: *ast.Expression) ?BindingValueSides {
+        if (referencedBindingName(left)) |name| return .{ .name = name, .value = right };
+        if (referencedBindingName(right)) |name| return .{ .name = name, .value = left };
+        return null;
+    }
+
+    /// The intersection of a sum's members with `other` (a single type, or the
+    /// members of another sum): the members of `declared` compatible with
+    /// `other`, collapsed to a single type when one remains. Null when `declared`
+    /// isn't a sum or nothing intersects.
+    fn sumIntersect(
+        self: *TypeChecker,
+        declared: *const ast.TypeExpr,
+        other: *const ast.TypeExpr,
+    ) Error!?*const ast.TypeExpr {
+        const d = self.unaliasType(declared);
+        if (d.* != .sum) return null;
+
+        var kept: std.ArrayListUnmanaged(*const ast.TypeExpr) = .empty;
+        for (d.sum.members) |m| {
+            const matches = if (other.* == .sum) blk: {
+                for (other.sum.members) |om| {
+                    if (self.pipeTypesEqual(m, om)) break :blk true;
+                }
+                break :blk false;
+            } else self.pipeTypesEqual(m, other);
+            if (matches) try kept.append(self.arena.allocator(), m);
+        }
+        if (kept.items.len == 0) return null;
+        if (kept.items.len == 1) return kept.items[0];
+        return try self.allocTypeExpression(.{
+            .sum = .{ .members = try kept.toOwnedSlice(self.arena.allocator()), .span = d.sum.span },
+        });
     }
 
     /// The type a sum has after removing `member` (the else-branch of `x is T`):

@@ -4325,7 +4325,7 @@ pub const IRCompiler = struct {
         try self.jmp(source, condition, false, else_addr);
         const then = try self.compileIfBranchExpression(source, if_expr.then_expr, if_condition.capture_binding);
         try self.set(source, result, stableResultSource(then));
-        self.currentFrame().rel_stack_counter = branch_stack_base;
+        try self.popToStackBase(source, branch_stack_base);
         try self.jmp(source, null, false, after_addr);
         try self.setLabel(else_addr.local_addr.label, .abs);
         var result_type = if (else_branch == .condition) mergedResultType(condition, then) else null;
@@ -4342,7 +4342,7 @@ pub const IRCompiler = struct {
             },
             .condition => {},
         }
-        self.currentFrame().rel_stack_counter = branch_stack_base;
+        try self.popToStackBase(source, branch_stack_base);
         try self.setLabel(after_addr.local_addr.label, .abs);
         try self.set(source, .initRegister(.r2), .from(result.dereference()));
 
@@ -4371,9 +4371,23 @@ pub const IRCompiler = struct {
         if (isWaitable(then_result)) |loc| {
             try self.wait(source, loc);
         }
-        self.currentFrame().rel_stack_counter = branch_stack_base;
+        // Emit real `pop`s for the runtime slots the branch body pushed via
+        // `.ref` (a bare `rel_stack_counter = base` reset leaks them, drifting
+        // the value stack — a later deref then hits a leaked slot). The pops sit
+        // before `after_addr`, so the false path (which jumped straight here) is
+        // balanced too. Same discipline as the catch handler / match case body.
+        try self.popToStackBase(source, branch_stack_base);
         try self.setLabel(after_addr.local_addr.label, .abs);
         return .fromValue(.void);
+    }
+
+    /// Pops runtime stack slots until the counter returns to `base`, emitting a
+    /// real `pop` per slot rather than bare-resetting the counter (which would
+    /// leak the slots).
+    fn popToStackBase(self: *IRCompiler, source: anytype, base: usize) Error!void {
+        while (self.currentFrame().rel_stack_counter > base) {
+            _ = try self.pop(source);
+        }
     }
 
     const IfCaptureBinding = struct {

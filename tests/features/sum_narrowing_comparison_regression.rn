@@ -1,0 +1,32 @@
+# Sum-type narrowing from comparisons (Phase 4): `==`/`!=` and relational
+# operators refine a sum-typed binding. `x == v` narrows the then-branch to the
+# members `v`'s type can be (here Int); `!=` narrows the else-branch; relational
+# ops (`<`, `>`, …) narrow to the numeric members.
+fn Void @() Void
+
+# `==` narrows the then-branch to Int (the motivating example).
+const a: Int || String = 0
+if (a == 0) {
+    const n: Int = a
+    echo "a int=${n}"
+} else {
+    echo "a other"
+}
+
+# `!=` narrows the else-branch to Int.
+const b: Int || String = "hi"
+if (b != 0) {
+    echo "b then=${b}"
+} else {
+    const n: Int = b
+    echo "b int=${n}"
+}
+
+# Relational narrows to the numeric member.
+const c: Int || String = 7
+if (c > 5) {
+    const n: Int = c
+    echo "c big=${n}"
+} else {
+    echo "c small-or-str"
+}

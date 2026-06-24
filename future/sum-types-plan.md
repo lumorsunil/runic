@@ -6,8 +6,10 @@ e.g. `const IntOrString = Int || String`. A value of `A || B` is *either* an
 error-handling backlog (the error-set merge, `future/error-handling-plan.md`
 item 18, is the narrow special case that ships first and independently).
 
-Status: **Phase 1 done; Phase 2 (widening) started; narrowing model agreed
-(2026-06-23).** Branch: `sum-types` (off `error`).
+Status: **Phases 1, 3 (`is` + flow narrowing), 4 (comparison/relational
+narrowing) done; Phase 2 widening done (enforcement pending). Two surfaced
+pre-existing bugs (`;` separator, `if`-branch stack drift) fixed.** Branch:
+`sum-types` (off `error`).
 
 ## Key architectural fact
 
@@ -162,28 +164,37 @@ defer `||` / negation composition.
     else narrows to the complement; conjunctions narrow both; 3-member else stays
     a sum and re-narrows. Test: `sum_narrowing_regression` (direct member use:
     arithmetic + interpolation of the narrowed binding).
-    - **Correction (2026-06-23): there is NO codegen/stack-drift bug.** An earlier
-      note here claimed `const n = x` inside a branch corrupted the IR stack —
-      that was a misdiagnosis from testing with single-line `;`. Multi-line
-      narrowing works end to end, including `const n: Int = x` copy-then-use
-      (verified). What actually fails is a **pre-existing, general parser quirk**,
-      unrelated to sums/narrowing/codegen: a binding whose initializer is a
-      *command-like bare identifier*, followed by `;` and more statements on the
-      **same line**, swallows those statements as command arguments —
-      `const z = y; echo "hi"` doesn't run the echo, while `const v = 1; echo
-      "hi"` (literal RHS) and `echo "a"; echo "b"` both work, and the
-      newline-separated form always works. Tracked as a separate parser bug; the
-      regression test uses newline-separated statements.
+    - **Two pre-existing bugs surfaced here, both now FIXED (2026-06-24):**
+      1. **`;` statement separator (parser).** A binding whose initializer is a
+         value-producing expression (a bare-identifier zero-arg `.call`, or an
+         arithmetic/comparison `.binary`) wrongly absorbed the following
+         `;`-separated statement as a command sequence (`const z = y; echo "hi"`
+         dropped the echo). Fixed in `parseBinding`: only genuinely
+         command-producing initializers sequence. Regression: `semicolon_regression`.
+      2. **`if`-branch stack drift (IR).** `compileIf` / `compileIfNoElse`
+         bare-reset `rel_stack_counter = branch_stack_base` without emitting
+         `pop`s, so a branch body that pushed a runtime slot (e.g.
+         `const n: Int = x`, a thread-backed capture) leaked it; a later
+         statement then dereferenced the leaked slot (`Could not dereference
+         value of type thread`). Fixed with `popToStackBase` (real `pop`s, like
+         the catch handler / match case body). This *was* a real bug — an earlier
+         note mistakenly called it a non-issue because the `;` bug masked it in
+         the test cases.
     - **Phase 2 gap (still open):** arithmetic/operators on a *bare* (un-narrowed)
       sum aren't rejected yet, so narrowing isn't strictly *required* for those
       ops — enforcement lands with the Phase 8 "no member-specific ops on a bare
       sum" work. Assignment widening *is* enforced (`sum_type_widen_mismatch`).
 
-- [ ] **Phase 4 — Comparison & relational narrowing.** Allow `==`/`!=` and
-  relational ops between a sum and a member (type check + evaluator: compare
-  underlying values, false on tag mismatch). Derive the narrowing facts:
-  `==` → intersection in the then-branch; relational → members supporting the
-  operator. Reject comparisons with no shared/with an unsupported member.
+- [x] **Phase 4 — Comparison & relational narrowing. DONE (2026-06-24).**
+  Comparing a sum to a member already type-checks and evaluates correctly (false
+  on tag mismatch), so this was purely adding narrowing facts to
+  `collectNarrowingFacts`: `x == v` narrows the then-branch to the intersection
+  of `x`'s members with `v`'s type (`collectEqualityNarrowing` + `sumIntersect`);
+  `x != v` narrows the else-branch; relational ops (`<` `>` `<=` `>=`) narrow to
+  the numeric members (`collectRelationalNarrowing`). Either operand may be the
+  binding. Delivers the motivating `if (x == 0)` → `Int` example. Test:
+  `sum_narrowing_comparison_regression`. (Rejecting comparisons with no shared
+  member is deferred — currently a no-narrowing no-op.)
 
 - [ ] **Phase 5 — `var` flow narrowing + assignment refinement.** Extend flow
   typing to `var`: an assignment refines the flow type from that point; the
