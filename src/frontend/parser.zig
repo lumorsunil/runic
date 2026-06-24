@@ -2812,7 +2812,18 @@ pub const Parser = struct {
             const next = try self.peekToken();
             if (next.tag != .semicolon) break;
             switch (initializer.*) {
-                .call, .pipeline, .binary, .block, .subshell => {},
+                // A bare zero-arg identifier call (`const z = y`) is a value
+                // reference, not a multi-part command — don't absorb the next
+                // statement; let `;` separate it (e.g. `const z = y; echo "hi"`).
+                .call => |call| if (call.arguments.len == 0 and call.callee.* == .identifier) break,
+                // Only command-producing binaries sequence; value ops
+                // (arithmetic, comparison, …) don't (`const x = 1 + 2; echo` must
+                // run the echo).
+                .binary => |binary| switch (binary.op) {
+                    .apply, .pipe, .logical_and, .logical_or, .sequence, .append_redirect, .redirect_fd, .fd_source_truncate_redirect, .fd_source_append_redirect => {},
+                    else => break,
+                },
+                .pipeline, .block, .subshell => {},
                 else => break,
             }
             _ = try self.nextToken(); // consume `;`
