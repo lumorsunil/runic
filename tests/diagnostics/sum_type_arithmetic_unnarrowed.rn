@@ -1,0 +1,6 @@
+// A bare (un-narrowed) sum can't be used in arithmetic — it isn't numeric.
+// You must narrow it first (with `is`, `==`, or match). A narrowed operand
+// inside `if (x is Int) { ... }` would be fine.
+const x: Int || String = 5
+
+echo "${x + 1}"

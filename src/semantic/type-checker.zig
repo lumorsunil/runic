@@ -2294,6 +2294,20 @@ pub const TypeChecker = struct {
         const left_type = maybe_left_type orelse return;
         const right_type = maybe_right_type orelse return;
 
+        // Member-specific operation enforcement: a *bare* (un-narrowed) sum is
+        // never numeric, so it can't be used in arithmetic — narrow it first
+        // (with `is`/`==`/match). A *narrowed* operand resolves to its member
+        // type here (via the scoped shadow binding), so this only rejects the
+        // un-narrowed case. Comparison/relational ops are intentionally allowed:
+        // they are how you narrow (`if (x > 5)`, `if (x == 0)`).
+        switch (binary.op) {
+            .add, .subtract, .multiply, .divide, .remainder => {
+                try self.rejectSumArithmeticOperand(binary.left, left_type);
+                try self.rejectSumArithmeticOperand(binary.right, right_type);
+            },
+            else => {},
+        }
+
         // Member access parses as a `.member` binary op (e.g. `MyError.Nope`).
         // Validate error-set variant access here so an unknown variant is a
         // type-checker diagnostic (stderr) rather than a later compiler error
@@ -2338,6 +2352,20 @@ pub const TypeChecker = struct {
             }
             try self.validateTypeAssignment(left_type, right_type, .{ .span = right_type.span() });
         }
+    }
+
+    /// Reports an error if an arithmetic operand is a bare sum type (it must be
+    /// narrowed to a numeric member first).
+    fn rejectSumArithmeticOperand(self: *TypeChecker, operand: *const ast.Expression, operand_type: *const ast.TypeExpr) Error!void {
+        const t = self.unaliasType(operand_type);
+        if (t.* != .sum) return;
+        try self.reportSpanError(
+            operand.span(),
+            Error.TypeMismatch,
+            .@"error",
+            "cannot use a sum type ({f}) in arithmetic; narrow it first with `is`, `==`, or match",
+            .{t},
+        );
     }
 
     pub fn runMember(self: *TypeChecker, scope: *Scope, member: *ast.MemberExpr) Error!void {

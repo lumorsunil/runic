@@ -129,15 +129,22 @@ defer `||` / negation composition.
     on member-wise comparison and would treat `Int || String` and
     `String || Int` as distinct. Order-insensitive equality is part of Phase 2.
 
-- [~] **Phase 2 — Type equality & assignability. STARTED.** **Widening done**:
-  `validateTypeAssignmentSum` accepts a value whose type is one of the members,
-  or a sub-sum whose members are all present (`sumHasMember`); a non-member is a
-  clear "expected type … actual …" mismatch. Tests: `sum_type_regression`
-  (widen Int/String/Float, flatten+dedup), `sum_type_widen_mismatch` (Bool ∉
-  `Int || String`). **Remaining**: order-insensitive sum *equality* in
-  `pipeTypesEqual` (so `Int || String` == `String || Int` and sum-typed params /
-  returns / function signatures compare correctly); reject the reverse (sum →
-  member) consistently everywhere; interactions with optionals/error-unions.
+- [~] **Phase 2 — Type equality, assignability & op enforcement. Widening +
+  arithmetic enforcement done.**
+  - **Widening (done):** `validateTypeAssignmentSum` accepts a value whose type
+    is one of the members, or a sub-sum whose members are all present
+    (`sumHasMember`); a non-member is a clear mismatch. Tests: `sum_type_regression`,
+    `sum_type_widen_mismatch`.
+  - **Arithmetic enforcement (done, 2026-06-25):** `runBinary` rejects a *bare*
+    (un-narrowed) sum operand in `+ - * / %` (`rejectSumArithmeticOperand`) —
+    narrowing is now *required* for arithmetic. A narrowed operand resolves to
+    its member type (via the scoped shadow), so it's unaffected; comparison and
+    relational ops stay allowed (they're how you narrow). Test:
+    `sum_type_arithmetic_unnarrowed`.
+  - **Remaining**: order-insensitive sum *equality* in `pipeTypesEqual` (so
+    `Int || String` == `String || Int`, and sum-typed params/returns compare);
+    reject other member-specific ops on a bare sum (e.g. string interpolation
+    `${x}` — Phase 8); interactions with optionals/error-unions.
 
 - [~] **Phase 3 — `is` type test + flow-type infrastructure. 3a DONE (operator);
   3b TODO (narrowing).**
