@@ -141,10 +141,21 @@ defer `||` / negation composition.
     its member type (via the scoped shadow), so it's unaffected; comparison and
     relational ops stay allowed (they're how you narrow). Test:
     `sum_type_arithmetic_unnarrowed`.
-  - **Remaining**: order-insensitive sum *equality* in `pipeTypesEqual` (so
-    `Int || String` == `String || Int`, and sum-typed params/returns compare);
-    reject other member-specific ops on a bare sum (e.g. string interpolation
-    `${x}` — Phase 8); interactions with optionals/error-unions.
+  - **Order-insensitive equality (done, 2026-06-26):** `pipeTypesEqual` now
+    treats sums as unordered sets (same size + every member matches), so
+    `Int || String` == `String || Int` and structurally-equal sums compare equal
+    regardless of member order/identity. Unblocks **sum-typed parameters** (a
+    param `v: Int || String` narrows inside the body) and order-insensitive
+    assignability. Also fixed a latent crash: `validateTypeAssignmentSum` used
+    `@fieldParentPtr` on a *by-value* `SumType` (garbage on the error path) — now
+    captured by pointer like the sibling handlers. Test: `sum_type_equality_regression`.
+  - **Remaining**: **functions *returning* a sum** — `fn … () Int || String { yield 7 }`
+    needs (a) a `yieldCoercesToSum` (a bare member value satisfies a sum return,
+    mirroring `yieldCoercesToErrorUnion`/`Optional`) and (b) resolving a call's
+    *raw* sum return type (unresolved member identifiers) before the equality
+    check, so `const r: Int || String = pick()` compares. Sum-typed params work;
+    returns are the gap. Plus: reject other member-specific ops on a bare sum
+    (string interpolation `${x}` — Phase 8); interactions with optionals/error-unions.
 
 - [~] **Phase 3 — `is` type test + flow-type infrastructure. 3a DONE (operator);
   3b TODO (narrowing).**

@@ -1,0 +1,19 @@
+# Sum types are unordered sets (Phase 2): `Int || String` and `String || Int`
+# are the same type, so they're mutually assignable and compare equal in
+# function signatures. This unblocks sum-typed parameters.
+fn Void @() Void
+
+# Order-insensitive assignability across two differently-ordered sum aliases.
+const IntOrString = Int || String
+const StringOrInt = String || Int
+const a: IntOrString = 5
+const b: StringOrInt = a
+const c: IntOrString = b
+echo "roundtrip ok"
+
+# A sum-typed parameter, narrowed inside the function body.
+fn Void tag(v: Int || String) String {
+    if (v is Int) { yield "int" } else { yield "str" }
+}
+echo "${tag 5}"
+echo "${tag "hi"}"

@@ -2731,6 +2731,25 @@ pub const TypeChecker = struct {
             .promise => |left_promise| self.pipeTypesEqual(left_promise.child, resolved_right.promise.child),
             .error_union => |left_error_union| self.pipeTypesEqual(left_error_union.err_set, resolved_right.error_union.err_set) and
                 self.pipeTypesEqual(left_error_union.payload, resolved_right.error_union.payload),
+            // Sums are unordered sets: equal iff same size and every member of
+            // one matches a member of the other (members are deduped, so a
+            // same-size one-way subset suffices). So `Int || String` ==
+            // `String || Int`, and two separately-built identical sums compare equal.
+            .sum => |left_sum| blk: {
+                const right_sum = resolved_right.sum;
+                if (left_sum.members.len != right_sum.members.len) break :blk false;
+                for (left_sum.members) |lm| {
+                    var found = false;
+                    for (right_sum.members) |rm| {
+                        if (self.pipeTypesEqual(lm, rm)) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) break :blk false;
+                }
+                break :blk true;
+            },
             .void, .integer, .float, .boolean, .byte, .null, .execution, .thread => true,
             else => std.meta.eql(resolved_left.*, resolved_right.*),
         };
@@ -3184,7 +3203,7 @@ pub const TypeChecker = struct {
             // A `||` merge is resolved to a concrete `error_set` or `sum` before
             // it is stored as a binding type, so a raw merge should not reach here.
             .type_merge => {},
-            .sum => |sum| self.validateTypeAssignmentSum(
+            .sum => |*sum| self.validateTypeAssignmentSum(
                 sum,
                 assignment_type,
                 options,
@@ -3285,7 +3304,7 @@ pub const TypeChecker = struct {
     /// that requires an explicit type-`match` (Phase 3, future/sum-types-plan.md).
     pub fn validateTypeAssignmentSum(
         self: *TypeChecker,
-        assignee: ast.TypeExpr.SumType,
+        assignee: *const ast.TypeExpr.SumType,
         assignment_type: *const ast.TypeExpr,
         options: ValidateTypeAssignmentOptions,
     ) Error!void {
@@ -3293,28 +3312,23 @@ pub const TypeChecker = struct {
         try self.logTypeCheckTrace(@src().fn_name, assignment_type.span());
 
         const actual = self.unaliasType(assignment_type);
+        // `assignee` points into the real `TypeExpr` union (captured by pointer
+        // in the dispatch), so recovering it for diagnostics is sound.
+        const assignee_type: *const ast.TypeExpr = @fieldParentPtr("sum", assignee);
 
         // A sub-sum widens iff every one of its members is in the assignee.
         if (actual.* == .sum) {
             for (actual.sum.members) |m| {
-                if (!self.sumHasMember(assignee, m)) {
-                    return try self.reportAssignmentError(
-                        @as(*const ast.TypeExpr, @fieldParentPtr("sum", &assignee)),
-                        assignment_type,
-                        options,
-                    );
+                if (!self.sumHasMember(assignee.*, m)) {
+                    return try self.reportAssignmentError(assignee_type, assignment_type, options);
                 }
             }
             return;
         }
 
-        if (self.sumHasMember(assignee, actual)) return;
+        if (self.sumHasMember(assignee.*, actual)) return;
 
-        try self.reportAssignmentError(
-            @as(*const ast.TypeExpr, @fieldParentPtr("sum", &assignee)),
-            assignment_type,
-            options,
-        );
+        try self.reportAssignmentError(assignee_type, assignment_type, options);
     }
 
     /// Whether `t` is structurally equal to one of the sum's members.
