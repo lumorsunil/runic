@@ -550,6 +550,11 @@ pub const TypeChecker = struct {
         if (declared_unaliased.* == .optional and
             self.yieldCoercesToOptional(resolved, declared_unaliased.optional)) return;
 
+        // Coerce into a sum stdout type: a bare member value (or a sub-sum)
+        // satisfies `A || B`.
+        if (declared_unaliased.* == .sum and
+            self.yieldCoercesToSum(resolved, declared_unaliased.sum)) return;
+
         try self.reportSpanError(
             yield_stmt.span,
             Error.TypeMismatch,
@@ -582,6 +587,23 @@ pub const TypeChecker = struct {
             if (union_set.error_set.variant(variant.name.name) == null) return false;
         }
         return true;
+    }
+
+    /// True if `yielded` satisfies a sum stdout type: its type is one of the
+    /// sum's members, or it is a sub-sum whose members are all present.
+    fn yieldCoercesToSum(
+        self: *TypeChecker,
+        yielded: *const ast.TypeExpr,
+        sum: ast.TypeExpr.SumType,
+    ) bool {
+        const y = self.unaliasType(yielded);
+        if (y.* == .sum) {
+            for (y.sum.members) |m| {
+                if (!self.sumHasMember(sum, m)) return false;
+            }
+            return true;
+        }
+        return self.sumHasMember(sum, y);
     }
 
     /// True if `yielded` satisfies a `?T` stdout type: a bare `T` value or `null`.
@@ -716,7 +738,13 @@ pub const TypeChecker = struct {
 
         try self.runExpression(scope, binding_decl.initializer);
 
-        const initializer_type = try self.resolveExprType(scope, binding_decl.initializer);
+        // Resolve the initializer's type so a raw type (e.g. a function call's
+        // return with unresolved member identifiers) compares against the
+        // annotation.
+        const initializer_type = if (try self.resolveExprType(scope, binding_decl.initializer)) |raw|
+            try self.resolveTypeExpr(scope, raw)
+        else
+            null;
 
         const type_expr = binding_annotation_type_expr orelse initializer_type;
 
@@ -779,6 +807,13 @@ pub const TypeChecker = struct {
                 },
             }),
             .type_merge => |merge| try self.resolveTypeMerge(scope, merge),
+            // Resolve each member so a sum that arrives with raw member
+            // identifiers (e.g. a function call's return type) compares correctly.
+            .sum => |sum| blk: {
+                const members = try self.arena.allocator().alloc(*const ast.TypeExpr, sum.members.len);
+                for (sum.members, members) |src, *dst| dst.* = try self.resolveTypeExpr(scope, src);
+                break :blk try self.allocTypeExpression(.{ .sum = .{ .members = members, .span = sum.span } });
+            },
             else => type_expr,
         };
     }

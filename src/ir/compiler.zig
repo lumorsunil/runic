@@ -2100,7 +2100,12 @@ pub const IRCompiler = struct {
         if (fn_type != .function) return null;
         const return_type_ptr = fn_type.function.return_type orelse return null;
         switch (return_type_ptr.*) {
-            .error_union, .optional => {},
+            // A sum return is captured by value too, so the member's tag (Int vs
+            // String, …) survives the boundary for the caller to narrow. The
+            // compiler stores the raw return AST, so a sum arrives as the
+            // unresolved `type_merge` node (a `type_merge` return is always a
+            // value sum — error-set merges only appear as the `E` in `E!T`).
+            .error_union, .optional, .sum, .type_merge => {},
             else => return null,
         }
         const fn_ref_value = binding.result.source.value;

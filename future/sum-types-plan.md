@@ -149,13 +149,18 @@ defer `||` / negation composition.
     assignability. Also fixed a latent crash: `validateTypeAssignmentSum` used
     `@fieldParentPtr` on a *by-value* `SumType` (garbage on the error path) — now
     captured by pointer like the sibling handlers. Test: `sum_type_equality_regression`.
-  - **Remaining**: **functions *returning* a sum** — `fn … () Int || String { yield 7 }`
-    needs (a) a `yieldCoercesToSum` (a bare member value satisfies a sum return,
-    mirroring `yieldCoercesToErrorUnion`/`Optional`) and (b) resolving a call's
-    *raw* sum return type (unresolved member identifiers) before the equality
-    check, so `const r: Int || String = pick()` compares. Sum-typed params work;
-    returns are the gap. Plus: reject other member-specific ops on a bare sum
-    (string interpolation `${x}` — Phase 8); interactions with optionals/error-unions.
+  - **Functions returning a sum (done, 2026-06-28):** three pieces. (a)
+    `yieldCoercesToSum` — a bare member value (or sub-sum) satisfies a sum return
+    type in `runYield`. (b) `resolveTypeExpr` gained a `.sum` arm (resolves each
+    member) and `runBindingDecl` resolves the initializer type, so a call's raw
+    sum return compares against an annotation. (c) `tryCompileTypedValueCapture`
+    accepts a `.sum`/`.type_merge` return (the compiler stores the raw return
+    AST, so a sum arrives as the unresolved `type_merge`), capturing it by value
+    so the member's runtime tag (Int vs String) survives the boundary for the
+    caller to narrow. Verified: `const r = pick true; if (r is Int) …` gets the
+    real Int. Test: `sum_type_equality_regression`.
+  - **Remaining**: reject other member-specific ops on a bare sum (string
+    interpolation `${x}` — Phase 8); interactions with optionals/error-unions.
 
 - [~] **Phase 3 — `is` type test + flow-type infrastructure. 3a DONE (operator);
   3b TODO (narrowing).**
