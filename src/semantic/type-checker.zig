@@ -1534,6 +1534,119 @@ pub const TypeChecker = struct {
         };
     }
 
+    /// If the match subject resolves to a sum type, returns it (for type-pattern
+    /// dispatch); otherwise null.
+    fn matchSumType(self: *TypeChecker, scope: *Scope, subject: *ast.Expression) Error!?ast.TypeExpr.SumType {
+        const raw = try self.resolveSubjectType(scope, subject) orelse return null;
+        const subject_type = self.unaliasType(raw);
+        return switch (subject_type.*) {
+            .sum => |sum| sum,
+            else => null,
+        };
+    }
+
+    /// Type-matches a sum value: each case pattern is a member-type name
+    /// (`Int`, `String`, …) or `_`. Inside a case body the subject binding is
+    /// narrowed to that member (a scoped shadow), and exhaustiveness over the
+    /// members is enforced unless a `_` case is present.
+    fn runSumMatch(
+        self: *TypeChecker,
+        scope: *Scope,
+        match_expr: *ast.MatchExpr,
+        sum: ast.TypeExpr.SumType,
+    ) Error!void {
+        const subject_name = referencedBindingName(match_expr.subject);
+        var has_wildcard = false;
+        // Track which members are covered for exhaustiveness.
+        var covered = try self.arena.allocator().alloc(bool, sum.members.len);
+        @memset(covered, false);
+
+        for (match_expr.cases) |case| {
+            const body_scope = try scope.addChild(self.arena.allocator(), case.span);
+
+            const member: ?*const ast.TypeExpr = switch (case.pattern) {
+                .wildcard => blk: {
+                    has_wildcard = true;
+                    break :blk null;
+                },
+                .binding => |binding| blk: {
+                    const idx = self.sumMemberIndexByName(sum, binding.name) orelse {
+                        try self.reportSpanError(
+                            binding.span,
+                            Error.TypeMismatch,
+                            .@"error",
+                            "'{s}' is not a member of the sum type being matched",
+                            .{binding.name},
+                        );
+                        break :blk null;
+                    };
+                    covered[idx] = true;
+                    break :blk sum.members[idx];
+                },
+                else => blk: {
+                    try self.reportSpanError(
+                        case.pattern.span(),
+                        Error.UnsupportedExpression,
+                        .@"error",
+                        "sum match patterns must be a member type (e.g. Int) or _",
+                        .{},
+                    );
+                    break :blk null;
+                },
+            };
+
+            // A `|n|` capture isn't supported for sum match yet (the subject is
+            // narrowed in-place instead — reference it by name).
+            if (case.capture) |capture| {
+                try self.reportSpanError(
+                    capture.span,
+                    Error.UnsupportedExpression,
+                    .@"error",
+                    "sum match captures are not supported yet; the matched value is narrowed in place — reference it by name",
+                    .{},
+                );
+            }
+
+            // Narrow the subject binding to the matched member inside the body.
+            if (member) |m| {
+                if (subject_name) |name| {
+                    try self.installNarrowFacts(body_scope, &.{.{ .name = name, .type_expr = m }});
+                }
+            }
+
+            try self.runBlock(body_scope, @constCast(&case.body));
+        }
+
+        if (!has_wildcard) {
+            for (sum.members, covered) |m, c| {
+                if (!c) try self.reportSpanError(
+                    match_expr.span,
+                    Error.NonExhaustiveMatch,
+                    .@"error",
+                    "match is not exhaustive: missing member '{f}' (add it or a `_` case)",
+                    .{m},
+                );
+            }
+        }
+    }
+
+    /// The index of the sum member matching a primitive type name (`Int`,
+    /// `Float`, `Bool`, `String`), or null.
+    fn sumMemberIndexByName(self: *TypeChecker, sum: ast.TypeExpr.SumType, name: []const u8) ?usize {
+        for (sum.members, 0..) |member, i| {
+            const m = self.unaliasType(member);
+            const matches = switch (m.*) {
+                .integer => std.mem.eql(u8, name, "Int"),
+                .float => std.mem.eql(u8, name, "Float"),
+                .boolean => std.mem.eql(u8, name, "Bool"),
+                .array => |array| array.element.* == .byte and std.mem.eql(u8, name, "String"),
+                else => false,
+            };
+            if (matches) return i;
+        }
+        return null;
+    }
+
     fn runErrorMatch(
         self: *TypeChecker,
         scope: *Scope,
@@ -1643,6 +1756,13 @@ pub const TypeChecker = struct {
         // capture the variant's payload.
         if (try self.matchErrorSet(scope, match_expr.subject)) |error_set| {
             try self.runErrorMatch(scope, match_expr, error_set);
+            return;
+        }
+
+        // Matching on a sum value: cases are member-type patterns
+        // (`Int => …, String => …`), each narrowing the subject in its body.
+        if (try self.matchSumType(scope, match_expr.subject)) |sum| {
+            try self.runSumMatch(scope, match_expr, sum);
             return;
         }
 

@@ -2673,14 +2673,7 @@ pub const IRCompiler = struct {
     /// primitive forms are also accepted.
     fn typeTagOf(type_expr: *const ast.TypeExpr) ?ir.Instruction.TypeTag {
         return switch (type_expr.*) {
-            .identifier => |named| {
-                const name = named.path.segments[named.path.segments.len - 1].name;
-                if (std.mem.eql(u8, name, "Int")) return .int;
-                if (std.mem.eql(u8, name, "Float")) return .float;
-                if (std.mem.eql(u8, name, "Bool")) return .boolean;
-                if (std.mem.eql(u8, name, "String")) return .string;
-                return null;
-            },
+            .identifier => |named| typeTagForName(named.path.segments[named.path.segments.len - 1].name),
             .integer => .int,
             .float => .float,
             .boolean => .boolean,
@@ -2689,6 +2682,15 @@ pub const IRCompiler = struct {
             .alias => |alias| typeTagOf(alias.type_expr),
             else => null,
         };
+    }
+
+    /// The runtime `TypeTag` for a builtin primitive type name, or null.
+    fn typeTagForName(name: []const u8) ?ir.Instruction.TypeTag {
+        if (std.mem.eql(u8, name, "Int")) return .int;
+        if (std.mem.eql(u8, name, "Float")) return .float;
+        if (std.mem.eql(u8, name, "Bool")) return .boolean;
+        if (std.mem.eql(u8, name, "String")) return .string;
+        return null;
     }
 
     fn compileCatchHandler(
@@ -4817,9 +4819,20 @@ pub const IRCompiler = struct {
                         try self.jmp(source, predicate, false, next_case_addr);
                     }
                 },
-                .binding => {
-                    const predicate = try self.compileMatchPredicate(source, case.pattern, subject_identifier);
-                    try self.jmp(source, predicate, false, next_case_addr);
+                .binding => |binding| {
+                    // A member-type name (`Int`, `String`, …) → a runtime type
+                    // tag test (sum type-match). Otherwise a predicate function.
+                    if (typeTagForName(binding.name)) |tag| {
+                        try self.addInstruction(.init(.from(source), .{ .is_type = .{
+                            .operand = subject_ref.dereference(),
+                            .tag = tag,
+                            .result = .initRegister(.r2),
+                        } }));
+                        try self.jmp(source, .fromLocation(.initRegister(.r2)), false, next_case_addr);
+                    } else {
+                        const predicate = try self.compileMatchPredicate(source, case.pattern, subject_identifier);
+                        try self.jmp(source, predicate, false, next_case_addr);
+                    }
                 },
                 else => unreachable,
             }

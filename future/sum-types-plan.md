@@ -223,9 +223,20 @@ defer `||` / negation composition.
   typing to `var`: an assignment refines the flow type from that point; the
   declared type still governs assignability; branch joins union the flow types.
 
-- [ ] **Phase 6 — Type-`match`.** Extend `match` to dispatch on a sum member type
-  with typed-pattern binding and exhaustiveness over the member set (or `_`);
-  lowering mirrors the error-variant `match` using the Phase 3 tag-test op.
+- [x] **Phase 6 — Type-`match`. DONE (2026-06-29).** `match x { Int => …,
+  String => … }` dispatches on a sum's member type. Type checker: `matchSumType`
+  detects a sum subject → `runSumMatch`, which reads each member-type pattern
+  (`Int`/`Float`/`Bool`/`String` via `sumMemberIndexByName`), **narrows the
+  subject binding to that member inside the case body** (reusing the
+  `installNarrowFacts` flow-narrowing shadow), and enforces exhaustiveness over
+  the members unless a `_` case is present. Compiler: `compileMatch`'s `.binding`
+  arm emits an `is_type` tag test (via `typeTagForName`) for member-type names
+  instead of a predicate call; the body reads the narrowed binding directly (the
+  runtime value already carries the right tag). So member ops work inside a case
+  (`Int => echo "${x + 1}"`). Tests: `sum_match_regression`,
+  `sum_match_non_exhaustive` (diagnostic). **Deferred:** a `|n|` capture form
+  (`Int => |n| …`) — rejected with a clear message for now, since the subject is
+  narrowed in place; needed only for a non-binding subject (`match foo() { … }`).
 
 - [ ] **Phase 7 — Coercible literals (untyped constants).** Implement decision 6:
   a numeric integer literal is `Int || Float` and coerces to any fitting member;
