@@ -6,12 +6,12 @@ e.g. `const IntOrString = Int || String`. A value of `A || B` is *either* an
 error-handling backlog (the error-set merge, `future/error-handling-plan.md`
 item 18, is the narrow special case that ships first and independently).
 
-Status: **Phases 1–6 done** (represent/widen, arithmetic enforcement +
+Status: **Phases 1–7 done** (represent/widen, arithmetic enforcement +
 order-insensitive equality, `is` + flow narrowing, comparison/relational
-narrowing, `var` flow narrowing, type-`match`); sum-typed params + returns work
-with value preservation. **Remaining: Phase 7 (coercible literals), Phase 8
-polish.** Surfaced + fixed two pre-existing bugs (`;` separator, `if`-branch
-stack drift). Branch: `sum-types` (off `error`).
+narrowing, `var` flow narrowing, type-`match`, numeric-literal rule); sum-typed
+params + returns work with value preservation. **Remaining: Phase 8 polish only.**
+Surfaced + fixed two pre-existing bugs (`;` separator, `if`-branch stack drift).
+Branch: `sum-types` (off `error`).
 
 ## Key architectural fact
 
@@ -54,21 +54,20 @@ work is small: one type-discriminant test op (analogous to the existing
    least one operand is *not* an error set; mixing an error set into a general
    sum is deferred (decide: reject, or treat the set as an opaque member).
 5. **Coercion** — member → sum (widen) is implicit; sum → member is **only** via
-   narrowing (flow or match), never implicit. Plus **literals are coercible
-   untyped constants** (decision 6).
-6. **Literals are coercible (untyped-constant model).** A literal's type is the
-   set of types it can represent; as a literal it coerces to *any single member
-   that fits* the context — this is distinct from a runtime sum value (a binding),
-   which never narrows implicitly. Applies to **all** literals uniformly; only
-   numeric literals are multi-target:
-   - integer literal (`0`, no decimals) → coercion type **`Int || Float`**;
-   - float literal (`0.5`) → `Float`; string literal → `String`; bool → `Bool`.
-   So `const n: Int = 0` keeps working (0 → Int), `arr[0]` works, `0.5` is
-   Float-only, and the bare `x == 0` comparison sees `0 : Int || Float`. An
-   **unannotated** `const x = 0` has type `Int || Float` and, being a `const`
-   bound directly to a coercible literal, stays coercible (Zig `comptime_int`
-   style). **High blast radius** (touches every numeric literal) → sequenced as
-   its own late phase, after core narrowing, to avoid destabilizing numeric code.
+   narrowing (flow or match), never implicit.
+6. **Numeric literal typing — decimal point decides (REVISED 2026-06-29).** A
+   numeric literal with **no** decimal point (or exponent) is **`Int`**; one with
+   a decimal point — *even `0.0`* — or an exponent is **`Float`**. No
+   coercible-untyped-constant model. This is simpler, fully predictable, and
+   **already exactly what the lexer does** (`lexNumber`: `has_dot or
+   has_exponent` → `float_literal`, else `int_literal`), so it needs **no
+   implementation** — it just replaces the earlier (never-built) `Int || Float`
+   coercible-literal idea (old Phase 7). Consequences: `const x: Int = 0` ✓,
+   `const y: Float = 0.0` ✓, `0.5`/`1e3` are Float; a bare `0` is plainly `Int`
+   (so `x == 0` narrows `Int || String` straight to `Int`, no `Int || Float`
+   ambiguity). An Int literal assigned to a `Float` annotation still works via
+   the existing Int→Float assignment coercion (`const f: Float = 0` ✓); to *be*
+   a Float a literal must be written with a decimal.
 
 ## Narrowing model
 
@@ -254,13 +253,15 @@ defer `||` / negation composition.
   (`Int => |n| …`) — rejected with a clear message for now, since the subject is
   narrowed in place; needed only for a non-binding subject (`match foo() { … }`).
 
-- [ ] **Phase 7 — Coercible literals (untyped constants).** Implement decision 6:
-  a numeric integer literal is `Int || Float` and coerces to any fitting member;
-  other literals coerce to their single natural type; a `const` bound to a literal
-  stays coercible. **Sequenced last** because it touches every numeric literal —
-  must keep all existing Int/Float code working (`const n: Int = 0`, indices,
-  ranges, arithmetic). Until this lands, narrowing works with `0 : Int` (which
-  already narrows `Int||String` → `Int` on `== 0`), so Phases 3–6 don't block on it.
+- [x] **Phase 7 — Numeric literal typing: decimal point decides. RESOLVED BY
+  DESIGN (2026-06-29), no implementation.** Replaced the coercible-untyped-constant
+  idea with the simpler rule (decision 6): no decimal/exponent → `Int`, decimal
+  (even `0.0`) or exponent → `Float`. The lexer already tokenizes exactly this
+  way (`lexNumber`), so there's nothing to build — a bare `0` is `Int`, `0.0` is
+  `Float`. This avoids the high-blast-radius literal-retyping work entirely and
+  makes narrowing cleaner (`x == 0` narrows `Int || String` straight to `Int`).
+  Verified: `const x: Int = 0`, `const y: Float = 0.0`, Int→Float assignment
+  coercion (`const f: Float = 0`), and `== 0` narrowing all behave as intended.
 
 - [ ] **Phase 8 — Interactions, diagnostics, polish.** Sums in arrays/maps,
   string interpolation of a bare (un-narrowed) sum (error: must narrow), typed-pipe
