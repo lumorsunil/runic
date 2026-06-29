@@ -6,10 +6,12 @@ e.g. `const IntOrString = Int || String`. A value of `A || B` is *either* an
 error-handling backlog (the error-set merge, `future/error-handling-plan.md`
 item 18, is the narrow special case that ships first and independently).
 
-Status: **Phases 1, 3 (`is` + flow narrowing), 4 (comparison/relational
-narrowing) done; Phase 2 widening done (enforcement pending). Two surfaced
-pre-existing bugs (`;` separator, `if`-branch stack drift) fixed.** Branch:
-`sum-types` (off `error`).
+Status: **Phases 1–6 done** (represent/widen, arithmetic enforcement +
+order-insensitive equality, `is` + flow narrowing, comparison/relational
+narrowing, `var` flow narrowing, type-`match`); sum-typed params + returns work
+with value preservation. **Remaining: Phase 7 (coercible literals), Phase 8
+polish.** Surfaced + fixed two pre-existing bugs (`;` separator, `if`-branch
+stack drift). Branch: `sum-types` (off `error`).
 
 ## Key architectural fact
 
@@ -219,9 +221,23 @@ defer `||` / negation composition.
   `sum_narrowing_comparison_regression`. (Rejecting comparisons with no shared
   member is deferred — currently a no-narrowing no-op.)
 
-- [ ] **Phase 5 — `var` flow narrowing + assignment refinement.** Extend flow
-  typing to `var`: an assignment refines the flow type from that point; the
-  declared type still governs assignability; branch joins union the flow types.
+- [x] **Phase 5 — `var` flow narrowing + assignment refinement. DONE (2026-06-29).**
+  `Scope.Binding` now separates `type_expr` (the *flow* type reads resolve to)
+  from `declared_type` (set at declaration; governs what may be assigned). (a)
+  `var` bindings now narrow in branch conditions (the `is_mutable` guards in
+  `collectNarrowingFacts`/equality/relational removed — the branch shadow is
+  naturally scoped). (b) A plain `x = v` to a sum-declared identifier validates
+  `v` against the *declared* type (so a `var x: Int || String` narrowed to String
+  can still be reassigned an Int), then refines the binding's flow type via
+  `flowTypeForSum` (the assigned member), so reads after the assignment — and the
+  arithmetic enforcement — see the narrowed type. Test:
+  `sum_var_narrowing_regression`.
+  - **Deferred (edges):** branch *joins* don't union flow types yet — a
+    refinement via an assignment *inside* an `if` branch mutates the binding and
+    leaks past the branch (sound for straight-line code, the stated use case;
+    cross-branch join needs snapshot/restore). Reassigning a `var` *inside the
+    very branch that narrowed it* keeps the branch shadow's narrowed view. Both
+    are niche; straight-line reassignment (the motivating case) is correct.
 
 - [x] **Phase 6 — Type-`match`. DONE (2026-06-29).** `match x { Int => …,
   String => … }` dispatches on a sum's member type. Type checker: `matchSumType`

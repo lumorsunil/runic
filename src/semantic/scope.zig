@@ -60,6 +60,7 @@ pub const Scope = struct {
         entry.value_ptr.* = .{
             .identifier = identifier,
             .type_expr = type_expr,
+            .declared_type = type_expr,
             .is_pub = is_pub,
             .is_mutable = is_mutable,
         };
@@ -67,7 +68,14 @@ pub const Scope = struct {
 
     pub const Binding = struct {
         identifier: ast.Identifier,
+        /// The current *flow* type — the refined view at this program point
+        /// (narrowed by `is`/comparison, or by a `var` reassignment). This is
+        /// what reads of the binding resolve to.
         type_expr: ?*const ast.TypeExpr,
+        /// The type written at the declaration; governs what may be *assigned*
+        /// to the binding (a `var`'s reassignment is validated against this, not
+        /// the narrowed flow type). Equal to `type_expr` at declaration.
+        declared_type: ?*const ast.TypeExpr = null,
         is_pub: bool,
         is_mutable: bool,
     };

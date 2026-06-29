@@ -1926,7 +1926,6 @@ pub const TypeChecker = struct {
             .is_expr => |is_expr| {
                 const name = referencedBindingName(is_expr.subject) orelse return;
                 const binding = scope.lookup(name) orelse return;
-                if (binding.is_mutable) return;
                 const declared = binding.type_expr orelse return;
                 const tested = self.unaliasType(try self.resolveTypeExpr(scope, is_expr.type_expr));
 
@@ -1968,7 +1967,6 @@ pub const TypeChecker = struct {
     ) Error!void {
         const sides = bindingAndValueSides(binary.left, binary.right) orelse return;
         const binding = scope.lookup(sides.name) orelse return;
-        if (binding.is_mutable) return;
         const declared = binding.type_expr orelse return;
         const value_raw = (try self.resolveExprType(scope, sides.value)) orelse return;
         const value_type = self.unaliasType(try self.resolveTypeExpr(scope, value_raw));
@@ -1987,7 +1985,6 @@ pub const TypeChecker = struct {
     ) Error!void {
         const sides = bindingAndValueSides(binary.left, binary.right) orelse return;
         const binding = scope.lookup(sides.name) orelse return;
-        if (binding.is_mutable) return;
         const d = self.unaliasType(binding.type_expr orelse return);
         if (d.* != .sum) return;
 
@@ -2505,8 +2502,39 @@ pub const TypeChecker = struct {
             if (binary.left.* == .env_var and isEnvAssignableType(right_type)) {
                 return;
             }
+
+            // For a plain `x = v` to an identifier binding, validate against the
+            // binding's *declared* type (not its current narrowed flow type — a
+            // `var x: Int || String` narrowed to `String` can still be reassigned
+            // an Int), then refine the flow type so reads after the assignment
+            // see the new (narrowed) type.
+            if (binary.op == .assign) {
+                if (referencedBindingName(binary.left)) |name| {
+                    if (scope.lookup(name)) |binding| {
+                        const declared = binding.declared_type orelse left_type;
+                        try self.validateTypeAssignment(declared, right_type, .{ .span = right_type.span() });
+                        if (self.unaliasType(declared).* == .sum) {
+                            binding.type_expr = self.flowTypeForSum(declared, right_type);
+                        }
+                        return;
+                    }
+                }
+            }
+
             try self.validateTypeAssignment(left_type, right_type, .{ .span = right_type.span() });
         }
+    }
+
+    /// The flow type a sum-declared binding takes after being assigned a value of
+    /// `value_type`: the intersection (a single member when the value is one
+    /// member), else the declared sum itself (no refinement).
+    fn flowTypeForSum(
+        self: *TypeChecker,
+        declared: *const ast.TypeExpr,
+        value_type: *const ast.TypeExpr,
+    ) *const ast.TypeExpr {
+        const v = self.unaliasType(value_type);
+        return (self.sumIntersect(declared, v) catch null) orelse declared;
     }
 
     /// Reports an error if an arithmetic operand is a bare sum type (it must be
