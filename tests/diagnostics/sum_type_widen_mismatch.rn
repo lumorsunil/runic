@@ -4,5 +4,4 @@
 const IntOrString = Int || String
 
 const z: IntOrString = true
-
-echo "${z}"
+echo "z bound"

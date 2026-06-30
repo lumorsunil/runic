@@ -13,10 +13,11 @@ if (a == 0) {
     echo "a other"
 }
 
-# `!=` narrows the else-branch to Int.
+# `!=` narrows the else-branch to Int. (In the then-branch `b` is still the bare
+# sum — `!= 0` doesn't pin it to a member — so we can't interpolate it there.)
 const b: Int || String = "hi"
 if (b != 0) {
-    echo "b then=${b}"
+    echo "b then (still a sum)"
 } else {
     const n: Int = b
     echo "b int=${n}"

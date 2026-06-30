@@ -2454,8 +2454,14 @@ pub const TypeChecker = struct {
         // they are how you narrow (`if (x > 5)`, `if (x == 0)`).
         switch (binary.op) {
             .add, .subtract, .multiply, .divide, .remainder => {
-                try self.rejectSumArithmeticOperand(binary.left, left_type);
-                try self.rejectSumArithmeticOperand(binary.right, right_type);
+                try self.rejectBareSum(binary.left, left_type, "use in arithmetic");
+                try self.rejectBareSum(binary.right, right_type, "use in arithmetic");
+            },
+            // Comparing a sum to a value that can never share a member is almost
+            // always a mistake (the result is constant). Reject it when the
+            // intersection is empty. (`==`/`!=`/relational double as narrowing.)
+            .equal, .not_equal, .less, .less_equal, .greater, .greater_equal => {
+                try self.rejectEmptyComparison(binary.left, left_type, binary.right, right_type);
             },
             else => {},
         }
@@ -2537,17 +2543,34 @@ pub const TypeChecker = struct {
         return (self.sumIntersect(declared, v) catch null) orelse declared;
     }
 
-    /// Reports an error if an arithmetic operand is a bare sum type (it must be
-    /// narrowed to a numeric member first).
-    fn rejectSumArithmeticOperand(self: *TypeChecker, operand: *const ast.Expression, operand_type: *const ast.TypeExpr) Error!void {
-        const t = self.unaliasType(operand_type);
-        if (t.* != .sum) return;
+    /// Reports an error when one side of a comparison is a sum and the other's
+    /// type shares no member with it — the comparison can never be true (`==`) or
+    /// never false (`!=`), so it's almost certainly a mistake. Only fires when
+    /// exactly one side is a sum (sum-vs-sum / member-vs-member are left alone).
+    fn rejectEmptyComparison(
+        self: *TypeChecker,
+        left: *const ast.Expression,
+        left_type: *const ast.TypeExpr,
+        right: *const ast.Expression,
+        right_type: *const ast.TypeExpr,
+    ) Error!void {
+        const l = self.unaliasType(left_type);
+        const r = self.unaliasType(right_type);
+        const sum_side: *const ast.TypeExpr, const other: *const ast.TypeExpr, const other_expr =
+            if (l.* == .sum and r.* != .sum)
+                .{ l, r, right }
+            else if (r.* == .sum and l.* != .sum)
+                .{ r, l, left }
+            else
+                return;
+
+        if ((try self.sumIntersect(sum_side, other)) != null) return;
         try self.reportSpanError(
-            operand.span(),
+            other_expr.span(),
             Error.TypeMismatch,
             .@"error",
-            "cannot use a sum type ({f}) in arithmetic; narrow it first with `is`, `==`, or match",
-            .{t},
+            "comparing {f} with {f}: '{f}' is not one of the sum's members, so the comparison is always {s}",
+            .{ sum_side, other, other, @as([]const u8, "false") },
         );
     }
 
@@ -3108,9 +3131,34 @@ pub const TypeChecker = struct {
         try self.logTypeCheckTrace(@src().fn_name, segment.span());
 
         switch (segment.*) {
-            .interpolation => |expr| try self.runExpression(scope, expr),
+            .interpolation => |expr| {
+                try self.runExpression(scope, expr);
+                // Interpolating a bare (un-narrowed) sum has no single string
+                // form — narrow it first (with `is`/`==`/match).
+                if (try self.resolveExprType(scope, expr)) |t| {
+                    try self.rejectBareSum(expr, t, "interpolate");
+                }
+            },
             .text => {},
         }
+    }
+
+    /// Reports an error if `expr`'s type is a bare sum — a sum must be narrowed
+    /// (via `is`/`==`/match) before a member-specific operation like `action`.
+    fn rejectBareSum(
+        self: *TypeChecker,
+        expr: *const ast.Expression,
+        expr_type: *const ast.TypeExpr,
+        comptime action: []const u8,
+    ) Error!void {
+        if (self.unaliasType(expr_type).* != .sum) return;
+        try self.reportSpanError(
+            expr.span(),
+            Error.TypeMismatch,
+            .@"error",
+            "cannot " ++ action ++ " a sum type ({f}) directly; narrow it first with `is`, `==`, or match",
+            .{self.unaliasType(expr_type)},
+        );
     }
 
     const RunIdentifierResult = enum { found, not_found };

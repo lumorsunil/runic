@@ -1,24 +1,24 @@
 # General sum types (future/sum-types-plan.md, Phase 1): `A || B` in a type
 # position declares a structural sum — a value is one of the member types.
 # Members are normalized (nested sums flattened, duplicates removed). A value of
-# a member type widens into the sum; narrowing back is a separate phase.
+# a member type widens into the sum; using it requires narrowing first.
 fn Void @() Void
 
 const IntOrString = Int || String
 
-# Widening: an Int and a String both satisfy `Int || String`.
+# Widening: an Int and a String both satisfy `Int || String`. Narrow to read.
 const a: IntOrString = 42
+if (a is Int) { echo "a=${a}" } else { echo "a not int" }
 const b: IntOrString = "hi"
-echo "a=${a}"
-echo "b=${b}"
+if (b is String) { echo "b=${b}" } else { echo "b not str" }
 
 # Chained `A || B || C`.
 const Many = Int || String || Float
 const c: Many = 3.5
-echo "c=${c}"
+if (c is Float) { echo "c=${c}" } else { echo "c not float" }
 
 # Nested sums flatten and duplicate members dedup: `IntOrString || Int || Float`
 # normalizes to `Int || String || Float`, so a String still widens in.
 const Nested = IntOrString || Int || Float
 const d: Nested = "world"
-echo "d=${d}"
+if (d is String) { echo "d=${d}" } else { echo "d not str" }

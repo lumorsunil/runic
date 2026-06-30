@@ -263,13 +263,23 @@ defer `||` / negation composition.
   Verified: `const x: Int = 0`, `const y: Float = 0.0`, Int→Float assignment
   coercion (`const f: Float = 0`), and `== 0` narrowing all behave as intended.
 
-- [ ] **Phase 8 — Interactions, diagnostics, polish.** Sums in arrays/maps,
-  string interpolation of a bare (un-narrowed) sum (error: must narrow), typed-pipe
-  transport (Values already carry tags, so likely free), function params/returns,
-  order-insensitive equality finished (Phase 2 remainder), clear diagnostics
-  ("cannot use `Int || String` directly; narrow it with `is`/match"), LSP
-  hover/completion (deferrable), docs in `docs/features.md`, regression + diagnostic
-  fixtures.
+- [~] **Phase 8 — Interactions, diagnostics, polish. IN PROGRESS.**
+  - **Soundness: member-ops on a bare sum (done, 2026-06-30).** `rejectBareSum`
+    now rejects interpolating an un-narrowed sum (`echo "${x}"`) — the most
+    common member-op — alongside the existing arithmetic rejection (both share
+    the helper). A narrowed binding resolves to its member type, so
+    `if (x is Int) { echo "${x}" }` is fine. Diagnostic:
+    `sum_type_interpolation_unnarrowed`.
+  - **Soundness: non-member comparison (done, 2026-06-30).** `rejectEmptyComparison`
+    rejects `x == v` / relational where exactly one side is a sum and the other
+    shares no member (the comparison is constant — almost always a mistake).
+    Comparing against a real member still works (and narrows). Diagnostic:
+    `sum_type_compare_non_member`.
+  - **Remaining:** docs in `docs/features.md`; sums in arrays/maps + the
+    `[]Int || String` precedence question; optional/error-union interaction
+    (`?Int || String` is currently accepted with undefined meaning — specify or
+    reject); the `|n|` match-capture form; LSP (deferrable); friendlier String
+    rendering in messages (`[]Byte` → `String`).
 
 ## Relationship to error sets / error unions
 
