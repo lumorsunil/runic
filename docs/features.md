@@ -233,6 +233,80 @@ if (maybe_name) |name| {
 
 **Result:** The then branch runs only when `maybe_name` contains a string, and `name` is available only inside that branch as the inner `String`.
 
+### Sum types: `A || B`
+
+A **sum type** `A || B` (any number of members: `A || B || C`) describes a value that is *one of* the member types. Declare one with `const` and use it as an annotation, a parameter, or a return type:
+
+```rn
+const IntOrString = Int || String
+
+const a: IntOrString = 42      // an Int widens in
+const b: Int || String = "hi"  // so does a String (inline form)
+```
+
+Sums are **unordered sets** and are normalized: `Int || String` is the same type as `String || Int`, and nested/duplicate members are flattened (`(Int || String) || Int` is just `Int || String`).
+
+**Widening is implicit; narrowing is explicit.** A value of a member type flows *into* a sum automatically, but you cannot use a bare sum as if it were one specific member — you must **narrow** it first. Operations that assume a concrete type (arithmetic, string interpolation, …) are rejected on an un-narrowed sum:
+
+```rn
+const x: Int || String = 5
+echo "${x}"        // error: cannot interpolate a sum directly; narrow it first
+echo "${x + 1}"    // error: cannot use a sum in arithmetic; narrow it first
+```
+
+**Narrowing with `is`.** The `x is T` operator is a runtime type test (it works on any value, not just sums) that evaluates to `Bool`. In an `if`, it refines the binding's type per branch — the then branch sees `T`, and the else branch sees the remaining members (a two-member sum collapses to the survivor):
+
+```rn
+const x: Int || String = 5
+if (x is Int) {
+  echo "doubled=${x + x}"   // x is Int here
+} else {
+  echo "string: ${x}"        // x is String here
+}
+```
+
+**Narrowing with comparisons.** `==`/`!=` and the relational operators (`<`, `>`, `<=`, `>=`) also narrow. `x == v` narrows the then branch to the members `v` could be; relational operators narrow to the numeric members. Comparing a sum against a value it can never equal (a non-member) is rejected as a likely mistake.
+
+```rn
+const x: Int || String = 0
+if (x == 0) { echo "int=${x + 1}" } else { echo "other" }  // then branch: x is Int
+```
+
+**Narrowing with `match`.** A `match` on a sum dispatches on the member type; each case narrows the subject inside its body, and the match must be exhaustive over the members unless a `_` case is present:
+
+```rn
+const x: Int || String || Float = 6
+match x {
+  Int   => echo "int=${x + 1}"
+  Float => echo "float=${x}"
+  _     => echo "other"
+}
+```
+
+**`var` bindings narrow too.** A mutable sum binding narrows in branch conditions just like a `const`, and a reassignment refines its type from that point on — while the *declared* type still governs what may be assigned (so you can reassign across members):
+
+```rn
+var v: Int || String = 1
+v = "text"            // v is String from here
+echo "str=${v}"
+v = 99                // v is Int again
+echo "doubled=${v + v}"
+```
+
+**Functions** can take and return sums; the member's concrete value is preserved across the call, so the caller can narrow the result:
+
+```rn
+fn Void pick(b: Bool) Int || String {
+  if (b is Bool) { yield 7 } else { yield "x" }
+}
+const r = pick true
+if (r is Int) { echo "got int ${r}" } else { echo "got string ${r}" }
+```
+
+**Result:** A sum type is a single value slot that may hold any of its members; the compiler tracks which member it currently is (its *flow type*) and forces you to narrow — with `is`, a comparison, or `match` — before performing any member-specific operation, so a sum value is never silently mistaken for one branch.
+
+> Note: `A || B` between two **error sets** instead builds a merged error set (the union of their variants) — see *Errors as first-class types*. General sum types and error-set merges share the `||` spelling but only error-set operands merge into a set; any other operand produces a sum.
+
 ### Background commands and `.wait`
 
 Runic supports bash-style background execution with a trailing `&`. In statement position the command continues in the background while the script moves on immediately. When you bind a background execution, the command's stdout/stderr are captured in memory just like any other bound execution result, and `.wait` blocks until the background work finishes.

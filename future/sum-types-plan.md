@@ -275,11 +275,16 @@ defer `||` / negation composition.
     shares no member (the comparison is constant — almost always a mistake).
     Comparing against a real member still works (and narrows). Diagnostic:
     `sum_type_compare_non_member`.
-  - **Remaining:** docs in `docs/features.md`; sums in arrays/maps + the
-    `[]Int || String` precedence question; optional/error-union interaction
-    (`?Int || String` is currently accepted with undefined meaning — specify or
-    reject); the `|n|` match-capture form; LSP (deferrable); friendlier String
-    rendering in messages (`[]Byte` → `String`).
+  - **Docs (done, 2026-06-30).** Added a "Sum types: `A || B`" section to
+    `docs/features.md` (after Optionals): declaration/widening, the
+    must-narrow rule, narrowing via `is`/comparison/`match`, `var` flow
+    refinement, sum params + returns, and a note on the error-set-merge overload
+    of `||`. Every example was run and verified.
+  - **Remaining:** sums in arrays/maps + the `[]Int || String` precedence
+    question; optional/error-union interaction (`?Int || String` is currently
+    accepted with undefined meaning — specify or reject); the `|n|` match-capture
+    form; LSP (deferrable); friendlier String rendering in messages
+    (`[]Byte` → `String`).
 
 ## Relationship to error sets / error unions
 
