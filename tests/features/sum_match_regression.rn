@@ -24,3 +24,13 @@ match c {
     Float => echo "c float=${c}"
     _ => echo "c other"
 }
+
+# An optional `|v|` capture binds the narrowed value — useful when the subject
+# isn't a plain binding (here a direct function call).
+fn Void pick(flag: Bool) Int || String {
+    if (flag is Bool) { yield 7 } else { yield "x" }
+}
+match pick true {
+    Int => |n| echo "cap int=${n + 1}"
+    String => |s| echo "cap str=${s}"
+}

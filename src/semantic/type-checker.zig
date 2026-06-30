@@ -1595,22 +1595,25 @@ pub const TypeChecker = struct {
                 },
             };
 
-            // A `|n|` capture isn't supported for sum match yet (the subject is
-            // narrowed in-place instead — reference it by name).
-            if (case.capture) |capture| {
-                try self.reportSpanError(
-                    capture.span,
-                    Error.UnsupportedExpression,
-                    .@"error",
-                    "sum match captures are not supported yet; the matched value is narrowed in place — reference it by name",
-                    .{},
-                );
-            }
-
-            // Narrow the subject binding to the matched member inside the body.
+            // Narrow the subject binding to the matched member inside the body,
+            // and bind an optional `|n|` capture to the narrowed value (useful
+            // when the subject isn't a plain binding, e.g. `match f() { … }`).
             if (member) |m| {
                 if (subject_name) |name| {
                     try self.installNarrowFacts(body_scope, &.{.{ .name = name, .type_expr = m }});
+                }
+                if (case.capture) |capture| {
+                    if (capture.bindings.len == 1) {
+                        try self.runBindingPattern(body_scope, capture.bindings[0], m, false, false);
+                    } else {
+                        try self.reportSpanError(
+                            capture.span,
+                            Error.BindingPatternNotSupported,
+                            .@"error",
+                            "match captures require exactly one binding",
+                            .{},
+                        );
+                    }
                 }
             }
 

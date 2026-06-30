@@ -283,6 +283,15 @@ match x {
 }
 ```
 
+A case may bind the narrowed value with a `|name|` capture — handy when the subject isn't a plain binding (e.g. a direct call):
+
+```rn
+match readValue() {
+  Int    => |n| echo "int ${n}"
+  String => |s| echo "string ${s}"
+}
+```
+
 **`var` bindings narrow too.** A mutable sum binding narrows in branch conditions just like a `const`, and a reassignment refines its type from that point on — while the *declared* type still governs what may be assigned (so you can reassign across members):
 
 ```rn

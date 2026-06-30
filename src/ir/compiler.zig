@@ -4647,10 +4647,11 @@ pub const IRCompiler = struct {
         source: *ast.Expression,
         case: ast.MatchCase,
         subject_ref: ir.Location,
+        is_type_pattern: bool,
     ) Error!Result {
         const capture = case.capture orelse return self.compileBlock(source, case.body);
 
-        // The payload binding pushes transient slots; carry the body result in
+        // The capture binding pushes transient slots; carry the body result in
         // a register and restore the stack counter so they don't accumulate
         // (mirrors `compileIfBranchExpression`/`compileIfElse`).
         const stack_base = self.currentFrame().rel_stack_counter;
@@ -4658,18 +4659,24 @@ pub const IRCompiler = struct {
         try self.scopes.push(self.allocator, .lexical);
         defer self.scopes.pop();
 
-        const payload_ref = try self.newRef(source, "match_payload");
-        try self.addInstruction(.init(.from(source), .{ .err_payload = .{
-            .operand = subject_ref.dereference(),
-            .result = payload_ref,
-        } }));
+        // A sum member-type capture binds the (narrowed) subject value itself;
+        // an error-variant capture binds the extracted payload.
+        const bound_ref = try self.newRef(source, "match_capture");
+        if (is_type_pattern) {
+            try self.set(source, bound_ref, .from(subject_ref.dereference()));
+        } else {
+            try self.addInstruction(.init(.from(source), .{ .err_payload = .{
+                .operand = subject_ref.dereference(),
+                .result = bound_ref,
+            } }));
+        }
 
         switch (capture.bindings[0].*) {
             .discard => {},
             .identifier => |identifier| try self.compileIdentifierBinding(
                 source,
                 identifier,
-                .from(payload_ref.dereference()),
+                .from(bound_ref.dereference()),
                 null,
                 false,
                 .normal,
@@ -4787,6 +4794,11 @@ pub const IRCompiler = struct {
                 .path => |path| path.segments.len >= 2 and self.error_sets.get(path.segments[0].name) != null,
                 else => false,
             };
+            // `Int`/`String`/… — a sum member-type pattern (a type-tag test).
+            const is_type_pattern = switch (case.pattern) {
+                .binding => |binding| typeTagForName(binding.name) != null,
+                else => false,
+            };
 
             switch (case.pattern) {
                 .wildcard => {
@@ -4837,21 +4849,22 @@ pub const IRCompiler = struct {
                 else => unreachable,
             }
 
-            // A payload capture (`|value|`) is only supported on error variants.
+            // A capture (`|value|`) binds an error variant's payload, or — for a
+            // sum member-type pattern — the narrowed subject value itself.
             if (case.capture) |capture| {
-                if (!is_error_variant or capture.bindings.len != 1) {
+                if ((!is_error_variant and !is_type_pattern) or capture.bindings.len != 1) {
                     try self.reportSourceError(
                         source,
                         Error.UnsupportedExpression,
                         .@"error",
-                        "match captures are only supported for error variants with a single binding",
+                        "match captures are only supported for error variants or sum member types with a single binding",
                         .{},
                     );
                     return .fromValue(.void);
                 }
             }
 
-            const case_result = try self.compileMatchCaseBody(source, case, subject_ref);
+            const case_result = try self.compileMatchCaseBody(source, case, subject_ref, is_type_pattern);
             try self.set(source, result_ref, stableResultSource(case_result));
             result_type = self.mergeResultTypes(result_type, case_result);
             try self.jmp(source, null, false, after_addr);

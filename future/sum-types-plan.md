@@ -289,9 +289,18 @@ defer `||` / negation composition.
     pinned by `sum_type_precedence_regression`. Narrowing recognizes the
     primitive members (Int/Float/Bool/String); an optional/array *member* isn't
     type-testable (noted).
-  - **Remaining (low priority):** the `|n|` match-capture form (only needed for a
-    non-binding subject); friendlier String rendering in messages
-    (`[]Byte` → `String`); LSP (deferrable).
+  - **String rendering (done, 2026-06-30).** `TypeExpr.format` now prints `[]Byte`
+    as `String` everywhere, so diagnostics read naturally (language-wide, not just
+    sums). Regenerated the affected fixtures.
+  - **`|n|` match-capture (done, 2026-06-30).** A sum `match` case may bind the
+    narrowed value: `Int => |n| …` binds the subject value (typed as the member),
+    useful when the subject isn't a plain binding (`match f() { Int => |n| … }`).
+    Type checker binds it in the case body scope; compiler binds the subject ref
+    directly (vs. the error-variant `err_payload` path), selected by `is_type_pattern`.
+    Test: `sum_match_regression`. (Surfaced + fixed a pre-existing lexer crash:
+    `consumeDigits` sliced its fixed 2-byte probe buffer out of bounds on any 3+
+    digit literal like `100` — `multi_digit_literal_regression`.)
+  - **Remaining (deferrable):** LSP hover/completion for sum types.
 
 ## Relationship to error sets / error unions
 

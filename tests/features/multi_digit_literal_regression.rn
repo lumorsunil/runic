@@ -1,0 +1,8 @@
+# Numeric literals with three or more digits (a fixed-size probe buffer in the
+# lexer's number scanner previously sliced out of bounds on these).
+fn Void @() Void
+echo "${5 + 100}"
+const big = 12345
+echo "${big}"
+const f = 3.14159
+echo "${f}"

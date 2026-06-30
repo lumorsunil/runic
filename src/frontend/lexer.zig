@@ -670,7 +670,10 @@ pub const Lexer = struct {
                 b[i] = ch - '0';
             };
         }
-        return if (buffer) |b| b[0..i] else &.{};
+        // `i` counts every digit consumed, but only `b.len` were written —
+        // clamp so a number with more digits than the buffer (e.g. 100 into a
+        // 2-byte probe buffer) doesn't slice out of bounds.
+        return if (buffer) |b| b[0..@min(i, b.len)] else &.{};
     }
 
     fn peek(self: *Lexer) ?u8 {
