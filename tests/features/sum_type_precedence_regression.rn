@@ -1,0 +1,23 @@
+# Sum-type precedence (Phase 8): the `||` type operator is captured by an
+# enclosing type constructor's operand — a prefix `?`/`[]` (and an `E!T` payload)
+# parse their operand with the full type parser, so they wrap a following sum.
+# A bare top-level `A || B` folds into a sum; parentheses give other groupings.
+fn Void @() Void
+
+# `?Int || String` parses as `?(Int || String)`: null and either member are ok.
+const a: ?Int || String = null
+echo "a null ok"
+const b: ?Int || String = "hi"
+echo "b str ok"
+
+# `[]Int || String` parses as `[]( Int || String )`: an array of sum elements.
+const c: []Int || String = .{ 1, 2 }
+echo "c arr ok"
+
+# Parentheses override: `(?Int) || String` is a sum of `?Int` and `String`.
+const d: (?Int) || String = "x"
+echo "d paren ok"
+
+# A bare top-level sum still folds and narrows normally.
+const e: Int || String || Float = 2.5
+if (e is Float) { echo "e=${e}" } else { echo "e other" }

@@ -280,11 +280,18 @@ defer `||` / negation composition.
     must-narrow rule, narrowing via `is`/comparison/`match`, `var` flow
     refinement, sum params + returns, and a note on the error-set-merge overload
     of `||`. Every example was run and verified.
-  - **Remaining:** sums in arrays/maps + the `[]Int || String` precedence
-    question; optional/error-union interaction (`?Int || String` is currently
-    accepted with undefined meaning — specify or reject); the `|n|` match-capture
-    form; LSP (deferrable); friendlier String rendering in messages
-    (`[]Byte` → `String`).
+  - **Precedence / interactions specified (done, 2026-06-30).** Turned out to be
+    *well-defined*, not undefined: a type constructor parses its operand with the
+    full type parser, so a prefix `?`/`[]` (and an `E!T` payload) **captures** a
+    following `||`. So `?Int || String` is `?(Int || String)`, `[]Int || String`
+    is `[]( Int || String )`, a bare top-level `A || B` folds, and parens give
+    other groupings (`(?Int) || String`). Documented in `docs/features.md` +
+    pinned by `sum_type_precedence_regression`. Narrowing recognizes the
+    primitive members (Int/Float/Bool/String); an optional/array *member* isn't
+    type-testable (noted).
+  - **Remaining (low priority):** the `|n|` match-capture form (only needed for a
+    non-binding subject); friendlier String rendering in messages
+    (`[]Byte` → `String`); LSP (deferrable).
 
 ## Relationship to error sets / error unions
 

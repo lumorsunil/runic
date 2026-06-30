@@ -305,6 +305,8 @@ if (r is Int) { echo "got int ${r}" } else { echo "got string ${r}" }
 
 **Result:** A sum type is a single value slot that may hold any of its members; the compiler tracks which member it currently is (its *flow type*) and forces you to narrow — with `is`, a comparison, or `match` — before performing any member-specific operation, so a sum value is never silently mistaken for one branch.
 
+**Precedence with `?`, `[]`, and `!`.** A type constructor captures a following `||` into its operand, so `?Int || String` parses as `?(Int || String)` (an optional sum) and `[]Int || String` as `[]( Int || String )` (an array of sum elements). A bare top-level `A || B` folds into a sum. Use parentheses for any other grouping — `(?Int) || String` is a sum whose members are `?Int` and `String`. (Narrowing with `is`/`match` recognizes the primitive members `Int`, `Float`, `Bool`, and `String`; a member that is itself an optional or array isn't narrowable by type test.)
+
 > Note: `A || B` between two **error sets** instead builds a merged error set (the union of their variants) — see *Errors as first-class types*. General sum types and error-set merges share the `||` spelling but only error-set operands merge into a set; any other operand produces a sum.
 
 ### Background commands and `.wait`
