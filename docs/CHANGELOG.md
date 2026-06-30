@@ -14,6 +14,109 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 _Nothing yet._
 
+## [0.4.0] — 2026-06-30
+
+This release adds two major language features — structured **error handling** and
+**sum types** — and removes the `return` keyword.
+
+### Added
+
+#### Structured error handling
+
+A complete, typed error system replacing ad-hoc exit codes and `set -e`
+conventions. See `docs/features.md`.
+
+- **Error sets & unions.** `const E = error { Bad, WithPayload: String }`;
+  functions return an error union `E!T`, or `!T` to infer the set from the body.
+  Construct values with `E.Variant` / `E{ .Variant = payload }`.
+- **Handling: `catch`, `||`, `try`, `match`.** `catch` unwraps-or-handles (`|err|`
+  binds the error), `||` discards to a fallback, `try` propagates out of the
+  enclosing function, and `match` dispatches on variants with payload capture and
+  exhaustiveness checking.
+- **Errors as values across the in-process boundary.** A function/pipeline result
+  preserves the real error value (set/variant/payload) via typed in-process
+  capture, so `catch`/`match`/`try`/`if`/`||`/`&&` operate on the structured
+  error, not its flattened text. Also covers optional-returning functions.
+- **Mandatory explicit handling.** An unhandled error is a **compile error** — it
+  must be `catch`/`||`'d or propagated with `try`, and a `try`'s error must be
+  covered by the enclosing function's declared set (a top-level `try` is
+  rejected). Commands keep the exit-code model: `ExecutableError` is exempt.
+- **Commands & pipelines as catchable errors.** A command's value view is
+  `ExecutableError!String`; `parseInt`/`parseFloat` are `ParseError!Int`/`!Float`.
+  Pipelines are **`pipefail`-style**: any stage yielding an error makes the whole
+  pipeline evaluate to that error for a trailing handler to catch.
+- **Inferred error sets (`!T`)** collect the body's error variants (including
+  cross-function propagation and a `try`'d command's `ExecutableError`), so
+  `match` exhaustiveness is enforced and callers see a concrete set.
+- **Error-set merge.** `A || B` between two error sets builds a merged set (the
+  union of their variants, with payload-conflict checking and dedup).
+
+#### Sum types: `A || B`
+
+A structural sum type — a value that is *one of* several member types — written
+with `||` (any number of members: `A || B || C`). See `docs/features.md` and the
+runnable `examples/sum_types.rn`.
+
+- **Declaration & widening.** `const IntOrString = Int || String` (or inline as an
+  annotation, parameter, or return type). Sums are unordered sets and normalized:
+  `Int || String` equals `String || Int`, and nested/duplicate members flatten. A
+  value of a member type widens into the sum implicitly.
+- **Must narrow before use.** A bare (un-narrowed) sum cannot be used as one
+  specific member — arithmetic and string interpolation on it are compile errors.
+  You narrow it first.
+- **Narrowing with `is`.** The new `x is T` operator is a runtime type test
+  (works on any value) evaluating to `Bool`; in an `if` it refines the binding
+  per branch (then: `T`; else: the remaining members, collapsing a two-member sum
+  to the survivor).
+- **Narrowing with comparisons.** `==`/`!=` and the relational operators narrow a
+  sum-typed binding; comparing a sum to a value it can never equal (a non-member)
+  is rejected as a likely mistake.
+- **Narrowing with `match`.** `match x { Int => …, String => … }` dispatches on the
+  member type, narrows the subject in each case body, enforces exhaustiveness
+  (unless `_`), and a case may bind the narrowed value with `|name|`.
+- **`var` flow narrowing.** A mutable sum binding narrows in branch conditions,
+  and a reassignment refines its type from that point on — while the declared type
+  still governs what may be assigned.
+- **Functions** can take and return sums; the concrete member value survives the
+  call boundary, so the caller can narrow the result.
+
+(Note: `||` between two error *sets* builds an error-set merge instead of a sum —
+see the error-handling section above.)
+
+#### Tooling
+
+- `examples/error_handling.rn` and `examples/sum_types.rn` showcases, and
+  `tests/cli_examples.sh` which exit-checks every `examples/*.rn` in CI
+  (previously no example was CI-verified).
+
+### Changed
+
+- **Error/value propagation is value/yield-based.** A function produces its
+  result (including an error) via `yield`; there is no `return`. `try` propagates
+  by re-yielding the error.
+- Numeric literal typing is now spelled out: a literal with no decimal point (or
+  exponent) is `Int`; one with a decimal point (even `0.0`) or an exponent is
+  `Float`.
+
+### Removed
+
+- **The `return` keyword.** Functions output via `yield` only. To stop a function
+  early, `yield` the result and place no further statements after it (or use
+  `exit` to halt the stage).
+
+### Fixed
+
+- **Multi-digit literal crash**: any numeric literal with three or more digits
+  (e.g. `100`) panicked the lexer (a fixed-size digit probe buffer was sliced out
+  of bounds). Fixed.
+- **`;` statement separator after a value binding**: `const z = y; echo "hi"`
+  (and arithmetic-RHS bindings) silently swallowed the following statement as a
+  command argument; only command-producing initializers now sequence with `;`.
+- **`if`-branch stack drift**: a branch body that bound a value (e.g.
+  `const n: Int = x`) leaked a runtime stack slot, corrupting a later statement;
+  the branch now balances its stack.
+- Type diagnostics render the string type as `String` instead of `[]Byte`.
+
 ## [0.3.0] — 2026-06-14
 
 ### Changed
