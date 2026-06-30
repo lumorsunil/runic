@@ -300,6 +300,12 @@ defer `||` / negation composition.
     Test: `sum_match_regression`. (Surfaced + fixed a pre-existing lexer crash:
     `consumeDigits` sliced its fixed 2-byte probe buffer out of bounds on any 3+
     digit literal like `100` — `multi_digit_literal_regression`.)
+  - **Showcase example (done, 2026-06-30).** `examples/sum_types.rn` demonstrates
+    every feature (widening, must-narrow, `is`/comparison/`match` narrowing,
+    `match` capture, `var` flow refinement, sum params + returns, `?`/precedence).
+    Added `tests/cli_examples.sh` (run by the CI smoke stage's `cli_*.sh` glob) to
+    exit-0-check *every* `examples/*.rn`, so the curated examples can't silently
+    rot — previously none were CI-verified.
   - **Remaining (deferrable):** LSP hover/completion for sum types.
 
 ## Relationship to error sets / error unions
