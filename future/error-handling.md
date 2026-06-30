@@ -1,56 +1,94 @@
 # error handling
 
+> **Status: implemented and shipped in 0.4.0.** This was the original proposal;
+> it has been updated to reflect what was actually built. The canonical
+> user-facing reference is the "Errors as first-class types" section of
+> `docs/features.md`; the detailed implementation record is
+> `error-handling-plan.md` (and `pipeline-errors-plan.md` for the pipeline
+> cluster). Runnable showcase: `examples/error_handling.rn`.
+
 ## introduction
 
-We would like to have zig-like error handling.
-Both with values and types.
-So for example, you could define an error type:
-`const MyError = error { MySpecificError }`
-Then, it can be used in a binding for example:
-`const value_or_error: MyError!String = MyError.MySpecificError`
-Also as a return value from a function:
+Zig-like error handling, with both values and types. Define an error set, then
+use it in a binding or as a function's return type. A function produces its
+result — including an error — via `yield` (Runic has no `return`):
 
 ```runic
 const ParseIntError = error { ExpectedNumber }
-fn String parseInt() ParseIntError!Int {
-  return ParseIntError.ExpectedNumber
+
+fn String parseLevel() ParseIntError!Int {
+  yield ParseIntError.ExpectedNumber
 }
 ```
 
-## `catch` keyword
+An error set may also be left to inference with a leading `!T`, which collects
+the variants the body actually produces:
 
-`const int = echo "1234" | parseInt catch 0`
-`catch` takes an error union value, checks if it's an error and if it is, evaluates to a default value (0 in the example above), if it was not an error, the original value is used
-so `ParseIntError.ExpectedNumber catch "hello"` will evaluate into `"hello"`
-while `"success" catch "hello"` will evaluate into "success".
-Now this was just an example to show how catch should work, we should probably not allow non-error types to be followed by the `catch` keyword. That should be a type check error.
+```runic
+fn Void mayFail() !String { ... }   // error set inferred from the body
+```
 
-## `try` keyword
+## `catch`
 
-Next up is the `try` keyword. The try keyword is syntactic sugar. The following expression:
-`const int = try (echo "1234" | parseInt)`
-Will turn into:
-`const int = (echo "1234" | parseInt) catch |err| return err`
+`const level = echo "1234" | parseInt catch 0`
+
+`catch` takes an error-union value: if it holds an error it evaluates to the
+handler (`0` above), otherwise to the unwrapped ok value. So
+`ParseIntError.ExpectedNumber catch "hello"` is `"hello"`, while
+`"success" catch "hello"` is `"success"`. The handler can bind the error with
+`|err|`. Applying `catch` to a non-error value is a type error.
+
+## `||`
+
+`||` is shorthand for "catch and discard the error", yielding the fallback:
+`const name = lookupName || "anonymous"`.
+
+## `try`
+
+`try` propagates an error out of the enclosing function (re-yielding it), else
+evaluates to the ok value:
+
+```runic
+fn Void run() ParseError!Int {
+  const level = try (echo "1234" | parseInt)
+  yield level * 2
+}
+```
+
+The enclosing function must **cover** every error `try` propagates — its return
+type has to be an error union whose set includes those variants (or an inferred
+`!T`). A `try` whose error isn't covered, or a top-level `try` (nothing to
+propagate to), is a compile error.
+
+## mandatory handling
+
+An error that is produced but neither handled (`catch`/`||`) nor propagated
+(`try`) is a **compile error**, so failures are never silently dropped. At the
+top level there is nothing to propagate to, so the error must be caught. Commands
+keep the implicit exit-code model — their `ExecutableError` is exempt, so a bare
+`ls` or `echo "x" | grep "y"` doesn't require a `catch`.
 
 ## executable calls
 
-All executable calls will have an inherent error union type as the stdout type:
-`const result: ExecutableError!String = echo "this should succeed"`
-
-## inferred error union types
-
-Error union types should be able to be inferred:
+A command's value view is an error union with `ExecutableError` as the set
+(`NonZeroExit` / `Signalled` / `SpawnFailed`):
 
 ```runic
-const result = echo "hello" infers to ExecutableError!String
-fn Void thisCouldError() !String { infers to ExecutableError!String
-  grep "--invalid-flag"
-}
+const result: ExecutableError!String = echo "this should succeed"
 ```
+
+The builtins `parseInt` / `parseFloat` return `ParseError!Int` / `ParseError!Float`.
+
+## pipelines
+
+A pipeline is `pipefail`-style: if any stage yields an error, the whole pipeline
+evaluates to that error for a trailing `catch`/`||`/`match`/`try` to handle. As in
+bash the stages still run concurrently — a stage erroring doesn't forcibly stop
+the others; the error simply becomes the pipeline's value.
 
 ## errors with values
 
-An error can also be defined with arbitrary payload types:
+An error variant may carry a typed payload:
 
 ```runic
 const MyError = error {
@@ -59,22 +97,32 @@ const MyError = error {
 }
 ```
 
-Essentially MyError becomes a union(enum)-like type (like in zig), and you can define a value of the type MyError using the same syntax.
-Here is an example of how we can construct an error value with a payload:
+`MyError` behaves like a Zig `union(enum)`. Construct a payload-less variant with
+`MyError.UnknownError`, and a payloaded one with `MyError{ .ErrorWithMessage = "..." }`:
 
 ```runic
 fn Void givesError() MyError!Void {
-    return MyError{ .ErrorWithMessage = "This is the error message." }
+    yield MyError{ .ErrorWithMessage = "This is the error message." }
 }
 ```
 
-And then the error payload can be accessed like so:
+`match` dispatches on the variant and binds the payload. Matching an error set is
+exhaustive (every variant, or a `_` case), and the structured error value is
+preserved across the in-process call boundary so `match`/`catch`/`if`/`||` see the
+real variant, not its flattened text:
 
 ```runic
 fn Void program() Void {
     givesError catch |err| match err {
-        MyError.UnknownError => echo "Error: Unknown error" >&2,
-        MyError.ErrorWithMessage => |message| echo "Error: ${message}" >&2,
+        MyError.UnknownError => echo "Error: Unknown error" >&2
+        MyError.ErrorWithMessage => |message| echo "Error: ${message}" >&2
     }
 }
 ```
+
+## error-set merge
+
+`A || B` between two error sets builds a merged set whose variants are the union
+of both (chains as `A || B || C`; a shared variant name must carry a compatible
+payload). The same `||` spelling between non-error types is a general
+[sum type](./sum-types-plan.md).
