@@ -608,6 +608,12 @@ pub const TypeExpr = union(enum) {
             .fn_ref_type => |frt| {
                 try writer.print("<fn_ref:{}>", .{frt.instr_set});
             },
+            // `[]Byte` is the string type; render it as `String` in diagnostics
+            // (other element types print as `[]<element>`).
+            .array => |array| if (array.element.* == .byte)
+                try writer.writeAll("String")
+            else
+                try array.format(writer),
             inline else => |s| try s.format(writer),
         }
     }

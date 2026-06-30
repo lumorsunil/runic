@@ -1,4 +1,4 @@
-[error]: tests/diagnostics/error_union_yield_mismatch.rn:2:21: yield type mismatch: function yields []Byte, but declared stdout type is E!Int
+[error]: tests/diagnostics/error_union_yield_mismatch.rn:2:21: yield type mismatch: function yields String, but declared stdout type is E!Int
    1:const E = error { Bad }
    2:fn Void f() E!Int { yield "str" }
    3:const r = f catch 0
