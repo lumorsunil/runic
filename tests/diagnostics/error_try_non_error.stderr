@@ -1,0 +1,5 @@
+[error]: tests/diagnostics/error_try_non_error.rn:1:15: try requires an error union or error value, found String
+   1:const v = try "plain"
+   2:echo "${v}"
+   3:
+

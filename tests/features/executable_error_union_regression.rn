@@ -1,0 +1,16 @@
+// A command bound where an ExecutableError!String is expected: a zero exit
+// yields the captured output (ok), any other exit yields an ExecutableError.
+
+const ok: ExecutableError!String = echo "produced"
+echo "ok=${ok catch "fb"}"
+
+const failed: ExecutableError!String = grep "zzz" "/dev/null"
+echo "failed=${failed catch "no-match"}"
+
+// `||` discards the command error and uses the fallback.
+const failed2: ExecutableError!String = grep "zzz" "/dev/null"
+echo "discarded=${failed2 || "fb2"}"
+
+// The error value carries the exit code.
+const failed3: ExecutableError!String = grep "zzz" "/dev/null"
+echo "raw=${failed3}"

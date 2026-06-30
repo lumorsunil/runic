@@ -1,4 +1,0 @@
-// Runtime diagnostic: parseInt on non-numeric input names the offending
-// value and source location, then aborts (a single clean message, not a
-// raw error dump).
-echo "abc" | parseInt | { yield &0 }

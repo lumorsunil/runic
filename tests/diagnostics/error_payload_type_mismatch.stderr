@@ -1,0 +1,6 @@
+[error]: tests/diagnostics/error_payload_type_mismatch.rn:2:25: expected type String, actual: Int
+   1:const E = error { WithMsg: String }
+   2:const e = E{ .WithMsg = 5 }
+   3:echo "${e}"
+   4:
+

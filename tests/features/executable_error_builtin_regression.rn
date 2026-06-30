@@ -1,0 +1,13 @@
+// ExecutableError is a builtin error set available in every script.
+const a = ExecutableError.SpawnFailed
+echo "a=${a}"
+
+const b = ExecutableError{ .NonZeroExit = 1 }
+echo "b=${b}"
+
+// Usable as an error union type, with catch on both the ok and error paths.
+const ok: ExecutableError!String = "value"
+echo "ok=${ok catch "fb"}"
+
+const failed: ExecutableError!String = ExecutableError.SpawnFailed
+echo "failed=${failed catch "recovered"}"

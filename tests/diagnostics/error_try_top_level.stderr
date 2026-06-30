@@ -1,0 +1,7 @@
+[error]: tests/diagnostics/error_try_top_level.rn:7:15: try propagates error 'Bad', but there is no enclosing function to propagate to; handle it with catch
+   5:// A top-level `try` has no enclosing function to propagate to, so the error
+   6:// cannot bubble up. It must be handled with catch instead.
+   7:const v = try mayFail
+   8:echo "${v}"
+   9:
+

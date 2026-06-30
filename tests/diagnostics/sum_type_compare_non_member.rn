@@ -1,0 +1,6 @@
+// Comparing a sum against a value whose type is not one of its members can
+// never be true, so it is rejected as a likely mistake. `Bool` is not a member
+// of `Int || String`.
+const x: Int || String = 5
+
+if (x == true) { echo "t" } else { echo "f" }

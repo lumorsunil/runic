@@ -1,0 +1,6 @@
+i=int
+i=not-str
+s=not-int
+s=str
+n=int
+both

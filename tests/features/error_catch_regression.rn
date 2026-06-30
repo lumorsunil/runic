@@ -1,0 +1,18 @@
+const E = error { Bad }
+
+// catch a pure error value -> the default
+const a = E.Bad catch "fallback"
+echo "a=${a}"
+
+// ok path: an error union holding an ok value -> that value
+const ok: E!String = "kept"
+const b = ok catch "fallback"
+echo "b=${b}"
+
+// err path: an error union holding an error -> the default
+const bad: E!String = E.Bad
+const c = bad catch "recovered"
+echo "c=${c}"
+
+// capture form binds |err| to the error value
+E.Bad catch |err| echo "captured ${err}"

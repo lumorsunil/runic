@@ -163,7 +163,6 @@ pub const Tag = enum {
     kw_for,
     kw_while,
     kw_match,
-    kw_return,
     kw_exit,
     kw_yield,
 
@@ -174,6 +173,9 @@ pub const Tag = enum {
     // Error-handling keywords
     kw_try,
     kw_catch,
+
+    /// `x is T` — a runtime type test (Bool), and the basis for sum narrowing.
+    kw_is,
 
     // Literal keywords
     kw_true,
@@ -253,12 +255,12 @@ pub const Tag = enum {
             .kw_for => "for",
             .kw_while => "while",
             .kw_match => "match",
-            .kw_return => "return",
             .kw_exit => "exit",
             .kw_yield => "yield",
             .kw_import => "import",
             .kw_try => "try",
             .kw_catch => "catch",
+            .kw_is => "is",
             .kw_true => "true",
             .kw_false => "false",
             .kw_null => "null",
@@ -296,12 +298,12 @@ const keyword_map = std.StaticStringMap(Tag).initComptime(.{
     .{ "for", .kw_for },
     .{ "while", .kw_while },
     .{ "match", .kw_match },
-    .{ "return", .kw_return },
     .{ "exit", .kw_exit },
     .{ "yield", .kw_yield },
     .{ "import", .kw_import },
     .{ "try", .kw_try },
     .{ "catch", .kw_catch },
+    .{ "is", .kw_is },
     .{ "true", .kw_true },
     .{ "false", .kw_false },
     .{ "null", .kw_null },

@@ -1,0 +1,5 @@
+ok=produced
+
+failed=no-match
+discarded=fb2
+raw=ExecutableError.NonZeroExit(1)

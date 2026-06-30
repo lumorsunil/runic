@@ -153,6 +153,15 @@ pub const TypeExpr = union(enum) {
     promise: PrefixType,
     error_union: ErrorUnion,
     error_set: ErrorSet,
+    /// A type-level `A || B` merge written in a type position (e.g.
+    /// `const Merged = ExecutableError || MyError`). Resolved by the type checker
+    /// into a concrete type: an `error_set` union when both operands are error
+    /// sets (backlog #18), otherwise a structural `sum` (see `future/sum-types-plan.md`).
+    type_merge: TypeMerge,
+    /// A structural sum type `A || B (|| …)`: a value is one of the member
+    /// types. Members are normalized (nested sums flattened, duplicates removed).
+    /// See `future/sum-types-plan.md`.
+    sum: SumType,
     err: ErrorType,
     array: ArrayType,
     struct_type: StructType,
@@ -224,15 +233,60 @@ pub const TypeExpr = union(enum) {
         }
     };
 
-    pub const ErrorSet = struct {
-        error_types: []*const TypeExpr,
+    pub const TypeMerge = struct {
+        lhs: *const TypeExpr,
+        rhs: *const TypeExpr,
         span: Span,
 
         pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try writer.print("{f} || {f}", .{ self.lhs, self.rhs });
+        }
+    };
+
+    pub const SumType = struct {
+        members: []const *const TypeExpr,
+        span: Span,
+
+        pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            for (self.members, 0..) |member, i| {
+                if (i > 0) try writer.writeAll(" || ");
+                try writer.print("{f}", .{member});
+            }
+        }
+    };
+
+    pub const ErrorSet = struct {
+        variants: []const Variant,
+        span: Span,
+
+        /// A single named error variant, optionally carrying a payload type
+        /// (`UnknownError` vs `ErrorWithMessage: String`).
+        pub const Variant = struct {
+            name: Identifier,
+            payload: ?*const TypeExpr,
+            span: Span,
+
+            pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+                try writer.writeAll(self.name.name);
+                if (self.payload) |payload| {
+                    try writer.print(": {f}", .{payload});
+                }
+            }
+        };
+
+        /// Returns the variant with the given name, or null if absent.
+        pub fn variant(self: @This(), name: []const u8) ?Variant {
+            for (self.variants) |v| {
+                if (std.mem.eql(u8, v.name.name, name)) return v;
+            }
+            return null;
+        }
+
+        pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
             try writer.writeAll("error{");
-            for (self.error_types, 0..) |err, i| {
-                try err.format(writer);
-                if (i < self.error_types.len - 1) {
+            for (self.variants, 0..) |v, i| {
+                try v.format(writer);
+                if (i < self.variants.len - 1) {
                     try writer.writeByte(',');
                 }
             }
@@ -240,12 +294,18 @@ pub const TypeExpr = union(enum) {
         }
     };
 
+    /// The type of a single error variant value (e.g. the type of
+    /// `MyError.UnknownError` before it is widened into an error set).
     pub const ErrorType = struct {
-        error_payload: *const TypeExpr,
+        name: Identifier,
+        payload: ?*const TypeExpr,
         span: Span,
 
         pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
-            try writer.print("Error({f})", .{self.error_payload});
+            try writer.writeAll(self.name.name);
+            if (self.payload) |payload| {
+                try writer.print(": {f}", .{payload});
+            }
         }
     };
 
@@ -496,6 +556,8 @@ pub const TypeExpr = union(enum) {
             .promise,
             .error_union,
             .error_set,
+            .type_merge,
+            .sum,
             .err,
             .alias,
             .identifier,
@@ -546,6 +608,12 @@ pub const TypeExpr = union(enum) {
             .fn_ref_type => |frt| {
                 try writer.print("<fn_ref:{}>", .{frt.instr_set});
             },
+            // `[]Byte` is the string type; render it as `String` in diagnostics
+            // (other element types print as `[]<element>`).
+            .array => |array| if (array.element.* == .byte)
+                try writer.writeAll("String")
+            else
+                try array.format(writer),
             inline else => |s| try s.format(writer),
         }
     }
@@ -568,6 +636,32 @@ pub const TypeExpr = union(enum) {
             .span = .global,
         },
     };
+
+    /// Builtin `ExecutableError` error set: a command's failure modes. Its value
+    /// view is `ExecutableError!String` (see the error-handling plan, D7).
+    const executableErrorIntType = TypeExpr{ .integer = .{ .span = .global } };
+    pub const executableErrorVariants = [_]ErrorSet.Variant{
+        .{ .name = Identifier.global("NonZeroExit"), .payload = &executableErrorIntType, .span = .global },
+        .{ .name = Identifier.global("Signalled"), .payload = &executableErrorIntType, .span = .global },
+        .{ .name = Identifier.global("SpawnFailed"), .payload = null, .span = .global },
+    };
+    pub const executableErrorSet = ErrorSet{
+        .variants = &executableErrorVariants,
+        .span = .global,
+    };
+    pub const executableErrorType = TypeExpr{ .error_set = executableErrorSet };
+
+    /// Builtin `ParseError` error set: the failure mode of the parse builtins
+    /// (`parseInt`/`parseFloat`), whose value view is `ParseError!Int` /
+    /// `ParseError!Float`. Payload-less for now.
+    pub const parseErrorVariants = [_]ErrorSet.Variant{
+        .{ .name = Identifier.global("Invalid"), .payload = null, .span = .global },
+    };
+    pub const parseErrorSet = ErrorSet{
+        .variants = &parseErrorVariants,
+        .span = .global,
+    };
+    pub const parseErrorType = TypeExpr{ .error_set = parseErrorSet };
 };
 
 /// StringLiteral supports interpolation segments so command arguments and
@@ -654,6 +748,32 @@ pub const FloatLiteral = struct {
     span: Span,
 };
 
+/// `Name{ .field = expr, ... }` — struct-literal syntax. Currently the only
+/// consumer is error value construction (`MyError{ .ErrorWithMessage = "..." }`,
+/// exactly one field naming a payload-carrying variant); general struct support
+/// can reuse this node later.
+pub const StructLiteral = struct {
+    name: Identifier,
+    fields: []const FieldInit,
+    span: Span,
+
+    pub const FieldInit = struct {
+        name: Identifier,
+        value: *Expression,
+        span: Span,
+    };
+
+    pub fn resolveType(
+        self: *@This(),
+        _: std.Io,
+        _: std.mem.Allocator,
+        scope: *semantic.Scope,
+    ) semantic.Scope.Error!?*const TypeExpr {
+        const binding = scope.lookup(self.name.name) orelse return null;
+        return binding.type_expr;
+    }
+};
+
 pub const BoolLiteral = struct {
     value: bool,
     span: Span,
@@ -673,6 +793,7 @@ pub const Expression = union(enum) {
     array: ArrayLiteral,
     map: MapLiteral,
     range: RangeLiteral,
+    struct_literal: StructLiteral,
     pipeline: Pipeline,
     pipeline_deprecated: Pipeline_deprecated,
     call: CallExpr,
@@ -687,6 +808,7 @@ pub const Expression = union(enum) {
     match_expr: MatchExpr,
     try_expr: TryExpr,
     catch_expr: CatchExpr,
+    is_expr: IsExpr,
     import_expr: ImportExpr,
     assignment: Assignment,
     executable: ExecutableExpr,
@@ -856,7 +978,11 @@ pub const CallExpr = struct {
 
         return switch (callee_type.*) {
             .function => |function| function.return_type orelse &globalExecutionType,
-            else => null,
+            // A bare identifier referencing a value parses as a zero-arg call
+            // (`okv` -> `okv()`); its type is just the value's type. (Commands
+            // resolve to `executableType`, which is a `.function`, so they take
+            // the arm above.)
+            else => if (self.arguments.len == 0) callee_type else null,
         };
     }
 };
@@ -892,6 +1018,8 @@ pub const MemberExpr = struct {
 
         return switch (object_type.*) {
             .struct_type => |struct_type| struct_type.memberType(self.member.name),
+            // `MyError.Variant` has the error set's type when the variant exists.
+            .error_set => |error_set| if (error_set.variant(self.member.name) != null) object_type else null,
             else => null,
         };
     }
@@ -966,6 +1094,39 @@ pub const BinaryExpr = struct {
                     else => break :blk null,
                 };
                 break :blk right_type;
+            },
+            // `errorUnion || fallback` discards the error: the result is the
+            // error union's payload type.
+            .logical_or => blk: {
+                if (left_type) |lt| switch (lt.*) {
+                    .error_union => |error_union| break :blk error_union.payload,
+                    .error_set, .err => break :blk right_type,
+                    else => {},
+                };
+                break :blk left_type;
+            },
+            // `errorUnion && next` is a monadic guard: `next` when the left is
+            // ok, the left's error otherwise. The result is an error union
+            // carrying the left's error set with `next`'s value as the payload,
+            // so it must itself be handled.
+            .logical_and => blk: {
+                if (left_type) |lt| {
+                    const err_set: ?*const TypeExpr = switch (lt.*) {
+                        .error_union => |error_union| error_union.err_set,
+                        .error_set => lt,
+                        else => null,
+                    };
+                    if (err_set) |set| {
+                        const result = try allocator.create(TypeExpr);
+                        result.* = .{ .error_union = .{
+                            .err_set = set,
+                            .payload = right_type orelse break :blk lt,
+                            .span = self.span,
+                        } };
+                        break :blk result;
+                    }
+                }
+                break :blk left_type;
             },
             else => left_type,
         };
@@ -1214,34 +1375,70 @@ pub const TryExpr = struct {
     span: Span,
 
     pub fn resolveType(
-        _: *@This(),
+        self: *@This(),
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        scope: *semantic.Scope,
+    ) semantic.Scope.Error!?*const TypeExpr {
+        // `try expr` evaluates to the error union's payload type (the error
+        // case is propagated out of the enclosing function).
+        const subject_type = try self.subject.resolveType(io, allocator, scope) orelse return null;
+        return switch (subject_type.*) {
+            .error_union => |error_union| error_union.payload,
+            else => subject_type,
+        };
+    }
+};
+
+/// The `Bool` result type shared by every `is` test.
+const is_result_type = TypeExpr{ .boolean = .{ .span = .global } };
+
+/// `x is T` — a runtime type test evaluating to `Bool`. Also the basis for sum
+/// narrowing (the type checker derives narrowing facts from it). See
+/// `future/sum-types-plan.md`.
+pub const IsExpr = struct {
+    subject: *Expression,
+    type_expr: *const TypeExpr,
+    span: Span,
+
+    pub fn resolveType(
+        self: *@This(),
         _: std.Io,
         _: std.mem.Allocator,
         _: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
-        return null;
+        _ = self;
+        return &is_result_type;
     }
 };
 
 pub const CatchExpr = struct {
     subject: *Expression,
-    handler: CatchClause,
+    /// Optional `|err|` binding for the error value (e.g. `catch |err| ...`).
+    capture: ?CaptureClause,
+    /// The default value / handler expression (may itself be a block).
+    handler: *Expression,
     span: Span,
 
     pub fn resolveType(
-        _: *@This(),
-        _: std.Io,
-        _: std.mem.Allocator,
-        _: *semantic.Scope,
+        self: *@This(),
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        scope: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
-        return null;
+        // `expr catch ...` evaluates to the error union's payload type; when the
+        // subject is a bare error value (no payload), it always yields the
+        // handler, so the handler's type is the result type.
+        const subject_type = try self.subject.resolveType(io, allocator, scope) orelse
+            return self.handler.resolveType(io, allocator, scope);
+        return switch (subject_type.*) {
+            .error_union => |error_union| error_union.payload,
+            // A bare error value or a command (treated as `ExecutableError!String`)
+            // yields the handler / ok-string; use the handler's type.
+            .error_set, .err, .execution => self.handler.resolveType(io, allocator, scope),
+            else => subject_type,
+        };
     }
-};
-
-pub const CatchClause = struct {
-    binding: ?*BindingPattern,
-    body: Block,
-    span: Span,
 };
 
 pub const ImportExpr = struct {
@@ -1474,8 +1671,6 @@ pub const Statement = union(enum) {
     binding_decl: BindingDecl,
     expression: ExpressionStmt,
 
-    error_decl: ErrorDecl,
-    return_stmt: ReturnStmt,
     exit_stmt: ExitStmt,
     yield_stmt: YieldStmt,
     while_stmt: WhileStmt,
@@ -1485,8 +1680,6 @@ pub const Statement = union(enum) {
         return switch (self) {
             .type_binding_decl => |decl| decl.span,
             .binding_decl => |decl| decl.span,
-            .error_decl => |err| err.span,
-            .return_stmt => |ret| ret.span,
             .exit_stmt => |exit_stmt| exit_stmt.span,
             .yield_stmt => |yield_stmt| yield_stmt.span,
             // .for_stmt => |loop_stmt| loop_stmt.span,
@@ -1650,52 +1843,15 @@ pub const BuiltinExpr = struct {
     }
 };
 
-pub const ErrorDecl = struct {
-    name: Identifier,
-    definition: ErrorBody,
-    span: Span,
-};
-
-pub const ErrorBody = union(enum) {
-    enumeration: EnumBody,
-    union_type: UnionBody,
-};
-
-pub const EnumBody = struct {
-    variants: []const EnumVariant,
-    span: Span,
-};
-
-pub const EnumVariant = struct {
-    name: Identifier,
-    span: Span,
-};
-
-pub const UnionBody = struct {
-    variants: []const UnionVariant,
-    span: Span,
-};
-
-pub const UnionVariant = struct {
-    name: Identifier,
-    payload: ?*const TypeExpr,
-    span: Span,
-};
-
 pub const ModulePath = struct {
     literal: StringLiteral,
     span: Span,
 };
 
-pub const ReturnStmt = struct {
-    value: ?*Expression,
-    span: Span,
-};
-
 /// `yield expr` pushes a value to a stream of the enclosing function/stage.
 /// `yield &2 expr` targets a specific file descriptor (`&1` = stdout (default),
-/// `&2` = stderr). Unlike `return`, it does not exit the function and the value
-/// is written to the stream rather than becoming the function's return value.
+/// `&2` = stderr). It does not halt the function; the value is written to the
+/// stream rather than becoming a return value (there is no `return`).
 pub const YieldStmt = struct {
     value: *Expression,
     /// Target file descriptor: 1 = stdout (default), 2 = stderr.

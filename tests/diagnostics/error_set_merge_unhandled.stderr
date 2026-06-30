@@ -1,0 +1,6 @@
+[error]: tests/diagnostics/error_set_merge_unhandled.rn:8:1: error is not handled; use catch (or || to discard) or propagate it
+   6:fn String f() Merged!String { yield MyError.Bad }
+   7:
+   8:f
+   9:
+

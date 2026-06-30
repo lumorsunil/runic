@@ -1,0 +1,48 @@
+# parseInt / parseFloat are `ParseError!Int` / `ParseError!Float`: a bad parse
+# is a catchable error value, not a hard abort. (Backlog #8.)
+
+# trailing catch: good input unwraps, bad input takes the fallback
+const a = echo "1234" | parseInt catch 0
+echo "a=${a}"
+const b = echo "abc" | parseInt catch 0
+echo "b=${b}"
+const c = echo "2.5" | parseFloat catch 9.9
+echo "c=${c}"
+const d = echo "nope" | parseFloat catch 9.9
+echo "d=${d}"
+
+# match on the error variant through `catch |e|`
+echo "abc" | parseInt catch |e| match e {
+    ParseError.Invalid => echo "got-invalid"
+}
+
+# valid input still flows by-value through a downstream stage
+echo "10" | parseInt | { const n = &0; yield "n2=${n * 2}\n" }
+
+# a mid-pipeline error short-circuits *through* a downstream arithmetic stage
+# (arithmetic on an error propagates it) and surfaces at the trailing catch.
+const e = echo "abc" | parseInt | { const n = &0; yield n * 2 } catch 99
+echo "e=${e}"
+const f = echo "21" | parseInt | { const n = &0; yield n * 2 } catch 99
+echo "f=${f}"
+
+# `||` discards a pipeline's error and uses the fallback (like `catch`).
+const g = echo "abc" | parseInt || 7
+echo "g=${g}"
+const h = echo "12" | parseInt || 7
+echo "h=${h}"
+
+# A yielded error aborts the pipeline and it evaluates to the error — even when
+# a downstream stage would *swallow* the value (a comparison) or the final
+# stage's type is plain `T` (a mid-pipeline error producer). The error leads the
+# stream, so the surrounding `catch` sees it.
+const i = echo "abc" | parseInt | { const n = &0; if (n > 5) { yield "big" } else { yield "small" } } catch "caught"
+echo "i=${i}"
+const j = echo "9" | parseInt | { const n = &0; if (n > 5) { yield "big" } else { yield "small" } } catch "caught"
+echo "j=${j}"
+fn Int doubler() Int { yield &0 * 2 }
+fn Int inc() Int { yield &0 + 1 }
+const k = echo "abc" | parseInt | doubler | inc catch 99
+echo "k=${k}"
+const l = echo "10" | parseInt | doubler | inc catch 99
+echo "l=${l}"

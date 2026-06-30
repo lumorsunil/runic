@@ -1,0 +1,2 @@
+const v = try "plain"
+echo "${v}"

@@ -1,0 +1,5 @@
+const E = error { Bad }
+const okv: E!String = "x"
+
+# `&&` produces an error union; a bare statement leaves it unhandled.
+okv && "y"

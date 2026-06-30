@@ -1,0 +1,14 @@
+// `try` on a command propagates ExecutableError; in an inferred (`!T`) function
+// that variant set is collected (#3c), so a `match` on the result must cover
+// the command failure modes (or use `_`). The mixed set (E.Bad + command
+// errors) is correctly non-exempt thanks to the subset exemption test.
+const E = error { Bad }
+
+fn String f() !String {
+    const out = try echo "hi"
+    yield E.Bad
+}
+
+match f {
+    E.Bad => echo "bad"
+}

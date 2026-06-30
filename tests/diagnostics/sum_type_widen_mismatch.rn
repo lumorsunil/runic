@@ -1,0 +1,7 @@
+// A value is assignable to a sum only when its type is one of the members
+// (widening). Bool is not a member of `Int || String`, so this is rejected.
+// Narrowing a sum back to a member needs an explicit match (not yet implemented).
+const IntOrString = Int || String
+
+const z: IntOrString = true
+echo "z bound"

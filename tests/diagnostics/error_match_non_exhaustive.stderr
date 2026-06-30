@@ -1,0 +1,8 @@
+[error]: tests/diagnostics/error_match_non_exhaustive.rn:3:1: match is not exhaustive: missing variant 'B' (add it or a `_` case)
+   1:const E = error { A, B: String }
+   2:const e = E.A
+   3:match e {
+   4:    E.A => echo "a",
+   5:}
+   6:
+

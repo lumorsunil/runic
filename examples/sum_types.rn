@@ -1,0 +1,86 @@
+// Run with: zig build run -- examples/sum_types.rn
+// Demonstrates Runic sum types `A || B`: declaration & widening, the must-narrow
+// rule, narrowing via `is` / comparison / `match` (with capture), `var` flow
+// refinement, sum-typed parameters and returns, and the `||` precedence rule.
+
+// A sum type is declared with `const` and used as an annotation. It is an
+// unordered set: `Int || String` is the same type as `String || Int`.
+const IntOrString = Int || String
+
+// Widening is implicit — a value of a member type flows into the sum.
+const a: IntOrString = 42
+const b: Int || String = "hello"
+
+// You cannot use a bare sum as one specific member; you must narrow it first.
+// `is` is a runtime type test; in an `if` it refines the binding per branch.
+if (a is Int) {
+    echo "a is an int, doubled: ${a + a}"
+} else {
+    echo "a is a string: ${a}"
+}
+
+// The else branch sees the remaining members (here it collapses to String).
+if (b is Int) {
+    echo "b int: ${b + 1}"
+} else {
+    echo "b string: ${b}"
+}
+
+// Comparisons narrow too: `== v` narrows the then-branch to v's type, and
+// relational operators narrow to the numeric members.
+const n: Int || String = 0
+if (n == 0) {
+    echo "n is the int zero (+1 = ${n + 1})"
+} else {
+    echo "n is something else"
+}
+
+// `match` dispatches on the member type, narrows the subject in each case, and
+// must be exhaustive (or use `_`).
+const v: Int || String || Float = 3.5
+match v {
+    Int   => echo "match: int ${v + 1}"
+    Float => echo "match: float ${v}"
+    _     => echo "match: other"
+}
+
+// A `match` case can bind the narrowed value with `|name|` — handy when the
+// subject is a direct call rather than a plain binding.
+fn Void classify(flag: Bool) Int || String {
+    if (flag is Bool) { yield 7 } else { yield "n/a" }
+}
+match classify true {
+    Int    => |i| echo "captured int: ${i + 100}"
+    String => |s| echo "captured string: ${s}"
+}
+
+// `var` bindings narrow in conditions like `const`, and a reassignment refines
+// the flow type from that point on — while the declared type still governs what
+// may be assigned, so you can reassign across members.
+var slot: Int || String = 1
+slot = "text"
+echo "slot is now a string: ${slot}"
+slot = 99
+echo "slot is an int again: ${slot + 1}"
+
+// Functions take and return sums; the concrete member survives the call, so the
+// caller narrows the result.
+fn Void firstOrCount(present: Bool) Int || String {
+    if (present is Bool) { yield "found" } else { yield 0 }
+}
+const result = firstOrCount true
+if (result is String) {
+    echo "result string: ${result}"
+} else {
+    echo "result count: ${result}"
+}
+
+// Precedence: a prefix `?`/`[]` captures a following `||`, so `?Int || String`
+// is `?(Int || String)` — an optional whose payload is the sum. Both `null` and
+// either member are assignable. (Unwrap the optional, then narrow the sum.)
+const maybe: ?Int || String = "ready"
+if (maybe) |inner| {
+    if (inner is String) { echo "optional sum: ${inner}" } else { echo "optional sum int: ${inner + 0}" }
+} else {
+    echo "optional sum is null"
+}

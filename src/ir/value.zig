@@ -27,6 +27,7 @@ pub const Value = union(enum) {
     thread: usize,
     fn_ref: FunctionRef,
     zig_string: []const u8,
+    err: Err,
     // register: Register,
     // dereference: union(enum) {
     //     addr: usize,
@@ -224,6 +225,22 @@ pub const Value = union(enum) {
         };
     };
 
+    /// A runtime error value. The type `E!T` is erased to a plain `Value`;
+    /// an error is this `.err` arm, anything else is the ok payload. Set and
+    /// variant are identified by name (see the error-handling plan, D2).
+    pub const Err = struct {
+        set: []const u8,
+        variant: []const u8,
+        payload: ?*const Value = null,
+
+        pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try writer.print("{s}.{s}", .{ self.set, self.variant });
+            if (self.payload) |payload| {
+                try writer.print("({f})", .{payload});
+            }
+        }
+    };
+
     pub const FunctionRef = struct {
         fn_addr: InstructionAddr,
 
@@ -317,7 +334,7 @@ pub const Value = union(enum) {
             .pipe => |handle| try w.print("<pipe:{}>", .{handle}),
             .closeable => |handle| try w.print("<closeable:{}>", .{handle}),
             .thread => |id| try w.print("<thread:{}>", .{id}),
-            inline .slice, .executable, .exit_code, .fn_ref, .stream => |s| try w.print("{f}", .{s}),
+            inline .slice, .executable, .exit_code, .fn_ref, .stream, .err => |s| try w.print("{f}", .{s}),
             inline .zig_string => |s| try w.print("\"{s}{s}\"", .{ s[0..10], if (s.len > 10) "..." else "" }),
             inline else => |t| try w.print("{}", .{t}),
         }

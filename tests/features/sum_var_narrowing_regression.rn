@@ -1,0 +1,23 @@
+# `var` flow narrowing (Phase 5): a mutable sum-typed binding narrows like a
+# `const` in branch conditions, and a reassignment refines its flow type from
+# that point on — while the *declared* type still governs what can be assigned
+# (so you can reassign across members).
+fn Void @() Void
+
+# var narrows inside a branch condition.
+var a: Int || String = 5
+if (a is Int) { echo "a doubled=${a + a}" } else { echo "a str" }
+
+# A reassignment refines the flow type: after `b = "..."`, b is a String; after
+# `b = 99`, b is an Int again (so arithmetic is allowed).
+var b: Int || String = 1
+b = "text"
+echo "b str=${b}"
+b = 99
+echo "b int=${b + 1}"
+
+# The declared type still governs assignability — both members are assignable
+# regardless of the current flow type.
+var c: Int || String = "start"
+c = 7
+echo "c reassigned"

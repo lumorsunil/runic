@@ -1,0 +1,7 @@
+const E = error { Bad }
+
+// A capturing catch handler that produces output as the LAST statement: its
+// capture fork must be drained before exit (regression: used to race / print
+// nothing for an error-union binding subject).
+const v: E!String = E.Bad
+v catch |err| echo "caught: ${err}"

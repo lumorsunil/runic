@@ -1,0 +1,6 @@
+[error]: tests/diagnostics/sum_type_compare_non_member.rn:6:10: comparing Int || String with Bool: 'Bool' is not one of the sum's members, so the comparison is always false
+   4:const x: Int || String = 5
+   5:
+   6:if (x == true) { echo "t" } else { echo "f" }
+   7:
+

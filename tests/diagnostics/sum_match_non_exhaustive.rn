@@ -1,0 +1,7 @@
+// A sum `match` without a `_` case must cover every member. Missing `String`
+// here makes the match non-exhaustive.
+const x: Int || String = 5
+
+match x {
+    Int => echo "int"
+}

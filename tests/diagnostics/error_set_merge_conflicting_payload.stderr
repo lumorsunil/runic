@@ -1,0 +1,9 @@
+[error]: tests/diagnostics/error_set_merge_conflicting_payload.rn:5:11: conflicting payload for variant 'Dup' in merged error set
+   3:const A = error { Dup: String }
+   4:const B = error { Dup: Int }
+   5:const M = A || B
+   6:
+   7:fn String f() M!String { yield A.Dup }
+   8:
+   9:echo "${f catch "x"}"
+

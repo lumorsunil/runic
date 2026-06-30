@@ -560,6 +560,9 @@ pub const IRCompiler = struct {
     current_instruction_set: usize = 0,
     labels: ir.Labels = .init(),
     struct_types: std.ArrayList(ir.Value.Struct.Type) = .empty,
+    /// Top-level error set declarations, keyed by name, so `compileMember` can
+    /// recognize `MyError.Variant` as error-value construction.
+    error_sets: std.StringHashMapUnmanaged(ast.TypeExpr.ErrorSet) = .empty,
     document_store: *DocumentStore,
     logging_enabled: bool,
     diagnostics: std.ArrayList(Diagnostic) = .empty,
@@ -1140,7 +1143,24 @@ pub const IRCompiler = struct {
         };
     }
 
+    /// Records every top-level `const Name = error { ... }` declaration so that
+    /// `MyError.Variant` member access can be compiled as error-value construction.
+    fn registerErrorSets(self: *IRCompiler) Allocator.Error!void {
+        // Builtin error sets available in every script.
+        try self.error_sets.put(self.allocator, "ExecutableError", ast.TypeExpr.executableErrorSet);
+        try self.error_sets.put(self.allocator, "ParseError", ast.TypeExpr.parseErrorSet);
+
+        for (self.script.statements) |stmt| {
+            if (stmt.* != .type_binding_decl) continue;
+            const decl = stmt.type_binding_decl;
+            if (decl.type_expr.* != .error_set) continue;
+            try self.error_sets.put(self.allocator, decl.identifier.name, decl.type_expr.error_set);
+        }
+    }
+
     pub fn compile(self: *IRCompiler) Error!CompilationResult {
+        try self.registerErrorSets();
+
         self.current_instruction_set = try self.addInstructionSetNoPushFrame();
 
         try self.scopes.push(self.allocator, .closure);
@@ -1306,7 +1326,6 @@ pub const IRCompiler = struct {
         return switch (stmt.*) {
             .type_binding_decl => Result.fromValue(.void),
             .binding_decl => |*b| self.compileBindingDecl(stmt, b),
-            .return_stmt => |r| self.compileReturn(stmt, r),
             .exit_stmt => |e| self.compileExit(stmt, e),
             .yield_stmt => |y| self.compileYield(stmt, y),
             .expression => |expr| self.compileExpressionStatement(stmt, expr.expression),
@@ -1365,7 +1384,7 @@ pub const IRCompiler = struct {
         // fn declarations and identifier references are not inadvertently called.
         const is_member_access = expr.* == .binary and expr.binary.op == .member;
         if (is_member_access and result.source == .value and result.source.value == .fn_ref) {
-            const call_result = try self.compileFunctionCall(expr, result.source.value, &.{}, &.{});
+            const call_result = try self.compileFunctionCall(expr, result.source.value, &.{}, &.{}, null);
             try self.finalizeStatementResult(source, call_result);
             return .fromValue(.void);
         }
@@ -1538,23 +1557,16 @@ pub const IRCompiler = struct {
         };
     }
 
-    fn compileReturn(
-        self: *IRCompiler,
-        source: *ast.Statement,
-        r: ast.ReturnStmt,
-    ) Error!Result {
-        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
-
-        var result: Result = if (r.value) |value| try self.compileExpression(value) else .fromValue(.void);
-        switch (result.source) {
-            .location => |loc| if (loc.abs == .ref) {
-                try self.set(source, .initRegister(.r2), stableResultSource(result));
-                result = .fromLocation(ir.Location.initRegister(.r2).typed(result.typeExpr()));
-            },
-            else => {},
-        }
-        try self.exitWith(source, result);
-        return .fromValue(.void);
+    /// Whether a compiled operand is (or may hold) an error value. Used by the
+    /// logical-or lowering to choose error-discard semantics over the exit-code
+    /// path — a `jmp`/`log` on an error value would misread it as an exit code.
+    fn resultIsErrorLike(result: Result) bool {
+        if (result.source.isValueTag(.err)) return true;
+        const result_type = result.typeExpr() orelse return false;
+        return switch (result_type) {
+            .error_union, .error_set, .err => true,
+            else => false,
+        };
     }
 
     /// `yield expr` writes the value of `expr` to the thread's stdout stream
@@ -1652,7 +1664,14 @@ pub const IRCompiler = struct {
                 return .fromValue(.void);
             },
             .identifier => |identifier| {
-                const result = try self.compileExpressionWithCapture(source, expr);
+                var result = try self.compileExpressionWithCapture(source, expr);
+                // A command bound where an error union is expected becomes
+                // `ExecutableError!String`: exit 0 → output, else an error.
+                if (annotation) |ann| {
+                    if (ann.* == .error_union and result.isType(execution_result_struct_type)) {
+                        result = try self.compileExecutionToErrorUnion(source, result, ann.*);
+                    }
+                }
                 try self.compileIdentifierBinding(
                     source,
                     identifier,
@@ -1843,6 +1862,10 @@ pub const IRCompiler = struct {
             .binary => |binary| self.compileBinary(expr, binary),
             .unary => |unary| self.compileUnary(expr, unary),
             .array => |array| self.compileArray(expr, array),
+            .struct_literal => |struct_literal| self.compileStructLiteral(expr, struct_literal),
+            .catch_expr => |catch_expr| self.compileCatch(expr, catch_expr),
+            .try_expr => |try_expr| self.compileTry(expr, try_expr),
+            .is_expr => |is_expr| self.compileIs(expr, is_expr),
             .for_expr => |for_expr| self.compileForLoop(expr, for_expr),
             .subshell => |subshell| self.compileSubshell(expr, subshell),
             .fd => |fd_expr| self.compileFd(expr, fd_expr),
@@ -2049,18 +2072,105 @@ pub const IRCompiler = struct {
         };
     }
 
+    /// In-process typed capture of a function call that returns a structured
+    /// value — an error union (`E!T`) or an optional (`?T`). Such a function
+    /// `yield`s the value (an error value / `null` / the payload); a byte
+    /// capture would flatten an error to text (`"E.Bad"`) or drop `null`,
+    /// losing the discriminant. Instead run the function with a `typed` stdout
+    /// pipe (so `yield` enqueues the value), wait, and dequeue it — returning
+    /// the value typed as the return type so `catch`/`try`/`match`/`if` operate
+    /// on the real value. Returns null (caller falls back to the byte path)
+    /// when not applicable.
+    fn tryCompileTypedValueCapture(
+        self: *IRCompiler,
+        source: anytype,
+        expr: *ast.Expression,
+    ) Error!?Result {
+        if (expr.* != .call) return null;
+        const call = expr.call;
+        if (call.background or call.redirects.len != 0) return null;
+        if (call.callee.* != .identifier) return null;
+
+        // The callee must be a known function (a direct fn_ref binding — closure
+        // captured / member-access functions fall back) returning a structured
+        // value (an error union or an optional).
+        const binding = self.lookup(call.callee.identifier.name, .{ .shallow = false }) orelse return null;
+        if (!binding.result.isFunctionRef()) return null;
+        const fn_type = binding.type_expr orelse return null;
+        if (fn_type != .function) return null;
+        const return_type_ptr = fn_type.function.return_type orelse return null;
+        switch (return_type_ptr.*) {
+            // A sum return is captured by value too, so the member's tag (Int vs
+            // String, …) survives the boundary for the caller to narrow. The
+            // compiler stores the raw return AST, so a sum arrives as the
+            // unresolved `type_merge` node (a `type_merge` return is always a
+            // value sum — error-set merges only appear as the `E` in `E!T`).
+            .error_union, .optional, .sum, .type_merge => {},
+            else => return null,
+        }
+        const fn_ref_value = binding.result.source.value;
+        // pub exports change the call's result shape (a struct, already waited);
+        // keep those on the existing path.
+        if (self.instruction_sets.items[fn_ref_value.fn_ref.fn_addr.instr_set].pub_exports.len != 0) return null;
+
+        // Mirror the byte-capture path's stack contract: leave exactly
+        // `capture_temp_ref_count` temporary refs on top and return the result
+        // in %r, so every caller (pop-5 or binding) stays balanced.
+        const stack_before = self.currentFrame().rel_stack_counter;
+
+        const pipe_ref = try self.newRef(source, "typed_capture_pipe");
+        try self.pipe(source, pipe_ref.dereference());
+        try self.pipeOpt(source, pipe_ref.dereference(), .typed, .fromValue(.fromBoolean(true)));
+
+        const call_result = try self.compileFunctionCall(
+            expr,
+            fn_ref_value,
+            call.arguments,
+            call.redirects,
+            pipe_ref.dereference(),
+        );
+
+        // Wait for the function to finish so its yielded value is enqueued.
+        const thread_ref = try self.newRef(source, "typed_capture_thread");
+        try self.set(source, thread_ref, stableResultSource(call_result));
+        try self.wait(source, thread_ref.dereference().typed(thread_type));
+
+        // Pad so the net refs created here match the byte path's count; the
+        // dequeue (below) runs before the caller pops them, and the result
+        // value lives in %r, which `.ref`/`.pop` never touch.
+        while (self.currentFrame().rel_stack_counter -| stack_before < capture_temp_ref_count) {
+            _ = try self.newRef(source, "typed_capture_pad");
+        }
+
+        // Dequeue the single yielded value (the error union) into %r.
+        try self.addInstruction(.init(.from(source), .{ .pipe_dequeue = pipe_ref.dereference() }));
+        return try .from(ir.Location.initRegister(.r).typed(return_type_ptr.*));
+    }
+
     fn compileExpressionWithCapture(
         self: *IRCompiler,
         source: anytype,
         expr: *ast.Expression,
     ) Error!Result {
+        if (try self.tryCompileTypedValueCapture(source, expr)) |captured| return captured;
+
         const background_capture = isBackgroundExecutionExpression(expr);
         const expr_effects = self.analyzeExpressionEffects(expr);
         if (expr_effects.needs_stdio_capture or background_capture) {
+            // A pipeline whose final stage yields an error union (e.g.
+            // `… | parseInt`) is captured by *value*: mark its stdout pipe
+            // `typed` so the final `yield` enqueues the structured value, then
+            // dequeue it below (instead of flattening it to bytes). `catch`/`try`
+            // then operate on the real error value.
+            const typed_result_type = try self.pipelineCaptureErrorUnionType(expr);
+
             // TODO: We need something that cleans up the pipes because otherwise they will get stuck if they are not used
             // Suggestion: Maybe we can have a nested variable structure for inner threads that will set to true when the thread is done processing. We can then continuously check that variable from the outermost scope (here), and whenever it is set to true, we would set the pipes to be closed.
             const stdout_pipe_ref = try self.newRef(source, "stdout_pipe");
             try self.pipe(source, stdout_pipe_ref);
+            if (typed_result_type != null) {
+                try self.pipeOpt(source, stdout_pipe_ref.dereference(), .typed, .fromValue(.fromBoolean(true)));
+            }
             try self.pipeOpt(source, stdout_pipe_ref.dereference(), .keep_open, .fromValue(.fromBoolean(true)));
             try self.pipeOpt(source, stdout_pipe_ref.dereference(), .close_destination, .fromValue(.fromBoolean(false)));
             try self.pipeOpt(source, stdout_pipe_ref.dereference(), .disconnect_destination, .fromValue(.fromBoolean(false)));
@@ -2108,6 +2218,12 @@ pub const IRCompiler = struct {
                 try self.pipeOpt(source, stderr_pipe_ref.dereference(), .keep_open, .fromValue(.fromBoolean(false)));
                 try self.wait(source, stdout_stream_thread_ref.dereference());
                 try self.wait(source, stderr_stream_thread_ref.dereference());
+            }
+            // Typed value capture: the final stage enqueued its structured value
+            // on the (typed) stdout pipe; dequeue it as the captured result.
+            if (typed_result_type) |t| {
+                try self.addInstruction(.init(.from(source), .{ .pipe_dequeue = stdout_pipe_ref.dereference() }));
+                return .from(ir.Location.initRegister(.r).typed(t));
             }
             if (result.isType(execution_handles_struct_type)) {
                 // alloc 5 # create execution result
@@ -2292,6 +2408,338 @@ pub const IRCompiler = struct {
         };
     }
 
+    /// Compiles `MyError.Variant` into a payload-less error value. Payloaded
+    /// construction (`MyError{ .Variant = payload }`) is Phase 3b.
+    fn compileErrorVariant(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        set_name: []const u8,
+        error_set: ast.TypeExpr.ErrorSet,
+        variant_ident: ast.Identifier,
+    ) Error!Result {
+        const variant = error_set.variant(variant_ident.name) orelse {
+            try self.reportSourceError(
+                source,
+                Error.NotImplemented,
+                .@"error",
+                "error set '{s}' has no variant '{s}'",
+                .{ set_name, variant_ident.name },
+            );
+            return .fromValue(.void);
+        };
+
+        if (variant.payload != null) {
+            try self.reportSourceError(
+                source,
+                Error.NotImplemented,
+                .@"error",
+                "error variant '{s}.{s}' requires a payload; use {s}{{ .{s} = <value> }} (not yet implemented)",
+                .{ set_name, variant_ident.name, set_name, variant_ident.name },
+            );
+            return .fromValue(.void);
+        }
+
+        return .fromValue(.{ .err = .{ .set = set_name, .variant = variant_ident.name } });
+    }
+
+    /// Compiles `MyError{ .Variant = payload }` into an error value carrying a
+    /// boxed payload. Phase 3b currently supports constant payloads (the
+    /// compiled value must be a `.value` source).
+    fn compileStructLiteral(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        struct_literal: ast.StructLiteral,
+    ) Error!Result {
+        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        const error_set = self.error_sets.get(struct_literal.name.name) orelse {
+            try self.reportSourceError(
+                source,
+                Error.NotImplemented,
+                .@"error",
+                "'{s}' is not an error set; struct literal construction is only supported for error values",
+                .{struct_literal.name.name},
+            );
+            return .fromValue(.void);
+        };
+
+        if (struct_literal.fields.len != 1) {
+            try self.reportSourceError(source, Error.NotImplemented, .@"error", "error value construction requires exactly one variant field", .{});
+            return .fromValue(.void);
+        }
+
+        const field = struct_literal.fields[0];
+        const variant = error_set.variant(field.name.name) orelse {
+            try self.reportSourceError(source, Error.NotImplemented, .@"error", "error set '{s}' has no variant '{s}'", .{ struct_literal.name.name, field.name.name });
+            return .fromValue(.void);
+        };
+
+        if (variant.payload == null) {
+            try self.reportSourceError(source, Error.NotImplemented, .@"error", "error variant '{s}.{s}' has no payload; use {s}.{s}", .{ struct_literal.name.name, field.name.name, struct_literal.name.name, field.name.name });
+            return .fromValue(.void);
+        }
+
+        // Construct the error value at runtime so the payload may be any value
+        // (constant or runtime), boxed by the `make_err` instruction.
+        const payload_result = try self.compileExpression(field.value);
+        const result_ref = try self.newRef(source, "error_value");
+        try self.addInstruction(.init(.from(source), .{ .make_err = .{
+            .set = struct_literal.name.name,
+            .variant = field.name.name,
+            .payload = payload_result.source,
+            .result = result_ref,
+        } }));
+        return .from(result_ref.dereference());
+    }
+
+    /// Converts a finished command (`ExecutionResult`) into an
+    /// `ExecutableError!String` value: exit 0 → the captured output (ok), any
+    /// other exit → `ExecutableError.NonZeroExit(code)`.
+    fn compileExecutionToErrorUnion(
+        self: *IRCompiler,
+        source: anytype,
+        exec: Result,
+        result_type: ?ast.TypeExpr,
+    ) Error!Result {
+        const exec_ref = try self.newRef(source, "exec_value");
+        try self.set(source, exec_ref, stableResultSource(exec));
+
+        const exit_code_ref = try self.newRef(source, "exec_exit_code");
+        try self.addInstruction(.init(.from(source), .{ .resolve_exit_code = .{
+            .source = exec_ref.dereference().typed(execution_result_struct_type),
+            .result = exit_code_ref,
+        } }));
+
+        const result_ref = try self.newRef(source, "exec_error_union");
+        const err_addr = try self.newLabel("exec_error", .unknown);
+        const after_addr = try self.newLabel("exec_after", .unknown);
+
+        // Non-zero exit (falsy exit code) → error branch.
+        try self.jmp(source, try .from(exit_code_ref.dereference()), false, err_addr);
+
+        // Success: the ok value is the captured (merged) output.
+        try self.set(source, .initRegister(.r2), .from(exec_ref.dereference()));
+        try self.set(source, result_ref, .fromLocation(.initAdd(
+            .{ .register = .r2 },
+            executionResultFieldOffset(.merged),
+            .{ .dereference = true },
+        )));
+        try self.jmp(source, null, false, after_addr);
+
+        // Failure: ExecutableError.NonZeroExit(code).
+        try self.setLabel(err_addr.local_addr.label, .abs);
+        try self.addInstruction(.init(.from(source), .{ .make_err = .{
+            .set = "ExecutableError",
+            .variant = "NonZeroExit",
+            .payload = .from(exit_code_ref.dereference()),
+            .result = result_ref,
+        } }));
+
+        try self.setLabel(after_addr.local_addr.label, .abs);
+        return .from(result_ref.dereference().typed(result_type));
+    }
+
+    /// `expr catch <default>` / `expr catch |err| <handler>`. Evaluates the
+    /// subject; if it is an error value, runs the handler (with `|err|` bound to
+    /// the error), otherwise uses the subject's ok value.
+    fn compileCatch(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        catch_expr: ast.CatchExpr,
+    ) Error!Result {
+        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        const subject_ref = try self.newRef(source, "catch_subject");
+        var subject = try self.compileStableExpressionIntoRef(source, catch_expr.subject, subject_ref);
+        // A command subject is treated as `ExecutableError!String`.
+        if (subject.isType(execution_result_struct_type)) {
+            const error_union = try self.compileExecutionToErrorUnion(source, subject, null);
+            try self.set(source, subject_ref, stableResultSource(error_union));
+            subject = try .from(subject_ref.dereference().typed(error_union.typeExpr()));
+        }
+
+        const is_err_ref = try self.newRef(source, "catch_is_err");
+        try self.addInstruction(.init(.from(source), .{ .is_err = .{
+            .operand = subject_ref.dereference(),
+            .result = is_err_ref,
+        } }));
+
+        const result = try self.newRef(source, "catch_result");
+        const handler_addr = try self.newLabel("catch_handler", .unknown);
+        const after_addr = try self.newLabel("catch_after", .unknown);
+
+        // Jump to the handler when the subject is an error.
+        try self.jmp(source, try .from(is_err_ref.dereference()), true, handler_addr);
+
+        // Ok path: the result is the subject's ok value.
+        try self.set(source, result, .from(subject_ref.dereference()));
+        try self.jmp(source, null, false, after_addr);
+
+        // Error path: run the handler (with the optional `|err|` capture).
+        try self.setLabel(handler_addr.local_addr.label, .abs);
+        const handler = try self.compileCatchHandler(source, catch_expr, subject_ref);
+        // Drain a forked handler (e.g. `catch |err| echo "…"`) here: the result
+        // is typed as the payload, so the statement-level wait would miss it and
+        // the handler's capture fork could race program exit.
+        if (isWaitable(handler)) |loc| try self.wait(source, loc);
+        try self.set(source, result, stableResultSource(handler));
+
+        try self.setLabel(after_addr.local_addr.label, .abs);
+
+        // Result type: the error union's payload when known, else the handler's
+        // type (a pure error value always yields the handler).
+        const result_type: ?ast.TypeExpr = blk: {
+            if (subject.typeExpr()) |subject_type| {
+                if (subject_type == .error_union) break :blk subject_type.error_union.payload.*;
+            }
+            break :blk handler.typeExpr();
+        };
+        return .from(result.dereference().typed(result_type));
+    }
+
+    /// `try expr` — if the subject is an error, propagate it out of the
+    /// enclosing function (`exit_with`); otherwise evaluate to the ok value.
+    fn compileTry(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        try_expr: ast.TryExpr,
+    ) Error!Result {
+        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        const subject_ref = try self.newRef(source, "try_subject");
+        var subject = try self.compileStableExpressionIntoRef(source, try_expr.subject, subject_ref);
+        // A command subject is treated as `ExecutableError!String`.
+        if (subject.isType(execution_result_struct_type)) {
+            const error_union = try self.compileExecutionToErrorUnion(source, subject, null);
+            try self.set(source, subject_ref, stableResultSource(error_union));
+            subject = try .from(subject_ref.dereference().typed(error_union.typeExpr()));
+        }
+
+        const is_err_ref = try self.newRef(source, "try_is_err");
+        try self.addInstruction(.init(.from(source), .{ .is_err = .{
+            .operand = subject_ref.dereference(),
+            .result = is_err_ref,
+        } }));
+
+        const after_addr = try self.newLabel("try_after", .unknown);
+        // Skip propagation when the subject is not an error.
+        try self.jmp(source, try .from(is_err_ref.dereference()), false, after_addr);
+        // Error: propagate it as the enclosing function's result by yielding the
+        // error value to stdout — the same channel a `yield <error>` uses — so a
+        // capturing caller (`catch`/`try`/`match`) observes the real error and it
+        // chains through nested propagation and pipeline stages. Then halt the
+        // function so the statements after the `try` do not run.
+        try self.pipeWrite(source, self.threadStdout(), stableResultSource(subject));
+        try self.exitWith(source, try .from(subject_ref.dereference()));
+        try self.setLabel(after_addr.local_addr.label, .abs);
+
+        const payload_type: ?ast.TypeExpr = switch (subject.typeExpr() orelse @as(ast.TypeExpr, .global(.void))) {
+            .error_union => |error_union| error_union.payload.*,
+            else => null,
+        };
+        return .from(subject_ref.dereference().typed(payload_type));
+    }
+
+    /// `x is T` — compile the subject, then test its runtime value's tag against
+    /// `T`. Evaluates to `Bool`.
+    fn compileIs(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        is_expr: ast.IsExpr,
+    ) Error!Result {
+        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        const tag = typeTagOf(is_expr.type_expr) orelse {
+            try self.reportSourceError(source, Error.UnsupportedExpression, .@"error", "`is` is not supported for type \"{f}\" yet", .{is_expr.type_expr});
+            return .fromValue(.fromBoolean(false));
+        };
+
+        const subject_ref = try self.newRef(source, "is_subject");
+        _ = try self.compileStableExpressionIntoRef(source, is_expr.subject, subject_ref);
+
+        const result_ref = try self.newRef(source, "is_result");
+        try self.addInstruction(.init(.from(source), .{ .is_type = .{
+            .operand = subject_ref.dereference(),
+            .tag = tag,
+            .result = result_ref,
+        } }));
+
+        return .from(result_ref.dereference().typed(.{ .boolean = .{ .span = source.span() } }));
+    }
+
+    /// Maps a type expression to its runtime `TypeTag`, or null when the type
+    /// isn't yet testable by `is`. The `is T` operand is unresolved AST, so the
+    /// builtin primitives arrive as identifiers (`Int`, `String`, …); resolved
+    /// primitive forms are also accepted.
+    fn typeTagOf(type_expr: *const ast.TypeExpr) ?ir.Instruction.TypeTag {
+        return switch (type_expr.*) {
+            .identifier => |named| typeTagForName(named.path.segments[named.path.segments.len - 1].name),
+            .integer => .int,
+            .float => .float,
+            .boolean => .boolean,
+            // `String` is `[]Byte`.
+            .array => |array| if (array.element.* == .byte) .string else null,
+            .alias => |alias| typeTagOf(alias.type_expr),
+            else => null,
+        };
+    }
+
+    /// The runtime `TypeTag` for a builtin primitive type name, or null.
+    fn typeTagForName(name: []const u8) ?ir.Instruction.TypeTag {
+        if (std.mem.eql(u8, name, "Int")) return .int;
+        if (std.mem.eql(u8, name, "Float")) return .float;
+        if (std.mem.eql(u8, name, "Bool")) return .boolean;
+        if (std.mem.eql(u8, name, "String")) return .string;
+        return null;
+    }
+
+    fn compileCatchHandler(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        catch_expr: ast.CatchExpr,
+        subject_ref: ir.Location,
+    ) Error!Result {
+        const stack_base = self.currentFrame().rel_stack_counter;
+
+        try self.scopes.push(self.allocator, .lexical);
+        defer self.scopes.pop();
+
+        if (catch_expr.capture) |capture| {
+            if (capture.bindings.len == 1) {
+                switch (capture.bindings[0].*) {
+                    .discard => {},
+                    .identifier => |identifier| try self.compileIdentifierBinding(
+                        source,
+                        identifier,
+                        .from(subject_ref.dereference()),
+                        null,
+                        false,
+                        .normal,
+                    ),
+                    else => {
+                        try self.reportSourceError(
+                            source,
+                            Error.UnsupportedBindingPattern,
+                            .@"error",
+                            "catch capture binding pattern not yet supported",
+                            .{},
+                        );
+                        return .fromValue(.void);
+                    },
+                }
+            }
+        }
+
+        const result = try self.compileExpression(catch_expr.handler);
+        // Balance the capture-binding slot (result carried in r2) so the runtime
+        // stack matches the counter — see the same discipline in compileMatchCaseBody.
+        try self.set(source, .initRegister(.r2), stableResultSource(result));
+        while (self.currentFrame().rel_stack_counter > stack_base) {
+            _ = try self.pop(source);
+        }
+        return .fromLocation(ir.Location.initRegister(.r2).typed(result.typeExpr()));
+    }
+
     fn compileMember(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -2305,6 +2753,19 @@ pub const IRCompiler = struct {
 
         if (std.mem.eql(u8, member.member.name, "wait")) {
             return self.compileWaitMember(source, member.object);
+        }
+
+        // `MyError.Variant` — construct a (payload-less) error value when the
+        // object is an identifier naming a known error set.
+        if (member.object.* == .identifier) {
+            if (self.error_sets.get(member.object.identifier.name)) |error_set| {
+                return self.compileErrorVariant(
+                    source,
+                    member.object.identifier.name,
+                    error_set,
+                    member.member,
+                );
+            }
         }
 
         const object = try self.compileExpression(member.object);
@@ -2975,8 +3436,8 @@ pub const IRCompiler = struct {
         return switch (callee.source) {
             .value => |v| switch (v) {
                 .executable => self.compileExecutableCall(source, v, call.arguments, call.redirects),
-                .fn_ref => self.compileFunctionCall(source, v, call.arguments, call.redirects),
-                .slice, .stream, .addr, .void, .null, .uinteger, .float, .strct, .exit_code, .pipe, .thread, .closeable => .from(v),
+                .fn_ref => self.compileFunctionCall(source, v, call.arguments, call.redirects, null),
+                .slice, .stream, .addr, .void, .null, .uinteger, .float, .strct, .exit_code, .pipe, .thread, .closeable, .err => .from(v),
                 .zig_string => Error.UnsupportedValueType,
             },
             .location => |loc| .from(loc),
@@ -3620,6 +4081,9 @@ pub const IRCompiler = struct {
         fn_ref_value: ir.Value,
         arguments: []const *ast.Expression,
         redirects: []const ast.Redirection,
+        // When set, the forked function runs with this stdout instead of the
+        // caller's (used by the in-process typed value capture).
+        stdout_override: ?ir.Location,
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
@@ -3704,7 +4168,7 @@ pub const IRCompiler = struct {
             source,
             fn_addr,
             self.threadStdin(),
-            streams.stdout,
+            stdout_override orelse streams.stdout,
             streams.stderr,
             closure_ref.dereference(),
             .inherit,
@@ -3868,7 +4332,7 @@ pub const IRCompiler = struct {
         try self.jmp(source, condition, false, else_addr);
         const then = try self.compileIfBranchExpression(source, if_expr.then_expr, if_condition.capture_binding);
         try self.set(source, result, stableResultSource(then));
-        self.currentFrame().rel_stack_counter = branch_stack_base;
+        try self.popToStackBase(source, branch_stack_base);
         try self.jmp(source, null, false, after_addr);
         try self.setLabel(else_addr.local_addr.label, .abs);
         var result_type = if (else_branch == .condition) mergedResultType(condition, then) else null;
@@ -3885,7 +4349,7 @@ pub const IRCompiler = struct {
             },
             .condition => {},
         }
-        self.currentFrame().rel_stack_counter = branch_stack_base;
+        try self.popToStackBase(source, branch_stack_base);
         try self.setLabel(after_addr.local_addr.label, .abs);
         try self.set(source, .initRegister(.r2), .from(result.dereference()));
 
@@ -3914,9 +4378,23 @@ pub const IRCompiler = struct {
         if (isWaitable(then_result)) |loc| {
             try self.wait(source, loc);
         }
-        self.currentFrame().rel_stack_counter = branch_stack_base;
+        // Emit real `pop`s for the runtime slots the branch body pushed via
+        // `.ref` (a bare `rel_stack_counter = base` reset leaks them, drifting
+        // the value stack — a later deref then hits a leaked slot). The pops sit
+        // before `after_addr`, so the false path (which jumped straight here) is
+        // balanced too. Same discipline as the catch handler / match case body.
+        try self.popToStackBase(source, branch_stack_base);
         try self.setLabel(after_addr.local_addr.label, .abs);
         return .fromValue(.void);
+    }
+
+    /// Pops runtime stack slots until the counter returns to `base`, emitting a
+    /// real `pop` per slot rather than bare-resetting the counter (which would
+    /// leak the slots).
+    fn popToStackBase(self: *IRCompiler, source: anytype, base: usize) Error!void {
+        while (self.currentFrame().rel_stack_counter > base) {
+            _ = try self.pop(source);
+        }
     }
 
     const IfCaptureBinding = struct {
@@ -3952,11 +4430,18 @@ pub const IRCompiler = struct {
 
         if (condition_type) |condition_type_| switch (condition_type_) {
             .optional => |optional| {
+                // Stash into a stable ref first: the condition may be a volatile
+                // register (e.g. an in-process typed capture of an optional-
+                // returning function), which would be clobbered before the
+                // capture binding reads it.
+                const cond_ref = try self.newRef(source, "if_optional_cond");
+                try self.set(source, cond_ref, stableResultSource(condition));
+
                 const is_present_ref = try self.newRef(source, "if_optional_present");
                 try self.cmp(
                     source,
                     .not_equal,
-                    stableResultSource(condition),
+                    .from(cond_ref.dereference()),
                     .fromValue(.null),
                     is_present_ref,
                 );
@@ -3975,9 +4460,47 @@ pub const IRCompiler = struct {
                             return .{ .condition = .fromValue(.void) };
                         }
 
-                        var capture_value = condition.source;
-                        if (capture_value == .location) {
-                            capture_value.location = capture_value.location.typed(optional.child.*);
+                        break :blk .{
+                            .pattern = capture_clause.bindings[0],
+                            .value = .fromLocation(cond_ref.dereference().typed(optional.child.*)),
+                        };
+                    } else null,
+                };
+            },
+            // `if (errorUnion)` is true when the value is ok (not an error);
+            // an `|value|` capture binds the ok payload.
+            .error_union, .error_set, .err => {
+                const cond_ref = try self.newRef(source, "if_error_cond");
+                try self.set(source, cond_ref, stableResultSource(condition));
+
+                const is_err_ref = try self.newRef(source, "if_is_err");
+                try self.addInstruction(.init(.from(source), .{ .is_err = .{
+                    .operand = cond_ref.dereference(),
+                    .result = is_err_ref,
+                } }));
+                const is_ok_ref = try self.newRef(source, "if_is_ok");
+                try self.addInstruction(.init(.from(source), .{ .neg = .{
+                    .operand = is_err_ref.dereference(),
+                    .result = is_ok_ref,
+                } }));
+
+                return .{
+                    .condition = try .from(is_ok_ref.dereference()),
+                    .capture_binding = if (capture) |capture_clause| blk: {
+                        if (capture_clause.bindings.len != 1) {
+                            try self.reportSourceError(
+                                source,
+                                Error.UnsupportedBindingPattern,
+                                .@"error",
+                                "if capture clauses currently require exactly one binding",
+                                .{},
+                            );
+                            return .{ .condition = .fromValue(.void) };
+                        }
+
+                        var capture_value: ir.ValueSource = .fromLocation(cond_ref.dereference());
+                        if (condition_type_ == .error_union) {
+                            capture_value.location = capture_value.location.typed(condition_type_.error_union.payload.*);
                         }
 
                         break :blk .{
@@ -4117,6 +4640,70 @@ pub const IRCompiler = struct {
         } });
     }
 
+    /// Compiles a match case body, binding the optional error-payload capture
+    /// (`Set.Variant => |payload| ...`) in a fresh scope.
+    fn compileMatchCaseBody(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        case: ast.MatchCase,
+        subject_ref: ir.Location,
+        is_type_pattern: bool,
+    ) Error!Result {
+        const capture = case.capture orelse return self.compileBlock(source, case.body);
+
+        // The capture binding pushes transient slots; carry the body result in
+        // a register and restore the stack counter so they don't accumulate
+        // (mirrors `compileIfBranchExpression`/`compileIfElse`).
+        const stack_base = self.currentFrame().rel_stack_counter;
+
+        try self.scopes.push(self.allocator, .lexical);
+        defer self.scopes.pop();
+
+        // A sum member-type capture binds the (narrowed) subject value itself;
+        // an error-variant capture binds the extracted payload.
+        const bound_ref = try self.newRef(source, "match_capture");
+        if (is_type_pattern) {
+            try self.set(source, bound_ref, .from(subject_ref.dereference()));
+        } else {
+            try self.addInstruction(.init(.from(source), .{ .err_payload = .{
+                .operand = subject_ref.dereference(),
+                .result = bound_ref,
+            } }));
+        }
+
+        switch (capture.bindings[0].*) {
+            .discard => {},
+            .identifier => |identifier| try self.compileIdentifierBinding(
+                source,
+                identifier,
+                .from(bound_ref.dereference()),
+                null,
+                false,
+                .normal,
+            ),
+            else => {
+                try self.reportSourceError(
+                    source,
+                    Error.UnsupportedBindingPattern,
+                    .@"error",
+                    "match capture binding pattern not yet supported",
+                    .{},
+                );
+                return .fromValue(.void);
+            },
+        }
+
+        const body_result = try self.compileBlock(source, case.body);
+        try self.set(source, .initRegister(.r2), stableResultSource(body_result));
+        // Pop the payload/binding slots (the result is safe in r2) so the
+        // runtime stack matches the counter — a bare counter reset would leave
+        // the slots on the runtime stack and mis-address later code.
+        while (self.currentFrame().rel_stack_counter > stack_base) {
+            _ = try self.pop(source);
+        }
+        return .fromLocation(ir.Location.initRegister(.r2).typed(body_result.typeExpr()));
+    }
+
     fn compileMatchPredicate(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -4197,21 +4784,21 @@ pub const IRCompiler = struct {
         var has_wildcard = false;
 
         for (match_expr.cases, 0..) |case, i| {
-            if (case.capture != null) {
-                try self.reportSourceError(
-                    source,
-                    Error.UnsupportedExpression,
-                    .@"error",
-                    "match captures are not yet supported",
-                    .{},
-                );
-                return .fromValue(.void);
-            }
-
             const next_case_addr = try self.newLabel(
                 try std.fmt.allocPrint(self.allocator, "match_case_next_{}", .{i}),
                 .unknown,
             );
+
+            // `Set.Variant` where `Set` is a known error set matches an error value.
+            const is_error_variant = switch (case.pattern) {
+                .path => |path| path.segments.len >= 2 and self.error_sets.get(path.segments[0].name) != null,
+                else => false,
+            };
+            // `Int`/`String`/… — a sum member-type pattern (a type-tag test).
+            const is_type_pattern = switch (case.pattern) {
+                .binding => |binding| typeTagForName(binding.name) != null,
+                else => false,
+            };
 
             switch (case.pattern) {
                 .wildcard => {
@@ -4219,24 +4806,65 @@ pub const IRCompiler = struct {
                 },
                 .literal => |literal| {
                     const pattern = try self.compileLiteral(source, literal);
-                    const is_match_ref = try self.newRef(source, "match_case_is_match");
+                    // Use a register for the transient test result so the case
+                    // loop pushes no stack slots (which would drift the counter).
                     try self.cmp(
                         source,
                         .equal,
                         .from(subject_ref.dereference()),
                         pattern.source,
-                        is_match_ref,
+                        .initRegister(.r2),
                     );
-                    try self.jmp(source, .fromLocation(is_match_ref.dereference()), false, next_case_addr);
+                    try self.jmp(source, .fromLocation(.initRegister(.r2)), false, next_case_addr);
                 },
-                .binding, .path => {
-                    const predicate = try self.compileMatchPredicate(source, case.pattern, subject_identifier);
-                    try self.jmp(source, predicate, false, next_case_addr);
+                .path => |path| {
+                    if (is_error_variant) {
+                        try self.addInstruction(.init(.from(source), .{ .match_err = .{
+                            .operand = subject_ref.dereference(),
+                            .set = path.segments[0].name,
+                            .variant = path.segments[path.segments.len - 1].name,
+                            .result = .initRegister(.r2),
+                        } }));
+                        try self.jmp(source, .fromLocation(.initRegister(.r2)), false, next_case_addr);
+                    } else {
+                        const predicate = try self.compileMatchPredicate(source, case.pattern, subject_identifier);
+                        try self.jmp(source, predicate, false, next_case_addr);
+                    }
+                },
+                .binding => |binding| {
+                    // A member-type name (`Int`, `String`, …) → a runtime type
+                    // tag test (sum type-match). Otherwise a predicate function.
+                    if (typeTagForName(binding.name)) |tag| {
+                        try self.addInstruction(.init(.from(source), .{ .is_type = .{
+                            .operand = subject_ref.dereference(),
+                            .tag = tag,
+                            .result = .initRegister(.r2),
+                        } }));
+                        try self.jmp(source, .fromLocation(.initRegister(.r2)), false, next_case_addr);
+                    } else {
+                        const predicate = try self.compileMatchPredicate(source, case.pattern, subject_identifier);
+                        try self.jmp(source, predicate, false, next_case_addr);
+                    }
                 },
                 else => unreachable,
             }
 
-            const case_result = try self.compileBlock(source, case.body);
+            // A capture (`|value|`) binds an error variant's payload, or — for a
+            // sum member-type pattern — the narrowed subject value itself.
+            if (case.capture) |capture| {
+                if ((!is_error_variant and !is_type_pattern) or capture.bindings.len != 1) {
+                    try self.reportSourceError(
+                        source,
+                        Error.UnsupportedExpression,
+                        .@"error",
+                        "match captures are only supported for error variants or sum member types with a single binding",
+                        .{},
+                    );
+                    return .fromValue(.void);
+                }
+            }
+
+            const case_result = try self.compileMatchCaseBody(source, case, subject_ref, is_type_pattern);
             try self.set(source, result_ref, stableResultSource(case_result));
             result_type = self.mergeResultTypes(result_type, case_result);
             try self.jmp(source, null, false, after_addr);
@@ -4414,6 +5042,85 @@ pub const IRCompiler = struct {
             .execution => string_type,
             else => return_type.*,
         };
+    }
+
+    /// When `expr` is a pipeline in which *any* stage can produce an error (e.g.
+    /// `… | parseInt → ParseError`), returns the pipeline's value-capture type
+    /// `E!T`: that error set with the final stage's ok output as the payload. An
+    /// upstream error short-circuits through the downstream stages (arithmetic on
+    /// an `.err` propagates it) and surfaces as the result, so the whole pipeline
+    /// is captured via typed transport — letting `catch`/`try` see the real error
+    /// rather than its flattened text. Returns null when no stage can error (the
+    /// byte capture path applies). Mid-pipeline stages keep their `Int`/`Float`
+    /// transport (`stageStdoutType`); this only governs the *final* capture.
+    fn pipelineCaptureErrorUnionType(self: *IRCompiler, expr: *ast.Expression) Error!?ast.TypeExpr {
+        if (expr.* != .pipeline) return null;
+        const stages = expr.pipeline.stages;
+        if (stages.len == 0) return null;
+
+        // Find an error-producing stage anywhere in the pipeline. Track its
+        // error set and natural payload (used as the fallback ok type below).
+        const ErrInfo = struct { set: *const ast.TypeExpr, payload: ast.TypeExpr };
+        const err_info: ErrInfo = blk: {
+            for (stages) |stage| {
+                if (self.isBuiltinStage(stage, "parseInt")) break :blk .{ .set = &ast.TypeExpr.parseErrorType, .payload = .global(.integer) };
+                if (self.isBuiltinStage(stage, "parseFloat")) break :blk .{ .set = &ast.TypeExpr.parseErrorType, .payload = .global(.float) };
+                const callee = switch (stage.*) {
+                    .call => |call| call.callee,
+                    else => stage,
+                };
+                const binding = switch (callee.*) {
+                    .identifier => |id| self.lookup(id.name, .{ .shallow = false }),
+                    else => null,
+                } orelse continue;
+                const fn_type = switch (binding.type_expr orelse continue) {
+                    .function => |f| f,
+                    else => continue,
+                };
+                const return_type = fn_type.return_type orelse continue;
+                if (return_type.* == .error_union) break :blk .{ .set = return_type.error_union.err_set, .payload = return_type.error_union.payload.* };
+            }
+            return null;
+        };
+
+        // Payload = the final stage's ok output type (what flows when no error).
+        // A block final stage infers its output from `&0`, so make the upstream
+        // stage's stdout type visible as the stdin type while inferring it; fall
+        // back to the error producer's payload when inference can't resolve it
+        // (the typed capture must still fire so `catch`/`try` see the error).
+        const last = stages[stages.len - 1];
+        const upstream_stdout: ?ast.TypeExpr = if (stages.len >= 2)
+            self.stageStdoutType(stages[stages.len - 2])
+        else
+            null;
+        if (upstream_stdout) |u| try self.stdin_type_stack.append(self.allocator, u);
+        const payload_opt = self.stageStdoutType(last);
+        if (upstream_stdout != null) _ = self.stdin_type_stack.pop();
+        const payload = payload_opt orelse err_info.payload;
+        const payload_ptr = try self.allocator.create(ast.TypeExpr);
+        payload_ptr.* = payload;
+        return ast.TypeExpr{ .error_union = .{
+            .err_set = err_info.set,
+            .payload = payload_ptr,
+            .span = .global,
+        } };
+    }
+
+    /// Whether capturing `expr` as a value yields an error union — an
+    /// error-union-returning function call or a pipeline with an error stage.
+    /// Such an `||`/`&&` LHS must be captured via `compileExpressionWithCapture`
+    /// (the typed capture) so its error is observed, not via the exit-code path.
+    fn lhsCapturesError(self: *IRCompiler, expr: *ast.Expression) Error!bool {
+        if ((try self.pipelineCaptureErrorUnionType(expr)) != null) return true;
+        if (expr.* != .call) return false;
+        const call = expr.call;
+        if (call.background or call.redirects.len != 0 or call.callee.* != .identifier) return false;
+        const binding = self.lookup(call.callee.identifier.name, .{ .shallow = false }) orelse return false;
+        if (!binding.result.isFunctionRef()) return false;
+        const fn_type = binding.type_expr orelse return false;
+        if (fn_type != .function) return false;
+        const return_type = fn_type.function.return_type orelse return false;
+        return return_type.* == .error_union;
     }
 
     /// A loop capture in scope during block-stdout inference, mapping the
@@ -5273,6 +5980,23 @@ pub const IRCompiler = struct {
                 return .from(ref.dereference());
             },
             .logical_and, .logical_or, .sequence => {
+                // `errorUnion || fallback` discards the error; `errorUnion && next`
+                // is a monadic guard. Handle the non-capture cases here; everything
+                // else keeps the existing exit-code logical lowering.
+                // Route to the value paths when neither operand needs capture, or
+                // when the LHS is an error producer (a function call / pipeline
+                // whose error must be observed via the typed capture).
+                const lhs_captures_error = binary.op != .sequence and try self.lhsCapturesError(binary.left);
+                if (binary.op != .sequence and
+                    (lhs_captures_error or
+                        (!self.analyzeExpressionEffects(binary.left).needs_stdio_capture and
+                            !self.analyzeExpressionEffects(binary.right).needs_stdio_capture)))
+                {
+                    return switch (binary.op) {
+                        .logical_or => self.compileLogicalOrValue(source, binary),
+                        else => self.compileLogicalAndValue(source, binary),
+                    };
+                }
                 return self.compileLogicalBinary(source, binary, .value);
             },
             .@"orelse" => {
@@ -5588,6 +6312,45 @@ pub const IRCompiler = struct {
                 if (left.source.isRegister(.r) and left.isType(thread_type)) {
                     left = try self.compileResultSaveR(source, left);
                 }
+
+                // `errorUnion || fallback` discards the error: run the fallback
+                // only when left holds an error. A plain exit-code jmp here would
+                // misread the error value as an exit code and crash the runner.
+                if (binary.op == .logical_or and resultIsErrorLike(left)) {
+                    const subject_ref = try self.newRef(source, "logical_or_subject");
+                    try self.set(source, subject_ref, stableResultSource(left));
+                    const is_err_ref = try self.newRef(source, "logical_or_is_err");
+                    try self.addInstruction(.init(.from(source), .{ .is_err = .{
+                        .operand = subject_ref.dereference(),
+                        .result = is_err_ref,
+                    } }));
+                    const after_addr = try self.newLabel("logical_or_after", .unknown);
+                    // Not an error: nothing to do (statement result is discarded).
+                    try self.jmp(source, try .from(is_err_ref.dereference()), false, after_addr);
+                    _ = try self.compileLogicalRightStatement(source, binary.right);
+                    try self.setLabel(after_addr.local_addr.label, .abs);
+                    return .fromValue(.void);
+                }
+
+                // `errorUnion && next` monadic guard. A bare `a && b` is rejected
+                // by the type checker (UnhandledError); this guards the compile
+                // path so an error-like left never hits the exit-code jmp below.
+                if (binary.op == .logical_and and resultIsErrorLike(left)) {
+                    const subject_ref = try self.newRef(source, "logical_and_subject");
+                    try self.set(source, subject_ref, stableResultSource(left));
+                    const is_err_ref = try self.newRef(source, "logical_and_is_err");
+                    try self.addInstruction(.init(.from(source), .{ .is_err = .{
+                        .operand = subject_ref.dereference(),
+                        .result = is_err_ref,
+                    } }));
+                    const after_addr = try self.newLabel("logical_and_after", .unknown);
+                    // Error: short-circuit (nothing to do at statement level).
+                    try self.jmp(source, try .from(is_err_ref.dereference()), true, after_addr);
+                    _ = try self.compileLogicalRightStatement(source, binary.right);
+                    try self.setLabel(after_addr.local_addr.label, .abs);
+                    return .fromValue(.void);
+                }
+
                 try self.finalizeStatementResult(source, left);
 
                 // sequence (;) always runs right — no conditional jump needed
@@ -5635,6 +6398,63 @@ pub const IRCompiler = struct {
                     // leave the outer pipes empty.
                     const result_ref = try self.newRef(source, "logical_result");
                     const left = try self.compileExpression(binary.left);
+
+                    // `errorUnion || fallback` discards the error. We are already
+                    // inside a capture fork, so compile the fallback directly
+                    // (no nested capture) rather than via the exit-code jmp, which
+                    // would misread the error value as an exit code and crash.
+                    if (binary.op == .logical_or and resultIsErrorLike(left)) {
+                        try self.set(source, result_ref, stableResultSource(left));
+                        const is_err_ref = try self.newRef(source, "logical_or_is_err");
+                        try self.addInstruction(.init(.from(source), .{ .is_err = .{
+                            .operand = result_ref.dereference(),
+                            .result = is_err_ref,
+                        } }));
+                        const after_addr = try self.newLabel("logical_or_after", .unknown);
+                        try self.jmp(source, try .from(is_err_ref.dereference()), false, after_addr);
+                        const right = try self.compileExpression(binary.right);
+                        try self.finalizeStatementResult(source, right);
+                        try self.set(source, result_ref, stableResultSource(right));
+                        try self.setLabel(after_addr.local_addr.label, .abs);
+                        const result_type: ?ast.TypeExpr = if (left.typeExpr()) |left_type| switch (left_type) {
+                            .error_union => |error_union| error_union.payload.*,
+                            else => right.typeExpr(),
+                        } else right.typeExpr();
+                        return .from(result_ref.dereference().typed(result_type));
+                    }
+
+                    // `errorUnion && next` monadic guard (already inside a capture
+                    // fork, so compile the rhs directly): `next` when left is ok,
+                    // the left's error otherwise. Result is `E!(typeof next)`.
+                    if (binary.op == .logical_and and resultIsErrorLike(left)) {
+                        try self.set(source, result_ref, stableResultSource(left));
+                        const is_err_ref = try self.newRef(source, "logical_and_is_err");
+                        try self.addInstruction(.init(.from(source), .{ .is_err = .{
+                            .operand = result_ref.dereference(),
+                            .result = is_err_ref,
+                        } }));
+                        const after_addr = try self.newLabel("logical_and_after", .unknown);
+                        // Error: short-circuit, keep the error already in result_ref.
+                        try self.jmp(source, try .from(is_err_ref.dereference()), true, after_addr);
+                        const right = try self.compileExpression(binary.right);
+                        try self.finalizeStatementResult(source, right);
+                        try self.set(source, result_ref, stableResultSource(right));
+                        try self.setLabel(after_addr.local_addr.label, .abs);
+                        const result_type: ?ast.TypeExpr = blk: {
+                            const lt = left.typeExpr() orelse break :blk null;
+                            if (lt != .error_union) break :blk lt;
+                            const rt = right.typeExpr() orelse break :blk lt;
+                            const payload_ptr = try self.allocator.create(ast.TypeExpr);
+                            payload_ptr.* = rt;
+                            break :blk ast.TypeExpr{ .error_union = .{
+                                .err_set = lt.error_union.err_set,
+                                .payload = payload_ptr,
+                                .span = lt.error_union.span,
+                            } };
+                        };
+                        return .from(result_ref.dereference().typed(result_type));
+                    }
+
                     // Wait for left so we can check its exit code (for &&/||)
                     try self.finalizeStatementResult(source, left);
                     try self.set(source, result_ref, stableResultSource(left));
@@ -5654,7 +6474,13 @@ pub const IRCompiler = struct {
                                 const right = try self.compileExpression(binary.right);
                                 try self.finalizeStatementResult(source, right);
                                 try self.set(source, result_ref, stableResultSource(right));
-                                break :blk .from(result_ref.dereference().typed(mergedResultType(left, right)));
+                                // The result is exactly the right operand (the
+                                // comptime-known left was discarded), so it carries
+                                // the right's type — not a merge with the left,
+                                // which would be null when they differ (e.g.
+                                // `false || echo "x"`: bool vs execution) and lose
+                                // the capture.
+                                break :blk .from(result_ref.dereference().typed(right.typeExpr()));
                             },
                         };
                     }
@@ -5728,6 +6554,133 @@ pub const IRCompiler = struct {
         const result = try self.compileExpression(expr);
         try self.finalizeStatementResult(source, result);
         return .fromValue(.void);
+    }
+
+    /// Non-capture `a || b`. If `a` is an error union, this is error-discard:
+    /// the error union's ok value, or `b` when `a` is an error. Otherwise it is
+    /// the ordinary exit-code logical-or.
+    fn compileLogicalOrValue(
+        self: *IRCompiler,
+        source: anytype,
+        binary: ast.BinaryExpr,
+    ) Error!Result {
+        // An error-producing LHS (function call / pipeline) is captured via the
+        // typed capture so its error value is observed (mirrors `catch`).
+        const left = if (try self.lhsCapturesError(binary.left))
+            try self.compileExpressionWithCapture(source, binary.left)
+        else
+            try self.compileExpression(binary.left);
+
+        const left_type_opt = left.typeExpr();
+        if (resultIsErrorLike(left)) {
+            const result_ref = try self.newRef(source, "logical_or_result");
+            try self.set(source, result_ref, stableResultSource(left));
+
+            const is_err_ref = try self.newRef(source, "logical_or_is_err");
+            try self.addInstruction(.init(.from(source), .{ .is_err = .{
+                .operand = result_ref.dereference(),
+                .result = is_err_ref,
+            } }));
+
+            const after_addr = try self.newLabel("logical_or_after", .unknown);
+            // Not an error: keep the ok value already in result_ref.
+            try self.jmp(source, try .from(is_err_ref.dereference()), false, after_addr);
+            // Error: discard it and use the fallback.
+            const right = try self.compileStableExpressionIntoRef(source, binary.right, result_ref);
+            try self.setLabel(after_addr.local_addr.label, .abs);
+
+            const result_type: ?ast.TypeExpr = if (left_type_opt) |left_type| switch (left_type) {
+                .error_union => |error_union| error_union.payload.*,
+                else => right.typeExpr(),
+            } else right.typeExpr();
+            return .from(result_ref.dereference().typed(result_type));
+        }
+
+        // Ordinary exit-code logical-or (mirrors the non-capture value path).
+        if (evaluateLogical(.from(binary.op), left.source)) |comptime_result| {
+            return switch (comptime_result) {
+                .left => left,
+                .right => try self.compileExpression(binary.right),
+            };
+        }
+
+        const right = try self.compileExpression(binary.right);
+        const ref = try self.newRef(source, "logical_result");
+        try self.addInstruction(.init(.from(source), .{ .log = .{
+            .op = .from(binary.op),
+            .a = left.source,
+            .b = right.source,
+            .result = ref,
+        } }));
+        return .from(ref.dereference());
+    }
+
+    /// Non-capture `a && b`. If `a` is an error union, this is a monadic guard:
+    /// `b` when `a` is ok, otherwise `a`'s error (short-circuit). The result is
+    /// an error union (`E!(typeof b)`) so it must itself be handled. Otherwise
+    /// it is the ordinary exit-code logical-and.
+    fn compileLogicalAndValue(
+        self: *IRCompiler,
+        source: anytype,
+        binary: ast.BinaryExpr,
+    ) Error!Result {
+        const left = if (try self.lhsCapturesError(binary.left))
+            try self.compileExpressionWithCapture(source, binary.left)
+        else
+            try self.compileExpression(binary.left);
+
+        const left_type_opt = left.typeExpr();
+        if (resultIsErrorLike(left)) {
+            const result_ref = try self.newRef(source, "logical_and_result");
+            try self.set(source, result_ref, stableResultSource(left));
+
+            const is_err_ref = try self.newRef(source, "logical_and_is_err");
+            try self.addInstruction(.init(.from(source), .{ .is_err = .{
+                .operand = result_ref.dereference(),
+                .result = is_err_ref,
+            } }));
+
+            const after_addr = try self.newLabel("logical_and_after", .unknown);
+            // Error: short-circuit, keep the error already in result_ref.
+            try self.jmp(source, try .from(is_err_ref.dereference()), true, after_addr);
+            // Ok: evaluate the right-hand side as the result.
+            const right = try self.compileStableExpressionIntoRef(source, binary.right, result_ref);
+            try self.setLabel(after_addr.local_addr.label, .abs);
+
+            // Result is `E!(typeof right)`: the left's error set with the
+            // right's value as the payload, so `catch`/`try` see an error union.
+            const result_type: ?ast.TypeExpr = blk: {
+                const lt = left_type_opt orelse break :blk null;
+                if (lt != .error_union) break :blk lt;
+                const rt = right.typeExpr() orelse break :blk lt;
+                const payload_ptr = try self.allocator.create(ast.TypeExpr);
+                payload_ptr.* = rt;
+                break :blk ast.TypeExpr{ .error_union = .{
+                    .err_set = lt.error_union.err_set,
+                    .payload = payload_ptr,
+                    .span = lt.error_union.span,
+                } };
+            };
+            return .from(result_ref.dereference().typed(result_type));
+        }
+
+        // Ordinary exit-code logical-and (mirrors the non-capture value path).
+        if (evaluateLogical(.from(binary.op), left.source)) |comptime_result| {
+            return switch (comptime_result) {
+                .left => left,
+                .right => try self.compileExpression(binary.right),
+            };
+        }
+
+        const right = try self.compileExpression(binary.right);
+        const ref = try self.newRef(source, "logical_result");
+        try self.addInstruction(.init(.from(source), .{ .log = .{
+            .op = .from(binary.op),
+            .a = left.source,
+            .b = right.source,
+            .result = ref,
+        } }));
+        return .from(ref.dereference());
     }
 
     fn compileOrelseBinary(
@@ -6219,7 +7172,7 @@ pub const IRCompiler = struct {
     fn instructionSetIsCountedLoopSafe(self: *IRCompiler, instr_set: usize) bool {
         for (self.instruction_sets.items[instr_set].instructions.items) |instr| {
             switch (instr.type) {
-                .comment, .set, .ath, .cmp, .neg, .get_env, .set_env, .simple_exec => {},
+                .comment, .set, .ath, .cmp, .neg, .is_err, .make_err, .match_err, .err_payload, .get_env, .set_env, .simple_exec => {},
                 else => return false,
             }
         }
@@ -6262,7 +7215,12 @@ pub const IRCompiler = struct {
                 if (std.mem.eql(u8, identifier.name, "cd") and self.lookup(identifier.name, .{ .shallow = false }) == null) {
                     break :blk false;
                 }
-                break :blk self.lookup(identifier.name, .{ .shallow = false }) == null;
+                // A bare identifier parses as a zero-arg call. An unknown name is
+                // an external command whose output must be captured. A known
+                // *function* call also produces output to capture in a value
+                // context; a known *variable* read must NOT be captured.
+                const binding = self.lookup(identifier.name, .{ .shallow = false }) orelse break :blk true;
+                break :blk binding.result.isFunctionRef();
             },
             else => true,
         };

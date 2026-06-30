@@ -1,0 +1,18 @@
+# Sum-type flow narrowing (Phase 3b): inside `if (x is T)` the binding `x` is
+# refined to `T` (then-branch) and to the remaining members (else-branch), so
+# member-specific operations on the narrowed value are allowed. (We exercise the
+# narrowed binding directly — arithmetic and interpolation — rather than copying
+# it into a new `const`, which hits a separate, pre-existing codegen bug for
+# binding copies inside a branch.)
+fn Void @() Void
+
+const x: Int || String = 5
+if (x is Int) { echo "x doubled=${x + x}" } else { echo "x str=${x}" }
+
+const y: Int || String = "hello"
+if (y is Int) { echo "y int=${y}" } else { echo "y str=${y}" }
+
+# `&&` narrows both operands in the then-branch.
+const a: Int || String = 2
+const b: Int || String = "z"
+if (a is Int && b is String) { echo "a+1=${a + 1} b=${b}" } else { echo "no" }

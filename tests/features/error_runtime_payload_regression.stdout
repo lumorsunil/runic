@@ -1,0 +1,3 @@
+a=E.Msg(runtime message)
+b=E.Msg(hello world)
+c=E.Msg(constant)

@@ -1,0 +1,8 @@
+[error]: tests/diagnostics/error_inferred_cross_function.rn:16:1: match is not exhaustive: missing variant 'Worse' (add it or a `_` case)
+  14:
+  15:const r = outer()
+  16:match r {
+  17:    E.Bad => echo "bad"
+  18:}
+  19:
+

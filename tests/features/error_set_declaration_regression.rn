@@ -1,0 +1,13 @@
+const MyError = error {
+    UnknownError,
+    ErrorWithMessage: String,
+}
+
+const SingleError = error { OnlyOne }
+
+const TrailingComma = error {
+    First,
+    Second: Int,
+}
+
+echo "error sets declared"

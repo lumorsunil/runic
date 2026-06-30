@@ -1,0 +1,5 @@
+const E = error { A, B: String }
+const e = E.A
+match e {
+    E.A => echo "a",
+}

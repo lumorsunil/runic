@@ -1,0 +1,18 @@
+const E = error { Bad }
+
+// Leading `!T`: the error set is inferred from the body, so the function may
+// yield both the ok payload and a yielded error value.
+fn Void inferOk() !String { yield "ok payload" }
+fn Void inferErr() !String { yield E.Bad }
+
+// The calls return an inferred error union, so they must be handled: `catch`
+// passes inferOk's ok payload through and supplies a fallback for inferErr.
+echo "${inferOk catch "fb"}"
+echo "|"
+echo "${inferErr catch "fb"}"
+echo "|"
+
+// Binding inference: `b` takes the error-union type of `a`, so `catch` applies.
+const a: E!String = "kept"
+const b = a
+echo "b=${b catch "fb"}"

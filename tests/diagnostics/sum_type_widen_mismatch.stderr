@@ -1,0 +1,7 @@
+[error]: tests/diagnostics/sum_type_widen_mismatch.rn:6:24: expected type IntOrString, actual: Bool
+   4:const IntOrString = Int || String
+   5:
+   6:const z: IntOrString = true
+   7:echo "z bound"
+   8:
+

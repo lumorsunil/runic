@@ -10,3 +10,10 @@ const x = "hello"; echo "${x}"
 
 // Parenthesized command sequence
 (echo "hello"; echo "cat")
+
+// A value-producing binding initializer (a bare identifier reference, or an
+// arithmetic expression) does NOT absorb the following `;` statement — only
+// command-producing initializers sequence.
+const v = 5
+const w = v; echo "w=${w}"
+const s = 1 + 2; echo "s=${s}"

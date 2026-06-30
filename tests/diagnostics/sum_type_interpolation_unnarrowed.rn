@@ -1,0 +1,6 @@
+// Interpolating a bare (un-narrowed) sum has no single string form — it must be
+// narrowed first (with `is`, `==`, or match). Inside `if (x is Int) { ... }` it
+// would be fine.
+const x: Int || String = 5
+
+echo "${x}"

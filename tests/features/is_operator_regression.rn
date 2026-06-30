@@ -1,0 +1,20 @@
+# The `is` operator (sum-types Phase 3a): `x is T` is a runtime type test that
+# evaluates to Bool. It works on any value (sum-typed or not) and composes with
+# `&&`. (Narrowing the type inside the branch is a later phase; here we only
+# exercise the boolean result via control flow.)
+fn Void @() Void
+
+const i: Int || String = 5
+if (i is Int) { echo "i=int" } else { echo "i=other" }
+if (i is String) { echo "i=str" } else { echo "i=not-str" }
+
+const s: Int || String = "hello"
+if (s is Int) { echo "s=int" } else { echo "s=not-int" }
+if (s is String) { echo "s=str" } else { echo "s=other" }
+
+# Works on a plain (non-sum) binding too.
+const n = 42
+if (n is Int) { echo "n=int" } else { echo "n=other" }
+
+# Composes with `&&`: each `is` binds tighter than the conjunction.
+if (i is Int && s is String) { echo "both" } else { echo "no" }

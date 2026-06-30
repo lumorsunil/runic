@@ -1,0 +1,6 @@
+[error]: tests/diagnostics/sum_type_interpolation_unnarrowed.rn:6:9: cannot interpolate a sum type (Int || String) directly; narrow it first with `is`, `==`, or match
+   4:const x: Int || String = 5
+   5:
+   6:echo "${x}"
+   7:
+

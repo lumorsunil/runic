@@ -1,0 +1,13 @@
+const E = error { Bad, Worse }
+
+// Leading `!T`: the error set is inferred from the body. Yielding `E.Bad`
+// makes the inferred set include E's variants, so a `match` on the result
+// must now be exhaustive (or use `_`).
+fn Void mayFail() !String {
+    yield E.Bad
+}
+
+const r = mayFail()
+match r {
+    E.Bad => echo "bad"
+}

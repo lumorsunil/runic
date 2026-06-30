@@ -1,0 +1,4 @@
+bound: E.WithMsg(boom)
+inline: E.WithMsg(direct)
+f: yielded
+|

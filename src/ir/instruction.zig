@@ -105,6 +105,18 @@ pub const Instruction = struct {
         log: Log,
         /// performs logical negation
         neg: Neg,
+        /// sets result to a boolean: whether operand is an error value (`.err`)
+        is_err: Neg,
+        /// sets result to a boolean: whether operand's runtime value is of the
+        /// given type tag (the `x is T` operator / sum narrowing)
+        is_type: IsType,
+        /// constructs an error value (boxing the runtime payload, if any)
+        make_err: MakeErr,
+        /// sets result to a boolean: whether operand is an error value whose
+        /// set+variant match (used by `match` on error variants)
+        match_err: MatchErr,
+        /// extracts an error value's payload into result (void if none)
+        err_payload: Neg,
         /// declares a new ref (basically a labeled push)
         ref: []const u8,
         /// sets a Location to a Value from a Location
@@ -173,6 +185,10 @@ pub const Instruction = struct {
         /// separate value onto the given pipe's typed queue (framing a byte
         /// stream into per-line values). used by the `lines` builtin.
         emit_lines: Location,
+        /// dequeues the next value from the given (typed) pipe's queue into %r,
+        /// or `.null` when the queue is empty. used to read a single structured
+        /// value (e.g. an error union) captured from an in-process function.
+        pipe_dequeue: Location,
 
         pub fn push_(value: ValueSource) @This() {
             return .{ .push = value };
@@ -214,7 +230,7 @@ pub const Instruction = struct {
 
         pub fn format(self: @This(), w: *std.Io.Writer) !void {
             switch (self) {
-                inline .push, .exit, .exit_with, .jmp, .fork, .set, .pipe_fwd, .pipe_file, .pipe_write, .wait, .stream, .pipe, .pipe_opt, .ath, .log, .cmp, .resolve_exit_code, .cd, .get_env, .set_env, .emit_lines => |t| try w.print("{t} {f}", .{ self, t }),
+                inline .push, .exit, .exit_with, .jmp, .fork, .set, .pipe_fwd, .pipe_file, .pipe_write, .wait, .stream, .pipe, .pipe_opt, .ath, .log, .cmp, .resolve_exit_code, .cd, .get_env, .set_env, .emit_lines, .pipe_dequeue => |t| try w.print("{t} {f}", .{ self, t }),
                 inline .ref, .comment, .get_module_cache, .set_module_cache => |t| try w.print("{t} {s}", .{ self, t }),
                 inline .alloc => |t| try w.print("{t} {}", .{ self, t }),
                 else => try w.print("{t}", .{self}),
@@ -284,6 +300,35 @@ pub const Instruction = struct {
 
     pub const UnaryOperation = struct {
         operand: Location,
+        result: Location,
+    };
+
+    /// Constructs an error value. `payload` (if present) is resolved at runtime
+    /// and boxed, so both constant and runtime payloads are supported.
+    pub const MakeErr = struct {
+        set: []const u8,
+        variant: []const u8,
+        payload: ?ValueSource,
+        result: Location,
+    };
+
+    /// Tests whether `operand` is an error value with the given set + variant.
+    pub const MatchErr = struct {
+        operand: Location,
+        set: []const u8,
+        variant: []const u8,
+        result: Location,
+    };
+
+    /// The runtime type categories testable by the `x is T` operator. Each maps
+    /// to one or more `Value` tags (e.g. `string` accepts both `.zig_string` and
+    /// `.slice`); see `Evaluator`'s `is_type` handler.
+    pub const TypeTag = enum { int, float, string, boolean };
+
+    /// Tests whether `operand`'s runtime value matches `tag`.
+    pub const IsType = struct {
+        operand: Location,
+        tag: TypeTag,
         result: Location,
     };
 

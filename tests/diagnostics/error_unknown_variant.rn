@@ -1,0 +1,3 @@
+const MyError = error { Bad }
+const e = MyError.Nope
+echo "${e}"

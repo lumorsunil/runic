@@ -281,7 +281,7 @@ const StatementExpressionIterator = struct {
 
     fn populateStackStatement(self: *StatementExpressionIterator, statement: *runic.ast.Statement) !void {
         switch (statement.*) {
-            .error_decl, .bash_block => {},
+            .bash_block => {},
             .type_binding_decl => {},
             .binding_decl => |binding_decl| try self.cursor.appendExpr(binding_decl.initializer),
             .while_stmt => |while_stmt| {
@@ -289,7 +289,6 @@ const StatementExpressionIterator = struct {
                 try self.cursor.appendExpr(while_stmt.condition);
             },
             .exit_stmt => |exit_stmt| if (exit_stmt.value) |v| try self.cursor.appendExpr(v),
-            .return_stmt => |return_stmt| if (return_stmt.value) |v| try self.cursor.appendExpr(v),
             .yield_stmt => |yield_stmt| try self.cursor.appendExpr(yield_stmt.value),
             .expression => |expr| try self.cursor.appendExpr(expr.expression),
         }
@@ -300,6 +299,7 @@ const StatementExpressionIterator = struct {
         switch (expr.*) {
             .identifier, .env_var, .path, .literal, .map, .import_expr, .pipeline_deprecated, .builtin, .fd => {},
             .array => |array| try cursor.appendExpressions(array.elements),
+            .struct_literal => |struct_literal| for (struct_literal.fields) |field| try cursor.appendExpr(field.value),
             .range => |range| {
                 try cursor.appendExpr(range.start);
                 if (range.end) |end| try cursor.appendExpr(end);
@@ -324,8 +324,9 @@ const StatementExpressionIterator = struct {
                 try cursor.appendExpr(match_expr.subject);
             },
             .try_expr => |try_expr| try cursor.appendExpr(try_expr.subject),
+            .is_expr => |is_expr| try cursor.appendExpr(is_expr.subject),
             .catch_expr => |catch_expr| {
-                try populateBlockExpr(cursor, catch_expr.handler.body);
+                try cursor.appendExpr(catch_expr.handler);
                 try cursor.appendExpr(catch_expr.subject);
             },
             .assignment => |assignment| try cursor.appendExpr(assignment.expr),

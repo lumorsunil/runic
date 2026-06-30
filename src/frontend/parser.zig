@@ -484,6 +484,48 @@ pub const Parser = struct {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
+        const subject = try self.parseExpressionInner();
+        return self.parseMaybeCatch(subject);
+    }
+
+    /// `try <expr>` — propagates an error out of the enclosing function, else
+    /// evaluates to the ok value. Binds tightly (parenthesize pipelines, e.g.
+    /// `try (echo "x" | parseInt)`).
+    fn parseTryExpression(self: *Self) Error!*ast.Expression {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const start = try self.expectTokenTag(.kw_try);
+        const subject = try self.parseExpressionInner();
+        return self.allocExpression(.{ .try_expr = .{
+            .subject = subject,
+            .span = start.span.endAt(subject.span()),
+        } });
+    }
+
+    /// `expr catch <default>` / `expr catch |err| <handler>`. `catch` binds
+    /// looser than pipelines, so the whole inner expression is its subject.
+    fn parseMaybeCatch(self: *Self, subject: *ast.Expression) Error!*ast.Expression {
+        var result = subject;
+        while (true) {
+            const next = try self.peekToken();
+            if (next.tag != .kw_catch) break;
+            _ = try self.nextToken(); // consume `catch`
+
+            const capture = try self.parseOptionalCaptureClause();
+            const handler = try self.parseControlFlowBody();
+
+            result = try self.allocExpression(.{ .catch_expr = .{
+                .subject = result,
+                .capture = capture,
+                .handler = handler,
+                .span = result.span().endAt(handler.span()),
+            } });
+        }
+        return result;
+    }
+
+    fn parseExpressionInner(self: *Self) Error!*ast.Expression {
         self.clearExpectedTokens();
 
         const next = try self.peekToken();
@@ -496,6 +538,7 @@ pub const Parser = struct {
             .kw_if => self.parseIfExpression(),
             .kw_for => self.parseForExpression(),
             .kw_match => self.parseMatchExpression(),
+            .kw_try => self.parseTryExpression(),
             else => {
                 if (try self.parseMaybeUnaryExpression()) |unary_expr| return unary_expr;
                 if (try self.parseMaybeBinaryExpression()) |binary_expr| return binary_expr;
@@ -570,6 +613,52 @@ pub const Parser = struct {
                 return Error.UnexpectedToken;
             },
         }
+    }
+
+    /// Parses `{ .field = expr, ... }` following an already-consumed type-like
+    /// identifier `name`. Commas and/or newlines separate fields; a trailing
+    /// comma is allowed. Used for error value construction (and future structs).
+    fn parseStructLiteral(self: *Self, name: ast.Identifier) Error!*ast.Expression {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        _ = try self.expectTokenTag(.l_brace);
+
+        var fields = std.ArrayList(ast.StructLiteral.FieldInit).empty;
+        defer fields.deinit(self.allocator);
+
+        while (true) {
+            self.skipNewlines();
+            const next = try self.peekToken();
+            if (next.tag == .r_brace) break;
+
+            const dot = try self.expectTokenTag(.dot);
+            const field_name = try self.parseIdentifier();
+            _ = try self.expectTokenTag(.assign);
+            const value = try self.parseExpression();
+
+            try fields.append(self.allocator, .{
+                .name = field_name,
+                .value = value,
+                .span = dot.span.endAt(value.span()),
+            });
+
+            self.skipNewlines();
+            const delimiter = try self.peekToken();
+            if (delimiter.tag == .comma) {
+                _ = try self.nextToken();
+            }
+        }
+
+        const close = try self.expectTokenTag(.r_brace);
+
+        return self.allocExpression(.{
+            .struct_literal = .{
+                .name = name,
+                .fields = try self.copyToArena(ast.StructLiteral.FieldInit, fields.items),
+                .span = name.span.endAt(close.span),
+            },
+        });
     }
 
     const BinaryComponent = union(enum) {
@@ -785,8 +874,22 @@ pub const Parser = struct {
                         .identifier => {
                             const breadcrumbInner = try self.createBreadcrumb("PBE:identifier");
                             defer breadcrumbInner.end();
+
+                            // `Name{ .field = expr }` — struct-literal syntax for a
+                            // type-like (uppercase) identifier. Currently used for
+                            // error value construction.
+                            const id = ast.Identifier.fromToken(next);
+                            const ahead = try self.peekSlice(2);
+                            if (id.isTypeIdentifier() and ahead[1].tag == .l_brace) {
+                                _ = try self.nextToken(); // consume the identifier
+                                try components.append(self.allocator, .{
+                                    .expr = try self.parseStructLiteral(id),
+                                });
+                                continue;
+                            }
+
                             try components.append(self.allocator, .{
-                                .identifier = .fromToken(next),
+                                .identifier = id,
                             });
                         },
                         .dollar => {
@@ -888,6 +991,27 @@ pub const Parser = struct {
                 },
                 .op => {
                     switch (next.tag) {
+                        // `x is T` — a postfix type test that binds tighter than
+                        // any binary operator. Wrap the just-parsed operand into
+                        // an `is_expr` and stay in the `.op` state (so `x is Int
+                        // && y is String` parses as `(x is Int) && (y is String)`).
+                        .kw_is => {
+                            _ = try self.nextToken(); // consume `is`
+                            const type_expr = try self.parseTypeExpr();
+                            const last = components.items[components.items.len - 1];
+                            const subject = try last.toExpression(self, null, .left);
+                            components.items[components.items.len - 1] = .{
+                                .expr = try self.allocExpression(.{ .is_expr = .{
+                                    .subject = subject,
+                                    .type_expr = type_expr,
+                                    .span = subject.span().endAt(type_expr.span()),
+                                } }),
+                            };
+                            // Counteract the loop's `state.advance()` so we stay
+                            // in `.op` (still expecting a binary operator).
+                            state = .expr;
+                            continue;
+                        },
                         .equal_equal, .bang_equal, .fd_source_truncate_redirect, .fd_source_append_redirect, .greater, .append_redirect, .redirect_fd, .greater_equal, .less, .less_equal, .plus, .minus, .star, .slash, .percent, .kw_and, .kw_or, .kw_orelse, .pipe_pipe, .amp_amp, .pipe, .dot, .assign, .plus_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign => {
                             const breadcrumbInner = try self.createBreadcrumb("PBE:op");
                             defer breadcrumbInner.end();
@@ -1366,7 +1490,7 @@ pub const Parser = struct {
 
     fn isExprTerminator(tag: token.Tag) bool {
         return switch (tag) {
-            .r_paren, .r_bracket, .r_brace, .comma, .pipe, .pipe_pipe, .amp_amp, .amp, .string_interp_end, .newline, .semicolon, .l_brace, .range, .dot_l_brace, .kw_else => true,
+            .r_paren, .r_bracket, .r_brace, .comma, .pipe, .pipe_pipe, .amp_amp, .amp, .string_interp_end, .newline, .semicolon, .l_brace, .range, .dot_l_brace, .kw_else, .kw_catch => true,
             else => false,
         };
     }
@@ -1599,12 +1723,9 @@ pub const Parser = struct {
 
         const if_tok = try self.expect(.kw_if);
         _ = try self.expect(.l_paren);
-        var condition = try self.parseExpression();
+        const condition = try self.parseExpression();
         _ = try self.expect(.r_paren);
         const capture = try self.parseOptionalCaptureClause();
-        if (capture != null) {
-            condition = try self.rewriteBareIdentifierCallForIfCapture(condition);
-        }
         // const then_block = try self.parseBlock();
         const then_expr = try self.parseControlFlowBody();
 
@@ -1639,19 +1760,6 @@ pub const Parser = struct {
                 .span = if_tok.span.endAt(end_span),
             },
         });
-    }
-
-    fn rewriteBareIdentifierCallForIfCapture(
-        self: *Self,
-        condition: *ast.Expression,
-    ) Error!*ast.Expression {
-        if (condition.* != .call) return condition;
-
-        const call = condition.call;
-        if (call.arguments.len != 0 or call.redirects.len != 0) return condition;
-        if (call.callee.* != .identifier) return condition;
-
-        return self.allocExpression(.{ .identifier = call.callee.identifier });
     }
 
     // for (items) |item| {...}
@@ -1691,7 +1799,7 @@ pub const Parser = struct {
 
         const next = try self.peekToken();
         const stmt: *ast.Statement = switch (next.tag) {
-            .kw_yield, .kw_return, .kw_exit => try self.parseSingleBodyStatement(),
+            .kw_yield, .kw_exit => try self.parseSingleBodyStatement(),
             else => return self.parseExpression(),
         };
 
@@ -1703,14 +1811,12 @@ pub const Parser = struct {
         } });
     }
 
-    /// Parses a single `yield`/`return`/`exit` statement for use as a bare
-    /// control-flow body. The caller guarantees the next token is one of these.
+    /// Parses a single `yield`/`exit` statement for use as a bare control-flow
+    /// body. The caller guarantees the next token is one of these.
     fn parseSingleBodyStatement(self: *Self) Error!*ast.Statement {
         const stmt = try self.arena.allocator().create(ast.Statement);
         if (try self.parseMaybeYield()) |yield_stmt| {
             stmt.* = .{ .yield_stmt = yield_stmt };
-        } else if (try self.parseMaybeReturn()) |return_stmt| {
-            stmt.* = .{ .return_stmt = return_stmt };
         } else if (try self.parseMaybeExit()) |exit_stmt| {
             stmt.* = .{ .exit_stmt = exit_stmt };
         } else {
@@ -1724,9 +1830,11 @@ pub const Parser = struct {
         defer breadcrumb.end();
 
         const match_tok = try self.expect(.kw_match);
-        _ = try self.expect(.l_paren);
+        // The subject parentheses are optional: `match (x) { … }` or `match x { … }`.
+        const has_paren = (try self.peekToken()).tag == .l_paren;
+        if (has_paren) _ = try self.expect(.l_paren);
         const subject = try self.parseExpression();
-        _ = try self.expect(.r_paren);
+        if (has_paren) _ = try self.expect(.r_paren);
         _ = try self.expect(.l_brace);
         self.skipNewlines();
 
@@ -1764,7 +1872,7 @@ pub const Parser = struct {
         const pattern = try self.parseMatchPattern();
         _ = try self.expect(.fat_arrow);
         const capture = try self.parseOptionalCaptureClause();
-        const body = try self.parseBlock();
+        const body = try self.parseMatchCaseBody();
 
         return .{
             .pattern = pattern,
@@ -1772,6 +1880,19 @@ pub const Parser = struct {
             .body = body,
             .span = pattern.span().endAt(body.span),
         };
+    }
+
+    /// A match case body is either a `{ … }` block or a bare expression (wrapped
+    /// into a single-statement block): `MyError.X => echo "…"`.
+    fn parseMatchCaseBody(self: *Self) Error!ast.Block {
+        if ((try self.peekToken()).tag == .l_brace) return self.parseBlock();
+
+        const expr = try self.parseExpression();
+        const stmt = try self.arena.allocator().create(ast.Statement);
+        stmt.* = .{ .expression = .{ .expression = expr, .span = expr.span() } };
+        const statements = try self.arena.allocator().alloc(*ast.Statement, 1);
+        statements[0] = stmt;
+        return ast.Block{ .statements = statements, .span = expr.span() };
     }
 
     fn parseMatchPattern(self: *Self) Error!ast.MatchPattern {
@@ -2209,11 +2330,6 @@ pub const Parser = struct {
 
         if (try self.parseMaybeBinding(null)) |binding_decl| {
             stmt.* = .{ .binding_decl = binding_decl };
-            return stmt;
-        }
-
-        if (try self.parseMaybeReturn()) |return_stmt| {
-            stmt.* = .{ .return_stmt = return_stmt };
             return stmt;
         }
 
@@ -2696,7 +2812,18 @@ pub const Parser = struct {
             const next = try self.peekToken();
             if (next.tag != .semicolon) break;
             switch (initializer.*) {
-                .call, .pipeline, .binary, .block, .subshell => {},
+                // A bare zero-arg identifier call (`const z = y`) is a value
+                // reference, not a multi-part command — don't absorb the next
+                // statement; let `;` separate it (e.g. `const z = y; echo "hi"`).
+                .call => |call| if (call.arguments.len == 0 and call.callee.* == .identifier) break,
+                // Only command-producing binaries sequence; value ops
+                // (arithmetic, comparison, …) don't (`const x = 1 + 2; echo` must
+                // run the echo).
+                .binary => |binary| switch (binary.op) {
+                    .apply, .pipe, .logical_and, .logical_or, .sequence, .append_redirect, .redirect_fd, .fd_source_truncate_redirect, .fd_source_append_redirect => {},
+                    else => break,
+                },
+                .pipeline, .block, .subshell => {},
                 else => break,
             }
             _ = try self.nextToken(); // consume `;`
@@ -2718,17 +2845,6 @@ pub const Parser = struct {
             .annotation = annotation,
             .initializer = initializer,
             .pattern = pattern,
-        };
-    }
-
-    fn parseMaybeReturn(self: *Self) Error!?ast.ReturnStmt {
-        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
-        defer breadcrumb.end();
-
-        const next = try self.peekToken();
-        return switch (next.tag) {
-            .kw_return => try self.parseReturn(),
-            else => null,
         };
     }
 
@@ -2775,28 +2891,6 @@ pub const Parser = struct {
         return .{
             .value = value,
             .fd = fd,
-            .span = start.span.endAt(value.span()),
-        };
-    }
-
-    fn parseReturn(self: *Self) Error!ast.ReturnStmt {
-        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
-        defer breadcrumb.end();
-
-        const start = try self.expectTokenTag(.kw_return);
-        const next = try self.peekToken();
-
-        if (isExprTerminator(next.tag)) {
-            return .{
-                .value = null,
-                .span = start.span,
-            };
-        }
-
-        const value = try self.parseExpression();
-
-        return .{
-            .value = value,
             .span = start.span.endAt(value.span()),
         };
     }
@@ -2922,8 +3016,66 @@ pub const Parser = struct {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
-        // TODO: implement
+        const next = try self.peekToken();
 
+        if (isTypeExprTerminator(next.tag)) return null;
+
+        // Leading `!T` — an error union with an inferred error set (the error
+        // set is filled in later by inference; see Phase 6).
+        if (next.tag == .bang) {
+            return try self.parseInferredErrorUnionTypeExpr();
+        }
+
+        const primary = (try self.parseMaybePrimaryTypeExpr()) orelse return null;
+        var lhs = try self.applyPostfixErrorUnion(primary);
+
+        // Type-level `A || B` merge (left-associative). The type checker
+        // currently accepts only error-set operands (backlog #18); general sum
+        // types over arbitrary members are a separate feature
+        // (future/sum-types-plan.md). Note: in *type* position `||` is the merge
+        // operator; value-position `||` (logical-or) is parsed elsewhere.
+        while ((try self.peekToken()).tag == .pipe_pipe) {
+            _ = try self.nextToken();
+            const rhs_primary = (try self.parseMaybePrimaryTypeExpr()) orelse {
+                const tok = try self.peekToken();
+                try self.reportParseError(
+                    Error.ExpectedTypeExpr,
+                    tok.span,
+                    "expected type after '||', actual: {s}",
+                    .{tok.lexeme},
+                );
+                return Error.ExpectedTypeExpr;
+            };
+            const rhs = try self.applyPostfixErrorUnion(rhs_primary);
+            lhs = try self.allocTypeExpression(.{
+                .type_merge = .{
+                    .lhs = lhs,
+                    .rhs = rhs,
+                    .span = lhs.span().endAt(rhs.span()),
+                },
+            });
+        }
+
+        return lhs;
+    }
+
+    /// Applies a postfix `!T` (explicit error union `E!T`) to an already-parsed
+    /// error-set type expression, or returns it unchanged when no `!` follows.
+    fn applyPostfixErrorUnion(self: *Self, err_set: *const ast.TypeExpr) Error!*const ast.TypeExpr {
+        const after = try self.peekToken();
+        if (after.tag != .bang) return err_set;
+        _ = try self.nextToken();
+        const payload = try self.parseTypeExpr();
+        return try self.allocTypeExpression(.{
+            .error_union = .{
+                .err_set = err_set,
+                .payload = payload,
+                .span = err_set.span().endAt(payload.span()),
+            },
+        });
+    }
+
+    fn parseMaybePrimaryTypeExpr(self: *Self) Error!?*const ast.TypeExpr {
         const next = try self.peekToken();
 
         if (isTypeExprTerminator(next.tag)) return null;
@@ -2933,7 +3085,7 @@ pub const Parser = struct {
             // .kw_enum => self.parseEnumTypeExpr(),
             // .kw_union => self.parseUnionTypeExpr(),
             // .kw_struct => self.parseStructTypeExpr(),
-            // .kw_error => self.parseErrorTypeExpr(),
+            .kw_error => self.parseErrorTypeExpr(),
             .l_bracket => self.parseArrayTypeExpr(),
             // .caret => self.parsePromiseTypeExpr(),
             .question => self.parseOptionalTypeExpr(),
@@ -2947,6 +3099,27 @@ pub const Parser = struct {
         };
     }
 
+    /// Parses a leading-`!` error union (`!T`). The error set is left empty as
+    /// an "infer me" placeholder; inference (Phase 6) replaces it with the
+    /// concrete set derived from the value/body.
+    fn parseInferredErrorUnionTypeExpr(self: *Self) Error!*const ast.TypeExpr {
+        const bang = try self.expectTokenTag(.bang);
+        const payload = try self.parseTypeExpr();
+        const err_set = try self.allocTypeExpression(.{
+            .error_set = .{
+                .variants = &.{},
+                .span = bang.span,
+            },
+        });
+        return self.allocTypeExpression(.{
+            .error_union = .{
+                .err_set = err_set,
+                .payload = payload,
+                .span = bang.span.endAt(payload.span()),
+            },
+        });
+    }
+
     fn parseOptionalTypeExpr(self: *Self) Error!*const ast.TypeExpr {
         const question = try self.expectTokenTag(.question);
         const child = try self.parseTypeExpr();
@@ -2958,6 +3131,60 @@ pub const Parser = struct {
             },
         };
         return type_expr;
+    }
+
+    /// Parses an error set type expression:
+    ///   error { UnknownError, ErrorWithMessage: String }
+    /// Each variant is a name with an optional `: PayloadType`. Commas and
+    /// newlines both separate variants; a trailing comma is allowed.
+    fn parseErrorTypeExpr(self: *Self) Error!*const ast.TypeExpr {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const start = try self.expectTokenTag(.kw_error);
+        _ = try self.expectTokenTag(.l_brace);
+
+        var variants = std.ArrayList(ast.TypeExpr.ErrorSet.Variant).empty;
+        defer variants.deinit(self.allocator);
+
+        while (true) {
+            self.skipNewlines();
+            const next = try self.peekToken();
+            if (next.tag == .r_brace) break;
+
+            const name = try self.parseIdentifier();
+
+            var payload: ?*const ast.TypeExpr = null;
+            var variant_end = name.span;
+            const after = try self.peekToken();
+            if (after.tag == .colon) {
+                _ = try self.nextToken();
+                const payload_type = try self.parseTypeExpr();
+                payload = payload_type;
+                variant_end = payload_type.span();
+            }
+
+            try variants.append(self.allocator, .{
+                .name = name,
+                .payload = payload,
+                .span = name.span.endAt(variant_end),
+            });
+
+            self.skipNewlines();
+            const delimiter = try self.peekToken();
+            if (delimiter.tag == .comma) {
+                _ = try self.nextToken();
+            }
+        }
+
+        const close = try self.expectTokenTag(.r_brace);
+
+        return self.allocTypeExpression(.{
+            .error_set = .{
+                .variants = try self.copyToArena(ast.TypeExpr.ErrorSet.Variant, variants.items),
+                .span = start.span.endAt(close.span),
+            },
+        });
     }
 
     fn parseTypeExpr(self: *Self) Error!*const ast.TypeExpr {

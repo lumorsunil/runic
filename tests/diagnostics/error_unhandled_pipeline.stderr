@@ -1,0 +1,5 @@
+[error]: tests/diagnostics/error_unhandled_pipeline.rn:2:1: error is not handled; use catch (or || to discard) or propagate it
+   1:// `parseInt` yields a `ParseError!Int`; a bare pipeline leaves it unhandled.
+   2:echo "abc" | parseInt
+   3:
+

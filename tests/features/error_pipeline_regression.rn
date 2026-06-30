@@ -1,0 +1,14 @@
+// A pipeline ending in a command is handled at the trailing catch/|| : the
+// pipeline's result (the final stage's exit/output) is caught.
+
+// Failing final stage (grep with no match) is caught.
+const a = echo "hi" | grep "zzz" catch "no-match"
+echo "a=${a}"
+
+// Succeeding pipeline yields its output.
+const b = echo "match-me" | grep "match" catch "none"
+echo "b=${b}"
+
+// `||` discards the pipeline error.
+const c = echo "hi" | grep "zzz" || "discarded"
+echo "c=${c}"

@@ -1,0 +1,15 @@
+[error]: tests/diagnostics/error_match_unknown_variant.rn:4:5: error set has no variant 'Nonexistent'
+   2:const e = MyError.A
+   3:match (e) {
+   4:    MyError.Nonexistent => { echo "nope" },
+   5:}
+   6:
+
+[error]: tests/diagnostics/error_match_unknown_variant.rn:3:1: match is not exhaustive: missing variant 'A' (add it or a `_` case)
+   1:const MyError = error { A }
+   2:const e = MyError.A
+   3:match (e) {
+   4:    MyError.Nonexistent => { echo "nope" },
+   5:}
+   6:
+

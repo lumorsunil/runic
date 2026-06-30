@@ -1,0 +1,9 @@
+[error]: tests/diagnostics/error_try_uncovered_return.rn:9:19: try propagates error 'Bad', but the enclosing function's return type declares no error set to cover it; handle it with catch or declare it in the return type
+   7:// type undetected, so this must be handled here (or declared in the return).
+   8:fn String f() String {
+   9:    const r = try mayFail
+  10:    yield r
+  11:}
+  12:
+  13:echo "${f}"
+

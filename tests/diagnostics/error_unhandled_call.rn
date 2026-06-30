@@ -1,0 +1,4 @@
+const E = error { Bad }
+// A bare call to an error-returning function leaves the error unhandled.
+fn Void mayFail() E!String { yield E.Bad }
+mayFail

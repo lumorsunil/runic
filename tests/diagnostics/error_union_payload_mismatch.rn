@@ -1,0 +1,3 @@
+const MyError = error { Bad }
+const x: MyError!String = 5
+echo "should not reach"

@@ -1,0 +1,8 @@
+const E = error { Bad }
+
+fn String mayFail() E!String { yield E.Bad }
+
+// A top-level `try` has no enclosing function to propagate to, so the error
+// cannot bubble up. It must be handled with catch instead.
+const v = try mayFail
+echo "${v}"

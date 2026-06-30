@@ -1077,6 +1077,20 @@ pub const IREvaluator = struct {
                     // producer is still running); block (retry) when the queue is
                     // empty but the producer is live; EOF when empty and closed.
                     if (self.context.dequeueTypedPipeValue(stdin_value.pipe)) |typed_value| {
+                        // Error short-circuit: a yielded error aborts the
+                        // pipeline. Forward it to this stage's stdout so it leads
+                        // the output stream — the consumer/capture reads the
+                        // error first and the pipeline evaluates to it, regardless
+                        // of what the body does with this value afterwards. (We
+                        // still return it to the body rather than EOF, so a
+                        // value-op like `&0 * 2` propagates it instead of
+                        // computing on `null`.)
+                        if (typed_value == .err and
+                            thread.private.stack.items.len >= 2 and
+                            thread.private.stack.items[1] == .pipe)
+                        {
+                            try self.context.enqueueTypedPipeValue(thread.private.stack.items[1].pipe, typed_value);
+                        }
                         thread.private.result_register = typed_value;
                         return .cont;
                     }
@@ -1110,22 +1124,14 @@ pub const IREvaluator = struct {
                 try self.materializeString(thread, thread.private.result_register, &text_writer.writer);
                 const trimmed = std.mem.trim(u8, text_writer.written(), " \t\r\n");
                 const parsed = std.fmt.parseInt(usize, trimmed, 10) catch {
-                    // Report a precise diagnostic here (naming the offending
-                    // input and source location); the runner suppresses its
-                    // generic "Error evaluating" line for InvalidInt so the
-                    // user sees a single clear message.
-                    if (instruction.source) |src| {
-                        const span = src.span();
-                        std.log.err("[error]: {s}:{}:{}: cannot parse \"{s}\" as Int", .{
-                            span.start.file,
-                            span.start.line,
-                            span.start.column,
-                            trimmed,
-                        });
-                    } else {
-                        std.log.err("[error]: cannot parse \"{s}\" as Int", .{trimmed});
-                    }
-                    return Error.InvalidInt;
+                    // A bad parse is a catchable `ParseError.Invalid` value
+                    // (`parseInt: ParseError!Int`), not a hard runtime abort.
+                    thread.private.result_register = .{ .err = .{
+                        .set = "ParseError",
+                        .variant = "Invalid",
+                        .payload = null,
+                    } };
+                    return .cont;
                 };
                 thread.private.result_register = .{ .uinteger = parsed };
                 return .cont;
@@ -1141,20 +1147,14 @@ pub const IREvaluator = struct {
                 try self.materializeString(thread, thread.private.result_register, &text_writer.writer);
                 const trimmed = std.mem.trim(u8, text_writer.written(), " \t\r\n");
                 const parsed = std.fmt.parseFloat(f64, trimmed) catch {
-                    // Precise, source-located diagnostic (the runner/CLI suppress
-                    // their generic footers for InvalidFloat, as for InvalidInt).
-                    if (instruction.source) |src| {
-                        const span = src.span();
-                        std.log.err("[error]: {s}:{}:{}: cannot parse \"{s}\" as Float", .{
-                            span.start.file,
-                            span.start.line,
-                            span.start.column,
-                            trimmed,
-                        });
-                    } else {
-                        std.log.err("[error]: cannot parse \"{s}\" as Float", .{trimmed});
-                    }
-                    return Error.InvalidFloat;
+                    // A bad parse is a catchable `ParseError.Invalid` value
+                    // (`parseFloat: ParseError!Float`), not a hard runtime abort.
+                    thread.private.result_register = .{ .err = .{
+                        .set = "ParseError",
+                        .variant = "Invalid",
+                        .payload = null,
+                    } };
+                    return .cont;
                 };
                 thread.private.result_register = .{ .float = parsed };
                 return .cont;
@@ -1196,6 +1196,16 @@ pub const IREvaluator = struct {
                     try w.writeByte('\n');
                 }
                 try w.flush();
+                return .cont;
+            },
+            .pipe_dequeue => |pipe_location| {
+                // Read one structured value back from an in-process typed pipe
+                // (e.g. an error union a function yielded). The producer has
+                // already been waited on, so the value is enqueued; an empty
+                // queue means the function yielded nothing -> `.null`.
+                const pipe_handle = (try self.resolveLocation(thread, pipe_location)).pipe;
+                thread.private.result_register =
+                    self.context.dequeueTypedPipeValue(pipe_handle) orelse .null;
                 return .cont;
             },
             .fwd_stdio => {
@@ -1245,6 +1255,55 @@ pub const IREvaluator = struct {
                     else => return Error.UnsupportedNegOperand,
                 };
                 try self.setLocation(thread, neg.result, .{ .exit_code = negated });
+                return .cont;
+            },
+            .is_err => |is_err| {
+                const operand = try self.resolveLocation(thread, is_err.operand);
+                try self.setLocation(thread, is_err.result, .fromBoolean(operand == .err));
+                return .cont;
+            },
+            .is_type => |is_type| {
+                const operand = try self.resolveLocation(thread, is_type.operand);
+                const matches = switch (is_type.tag) {
+                    .int => operand == .uinteger,
+                    .float => operand == .float,
+                    // Bool is carried as an exit code (see the compiler).
+                    .boolean => operand == .exit_code,
+                    // A string is either an interned Zig string or a runtime byte slice.
+                    .string => operand == .zig_string or operand == .slice,
+                };
+                try self.setLocation(thread, is_type.result, .fromBoolean(matches));
+                return .cont;
+            },
+            .make_err => |make_err| {
+                const payload_ptr: ?*const ir.Value = if (make_err.payload) |payload| blk: {
+                    const value = try self.resolveValueSource(thread, payload);
+                    const boxed = try self.allocator.create(ir.Value);
+                    boxed.* = value;
+                    break :blk boxed;
+                } else null;
+                try self.setLocation(thread, make_err.result, .{ .err = .{
+                    .set = make_err.set,
+                    .variant = make_err.variant,
+                    .payload = payload_ptr,
+                } });
+                return .cont;
+            },
+            .match_err => |match_err| {
+                const operand = try self.resolveLocation(thread, match_err.operand);
+                const matches = operand == .err and
+                    std.mem.eql(u8, operand.err.set, match_err.set) and
+                    std.mem.eql(u8, operand.err.variant, match_err.variant);
+                try self.setLocation(thread, match_err.result, .fromBoolean(matches));
+                return .cont;
+            },
+            .err_payload => |err_payload| {
+                const operand = try self.resolveLocation(thread, err_payload.operand);
+                const payload: ir.Value = if (operand == .err and operand.err.payload != null)
+                    operand.err.payload.?.*
+                else
+                    .void;
+                try self.setLocation(thread, err_payload.result, payload);
                 return .cont;
             },
             .exec => |exec| {
@@ -1649,6 +1708,18 @@ pub const IREvaluator = struct {
 
                 const left = (try self.tryResolveFastValueSource(thread, ath.a)) orelse try self.resolveValueSource(thread, ath.a);
                 const right = (try self.tryResolveFastValueSource(thread, ath.b)) orelse try self.resolveValueSource(thread, ath.b);
+
+                // Error short-circuit: arithmetic on an error value propagates the
+                // error unchanged, so an upstream pipeline error (e.g. a bad
+                // `parseInt`) flows through a downstream `&0 * 2` stage to the
+                // terminus instead of crashing the computation.
+                if (left == .err or right == .err) {
+                    const err_val: ir.Value = if (left == .err) left else right;
+                    if (!try self.setFastLocation(thread, ath.result, err_val)) {
+                        try self.setLocation(thread, ath.result, err_val);
+                    }
+                    return .cont;
+                }
 
                 if (evaluateArithmetic(ath.op, .from(left), .from(right))) |result| {
                     if (!try self.setFastLocation(thread, ath.result, result)) {
@@ -2060,6 +2131,14 @@ pub const IREvaluator = struct {
                 }
             },
             .null => try w.writeAll("null"),
+            .err => |e| {
+                try w.print("{s}.{s}", .{ e.set, e.variant });
+                if (e.payload) |payload| {
+                    try w.writeAll("(");
+                    try self.materializeString(thread, payload.*, w);
+                    try w.writeAll(")");
+                }
+            },
             .void, .strct, .thread, .closeable, .fn_ref => {},
         }
     }

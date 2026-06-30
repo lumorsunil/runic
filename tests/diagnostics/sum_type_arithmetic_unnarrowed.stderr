@@ -1,0 +1,12 @@
+[error]: tests/diagnostics/sum_type_arithmetic_unnarrowed.rn:6:9: cannot use in arithmetic a sum type (Int || String) directly; narrow it first with `is`, `==`, or match
+   4:const x: Int || String = 5
+   5:
+   6:echo "${x + 1}"
+   7:
+
+[error]: tests/diagnostics/sum_type_arithmetic_unnarrowed.rn:6:9: cannot interpolate a sum type (Int || String) directly; narrow it first with `is`, `==`, or match
+   4:const x: Int || String = 5
+   5:
+   6:echo "${x + 1}"
+   7:
+

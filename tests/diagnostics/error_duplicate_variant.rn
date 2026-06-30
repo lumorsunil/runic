@@ -1,0 +1,7 @@
+const Dup = error {
+    Foo,
+    Bar,
+    Foo,
+}
+
+echo "should not reach"

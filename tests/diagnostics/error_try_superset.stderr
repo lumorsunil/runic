@@ -1,0 +1,9 @@
+[error]: tests/diagnostics/error_try_superset.rn:8:18: try propagates error 'Other', which is not in the enclosing function's error set error{Bad}
+   6:fn Void f() E!String {
+   7:    const x: F!String = F.Other
+   8:    yield "${try x}"
+   9:}
+  10:
+  11:const r = f catch "fb"
+  12:echo "${r}"
+

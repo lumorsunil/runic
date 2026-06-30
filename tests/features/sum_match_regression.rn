@@ -1,0 +1,36 @@
+# Type-`match` on a sum (Phase 6): cases are member-type patterns
+# (`Int => …`, `String => …`) with an optional `_`. Each case narrows the
+# subject binding to that member inside its body, so member-specific operations
+# (arithmetic, interpolation) are allowed. Exhaustiveness over the members is
+# enforced unless a `_` case is present.
+fn Void @() Void
+
+const a: Int || String = 5
+match a {
+    Int => echo "a int=${a + 1}"
+    String => echo "a str=${a}"
+}
+
+const b: Int || String = "hi"
+match b {
+    Int => echo "b int=${b}"
+    String => echo "b str=${b}"
+}
+
+# Three members with a wildcard catch-all.
+const c: Int || String || Float = 2.5
+match c {
+    Int => echo "c int"
+    Float => echo "c float=${c}"
+    _ => echo "c other"
+}
+
+# An optional `|v|` capture binds the narrowed value — useful when the subject
+# isn't a plain binding (here a direct function call).
+fn Void pick(flag: Bool) Int || String {
+    if (flag is Bool) { yield 7 } else { yield "x" }
+}
+match pick true {
+    Int => |n| echo "cap int=${n + 1}"
+    String => |s| echo "cap str=${s}"
+}

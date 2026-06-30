@@ -1,0 +1,22 @@
+# `errorUnion && next` is a monadic guard: `next` when the left is ok, the
+# left's error otherwise. The result is itself an error union, so it must be
+# handled (here with `catch`).
+const E = error { Bad }
+const okv: E!String = "first"
+const badv: E!String = E.Bad
+
+# ok && next  -> next's value
+const r1 = (okv && "second") catch "fb"
+echo "r1=${r1}"
+
+# err && next -> error short-circuits, propagates, caught by catch
+const r2 = (badv && "second") catch "fb"
+echo "r2=${r2}"
+
+# left-associative chaining: ((okv && "x") && "y")
+const r3 = (okv && "x" && "y") catch "fb"
+echo "r3=${r3}"
+
+# a leading error short-circuits the whole chain
+const r4 = (badv && "x" && "y") catch "fb"
+echo "r4=${r4}"

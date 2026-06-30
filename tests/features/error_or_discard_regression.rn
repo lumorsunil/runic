@@ -1,0 +1,32 @@
+const E = error { Bad }
+
+// `||` discards the error and uses the fallback.
+const a = E.Bad || "fallback"
+echo "a=${a}"
+
+// An ok value passes through unchanged.
+const ok: E!String = "kept"
+const b = ok || "fallback"
+echo "b=${b}"
+
+// An error union holding an error falls back.
+const bad: E!String = E.Bad
+const c = bad || "recovered"
+echo "c=${c}"
+
+// Statement-level `||` with a command fallback. An error runs the command;
+// previously the runner crashed reading the error value as an exit code.
+const d: E!String = E.Bad
+d || echo "ran-on-error"
+
+// An ok value at statement level does NOT run the command fallback.
+const e: E!String = "kept"
+e || echo "should-not-run"
+
+// `||` on an error-returning function call (captured) discards the error.
+fn Void mayFail() E!String { yield E.Bad }
+fn Void mayOk() E!String { yield "real" }
+const f = mayFail || "fb"
+echo "f=${f}"
+const g = mayOk || "fb"
+echo "g=${g}"

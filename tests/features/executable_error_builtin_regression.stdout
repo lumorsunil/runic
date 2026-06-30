@@ -1,0 +1,4 @@
+a=ExecutableError.SpawnFailed
+b=ExecutableError.NonZeroExit(1)
+ok=value
+failed=recovered

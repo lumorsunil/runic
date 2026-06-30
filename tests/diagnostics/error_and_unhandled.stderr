@@ -1,0 +1,6 @@
+[error]: tests/diagnostics/error_and_unhandled.rn:5:1: error is not handled; use catch (or || to discard) or propagate it
+   3:
+   4:# `&&` produces an error union; a bare statement leaves it unhandled.
+   5:okv && "y"
+   6:
+

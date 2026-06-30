@@ -5,7 +5,7 @@
 
 // A typed function names its stdin and stdout types: `fn StdinType name() StdoutType`.
 // `&0` reads the stdin value; `yield` writes to stdout (`&1`). Output is explicit —
-// the body / `return` value is NOT pushed to stdout.
+// the body value is NOT pushed to stdout.
 fn Int square() Int {
     const n = &0
     yield n * n

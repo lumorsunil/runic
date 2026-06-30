@@ -78,62 +78,104 @@ echo "${nested}"
 
 ### Errors as first-class types
 
-Runic treats `error` the same way Zig does: it is a special type that can be declared as a simple enum when all variants are opaque or as a tagged union when each variant should carry structured data. Functions that can fail return `!T` (an error or a `T`), and callers use `try`/`catch` mechanics to branch on failure paths explicitly.
+Runic treats `error` like Zig: an error set is a type, declared with `const`, whose variants may be opaque or carry a typed payload.
 
 ```rn
-error NetworkError = enum { Timeout, ConnectionLost }
-error FileError = union {
-  NotFound: { path: Str },
-  PermissionDenied: { user: Str },
-}
-
-fn load_config() !Config {
-  return error.FileError.NotFound { path: "/etc/app.conf" }
-}
-
-const config = load_config() catch |err| {
-  echo "load failed: ${err}"
+const NetworkError = error { Timeout, ConnectionLost }
+const FileError = error {
+  NotFound,
+  PermissionDenied: String,   // a variant may carry a payload
 }
 ```
 
-**Result:** Error sets become inspectable data. Authors define lightweight enums for terse cases or unions when extra context matters, and callers can catch failures in a structured way instead of relying on string comparisons or shell exit-code conventions.
+A function that can fail returns an **error union** `E!T` (an error from set `E`, or a value of type `T`). The error set may also be left to inference with a leading `!T`:
+
+```rn
+fn Void parseLevel() FileError!Int { ... }   // FileError or Int
+fn Void mayFail() !String { ... }            // error set inferred from the body
+```
+
+**Constructing error values.** Use `Set.Variant` for a payload-less variant, and `Set{ .Variant = payload }` when it carries one:
+
+```rn
+const e1 = FileError.NotFound
+const e2 = FileError{ .PermissionDenied = "alice" }
+```
+
+**Merging error sets.** Combine sets with `||` (as in Zig) to get a set whose variants are the union of both — useful for a function that can fail in several ways, or for merging the builtin `ExecutableError`:
+
+```rn
+const IoError = NetworkError || FileError              // Timeout, ConnectionLost, NotFound, PermissionDenied
+const Merged  = ExecutableError || FileError           // command failures *and* file errors
+fn Void fetch() IoError!String { ... }
+```
+
+Merges chain (`A || B || C`) and dedup a shared variant name (its payload type must match). A merged set that carries any non-command error is *not* exempt from handling — only a set whose variants are all `ExecutableError`'s keeps the implicit exit-code model. (Merging arbitrary non-error types — general sum types like `Int || String` — is not implemented yet.)
+
+**Result:** Error sets are inspectable data. Authors define terse opaque variants or attach a payload when extra context matters, and callers branch on failures structurally instead of comparing strings or shell exit codes.
+
+#### Handling errors: `catch`, `||`, and `try`
+
+`catch` consumes an error union: if it holds an error, the result is the handler; otherwise it is the unwrapped ok value. The handler may bind the error with `|err|`.
+
+```rn
+const level = parseLevel catch 0                    // default on error
+const level2 = parseLevel catch |err| { echo "bad: ${err}"; exit 1 }
+```
+
+`||` is shorthand for "catch and discard the error", yielding the fallback:
+
+```rn
+const name = lookupName || "anonymous"
+```
+
+`try` propagates the error out of the enclosing function, otherwise evaluates to the ok value:
+
+```rn
+fn Void run() FileError!Int {
+  const cfg = try parseLevel    // on error, run returns it; otherwise cfg is the Int
+  yield cfg * 2
+}
+```
+
+The enclosing function **must cover** every error `try` propagates — its return type has to be an error union whose set includes those variants (or an inferred `!T`, which collects them). Propagating an error a function does not declare is a compile error: a `try` in a function whose return type is not an error union, or whose set is missing the variant, is rejected. A top-level `try` has no enclosing function to propagate to, so it must be `catch`'d instead. (`ExecutableError` from a command is exempt — commands keep the exit-code model.)
 
 #### Mandatory explicit handling
 
-Every emitted error must be handled explicitly—either propagated with `try` or resolved locally with `catch`—so the compiler guarantees nothing is silently dropped. The syntax mirrors Zig exactly, preserving muscle memory for developers already familiar with its error discipline.
+An error that is produced but neither handled (`catch`/`||`) nor propagated (`try`/yielded from an error-returning function) is a compile error, so failures are never silently dropped. This applies wherever the error escapes as a statement's value — a bare error value, a call to an error-returning function, or a pipeline whose final stage yields an error union. At the top level there is nothing to propagate to, so the error must be caught. (Commands keep the exit-code model: their `ExecutableError` is exempt, so a bare `ls`/`echo "x" | grep "y"` does not require a `catch`.)
 
 ```rn
-fn init() !Void {
-  try bootstrap_network(); // bubbles failures to the caller
+const E = error { Bad }
+E.Bad           // error: error is not handled; use catch (or || to discard) or propagate it
+E.Bad catch 0   // ok
+```
 
-  read_config("/etc/runic.conf") catch |err| {
-    if err == error.FileError.NotFound {
-      return err; // or transform before rethrowing
-    }
-    echo "Recovered from ${err}";
-  }
+#### Inspecting variants with `match`
+
+`match` dispatches on an error's variant and can capture the payload:
+
+```rn
+const FileError = error { NotFound, PermissionDenied: String }
+
+opError catch |err| match (err) {
+  FileError.NotFound => { echo "missing" },
+  FileError.PermissionDenied => |user| { echo "denied for ${user}" },
+  _ => { echo "other failure" },
 }
 ```
 
-**Result:** Callers must either continue propagating errors through `try` or consume them via `catch |err| { ... }`, making failure paths visible in every function signature and block just as they are in Zig.
+#### Commands are error unions
 
-#### Restricting function error sets
-
-If a function can only surface a subset of errors, constrain its return type so callers know exactly which failures to handle.
+Every executable call has the value view `ExecutableError!String`: a zero exit code yields the captured output, any other exit yields an `ExecutableError`. This makes command failures catchable like any other error (while `ExecutionResult` — `.exit_code`, `.wait`, etc. — remains available as the explicit handle):
 
 ```rn
-fn read_config(path: Str) FileError!Config {
-  if !file.exists(path) {
-    return error.FileError.NotFound { path }
-  }
-  try file.ensure_access(path) catch |err| {
-    return error.FileError.PermissionDenied { user: err.user }
-  }
-  return parse_config(path)
-}
+const ExecutableError = error { NonZeroExit: Int, Signalled: Int, SpawnFailed }
+
+const matched = grep "needle" "haystack.txt" catch "no match"
+const out = (build | tee "build.log") catch "build failed"
 ```
 
-**Result:** `read_config` advertises that it can only fail with the specific file-related variants, so callers that already handle `NetworkError` or other families know they never have to match on them when invoking this function.
+**Result:** Commands, user functions, and pipelines all surface failures through the same `catch`/`try`/`||`/`match` mechanics, instead of `set -e` and exit-code conventions.
 
 ### Exact-value `match`
 
@@ -191,6 +233,91 @@ if (maybe_name) |name| {
 
 **Result:** The then branch runs only when `maybe_name` contains a string, and `name` is available only inside that branch as the inner `String`.
 
+### Sum types: `A || B`
+
+A **sum type** `A || B` (any number of members: `A || B || C`) describes a value that is *one of* the member types. Declare one with `const` and use it as an annotation, a parameter, or a return type:
+
+```rn
+const IntOrString = Int || String
+
+const a: IntOrString = 42      // an Int widens in
+const b: Int || String = "hi"  // so does a String (inline form)
+```
+
+Sums are **unordered sets** and are normalized: `Int || String` is the same type as `String || Int`, and nested/duplicate members are flattened (`(Int || String) || Int` is just `Int || String`).
+
+**Widening is implicit; narrowing is explicit.** A value of a member type flows *into* a sum automatically, but you cannot use a bare sum as if it were one specific member — you must **narrow** it first. Operations that assume a concrete type (arithmetic, string interpolation, …) are rejected on an un-narrowed sum:
+
+```rn
+const x: Int || String = 5
+echo "${x}"        // error: cannot interpolate a sum directly; narrow it first
+echo "${x + 1}"    // error: cannot use a sum in arithmetic; narrow it first
+```
+
+**Narrowing with `is`.** The `x is T` operator is a runtime type test (it works on any value, not just sums) that evaluates to `Bool`. In an `if`, it refines the binding's type per branch — the then branch sees `T`, and the else branch sees the remaining members (a two-member sum collapses to the survivor):
+
+```rn
+const x: Int || String = 5
+if (x is Int) {
+  echo "doubled=${x + x}"   // x is Int here
+} else {
+  echo "string: ${x}"        // x is String here
+}
+```
+
+**Narrowing with comparisons.** `==`/`!=` and the relational operators (`<`, `>`, `<=`, `>=`) also narrow. `x == v` narrows the then branch to the members `v` could be; relational operators narrow to the numeric members. Comparing a sum against a value it can never equal (a non-member) is rejected as a likely mistake.
+
+```rn
+const x: Int || String = 0
+if (x == 0) { echo "int=${x + 1}" } else { echo "other" }  // then branch: x is Int
+```
+
+**Narrowing with `match`.** A `match` on a sum dispatches on the member type; each case narrows the subject inside its body, and the match must be exhaustive over the members unless a `_` case is present:
+
+```rn
+const x: Int || String || Float = 6
+match x {
+  Int   => echo "int=${x + 1}"
+  Float => echo "float=${x}"
+  _     => echo "other"
+}
+```
+
+A case may bind the narrowed value with a `|name|` capture — handy when the subject isn't a plain binding (e.g. a direct call):
+
+```rn
+match readValue() {
+  Int    => |n| echo "int ${n}"
+  String => |s| echo "string ${s}"
+}
+```
+
+**`var` bindings narrow too.** A mutable sum binding narrows in branch conditions just like a `const`, and a reassignment refines its type from that point on — while the *declared* type still governs what may be assigned (so you can reassign across members):
+
+```rn
+var v: Int || String = 1
+v = "text"            // v is String from here
+echo "str=${v}"
+v = 99                // v is Int again
+echo "doubled=${v + v}"
+```
+
+**Functions** can take and return sums; the member's concrete value is preserved across the call, so the caller can narrow the result:
+
+```rn
+fn Void pick(b: Bool) Int || String {
+  if (b is Bool) { yield 7 } else { yield "x" }
+}
+const r = pick true
+if (r is Int) { echo "got int ${r}" } else { echo "got string ${r}" }
+```
+
+**Result:** A sum type is a single value slot that may hold any of its members; the compiler tracks which member it currently is (its *flow type*) and forces you to narrow — with `is`, a comparison, or `match` — before performing any member-specific operation, so a sum value is never silently mistaken for one branch.
+
+**Precedence with `?`, `[]`, and `!`.** A type constructor captures a following `||` into its operand, so `?Int || String` parses as `?(Int || String)` (an optional sum) and `[]Int || String` as `[]( Int || String )` (an array of sum elements). A bare top-level `A || B` folds into a sum. Use parentheses for any other grouping — `(?Int) || String` is a sum whose members are `?Int` and `String`. (Narrowing with `is`/`match` recognizes the primitive members `Int`, `Float`, `Bool`, and `String`; a member that is itself an optional or array isn't narrowable by type test.)
+
+> Note: `A || B` between two **error sets** instead builds a merged error set (the union of their variants) — see *Errors as first-class types*. General sum types and error-set merges share the `||` spelling but only error-set operands merge into a set; any other operand produces a sum.
+
 ### Background commands and `.wait`
 
 Runic supports bash-style background execution with a trailing `&`. In statement position the command continues in the background while the script moves on immediately. When you bind a background execution, the command's stdout/stderr are captured in memory just like any other bound execution result, and `.wait` blocks until the background work finishes.
@@ -238,7 +365,7 @@ for (fruits, 0..) |fruit, idx| {
 **Result:** Iteration works uniformly across arrays and ranges without manual indexing, and the capture clause makes loop variables explicit without leaking bindings outside the block.
 
 A `for` or `if`/`else` body does not have to be a block. It may be a bare
-expression or a single `yield`/`return`/`exit` statement, which avoids `{ }` for
+expression or a single `yield`/`exit` statement, which avoids `{ }` for
 one-liners:
 
 ```rn
@@ -303,17 +430,19 @@ echo "hello" 1>&2 2>"/dev/null"
 
 ## Error-aware pipelines
 
-Pipelines expose per-stage exit codes, enabling guarded chaining without relying on `set -e`.
+A pipeline's result is an error union, so a trailing `catch`/`||`/`match`/`try` handles failure without relying on `set -e`. Error propagation is **`pipefail`-style**: if *any* stage yields an error (a failing command's `ExecutableError`, or e.g. `parseInt` producing a `ParseError`), the whole pipeline evaluates to that error — not just the final stage's status. As in bash, the stages run concurrently and a stage erroring doesn't forcibly halt the others (data already in flight is still processed); the error simply becomes the pipeline's value for a surrounding handler to catch:
 
 ```rn
-const status = (build | tee "build.log").status
-if !status.ok {
-  echo "Build failed at step ${status.failed_stage}"
+const log = build | tee "build.log" catch "build failed"
+if (build | tee "build.log") |output| {
+  echo "ok: ${output}"
+} else {
+  echo "build failed"
   exit 1
 }
 ```
 
-**Result:** The script reports which stage of the pipeline failed and aborts deterministically rather than silently ignoring intermediate errors.
+**Result:** Pipeline failures are caught at the boundary and handled deterministically rather than silently ignored. (`catch` binds looser than `|`, so it applies to the whole pipeline.)
 
 ## Module system and reuse
 
@@ -335,7 +464,7 @@ To define your own module, add a `.rn` file relative to the script that will imp
 fn Void @() Void
 
 pub fn Void add(lhs: Int, rhs: Int) Int {
-  return lhs + rhs
+  yield lhs + rhs
 }
 
 pub const pi = 3.14159
@@ -357,7 +486,7 @@ Example:
 fn Void @() Void
 
 pub fn Void add(lhs: Int, rhs: Int) Int {
-  return lhs + rhs
+  yield lhs + rhs
 }
 
 pub const pi = 3.14159
@@ -404,7 +533,7 @@ The three standard streams are referenced with file-descriptor syntax: `&0`
 ### `yield` — pushing values to a stream
 
 Output is explicit. `yield expr` writes a value to stdout (`&1`); `yield &2 expr`
-writes to stderr. A function's `return`/body value is **not** automatically
+writes to stderr. A function's body value is **not** automatically
 written to stdout, so a stage that consumes its input without `yield`ing
 produces no stdout output.
 
@@ -419,8 +548,8 @@ echo "4" | parseInt | square   // prints 16
 The declared stdout type constrains what may be `yield`ed to `&1` — `yield "text"`
 in an `Int`-stdout function is a compile-time error. (`yield &2` carries untyped
 diagnostic output and is not constrained.) A function may `yield` zero or more
-times; `return` is for control flow / the function's exit value and no longer
-carries output:
+times; there is no `return` — output is carried solely by `yield`, and a
+function halts when it runs out of statements (use `exit` to halt early):
 
 ```rn
 fn Int consume() Void {
@@ -685,7 +814,7 @@ Just like in zig, all files in runic are implicitly structs. All functions or de
 // lib.rn
 
 fn Void add(x: Float, y: Float) Float {
-  return x + y
+  yield x + y
 }
 ```
 

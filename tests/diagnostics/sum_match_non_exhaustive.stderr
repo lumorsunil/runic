@@ -1,0 +1,8 @@
+[error]: tests/diagnostics/sum_match_non_exhaustive.rn:5:1: match is not exhaustive: missing member 'String' (add it or a `_` case)
+   3:const x: Int || String = 5
+   4:
+   5:match x {
+   6:    Int => echo "int"
+   7:}
+   8:
+

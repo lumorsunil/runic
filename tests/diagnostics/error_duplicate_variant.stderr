@@ -1,0 +1,9 @@
+[error]: tests/diagnostics/error_duplicate_variant.rn:4:5: duplicate error variant Foo
+   2:    Foo,
+   3:    Bar,
+   4:    Foo,
+   5:}
+   6:
+   7:echo "should not reach"
+   8:
+

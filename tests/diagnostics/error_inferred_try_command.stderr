@@ -1,0 +1,24 @@
+[error]: tests/diagnostics/error_inferred_try_command.rn:12:1: match is not exhaustive: missing variant 'NonZeroExit' (add it or a `_` case)
+  10:}
+  11:
+  12:match f {
+  13:    E.Bad => echo "bad"
+  14:}
+  15:
+
+[error]: tests/diagnostics/error_inferred_try_command.rn:12:1: match is not exhaustive: missing variant 'Signalled' (add it or a `_` case)
+  10:}
+  11:
+  12:match f {
+  13:    E.Bad => echo "bad"
+  14:}
+  15:
+
+[error]: tests/diagnostics/error_inferred_try_command.rn:12:1: match is not exhaustive: missing variant 'SpawnFailed' (add it or a `_` case)
+  10:}
+  11:
+  12:match f {
+  13:    E.Bad => echo "bad"
+  14:}
+  15:
+
