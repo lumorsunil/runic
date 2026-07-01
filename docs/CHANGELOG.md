@@ -12,6 +12,10 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.5.0] — 2026-07-01
+
 ### Added
 
 - **Strict mode (`--strict` / `-e`).** A `set -e`-style opt-in that also requires
