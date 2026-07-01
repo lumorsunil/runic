@@ -93,7 +93,7 @@ pub fn runScript(
     }
 
     if (!config.skip_type_check) {
-        var type_checker = TypeChecker.init(io, allocator, &document_store.document_store, env_map);
+        var type_checker = TypeChecker.init(io, allocator, &document_store.document_store, env_map, config.strict);
         defer type_checker.deinit();
 
         const type_checker_result = type_checker.typeCheck(resolvedPath) catch |err| {

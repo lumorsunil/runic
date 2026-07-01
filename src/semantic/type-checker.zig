@@ -19,6 +19,10 @@ pub const TypeChecker = struct {
     document_store: *DocumentStore,
     modules: std.StringArrayHashMapUnmanaged(*Scope),
     env: ?*std.process.Environ.Map = null,
+    /// Strict mode (`--strict`): also require handling of command failures
+    /// (`ExecutableError`), which are otherwise exempt (bash-like exit-code
+    /// model). A `set -e`-style opt-in — off by default.
+    strict: bool = false,
     /// Stack of the enclosing functions' declared stdout types. Pushed when a
     /// function body is type-checked and consulted by `runYield` so that every
     /// `yield &1` is validated in the scope where it actually appears (e.g.
@@ -118,6 +122,7 @@ pub const TypeChecker = struct {
         allocator: std.mem.Allocator,
         document_store: *DocumentStore,
         env: *std.process.Environ.Map,
+        strict: bool,
     ) TypeChecker {
         const logging_enabled_s = env.get("RUNIC_LOG_" ++ logging_name) orelse "";
         const logging_enabled = std.mem.eql(u8, logging_enabled_s, "1");
@@ -129,6 +134,7 @@ pub const TypeChecker = struct {
             .document_store = document_store,
             .modules = .empty,
             .env = env,
+            .strict = strict,
         };
     }
 
@@ -1311,13 +1317,17 @@ pub const TypeChecker = struct {
     }
 
     /// True for an error union or error value whose set is not the builtin
-    /// `ExecutableError` (commands keep the implicit exit-code model).
+    /// `ExecutableError` (commands keep the implicit exit-code model). In strict
+    /// mode (`--strict`) command failures are *not* exempt: a bare command
+    /// (`.execution`) and an `ExecutableError` union/set also count as unhandled.
     fn isUnhandledErrorType(self: *TypeChecker, t: *const ast.TypeExpr) bool {
         const unaliased = self.unaliasType(t);
         return switch (unaliased.*) {
-            .error_union => |error_union| !self.isExecutableErrorSet(error_union.err_set),
-            .error_set => !self.isExecutableErrorSet(unaliased),
+            .error_union => |error_union| self.strict or !self.isExecutableErrorSet(error_union.err_set),
+            .error_set => self.strict or !self.isExecutableErrorSet(unaliased),
             .err => true,
+            // A bare command's result — exempt by default, enforced under strict.
+            .execution => self.strict,
             else => false,
         };
     }
