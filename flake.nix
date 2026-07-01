@@ -33,7 +33,7 @@
 
         meta = with pkgs.lib; {
           description = "A modern scripting language inspired by bash";
-          homepage = "https://github.com/ijadux2/runic";
+          homepage = "https://github.com/lumorsunil/runic";
           license = licenses.mit;
           platforms = platforms.linux;
         };
