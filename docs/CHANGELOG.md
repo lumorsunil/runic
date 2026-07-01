@@ -14,6 +14,15 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 _Nothing yet._
 
+## [0.5.0] — 2026-07-01
+
+### Added
+
+- **Strict mode (`--strict` / `-e`).** A `set -e`-style opt-in that also requires
+  handling of command failures (`ExecutableError`), which are exempt by default.
+  Off by default, so existing scripts are unaffected; when on, a bare command
+  whose failure isn't `catch`/`||`'d is a compile error.
+
 ## [0.4.0] — 2026-06-30
 
 This release adds two major language features — structured **error handling** and

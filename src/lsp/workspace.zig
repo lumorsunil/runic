@@ -73,6 +73,7 @@ pub const Workspace = struct {
                 allocator,
                 &documentStore.document_store,
                 env_map,
+                false, // strict mode is a CLI opt-in, not applied to LSP analysis
             ),
         };
 

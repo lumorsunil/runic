@@ -150,6 +150,18 @@ E.Bad           // error: error is not handled; use catch (or || to discard) or 
 E.Bad catch 0   // ok
 ```
 
+**Strict mode (`--strict`, or `-e`).** By default a command's `ExecutableError`
+is exempt (bash-like: a bare `ls` runs and its failure is ignored). Passing
+`--strict` removes that exemption — a command failure must be handled too, just
+like a user error. It's a `set -e`-style opt-in, off by default, so existing
+scripts are unaffected.
+
+```rn
+ls "/missing"                     // default: runs, failure ignored
+                                  // --strict: error — must handle it
+const out = ls "/missing" catch "" // ok under --strict
+```
+
 #### Inspecting variants with `match`
 
 `match` dispatches on an error's variant and can capture the payload:

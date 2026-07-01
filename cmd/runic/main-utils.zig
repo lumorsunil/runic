@@ -18,6 +18,8 @@ pub const CliConfig = struct {
     debug_ir: bool = false,
     dry_run: bool = false,
     verbose: bool = false,
+    /// Strict mode: also require handling of command failures (`ExecutableError`).
+    strict: bool = false,
 
     pub const ScriptInvocation = struct {
         path: []const u8,
@@ -639,6 +641,7 @@ pub fn parseCommandLine(allocator: Allocator, args: std.process.Args) !ParseResu
     var debug_ir = false;
     var dry_run = false;
     var verbose = false;
+    var strict = false;
     var parsing_options = true;
     var idx: usize = 1;
 
@@ -694,6 +697,10 @@ pub fn parseCommandLine(allocator: Allocator, args: std.process.Args) !ParseResu
             }
             if (argEqual(arg, "--verbose")) {
                 verbose = true;
+                continue;
+            }
+            if (argEqual(arg, "--strict") or argEqual(arg, "-e")) {
+                strict = true;
                 continue;
             }
             if (std.mem.startsWith(u8, arg, trace_prefix)) {
@@ -778,6 +785,7 @@ pub fn parseCommandLine(allocator: Allocator, args: std.process.Args) !ParseResu
             .debug_ir = debug_ir,
             .dry_run = dry_run,
             .verbose = verbose,
+            .strict = strict,
         },
     };
 
@@ -799,6 +807,7 @@ pub fn printUsage(writer: *std.Io.Writer) !void {
         \\  --print-ast          Parse the script and emit its AST instead of executing.
         \\  --print-tokens       Dump the raw lexer tokens for the provided script path.
         \\  --type-check-only    Dry run with only type checking.
+        \\  --strict, -e         Also require handling of command failures (ExecutableError).
         \\  --debug-ir           Enable IR debug mode.
         \\  --eval, -c SOURCE    Execute Runic source passed directly on the command line.
         \\
