@@ -998,7 +998,11 @@ pub const MemberExpr = struct {
         allocator: std.mem.Allocator,
         scope: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
-        const object_type = try self.object.resolveType(io, allocator, scope) orelse return null;
+        const raw_object_type = try self.object.resolveType(io, allocator, scope) orelse return null;
+        // A struct behind an alias (e.g. a `Point`-typed binding/param) resolves
+        // to `.alias`; unwrap it so member access sees the struct type.
+        var object_type = raw_object_type;
+        while (object_type.* == .alias) object_type = object_type.alias.type_expr;
 
         if (std.mem.eql(u8, self.member.name, "?")) {
             return switch (object_type.*) {
@@ -1127,6 +1131,22 @@ pub const BinaryExpr = struct {
                     }
                 }
                 break :blk left_type;
+            },
+            // `object.field` — field access parses as a `.member` binary. Resolve
+            // to the field's type on the (unaliased) struct, not the object type.
+            .member => blk: {
+                const lt = left_type orelse break :blk null;
+                var resolved = lt;
+                while (resolved.* == .alias) resolved = resolved.alias.type_expr;
+                const field_name = switch (self.right.*) {
+                    .identifier => |id| id.name,
+                    else => break :blk null,
+                };
+                break :blk switch (resolved.*) {
+                    .struct_type => |st| st.memberType(field_name),
+                    .error_set => |es| if (es.variant(field_name) != null) resolved else null,
+                    else => null,
+                };
             },
             else => left_type,
         };

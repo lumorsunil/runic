@@ -563,6 +563,9 @@ pub const IRCompiler = struct {
     /// Top-level error set declarations, keyed by name, so `compileMember` can
     /// recognize `MyError.Variant` as error-value construction.
     error_sets: std.StringHashMapUnmanaged(ast.TypeExpr.ErrorSet) = .empty,
+    /// Top-level user struct type declarations, keyed by name, so
+    /// `compileStructLiteral` can build a struct value with the right layout.
+    user_struct_types: std.StringHashMapUnmanaged(ast.TypeExpr.StructType) = .empty,
     document_store: *DocumentStore,
     logging_enabled: bool,
     diagnostics: std.ArrayList(Diagnostic) = .empty,
@@ -1153,8 +1156,11 @@ pub const IRCompiler = struct {
         for (self.script.statements) |stmt| {
             if (stmt.* != .type_binding_decl) continue;
             const decl = stmt.type_binding_decl;
-            if (decl.type_expr.* != .error_set) continue;
-            try self.error_sets.put(self.allocator, decl.identifier.name, decl.type_expr.error_set);
+            switch (decl.type_expr.*) {
+                .error_set => |es| try self.error_sets.put(self.allocator, decl.identifier.name, es),
+                .struct_type => |st| try self.user_struct_types.put(self.allocator, decl.identifier.name, st),
+                else => {},
+            }
         }
     }
 
@@ -2105,7 +2111,10 @@ pub const IRCompiler = struct {
             // compiler stores the raw return AST, so a sum arrives as the
             // unresolved `type_merge` node (a `type_merge` return is always a
             // value sum — error-set merges only appear as the `E` in `E!T`).
-            .error_union, .optional, .sum, .type_merge => {},
+            .error_union, .optional, .sum, .type_merge, .struct_type => {},
+            // A struct return arrives as the raw type-name identifier; capture it
+            // by value so the struct survives the call boundary for field access.
+            .identifier => |named| if (self.user_struct_types.get(named.path.segments[named.path.segments.len - 1].name) == null) return null,
             else => return null,
         }
         const fn_ref_value = binding.result.source.value;
@@ -2452,12 +2461,20 @@ pub const IRCompiler = struct {
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
+        // User-defined struct construction: allocate the struct's slots and
+        // populate each field at its layout offset (like the execution-result
+        // struct build). Field values are compiled into refs first so they
+        // don't clobber the alloc base register.
+        if (self.user_struct_types.get(struct_literal.name.name)) |struct_type| {
+            return self.compileStructValueLiteral(source, struct_type, struct_literal);
+        }
+
         const error_set = self.error_sets.get(struct_literal.name.name) orelse {
             try self.reportSourceError(
                 source,
                 Error.NotImplemented,
                 .@"error",
-                "'{s}' is not an error set; struct literal construction is only supported for error values",
+                "'{s}' is not a struct or error set; cannot construct it with {{ … }}",
                 .{struct_literal.name.name},
             );
             return .fromValue(.void);
@@ -2490,6 +2507,51 @@ pub const IRCompiler = struct {
             .result = result_ref,
         } }));
         return .from(result_ref.dereference());
+    }
+
+    /// Builds a user struct value: compile each field's value into a ref (so the
+    /// alloc base register isn't clobbered), allocate the struct's slots, then
+    /// write each field at its layout offset. Returns the base address typed as
+    /// the struct, so field access (`p.x`) reads `[base + offset]`.
+    fn compileStructValueLiteral(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        struct_type: ast.TypeExpr.StructType,
+        struct_literal: ast.StructLiteral,
+    ) Error!Result {
+        const FieldSlot = struct { offset: usize, ref: ir.Location };
+        var slots = std.ArrayList(FieldSlot).empty;
+        defer slots.deinit(self.allocator);
+
+        var total: usize = 0;
+        for (struct_type.fields) |field| {
+            const layout = struct_type.fieldLayout(field.name.name) catch return .fromValue(.void);
+            total += field.type_expr.slotSize() catch 1;
+
+            // The value supplied for this field (the type checker already
+            // verified presence/typing).
+            const value: Result = blk: {
+                for (struct_literal.fields) |lit_field| {
+                    if (std.mem.eql(u8, lit_field.name.name, field.name.name)) {
+                        break :blk try self.compileExpression(lit_field.value);
+                    }
+                }
+                break :blk .fromValue(.void);
+            };
+            const field_ref = try self.newRef(source, "struct_field");
+            try self.set(source, field_ref, value.source);
+            try slots.append(self.allocator, .{ .offset = layout.offset, .ref = field_ref.dereference() });
+        }
+
+        try self.alloc(source, total); // %r = base of the struct's slots
+        for (slots.items) |slot| {
+            try self.set(
+                source,
+                .initAdd(.{ .register = .r }, slot.offset, .{ .dereference = true }),
+                .from(slot.ref),
+            );
+        }
+        return .fromLocation(ir.Location.initRegister(.r).typed(.{ .struct_type = struct_type }));
     }
 
     /// Converts a finished command (`ExecutionResult`) into an
@@ -2815,12 +2877,24 @@ pub const IRCompiler = struct {
                 ));
             },
             .struct_type => |struct_type| struct_type,
+            // A binding annotated with a user struct's name carries the type as
+            // an identifier; resolve it to the struct's layout.
+            .identifier => |named| self.user_struct_types.get(named.path.segments[named.path.segments.len - 1].name) orelse {
+                try self.reportSourceError(
+                    source,
+                    Error.NotImplemented,
+                    .@"error",
+                    "member access is only supported for struct types in IR",
+                    .{},
+                );
+                return .fromValue(.void);
+            },
             else => {
                 try self.reportSourceError(
                     source,
                     Error.NotImplemented,
                     .@"error",
-                    "member access is only supported for internal struct types in IR",
+                    "member access is only supported for struct types in IR",
                     .{},
                 );
                 return .fromValue(.void);

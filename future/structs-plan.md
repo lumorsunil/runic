@@ -78,17 +78,23 @@ p.mag        # == mag(p)
 
 ## Phases
 
-- [ ] **Phase 1 — Parse struct type declarations.** Re-enable/implement
+- [x] **Phase 1 — Parse struct type declarations. DONE (2026-07-02).**
   `parseStructTypeExpr` (`struct { field: Type, … }`, comma/newline separated),
-  and accept it in a `const` type binding. AST `struct_type` already exists.
-- [ ] **Phase 2 — Construct + field read, end to end.** Wire a user-declared
-  struct through `struct_literal` construction, `validateTypeAssignmentStruct`,
-  and `runStructMemberAccess`/`compileStructLiteral` so `Point{ .x=3 }` and `p.x`
-  work as values (bind, interpolate, pass, return). Close any gaps the
-  builtin-only path left (field type resolution, unknown-field / missing-field /
-  wrong-payload-type diagnostics).
-- [ ] **Phase 3 — Nesting + functions.** Struct-typed fields; struct-typed
-  parameters and return types; struct values across the call boundary.
+  wired into `parseMaybePrimaryTypeExpr`; produces the existing `struct_type` AST
+  (empty `decls` — methods are free functions).
+- [x] **Phase 2 — Construct + field read, end to end. DONE (2026-07-02).**
+  `runStructValueLiteral` (type checker) validates `Name{ .f = v }` construction
+  (unknown field, missing field, duplicate field, per-field type). `compileStructValueLiteral`
+  (IR) builds the value: compile fields into refs, `alloc` the slots, write each
+  at its layout offset, return the base typed as the struct. Field access reuses
+  the existing offset-based `compileMember` (extended to resolve an identifier
+  object type against the user-struct registry).
+- [x] **Phase 3 — Nesting + functions. DONE (2026-07-02).** Nested struct fields
+  + nested access work. Struct params work (fixed `.member` type resolution:
+  `BinaryExpr.resolveType` and member handling now unalias and resolve a field's
+  type instead of returning the object type). Struct returns survive the call
+  boundary via `tryCompileTypedValueCapture` (extended to struct / struct-name-
+  identifier returns). Test: `struct_regression`.
 - [ ] **Phase 4 — Methods (UFCS).** Resolve `p.method args…` as `method(p, args…)`
   when `method` isn't a field: look up a function in scope whose first parameter
   matches `p`'s type, and call it with the receiver prepended. Field access takes
