@@ -1134,6 +1134,8 @@ pub const BinaryExpr = struct {
             },
             // `object.field` — field access parses as a `.member` binary. Resolve
             // to the field's type on the (unaliased) struct, not the object type.
+            // When the name isn't a struct field, fall back to UFCS: a function
+            // `name` in scope, whose return type is the result of `object.name`.
             .member => blk: {
                 const lt = left_type orelse break :blk null;
                 var resolved = lt;
@@ -1142,11 +1144,17 @@ pub const BinaryExpr = struct {
                     .identifier => |id| id.name,
                     else => break :blk null,
                 };
-                break :blk switch (resolved.*) {
-                    .struct_type => |st| st.memberType(field_name),
-                    .error_set => |es| if (es.variant(field_name) != null) resolved else null,
-                    else => null,
-                };
+                switch (resolved.*) {
+                    // A struct field resolves to its type. A UFCS method access
+                    // (`recv.method`, not a field) is left untyped here — its
+                    // value flows at runtime; typed-context validation of a UFCS
+                    // result is deferred (blocked on the pre-existing function
+                    // return-type normalization gap that also affects a plain
+                    // `const r: Int = someIntFn`).
+                    .struct_type => |st| break :blk st.memberType(field_name),
+                    .error_set => |es| break :blk if (es.variant(field_name) != null) resolved else null,
+                    else => break :blk null,
+                }
             },
             else => left_type,
         };

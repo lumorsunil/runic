@@ -2923,11 +2923,15 @@ pub const IRCompiler = struct {
 
         const field_ = struct_type.fieldLayout(member.member.name) catch |err| switch (err) {
             error.FieldNotFound => {
+                // Not a field — try UFCS: `recv.method` ≡ `method(recv)` when a
+                // function named `method` is in scope (field access wins, which
+                // is why this is only reached after fieldLayout fails).
+                if (try self.tryUfcsRewrite(source, member.object, member.member.name, &.{}, &.{})) |r| return r;
                 try self.reportSourceError(
                     source,
                     Error.NotImplemented,
                     .@"error",
-                    "member \"{s}\" not found on internal struct",
+                    "member \"{s}\" not found on struct (no field or method)",
                     .{member.member.name},
                 );
                 return .fromValue(.void);
@@ -3503,6 +3507,13 @@ pub const IRCompiler = struct {
             if (std.mem.eql(u8, name, "cd") and self.lookup(name, .{ .shallow = false }) == null) {
                 return self.compileBuiltinCd(source, call.arguments);
             }
+        }
+
+        // UFCS method call: `recv.method args…` ≡ `method(recv, args…)` when
+        // `method` is a function in scope. (A field wouldn't be callable with
+        // args, so the method wins in call position.)
+        if (call.callee.* == .binary and call.callee.binary.op == .member and call.callee.binary.right.* == .identifier) {
+            if (try self.tryUfcsRewrite(source, call.callee.binary.left, call.callee.binary.right.identifier.name, call.arguments, call.redirects)) |r| return r;
         }
 
         const callee = try self.compileExpression(call.callee);
@@ -4147,6 +4158,28 @@ pub const IRCompiler = struct {
         try self.jmp(source, null, true, closure.return_addr);
 
         self.current_instruction_set = orig_instr_set;
+    }
+
+    /// UFCS: compile `receiver.method(args…)` as `method(receiver, args…)` when
+    /// `method` names a function in scope. Returns null when there is no such
+    /// function (so the caller falls back to field access / its normal path).
+    /// The receiver AST node is reused as arg 0, so it is evaluated exactly once.
+    fn tryUfcsRewrite(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        receiver: *ast.Expression,
+        method_name: []const u8,
+        args: []const *ast.Expression,
+        redirects: []const ast.Redirection,
+    ) Error!?Result {
+        const binding = self.lookup(method_name, .{ .shallow = false }) orelse return null;
+        if (!binding.result.isFunctionRef()) return null;
+
+        const full = try self.allocator.alloc(*ast.Expression, args.len + 1);
+        full[0] = receiver;
+        for (args, 0..) |a, i| full[i + 1] = a;
+
+        return try self.compileFunctionCall(source, binding.result.source.value, full, redirects, null);
     }
 
     fn compileFunctionCall(
@@ -7268,6 +7301,13 @@ pub const IRCompiler = struct {
                 break :brk result;
             },
             .binary => |binary| brk: {
+                // A UFCS method access `recv.method` is a function call in value
+                // position, so its output must be captured like any call.
+                if (binary.op == .member and binary.right.* == .identifier) {
+                    if (self.lookup(binary.right.identifier.name, .{ .shallow = false })) |b| {
+                        if (b.result.isFunctionRef()) break :brk .{ .needs_stdio_capture = true };
+                    }
+                }
                 var result = self.analyzeExpressionEffects(binary.left);
                 result.merge(self.analyzeExpressionEffects(binary.right));
                 break :brk result;

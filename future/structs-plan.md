@@ -95,10 +95,26 @@ p.mag        # == mag(p)
   type instead of returning the object type). Struct returns survive the call
   boundary via `tryCompileTypedValueCapture` (extended to struct / struct-name-
   identifier returns). Test: `struct_regression`.
-- [ ] **Phase 4 — Methods (UFCS).** Resolve `p.method args…` as `method(p, args…)`
-  when `method` isn't a field: look up a function in scope whose first parameter
-  matches `p`'s type, and call it with the receiver prepended. Field access takes
-  precedence over UFCS on a name collision. Diagnostics for "no field or method".
+- [x] **Phase 4 — Methods (UFCS). DONE (2026-07-04), with a deferred typed-capture edge.**
+  `recv.method args…` compiles to `method(recv, args…)` when `method` is a
+  function in scope. Compiler: `tryUfcsRewrite` synthesizes the call (receiver
+  reused as arg 0 → evaluated once); wired into `compileCall` (with-args, method
+  wins in call position) and `compileMember`'s field-not-found path (no-args,
+  field wins). `analyzeExpressionEffects` flags a UFCS member as needing stdio
+  capture so `${p.mag}` captures instead of leaking to stdout. Works: no-arg
+  methods, methods with args, receiver that is a nested field (`l.to.mag`), field
+  precedence. Tests: `struct_methods_regression`.
+  - **Deferred (edges):**
+    1. **Typed-value capture of a UFCS result.** `const m: Int = p.mag` byte-captures
+       (stringifies) the result, so typed use (`m + 1`) fails — `tryCompileTypedValueCapture`
+       handles `.call` callees, not `.member` UFCS. Same class as the sum/error
+       typed-capture work; extend it to UFCS members. Interpolation/statement use
+       works today.
+    2. **Typed-context validation of a UFCS result** in the type checker (a wrong
+       annotation isn't caught). Blocked on a **pre-existing** function
+       return-type normalization gap that also breaks a plain
+       `const r: Int = someIntFn` (raw `.identifier{Int}` return vs resolved
+       annotation) — not struct-specific; fix separately.
 - [ ] **Phase 5 — Polish.** Field mutation on a `var` (if not already), docs in
   `docs/features.md`, a `examples/structs.rn` showcase, and the regression +
   diagnostic suites (there are currently **no** struct feature tests).
