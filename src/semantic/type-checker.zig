@@ -3654,7 +3654,7 @@ pub const TypeChecker = struct {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, assignment_type.span());
 
-        if (assignment_type.* == .null) return;
+        if (self.unaliasType(assignment_type).* == .null) return;
 
         try self.reportAssignmentError(
             @as(*const ast.TypeExpr, @fieldParentPtr("null", assignee)),
@@ -3805,7 +3805,7 @@ pub const TypeChecker = struct {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, assignment_type.span());
 
-        switch (assignment_type.*) {
+        switch (self.unaliasType(assignment_type).*) {
             .array => |array| {
                 try self.validateTypeAssignment(assignee.element, array.element, options);
             },
@@ -3881,7 +3881,7 @@ pub const TypeChecker = struct {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, assignment_type.span());
 
-        switch (assignment_type.*) {
+        switch (self.unaliasType(assignment_type).*) {
             .integer => {},
             else => try self.reportAssignmentError(
                 @as(*const ast.TypeExpr, @fieldParentPtr("integer", assignee)),
@@ -3900,7 +3900,7 @@ pub const TypeChecker = struct {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, assignment_type.span());
 
-        switch (assignment_type.*) {
+        switch (self.unaliasType(assignment_type).*) {
             .integer, .float => {},
             else => try self.reportAssignmentError(
                 @as(*const ast.TypeExpr, @fieldParentPtr("float", assignee)),
@@ -3919,7 +3919,7 @@ pub const TypeChecker = struct {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, assignment_type.span());
 
-        switch (assignment_type.*) {
+        switch (self.unaliasType(assignment_type).*) {
             .boolean => {},
             else => try self.reportAssignmentError(
                 @as(*const ast.TypeExpr, @fieldParentPtr("boolean", assignee)),
@@ -3938,7 +3938,7 @@ pub const TypeChecker = struct {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, assignment_type.span());
 
-        switch (assignment_type.*) {
+        switch (self.unaliasType(assignment_type).*) {
             .byte => {},
             else => try self.reportAssignmentError(
                 @as(*const ast.TypeExpr, @fieldParentPtr("byte", assignee)),

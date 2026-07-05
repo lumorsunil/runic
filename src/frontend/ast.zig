@@ -1145,13 +1145,18 @@ pub const BinaryExpr = struct {
                     else => break :blk null,
                 };
                 switch (resolved.*) {
-                    // A struct field resolves to its type. A UFCS method access
-                    // (`recv.method`, not a field) is left untyped here — its
-                    // value flows at runtime; typed-context validation of a UFCS
-                    // result is deferred (blocked on the pre-existing function
-                    // return-type normalization gap that also affects a plain
-                    // `const r: Int = someIntFn`).
-                    .struct_type => |st| break :blk st.memberType(field_name),
+                    .struct_type => |st| {
+                        if (st.memberType(field_name)) |ft| break :blk ft;
+                        // UFCS method: `recv.method` has the function's return type.
+                        if (scope.lookup(field_name)) |b| {
+                            if (b.type_expr) |bt| {
+                                var fn_type = bt;
+                                while (fn_type.* == .alias) fn_type = fn_type.alias.type_expr;
+                                if (fn_type.* == .function) break :blk fn_type.function.return_type;
+                            }
+                        }
+                        break :blk null;
+                    },
                     .error_set => |es| break :blk if (es.variant(field_name) != null) resolved else null,
                     else => break :blk null,
                 }

@@ -110,11 +110,17 @@ p.mag        # == mag(p)
        handles `.call` callees, not `.member` UFCS. Same class as the sum/error
        typed-capture work; extend it to UFCS members. Interpolation/statement use
        works today.
-    2. **Typed-context validation of a UFCS result** in the type checker (a wrong
-       annotation isn't caught). Blocked on a **pre-existing** function
-       return-type normalization gap that also breaks a plain
-       `const r: Int = someIntFn` (raw `.identifier{Int}` return vs resolved
-       annotation) — not struct-specific; fix separately.
+    2. ✅ **Typed-context validation of a UFCS result — DONE (2026-07-04).** Fixed
+       the underlying **pre-existing** normalization bug: the scalar/array
+       assignment validators (`validateTypeAssignmentInteger`/`Float`/`Boolean`/
+       `Byte`/`Null`/`Array`) compared `assignment_type.*` without unaliasing, so
+       a function's alias-wrapped `Int`/`String` return false-positived against a
+       resolved annotation (broke a plain `const r: Int = someIntFn` too, not just
+       structs). They now unalias first. With that fixed, `BinaryExpr.resolveType`
+       resolves a UFCS `recv.method` to the method's return type, so a wrong
+       annotation is caught (`const bad: String = p.mag` → Int/String mismatch)
+       and a correct one passes. Tests: `typed_call_binding_regression`,
+       `typed_call_binding_mismatch`.
 - [ ] **Phase 5 — Polish.** Field mutation on a `var` (if not already), docs in
   `docs/features.md`, a `examples/structs.rn` showcase, and the regression +
   diagnostic suites (there are currently **no** struct feature tests).
