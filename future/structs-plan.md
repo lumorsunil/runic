@@ -104,12 +104,20 @@ p.mag        # == mag(p)
   capture so `${p.mag}` captures instead of leaking to stdout. Works: no-arg
   methods, methods with args, receiver that is a nested field (`l.to.mag`), field
   precedence. Tests: `struct_methods_regression`.
-  - **Deferred (edges):**
-    1. **Typed-value capture of a UFCS result.** `const m: Int = p.mag` byte-captures
-       (stringifies) the result, so typed use (`m + 1`) fails — `tryCompileTypedValueCapture`
-       handles `.call` callees, not `.member` UFCS. Same class as the sum/error
-       typed-capture work; extend it to UFCS members. Interpolation/statement use
-       works today.
+  - **Edges (both resolved):**
+    1. ✅ **Typed-value capture of a UFCS/scalar result — DONE (2026-07-XX).**
+       `tryCompileTypedValueCapture` now recognizes UFCS forms (`capturableCallInfo`
+       normalizes a plain call and a `.member` UFCS access to a `{method, args}`
+       shape, prepending the receiver) and scalar returns (`isTypedCaptureReturn`
+       accepts Int/Float/Bool alongside the structured types), so a method/call
+       result keeps its runtime tag for arithmetic (`const m: Int = p.mag; m + 1`).
+       Also fixed a **latent arg-passing bug** it surfaced: `compileFunctionCall`'s
+       arg loop `consume`d (popped) any stack-location argument, but a bare
+       *struct-binding* argument is a borrowed slot, not an owned temp — popping it
+       corrupted the stack (runtime out-of-bounds). The loop now only pops when
+       compiling the arg actually grew the frame (an owned temp). This affected any
+       struct arg through the value-capture path, not just UFCS. Tests:
+       `struct_methods_regression` (typed-capture cases added).
     2. ✅ **Typed-context validation of a UFCS result — DONE (2026-07-04).** Fixed
        the underlying **pre-existing** normalization bug: the scalar/array
        assignment validators (`validateTypeAssignmentInteger`/`Float`/`Boolean`/

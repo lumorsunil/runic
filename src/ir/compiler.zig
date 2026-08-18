@@ -2087,36 +2087,79 @@ pub const IRCompiler = struct {
     /// the value typed as the return type so `catch`/`try`/`match`/`if` operate
     /// on the real value. Returns null (caller falls back to the byte path)
     /// when not applicable.
+    const CapturableCall = struct {
+        /// The function to call.
+        method_name: []const u8,
+        /// Full arguments (for a UFCS call `recv.m a b`, the receiver is arg 0).
+        arguments: []const *ast.Expression,
+        redirects: []const ast.Redirection,
+    };
+
+    /// Extracts the function + arguments of a value-capturable call: a plain
+    /// `name(args…)`, or a UFCS method access `recv.method` / `recv.method args…`
+    /// (receiver prepended). Returns null for anything else.
+    fn capturableCallInfo(self: *IRCompiler, expr: *ast.Expression) Error!?CapturableCall {
+        switch (expr.*) {
+            .call => |call| {
+                if (call.background) return null;
+                switch (call.callee.*) {
+                    .identifier => |id| return .{ .method_name = id.name, .arguments = call.arguments, .redirects = call.redirects },
+                    .binary => |b| if (b.op == .member and b.right.* == .identifier)
+                        return .{ .method_name = b.right.identifier.name, .arguments = try self.prependReceiver(b.left, call.arguments), .redirects = call.redirects }
+                    else
+                        return null,
+                    else => return null,
+                }
+            },
+            // Bare `recv.method` (no args) — a UFCS call with the receiver alone.
+            .binary => |b| if (b.op == .member and b.right.* == .identifier)
+                return .{ .method_name = b.right.identifier.name, .arguments = try self.prependReceiver(b.left, &.{}), .redirects = &.{} }
+            else
+                return null,
+            else => return null,
+        }
+    }
+
+    fn prependReceiver(self: *IRCompiler, receiver: *ast.Expression, args: []const *ast.Expression) Error![]const *ast.Expression {
+        const full = try self.allocator.alloc(*ast.Expression, args.len + 1);
+        full[0] = receiver;
+        for (args, 0..) |a, i| full[i + 1] = a;
+        return full;
+    }
+
+    /// Whether a function's return type should be captured as a typed value
+    /// (rather than byte-serialized). Structured values (error union / optional /
+    /// sum / struct) must survive intact; scalar numbers/bools must keep their
+    /// runtime tag so the caller can do arithmetic. String returns stay on the
+    /// byte path (their serialized form *is* the value).
+    fn isTypedCaptureReturn(self: *IRCompiler, t: *const ast.TypeExpr) bool {
+        return switch (t.*) {
+            .error_union, .optional, .sum, .type_merge, .struct_type, .integer, .float, .boolean => true,
+            .identifier => |named| blk: {
+                const name = named.path.segments[named.path.segments.len - 1].name;
+                if (self.user_struct_types.contains(name)) break :blk true;
+                break :blk std.mem.eql(u8, name, "Int") or std.mem.eql(u8, name, "Float") or std.mem.eql(u8, name, "Bool");
+            },
+            else => false,
+        };
+    }
+
     fn tryCompileTypedValueCapture(
         self: *IRCompiler,
         source: anytype,
         expr: *ast.Expression,
     ) Error!?Result {
-        if (expr.* != .call) return null;
-        const call = expr.call;
-        if (call.background or call.redirects.len != 0) return null;
-        if (call.callee.* != .identifier) return null;
+        const info = (try self.capturableCallInfo(expr)) orelse return null;
+        if (info.redirects.len != 0) return null;
 
-        // The callee must be a known function (a direct fn_ref binding — closure
-        // captured / member-access functions fall back) returning a structured
-        // value (an error union or an optional).
-        const binding = self.lookup(call.callee.identifier.name, .{ .shallow = false }) orelse return null;
+        // The callee must be a known function (a direct fn_ref binding — closure-
+        // captured functions fall back) returning a typed-capturable value.
+        const binding = self.lookup(info.method_name, .{ .shallow = false }) orelse return null;
         if (!binding.result.isFunctionRef()) return null;
         const fn_type = binding.type_expr orelse return null;
         if (fn_type != .function) return null;
         const return_type_ptr = fn_type.function.return_type orelse return null;
-        switch (return_type_ptr.*) {
-            // A sum return is captured by value too, so the member's tag (Int vs
-            // String, …) survives the boundary for the caller to narrow. The
-            // compiler stores the raw return AST, so a sum arrives as the
-            // unresolved `type_merge` node (a `type_merge` return is always a
-            // value sum — error-set merges only appear as the `E` in `E!T`).
-            .error_union, .optional, .sum, .type_merge, .struct_type => {},
-            // A struct return arrives as the raw type-name identifier; capture it
-            // by value so the struct survives the call boundary for field access.
-            .identifier => |named| if (self.user_struct_types.get(named.path.segments[named.path.segments.len - 1].name) == null) return null,
-            else => return null,
-        }
+        if (!self.isTypedCaptureReturn(return_type_ptr)) return null;
         const fn_ref_value = binding.result.source.value;
         // pub exports change the call's result shape (a struct, already waited);
         // keep those on the existing path.
@@ -2134,8 +2177,8 @@ pub const IRCompiler = struct {
         const call_result = try self.compileFunctionCall(
             expr,
             fn_ref_value,
-            call.arguments,
-            call.redirects,
+            info.arguments,
+            info.redirects,
             pipe_ref.dereference(),
         );
 
@@ -4225,6 +4268,12 @@ pub const IRCompiler = struct {
         }
 
         for (arguments, 0..) |arg, i| {
+            // Track whether compiling this argument pushed an owned temporary.
+            // `consume` pops any stack-location result, but a bare binding
+            // reference (e.g. a struct-valued `p` passed as an arg) is a
+            // *borrowed* stack slot, not a temp we own — popping it corrupts the
+            // stack. Only pop when the arg compilation actually grew the frame.
+            const stack_before_arg = self.currentFrame().rel_stack_counter;
             const arg_result = try self.compileResultSaveR(source, try self.compileExpression(arg));
             try self.set(source, .initRegister(.r), .from(closure_ref.dereference()));
             try self.set(
@@ -4232,7 +4281,9 @@ pub const IRCompiler = struct {
                 .initAdd(.{ .register = .r }, i, .{ .dereference = true }),
                 arg_result.source,
             );
-            try self.consume(source, arg_result);
+            if (self.currentFrame().rel_stack_counter > stack_before_arg) {
+                try self.consume(source, arg_result);
+            }
         }
 
         try self.set(source, .initRegister(.r), .from(closure_ref.dereference()));

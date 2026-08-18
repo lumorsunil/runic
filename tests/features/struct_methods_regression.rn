@@ -23,3 +23,10 @@ echo "x=${p.x} y=${p.y}"
 const Line = struct { from: Point, to: Point }
 const l: Line = Line{ .from = Point{ .x = 1, .y = 1 }, .to = Point{ .x = 3, .y = 4 } }
 echo "to.mag=${l.to.mag}"
+
+# A method result captured into a typed binding survives as a value (keeps its
+# tag), so it can be used in arithmetic — not just interpolated.
+const m: Int = p.mag
+echo "m+1=${m + 1}"
+const sc: Int = p.scaled 10
+echo "sc*2=${sc + sc}"
