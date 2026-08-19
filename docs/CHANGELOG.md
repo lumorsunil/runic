@@ -14,6 +14,34 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 _Nothing yet._
 
+## [0.6.0] — 2026-08-19
+
+### Added
+
+- **User-defined structs.** Declare a struct type with
+  `const Point = struct { x: Int, y: Int }`, construct values with
+  `Point{ .x = 3, .y = 4 }`, and read fields with `p.x`. Construction checks every
+  field (unknown / missing / duplicate field and per-field type are compile
+  errors). Structs nest, and can be passed to and returned from functions by
+  value.
+- **Struct methods via UFCS.** A method is a free function whose first parameter
+  is the receiver; `recv.method args…` is shorthand for `method(recv, args…)`. A
+  field of the same name takes precedence over a method.
+- **Struct field mutation.** A field of a `var` struct can be reassigned with
+  `p.field = value` (nested fields too); the field's declared type is enforced,
+  and mutating a field of a `const` struct is a compile error.
+
+### Fixed
+
+- Struct field reads no longer alias when two are used in one expression (e.g.
+  `p.x + q.x`, or two struct parameters read in a function body) — each read is
+  now stable rather than sharing a scratch register.
+- A typed binding whose initializer is a function-call result no longer
+  false-positives (`const r: Int = someIntFn` previously reported "expected Int,
+  actual: Int"); the assignment validators now normalize an alias-wrapped return
+  type. Also fixed a latent stack-corruption crash when passing a struct value as
+  a function argument through the value-capture path.
+
 ## [0.5.0] — 2026-07-01
 
 ### Added
