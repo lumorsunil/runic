@@ -14,6 +14,17 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 _Nothing yet._
 
+## [0.6.1] — 2026-08-20
+
+### Fixed
+
+- A function call (or UFCS method call) used directly as an **arithmetic
+  operand** — e.g. `${five - 1}` or `${p.magSq - q.magSq}` — no longer crashes
+  with "Could not dereference value of type thread". Such operands are now
+  captured so they yield their value instead of a fork/thread handle, and two
+  call operands in one expression are stabilized so they don't clobber each
+  other.
+
 ## [0.6.0] — 2026-08-19
 
 ### Added
