@@ -1,0 +1,6 @@
+// A whole struct has no single string form — interpolate one of its fields
+// instead of the struct itself.
+fn Void @() Void
+const Point = struct { x: Int, y: Int }
+const p: Point = Point{ .x = 3, .y = 4 }
+echo "${p}"

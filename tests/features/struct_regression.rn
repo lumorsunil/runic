@@ -1,0 +1,38 @@
+# User-defined structs (Phases 1-3): declaration, construction, field access,
+# nested structs, and struct-typed parameters and returns. Methods (UFCS) are a
+# separate phase.
+fn Void @() Void
+
+const Point = struct { x: Int, y: Int }
+
+# Construct + read fields.
+const p: Point = Point{ .x = 3, .y = 4 }
+echo "p.x=${p.x} p.y=${p.y}"
+
+# Mixed field types.
+const Rec = struct { name: String, count: Int }
+const r: Rec = Rec{ .name = "widget", .count = 42 }
+echo "${r.name} x${r.count}"
+
+# Nested structs + nested field access.
+const Line = struct { from: Point, to: Point }
+const l: Line = Line{ .from = Point{ .x = 0, .y = 0 }, .to = Point{ .x = 3, .y = 4 } }
+echo "to.x=${l.to.x} to.y=${l.to.y}"
+
+# A struct-typed parameter, with field access inside the function.
+fn Void sumxy(pt: Point) Int { yield pt.x + pt.y }
+echo "sum=${sumxy p}"
+
+# A struct return; the caller reads its fields.
+fn Void origin() Point { yield Point{ .x = 5, .y = 9 } }
+const o = origin
+echo "o.x=${o.x} o.y=${o.y}"
+
+# Fields from two *different* structs read in the same expression must not alias
+# (each field access must be stable, not share a volatile base register).
+const q: Point = Point{ .x = 10, .y = 20 }
+echo "p.x+q.x=${p.x + q.x} p.y+q.y=${p.y + q.y}"
+
+# Two struct arguments passed to a function, both read in the body.
+fn Void addX(a: Point, b: Point) Int { yield a.x + b.x }
+echo "addX=${addX p q}"

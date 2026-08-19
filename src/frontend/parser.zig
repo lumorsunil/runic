@@ -3084,7 +3084,7 @@ pub const Parser = struct {
             .identifier => self.parseIdentifierTypeExpr(),
             // .kw_enum => self.parseEnumTypeExpr(),
             // .kw_union => self.parseUnionTypeExpr(),
-            // .kw_struct => self.parseStructTypeExpr(),
+            .kw_struct => self.parseStructTypeExpr(),
             .kw_error => self.parseErrorTypeExpr(),
             .l_bracket => self.parseArrayTypeExpr(),
             // .caret => self.parsePromiseTypeExpr(),
@@ -3182,6 +3182,53 @@ pub const Parser = struct {
         return self.allocTypeExpression(.{
             .error_set = .{
                 .variants = try self.copyToArena(ast.TypeExpr.ErrorSet.Variant, variants.items),
+                .span = start.span.endAt(close.span),
+            },
+        });
+    }
+
+    /// `struct { name: Type, … }` — a user-defined struct type. Fields are
+    /// `name: Type`, separated by commas and/or newlines (trailing comma ok).
+    /// Methods are free functions with an explicit receiver param (UFCS), so the
+    /// struct body carries fields only (`decls` stays empty here).
+    fn parseStructTypeExpr(self: *Self) Error!*const ast.TypeExpr {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const start = try self.expectTokenTag(.kw_struct);
+        _ = try self.expectTokenTag(.l_brace);
+
+        var fields = std.ArrayList(ast.TypeExpr.StructField).empty;
+        defer fields.deinit(self.allocator);
+
+        while (true) {
+            self.skipNewlines();
+            const next = try self.peekToken();
+            if (next.tag == .r_brace) break;
+
+            const name = try self.parseIdentifier();
+            _ = try self.expectTokenTag(.colon);
+            const field_type = try self.parseTypeExpr();
+
+            try fields.append(self.allocator, .{
+                .name = name,
+                .type_expr = field_type,
+                .span = name.span.endAt(field_type.span()),
+            });
+
+            self.skipNewlines();
+            const delimiter = try self.peekToken();
+            if (delimiter.tag == .comma) {
+                _ = try self.nextToken();
+            }
+        }
+
+        const close = try self.expectTokenTag(.r_brace);
+
+        return self.allocTypeExpression(.{
+            .struct_type = .{
+                .fields = try self.copyToArena(ast.TypeExpr.StructField, fields.items),
+                .decls = &.{},
                 .span = start.span.endAt(close.span),
             },
         });

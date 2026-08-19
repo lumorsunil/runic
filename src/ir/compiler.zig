@@ -563,6 +563,9 @@ pub const IRCompiler = struct {
     /// Top-level error set declarations, keyed by name, so `compileMember` can
     /// recognize `MyError.Variant` as error-value construction.
     error_sets: std.StringHashMapUnmanaged(ast.TypeExpr.ErrorSet) = .empty,
+    /// Top-level user struct type declarations, keyed by name, so
+    /// `compileStructLiteral` can build a struct value with the right layout.
+    user_struct_types: std.StringHashMapUnmanaged(ast.TypeExpr.StructType) = .empty,
     document_store: *DocumentStore,
     logging_enabled: bool,
     diagnostics: std.ArrayList(Diagnostic) = .empty,
@@ -1153,8 +1156,11 @@ pub const IRCompiler = struct {
         for (self.script.statements) |stmt| {
             if (stmt.* != .type_binding_decl) continue;
             const decl = stmt.type_binding_decl;
-            if (decl.type_expr.* != .error_set) continue;
-            try self.error_sets.put(self.allocator, decl.identifier.name, decl.type_expr.error_set);
+            switch (decl.type_expr.*) {
+                .error_set => |es| try self.error_sets.put(self.allocator, decl.identifier.name, es),
+                .struct_type => |st| try self.user_struct_types.put(self.allocator, decl.identifier.name, st),
+                else => {},
+            }
         }
     }
 
@@ -1844,7 +1850,7 @@ pub const IRCompiler = struct {
                 call_copy.background = false;
                 break :blk self.compileBackgroundExpressionValue(expr, .{ .call = call_copy });
             } else self.compileCall(expr, call),
-            .member => |member| self.compileMember(expr, member),
+            .member => |member| self.compileMember(expr, member, .read),
             .if_expr => |if_expr| self.compileIf(expr, if_expr),
             .match_expr => |match_expr| self.compileMatch(expr, match_expr),
             .pipeline => |pipeline| if (pipeline.background) blk: {
@@ -2081,33 +2087,79 @@ pub const IRCompiler = struct {
     /// the value typed as the return type so `catch`/`try`/`match`/`if` operate
     /// on the real value. Returns null (caller falls back to the byte path)
     /// when not applicable.
+    const CapturableCall = struct {
+        /// The function to call.
+        method_name: []const u8,
+        /// Full arguments (for a UFCS call `recv.m a b`, the receiver is arg 0).
+        arguments: []const *ast.Expression,
+        redirects: []const ast.Redirection,
+    };
+
+    /// Extracts the function + arguments of a value-capturable call: a plain
+    /// `name(args…)`, or a UFCS method access `recv.method` / `recv.method args…`
+    /// (receiver prepended). Returns null for anything else.
+    fn capturableCallInfo(self: *IRCompiler, expr: *ast.Expression) Error!?CapturableCall {
+        switch (expr.*) {
+            .call => |call| {
+                if (call.background) return null;
+                switch (call.callee.*) {
+                    .identifier => |id| return .{ .method_name = id.name, .arguments = call.arguments, .redirects = call.redirects },
+                    .binary => |b| if (b.op == .member and b.right.* == .identifier)
+                        return .{ .method_name = b.right.identifier.name, .arguments = try self.prependReceiver(b.left, call.arguments), .redirects = call.redirects }
+                    else
+                        return null,
+                    else => return null,
+                }
+            },
+            // Bare `recv.method` (no args) — a UFCS call with the receiver alone.
+            .binary => |b| if (b.op == .member and b.right.* == .identifier)
+                return .{ .method_name = b.right.identifier.name, .arguments = try self.prependReceiver(b.left, &.{}), .redirects = &.{} }
+            else
+                return null,
+            else => return null,
+        }
+    }
+
+    fn prependReceiver(self: *IRCompiler, receiver: *ast.Expression, args: []const *ast.Expression) Error![]const *ast.Expression {
+        const full = try self.allocator.alloc(*ast.Expression, args.len + 1);
+        full[0] = receiver;
+        for (args, 0..) |a, i| full[i + 1] = a;
+        return full;
+    }
+
+    /// Whether a function's return type should be captured as a typed value
+    /// (rather than byte-serialized). Structured values (error union / optional /
+    /// sum / struct) must survive intact; scalar numbers/bools must keep their
+    /// runtime tag so the caller can do arithmetic. String returns stay on the
+    /// byte path (their serialized form *is* the value).
+    fn isTypedCaptureReturn(self: *IRCompiler, t: *const ast.TypeExpr) bool {
+        return switch (t.*) {
+            .error_union, .optional, .sum, .type_merge, .struct_type, .integer, .float, .boolean => true,
+            .identifier => |named| blk: {
+                const name = named.path.segments[named.path.segments.len - 1].name;
+                if (self.user_struct_types.contains(name)) break :blk true;
+                break :blk std.mem.eql(u8, name, "Int") or std.mem.eql(u8, name, "Float") or std.mem.eql(u8, name, "Bool");
+            },
+            else => false,
+        };
+    }
+
     fn tryCompileTypedValueCapture(
         self: *IRCompiler,
         source: anytype,
         expr: *ast.Expression,
     ) Error!?Result {
-        if (expr.* != .call) return null;
-        const call = expr.call;
-        if (call.background or call.redirects.len != 0) return null;
-        if (call.callee.* != .identifier) return null;
+        const info = (try self.capturableCallInfo(expr)) orelse return null;
+        if (info.redirects.len != 0) return null;
 
-        // The callee must be a known function (a direct fn_ref binding — closure
-        // captured / member-access functions fall back) returning a structured
-        // value (an error union or an optional).
-        const binding = self.lookup(call.callee.identifier.name, .{ .shallow = false }) orelse return null;
+        // The callee must be a known function (a direct fn_ref binding — closure-
+        // captured functions fall back) returning a typed-capturable value.
+        const binding = self.lookup(info.method_name, .{ .shallow = false }) orelse return null;
         if (!binding.result.isFunctionRef()) return null;
         const fn_type = binding.type_expr orelse return null;
         if (fn_type != .function) return null;
         const return_type_ptr = fn_type.function.return_type orelse return null;
-        switch (return_type_ptr.*) {
-            // A sum return is captured by value too, so the member's tag (Int vs
-            // String, …) survives the boundary for the caller to narrow. The
-            // compiler stores the raw return AST, so a sum arrives as the
-            // unresolved `type_merge` node (a `type_merge` return is always a
-            // value sum — error-set merges only appear as the `E` in `E!T`).
-            .error_union, .optional, .sum, .type_merge => {},
-            else => return null,
-        }
+        if (!self.isTypedCaptureReturn(return_type_ptr)) return null;
         const fn_ref_value = binding.result.source.value;
         // pub exports change the call's result shape (a struct, already waited);
         // keep those on the existing path.
@@ -2125,8 +2177,8 @@ pub const IRCompiler = struct {
         const call_result = try self.compileFunctionCall(
             expr,
             fn_ref_value,
-            call.arguments,
-            call.redirects,
+            info.arguments,
+            info.redirects,
             pipe_ref.dereference(),
         );
 
@@ -2452,12 +2504,20 @@ pub const IRCompiler = struct {
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
+        // User-defined struct construction: allocate the struct's slots and
+        // populate each field at its layout offset (like the execution-result
+        // struct build). Field values are compiled into refs first so they
+        // don't clobber the alloc base register.
+        if (self.user_struct_types.get(struct_literal.name.name)) |struct_type| {
+            return self.compileStructValueLiteral(source, struct_type, struct_literal);
+        }
+
         const error_set = self.error_sets.get(struct_literal.name.name) orelse {
             try self.reportSourceError(
                 source,
                 Error.NotImplemented,
                 .@"error",
-                "'{s}' is not an error set; struct literal construction is only supported for error values",
+                "'{s}' is not a struct or error set; cannot construct it with {{ … }}",
                 .{struct_literal.name.name},
             );
             return .fromValue(.void);
@@ -2490,6 +2550,51 @@ pub const IRCompiler = struct {
             .result = result_ref,
         } }));
         return .from(result_ref.dereference());
+    }
+
+    /// Builds a user struct value: compile each field's value into a ref (so the
+    /// alloc base register isn't clobbered), allocate the struct's slots, then
+    /// write each field at its layout offset. Returns the base address typed as
+    /// the struct, so field access (`p.x`) reads `[base + offset]`.
+    fn compileStructValueLiteral(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        struct_type: ast.TypeExpr.StructType,
+        struct_literal: ast.StructLiteral,
+    ) Error!Result {
+        const FieldSlot = struct { offset: usize, ref: ir.Location };
+        var slots = std.ArrayList(FieldSlot).empty;
+        defer slots.deinit(self.allocator);
+
+        var total: usize = 0;
+        for (struct_type.fields) |field| {
+            const layout = struct_type.fieldLayout(field.name.name) catch return .fromValue(.void);
+            total += field.type_expr.slotSize() catch 1;
+
+            // The value supplied for this field (the type checker already
+            // verified presence/typing).
+            const value: Result = blk: {
+                for (struct_literal.fields) |lit_field| {
+                    if (std.mem.eql(u8, lit_field.name.name, field.name.name)) {
+                        break :blk try self.compileExpression(lit_field.value);
+                    }
+                }
+                break :blk .fromValue(.void);
+            };
+            const field_ref = try self.newRef(source, "struct_field");
+            try self.set(source, field_ref, value.source);
+            try slots.append(self.allocator, .{ .offset = layout.offset, .ref = field_ref.dereference() });
+        }
+
+        try self.alloc(source, total); // %r = base of the struct's slots
+        for (slots.items) |slot| {
+            try self.set(
+                source,
+                .initAdd(.{ .register = .r }, slot.offset, .{ .dereference = true }),
+                .from(slot.ref),
+            );
+        }
+        return .fromLocation(ir.Location.initRegister(.r).typed(.{ .struct_type = struct_type }));
     }
 
     /// Converts a finished command (`ExecutionResult`) into an
@@ -2740,10 +2845,17 @@ pub const IRCompiler = struct {
         return .fromLocation(ir.Location.initRegister(.r2).typed(result.typeExpr()));
     }
 
+    /// How a struct field access should be compiled: as a read (the field's
+    /// value is materialized into a stable ref, so it survives a later field
+    /// access clobbering the base register) or as an assignment target (the raw
+    /// `[base + offset]` slot, written to immediately by the caller).
+    const MemberMode = enum { read, lvalue };
+
     fn compileMember(
         self: *IRCompiler,
         source: *ast.Expression,
         member: ast.MemberExpr,
+        mode: MemberMode,
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
@@ -2815,12 +2927,24 @@ pub const IRCompiler = struct {
                 ));
             },
             .struct_type => |struct_type| struct_type,
+            // A binding annotated with a user struct's name carries the type as
+            // an identifier; resolve it to the struct's layout.
+            .identifier => |named| self.user_struct_types.get(named.path.segments[named.path.segments.len - 1].name) orelse {
+                try self.reportSourceError(
+                    source,
+                    Error.NotImplemented,
+                    .@"error",
+                    "member access is only supported for struct types in IR",
+                    .{},
+                );
+                return .fromValue(.void);
+            },
             else => {
                 try self.reportSourceError(
                     source,
                     Error.NotImplemented,
                     .@"error",
-                    "member access is only supported for internal struct types in IR",
+                    "member access is only supported for struct types in IR",
                     .{},
                 );
                 return .fromValue(.void);
@@ -2849,11 +2973,15 @@ pub const IRCompiler = struct {
 
         const field_ = struct_type.fieldLayout(member.member.name) catch |err| switch (err) {
             error.FieldNotFound => {
+                // Not a field — try UFCS: `recv.method` ≡ `method(recv)` when a
+                // function named `method` is in scope (field access wins, which
+                // is why this is only reached after fieldLayout fails).
+                if (try self.tryUfcsRewrite(source, member.object, member.member.name, &.{}, &.{})) |r| return r;
                 try self.reportSourceError(
                     source,
                     Error.NotImplemented,
                     .@"error",
-                    "member \"{s}\" not found on internal struct",
+                    "member \"{s}\" not found on struct (no field or method)",
                     .{member.member.name},
                 );
                 return .fromValue(.void);
@@ -2881,14 +3009,25 @@ pub const IRCompiler = struct {
         try self.set(source, object_ref, object.source);
         try self.set(source, .initRegister(.r2), .from(object_ref.dereference()));
 
-        return .fromLocation(.initAdd(
+        // The field slot addresses through %r2, a volatile register: a second
+        // field access (e.g. `p.x + q.x`) would reset %r2 and make both operands
+        // read the same struct. So for a read, copy the field's value into a
+        // fresh stable ref and return that. For an assignment target the caller
+        // writes immediately, before anything clobbers %r2, so the raw slot is
+        // fine (and must be returned so the write lands in the struct).
+        const slot = ir.Location.initAdd(
             .{ .register = .r2 },
             field_.offset,
-            .{
-                .dereference = true,
-                .type_expr = field_.type_expr,
+            .{ .dereference = true, .type_expr = field_.type_expr },
+        );
+        switch (mode) {
+            .lvalue => return .fromLocation(slot),
+            .read => {
+                const field_ref = try self.newRef(source, "member_field");
+                try self.set(source, field_ref, .fromLocation(slot));
+                return .fromLocation(field_ref.dereference().typed(field_.type_expr));
             },
-        ));
+        }
     }
 
     fn compileWaitMember(
@@ -3040,6 +3179,7 @@ pub const IRCompiler = struct {
         self: *IRCompiler,
         source: *ast.Expression,
         binary: ast.BinaryExpr,
+        mode: MemberMode,
     ) Error!Result {
         const member_name = switch (binary.right.*) {
             .identifier => |identifier| identifier,
@@ -3059,7 +3199,7 @@ pub const IRCompiler = struct {
             .object = binary.left,
             .member = member_name,
             .span = binary.span,
-        });
+        }, mode);
     }
 
     fn compileStringLiteral(
@@ -3429,6 +3569,13 @@ pub const IRCompiler = struct {
             if (std.mem.eql(u8, name, "cd") and self.lookup(name, .{ .shallow = false }) == null) {
                 return self.compileBuiltinCd(source, call.arguments);
             }
+        }
+
+        // UFCS method call: `recv.method args…` ≡ `method(recv, args…)` when
+        // `method` is a function in scope. (A field wouldn't be callable with
+        // args, so the method wins in call position.)
+        if (call.callee.* == .binary and call.callee.binary.op == .member and call.callee.binary.right.* == .identifier) {
+            if (try self.tryUfcsRewrite(source, call.callee.binary.left, call.callee.binary.right.identifier.name, call.arguments, call.redirects)) |r| return r;
         }
 
         const callee = try self.compileExpression(call.callee);
@@ -4075,6 +4222,28 @@ pub const IRCompiler = struct {
         self.current_instruction_set = orig_instr_set;
     }
 
+    /// UFCS: compile `receiver.method(args…)` as `method(receiver, args…)` when
+    /// `method` names a function in scope. Returns null when there is no such
+    /// function (so the caller falls back to field access / its normal path).
+    /// The receiver AST node is reused as arg 0, so it is evaluated exactly once.
+    fn tryUfcsRewrite(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        receiver: *ast.Expression,
+        method_name: []const u8,
+        args: []const *ast.Expression,
+        redirects: []const ast.Redirection,
+    ) Error!?Result {
+        const binding = self.lookup(method_name, .{ .shallow = false }) orelse return null;
+        if (!binding.result.isFunctionRef()) return null;
+
+        const full = try self.allocator.alloc(*ast.Expression, args.len + 1);
+        full[0] = receiver;
+        for (args, 0..) |a, i| full[i + 1] = a;
+
+        return try self.compileFunctionCall(source, binding.result.source.value, full, redirects, null);
+    }
+
     fn compileFunctionCall(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -4118,6 +4287,12 @@ pub const IRCompiler = struct {
         }
 
         for (arguments, 0..) |arg, i| {
+            // Track whether compiling this argument pushed an owned temporary.
+            // `consume` pops any stack-location result, but a bare binding
+            // reference (e.g. a struct-valued `p` passed as an arg) is a
+            // *borrowed* stack slot, not a temp we own — popping it corrupts the
+            // stack. Only pop when the arg compilation actually grew the frame.
+            const stack_before_arg = self.currentFrame().rel_stack_counter;
             const arg_result = try self.compileResultSaveR(source, try self.compileExpression(arg));
             try self.set(source, .initRegister(.r), .from(closure_ref.dereference()));
             try self.set(
@@ -4125,7 +4300,9 @@ pub const IRCompiler = struct {
                 .initAdd(.{ .register = .r }, i, .{ .dereference = true }),
                 arg_result.source,
             );
-            try self.consume(source, arg_result);
+            if (self.currentFrame().rel_stack_counter > stack_before_arg) {
+                try self.consume(source, arg_result);
+            }
         }
 
         try self.set(source, .initRegister(.r), .from(closure_ref.dereference()));
@@ -6080,6 +6257,19 @@ pub const IRCompiler = struct {
                     return .from(result_ref.dereference().typed(optional_string_type));
                 }
 
+                // Struct field assignment `p.x = v`: compile the value into a
+                // stable ref first (so evaluating it can't clobber the base
+                // register), then compile the target as an lvalue (raw slot) and
+                // write immediately — nothing runs between that could reset %r2.
+                if (binary.left.* == .binary and binary.left.binary.op == .member) {
+                    const value = try self.compileExpression(binary.right);
+                    const value_ref = try self.newRef(source, "field_assign_value");
+                    try self.set(source, value_ref, stableResultSource(value));
+                    const slot = try self.compileMemberBinary(source, binary.left.binary, .lvalue);
+                    try self.set(source, slot.source.location, .from(value_ref.dereference()));
+                    return .from(value_ref.dereference().typed(value.typeExpr()));
+                }
+
                 const left = try self.compileExpression(binary.left);
                 if (left.source == .location and binary.right.* == .binary) {
                     const right_binary = binary.right.binary;
@@ -6152,7 +6342,7 @@ pub const IRCompiler = struct {
                 try self.log(@src().fn_name ++ ": error, encountered {t} binary expression", .{binary.op});
                 try self.logEvaluateSpan(binary.span);
             },
-            .member => return self.compileMemberBinary(source, binary),
+            .member => return self.compileMemberBinary(source, binary, .read),
         }
 
         try self.reportSourceError(source, Error.UnsupportedBinaryOperation, .@"error", "binary operator \"{t}\" not yet supported", .{binary.op});
@@ -7194,6 +7384,13 @@ pub const IRCompiler = struct {
                 break :brk result;
             },
             .binary => |binary| brk: {
+                // A UFCS method access `recv.method` is a function call in value
+                // position, so its output must be captured like any call.
+                if (binary.op == .member and binary.right.* == .identifier) {
+                    if (self.lookup(binary.right.identifier.name, .{ .shallow = false })) |b| {
+                        if (b.result.isFunctionRef()) break :brk .{ .needs_stdio_capture = true };
+                    }
+                }
                 var result = self.analyzeExpressionEffects(binary.left);
                 result.merge(self.analyzeExpressionEffects(binary.right));
                 break :brk result;

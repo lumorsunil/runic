@@ -1,0 +1,21 @@
+# A typed binding whose initializer is a function-call result must compare its
+# (aliased) return type against the annotation. A function's `Int`/`String`
+# return resolves to an alias-wrapped primitive, so the assignment validators
+# must unalias before the tag check (previously `const r: Int = someIntFn`
+# false-positived with "expected Int, actual: Int").
+fn Void @() Void
+
+fn Void answer() Int { yield 42 }
+const r: Int = answer
+echo "r=${r}"
+
+fn Void greet() String { yield "hello" }
+const s: String = greet
+echo "s=${s}"
+
+# UFCS method result in a typed binding validates the same way.
+const Point = struct { x: Int, y: Int }
+fn Void mag(self: Point) Int { yield self.x + self.y }
+const p: Point = Point{ .x = 3, .y = 4 }
+const m: Int = p.mag
+echo "m=${m}"

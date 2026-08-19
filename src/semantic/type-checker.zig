@@ -2090,6 +2090,17 @@ pub const TypeChecker = struct {
         };
     }
 
+    /// The root binding name of a member-access chain (`a.b.c` → `a`), or the
+    /// bare identifier itself. Null for anything not rooted in an identifier.
+    fn rootBindingName(expr: *const ast.Expression) ?[]const u8 {
+        return switch (expr.*) {
+            .identifier => |identifier| identifier.name,
+            .binary => |binary| if (binary.op == .member) rootBindingName(binary.left) else null,
+            .member => |member| rootBindingName(member.object),
+            else => null,
+        };
+    }
+
     fn runIfCapture(
         self: *TypeChecker,
         then_scope: *Scope,
@@ -2538,6 +2549,26 @@ pub const TypeChecker = struct {
                         return;
                     }
                 }
+
+                // Field assignment `p.x = v`: the target is a member access.
+                // Enforce that the root binding is mutable and validate `v`
+                // against the (resolved) field type.
+                if (binary.left.* == .binary and binary.left.binary.op == .member) {
+                    if (rootBindingName(binary.left)) |root| {
+                        if (scope.lookup(root)) |binding| if (!binding.is_mutable) {
+                            try self.reportSpanError(
+                                binary.left.span(),
+                                Error.TypeMismatch,
+                                .@"error",
+                                "cannot assign to a field of immutable '{s}'; declare it with var",
+                                .{root},
+                            );
+                        };
+                    }
+                    const field_type = try self.resolveTypeExpr(scope, left_type);
+                    try self.validateTypeAssignment(field_type, right_type, .{ .span = right_type.span() });
+                    return;
+                }
             }
 
             try self.validateTypeAssignment(left_type, right_type, .{ .span = right_type.span() });
@@ -2592,9 +2623,12 @@ pub const TypeChecker = struct {
         try self.logTypeCheckTrace(@src().fn_name, member.span);
 
         try self.runExpression(scope, member.object);
-        const object_type = try self.resolveExprType(scope, member.object) orelse {
+        const raw_object_type = try self.resolveExprType(scope, member.object) orelse {
             return error.MemberObjectTypeUndefined;
         };
+        // Unwrap aliases so a struct-typed binding/param (`p: Point`) resolves to
+        // its struct type for member access.
+        const object_type = self.unaliasType(raw_object_type);
 
         if (std.mem.eql(u8, member.member.name, "?")) {
             return switch (object_type.*) {
@@ -3057,13 +3091,72 @@ pub const TypeChecker = struct {
         const type_expr = self.unaliasType(binding.type_expr orelse return);
         switch (type_expr.*) {
             .error_set => |error_set| try self.runErrorValueLiteral(scope, error_set, struct_literal),
+            .struct_type => |struct_type| try self.runStructValueLiteral(scope, struct_type, struct_literal),
             else => try self.reportSpanError(
                 struct_literal.name.span,
                 Error.UnsupportedExpression,
                 .@"error",
-                "'{s}' is not an error set; struct literal construction is only supported for error values",
+                "'{s}' is not a struct or error set; cannot construct it with {{ … }}",
                 .{struct_literal.name.name},
             ),
+        }
+    }
+
+    /// Validates `Name{ .field = value, … }` against a struct type: every named
+    /// field must exist (with a type-compatible value), no duplicates, and every
+    /// declared field must be provided (no defaults yet).
+    fn runStructValueLiteral(
+        self: *TypeChecker,
+        scope: *Scope,
+        struct_type: ast.TypeExpr.StructType,
+        struct_literal: *ast.StructLiteral,
+    ) Error!void {
+        for (struct_literal.fields, 0..) |field, i| {
+            // Duplicate field.
+            for (struct_literal.fields[0..i]) |prev| {
+                if (std.mem.eql(u8, prev.name.name, field.name.name)) {
+                    try self.reportSpanError(
+                        field.name.span,
+                        Error.TypeMismatch,
+                        .@"error",
+                        "duplicate field '{s}' in struct literal",
+                        .{field.name.name},
+                    );
+                    break;
+                }
+            }
+
+            const declared = struct_type.memberType(field.name.name) orelse {
+                try self.reportSpanError(
+                    field.name.span,
+                    Error.MemberNotFound,
+                    .@"error",
+                    "struct has no field '{s}'",
+                    .{field.name.name},
+                );
+                continue;
+            };
+            const resolved_field = try self.resolveTypeExpr(scope, declared);
+            const value_type = (try self.resolveExprType(scope, field.value)) orelse continue;
+            try self.validateTypeAssignment(resolved_field, value_type, .{ .span = field.value.span() });
+        }
+
+        // Every declared field must be supplied (no default values yet).
+        for (struct_type.fields) |field| {
+            var found = false;
+            for (struct_literal.fields) |provided| {
+                if (std.mem.eql(u8, provided.name.name, field.name.name)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) try self.reportSpanError(
+                struct_literal.span,
+                Error.TypeMismatch,
+                .@"error",
+                "missing field '{s}' in struct literal",
+                .{field.name.name},
+            );
         }
     }
 
@@ -3146,10 +3239,22 @@ pub const TypeChecker = struct {
         switch (segment.*) {
             .interpolation => |expr| {
                 try self.runExpression(scope, expr);
-                // Interpolating a bare (un-narrowed) sum has no single string
-                // form — narrow it first (with `is`/`==`/match).
                 if (try self.resolveExprType(scope, expr)) |t| {
+                    // Interpolating a bare (un-narrowed) sum has no single string
+                    // form — narrow it first (with `is`/`==`/match).
                     try self.rejectBareSum(expr, t, "interpolate");
+                    // A whole struct has no single string form — interpolate a
+                    // field (`${p.x}`), not the struct itself.
+                    const unaliased = self.unaliasType(t);
+                    if (unaliased.* == .struct_type and !isExecutionLikeStruct(unaliased.struct_type)) {
+                        try self.reportSpanError(
+                            expr.span(),
+                            Error.TypeMismatch,
+                            .@"error",
+                            "cannot interpolate a whole struct; interpolate a field instead (e.g. ${{value.field}})",
+                            .{},
+                        );
+                    }
                 }
             },
             .text => {},
@@ -3592,7 +3697,7 @@ pub const TypeChecker = struct {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, assignment_type.span());
 
-        if (assignment_type.* == .null) return;
+        if (self.unaliasType(assignment_type).* == .null) return;
 
         try self.reportAssignmentError(
             @as(*const ast.TypeExpr, @fieldParentPtr("null", assignee)),
@@ -3743,7 +3848,7 @@ pub const TypeChecker = struct {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, assignment_type.span());
 
-        switch (assignment_type.*) {
+        switch (self.unaliasType(assignment_type).*) {
             .array => |array| {
                 try self.validateTypeAssignment(assignee.element, array.element, options);
             },
@@ -3819,7 +3924,7 @@ pub const TypeChecker = struct {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, assignment_type.span());
 
-        switch (assignment_type.*) {
+        switch (self.unaliasType(assignment_type).*) {
             .integer => {},
             else => try self.reportAssignmentError(
                 @as(*const ast.TypeExpr, @fieldParentPtr("integer", assignee)),
@@ -3838,7 +3943,7 @@ pub const TypeChecker = struct {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, assignment_type.span());
 
-        switch (assignment_type.*) {
+        switch (self.unaliasType(assignment_type).*) {
             .integer, .float => {},
             else => try self.reportAssignmentError(
                 @as(*const ast.TypeExpr, @fieldParentPtr("float", assignee)),
@@ -3857,7 +3962,7 @@ pub const TypeChecker = struct {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, assignment_type.span());
 
-        switch (assignment_type.*) {
+        switch (self.unaliasType(assignment_type).*) {
             .boolean => {},
             else => try self.reportAssignmentError(
                 @as(*const ast.TypeExpr, @fieldParentPtr("boolean", assignee)),
@@ -3876,7 +3981,7 @@ pub const TypeChecker = struct {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, assignment_type.span());
 
-        switch (assignment_type.*) {
+        switch (self.unaliasType(assignment_type).*) {
             .byte => {},
             else => try self.reportAssignmentError(
                 @as(*const ast.TypeExpr, @fieldParentPtr("byte", assignee)),

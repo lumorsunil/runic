@@ -1,0 +1,7 @@
+[error]: tests/diagnostics/typed_call_binding_mismatch.rn:5:19: expected type String, actual: Int
+   3:fn Void @() Void
+   4:fn Void answer() Int { yield 42 }
+   5:const s: String = answer
+   6:echo "${s}"
+   7:
+

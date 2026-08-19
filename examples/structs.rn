@@ -1,0 +1,42 @@
+// Run with: zig build run -- examples/structs.rn
+// Demonstrates Runic structs: declaration, construction, field access, nesting,
+// struct-typed parameters and returns, methods via UFCS, and field mutation.
+
+// A struct type is a named collection of typed fields.
+const Point = struct { x: Int, y: Int }
+
+// Construct a value with `Name{ .field = value }`; read fields with `.field`.
+const p: Point = Point{ .x = 3, .y = 4 }
+echo "p = (${p.x}, ${p.y})"
+
+// Methods are free functions whose first parameter is the receiver; `p.method`
+// is shorthand for `method(p)`.
+fn Void magnitudeSq(self: Point) Int { yield self.x * self.x + self.y * self.y }
+echo "|p|^2 = ${p.magnitudeSq}"
+
+// A method taking extra arguments: `p.scaledSum k` == `scaledSum(p, k)`.
+fn Void scaledSum(self: Point, k: Int) Int { yield (self.x + self.y) * k }
+echo "scaledSum 10 = ${p.scaledSum 10}"
+
+// Structs pass to and return from functions by value.
+fn Void origin() Point { yield Point{ .x = 0, .y = 0 } }
+fn Void manhattan(a: Point, b: Point) Int {
+    yield (a.x - b.x) + (a.y - b.y)
+}
+const o = origin
+echo "manhattan(p, origin) = ${manhattan p o}"
+
+// Structs nest; access chains through nested fields.
+const Line = struct { from: Point, to: Point }
+const seg: Line = Line{ .from = Point{ .x = 0, .y = 0 }, .to = Point{ .x = 3, .y = 4 } }
+echo "seg.to = (${seg.to.x}, ${seg.to.y})"
+
+// A field of a `var` struct can be mutated in place (nested fields too).
+var q: Point = Point{ .x = 1, .y = 1 }
+q.x = 10
+q.y = 20
+echo "q after mutation = (${q.x}, ${q.y})"
+
+var path: Line = Line{ .from = Point{ .x = 0, .y = 0 }, .to = Point{ .x = 1, .y = 1 } }
+path.to.x = 99
+echo "path.to.x = ${path.to.x}"

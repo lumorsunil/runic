@@ -1,0 +1,7 @@
+[error]: tests/diagnostics/struct_const_field_assign.rn:6:1: cannot assign to a field of immutable 'p'; declare it with var
+   4:const Point = struct { x: Int, y: Int }
+   5:const p: Point = Point{ .x = 3, .y = 4 }
+   6:p.x = 10
+   7:echo "${p.x}"
+   8:
+

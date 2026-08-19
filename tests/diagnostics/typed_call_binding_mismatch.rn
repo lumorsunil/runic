@@ -1,0 +1,6 @@
+// A function returning Int cannot be bound to a String annotation — the
+// (aliased) return type is normalized before comparison, so this is caught.
+fn Void @() Void
+fn Void answer() Int { yield 42 }
+const s: String = answer
+echo "${s}"

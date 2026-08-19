@@ -1,0 +1,32 @@
+# Struct methods via UFCS (Phase 4): `recv.method args…` calls a free function
+# `method(recv, args…)` whose first parameter is the receiver. Field access wins
+# over UFCS on a name collision (fields are tried first).
+fn Void @() Void
+
+const Point = struct { x: Int, y: Int }
+
+# A no-arg method (receiver only).
+fn Void mag(self: Point) Int { yield self.x + self.y }
+
+# A method taking an extra argument.
+fn Void scaled(self: Point, k: Int) Int { yield (self.x + self.y) * k }
+
+const p: Point = Point{ .x = 3, .y = 4 }
+
+echo "mag=${p.mag}"
+echo "scaled=${p.scaled 10}"
+
+# Field access is unaffected and still takes precedence.
+echo "x=${p.x} y=${p.y}"
+
+# A method whose receiver is itself a field-bearing struct value.
+const Line = struct { from: Point, to: Point }
+const l: Line = Line{ .from = Point{ .x = 1, .y = 1 }, .to = Point{ .x = 3, .y = 4 } }
+echo "to.mag=${l.to.mag}"
+
+# A method result captured into a typed binding survives as a value (keeps its
+# tag), so it can be used in arithmetic — not just interpolated.
+const m: Int = p.mag
+echo "m+1=${m + 1}"
+const sc: Int = p.scaled 10
+echo "sc*2=${sc + sc}"

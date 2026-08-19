@@ -807,16 +807,77 @@ so a typed function that follows an executable stage must declare `String` stdin
 
 ## Structs
 
-Structs are a collection of fields, each with their own type.
+A struct is a named collection of typed fields. Declare a struct type with
+`const`, using `name: Type` fields separated by commas and/or newlines:
 
 ```rn
+const Point = struct { x: Int, y: Int }
+
 const Result = struct {
-    value: ?Float,
-    ok: bool,
+    value: Float
+    ok: Bool
 }
 ```
 
-**Result:** This binds an identifier Result to a type which is a struct. This way you can also alias types using let bindings and also create struct types on the fly as type expressions.
+**Construction & field access.** Build a value with `Name{ .field = value, … }`
+(all fields required), and read a field with `.field`:
+
+```rn
+const p: Point = Point{ .x = 3, .y = 4 }
+echo "x=${p.x} y=${p.y}"
+```
+
+Constructing a struct checks every field: an unknown field, a missing field, a
+duplicate field, or a value whose type doesn't match the field's type is a
+compile error.
+
+**Nesting.** A field may itself be a struct; construction and access nest:
+
+```rn
+const Line = struct { from: Point, to: Point }
+const l: Line = Line{ .from = Point{ .x = 0, .y = 0 }, .to = Point{ .x = 3, .y = 4 } }
+echo "${l.to.x}"
+```
+
+**Functions.** Structs can be passed to and returned from functions; the value
+survives the call boundary intact, so a caller can read the returned struct's
+fields:
+
+```rn
+fn Void midpointX(a: Point, b: Point) Int { yield (a.x + b.x) / 2 }
+fn Void origin() Point { yield Point{ .x = 0, .y = 0 } }
+
+const o = origin
+echo "mid=${midpointX o p}"
+```
+
+**Methods (UFCS).** A method is just a free function whose first parameter is the
+receiver; `recv.method args…` is shorthand for `method(recv, args…)`. A field of
+the same name takes precedence over a method:
+
+```rn
+fn Void mag(self: Point) Int { yield self.x + self.y }
+echo "mag=${p.mag}"          // == mag(p)
+
+fn Void scaled(self: Point, k: Int) Int { yield (self.x + self.y) * k }
+echo "${p.scaled 10}"        // == scaled(p, 10)
+```
+
+**Mutation.** A field of a `var` struct can be reassigned with `p.field = value`
+(nested fields too). The field's declared type is enforced, and mutating a field
+of a `const` struct is a compile error:
+
+```rn
+var p: Point = Point{ .x = 3, .y = 4 }
+p.x = 10
+echo "${p.x}"                // 10
+```
+
+**Result:** `Point`/`Result` are struct types you can annotate bindings,
+parameters, and returns with. A struct value holds its fields together and is
+passed by value. Interpolate an individual field (`${p.x}`) — interpolating a
+whole struct is rejected, since it has no single string form. (Default field
+values and generic/parameterized structs are not yet supported.)
 
 ## Files are structs
 

@@ -1,0 +1,7 @@
+// A field of an immutable (const) struct cannot be reassigned — declare the
+// binding with var to mutate its fields.
+fn Void @() Void
+const Point = struct { x: Int, y: Int }
+const p: Point = Point{ .x = 3, .y = 4 }
+p.x = 10
+echo "${p.x}"

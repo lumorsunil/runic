@@ -998,7 +998,11 @@ pub const MemberExpr = struct {
         allocator: std.mem.Allocator,
         scope: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
-        const object_type = try self.object.resolveType(io, allocator, scope) orelse return null;
+        const raw_object_type = try self.object.resolveType(io, allocator, scope) orelse return null;
+        // A struct behind an alias (e.g. a `Point`-typed binding/param) resolves
+        // to `.alias`; unwrap it so member access sees the struct type.
+        var object_type = raw_object_type;
+        while (object_type.* == .alias) object_type = object_type.alias.type_expr;
 
         if (std.mem.eql(u8, self.member.name, "?")) {
             return switch (object_type.*) {
@@ -1127,6 +1131,35 @@ pub const BinaryExpr = struct {
                     }
                 }
                 break :blk left_type;
+            },
+            // `object.field` — field access parses as a `.member` binary. Resolve
+            // to the field's type on the (unaliased) struct, not the object type.
+            // When the name isn't a struct field, fall back to UFCS: a function
+            // `name` in scope, whose return type is the result of `object.name`.
+            .member => blk: {
+                const lt = left_type orelse break :blk null;
+                var resolved = lt;
+                while (resolved.* == .alias) resolved = resolved.alias.type_expr;
+                const field_name = switch (self.right.*) {
+                    .identifier => |id| id.name,
+                    else => break :blk null,
+                };
+                switch (resolved.*) {
+                    .struct_type => |st| {
+                        if (st.memberType(field_name)) |ft| break :blk ft;
+                        // UFCS method: `recv.method` has the function's return type.
+                        if (scope.lookup(field_name)) |b| {
+                            if (b.type_expr) |bt| {
+                                var fn_type = bt;
+                                while (fn_type.* == .alias) fn_type = fn_type.alias.type_expr;
+                                if (fn_type.* == .function) break :blk fn_type.function.return_type;
+                            }
+                        }
+                        break :blk null;
+                    },
+                    .error_set => |es| break :blk if (es.variant(field_name) != null) resolved else null,
+                    else => break :blk null,
+                }
             },
             else => left_type,
         };

@@ -1,0 +1,20 @@
+# Struct field mutation (Phase 5): a field of a `var` struct can be reassigned
+# with `p.field = value` (including nested fields). The declared field type is
+# enforced, and the mutation is visible to later reads.
+fn Void @() Void
+
+const Point = struct { x: Int, y: Int }
+
+var p: Point = Point{ .x = 3, .y = 4 }
+p.x = 10
+echo "x=${p.x} y=${p.y}"
+
+# Multiple mutations, then arithmetic on the updated fields.
+p.y = 6
+echo "sum=${p.x + p.y}"
+
+# Nested field mutation only touches the targeted field.
+const Line = struct { from: Point, to: Point }
+var l: Line = Line{ .from = Point{ .x = 0, .y = 0 }, .to = Point{ .x = 3, .y = 4 } }
+l.to.x = 99
+echo "to.x=${l.to.x} to.y=${l.to.y} from.x=${l.from.x}"
