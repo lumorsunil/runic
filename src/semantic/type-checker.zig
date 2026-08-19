@@ -2090,6 +2090,17 @@ pub const TypeChecker = struct {
         };
     }
 
+    /// The root binding name of a member-access chain (`a.b.c` → `a`), or the
+    /// bare identifier itself. Null for anything not rooted in an identifier.
+    fn rootBindingName(expr: *const ast.Expression) ?[]const u8 {
+        return switch (expr.*) {
+            .identifier => |identifier| identifier.name,
+            .binary => |binary| if (binary.op == .member) rootBindingName(binary.left) else null,
+            .member => |member| rootBindingName(member.object),
+            else => null,
+        };
+    }
+
     fn runIfCapture(
         self: *TypeChecker,
         then_scope: *Scope,
@@ -2537,6 +2548,26 @@ pub const TypeChecker = struct {
                         }
                         return;
                     }
+                }
+
+                // Field assignment `p.x = v`: the target is a member access.
+                // Enforce that the root binding is mutable and validate `v`
+                // against the (resolved) field type.
+                if (binary.left.* == .binary and binary.left.binary.op == .member) {
+                    if (rootBindingName(binary.left)) |root| {
+                        if (scope.lookup(root)) |binding| if (!binding.is_mutable) {
+                            try self.reportSpanError(
+                                binary.left.span(),
+                                Error.TypeMismatch,
+                                .@"error",
+                                "cannot assign to a field of immutable '{s}'; declare it with var",
+                                .{root},
+                            );
+                        };
+                    }
+                    const field_type = try self.resolveTypeExpr(scope, left_type);
+                    try self.validateTypeAssignment(field_type, right_type, .{ .span = right_type.span() });
+                    return;
                 }
             }
 
@@ -3208,10 +3239,22 @@ pub const TypeChecker = struct {
         switch (segment.*) {
             .interpolation => |expr| {
                 try self.runExpression(scope, expr);
-                // Interpolating a bare (un-narrowed) sum has no single string
-                // form — narrow it first (with `is`/`==`/match).
                 if (try self.resolveExprType(scope, expr)) |t| {
+                    // Interpolating a bare (un-narrowed) sum has no single string
+                    // form — narrow it first (with `is`/`==`/match).
                     try self.rejectBareSum(expr, t, "interpolate");
+                    // A whole struct has no single string form — interpolate a
+                    // field (`${p.x}`), not the struct itself.
+                    const unaliased = self.unaliasType(t);
+                    if (unaliased.* == .struct_type and !isExecutionLikeStruct(unaliased.struct_type)) {
+                        try self.reportSpanError(
+                            expr.span(),
+                            Error.TypeMismatch,
+                            .@"error",
+                            "cannot interpolate a whole struct; interpolate a field instead (e.g. ${{value.field}})",
+                            .{},
+                        );
+                    }
                 }
             },
             .text => {},

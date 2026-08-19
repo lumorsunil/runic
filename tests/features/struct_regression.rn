@@ -27,3 +27,12 @@ echo "sum=${sumxy p}"
 fn Void origin() Point { yield Point{ .x = 5, .y = 9 } }
 const o = origin
 echo "o.x=${o.x} o.y=${o.y}"
+
+# Fields from two *different* structs read in the same expression must not alias
+# (each field access must be stable, not share a volatile base register).
+const q: Point = Point{ .x = 10, .y = 20 }
+echo "p.x+q.x=${p.x + q.x} p.y+q.y=${p.y + q.y}"
+
+# Two struct arguments passed to a function, both read in the body.
+fn Void addX(a: Point, b: Point) Int { yield a.x + b.x }
+echo "addX=${addX p q}"

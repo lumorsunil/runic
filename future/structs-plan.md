@@ -5,8 +5,9 @@ access, pass/return/assign, nesting, and **methods**. Roadmap Theme 3
 ("better user-defined struct/type support"). `docs/features.md` already promises
 the syntax, but it isn't wired up yet.
 
-Status: **design agreed; implementation starting.** Scope: MVP + methods
-(explicit receiver param, UFCS). Branch: `structs` (off `main`).
+Status: **COMPLETE (2026-08-19).** MVP + methods (explicit receiver param, UFCS)
+all landed — declaration, construction, field access, nesting, params, returns,
+methods, field mutation. Branch: `structs` (off `main`).
 
 ## Current state (what already exists vs. the gap)
 
@@ -129,9 +130,27 @@ p.mag        # == mag(p)
        annotation is caught (`const bad: String = p.mag` → Int/String mismatch)
        and a correct one passes. Tests: `typed_call_binding_regression`,
        `typed_call_binding_mismatch`.
-- [ ] **Phase 5 — Polish.** Field mutation on a `var` (if not already), docs in
-  `docs/features.md`, a `examples/structs.rn` showcase, and the regression +
-  diagnostic suites (there are currently **no** struct feature tests).
+- [x] **Phase 5 — Polish. DONE (2026-08-19).**
+  - **Field mutation** — `p.field = v` on a `var` struct (nested too), validated
+    against the field's declared type; mutating a field of a `const` is a compile
+    error (`rootBindingName` finds the receiver's mutability). Runtime write goes
+    through a dedicated lvalue path (`compileMember` `MemberMode.lvalue`).
+  - **Whole-struct interpolation rejected** — `${p}` has no single string form;
+    interpolate a field. (Execution-result structs stay exempt.)
+  - **Fixed a field-access aliasing bug** — a struct field read returned a
+    location relative to the volatile `%r2` register, so two field accesses in
+    one expression (`p.x + q.x`, or two struct params read in a body) both read
+    the last struct. `compileMember` now materializes a read into a stable ref
+    (`MemberMode.read`); assignment uses the raw slot (`.lvalue`) written
+    immediately.
+  - **Docs** (`docs/features.md` Structs section rewritten to as-built) and
+    **`examples/structs.rn`** showcase (CI-checked). Regression + diagnostic
+    suites: `struct_regression`, `struct_methods_regression`,
+    `struct_mutation_regression`, and diagnostics `struct_const_field_assign`,
+    `struct_whole_interpolation`.
+
+**Structs MVP + methods: COMPLETE.** Full CI green (13/13 unit, 42 diag, 8
+examples, 108 smoke, 3 strict).
 
 ## Open questions / deferred
 

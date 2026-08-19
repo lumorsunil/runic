@@ -1850,7 +1850,7 @@ pub const IRCompiler = struct {
                 call_copy.background = false;
                 break :blk self.compileBackgroundExpressionValue(expr, .{ .call = call_copy });
             } else self.compileCall(expr, call),
-            .member => |member| self.compileMember(expr, member),
+            .member => |member| self.compileMember(expr, member, .read),
             .if_expr => |if_expr| self.compileIf(expr, if_expr),
             .match_expr => |match_expr| self.compileMatch(expr, match_expr),
             .pipeline => |pipeline| if (pipeline.background) blk: {
@@ -2845,10 +2845,17 @@ pub const IRCompiler = struct {
         return .fromLocation(ir.Location.initRegister(.r2).typed(result.typeExpr()));
     }
 
+    /// How a struct field access should be compiled: as a read (the field's
+    /// value is materialized into a stable ref, so it survives a later field
+    /// access clobbering the base register) or as an assignment target (the raw
+    /// `[base + offset]` slot, written to immediately by the caller).
+    const MemberMode = enum { read, lvalue };
+
     fn compileMember(
         self: *IRCompiler,
         source: *ast.Expression,
         member: ast.MemberExpr,
+        mode: MemberMode,
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
@@ -3002,14 +3009,25 @@ pub const IRCompiler = struct {
         try self.set(source, object_ref, object.source);
         try self.set(source, .initRegister(.r2), .from(object_ref.dereference()));
 
-        return .fromLocation(.initAdd(
+        // The field slot addresses through %r2, a volatile register: a second
+        // field access (e.g. `p.x + q.x`) would reset %r2 and make both operands
+        // read the same struct. So for a read, copy the field's value into a
+        // fresh stable ref and return that. For an assignment target the caller
+        // writes immediately, before anything clobbers %r2, so the raw slot is
+        // fine (and must be returned so the write lands in the struct).
+        const slot = ir.Location.initAdd(
             .{ .register = .r2 },
             field_.offset,
-            .{
-                .dereference = true,
-                .type_expr = field_.type_expr,
+            .{ .dereference = true, .type_expr = field_.type_expr },
+        );
+        switch (mode) {
+            .lvalue => return .fromLocation(slot),
+            .read => {
+                const field_ref = try self.newRef(source, "member_field");
+                try self.set(source, field_ref, .fromLocation(slot));
+                return .fromLocation(field_ref.dereference().typed(field_.type_expr));
             },
-        ));
+        }
     }
 
     fn compileWaitMember(
@@ -3161,6 +3179,7 @@ pub const IRCompiler = struct {
         self: *IRCompiler,
         source: *ast.Expression,
         binary: ast.BinaryExpr,
+        mode: MemberMode,
     ) Error!Result {
         const member_name = switch (binary.right.*) {
             .identifier => |identifier| identifier,
@@ -3180,7 +3199,7 @@ pub const IRCompiler = struct {
             .object = binary.left,
             .member = member_name,
             .span = binary.span,
-        });
+        }, mode);
     }
 
     fn compileStringLiteral(
@@ -6238,6 +6257,19 @@ pub const IRCompiler = struct {
                     return .from(result_ref.dereference().typed(optional_string_type));
                 }
 
+                // Struct field assignment `p.x = v`: compile the value into a
+                // stable ref first (so evaluating it can't clobber the base
+                // register), then compile the target as an lvalue (raw slot) and
+                // write immediately — nothing runs between that could reset %r2.
+                if (binary.left.* == .binary and binary.left.binary.op == .member) {
+                    const value = try self.compileExpression(binary.right);
+                    const value_ref = try self.newRef(source, "field_assign_value");
+                    try self.set(source, value_ref, stableResultSource(value));
+                    const slot = try self.compileMemberBinary(source, binary.left.binary, .lvalue);
+                    try self.set(source, slot.source.location, .from(value_ref.dereference()));
+                    return .from(value_ref.dereference().typed(value.typeExpr()));
+                }
+
                 const left = try self.compileExpression(binary.left);
                 if (left.source == .location and binary.right.* == .binary) {
                     const right_binary = binary.right.binary;
@@ -6310,7 +6342,7 @@ pub const IRCompiler = struct {
                 try self.log(@src().fn_name ++ ": error, encountered {t} binary expression", .{binary.op});
                 try self.logEvaluateSpan(binary.span);
             },
-            .member => return self.compileMemberBinary(source, binary),
+            .member => return self.compileMemberBinary(source, binary, .read),
         }
 
         try self.reportSourceError(source, Error.UnsupportedBinaryOperation, .@"error", "binary operator \"{t}\" not yet supported", .{binary.op});

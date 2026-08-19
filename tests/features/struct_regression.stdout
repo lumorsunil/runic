@@ -3,3 +3,5 @@ widget x42
 to.x=3 to.y=4
 sum=7
 o.x=5 o.y=9
+p.x+q.x=13 p.y+q.y=24
+addX=13
