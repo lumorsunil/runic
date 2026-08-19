@@ -6134,6 +6134,23 @@ pub const IRCompiler = struct {
         };
     }
 
+    /// Compiles an operand of an arithmetic expression as a value. An operand
+    /// that produces output (a function call, UFCS method, pipeline, …) must be
+    /// *captured* so it yields its value rather than a fork/thread handle;
+    /// the captured value is stabilized into a fresh ref so a second capturing
+    /// operand can't clobber it (both would otherwise land in `%r`). A plain
+    /// binding/literal operand takes the cheap path.
+    fn compileArithmeticOperand(self: *IRCompiler, source: anytype, expr: *ast.Expression) Error!Result {
+        if (self.analyzeExpressionEffects(expr).needs_stdio_capture) {
+            const captured = try self.compileExpressionWithCapture(source, expr);
+            const type_expr = captured.typeExpr();
+            const ref = try self.newRef(source, "arith_operand");
+            try self.set(source, ref, stableResultSource(captured));
+            return .from(ref.dereference().typed(type_expr));
+        }
+        return (try self.compileExpression(expr)).dereference();
+    }
+
     fn compileBinary(
         self: *IRCompiler,
         source: anytype,
@@ -6143,8 +6160,8 @@ pub const IRCompiler = struct {
 
         switch (binary.op) {
             .add, .subtract, .multiply, .divide, .remainder => {
-                const left = (try self.compileExpression(binary.left)).dereference();
-                const right = (try self.compileExpression(binary.right)).dereference();
+                const left = try self.compileArithmeticOperand(source, binary.left);
+                const right = try self.compileArithmeticOperand(source, binary.right);
 
                 if (evaluateArithmetic(.from(binary.op), left.source, right.source)) |comptime_result| {
                     return .from(comptime_result);

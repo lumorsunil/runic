@@ -1,0 +1,29 @@
+# A function call (or UFCS method call) used directly as an arithmetic operand
+# must capture the function's yielded value, not leave a fork/thread handle.
+# Two such operands in one expression must each be stabilized so they don't
+# clobber a shared result register.
+fn Void @() Void
+
+fn Void five() Int { yield 5 }
+fn Void three() Int { yield 3 }
+
+# A single call as an operand.
+echo "five-1=${five - 1}"
+
+# Two calls in one expression.
+echo "five-three=${five - three}"
+echo "five*three=${five * three}"
+
+# UFCS method calls in arithmetic (receiver is a struct).
+const Point = struct { x: Int, y: Int }
+fn Void magSq(self: Point) Int { yield self.x * self.x + self.y * self.y }
+const p: Point = Point{ .x = 3, .y = 4 }
+const q: Point = Point{ .x = 1, .y = 2 }
+echo "p.magSq-q.magSq=${p.magSq - q.magSq}"
+
+# A UFCS call on a nested field receiver, twice in one expression (kept positive
+# — Int is unsigned, so the larger magnitude goes first).
+const Seg = struct { from: Point, to: Point }
+fn Void span(s: Seg) Int { yield s.from.magSq - s.to.magSq }
+const seg: Seg = Seg{ .from = p, .to = q }
+echo "span=${span seg}"
