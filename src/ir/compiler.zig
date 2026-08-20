@@ -1097,7 +1097,7 @@ pub const IRCompiler = struct {
     ) Error!void {
         const exit_code: ExitCode = @as(?ExitCode, switch (value.source) {
             .value => |v| switch (v) {
-                .uinteger => |x| .fromByte(@intCast(@mod(x, 256))),
+                .integer => |x| .fromByte(@intCast(@mod(x, 256))),
                 .exit_code => |exit_code| exit_code,
                 else => null,
             },
@@ -1265,7 +1265,7 @@ pub const IRCompiler = struct {
         args: []const []const u8,
     ) Error!ir.ValueSource {
         try self.alloc(null, args.len + 1);
-        try self.set(null, .initAbs(.{ .register = .r }, .{ .dereference = true }), .fromValue(.{ .uinteger = args.len }));
+        try self.set(null, .initAbs(.{ .register = .r }, .{ .dereference = true }), .fromValue(.{ .integer = @as(i64, @intCast(args.len)) }));
 
         const array_ref = try self.newRef(null, "script_args");
         try self.set(null, array_ref, .fromLocation(.initRegister(.r)));
@@ -1944,7 +1944,7 @@ pub const IRCompiler = struct {
         if (left.source != .value or right.source != .value) return false;
         return switch (left.source.value) {
             .null => right.source.value == .null,
-            .uinteger => |l| right.source.value == .uinteger and l == right.source.value.uinteger,
+            .integer => |l| right.source.value == .integer and l == right.source.value.integer,
             .float => |l| right.source.value == .float and l == right.source.value.float,
             .exit_code => |l| right.source.value == .exit_code and l.toBoolean() == right.source.value.exit_code.toBoolean(),
             .zig_string => |l| right.source.value == .zig_string and std.mem.eql(u8, l, right.source.value.zig_string),
@@ -1997,6 +1997,10 @@ pub const IRCompiler = struct {
                 break :blk switch (unary.op) {
                     .logical_not => if (operand.source.isValueTag(.exit_code))
                         Result.fromValue(.fromBoolean(!operand.source.value.exit_code.toBoolean()))
+                    else
+                        null,
+                    .negate => if (evaluateArithmetic(.sub, .fromValue(.{ .integer = 0 }), operand.source)) |folded|
+                        Result.fromValue(folded)
                     else
                         null,
                 };
@@ -3220,7 +3224,7 @@ pub const IRCompiler = struct {
         try self.set(
             source,
             .initAbs(.{ .register = .r }, .{ .dereference = true }),
-            .fromValue(.{ .uinteger = string_literal.segments.len }),
+            .fromValue(.{ .integer = @as(i64, @intCast(string_literal.segments.len)) }),
         );
         try self.set(source, ref, .fromLocation(.initRegister(.r)));
         // const s_tream = try self.allocator.alloc(ir.Value, string_literal.segments.len);
@@ -3334,7 +3338,7 @@ pub const IRCompiler = struct {
     }
 
     fn parseInt(text: []const u8) std.fmt.ParseIntError!ir.Value {
-        return .{ .uinteger = try std.fmt.parseInt(usize, text, 10) };
+        return .{ .integer = try std.fmt.parseInt(i64, text, 10) };
     }
 
     fn parseFloat(text: []const u8) std.fmt.ParseFloatError!ir.Value {
@@ -3584,7 +3588,7 @@ pub const IRCompiler = struct {
             .value => |v| switch (v) {
                 .executable => self.compileExecutableCall(source, v, call.arguments, call.redirects),
                 .fn_ref => self.compileFunctionCall(source, v, call.arguments, call.redirects, null),
-                .slice, .stream, .addr, .void, .null, .uinteger, .float, .strct, .exit_code, .pipe, .thread, .closeable, .err => .from(v),
+                .slice, .stream, .addr, .void, .null, .integer, .float, .strct, .exit_code, .pipe, .thread, .closeable, .err => .from(v),
                 .zig_string => Error.UnsupportedValueType,
             },
             .location => |loc| .from(loc),
@@ -4053,7 +4057,7 @@ pub const IRCompiler = struct {
             try self.push(source, arg.source);
         }
         try self.push(source, .from(executable));
-        try self.push(source, .fromValue(.{ .uinteger = arguments.len }));
+        try self.push(source, .fromValue(.{ .integer = @as(i64, @intCast(arguments.len)) }));
 
         const exec_handle = try self.exec_(source, arguments.len, false);
         const exec_handle_ref = try self.newRef(source, "exec_handle");
@@ -6052,6 +6056,17 @@ pub const IRCompiler = struct {
                 const negated = try self.neg(source, result.source.location, .initRegister(.r));
                 return .from(negated.typed(.{ .boolean = .{ .span = .global } }));
             },
+            // `-x` is `0 - x` — works for Int and Float via the arithmetic path.
+            .negate => {
+                const operand = try self.compileArithmeticOperand(source, unary.operand);
+                const zero = ir.ValueSource.fromValue(.{ .integer = 0 });
+                if (evaluateArithmetic(.sub, zero, operand.source)) |folded| {
+                    return .from(folded);
+                }
+                const ref = try self.newRef(source, "neg_result");
+                try self.ath(source, .subtract, zero, operand.source, ref);
+                return .from(ref.dereference());
+            },
         }
     }
 
@@ -6389,7 +6404,7 @@ pub const IRCompiler = struct {
         array: ast.ArrayLiteral,
     ) Error!Result {
         try self.alloc(source, array.elements.len + 1);
-        try self.set(source, .initAbs(.{ .register = .r }, .{ .dereference = true }), .fromValue(.{ .uinteger = array.elements.len }));
+        try self.set(source, .initAbs(.{ .register = .r }, .{ .dereference = true }), .fromValue(.{ .integer = @as(i64, @intCast(array.elements.len)) }));
         const array_ref = try self.newRef(source, "array");
         try self.set(source, array_ref, .fromLocation(.initRegister(.r)));
         var element_type: ?ast.TypeExpr = null;
@@ -6454,8 +6469,8 @@ pub const IRCompiler = struct {
                         range_limit_ref = range_limit_ref_;
                     }
                     if (range.inclusive_end) {
-                        try self.ath(source, .add, .from(range_limit_ref.?.dereference()), .fromValue(.{ .uinteger = 1 }), range_limit_ref.?);
-                        try self.ath(source, .add, .from(len_ref.?.dereference()), .fromValue(.{ .uinteger = 1 }), len_ref.?);
+                        try self.ath(source, .add, .from(range_limit_ref.?.dereference()), .fromValue(.{ .integer = 1 }), range_limit_ref.?);
+                        try self.ath(source, .add, .from(len_ref.?.dereference()), .fromValue(.{ .integer = 1 }), len_ref.?);
                     }
                 }
 
@@ -7089,7 +7104,7 @@ pub const IRCompiler = struct {
         }
 
         const counter_ref = try self.newRef(source, "for_counter");
-        try self.set(source, counter_ref, .fromValue(.{ .uinteger = 0 }));
+        try self.set(source, counter_ref, .fromValue(.{ .integer = 0 }));
         const iterations_ref = try self.compileForIterationsRef(source, for_sources) orelse {
             try self.reportSourceError(source, Error.NotImplemented, .@"error", "for loops require at least one finite source", .{});
             return .fromValue(.void);
@@ -7155,7 +7170,7 @@ pub const IRCompiler = struct {
             source,
             .add,
             .from(counter_ref.dereference()),
-            .fromValue(.{ .uinteger = 1 }),
+            .fromValue(.{ .integer = 1 }),
             counter_ref,
         );
         try self.jmp(source, null, true, for_label);
@@ -7263,7 +7278,7 @@ pub const IRCompiler = struct {
     ) Error!Result {
         const iter_ref = try self.newRef(source, "for_counter");
         if (for_source.zero_based_range) {
-            try self.set(source, iter_ref, .fromValue(.{ .uinteger = 0 }));
+            try self.set(source, iter_ref, .fromValue(.{ .integer = 0 }));
         } else {
             try self.set(source, iter_ref, .from(for_source.start_ref.?.dereference()));
         }
@@ -7367,7 +7382,7 @@ pub const IRCompiler = struct {
             source,
             .add,
             .from(iter_ref.dereference()),
-            .fromValue(.{ .uinteger = 1 }),
+            .fromValue(.{ .integer = 1 }),
             iter_ref,
         );
         try self.jmp(source, null, true, for_label);

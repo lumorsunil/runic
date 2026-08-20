@@ -1054,21 +1054,29 @@ pub const UnaryExpr = struct {
     span: Span,
 
     pub fn resolveType(
-        _: *@This(),
-        _: std.Io,
-        _: std.mem.Allocator,
-        _: *semantic.Scope,
+        self: *@This(),
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        scope: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
-        return null;
+        return switch (self.op) {
+            // `-x` has the operand's numeric type; `!x` is a Bool.
+            .negate => self.operand.resolveType(io, allocator, scope),
+            .logical_not => &boolTypeExpr,
+        };
     }
 };
 
+const boolTypeExpr = TypeExpr{ .boolean = .{ .span = .global } };
+
 pub const UnaryOp = enum {
     logical_not,
+    negate,
 
     pub fn fromToken(tok: token.Token) ?@This() {
         return switch (tok.tag) {
             .bang => .logical_not,
+            .minus => .negate,
             else => null,
         };
     }

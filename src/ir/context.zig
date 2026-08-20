@@ -569,7 +569,7 @@ test "shared heap allocates dense contiguous storage" {
     try std.testing.expectEqual(@as(usize, 0), base.addr);
     try std.testing.expectEqual(@as(usize, 3), shared.heap.items.len);
 
-    shared.heapGetPtr(1).?.* = .{ .uinteger = 42 };
-    try std.testing.expectEqual(@as(?Value, .{ .uinteger = 42 }), shared.heapGet(1));
+    shared.heapGetPtr(1).?.* = .{ .integer = 42 };
+    try std.testing.expectEqual(@as(?Value, .{ .integer = 42 }), shared.heapGet(1));
     try std.testing.expectEqual(@as(?Value, null), shared.heapGet(99));
 }

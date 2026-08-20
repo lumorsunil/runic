@@ -69,12 +69,16 @@ Infrastructure
 Ordered by dependency. Correctness first (it unblocks everything and needs no
 new syntax), then the primitives the stdlib is actually made of.
 
-- [ ] **Phase 0 — Correctness foundation.** No new syntax; fixes existing crashes.
-  - Signed `Int` (`i64`) — runtime `Value` int representation + arithmetic/compare
-    + literal lexing of `-1`; keep array indices/lengths well-defined.
-  - Fix function-value call: `const f = dbl; f x`.
-  - Fix recursion + arithmetic (`n + f(n - 1)`).
-  - Fix typed array element access: `xs: []Int` ⇒ `xs[i] : Int`.
+- [~] **Phase 0 — Correctness foundation.** No new syntax; fixes existing crashes.
+  - [x] **Signed `Int` (`i64`) — DONE.** `Value.integer` is now `i64` (renamed
+    from `uinteger: usize`); usize-consumption sites (lengths, indices, addr
+    offsets, argv, heap len) cast explicitly; `parseInt`/literal parse read `i64`.
+    Added **unary negation** (`-x` → `0 - x`, folds at comptime) with `UnaryOp.negate`
+    (Int/Float). Tests: `signed_int_regression`; `call_in_arithmetic_regression`
+    updated to a negative result.
+  - [ ] Fix function-value call: `const f = dbl; f x`.
+  - [ ] Fix recursion + arithmetic (`n + f(n - 1)`).
+  - [ ] Fix typed array element access: `xs: []Int` ⇒ `xs[i] : Int`.
   - Regression tests for each.
 
 - [ ] **Phase 1 — Strings.** The heart of the stdlib. Needs Phase 0 for indices.

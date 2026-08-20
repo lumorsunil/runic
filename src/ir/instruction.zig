@@ -173,7 +173,7 @@ pub const Instruction = struct {
         /// blocks (retries) until the stdin pipe signals completion (keep_open=false).
         /// stores the result in %r.
         collect_stdin,
-        /// parses the string in %r into an Int (uinteger) value, trimming
+        /// parses the string in %r into an Int (integer) value, trimming
         /// surrounding whitespace. stores the result in %r. invalid input is a
         /// runtime error.
         parse_int,
