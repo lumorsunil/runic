@@ -97,14 +97,25 @@ new syntax), then the primitives the stdlib is actually made of.
 
   **Phase 0 COMPLETE.** Full CI green (13/13, 42 diag, 8 examples, 113 smoke, 3 strict).
 
-- [ ] **Phase 1 — Strings.** The heart of the stdlib. Needs Phase 0 for indices.
-  - Byte-level string builtins (Zig): `len`, `slice`/`substring`, `indexOf`,
-    `split`, `join`, `trim`/`trimStart`/`trimEnd`, `upper`, `lower`, `replace`,
-    `contains`, `startsWith`, `endsWith`. Decide `chars` vs `bytes` (UTF-8?).
-  - Surface as UFCS methods (`s.len`, `s.split ","`).
-  - Pipeline↔param coercion (decision 2) so a 1-param `String→String` function is
-    a pipeline stage; makes the string methods pipeline-usable.
-  - (Optional) string `+` concatenation, or keep interpolation as the concat tool.
+- [~] **Phase 1 — Strings.** The heart of the stdlib.
+  - [x] **String builtins — DONE.** Byte-level ops via a new `str_op` IR
+    instruction, surfaced as UFCS methods (`s.len`, `s.split ","`): `len`,
+    `indexOf` (Int); `contains`/`startsWith`/`endsWith` (Bool);
+    `upper`/`lower`/`trim`/`trimStart`/`trimEnd`/`slice`/`repeat`/`replace`
+    (String); `split` (→ real `[]String` heap array) and `join` (`[]String` →
+    String). They chain (`s.trim.upper`) and work on String params. Dispatch:
+    no-arg in `compileMember`, with-args in `compileCall`, keyed by a
+    `stringBuiltin(name)` table; `len` only intercepts a string receiver so
+    arrays keep their own `.len`. Currently **byte**-oriented (not UTF-8-aware).
+    Tests: `string_builtins_regression`, `string_split_join_regression`.
+  - [ ] **Pipeline↔param coercion (decision 2) — DEFERRED.** Bounded type-checker
+    change (accept a 1-param Void-stdin function whose param matches the upstream
+    stdout), but a substantial compiler change (a param-taking function reads its
+    parameter, not stdin, so making it a *streaming* pipeline stage means feeding
+    the incoming pipe value into the parameter). Its own feature; strings are
+    fully usable via UFCS/interpolation without it.
+  - String `+` concatenation: not added; interpolation (`"${a}${b}"`) is the
+    concat tool.
 
 - [ ] **Phase 2 — Higher-order functions + generics.** Composability.
   - Function values (overlaps Phase 0): a function bound to a value and called.
