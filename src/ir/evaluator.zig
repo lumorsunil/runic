@@ -1276,6 +1276,26 @@ pub const IREvaluator = struct {
                 return .cont;
             },
             .str_op => |str_op| {
+                // `join`'s receiver is an array of strings, not a string, so it
+                // is handled before materializing the operand.
+                if (str_op.op == .join) {
+                    const arr = try self.resolveValueSource(thread, str_op.operand);
+                    const base = arr.addr;
+                    const count: usize = @intCast(thread.shared.heapGet(base).?.integer);
+                    var jsep = std.Io.Writer.Allocating.init(self.allocator);
+                    defer jsep.deinit();
+                    try self.materializeString(thread, try self.resolveValueSource(thread, str_op.arg0), &jsep.writer);
+                    const sep = jsep.written();
+                    var out = std.Io.Writer.Allocating.init(self.allocator);
+                    defer out.deinit();
+                    for (0..count) |i| {
+                        if (i > 0) try out.writer.writeAll(sep);
+                        try self.materializeString(thread, thread.shared.heapGet(base + 1 + i).?, &out.writer);
+                    }
+                    try self.setLocation(thread, str_op.result, .{ .zig_string = try self.allocator.dupe(u8, out.written()) });
+                    return .cont;
+                }
+
                 var sbuf = std.Io.Writer.Allocating.init(self.allocator);
                 defer sbuf.deinit();
                 try self.materializeString(thread, try self.resolveValueSource(thread, str_op.operand), &sbuf.writer);
@@ -1332,6 +1352,32 @@ pub const IREvaluator = struct {
                         _ = std.mem.replace(u8, s, needle, with, out);
                         break :blk ir.Value{ .zig_string = out };
                     },
+                    .split => blk: {
+                        var sepbuf = std.Io.Writer.Allocating.init(self.allocator);
+                        defer sepbuf.deinit();
+                        try self.materializeString(thread, try self.resolveValueSource(thread, str_op.arg0), &sepbuf.writer);
+                        const sep = sepbuf.written();
+
+                        var parts = std.ArrayList([]const u8).empty;
+                        defer parts.deinit(self.allocator);
+                        if (sep.len == 0) {
+                            try parts.append(self.allocator, s);
+                        } else {
+                            var it = std.mem.splitSequence(u8, s, sep);
+                            while (it.next()) |part| try parts.append(self.allocator, part);
+                        }
+
+                        // Build a runtime array: slot 0 = length, slots 1.. = the
+                        // (owned) string parts.
+                        const base_val = try thread.shared.alloc(self.allocator, parts.items.len + 1);
+                        const base = base_val.addr;
+                        thread.shared.heapGetPtr(base).?.* = .{ .integer = @intCast(parts.items.len) };
+                        for (parts.items, 0..) |part, i| {
+                            thread.shared.heapGetPtr(base + 1 + i).?.* = .{ .zig_string = try self.allocator.dupe(u8, part) };
+                        }
+                        break :blk base_val;
+                    },
+                    .join => unreachable, // handled above
                 };
                 try self.setLocation(thread, str_op.result, result);
                 return .cont;

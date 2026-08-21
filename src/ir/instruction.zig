@@ -356,6 +356,8 @@ pub const Instruction = struct {
             slice,
             repeat,
             replace,
+            split,
+            join,
         };
 
         pub fn format(self: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {

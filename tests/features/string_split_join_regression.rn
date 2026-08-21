@@ -1,0 +1,21 @@
+# String split/join (stdlib Phase 1): `s.split sep` returns a real []String
+# array (len/index/iterate all work); `arr.join sep` concatenates an array of
+# strings with a separator. They roundtrip.
+fn Void @() Void
+
+const parts = "a,b,c,d".split ","
+echo "len=${parts.len}"
+echo "at0=${parts[0]} at2=${parts[2]}"
+for (parts) |p| { echo "part: ${p}" }
+
+# Empty separator yields the whole string as one element.
+const whole = "abc".split ""
+echo "whole.len=${whole.len} whole0=${whole[0]}"
+
+# join.
+const words = .{ "the", "quick", "fox" }
+echo "joined=${words.join " "}"
+
+# split then join roundtrip with a different separator.
+const p2 = "one,two,three".split ","
+echo "rejoined=${p2.join " | "}"
