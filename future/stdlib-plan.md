@@ -76,10 +76,22 @@ new syntax), then the primitives the stdlib is actually made of.
     Added **unary negation** (`-x` → `0 - x`, folds at comptime) with `UnaryOp.negate`
     (Int/Float). Tests: `signed_int_regression`; `call_in_arithmetic_regression`
     updated to a negative result.
-  - [ ] Fix function-value call: `const f = dbl; f x`.
-  - [ ] Fix recursion + arithmetic (`n + f(n - 1)`).
-  - [ ] Fix typed array element access: `xs: []Int` ⇒ `xs[i] : Int`.
-  - Regression tests for each.
+  - [x] **Function-value call — DONE.** `const f = dbl` binds a function
+    reference (a zero-arg reference to a parameter-taking function is a value, not
+    a call); `f x` calls it. Handled in `compileCall` dispatch,
+    `tryCompileTypedValueCapture`, and `callNeedsStdioCapture` via
+    `InstructionSet.param_count`. Test: `function_value_regression`.
+  - [x] **Typed array element access — DONE.** `BinaryExpr.resolveType` resolves
+    `xs[i]` to the element type. Test: `typed_array_param_regression`.
+  - [ ] **Recursion returning a value — STILL BROKEN (deep, isolated).**
+    Typed-value capture of a **self-recursive** call fails: `const r = f(n-1)`
+    inside `f` crashes ("Could not dereference address 0x11"), and `yield f(n-1)`
+    yields empty. Root cause is the interaction of `compileFunctionCall`'s
+    self-recursive closure-copy path with the typed-capture pipe/fork/dequeue
+    wrapper — not arithmetic-specific. Never surfaced before because the only
+    recursion in tests (`recursive_regression`) is nullary and side-effecting (no
+    captured return). Needs a focused fix in the capture machinery; deferred as
+    its own task.
 
 - [ ] **Phase 1 — Strings.** The heart of the stdlib. Needs Phase 0 for indices.
   - Byte-level string builtins (Zig): `len`, `slice`/`substring`, `indexOf`,
