@@ -83,15 +83,19 @@ new syntax), then the primitives the stdlib is actually made of.
     `InstructionSet.param_count`. Test: `function_value_regression`.
   - [x] **Typed array element access — DONE.** `BinaryExpr.resolveType` resolves
     `xs[i]` to the element type. Test: `typed_array_param_regression`.
-  - [ ] **Recursion returning a value — STILL BROKEN (deep, isolated).**
-    Typed-value capture of a **self-recursive** call fails: `const r = f(n-1)`
-    inside `f` crashes ("Could not dereference address 0x11"), and `yield f(n-1)`
-    yields empty. Root cause is the interaction of `compileFunctionCall`'s
-    self-recursive closure-copy path with the typed-capture pipe/fork/dequeue
-    wrapper — not arithmetic-specific. Never surfaced before because the only
-    recursion in tests (`recursive_regression`) is nullary and side-effecting (no
-    captured return). Needs a focused fix in the capture machinery; deferred as
-    its own task.
+  - [x] **Recursion returning a value — DONE.** Two fixes: (1) seed
+    `closure_slot_count` with the parameter count at the *start* of `compileFnDecl`
+    so a recursive fork emitted mid-body (from a value-capture wrapper, where
+    `is_self_recursive` is false and the final count isn't set yet) allocates a
+    closure large enough for the args — the previous `alloc 0` wrote the argument
+    past a zero-size closure ("deref 0x11"); (2) give the self-visible function
+    binding a `.function` type carrying its return type, so a recursive call is
+    value-captured *by type* (`const r = f(n-1)` keeps `r` typed) instead of
+    byte-flattened to a string (which broke `n + f(n-1)`). Now `sumTo`/`fact`/
+    `fib` all work, including two recursive calls in one expression. Test:
+    `recursion_value_regression`.
+
+  **Phase 0 COMPLETE.** Full CI green (13/13, 42 diag, 8 examples, 113 smoke, 3 strict).
 
 - [ ] **Phase 1 — Strings.** The heart of the stdlib. Needs Phase 0 for indices.
   - Byte-level string builtins (Zig): `len`, `slice`/`substring`, `indexOf`,

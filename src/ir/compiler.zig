@@ -5900,11 +5900,25 @@ pub const IRCompiler = struct {
         try self.scopes.push(self.allocator, .closure);
 
         if (fn_decl.name) |name| {
+            // Give the (self-visible) function binding a `.function` type carrying
+            // its return type, so a recursive call in the body can be value-captured
+            // by type (`const rest = cd (n - 1)` keeps `rest` typed as the return,
+            // usable in arithmetic — not byte-flattened to a string).
+            const param_types = try self.allocator.alloc(?*const ast.TypeExpr, fn_decl.params._non_variadic.len);
+            for (fn_decl.params._non_variadic, param_types) |param, *pt| {
+                pt.* = param.type_annotation;
+            }
+            const fn_type = ast.TypeExpr{ .function = .{
+                .params = .{ ._non_variadic = param_types },
+                .stdin_type = fn_decl.stdin_type,
+                .return_type = fn_decl.return_type,
+                .span = fn_decl.span,
+            } };
             try self.scopes.declare(
                 self.allocator,
                 name.name,
                 try .from(fn_ref),
-                null,
+                fn_type,
                 false,
                 .normal,
             );
@@ -5940,6 +5954,13 @@ pub const IRCompiler = struct {
                 },
             }
         }
+
+        // Seed the closure slot count with the parameters so a recursive call
+        // compiled *inside the body* (e.g. a value-captured `cd (n - 1)`, whose
+        // fork is emitted from a nested capture wrapper where `is_self_recursive`
+        // is false) allocates a closure large enough for the arguments. The final
+        // count (params + captured closure variables) is set after the body.
+        self.currentInstrSet().closure_slot_count = fn_decl.params._non_variadic.len;
 
         // TODO: closure bindings, how do we manage them (non-parameters)?
         // TODO: figure out how to be able to call async functions multiple times and have the result not be overwritten in a ref
