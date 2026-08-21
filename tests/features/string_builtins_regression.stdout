@@ -11,6 +11,7 @@ indexOf o = 4
 indexOf zz = -1
 slice(0,5)=Hello
 ab x3=ababab
+replace=a/b/c
 chained=[SPACED OUT]
 len*2=24
 shout=QUIET

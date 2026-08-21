@@ -27,6 +27,9 @@ echo "indexOf zz = ${s.indexOf "zz"}"
 echo "slice(0,5)=${s.slice 0 5}"
 echo "ab x3=${"ab".repeat 3}"
 
+# Replace all occurrences.
+echo "replace=${"a.b.c".replace "." "/"}"
+
 # Chaining, typed results, and method on a String param.
 echo "chained=[${padded.trim.upper}]"
 const n: Int = s.len

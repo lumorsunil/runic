@@ -1317,6 +1317,21 @@ pub const IREvaluator = struct {
                         for (0..n) |i| @memcpy(out[i * s.len ..][0..s.len], s);
                         break :blk ir.Value{ .zig_string = out };
                     },
+                    .replace => blk: {
+                        var nbuf = std.Io.Writer.Allocating.init(self.allocator);
+                        defer nbuf.deinit();
+                        var hbuf = std.Io.Writer.Allocating.init(self.allocator);
+                        defer hbuf.deinit();
+                        try self.materializeString(thread, try self.resolveValueSource(thread, str_op.arg0), &nbuf.writer);
+                        try self.materializeString(thread, try self.resolveValueSource(thread, str_op.arg1), &hbuf.writer);
+                        const needle = nbuf.written();
+                        const with = hbuf.written();
+                        if (needle.len == 0) break :blk ir.Value{ .zig_string = try self.allocator.dupe(u8, s) };
+                        const count = std.mem.count(u8, s, needle);
+                        const out = try self.allocator.alloc(u8, s.len - needle.len * count + with.len * count);
+                        _ = std.mem.replace(u8, s, needle, with, out);
+                        break :blk ir.Value{ .zig_string = out };
+                    },
                 };
                 try self.setLocation(thread, str_op.result, result);
                 return .cont;

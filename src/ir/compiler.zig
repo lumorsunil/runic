@@ -4304,6 +4304,7 @@ pub const IRCompiler = struct {
         if (eql(u8, name, "indexOf")) return .{ .op = .index_of, .arity = 1, .result = int_t, .string_only_receiver = false };
         if (eql(u8, name, "slice")) return .{ .op = .slice, .arity = 2, .result = string_type, .string_only_receiver = false };
         if (eql(u8, name, "repeat")) return .{ .op = .repeat, .arity = 1, .result = string_type, .string_only_receiver = false };
+        if (eql(u8, name, "replace")) return .{ .op = .replace, .arity = 2, .result = string_type, .string_only_receiver = false };
         return null;
     }
 
