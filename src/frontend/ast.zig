@@ -1169,6 +1169,16 @@ pub const BinaryExpr = struct {
                     else => break :blk null,
                 }
             },
+            // `xs[i]` yields the array's element type, not the array type.
+            .array_access => blk: {
+                const lt = left_type orelse break :blk null;
+                var resolved = lt;
+                while (resolved.* == .alias) resolved = resolved.alias.type_expr;
+                break :blk switch (resolved.*) {
+                    .array => |array| array.element,
+                    else => null,
+                };
+            },
             else => left_type,
         };
     }

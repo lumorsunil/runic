@@ -484,6 +484,10 @@ const Scope = struct {
 const InstructionSet = struct {
     instructions: std.ArrayList(ir.Instruction) = .empty,
     frames: std.ArrayList(StackFrame) = .empty,
+    /// Number of declared parameters (for `_non_variadic`). Lets a zero-arg
+    /// reference to a parameter-taking function resolve to a function *value*
+    /// (`const f = dbl`) instead of being called with no arguments.
+    param_count: usize = 0,
     closure_slot_count: usize = 0,
     closure_captures: []const ClosureCapture = &.{},
     pub_exports: []const PubExport = &.{},
@@ -2165,6 +2169,13 @@ pub const IRCompiler = struct {
         const return_type_ptr = fn_type.function.return_type orelse return null;
         if (!self.isTypedCaptureReturn(return_type_ptr)) return null;
         const fn_ref_value = binding.result.source.value;
+        // A zero-arg reference to a function that declares parameters is a
+        // function *value* (`const f = dbl`), not a call to capture.
+        if (info.arguments.len == 0 and
+            self.instruction_sets.items[fn_ref_value.fn_ref.fn_addr.instr_set].param_count > 0)
+        {
+            return null;
+        }
         // pub exports change the call's result shape (a struct, already waited);
         // keep those on the existing path.
         if (self.instruction_sets.items[fn_ref_value.fn_ref.fn_addr.instr_set].pub_exports.len != 0) return null;
@@ -3587,7 +3598,14 @@ pub const IRCompiler = struct {
         return switch (callee.source) {
             .value => |v| switch (v) {
                 .executable => self.compileExecutableCall(source, v, call.arguments, call.redirects),
-                .fn_ref => self.compileFunctionCall(source, v, call.arguments, call.redirects, null),
+                // A zero-arg reference to a function that declares parameters is a
+                // function *value* (`const f = dbl`), not a call — yield the fn_ref
+                // so it can be called later (`f x`). A nullary function is called.
+                .fn_ref => if (call.arguments.len == 0 and call.redirects.len == 0 and
+                    self.instruction_sets.items[v.fn_ref.fn_addr.instr_set].param_count > 0)
+                    .from(v)
+                else
+                    self.compileFunctionCall(source, v, call.arguments, call.redirects, null),
                 .slice, .stream, .addr, .void, .null, .integer, .float, .strct, .exit_code, .pipe, .thread, .closeable, .err => .from(v),
                 .zig_string => Error.UnsupportedValueType,
             },
@@ -5898,6 +5916,7 @@ pub const IRCompiler = struct {
         try self.stdin_type_stack.append(self.allocator, if (fn_decl.stdin_type) |st| st.* else null);
         defer _ = self.stdin_type_stack.pop();
 
+        self.instruction_sets.items[instr_set].param_count = fn_decl.params._non_variadic.len;
         for (fn_decl.params._non_variadic) |param| {
             switch (param.pattern.*) {
                 .discard => {},
@@ -7433,6 +7452,13 @@ pub const IRCompiler = struct {
         };
     }
 
+    /// The declared parameter count of a fn_ref value source, or null if the
+    /// source isn't a compile-time fn_ref.
+    fn fnRefParamCount(self: *IRCompiler, source: ir.ValueSource) ?usize {
+        if (source != .value or source.value != .fn_ref) return null;
+        return self.instruction_sets.items[source.value.fn_ref.fn_addr.instr_set].param_count;
+    }
+
     fn callNeedsStdioCapture(self: *IRCompiler, call: ast.CallExpr) bool {
         if (call.arguments.len != 0 or call.redirects.len != 0 or call.background) {
             return true;
@@ -7449,7 +7475,11 @@ pub const IRCompiler = struct {
                 // *function* call also produces output to capture in a value
                 // context; a known *variable* read must NOT be captured.
                 const binding = self.lookup(identifier.name, .{ .shallow = false }) orelse break :blk true;
-                break :blk binding.result.isFunctionRef();
+                if (!binding.result.isFunctionRef()) break :blk false;
+                // A zero-arg reference to a function that declares parameters is
+                // a function *value* (`const f = dbl`), not a call — no output.
+                if (self.fnRefParamCount(binding.result.source)) |pc| if (pc > 0) break :blk false;
+                break :blk true;
             },
             else => true,
         };
