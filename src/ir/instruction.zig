@@ -110,6 +110,9 @@ pub const Instruction = struct {
         /// sets result to a boolean: whether operand's runtime value is of the
         /// given type tag (the `x is T` operator / sum narrowing)
         is_type: IsType,
+        /// applies a string builtin (`s.len`, `s.upper`, `s.contains "x"`, …) to
+        /// the operand string, with up to two arguments, storing the result.
+        str_op: StrOp,
         /// constructs an error value (boxing the runtime payload, if any)
         make_err: MakeErr,
         /// sets result to a boolean: whether operand is an error value whose
@@ -330,6 +333,33 @@ pub const Instruction = struct {
         operand: Location,
         tag: TypeTag,
         result: Location,
+    };
+
+    pub const StrOp = struct {
+        op: Op,
+        operand: ValueSource,
+        arg0: ValueSource,
+        arg1: ValueSource,
+        result: Location,
+
+        pub const Op = enum {
+            len,
+            upper,
+            lower,
+            trim,
+            trim_start,
+            trim_end,
+            contains,
+            starts_with,
+            ends_with,
+            index_of,
+            slice,
+            repeat,
+        };
+
+        pub fn format(self: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
+            try w.print("{f} = str.{t}({f}, {f}, {f})", .{ self.result, self.op, self.operand, self.arg0, self.arg1 });
+        }
     };
 
     pub fn BinaryOperation(comptime OpType: type) type {

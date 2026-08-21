@@ -2896,6 +2896,21 @@ pub const IRCompiler = struct {
         }
 
         const object = try self.compileExpression(member.object);
+
+        // String builtins with no arguments (`s.len`, `s.upper`, `s.trim`, …).
+        // `len` also names an array's length, so it only applies to a string
+        // receiver; the transform/predicate names apply to any (materialized)
+        // value. A string may be untyped (a bare literal), so a missing type is
+        // treated as a string here.
+        if (stringBuiltin(member.member.name)) |sb| {
+            if (sb.arity == 0) {
+                const obj_is_string = if (object.typeExpr()) |t| self.typeIsString(t) else true;
+                if (!sb.string_only_receiver or obj_is_string) {
+                    return self.compileStrOp(source, object, sb, &.{});
+                }
+            }
+        }
+
         const object_type = object.typeExpr() orelse {
             try self.reportSourceError(
                 source,
@@ -3586,6 +3601,18 @@ pub const IRCompiler = struct {
             }
         }
 
+        // String builtins with arguments (`s.contains "x"`, `s.slice 1 3`, …) —
+        // a `.member` callee naming a string builtin with a matching arity. Wins
+        // over UFCS for these reserved names.
+        if (call.callee.* == .binary and call.callee.binary.op == .member and call.callee.binary.right.* == .identifier and call.redirects.len == 0) {
+            if (stringBuiltin(call.callee.binary.right.identifier.name)) |sb| {
+                if (sb.arity == @as(u8, @intCast(call.arguments.len)) and sb.arity > 0) {
+                    const object = try self.compileExpression(call.callee.binary.left);
+                    return self.compileStrOp(source, object, sb, call.arguments);
+                }
+            }
+        }
+
         // UFCS method call: `recv.method args…` ≡ `method(recv, args…)` when
         // `method` is a function in scope. (A field wouldn't be callable with
         // args, so the method wins in call position.)
@@ -4248,6 +4275,77 @@ pub const IRCompiler = struct {
     /// `method` names a function in scope. Returns null when there is no such
     /// function (so the caller falls back to field access / its normal path).
     /// The receiver AST node is reused as arg 0, so it is evaluated exactly once.
+    const StringBuiltin = struct {
+        op: ir.Instruction.StrOp.Op,
+        arity: u8,
+        result: ast.TypeExpr,
+        /// Only applies to string receivers (e.g. `len`, which also names the
+        /// array length). String-only names (`upper`, `contains`, …) apply to
+        /// any receiver, materialized to bytes.
+        string_only_receiver: bool,
+    };
+
+    /// Maps a method name to its string-builtin descriptor (UFCS over Zig string
+    /// ops), or null. Result types: `Int` for len/indexOf, `Bool` for the
+    /// predicates, `String` for the transforms.
+    fn stringBuiltin(name: []const u8) ?StringBuiltin {
+        const int_t = ast.TypeExpr.global(.integer);
+        const bool_t = ast.TypeExpr.global(.boolean);
+        const eql = std.mem.eql;
+        if (eql(u8, name, "len")) return .{ .op = .len, .arity = 0, .result = int_t, .string_only_receiver = true };
+        if (eql(u8, name, "upper")) return .{ .op = .upper, .arity = 0, .result = string_type, .string_only_receiver = false };
+        if (eql(u8, name, "lower")) return .{ .op = .lower, .arity = 0, .result = string_type, .string_only_receiver = false };
+        if (eql(u8, name, "trim")) return .{ .op = .trim, .arity = 0, .result = string_type, .string_only_receiver = false };
+        if (eql(u8, name, "trimStart")) return .{ .op = .trim_start, .arity = 0, .result = string_type, .string_only_receiver = false };
+        if (eql(u8, name, "trimEnd")) return .{ .op = .trim_end, .arity = 0, .result = string_type, .string_only_receiver = false };
+        if (eql(u8, name, "contains")) return .{ .op = .contains, .arity = 1, .result = bool_t, .string_only_receiver = false };
+        if (eql(u8, name, "startsWith")) return .{ .op = .starts_with, .arity = 1, .result = bool_t, .string_only_receiver = false };
+        if (eql(u8, name, "endsWith")) return .{ .op = .ends_with, .arity = 1, .result = bool_t, .string_only_receiver = false };
+        if (eql(u8, name, "indexOf")) return .{ .op = .index_of, .arity = 1, .result = int_t, .string_only_receiver = false };
+        if (eql(u8, name, "slice")) return .{ .op = .slice, .arity = 2, .result = string_type, .string_only_receiver = false };
+        if (eql(u8, name, "repeat")) return .{ .op = .repeat, .arity = 1, .result = string_type, .string_only_receiver = false };
+        return null;
+    }
+
+    /// True when a compile-time type denotes the string type (`[]Byte`).
+    fn typeIsString(_: *IRCompiler, type_expr: ast.TypeExpr) bool {
+        var t = type_expr;
+        while (t == .alias) t = t.alias.type_expr.*;
+        return t == .array and t.array.element.* == .byte;
+    }
+
+    /// Compiles a string builtin: stabilizes the receiver (operand) and its args,
+    /// then emits a `str_op`. The receiver is already compiled (`object`); `args`
+    /// are the (0–2) argument expressions.
+    fn compileStrOp(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        object: Result,
+        sb: StringBuiltin,
+        args: []const *ast.Expression,
+    ) Error!Result {
+        const operand_ref = try self.newRef(source, "str_operand");
+        try self.set(source, operand_ref, stableResultSource(object));
+
+        var arg_sources = [_]ir.ValueSource{ .fromValue(.void), .fromValue(.void) };
+        for (args, 0..) |arg, i| {
+            const arg_result = try self.compileExpression(arg);
+            const arg_ref = try self.newRef(source, "str_arg");
+            try self.set(source, arg_ref, stableResultSource(arg_result));
+            arg_sources[i] = .from(arg_ref.dereference());
+        }
+
+        const result_ref = try self.newRef(source, "str_result");
+        try self.addInstruction(.init(.from(source), .{ .str_op = .{
+            .op = sb.op,
+            .operand = .from(operand_ref.dereference()),
+            .arg0 = arg_sources[0],
+            .arg1 = arg_sources[1],
+            .result = result_ref.dereference(),
+        } }));
+        return .fromLocation(result_ref.dereference().typed(sb.result));
+    }
+
     fn tryUfcsRewrite(
         self: *IRCompiler,
         source: *ast.Expression,

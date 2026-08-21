@@ -1275,6 +1275,52 @@ pub const IREvaluator = struct {
                 try self.setLocation(thread, is_type.result, .fromBoolean(matches));
                 return .cont;
             },
+            .str_op => |str_op| {
+                var sbuf = std.Io.Writer.Allocating.init(self.allocator);
+                defer sbuf.deinit();
+                try self.materializeString(thread, try self.resolveValueSource(thread, str_op.operand), &sbuf.writer);
+                const s = sbuf.written();
+                const ws = " \t\r\n";
+
+                const result: ir.Value = switch (str_op.op) {
+                    .len => .{ .integer = @intCast(s.len) },
+                    .upper => try self.strMapAlloc(s, std.ascii.toUpper),
+                    .lower => try self.strMapAlloc(s, std.ascii.toLower),
+                    .trim => .{ .zig_string = try self.allocator.dupe(u8, std.mem.trim(u8, s, ws)) },
+                    .trim_start => .{ .zig_string = try self.allocator.dupe(u8, std.mem.trimStart(u8, s, ws)) },
+                    .trim_end => .{ .zig_string = try self.allocator.dupe(u8, std.mem.trimEnd(u8, s, ws)) },
+                    .contains, .starts_with, .ends_with, .index_of => blk: {
+                        var abuf = std.Io.Writer.Allocating.init(self.allocator);
+                        defer abuf.deinit();
+                        try self.materializeString(thread, try self.resolveValueSource(thread, str_op.arg0), &abuf.writer);
+                        const a = abuf.written();
+                        break :blk switch (str_op.op) {
+                            .contains => ir.Value.fromBoolean(std.mem.indexOf(u8, s, a) != null),
+                            .starts_with => ir.Value.fromBoolean(std.mem.startsWith(u8, s, a)),
+                            .ends_with => ir.Value.fromBoolean(std.mem.endsWith(u8, s, a)),
+                            .index_of => ir.Value{ .integer = if (std.mem.indexOf(u8, s, a)) |i| @intCast(i) else -1 },
+                            else => unreachable,
+                        };
+                    },
+                    .slice => blk: {
+                        const len_i: i64 = @intCast(s.len);
+                        const start = (try self.resolveValueSource(thread, str_op.arg0)).integer;
+                        const end = (try self.resolveValueSource(thread, str_op.arg1)).integer;
+                        const lo = @min(@max(start, 0), len_i);
+                        const hi = @min(@max(end, lo), len_i);
+                        break :blk ir.Value{ .zig_string = try self.allocator.dupe(u8, s[@intCast(lo)..@intCast(hi)]) };
+                    },
+                    .repeat => blk: {
+                        const count = (try self.resolveValueSource(thread, str_op.arg0)).integer;
+                        const n: usize = @intCast(@max(count, 0));
+                        const out = try self.allocator.alloc(u8, s.len * n);
+                        for (0..n) |i| @memcpy(out[i * s.len ..][0..s.len], s);
+                        break :blk ir.Value{ .zig_string = out };
+                    },
+                };
+                try self.setLocation(thread, str_op.result, result);
+                return .cont;
+            },
             .make_err => |make_err| {
                 const payload_ptr: ?*const ir.Value = if (make_err.payload) |payload| blk: {
                     const value = try self.resolveValueSource(thread, payload);
@@ -2080,6 +2126,13 @@ pub const IREvaluator = struct {
             const element = try self.heapValueAt(heap_addr + i + 1);
             try self.materializeString(thread, element, w);
         }
+    }
+
+    /// Duplicates `s` and applies a per-byte map, returning an owned zig_string.
+    fn strMapAlloc(self: *IREvaluator, s: []const u8, comptime f: fn (u8) u8) !ir.Value {
+        const out = try self.allocator.dupe(u8, s);
+        for (out) |*c| c.* = f(c.*);
+        return .{ .zig_string = out };
     }
 
     fn materializeString(

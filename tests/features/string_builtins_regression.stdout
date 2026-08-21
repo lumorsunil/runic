@@ -1,0 +1,16 @@
+len=12
+upper=HELLO, WORLD
+lower=hello, world
+trim=[spaced out]
+trimStart=[spaced out  ]
+trimEnd=[  spaced out]
+is a runic file
+starts with main
+has a dot
+indexOf o = 4
+indexOf zz = -1
+slice(0,5)=Hello
+ab x3=ababab
+chained=[SPACED OUT]
+len*2=24
+shout=QUIET

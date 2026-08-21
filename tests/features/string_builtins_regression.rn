@@ -1,0 +1,35 @@
+# String builtins (stdlib Phase 1): byte-level string ops surfaced as UFCS
+# methods over Zig builtins. `len` returns Int, the predicates return Bool, and
+# the transforms return String. They chain and work on String params.
+fn Void @() Void
+
+const s = "Hello, World"
+echo "len=${s.len}"
+echo "upper=${s.upper}"
+echo "lower=${s.lower}"
+
+const padded = "  spaced out  "
+echo "trim=[${padded.trim}]"
+echo "trimStart=[${padded.trimStart}]"
+echo "trimEnd=[${padded.trimEnd}]"
+
+# Predicates (Bool) used in control flow.
+const path = "main.rn"
+if (path.endsWith ".rn") { echo "is a runic file" } else { echo "no" }
+if (path.startsWith "main") { echo "starts with main" } else { echo "no" }
+if (path.contains ".") { echo "has a dot" } else { echo "no" }
+
+# Int-returning ops.
+echo "indexOf o = ${s.indexOf "o"}"
+echo "indexOf zz = ${s.indexOf "zz"}"
+
+# Slicing and repeating (String).
+echo "slice(0,5)=${s.slice 0 5}"
+echo "ab x3=${"ab".repeat 3}"
+
+# Chaining, typed results, and method on a String param.
+echo "chained=[${padded.trim.upper}]"
+const n: Int = s.len
+echo "len*2=${n * 2}"
+fn Void shout(x: String) String { yield x.upper }
+echo "shout=${shout "quiet"}"
