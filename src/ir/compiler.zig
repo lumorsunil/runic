@@ -5582,6 +5582,43 @@ pub const IRCompiler = struct {
         return typeExprIsNamed(out_type, "Int") or typeExprIsNamed(out_type, "Float");
     }
 
+    /// Pipeline↔param coercion: a stage that is a zero-arg reference to a
+    /// single-parameter function receives the upstream value in that parameter.
+    /// Collects stdin into a value, binds it to the parameter, and calls the
+    /// function (whose output flows to the stage's stdout). Returns null when the
+    /// stage isn't such a reference (fall back to normal stage compilation).
+    fn tryCompilePipelineParamStage(self: *IRCompiler, source: *ast.Expression, stage_expr: *ast.Expression) Error!?Result {
+        const callee: *ast.Expression = switch (stage_expr.*) {
+            .call => |call| if (call.arguments.len == 0 and call.redirects.len == 0) call.callee else return null,
+            .identifier => stage_expr,
+            else => return null,
+        };
+        if (callee.* != .identifier) return null;
+        const binding = self.lookup(callee.identifier.name, .{ .shallow = false }) orelse return null;
+        if (!binding.result.isFunctionRef()) return null;
+        const fn_ref = binding.result.source.value;
+        if (self.instruction_sets.items[fn_ref.fn_ref.fn_addr.instr_set].param_count != 1) return null;
+
+        // Collect the whole upstream output and bind it to the single parameter.
+        try self.addInstruction(.init(.from(source), .collect_stdin));
+        const input_ref = try self.newRef(source, "pipe_param_input");
+        try self.set(source, input_ref, .fromLocation(.initRegister(.r)));
+
+        const input_name = "\x00pipe_param_input";
+        try self.scopes.declare(
+            self.allocator,
+            input_name,
+            try .from(input_ref.dereference().typed(string_type)),
+            string_type,
+            false,
+            .normal,
+        );
+        const arg_expr = try self.allocator.create(ast.Expression);
+        arg_expr.* = .{ .identifier = .{ .name = input_name, .span = source.span() } };
+
+        return try self.compileFunctionCall(source, fn_ref, &.{arg_expr}, &.{}, null);
+    }
+
     fn compilePipeline(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -5683,7 +5720,12 @@ pub const IRCompiler = struct {
                 null;
             const pushed_stdin = i > 0;
             if (pushed_stdin) try self.stdin_type_stack.append(self.allocator, inferred_stdin);
-            const result = try self.compileExpression(stage_expr);
+            // Only a receiver stage (not the producer at i==0) can bind stdin to
+            // a parameter.
+            const result = if (i > 0)
+                (try self.tryCompilePipelineParamStage(source, stage_expr)) orelse try self.compileExpression(stage_expr)
+            else
+                try self.compileExpression(stage_expr);
             if (pushed_stdin) _ = self.stdin_type_stack.pop();
 
             // A stage's value is no longer auto-pushed to stdout; output is
@@ -5718,7 +5760,8 @@ pub const IRCompiler = struct {
             self.allocator,
             self.stageStdoutType(pipeline.stages[last_idx - 1]),
         );
-        const result = try self.compileExpression(pipeline.stages[last_idx]);
+        const result = (try self.tryCompilePipelineParamStage(source, pipeline.stages[last_idx])) orelse
+            try self.compileExpression(pipeline.stages[last_idx]);
         if (last_pushed_stdin) _ = self.stdin_type_stack.pop();
         if (isWaitable(result)) |loc| {
             try self.comment("wait from {s} (last stage)", .{@src().fn_name});

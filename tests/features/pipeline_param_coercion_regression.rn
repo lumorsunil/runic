@@ -1,0 +1,21 @@
+# Pipeline↔param coercion (stdlib Phase 1, decision 2): a stage that is a
+# reference to a single-parameter, Void-stdin function receives the upstream
+# value in that parameter. So one helper works as a call, a UFCS method, and a
+# pipeline stage. (Trailing newlines shown come from `echo`.)
+fn Void @() Void
+
+fn Void shout(s: String) String { yield s.upper }
+
+# As a pipeline stage.
+echo "hello" | shout
+
+# Chained param stages.
+fn Void bracket(s: String) String { yield "[${s.trim}]" }
+echo "world" | shout | bracket
+
+# The same function still works as a normal call.
+echo "call: ${shout "quiet"}"
+
+# A param-stage mixes with a stdin-typed stage.
+fn String echoStdin() String { const s = &0; yield s.trim }
+echo "mixed" | shout | echoStdin

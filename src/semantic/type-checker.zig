@@ -2842,8 +2842,29 @@ pub const TypeChecker = struct {
         const resolved_target_type = target_type orelse return null;
 
         return switch (resolved_target_type.*) {
-            .function => |function| try self.resolvePipeType(scope, function.stdin_type),
+            .function => |function| blk: {
+                const stdin = try self.resolvePipeType(scope, function.stdin_type);
+                // Pipeline↔param coercion: a function with a Void (or absent)
+                // stdin and exactly one parameter accepts the upstream value in
+                // that parameter, so the parameter type is its effective input.
+                const void_stdin = stdin == null or self.unaliasType(stdin.?).* == .void;
+                if (void_stdin) {
+                    if (singleParamType(function)) |pt| {
+                        break :blk try self.resolvePipeType(scope, pt);
+                    }
+                }
+                break :blk stdin;
+            },
             else => null,
+        };
+    }
+
+    /// The single parameter's declared type for a one-parameter function, else
+    /// null (zero, many, variadic, or untyped-parameter functions).
+    fn singleParamType(function: ast.TypeExpr.FunctionType) ?*const ast.TypeExpr {
+        return switch (function.params) {
+            ._non_variadic => |params| if (params.len == 1) params[0] else null,
+            ._variadic => null,
         };
     }
 
