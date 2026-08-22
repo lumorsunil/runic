@@ -936,6 +936,43 @@ pub const TypeChecker = struct {
         return self.pipeTypesEqual(ra, rb);
     }
 
+    /// Walks a signature type expression and records each uppercase identifier
+    /// that isn't a declared type in `outer` — a candidate implicit type variable.
+    fn collectTypeVars(
+        self: *TypeChecker,
+        outer: *Scope,
+        type_expr: *const ast.TypeExpr,
+        out: *std.StringHashMapUnmanaged(void),
+    ) Error!void {
+        switch (type_expr.*) {
+            .identifier => |named| {
+                const seg = named.path.segments[0];
+                if (seg.isTypeIdentifier() and outer.lookup(seg.name) == null) {
+                    try out.put(self.arena.allocator(), seg.name, {});
+                }
+            },
+            .array => |a| try self.collectTypeVars(outer, a.element, out),
+            .optional => |o| try self.collectTypeVars(outer, o.child, out),
+            .promise => |p| try self.collectTypeVars(outer, p.child, out),
+            .sum => |s| for (s.members) |m| try self.collectTypeVars(outer, m, out),
+            .type_merge => |m| {
+                try self.collectTypeVars(outer, m.lhs, out);
+                try self.collectTypeVars(outer, m.rhs, out);
+            },
+            .function => |f| {
+                if (f.stdin_type) |st| try self.collectTypeVars(outer, st, out);
+                if (f.return_type) |rt| try self.collectTypeVars(outer, rt, out);
+                switch (f.params) {
+                    ._non_variadic => |ps| for (ps) |p| {
+                        if (p) |pt| try self.collectTypeVars(outer, pt, out);
+                    },
+                    ._variadic => |p| if (p) |pt| try self.collectTypeVars(outer, pt, out),
+                }
+            },
+            else => {},
+        }
+    }
+
     fn resolveTypeIdentifierToAlias(
         self: *TypeChecker,
         scope: *Scope,
@@ -1020,6 +1057,28 @@ pub const TypeChecker = struct {
         }
 
         const fn_scope = try scope.addChild(self.arena.allocator(), fn_decl.span);
+
+        // Implicit generics: an uppercase type name in the signature that isn't a
+        // declared type is a type variable, scoped to this function (e.g. `T`/`U`
+        // in `fn map(xs: []T, f: fn(T) U) []U`). Declare them before resolving the
+        // signature so they don't report "type T not declared".
+        {
+            var type_vars: std.StringHashMapUnmanaged(void) = .empty;
+            defer type_vars.deinit(self.arena.allocator());
+            if (fn_decl.stdin_type) |st| try self.collectTypeVars(scope, st, &type_vars);
+            switch (fn_decl.params) {
+                ._non_variadic => |params| for (params) |param| {
+                    if (param.type_annotation) |ta| try self.collectTypeVars(scope, ta, &type_vars);
+                },
+                ._variadic => |param| if (param.type_annotation) |ta| try self.collectTypeVars(scope, ta, &type_vars),
+            }
+            if (fn_decl.return_type) |rt| try self.collectTypeVars(scope, rt, &type_vars);
+            var it = type_vars.keyIterator();
+            while (it.next()) |name| {
+                const marker = try self.allocTypeExpression(.{ .type_var = .{ .name = name.*, .span = fn_decl.span } });
+                try fn_scope.declare(self.arena.allocator(), .{ .name = name.*, .span = fn_decl.span }, marker, false, false);
+            }
+        }
 
         if (fn_decl.stdin_type) |stdin_type| {
             const resolved = try self.resolveTypeExpr(fn_scope, stdin_type);
@@ -1429,6 +1488,7 @@ pub const TypeChecker = struct {
             .identifier => |*identifier| self.runTypeIdentifier(scope, identifier),
             .alias => |*alias| self.runTypeAlias(alias),
             .failed => {},
+            .type_var => {},
             .void, .integer, .float, .boolean, .byte, .null, .execution, .thread => {},
             .optional, .promise => |prefix| try self.runTypeExpression(scope, prefix.child),
             .error_union => |error_union| {
@@ -2655,6 +2715,7 @@ pub const TypeChecker = struct {
 
         switch (object_type.*) {
             .failed => {},
+            .type_var => {},
             .identifier => return error.UnresolvedTypeLiteral,
             .optional => return error.MemberAccessOnOptional,
             .array => |array| try self.runArrayMemberAccess(array, &member.member),
@@ -3475,8 +3536,13 @@ pub const TypeChecker = struct {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, assignment_type.span());
 
+        // A generic type variable on either side unifies with anything (the
+        // runtime is dynamic; a generic function is checked permissively).
+        if (self.unaliasType(binding_type).* == .type_var or self.unaliasType(assignment_type).* == .type_var) return;
+
         try switch (binding_type.*) {
             .failed => {},
+            .type_var => {},
             .thread => unreachable,
             .void => |*void_| self.validateTypeAssignmentVoid(
                 void_,

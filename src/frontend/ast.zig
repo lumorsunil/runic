@@ -176,6 +176,11 @@ pub const TypeExpr = union(enum) {
     execution: PrimitiveType,
     thread: PrimitiveType,
     failed: FailedType,
+    /// An implicit generic type variable (an uppercase name in a function
+    /// signature that isn't a declared type, e.g. `T`/`U` in `map`). Since the
+    /// runtime is dynamically typed, a generic function compiles once; a type
+    /// variable is permissive in type comparisons (unifies with anything).
+    type_var: TypeVar,
     // lazy: LazyType,
     /// A compile-time function reference pointing to a specific IR instruction set.
     /// Used for module pub fn exports so compileMember can return the fn_ref value directly.
@@ -184,6 +189,15 @@ pub const TypeExpr = union(enum) {
     pub const FnRefType = struct {
         instr_set: usize,
         span: Span,
+    };
+
+    pub const TypeVar = struct {
+        name: []const u8,
+        span: Span,
+
+        pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try writer.writeAll(self.name);
+        }
     };
 
     pub fn global(comptime tag: std.meta.Tag(@This())) @This() {
@@ -563,6 +577,7 @@ pub const TypeExpr = union(enum) {
             .identifier,
             .failed,
             .fn_ref_type,
+            .type_var,
             => 1,
             .struct_type => |struct_type| blk: {
                 var size: usize = 0;
