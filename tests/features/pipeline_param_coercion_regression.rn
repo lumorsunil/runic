@@ -19,3 +19,11 @@ echo "call: ${shout "quiet"}"
 # A param-stage mixes with a stdin-typed stage.
 fn String echoStdin() String { const s = &0; yield s.trim }
 echo "mixed" | shout | echoStdin
+
+# Typed parameters: a typed value (Int/Float) transports through the pipe and
+# binds to the parameter as that type (not a stringified copy), so arithmetic in
+# the stage body works.
+fn Void double(n: Int) Int { yield n + n }
+fn Void halve(x: Float) Float { yield x / 2.0 }
+echo "int: ${echo "21" | parseInt | double}"
+echo "float: ${echo "3.0" | parseFloat | halve}"

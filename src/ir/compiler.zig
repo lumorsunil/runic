@@ -5599,7 +5599,20 @@ pub const IRCompiler = struct {
         const fn_ref = binding.result.source.value;
         if (self.instruction_sets.items[fn_ref.fn_ref.fn_addr.instr_set].param_count != 1) return null;
 
-        // Collect the whole upstream output and bind it to the single parameter.
+        // The single parameter's type. `collect_stdin` (== `&0`) dequeues the
+        // upstream value typed when the boundary is typed (Int/Float/…) and as a
+        // String byte blob otherwise, matching the parameter type either way.
+        const param_type: ast.TypeExpr = blk: {
+            if (binding.type_expr) |t| if (t == .function) switch (t.function.params) {
+                ._non_variadic => |ps| if (ps.len == 1) {
+                    if (ps[0]) |pt| break :blk pt.*;
+                },
+                ._variadic => {},
+            };
+            break :blk string_type;
+        };
+
+        // Collect the upstream value and bind it to the single parameter.
         try self.addInstruction(.init(.from(source), .collect_stdin));
         const input_ref = try self.newRef(source, "pipe_param_input");
         try self.set(source, input_ref, .fromLocation(.initRegister(.r)));
@@ -5608,8 +5621,8 @@ pub const IRCompiler = struct {
         try self.scopes.declare(
             self.allocator,
             input_name,
-            try .from(input_ref.dereference().typed(string_type)),
-            string_type,
+            try .from(input_ref.dereference().typed(param_type)),
+            param_type,
             false,
             .normal,
         );

@@ -115,9 +115,13 @@ new syntax), then the primitives the stdlib is actually made of.
     `tryCompilePipelineParamStage` desugars the stage to `collect_stdin` +
     bind-to-parameter + call (guarded to exactly one parameter; receiver stages
     only). Param-stages chain and mix with stdin-typed stages. Test:
-    `pipeline_param_coercion_regression`. (Currently collects the input as a
-    String; a typed scalar parameter — e.g. `Int` — would need typed transport,
-    a follow-up.)
+    `pipeline_param_coercion_regression`. **Typed transport works:** a typed
+    scalar parameter (`Int`/`Float`) receives the value typed (the boundary is
+    classified by the parameter type, so the inter-stage pipe is typed and `&0`
+    dequeues the typed value); the collected input is bound as the parameter's
+    type. `parseInt | double` and `parseFloat | halve` work. (A param-stage
+    processes one value per invocation — the same single-value behavior as any
+    stdin-typed function stage.)
   - String `+` concatenation: not added; interpolation (`"${a}${b}"`) is the
     concat tool.
 
