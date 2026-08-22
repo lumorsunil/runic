@@ -108,14 +108,21 @@ new syntax), then the primitives the stdlib is actually made of.
     `stringBuiltin(name)` table; `len` only intercepts a string receiver so
     arrays keep their own `.len`. Currently **byte**-oriented (not UTF-8-aware).
     Tests: `string_builtins_regression`, `string_split_join_regression`.
-  - [ ] **Pipeline↔param coercion (decision 2) — DEFERRED.** Bounded type-checker
-    change (accept a 1-param Void-stdin function whose param matches the upstream
-    stdout), but a substantial compiler change (a param-taking function reads its
-    parameter, not stdin, so making it a *streaming* pipeline stage means feeding
-    the incoming pipe value into the parameter). Its own feature; strings are
-    fully usable via UFCS/interpolation without it.
+  - [x] **Pipeline↔param coercion (decision 2) — DONE.** A stage that references
+    a single-parameter, Void-stdin function receives the upstream value in that
+    parameter, so one helper works as `s.trim`, `trim(s)`, and `… | trim`. Type
+    checker returns the parameter type as the stage's effective input;
+    `tryCompilePipelineParamStage` desugars the stage to `collect_stdin` +
+    bind-to-parameter + call (guarded to exactly one parameter; receiver stages
+    only). Param-stages chain and mix with stdin-typed stages. Test:
+    `pipeline_param_coercion_regression`. (Currently collects the input as a
+    String; a typed scalar parameter — e.g. `Int` — would need typed transport,
+    a follow-up.)
   - String `+` concatenation: not added; interpolation (`"${a}${b}"`) is the
     concat tool.
+
+  **Phase 1 COMPLETE.** Full CI green (13/13, 42 diag, 8 examples, 116 smoke,
+  3 strict).
 
 - [ ] **Phase 2 — Higher-order functions + generics.** Composability.
   - Function values (overlaps Phase 0): a function bound to a value and called.
