@@ -567,6 +567,10 @@ pub const Instruction = struct {
 
     pub const Fork = struct {
         dest: InstructionAddr,
+        /// When set, the target instruction set is read at runtime from the
+        /// fn_ref value at this location (an indirect call `f x`), overriding
+        /// `dest`'s instr_set.
+        dest_from: ?Location = null,
         stdin: Location,
         stdout: Location,
         stderr: Location,

@@ -3622,6 +3622,17 @@ pub const IRCompiler = struct {
 
         const callee = try self.compileExpression(call.callee);
 
+        // Indirect call: a function-valued location (a `fn(...)`-typed parameter)
+        // called with arguments. The target function is only known at runtime.
+        if (callee.source == .location and call.arguments.len > 0 and call.redirects.len == 0) {
+            if (callee.typeExpr()) |t| {
+                if (t == .function) {
+                    const rt: ?ast.TypeExpr = if (t.function.return_type) |r| r.* else null;
+                    return self.compileIndirectCall(source, callee.source.location, rt, call.arguments);
+                }
+            }
+        }
+
         return switch (callee.source) {
             .value => |v| switch (v) {
                 .executable => self.compileExecutableCall(source, v, call.arguments, call.redirects),
@@ -4365,6 +4376,59 @@ pub const IRCompiler = struct {
         for (args, 0..) |a, i| full[i + 1] = a;
 
         return try self.compileFunctionCall(source, binding.result.source.value, full, redirects, null);
+    }
+
+    /// Indirect call `f x …`: the callee is a *function value* known only at
+    /// runtime (a function-typed parameter). Forks the fn_ref read from the
+    /// callee location, passing the arguments in the closure, and captures the
+    /// yielded value. Closure size is the argument count — valid for a
+    /// capture-free (top-level) function, which is what a HOF receives.
+    fn compileIndirectCall(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        callee_loc: ir.Location,
+        return_type: ?ast.TypeExpr,
+        args: []const *ast.Expression,
+    ) Error!Result {
+        const fn_ref_ref = try self.newRef(source, "indirect_fn");
+        try self.set(source, fn_ref_ref, .from(callee_loc));
+
+        const pipe_ref = try self.newRef(source, "indirect_pipe");
+        try self.pipe(source, pipe_ref.dereference());
+        try self.pipeOpt(source, pipe_ref.dereference(), .typed, .fromValue(.fromBoolean(true)));
+
+        const arg_refs = try self.allocator.alloc(ir.Location, args.len);
+        defer self.allocator.free(arg_refs);
+        for (args, arg_refs) |arg, *ar| {
+            const arg_value = try self.compileExpression(arg);
+            const r = try self.newRef(source, "indirect_arg");
+            try self.set(source, r, stableResultSource(arg_value));
+            ar.* = r.dereference();
+        }
+
+        try self.alloc(source, args.len);
+        const closure_ref = try self.newRef(source, "indirect_closure");
+        try self.set(source, closure_ref, .fromLocation(.initRegister(.r)));
+        for (arg_refs, 0..) |ar, i| {
+            try self.set(source, .initRegister(.r), .from(closure_ref.dereference()));
+            try self.set(source, .initAdd(.{ .register = .r }, i, .{ .dereference = true }), .from(ar));
+        }
+
+        try self.addInstruction(.init(.from(source), .{ .fork = .{
+            .dest = ir.InstructionAddr.initAbs(0, 0),
+            .dest_from = fn_ref_ref.dereference(),
+            .stdin = self.threadStdin(),
+            .stdout = pipe_ref.dereference(),
+            .stderr = self.threadStderr(),
+            .closure = closure_ref.dereference(),
+            .subshell = .inherit,
+        } }));
+        const thread_ref = try self.newRef(source, "indirect_thread");
+        try self.set(source, thread_ref, .fromLocation(.initRegister(.r)));
+        try self.wait(source, thread_ref.dereference().typed(thread_type));
+
+        try self.addInstruction(.init(.from(source), .{ .pipe_dequeue = pipe_ref.dereference() }));
+        return .fromLocation(ir.Location.initRegister(.r).typed(return_type orelse .global(.void)));
     }
 
     fn compileFunctionCall(

@@ -3085,6 +3085,7 @@ pub const Parser = struct {
             // .kw_enum => self.parseEnumTypeExpr(),
             // .kw_union => self.parseUnionTypeExpr(),
             .kw_struct => self.parseStructTypeExpr(),
+            .kw_fn => self.parseFunctionTypeExpr(),
             .kw_error => self.parseErrorTypeExpr(),
             .l_bracket => self.parseArrayTypeExpr(),
             // .caret => self.parsePromiseTypeExpr(),
@@ -3183,6 +3184,45 @@ pub const Parser = struct {
             .error_set = .{
                 .variants = try self.copyToArena(ast.TypeExpr.ErrorSet.Variant, variants.items),
                 .span = start.span.endAt(close.span),
+            },
+        });
+    }
+
+    /// A function type in type position: `fn(ParamType, …) ReturnType`. The
+    /// stdin type is left implicit (Void); the return type is optional. Used to
+    /// type a function-valued parameter (`f: fn(Int) Int`).
+    fn parseFunctionTypeExpr(self: *Self) Error!*const ast.TypeExpr {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const start = try self.expectTokenTag(.kw_fn);
+        _ = try self.expectTokenTag(.l_paren);
+
+        var params = std.ArrayList(?*const ast.TypeExpr).empty;
+        defer params.deinit(self.allocator);
+        while (true) {
+            self.skipNewlines();
+            if ((try self.peekToken()).tag == .r_paren) break;
+            const param_type = try self.parseTypeExpr();
+            try params.append(self.allocator, param_type);
+            self.skipNewlines();
+            if ((try self.peekToken()).tag == .comma) _ = try self.nextToken();
+        }
+        const close = try self.expectTokenTag(.r_paren);
+
+        var return_type: ?*const ast.TypeExpr = null;
+        var end = close.span;
+        if (try self.parseMaybeTypeExpr()) |rt| {
+            return_type = rt;
+            end = rt.span();
+        }
+
+        return self.allocTypeExpression(.{
+            .function = .{
+                .params = .{ ._non_variadic = try self.copyToArena(?*const ast.TypeExpr, params.items) },
+                .stdin_type = null,
+                .return_type = return_type,
+                .span = start.span.endAt(end),
             },
         });
     }
@@ -3334,7 +3374,7 @@ pub const Parser = struct {
 
     fn isTypeExprTerminator(tag: token.Tag) bool {
         return switch (tag) {
-            .l_paren, .l_brace, .l_bracket, .identifier, .star, .caret, .bang, .question, .kw_enum, .kw_error, .kw_union, .kw_struct => false,
+            .l_paren, .l_brace, .l_bracket, .identifier, .star, .caret, .bang, .question, .kw_enum, .kw_error, .kw_union, .kw_struct, .kw_fn => false,
             else => true,
         };
     }

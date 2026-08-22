@@ -1,0 +1,22 @@
+# Higher-order functions (stdlib Phase 2): a parameter can be typed as a function
+# (`f: fn(Int) Int`) and called (`f v`). The callee is only known at runtime, so
+# it compiles to an indirect call (fork the fn_ref, capture the result).
+fn Void @() Void
+
+fn Void inc(n: Int) Int { yield n + 1 }
+fn Void dbl(n: Int) Int { yield n + n }
+
+# Apply a passed function once.
+fn Void applyOnce(f: fn(Int) Int, v: Int) Int { yield f v }
+echo "applyOnce dbl 5 = ${applyOnce dbl 5}"
+echo "applyOnce inc 5 = ${applyOnce inc 5}"
+
+# Apply it twice (nested indirect call).
+fn Void twice(f: fn(Int) Int, v: Int) Int { yield f (f v) }
+echo "twice inc 5 = ${twice inc 5}"
+echo "twice dbl 3 = ${twice dbl 3}"
+
+# A passed function taking two arguments.
+fn Void add(a: Int, b: Int) Int { yield a + b }
+fn Void combine(f: fn(Int, Int) Int, a: Int, b: Int) Int { yield f a b }
+echo "combine add 4 7 = ${combine add 4 7}"

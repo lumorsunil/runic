@@ -1728,7 +1728,12 @@ pub const IREvaluator = struct {
                     return Error.MissingSpawnedThreadContext;
                 };
 
-                new_thread.setInstructionCounter(try self.resolveAddr(thread, fork.dest));
+                const dest_addr: ir.ResolvedInstructionAddr = if (fork.dest_from) |loc| blk: {
+                    const fn_val = try self.resolveLocation(thread, loc);
+                    if (fn_val != .fn_ref) return Error.UnsupportedInstruction;
+                    break :blk .init(fn_val.fn_ref.fn_addr.instr_set, 0);
+                } else try self.resolveAddr(thread, fork.dest);
+                new_thread.setInstructionCounter(dest_addr);
 
                 thread.private.result_register = .{ .thread = new_thread_handle };
 
