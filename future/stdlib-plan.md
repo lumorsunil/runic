@@ -23,7 +23,7 @@ interpolation. Builtins: `parseInt`, `parseFloat`, `lines`, `len`, `cd`, `wait`.
 
 Correctness landmines
 - **`Int` is unsigned** — `0 - 5` evaluates to `0`. Breaks all subtraction/math.
-- **Recursion + arithmetic crashes** — `n + sumTo(n - 1)` → deref error.
+- **Recursion + arithmetic crashes** — `n + sumTo (n - 1)` → deref error.
 - **Function values crash** — `const f = dbl; f 5` → error.
 - **Typed array element access mis-types** — a param `xs: []Int` makes `xs[0]`
   resolve to `[]Int`, not `Int`.
@@ -52,7 +52,7 @@ Infrastructure
    (`… | trim`): in pipeline position, if the function's one parameter type
    matches the upstream stdout type, the incoming value binds to that parameter
    (stdin empty). This unifies UFCS/call/pipe — one helper works as `s.trim`,
-   `trim(s)`, and `… | trim` — and makes the string methods pipeline-usable.
+   `trim s`, and `… | trim` — and makes the string methods pipeline-usable.
 3. **`Int` becomes signed (`i64`).** Fixes `3 - 5 == -2` everywhere; matches
    scripting-language expectations. Foundation for all math.
 4. **Composability: HOF + generics, via one comptime engine.** Generic functions
@@ -90,8 +90,8 @@ new syntax), then the primitives the stdlib is actually made of.
     closure large enough for the args — the previous `alloc 0` wrote the argument
     past a zero-size closure ("deref 0x11"); (2) give the self-visible function
     binding a `.function` type carrying its return type, so a recursive call is
-    value-captured *by type* (`const r = f(n-1)` keeps `r` typed) instead of
-    byte-flattened to a string (which broke `n + f(n-1)`). Now `sumTo`/`fact`/
+    value-captured *by type* (`const r = f (n - 1)` keeps `r` typed) instead of
+    byte-flattened to a string (which broke `n + f (n - 1)`). Now `sumTo`/`fact`/
     `fib` all work, including two recursive calls in one expression. Test:
     `recursion_value_regression`.
 
@@ -110,7 +110,7 @@ new syntax), then the primitives the stdlib is actually made of.
     Tests: `string_builtins_regression`, `string_split_join_regression`.
   - [x] **Pipeline↔param coercion (decision 2) — DONE.** A stage that references
     a single-parameter, Void-stdin function receives the upstream value in that
-    parameter, so one helper works as `s.trim`, `trim(s)`, and `… | trim`. Type
+    parameter, so one helper works as `s.trim`, `trim s`, and `… | trim`. Type
     checker returns the parameter type as the stage's effective input;
     `tryCompilePipelineParamStage` desugars the stage to `collect_stdin` +
     bind-to-parameter + call (guarded to exactly one parameter; receiver stages
