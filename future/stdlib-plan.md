@@ -128,14 +128,28 @@ new syntax), then the primitives the stdlib is actually made of.
   **Phase 1 COMPLETE.** Full CI green (13/13, 42 diag, 8 examples, 116 smoke,
   3 strict).
 
-- [ ] **Phase 2 — Higher-order functions + generics.** Composability.
-  - Function values (overlaps Phase 0): a function bound to a value and called.
-  - Function-typed parameters: parse + type-check `fn(T) U` parameter types.
-  - Implicit type variables in signatures ⇒ desugar to comptime type params;
-    monomorphization + call-site inference (decision 4).
-  - Generic array helpers (in Runic, using the above): `map`, `filter`, `reduce`,
-    `find`, `any`, `all`, `count`, `sort`. These double as the first real test of
-    generics.
+- [x] **Phase 2 — Higher-order functions + generics. DONE.** Composability.
+  - [x] Function values (Phase 0): a function bound to a value and called.
+  - [x] **Function-typed parameters**: `fn(ParamType, …) ReturnType` parses in
+    type position (implicit Void stdin). A `.function`-typed location callee with
+    args compiles to a **runtime indirect call** — `Fork.dest_from` reads the
+    target instr_set from the fn_ref at runtime; closure size = arg count
+    (capture-free top-level functions, which is what a HOF receives).
+  - [x] **Implicit type variables**: an uppercase name in a signature that isn't
+    a declared type is a `type_var`, permissive in type comparisons (both
+    directions). No monomorphization needed — the runtime is dynamic, so a generic
+    function compiles once. (Simpler than the planned comptime-desugaring;
+    revisit if comptime type *construction* is needed for Phase 4 containers.)
+  - [x] **Generic array helpers**, written in Runic: `map`, `filter`, `reduce`
+    (and `count`/`first`), using type vars + a higher-order function + array
+    building (`.{ }` empty literal + `arr.push value` → new array). Also fixed
+    comparison result typing (`==`/… → Bool). `find`/`any`/`all`/`sort` are
+    trivial follow-ups on the same primitives.
+  - Tests: `higher_order_function_regression`, `generics_regression`,
+    `map_filter_regression`.
+
+  **Phase 2 COMPLETE.** Full CI green (13/13, 42 diag, 8 examples, 119 smoke,
+  3 strict).
 
 - [ ] **Phase 3 — The `std` module + shallow modules.**
   - Implement `import "std"` resolution: bundle std `.rn` modules (some
