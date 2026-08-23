@@ -151,13 +151,22 @@ new syntax), then the primitives the stdlib is actually made of.
   **Phase 2 COMPLETE.** Full CI green (13/13, 42 diag, 8 examples, 119 smoke,
   3 strict).
 
-- [ ] **Phase 3 — The `std` module + shallow modules.**
-  - Implement `import "std"` resolution: bundle std `.rn` modules (some
-    builtin-backed) so `const std = import "std"` works and members resolve
-    (`std.str`, `std.fs`, …).
-  - Author the shallow modules: `std.str` (UFCS over Phase-1 builtins), `std.env`,
-    `std.fs`, `std.path`, `std.process`, `std.testing` (assert helpers). Keep each
-    compact per the stabilization checklist in `docs/standard-library.md`.
+- [ ] **Phase 3 — The `std` module + shallow modules.** Concrete API spec (every
+  signature) is in `docs/standard-library.md` → *Module Reference*. Agreed scope
+  (2026-08-23): all eight modules; `std.str` is **composites only** (the built-in
+  string methods stay canonical); **add Float math builtins now**.
+  - **Language prerequisites:**
+    - Implement `import "std"` resolution: the reserved `std` import resolves to
+      the bundled modules so `const std = import "std"` works and members resolve
+      (`std.list.map …`). Until then, author/test modules as plain `.rn` files
+      imported by relative path.
+    - **Float math builtins** — `sqrt`, `floor`, `ceil`, `round`, `trunc`, Float
+      `pow` (for `std.math`'s Float surface; everything else is pure Runic).
+  - **Modules** (author + test each, per the stabilization checklist):
+    - Pure Runic: `std.list` (map/filter/reduce/find/any/all/count/contains/
+      reverse/concat/range/sort), `std.path`, `std.env`, `std.str` (composites).
+    - Command wrappers: `std.fs`, `std.process`.
+    - `std.math` (int helpers + Float builtins), `std.testing` (assert/assertEq/…).
 
 - [ ] **Phase 4 — Deferred / later discussion.**
   - Generic containers: comptime type-returning functions (`fn Box(comptime T:

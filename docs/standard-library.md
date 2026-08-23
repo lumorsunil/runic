@@ -60,21 +60,157 @@ const here = fs.cwd()
 echo "working directory: ${here}"
 ```
 
-## Initial Module Set
+## Module Reference
 
-The first standard-library modules should be narrow and practical:
+The first standard library is eight narrow modules. Each exposes a compact set of
+functions before adding broader coverage — prefer a few stable names over large
+surfaces that will churn.
 
-| Module        | Purpose                                                                                         |
-| ------------- | ----------------------------------------------------------------------------------------------- |
-| `std.fs`      | File and directory helpers such as `exists`, `read_text`, `write_text`, `cwd`, and path checks. |
-| `std.path`    | Path joining, basename/dirname extraction, extension checks, and normalization helpers.         |
-| `std.env`     | Explicit environment lookup, fallback handling, and scoped updates around `$NAME`.              |
-| `std.process` | Small helpers for command execution results, status checks, and captured output.                |
-| `std.str`     | String trimming, splitting, prefix/suffix checks, and simple conversions.                       |
-| `std.testing` | Assertions and fixture helpers for `.rn` module and CLI smoke tests.                            |
+| Module        | Purpose                                                                    |
+| ------------- | -------------------------------------------------------------------------- |
+| `std.list`    | Generic array helpers (`map`/`filter`/`reduce`, …) over `[]T`.             |
+| `std.str`     | String helpers *composed from* the built-in methods (the builtins stay canonical). |
+| `std.path`    | Path manipulation — join, basename/dirname, extension, normalize.         |
+| `std.env`     | Explicit environment lookup, fallback, and scoped updates around `$NAME`. |
+| `std.fs`      | File and directory helpers (wrapping `test`/`cat`/`ls`/… commands).        |
+| `std.process` | Command execution results — status, captured output, require-ok.          |
+| `std.math`    | Numeric helpers (`abs`/`min`/`max`/`clamp` + Float `sqrt`/`floor`/…).      |
+| `std.testing` | Assertions for `.rn` module and CLI smoke tests.                          |
 
-Each module should expose a compact set of functions before adding broader
-coverage. Prefer a few stable names over large surfaces that will churn.
+**Conventions.** Functions use the space-call form (`std.list.map xs f`), camelCase
+names, and explicit input/output types. A fallible operation returns an **error
+union** (`fs.readText : ExecutableError!String`); an operation whose result may be
+absent returns an **optional** (`env.get : ?String`). Generic helpers use implicit
+type variables (`T`/`U`) and function-typed parameters (`fn(T) U`).
+
+### `std.list`
+
+Generic helpers over arrays, built on type variables + higher-order functions +
+`arr.push`.
+
+| Signature | Result |
+| --- | --- |
+| `map(xs: []T, f: fn(T) U) []U` | each element mapped through `f` |
+| `filter(xs: []T, keep: fn(T) Bool) []T` | elements for which `keep` is true |
+| `reduce(xs: []T, f: fn(U, T) U, init: U) U` | left fold |
+| `find(xs: []T, pred: fn(T) Bool) ?T` | first matching element, or absent |
+| `any(xs: []T, pred: fn(T) Bool) Bool` | true if any matches |
+| `all(xs: []T, pred: fn(T) Bool) Bool` | true if all match |
+| `count(xs: []T) Int` | number of elements (`xs.len` is the builtin) |
+| `contains(xs: []T, x: T) Bool` | membership (scalar equality) |
+| `reverse(xs: []T) []T` | reversed copy |
+| `concat(a: []T, b: []T) []T` | `a` followed by `b` |
+| `range(start: Int, end: Int) []Int` | `[start, …, end - 1]` |
+| `sort(xs: []T, less: fn(T, T) Bool) []T` | sorted copy by `less` |
+
+### `std.str`
+
+Only helpers **not** covered by the built-in UFCS methods (`s.len`, `s.split`,
+`s.trim`, `s.upper`/`lower`, `s.contains`/`startsWith`/`endsWith`, `s.indexOf`,
+`s.slice`, `s.replace`, `s.repeat`, `s.split`/`join`). No re-export.
+
+| Signature | Result |
+| --- | --- |
+| `words(s: String) []String` | split on runs of whitespace, no empties |
+| `capitalize(s: String) String` | first byte upper, rest unchanged |
+| `padLeft(s: String, width: Int, fill: String) String` | left-pad to `width` |
+| `padRight(s: String, width: Int, fill: String) String` | right-pad to `width` |
+| `isBlank(s: String) Bool` | empty or all whitespace |
+
+### `std.path`
+
+Pure string manipulation over `/`-separated paths.
+
+| Signature | Result |
+| --- | --- |
+| `join(parts: []String) String` | join with `/`, collapsing repeats |
+| `basename(p: String) String` | last component |
+| `dirname(p: String) String` | everything but the last component |
+| `ext(p: String) String` | extension incl. dot (`.rn`), or empty |
+| `stem(p: String) String` | basename without extension |
+| `isAbsolute(p: String) Bool` | starts with `/` |
+| `normalize(p: String) String` | collapse `//`, resolve `.`/`..` lexically |
+
+### `std.env`
+
+Over `$NAME` reads and the subshell-context updates.
+
+| Signature | Result |
+| --- | --- |
+| `get(name: String) ?String` | value or absent |
+| `getOr(name: String, default: String) String` | value or `default` |
+| `set(name: String, value: String) Void` | update the current context |
+| `has(name: String) Bool` | whether the variable is set |
+| `home() String` | `$HOME` (or a sensible fallback) |
+| `path() []String` | `$PATH` split on `:` |
+
+### `std.fs`
+
+Thin wrappers over portable commands; each documents its command. Fallible ops
+return `ExecutableError!…` so callers use `catch`/`try`.
+
+| Signature | Wraps | Result |
+| --- | --- | --- |
+| `exists(p: String) Bool` | `test -e` | path exists |
+| `isDir(p: String) Bool` | `test -d` | is a directory |
+| `isFile(p: String) Bool` | `test -f` | is a regular file |
+| `readText(p: String) ExecutableError!String` | `cat` | file contents |
+| `writeText(p: String, content: String) ExecutableError!Void` | redirect | write (truncate) |
+| `appendText(p: String, content: String) ExecutableError!Void` | redirect | append |
+| `listDir(p: String) []String` | `ls` | entry names |
+| `mkdirp(p: String) ExecutableError!Void` | `mkdir -p` | create dirs |
+| `remove(p: String) ExecutableError!Void` | `rm -rf` | delete |
+| `cwd() String` | builtin `pwd` | current directory |
+
+### `std.process`
+
+Helpers around a command's `ExecutableError!String` value view.
+
+| Signature | Result |
+| --- | --- |
+| `output(result: ExecutableError!String) String` | captured stdout, or "" on failure |
+| `status(result: ExecutableError!String) Int` | exit code (0 on success) |
+| `succeeds(result: ExecutableError!String) Bool` | exited 0 |
+| `requireOk(result: ExecutableError!String, msg: String) String` | output, or abort with `msg` |
+
+### `std.math`
+
+Integer/Float numeric helpers. `abs`/`min`/`max`/`clamp`/`sign`/`pow` are pure
+Runic; the Float functions are backed by **new builtins** (see prerequisites).
+
+| Signature | Result |
+| --- | --- |
+| `abs(n: Int) Int`, `absF(x: Float) Float` | absolute value |
+| `min(a: Int, b: Int) Int`, `max(a: Int, b: Int) Int` | extremum |
+| `clamp(n: Int, lo: Int, hi: Int) Int` | constrain to `[lo, hi]` |
+| `sign(n: Int) Int` | -1 / 0 / 1 |
+| `pow(base: Int, exp: Int) Int` | integer power (`exp ≥ 0`) |
+| `sqrt(x: Float) Float` | square root — *builtin* |
+| `floor(x: Float) Float`, `ceil(x: Float) Float` | round toward −∞ / +∞ — *builtin* |
+| `round(x: Float) Float`, `trunc(x: Float) Float` | nearest / toward zero — *builtin* |
+
+### `std.testing`
+
+| Signature | Behavior |
+| --- | --- |
+| `assert(cond: Bool, msg: String) Void` | abort (nonzero exit) with `msg` if false |
+| `assertEq(a: T, b: T, msg: String) Void` | abort if `a != b` |
+| `assertContains(s: String, sub: String) Void` | abort if `s` lacks `sub` |
+| `fail(msg: String) Void` | unconditional abort |
+
+## Language prerequisites for Phase 3
+
+Most modules are writable in Runic today. The remaining language work:
+
+- **The `import "std"` mechanism** — resolve the reserved `std` import to the
+  bundled modules so `const std = import "std"` and `std.list.map …` work. (Until
+  then, modules are plain `.rn` files imported by relative path — see below.)
+- **Float math builtins** — `sqrt`, `floor`, `ceil`, `round`, `trunc` (and a Float
+  `pow`), exposed as UFCS methods or `std.math` functions, for `std.math`'s Float
+  surface. Everything else in `std.math` is pure Runic.
+
+Nothing else is blocked: `std.list`/`str`/`path`/`env` are pure Runic;
+`std.fs`/`process` are command wrappers; `std.testing` needs only assert + abort.
 
 ## Usage Patterns
 
