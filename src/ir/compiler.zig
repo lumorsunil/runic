@@ -63,6 +63,7 @@ pub const execution_result_struct_type = ast.TypeExpr{ .struct_type = .{
 
 pub const thread_type = ast.TypeExpr.global(.thread);
 pub const string_element_type = ast.TypeExpr.global(.byte);
+const push_fallback_element = ast.TypeExpr{ .void = .{ .span = .global } };
 pub const string_type = ast.TypeExpr{ .array = .{
     .element = &string_element_type,
     .span = .global,
@@ -2143,6 +2144,11 @@ pub const IRCompiler = struct {
     fn isTypedCaptureReturn(self: *IRCompiler, t: *const ast.TypeExpr) bool {
         return switch (t.*) {
             .error_union, .optional, .sum, .type_merge, .struct_type, .integer, .float, .boolean => true,
+            // A generic result (`type_var`) is captured by value — preserve
+            // whatever it is. A real array (`[]T`, element not `Byte`) is captured
+            // as the array itself; a String (`[]Byte`) stays on the byte path.
+            .type_var => true,
+            .array => |a| a.element.* != .byte,
             .identifier => |named| blk: {
                 const name = named.path.segments[named.path.segments.len - 1].name;
                 if (self.user_struct_types.contains(name)) break :blk true;
@@ -3610,6 +3616,23 @@ pub const IRCompiler = struct {
                     const object = try self.compileExpression(call.callee.binary.left);
                     return self.compileStrOp(source, object, sb, call.arguments);
                 }
+            }
+            // `arr.push value` — append to an array, yielding a new array.
+            if (std.mem.eql(u8, call.callee.binary.right.identifier.name, "push") and call.arguments.len == 1) {
+                const object = try self.compileExpression(call.callee.binary.left);
+                const array_type_expr = object.typeExpr() orelse array_type(&push_fallback_element);
+                const array_ref = try self.newRef(source, "push_array");
+                try self.set(source, array_ref, stableResultSource(object));
+                const value = try self.compileExpression(call.arguments[0]);
+                const value_ref = try self.newRef(source, "push_value");
+                try self.set(source, value_ref, stableResultSource(value));
+                const result_ref = try self.newRef(source, "push_result");
+                try self.addInstruction(.init(.from(source), .{ .array_push = .{
+                    .array = .from(array_ref.dereference()),
+                    .value = .from(value_ref.dereference()),
+                    .result = result_ref.dereference(),
+                } }));
+                return .fromLocation(result_ref.dereference().typed(array_type_expr));
             }
         }
 

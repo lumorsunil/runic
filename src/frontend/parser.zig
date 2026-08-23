@@ -2025,7 +2025,14 @@ pub const Parser = struct {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
-        _ = try self.expectTokenTag(.dot_l_brace);
+        const start = try self.expectTokenTag(.dot_l_brace);
+
+        // Empty array literal `.{ }`.
+        self.skipNewlines();
+        if ((try self.peekToken()).tag == .r_brace) {
+            const close = try self.expectTokenTag(.r_brace);
+            return .{ .elements = &.{}, .span = start.span.endAt(close.span) };
+        }
 
         const elements = try self.parseList(.comma, parseExpression, .{ .skipNewLines = true });
 

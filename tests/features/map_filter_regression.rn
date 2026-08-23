@@ -1,0 +1,42 @@
+# Generic map/filter written in Runic (stdlib Phase 2): type variables + a
+# higher-order function + array building (an empty literal `.{ }` plus `arr.push
+# value`, which returns a new array). One definition works for any element type.
+fn Void @() Void
+
+fn Void map(xs: []T, f: fn(T) U) []U {
+  var result = .{ }
+  for (xs) |x| { result = result.push (f x) }
+  yield result
+}
+
+fn Void filter(xs: []T, keep: fn(T) Bool) []T {
+  var result = .{ }
+  for (xs) |x| { if (keep x) { result = result.push x } }
+  yield result
+}
+
+fn Void reduce(xs: []T, f: fn(U, T) U, init: U) U {
+  var acc = init
+  for (xs) |x| { acc = f acc x }
+  yield acc
+}
+
+fn Void dbl(n: Int) Int { yield n + n }
+fn Void isEven(n: Int) Bool { yield (n % 2) == 0 }
+fn Void add(a: Int, b: Int) Int { yield a + b }
+
+const nums = .{ 1, 2, 3, 4, 5, 6 }
+
+const doubled = map nums dbl
+echo "map len=${doubled.len}"
+for (doubled) |d| { echo "  d=${d}" }
+
+const evens = filter nums isEven
+echo "filter len=${evens.len}"
+for (evens) |e| { echo "  e=${e}" }
+
+echo "reduce sum=${reduce nums add 0}"
+
+# Compose: sum of the doubled evens.
+const doubledEvens = map evens dbl
+echo "sum of doubled evens=${reduce doubledEvens add 0}"

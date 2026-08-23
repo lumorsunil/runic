@@ -113,6 +113,9 @@ pub const Instruction = struct {
         /// applies a string builtin (`s.len`, `s.upper`, `s.contains "x"`, …) to
         /// the operand string, with up to two arguments, storing the result.
         str_op: StrOp,
+        /// `arr.push value` — allocates a new array (`[len+1, …elements, value]`)
+        /// and stores its base address in `result`.
+        array_push: ArrayPush,
         /// constructs an error value (boxing the runtime payload, if any)
         make_err: MakeErr,
         /// sets result to a boolean: whether operand is an error value whose
@@ -362,6 +365,16 @@ pub const Instruction = struct {
 
         pub fn format(self: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
             try w.print("{f} = str.{t}({f}, {f}, {f})", .{ self.result, self.op, self.operand, self.arg0, self.arg1 });
+        }
+    };
+
+    pub const ArrayPush = struct {
+        array: ValueSource,
+        value: ValueSource,
+        result: Location,
+
+        pub fn format(self: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
+            try w.print("{f} = push({f}, {f})", .{ self.result, self.array, self.value });
         }
     };
 

@@ -1113,6 +1113,14 @@ pub const BinaryExpr = struct {
         const right_type = try self.right.resolveType(io, allocator, scope);
 
         return switch (self.op) {
+            // Comparisons and logical ops produce a Bool, not the operand type.
+            .equal,
+            .not_equal,
+            .greater,
+            .greater_equal,
+            .less,
+            .less_equal,
+            => &boolTypeExpr,
             .assign, .add_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign => left_type,
             .@"orelse" => blk: {
                 if (left_type) |lt| switch (lt.*) {

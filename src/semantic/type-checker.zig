@@ -813,6 +813,25 @@ pub const TypeChecker = struct {
                 },
             }),
             .type_merge => |merge| try self.resolveTypeMerge(scope, merge),
+            // Resolve a function type's parts so any type variables in a generic
+            // signature are baked into the stored type (as `.type_var`), rather
+            // than left as raw identifiers that a call site would fail to resolve.
+            .function => |function| blk: {
+                const params: ast.TypeExpr.FunctionType.Parameters = switch (function.params) {
+                    ._non_variadic => |ps| pblk: {
+                        const out = try self.arena.allocator().alloc(?*const ast.TypeExpr, ps.len);
+                        for (ps, out) |p, *dst| dst.* = if (p) |pt| try self.resolveTypeExpr(scope, pt) else null;
+                        break :pblk .{ ._non_variadic = out };
+                    },
+                    ._variadic => |p| .{ ._variadic = if (p) |pt| try self.resolveTypeExpr(scope, pt) else null },
+                };
+                break :blk try self.allocTypeExpression(.{ .function = .{
+                    .params = params,
+                    .stdin_type = if (function.stdin_type) |st| try self.resolveTypeExpr(scope, st) else null,
+                    .return_type = if (function.return_type) |rt| try self.resolveTypeExpr(scope, rt) else null,
+                    .span = function.span,
+                } });
+            },
             // Resolve each member so a sum that arrives with raw member
             // identifiers (e.g. a function call's return type) compares correctly.
             .sum => |sum| blk: {
@@ -981,6 +1000,15 @@ pub const TypeChecker = struct {
         const name = identifier.path.segments[0].name;
 
         const binding = scope.lookup(name) orelse {
+            // An unresolved *uppercase* type name is an implicit generic type
+            // variable (e.g. `T`/`U` in a generic signature, or that signature
+            // re-resolved at a call site outside the function scope). Since the
+            // runtime is dynamic, it is permissive — resolve it to a type_var
+            // rather than reporting "not declared". (A lowercase unknown name is
+            // still an error.)
+            if (identifier.path.segments[0].isTypeIdentifier()) {
+                return try self.allocTypeExpression(.{ .type_var = .{ .name = name, .span = identifier.span } });
+            }
             try self.reportSpanError(
                 identifier.span,
                 Error.IdentifierNotFound,
@@ -1046,22 +1074,15 @@ pub const TypeChecker = struct {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, fn_decl.span);
 
-        if (fn_decl.name) |identifier| {
-            try scope.declare(
-                self.arena.allocator(),
-                identifier,
-                try self.resolveExprType(scope, fn_decl),
-                fn_decl.is_pub,
-                false,
-            );
-        }
-
         const fn_scope = try scope.addChild(self.arena.allocator(), fn_decl.span);
 
         // Implicit generics: an uppercase type name in the signature that isn't a
         // declared type is a type variable, scoped to this function (e.g. `T`/`U`
-        // in `fn map(xs: []T, f: fn(T) U) []U`). Declare them before resolving the
-        // signature so they don't report "type T not declared".
+        // in `fn map(xs: []T, f: fn(T) U) []U`). Declare them in the function
+        // scope first, so the signature resolves (no "type T not declared") and —
+        // resolved *in the function scope* — the type variables are baked into the
+        // stored function type as `.type_var`, so a call site never re-resolves a
+        // raw `T`/`U`.
         {
             var type_vars: std.StringHashMapUnmanaged(void) = .empty;
             defer type_vars.deinit(self.arena.allocator());
@@ -1078,6 +1099,20 @@ pub const TypeChecker = struct {
                 const marker = try self.allocTypeExpression(.{ .type_var = .{ .name = name.*, .span = fn_decl.span } });
                 try fn_scope.declare(self.arena.allocator(), .{ .name = name.*, .span = fn_decl.span }, marker, false, false);
             }
+        }
+
+        if (fn_decl.name) |identifier| {
+            // Resolve the function's type in the function scope so type variables
+            // are baked in, then expose the binding in the outer scope.
+            const raw_fn_type = try self.resolveExprType(fn_scope, fn_decl);
+            const resolved_fn_type = if (raw_fn_type) |t| try self.resolveTypeExpr(fn_scope, t) else null;
+            try scope.declare(
+                self.arena.allocator(),
+                identifier,
+                resolved_fn_type,
+                fn_decl.is_pub,
+                false,
+            );
         }
 
         if (fn_decl.stdin_type) |stdin_type| {

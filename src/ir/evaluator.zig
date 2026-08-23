@@ -1382,6 +1382,24 @@ pub const IREvaluator = struct {
                 try self.setLocation(thread, str_op.result, result);
                 return .cont;
             },
+            .array_push => |ap| {
+                const arr = try self.resolveValueSource(thread, ap.array);
+                const value = try self.resolveValueSource(thread, ap.value);
+                // An empty/absent array (`.void`) starts a fresh one.
+                const len: usize = if (arr == .addr)
+                    @intCast(thread.shared.heapGet(arr.addr).?.integer)
+                else
+                    0;
+                const new_base = try thread.shared.alloc(self.allocator, len + 2);
+                const nb = new_base.addr;
+                thread.shared.heapGetPtr(nb).?.* = .{ .integer = @intCast(len + 1) };
+                if (arr == .addr) {
+                    for (0..len) |i| thread.shared.heapGetPtr(nb + 1 + i).?.* = thread.shared.heapGet(arr.addr + 1 + i).?;
+                }
+                thread.shared.heapGetPtr(nb + 1 + len).?.* = value;
+                try self.setLocation(thread, ap.result, new_base);
+                return .cont;
+            },
             .make_err => |make_err| {
                 const payload_ptr: ?*const ir.Value = if (make_err.payload) |payload| blk: {
                     const value = try self.resolveValueSource(thread, payload);
