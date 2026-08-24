@@ -1,0 +1,75 @@
+// std.list — generic helpers over arrays (`[]T`), built on implicit type
+// variables, higher-order functions, and `arr.push` (which returns a new array).
+// One definition works for any element type; the runtime is dynamic, so these
+// compile once.
+fn Void @() Void
+
+// Each element mapped through `f`.
+pub fn Void map(xs: []T, f: fn(T) U) []U {
+  var result = .{ }
+  for (xs) |x| { result = result.push (f x) }
+  yield result
+}
+
+// Only the elements for which `keep` returns true.
+pub fn Void filter(xs: []T, keep: fn(T) Bool) []T {
+  var result = .{ }
+  for (xs) |x| { if (keep x) { result = result.push x } }
+  yield result
+}
+
+// Left fold: `f (… (f (f init x0) x1) …) xn`.
+pub fn Void reduce(xs: []T, f: fn(U, T) U, init: U) U {
+  var acc = init
+  for (xs) |x| { acc = f acc x }
+  yield acc
+}
+
+// Number of elements. (`xs.len` is the builtin; this is the named helper.)
+pub fn Void count(xs: []T) Int {
+  var n = 0
+  for (xs) |x| { n = n + 1 }
+  yield n
+}
+
+// True if any element satisfies `pred`.
+pub fn Void any(xs: []T, pred: fn(T) Bool) Bool {
+  var found = false
+  for (xs) |x| { if (pred x) { found = true } }
+  yield found
+}
+
+// True if every element satisfies `pred`.
+pub fn Void all(xs: []T, pred: fn(T) Bool) Bool {
+  var ok = true
+  for (xs) |x| { if (pred x) { } else { ok = false } }
+  yield ok
+}
+
+// A reversed copy.
+pub fn Void reverse(xs: []T) []T {
+  var result = .{ }
+  const n = xs.len
+  for (0..n) |i| { result = result.push xs[n - 1 - i] }
+  yield result
+}
+
+// `a` followed by `b`.
+pub fn Void concat(a: []T, b: []T) []T {
+  var result = .{ }
+  for (a) |x| { result = result.push x }
+  for (b) |x| { result = result.push x }
+  yield result
+}
+
+// `[start, start+1, …, end-1]` (empty when `end <= start`).
+pub fn Void range(start: Int, end: Int) []Int {
+  var result = .{ }
+  const n = end - start
+  var i = start
+  for (0..n) |_| {
+    result = result.push i
+    i = i + 1
+  }
+  yield result
+}

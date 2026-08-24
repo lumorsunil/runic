@@ -1,0 +1,31 @@
+// The reserved `import "std"` resolves to the bundled, embedded standard
+// library (no filesystem lookup); modules are public members (`std.list.*`).
+// Bool renders in the exit-code convention: true -> "0", false -> "1".
+const std = import "std"
+
+fn Void dbl(n: Int) Int { yield n + n }
+fn Void isEven(n: Int) Bool { yield (n % 2) == 0 }
+fn Void add(a: Int, b: Int) Int { yield a + b }
+
+const nums = .{ 1, 2, 3, 4, 5 }
+
+const doubled = std.list.map nums dbl
+echo "map=${doubled.len}"
+
+const evens = std.list.filter nums isEven
+echo "filter=${evens.len}"
+
+echo "reduce=${std.list.reduce nums add 0}"
+echo "count=${std.list.count nums}"
+
+const r = std.list.reverse nums
+echo "reverse=${r[0]}${r[4]}"
+
+const c = std.list.concat nums evens
+echo "concat=${c.len}"
+
+const rng = std.list.range 2 6
+echo "range=${rng.len}:${rng[0]}:${rng[3]}"
+
+echo "any=${std.list.any nums isEven}"
+echo "all=${std.list.all nums isEven}"

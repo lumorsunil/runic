@@ -1,0 +1,9 @@
+map=5
+filter=2
+reduce=15
+count=5
+reverse=51
+concat=7
+range=4:2:5
+any=0
+all=1
