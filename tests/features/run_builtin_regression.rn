@@ -1,0 +1,14 @@
+// `run` executes an executable at a runtime-computed path — a variable, an
+// interpolated string, or a path a bare command word can't express — with the
+// first argument as the executable and the rest as its arguments.
+
+// literal path argument
+run "tests/support/bin/echo_args" "x" "y"
+
+// path from a variable
+const bin = "tests/support/bin/echo_args"
+run bin "from-var"
+
+// capture the output of a run invocation
+const out = run bin "captured"
+echo "got ${out}"

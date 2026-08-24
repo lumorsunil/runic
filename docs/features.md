@@ -76,6 +76,43 @@ echo "${nested}"
 
 **Result:** The first `pwd` prints `/tmp`, the nested subshell prints `/`, and once the subshell exits the parent context still reports `/tmp`. Calling `cd` with no argument uses the current subshell's `HOME` value.
 
+### Executables outside `PATH`
+
+A bare command word (`git`, `ls`) is looked up on `PATH` or in the current
+directory, so a program at a *sub*path — `scripts/start`, `tools/build/gen` —
+can't be named as a bare word (`scripts/start` would parse as the division
+`scripts / start`). Runic offers two unambiguous ways to run one:
+
+**Path sigil.** A command word that *starts* with a path sigil — `./`, `../`,
+or `/` — is parsed whole as a single executable path, arguments follow as usual:
+
+```rn
+./scripts/start "arg0" "arg1"     // relative to the current directory
+../tools/build/gen "out"          // parent-relative
+/usr/bin/env                      // absolute
+```
+
+The sigil requirement is what keeps it unambiguous: `/`, `./`, and `../` can't
+begin an ordinary expression, so `a / b` (division) and `a.b` (member access)
+are unaffected — only a leading sigil selects the path form. A bare relative
+subpath (`scripts/start`, no sigil) still parses as division; write `./scripts/start`
+or use `run`.
+
+**`run` builtin.** When the path is computed at runtime — a variable, an
+interpolated string, or anything a static command word can't express — `run`
+takes the executable as its first argument and the rest as its arguments:
+
+```rn
+run "scripts/start" "arg0"        // literal path (no sigil needed)
+const bin = "tools/build/gen"
+run bin "out"                     // path from a variable
+const version = run bin "--version"   // captures output like any command
+```
+
+`run` produces the same `ExecutableError!String` value view as any command, so
+its result can be captured, piped, and error-handled identically. (A local
+binding named `run` shadows the builtin.)
+
 ### Errors as first-class types
 
 Runic treats `error` like Zig: an error set is a type, declared with `const`, whose variants may be opaque or carry a typed payload.

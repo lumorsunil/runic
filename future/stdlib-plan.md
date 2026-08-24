@@ -151,6 +151,25 @@ new syntax), then the primitives the stdlib is actually made of.
   **Phase 2 COMPLETE.** Full CI green (13/13, 42 diag, 8 examples, 119 smoke,
   3 strict).
 
+- [x] **Adjacent — Executables outside `PATH`. DONE (2026-08-24).** Not a stdlib
+  blocker, but resolved alongside it: a program at a subpath couldn't be named as
+  a bare command word (`scripts/start` parsed as division). Two unambiguous forms,
+  both documented in `docs/features.md`:
+  - **Path sigil** — a command word starting with `./`, `../`, or `/` parses whole
+    as one executable path. Unambiguous because those sigils can't begin an
+    expression, so division (`a / b`) and member access (`a.b`) are untouched.
+    Parser: `tryParsePathExpression`/`isPathToken`, hooked into the `.expr` state
+    of the component binary parser; the path flows through the existing
+    direct-executable machinery as an identifier whose name is the full path.
+  - **`run` builtin** — `run <path> args…` executes a runtime-computed path (var,
+    interpolation, spaced) with arg[0] as the executable. Reuses
+    `compileExecutableCall` (generalized to compile a dynamic executable
+    expression); `materializeExecArgv` already accepted a dynamic executable.
+    Same `ExecutableError!String` value view as any command; shadowable.
+  - Tests: `path_executable_regression`, `run_builtin_regression`. `~/` (home)
+    deferred — needs a tilde lexer token + expansion; covered today by
+    `run "${HOME}/…"`-style interpolation.
+
 - [ ] **Phase 3 — The `std` module + shallow modules.** Concrete API spec (every
   signature) is in `docs/standard-library.md` → *Module Reference*. Agreed scope
   (2026-08-23): all eight modules; `std.str` is **composites only** (the built-in

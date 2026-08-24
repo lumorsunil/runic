@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Deterministic helper for executable-path regression tests: echoes its
+# arguments on one line so the caller's argv can be asserted.
+printf 'args:'
+for a in "$@"; do
+  printf ' %s' "$a"
+done
+printf '\n'

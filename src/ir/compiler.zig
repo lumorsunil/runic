@@ -1426,6 +1426,9 @@ pub const IRCompiler = struct {
 
         const name = call.callee.identifier.name;
         if (std.mem.eql(u8, name, "cd")) return false;
+        // `run` computes its executable from the first argument; it must go
+        // through the general call path, not the static-name direct exec.
+        if (std.mem.eql(u8, name, "run")) return false;
         for (call.arguments) |arg| {
             if (!isSimpleExecArgument(arg)) return false;
         }
@@ -3605,6 +3608,16 @@ pub const IRCompiler = struct {
             if (std.mem.eql(u8, name, "cd") and self.lookup(name, .{ .shallow = false }) == null) {
                 return self.compileBuiltinCd(source, call.arguments);
             }
+            // `run "path" args…` — execute an executable at a runtime-computed
+            // path (a variable, interpolation, or a spaced path a bare command
+            // token can't express). The first argument is the executable; the
+            // rest are its arguments.
+            if (std.mem.eql(u8, name, "run") and
+                call.arguments.len >= 1 and
+                self.lookup(name, .{ .shallow = false }) == null)
+            {
+                return self.compileExecutableCall(source, .void, call.arguments[0], call.arguments[1..], call.redirects);
+            }
         }
 
         // String builtins with arguments (`s.contains "x"`, `s.slice 1 3`, …) —
@@ -3658,7 +3671,7 @@ pub const IRCompiler = struct {
 
         return switch (callee.source) {
             .value => |v| switch (v) {
-                .executable => self.compileExecutableCall(source, v, call.arguments, call.redirects),
+                .executable => self.compileExecutableCall(source, v, null, call.arguments, call.redirects),
                 // A zero-arg reference to a function that declares parameters is a
                 // function *value* (`const f = dbl`), not a call — yield the fn_ref
                 // so it can be called later (`f x`). A nullary function is called.
@@ -4009,6 +4022,10 @@ pub const IRCompiler = struct {
         self: *IRCompiler,
         source: *ast.Expression,
         executable: ir.Value,
+        // When non-null, the executable is a runtime string produced by this
+        // expression (`run "path" …`) rather than the static `executable` value;
+        // it is compiled inside the exec closure alongside the arguments.
+        executable_expr: ?*ast.Expression,
         arguments: []const *ast.Expression,
         redirects: []const ast.Redirection,
     ) Error!Result {
@@ -4135,7 +4152,12 @@ pub const IRCompiler = struct {
             }
             try self.push(source, arg.source);
         }
-        try self.push(source, .from(executable));
+        if (executable_expr) |exe_expr| {
+            const exe = try self.compileExpression(exe_expr);
+            try self.push(source, exe.source);
+        } else {
+            try self.push(source, .from(executable));
+        }
         try self.push(source, .fromValue(.{ .integer = @as(i64, @intCast(arguments.len)) }));
 
         const exec_handle = try self.exec_(source, arguments.len, false);

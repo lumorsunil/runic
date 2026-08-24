@@ -1,0 +1,15 @@
+// Executable paths with a leading path sigil (`./`) parse as a single command
+// token, so a script outside PATH/cwd can be invoked directly without quoting
+// or a `run` wrapper. The sigil disambiguates from division/member access by
+// only triggering at the start of a command word.
+
+// relative subpath via `./`
+./tests/support/bin/echo_args "a" "b"
+
+// division still parses as arithmetic (not a path)
+const q = 10 / 2
+echo "q ${q}"
+
+// member access still parses (not a path)
+const s = "hello"
+echo "len ${s.len}"

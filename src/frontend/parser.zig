@@ -870,6 +870,12 @@ pub const Parser = struct {
 
             switch (state) {
                 .expr => {
+                    // An unquoted path command (`./x`, `/usr/bin/y`, `../z`) in
+                    // value position — consumed whole before the token switch.
+                    if (try self.tryParsePathExpression()) |path_expr| {
+                        try components.append(self.allocator, .{ .expr = path_expr });
+                        continue;
+                    }
                     switch (next.tag) {
                         .identifier => {
                             const breadcrumbInner = try self.createBreadcrumb("PBE:identifier");
@@ -2416,9 +2422,60 @@ pub const Parser = struct {
         }
     }
 
+    /// Tokens that may appear inside an unquoted executable path
+    /// (`./scripts/start-2`, `/usr/bin/env`).
+    fn isPathToken(tag: token.Tag) bool {
+        return switch (tag) {
+            .identifier, .slash, .dot, .range, .minus, .int_literal => true,
+            else => false,
+        };
+    }
+
+    /// Option-1 path command: an unquoted executable whose name begins with a
+    /// path sigil — `/…` (absolute), `./…` or `../…` (relative). None of these can
+    /// begin an ordinary expression (`/`, `.`, `..` all need a left operand), so
+    /// there is no ambiguity with division/member-access. Consumes the contiguous
+    /// (no-whitespace) run of path tokens into a single identifier whose name is
+    /// the full path, which then flows through the normal executable machinery.
+    fn tryParsePathExpression(self: *Self) Error!?*ast.Expression {
+        const lookahead = self.peekSlice(2) catch return null;
+        if (lookahead.len == 0) return null;
+        const first = lookahead[0];
+        const adjacent = lookahead.len >= 2 and lookahead[1].span.start.offset == first.span.end.offset;
+        const is_path_start = switch (first.tag) {
+            .slash => true,
+            .dot, .range => adjacent and lookahead[1].tag == .slash,
+            else => false,
+        };
+        if (!is_path_start) return null;
+
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(self.allocator);
+        var start_span: ?token.Span = null;
+        var end_span: token.Span = first.span;
+        var expected_offset: usize = first.span.start.offset;
+        while (true) {
+            const t = self.peekToken() catch break;
+            if (!isPathToken(t.tag)) break;
+            if (start_span != null and t.span.start.offset != expected_offset) break;
+            _ = try self.nextToken();
+            try buf.appendSlice(self.allocator, t.lexeme);
+            if (start_span == null) start_span = t.span;
+            end_span = t.span;
+            expected_offset = t.span.end.offset;
+        }
+
+        const name = try self.copyToArena(u8, buf.items);
+        return try self.allocExpression(.{
+            .identifier = .{ .name = name, .span = token.Span.fromTo(start_span.?, end_span) },
+        });
+    }
+
     fn parsePrimaryExpression(self: *Self) Error!*ast.Expression {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
+
+        if (try self.tryParsePathExpression()) |path_expr| return path_expr;
 
         const expected_primary_tokens = [_]token.Tag{
             .identifier,
