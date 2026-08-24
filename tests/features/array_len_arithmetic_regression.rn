@@ -1,0 +1,30 @@
+// `.len` on a non-literal array (a function return or a `[]T` parameter) must
+// yield a stable Int usable in arithmetic and indexing. Regression: the length
+// was returned addressed through the volatile %r2 register without copying to a
+// stable ref, so binding it (`const n = xs.len`) and then computing `xs.len - 1`
+// / `xs[n - 1 - i]` read through a clobbered %r2 ("Could not dereference value
+// of type exit_code"). A literal array hid the bug (its length comptime-folds).
+fn Void @() Void
+
+fn Void mk() []Int {
+  var r = .{ }
+  r = r.push 10
+  r = r.push 20
+  r = r.push 30
+  yield r
+}
+
+// length of a function-returned array, used in arithmetic
+const xs = mk
+const n = xs.len
+echo "n=${n} n-1=${n - 1} n+n=${n + n}"
+
+// length of a `[]T` parameter, used to index from the end (reverse)
+fn Void lastFirst(ys: []T) []T {
+  var out = .{ }
+  const m = ys.len
+  for (0..m) |i| { out = out.push ys[m - 1 - i] }
+  yield out
+}
+const rev = lastFirst xs
+echo "rev0=${rev[0]} rev2=${rev[2]}"

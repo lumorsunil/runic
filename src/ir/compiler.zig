@@ -3045,15 +3045,18 @@ pub const IRCompiler = struct {
                     return .fromValue(.void);
                 }
 
+                // The length lives at slot 0 of the heap array, addressed through
+                // %r2 — a volatile register. Copy it into a fresh stable ref so a
+                // later access (or arithmetic on the bound length, `xs.len - 1`)
+                // doesn't read through a clobbered %r2. Mirrors the struct-field
+                // read below.
                 try self.set(source, .initRegister(.r2), object.source);
-
-                return .fromLocation(.initAbs(
+                const len_ref = try self.newRef(source, "array_len");
+                try self.set(source, len_ref, .fromLocation(.initAbs(
                     .{ .register = .r2 },
-                    .{
-                        .dereference = true,
-                        .type_expr = .global(.integer),
-                    },
-                ));
+                    .{ .dereference = true, .type_expr = .global(.integer) },
+                )));
+                return .fromLocation(len_ref.dereference().typed(.global(.integer)));
             },
             .struct_type => |struct_type| struct_type,
             // A binding annotated with a user struct's name carries the type as
