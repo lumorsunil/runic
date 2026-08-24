@@ -189,6 +189,14 @@ pub const TypeExpr = union(enum) {
     pub const FnRefType = struct {
         instr_set: usize,
         span: Span,
+        /// The referenced function's declared return type, when known. Carried so
+        /// a call through a module member (`m.fn args`) can value-capture the
+        /// yielded result typed as its return type, exactly like a direct call.
+        return_type: ?*const TypeExpr = null,
+        /// The referenced function's declared parameter count, when known, so a
+        /// call site can tell a zero-arg *reference* (`const f = m.fn`) from a
+        /// nullary *call*.
+        param_count: ?usize = null,
     };
 
     pub const TypeVar = struct {

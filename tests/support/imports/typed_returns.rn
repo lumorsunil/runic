@@ -1,0 +1,18 @@
+fn Void @() Void
+
+# A pub fn with a concrete scalar return, called through a module member.
+pub fn Void triple(n: Int) Int { yield n + n + n }
+
+# A generic pub fn returning an array (`[]U`) — the result must stay a real
+# array through the member call, so `.len` and `for` work on it.
+pub fn Void map(xs: []T, f: fn(T) U) []U {
+  var result = .{ }
+  for (xs) |x| { result = result.push (f x) }
+  yield result
+}
+
+# A pub fn returning an optional, so a module-member call value-captures the
+# discriminant (not a byte-flattened string).
+pub fn Void maybe(n: Int) ?Int {
+  if (n > 0) { yield n } else { yield null }
+}

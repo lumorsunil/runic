@@ -1,0 +1,5 @@
+fn Void @() Void
+
+# Re-export the typed-returns module so callers reach it as a nested member
+# (`root.nums.triple`), the shape `import "std"` uses (`std.list.map`).
+pub const nums = import "typed_returns.rn"

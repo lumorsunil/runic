@@ -2166,6 +2166,17 @@ pub const IRCompiler = struct {
         source: anytype,
         expr: *ast.Expression,
     ) Error!?Result {
+        // A call through a module member (`m.fn args`, `std.list.map xs f`) whose
+        // pub fn declares a typed-capturable return. The fn_ref and its return
+        // type come from the member's `fn_ref_type` (no receiver is prepended —
+        // unlike UFCS, a module member is not a method on its object).
+        if (try self.moduleMemberFnRef(expr)) |mm| {
+            if (self.isTypedCaptureReturn(mm.return_type)) {
+                return try self.emitTypedValueCapture(source, expr, mm.fn_ref_value, mm.arguments, &.{}, mm.return_type);
+            }
+            return null;
+        }
+
         const info = (try self.capturableCallInfo(expr)) orelse return null;
         if (info.redirects.len != 0) return null;
 
@@ -2189,6 +2200,22 @@ pub const IRCompiler = struct {
         // keep those on the existing path.
         if (self.instruction_sets.items[fn_ref_value.fn_ref.fn_addr.instr_set].pub_exports.len != 0) return null;
 
+        return try self.emitTypedValueCapture(source, expr, fn_ref_value, info.arguments, info.redirects, return_type_ptr);
+    }
+
+    /// Emits an in-process typed value capture of a function call: fork with a
+    /// `typed` stdout pipe, wait, then dequeue the single yielded value into %r
+    /// typed as `return_type_ptr`. Shared by the local-binding and module-member
+    /// capture paths.
+    fn emitTypedValueCapture(
+        self: *IRCompiler,
+        source: anytype,
+        expr: *ast.Expression,
+        fn_ref_value: ir.Value,
+        arguments: []const *ast.Expression,
+        redirects: []const ast.Redirection,
+        return_type_ptr: *const ast.TypeExpr,
+    ) Error!Result {
         // Mirror the byte-capture path's stack contract: leave exactly
         // `capture_temp_ref_count` temporary refs on top and return the result
         // in %r, so every caller (pop-5 or binding) stays balanced.
@@ -2201,8 +2228,8 @@ pub const IRCompiler = struct {
         const call_result = try self.compileFunctionCall(
             expr,
             fn_ref_value,
-            info.arguments,
-            info.redirects,
+            arguments,
+            redirects,
             pipe_ref.dereference(),
         );
 
@@ -2221,6 +2248,69 @@ pub const IRCompiler = struct {
         // Dequeue the single yielded value (the error union) into %r.
         try self.addInstruction(.init(.from(source), .{ .pipe_dequeue = pipe_ref.dereference() }));
         return try .from(ir.Location.initRegister(.r).typed(return_type_ptr.*));
+    }
+
+    const ModuleMemberFnRef = struct {
+        fn_ref_value: ir.Value,
+        return_type: *const ast.TypeExpr,
+        arguments: []const *ast.Expression,
+    };
+
+    /// If `expr` is a call whose callee is a module member naming a pub fn (a
+    /// `fn_ref_type` field with a known return type) — `m.fn args` or a nested
+    /// `std.list.map xs f` — returns its fn_ref, return type, and the *raw*
+    /// arguments (no receiver prepended). Returns null otherwise. Resolves the
+    /// callee's type statically (via bindings/fields), emitting no instructions.
+    fn moduleMemberFnRef(self: *IRCompiler, expr: *ast.Expression) Error!?ModuleMemberFnRef {
+        const callee: *ast.Expression, const arguments: []const *ast.Expression = switch (expr.*) {
+            .call => |call| blk: {
+                if (call.background or call.redirects.len != 0) return null;
+                break :blk .{ call.callee, call.arguments };
+            },
+            .binary => .{ expr, &.{} },
+            else => return null,
+        };
+        if (callee.* != .binary or callee.binary.op != .member or callee.binary.right.* != .identifier) return null;
+
+        const callee_type = self.resolveStaticType(callee) orelse return null;
+        if (callee_type != .fn_ref_type) return null;
+        const frt = callee_type.fn_ref_type;
+        const return_type = frt.return_type orelse return null;
+
+        // A zero-arg reference to a fn that declares parameters is a function
+        // *value* (`const f = m.fn`), not a call — leave it to the value path.
+        if (arguments.len == 0 and (frt.param_count orelse 0) > 0) return null;
+
+        return .{
+            .fn_ref_value = .{ .fn_ref = .{ .fn_addr = ir.InstructionAddr.initAbs(frt.instr_set, 0) } },
+            .return_type = return_type,
+            .arguments = arguments,
+        };
+    }
+
+    /// Best-effort compile-time type of an expression, resolved purely from
+    /// binding declarations and struct field layouts (no instructions emitted).
+    /// Handles the shapes module-member resolution needs: a bound identifier and
+    /// nested `object.member` field access. Returns null when the type is not
+    /// statically known this way.
+    fn resolveStaticType(self: *IRCompiler, expr: *ast.Expression) ?ast.TypeExpr {
+        switch (expr.*) {
+            .identifier => |id| {
+                const binding = self.lookup(id.name, .{ .shallow = false }) orelse return null;
+                return binding.type_expr;
+            },
+            .binary => |b| {
+                if (b.op != .member or b.right.* != .identifier) return null;
+                var object_type = self.resolveStaticType(b.left) orelse return null;
+                while (object_type == .alias) object_type = object_type.alias.type_expr.*;
+                if (object_type != .struct_type) return null;
+                for (object_type.struct_type.fields) |field| {
+                    if (std.mem.eql(u8, field.name.name, b.right.identifier.name)) return field.type_expr.*;
+                }
+                return null;
+            },
+            else => return null,
+        }
     }
 
     fn compileExpressionWithCapture(
@@ -4621,10 +4711,7 @@ pub const IRCompiler = struct {
             for (pub_exports, 0..) |pub_export, i| {
                 const field_type_ptr = try self.allocator.create(ast.TypeExpr);
                 if (pub_export.fn_ref_value) |fn_ref_val| {
-                    field_type_ptr.* = .{ .fn_ref_type = .{
-                        .instr_set = fn_ref_val.fn_ref.fn_addr.instr_set,
-                        .span = .global,
-                    } };
+                    field_type_ptr.* = .{ .fn_ref_type = try self.fnRefTypeFor(fn_ref_val, pub_export.type_expr) };
                 } else {
                     field_type_ptr.* = pub_export.type_expr orelse .global(.integer);
                 }
@@ -6128,10 +6215,7 @@ pub const IRCompiler = struct {
         for (pub_exports, 0..) |pub_export, i| {
             const field_type_ptr = try self.allocator.create(ast.TypeExpr);
             if (pub_export.fn_ref_value) |fn_ref_val| {
-                field_type_ptr.* = .{ .fn_ref_type = .{
-                    .instr_set = fn_ref_val.fn_ref.fn_addr.instr_set,
-                    .span = .global,
-                } };
+                field_type_ptr.* = .{ .fn_ref_type = try self.fnRefTypeFor(fn_ref_val, pub_export.type_expr) };
             } else {
                 field_type_ptr.* = pub_export.type_expr orelse .global(.integer);
             }
@@ -6148,6 +6232,33 @@ pub const IRCompiler = struct {
         } };
 
         return .fromLocation(result_ref.dereference().typed(merged_type));
+    }
+
+    /// Builds the `fn_ref_type` for a module pub-fn field, carrying the function's
+    /// declared return type and parameter count (recovered from its `.function`
+    /// binding type) so a call through the member can value-capture the result
+    /// typed as its return type, exactly like a direct call.
+    fn fnRefTypeFor(
+        self: *IRCompiler,
+        fn_ref_val: ir.Value,
+        binding_type: ?ast.TypeExpr,
+    ) Error!ast.TypeExpr.FnRefType {
+        var return_type: ?*const ast.TypeExpr = null;
+        var param_count: ?usize = null;
+        if (binding_type) |bt| if (bt == .function) {
+            return_type = bt.function.return_type;
+            param_count = switch (bt.function.params) {
+                ._non_variadic => |ps| ps.len,
+                ._variadic => null,
+            };
+        };
+        _ = self;
+        return .{
+            .instr_set = fn_ref_val.fn_ref.fn_addr.instr_set,
+            .span = .global,
+            .return_type = return_type,
+            .param_count = param_count,
+        };
     }
 
     fn compileFnDecl(
