@@ -3341,6 +3341,12 @@ pub const IRCompiler = struct {
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
+        // Empty literal (`""`) — no segments; still a String, not a 0-length
+        // struct (the multi-segment path below would mistype it).
+        if (string_literal.segments.len == 0) {
+            return .from(try self.addSlice(1, ""));
+        }
+
         if (string_literal.segments.len == 1) {
             const decoded = try self.decodeStringLiteralText(string_literal.segments[0].text.payload);
             defer self.allocator.free(decoded);
@@ -4460,10 +4466,44 @@ pub const IRCompiler = struct {
     }
 
     /// True when a compile-time type denotes the string type (`[]Byte`).
+    /// Normalizes the `String`-named type identifier to the structural string
+    /// type (`[]Byte`), recursing through arrays and optionals, so a `String`
+    /// parameter or `[]String` element is recognized by every string-handling
+    /// site (which key on `.array` with a byte element). Non-`String` identifiers
+    /// — including user struct names — are left untouched.
+    fn normalizeStringTypes(self: *IRCompiler, t: ast.TypeExpr) ast.TypeExpr {
+        switch (t) {
+            .identifier => |id| {
+                const segs = id.path.segments;
+                if (segs.len == 1 and std.mem.eql(u8, segs[segs.len - 1].name, "String")) return string_type;
+                return t;
+            },
+            .array => |a| {
+                const elem = self.allocator.create(ast.TypeExpr) catch return t;
+                elem.* = self.normalizeStringTypes(a.element.*);
+                return .{ .array = .{ .element = elem, .span = a.span } };
+            },
+            .optional => |o| {
+                const child = self.allocator.create(ast.TypeExpr) catch return t;
+                child.* = self.normalizeStringTypes(o.child.*);
+                return .{ .optional = .{ .child = child, .span = o.span } };
+            },
+            else => return t,
+        }
+    }
+
     fn typeIsString(_: *IRCompiler, type_expr: ast.TypeExpr) bool {
         var t = type_expr;
         while (t == .alias) t = t.alias.type_expr.*;
-        return t == .array and t.array.element.* == .byte;
+        if (t == .array and t.array.element.* == .byte) return true;
+        // A `String`-named element (e.g. the element type of a `[]String`
+        // parameter) arrives as the unresolved identifier rather than the
+        // structural `[]Byte`.
+        if (t == .identifier) {
+            const segs = t.identifier.path.segments;
+            return segs.len == 1 and std.mem.eql(u8, segs[segs.len - 1].name, "String");
+        }
+        return false;
     }
 
     /// Compiles a string builtin: stabilizes the receiver (operand) and its args,
@@ -6319,7 +6359,7 @@ pub const IRCompiler = struct {
                         .mutable(identifier, .normal),
                         0,
                         false,
-                        if (param.type_annotation) |type_annotation| type_annotation.* else null,
+                        if (param.type_annotation) |type_annotation| self.normalizeStringTypes(type_annotation.*) else null,
                     );
                 },
                 .tuple, .record => {
@@ -6926,7 +6966,7 @@ pub const IRCompiler = struct {
                     .base_ref = source_ref,
                     .len_ref = len_ref,
                     .range_limit_ref = null,
-                    .value_type = source_result.typeExpr().?.array.element.*,
+                    .value_type = self.normalizeStringTypes(source_result.typeExpr().?.array.element.*),
                 };
             },
         }

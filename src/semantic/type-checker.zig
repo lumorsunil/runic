@@ -1620,8 +1620,19 @@ pub const TypeChecker = struct {
 
         for (for_expr.sources, for_expr.capture.bindings) |source, pattern| {
             try self.runExpression(scope, source);
-            const type_expr = try self.resolveExprType(scope, source);
-            try self.runBindingPattern(for_scope, pattern, type_expr, false, false);
+            const source_type = try self.resolveExprType(scope, source);
+            // The capture binds to one *element*, so unwrap an array source to
+            // its element type (`[]String` → `String`). A non-array source (a
+            // range `0..n`, `&0` stdin) already resolves to the element type.
+            const element_type: ?*const ast.TypeExpr = blk: {
+                const st = source_type orelse break :blk null;
+                const unaliased = self.unaliasType(st);
+                if (unaliased.* != .array) break :blk source_type;
+                // Resolve the element so a named primitive element (`[]Int` whose
+                // element parsed as the identifier `Int`) normalizes to its tag.
+                break :blk try self.resolveTypeExpr(scope, unaliased.array.element);
+            };
+            try self.runBindingPattern(for_scope, pattern, element_type, false, false);
         }
 
         try self.runExpression(for_scope, for_expr.body);
