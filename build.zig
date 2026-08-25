@@ -21,6 +21,7 @@ pub fn build(b: *std.Build) void {
     const std_module_files = [_][]const u8{
         "std/std.rn",
         "std/list.rn",
+        "std/str.rn",
     };
     for (std_module_files) |rel| {
         runtime.addAnonymousImport(rel, .{ .root_source_file = b.path(rel) });

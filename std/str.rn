@@ -1,0 +1,51 @@
+// std.str — string helpers composed from the built-in UFCS methods (which stay
+// canonical: `s.len`, `s.split`, `s.trim`, `s.upper`/`lower`, `s.slice`,
+// `s.contains`/`startsWith`/`endsWith`, `s.indexOf`, `s.replace`, `s.repeat`).
+// Only helpers *not* already covered by those builtins live here. Byte-oriented,
+// like the builtins (not UTF-8-aware).
+fn Void @() Void
+
+// Split on whitespace, dropping empty fields (so runs of spaces collapse).
+pub fn Void words(s: String) []String {
+  var result = .{ }
+  const parts = s.split " "
+  for (parts) |p| { if (p.len > 0) { result = result.push p } }
+  yield result
+}
+
+// First byte upper-cased, the rest unchanged. Empty string is returned as-is.
+pub fn Void capitalize(s: String) String {
+  if (s.len == 0) {
+    yield s
+  } else {
+    const head = s.slice 0 1
+    const tail = s.slice 1 (s.len)
+    yield "${head.upper}${tail}"
+  }
+}
+
+// Empty, or only whitespace.
+pub fn Void isBlank(s: String) Bool {
+  yield (s.trim.len) == 0
+}
+
+// Left-pad with `fill` until at least `width` bytes long (`fill` is normally a
+// single byte; a multi-byte fill may overshoot). Longer strings are unchanged.
+pub fn Void padLeft(s: String, width: Int, fill: String) String {
+  const deficit = width - s.len
+  if (deficit > 0) {
+    yield "${fill.repeat deficit}${s}"
+  } else {
+    yield s
+  }
+}
+
+// Right-pad with `fill` until at least `width` bytes long. See `padLeft`.
+pub fn Void padRight(s: String, width: Int, fill: String) String {
+  const deficit = width - s.len
+  if (deficit > 0) {
+    yield "${s}${fill.repeat deficit}"
+  } else {
+    yield s
+  }
+}
