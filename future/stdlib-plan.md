@@ -170,22 +170,39 @@ new syntax), then the primitives the stdlib is actually made of.
     deferred — needs a tilde lexer token + expansion; covered today by
     `run "${HOME}/…"`-style interpolation.
 
-- [ ] **Phase 3 — The `std` module + shallow modules.** Concrete API spec (every
+- [~] **Phase 3 — The `std` module + shallow modules.** Concrete API spec (every
   signature) is in `docs/standard-library.md` → *Module Reference*. Agreed scope
   (2026-08-23): all eight modules; `std.str` is **composites only** (the built-in
   string methods stay canonical); **add Float math builtins now**.
-  - **Language prerequisites:**
-    - Implement `import "std"` resolution: the reserved `std` import resolves to
-      the bundled modules so `const std = import "std"` works and members resolve
-      (`std.list.map …`). Until then, author/test modules as plain `.rn` files
-      imported by relative path.
-    - **Float math builtins** — `sqrt`, `floor`, `ceil`, `round`, `trunc`, Float
-      `pow` (for `std.math`'s Float surface; everything else is pure Runic).
-  - **Modules** (author + test each, per the stabilization checklist):
-    - Pure Runic: `std.list` (map/filter/reduce/find/any/all/count/contains/
-      reverse/concat/range/sort), `std.path`, `std.env`, `std.str` (composites).
-    - Command wrappers: `std.fs`, `std.process`.
-    - `std.math` (int helpers + Float builtins), `std.testing` (assert/assertEq/…).
+  - [x] **`import "std"` resolution — DONE (2026-08-25).** The reserved `std`
+    namespace resolves to modules **embedded in the binary** (`@embedFile` via
+    anonymous imports in `build.zig` → `src/frontend/std_modules.zig`), registered
+    under virtual document paths (`:std`, `:std/list`). `resolveModulePath` maps
+    `import "std"` → `:std` and `import "std/<name>"` → `:std/<name>` (importer-
+    independent, trailing `.rn` trimmed); `requestDocument` loads `:std…` from the
+    embed table. `std.rn` re-exports each module as a public member.
+  - [x] **Foundational IR fixes unblocking typed stdlib** (all committed):
+    module-member calls value-capture by return type; array `.len` stabilized;
+    for-loop capture binds the *element* type; `String`/`[]String`/`""` type
+    consistently.
+  - [x] **`std.list` — DONE.** map/filter/reduce/count/any/all/reverse/concat/range.
+  - [x] **`std.str` — DONE.** words/capitalize/isBlank/padLeft/padRight (composites).
+  - [ ] **Float math builtins** — `sqrt`, `floor`, `ceil`, `round`, `trunc`, Float
+    `pow` (for `std.math`'s Float surface; everything else is pure Runic). Not started.
+  - [ ] **Remaining modules**: `std.path`, `std.env`, `std.math`, `std.fs`,
+    `std.process`, `std.testing`.
+  - **Known blockers found while authoring (fix before the modules that hit them):**
+    - **`std.path` deferred** — two distinct bugs: (1) `join` collides with the
+      built-in `[]String.join` string op (a `X.join` member callee always tries
+      the string builtin before module-member dispatch — the builtin should only
+      apply to a string/array receiver, not a module); (2) a helper that
+      `yield`s a **String variable** (vs a `yield "<interpolation>"`) through a
+      **two-level embedded** member (`std.path.basename`) fails to capture (deref
+      error) — a String-return module-member capture gap. `std.path.rn` was written
+      and verified via one-level relative import; recover it from git history / the
+      2026-08-25 session once these are fixed.
+    - `std.list` **piping into a module-member stage** (`… | std.list.count`) isn't
+      coerced (the pipeline-param coercion keys on local bindings). Call directly.
 
 - [ ] **Phase 4 — Deferred / later discussion.**
   - Generic containers: comptime type-returning functions (`fn Box(comptime T:
