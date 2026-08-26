@@ -47,3 +47,10 @@ echo "stem=${std.path.stem "a/b/c.txt"}"
 echo "abs=${std.path.isAbsolute "/x"}"
 const segs = .{ ".runic", "config" }
 echo "join=${std.path.join segs}"
+
+// std.math
+echo "abs=${std.math.abs (0 - 5)}"
+echo "min=${std.math.min 3 8} max=${std.math.max 3 8}"
+echo "clamp=${std.math.clamp 15 0 10}"
+echo "sign=${std.math.sign (0 - 3)}${std.math.sign 0}${std.math.sign 7}"
+echo "pow=${std.math.pow 2 8}"

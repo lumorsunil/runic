@@ -19,3 +19,8 @@ ext=.txt
 stem=c
 abs=0
 join=.runic/config
+abs=5
+min=3 max=8
+clamp=10
+sign=-101
+pow=256

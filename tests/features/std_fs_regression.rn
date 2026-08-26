@@ -1,0 +1,28 @@
+// std.fs over portable commands: create/write/read/exists/list/remove. Uses a
+// fixed temp dir under /tmp, cleaned first so the run is idempotent. Output is
+// content this script controls (not order-dependent — listDir is checked by
+// count), so it is deterministic.
+const std = import "std"
+
+const dir = "/tmp/runic_std_fs_regression"
+std.fs.remove dir
+std.fs.mkdirp dir
+
+echo "existsDir=${std.fs.exists dir}"
+echo "isDir=${std.fs.isDir dir}"
+
+const a = "/tmp/runic_std_fs_regression/a.txt"
+std.fs.writeText a "hello"
+std.fs.appendText a "more"
+echo "isFile=${std.fs.isFile a}"
+const content = std.fs.readText a
+echo "content=${content}"
+
+std.fs.writeText "/tmp/runic_std_fs_regression/b.txt" "b"
+const entries = std.fs.listDir dir
+echo "entryCount=${entries.len}"
+
+std.fs.remove a
+echo "afterRemove=${std.fs.exists a}"
+
+std.fs.remove dir

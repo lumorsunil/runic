@@ -10,3 +10,6 @@ fn Void @() Void
 pub const list = import "std/list"
 pub const str = import "std/str"
 pub const path = import "std/path"
+pub const math = import "std/math"
+pub const fs = import "std/fs"
+pub const env = import "std/env"

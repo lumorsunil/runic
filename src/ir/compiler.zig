@@ -2292,13 +2292,19 @@ pub const IRCompiler = struct {
     /// struct) that declares a field named `name` — i.e. `object.name` is a real
     /// member, so a same-named builtin (string op, `push`) must not shadow it.
     fn memberIsStructField(self: *IRCompiler, object: *ast.Expression, name: []const u8) bool {
-        var t = self.resolveStaticType(object) orelse return false;
+        return self.memberFieldType(object, name) != null;
+    }
+
+    /// The static type of `object.name` when `object` resolves to a struct that
+    /// declares a field `name`; null otherwise. No instructions emitted.
+    fn memberFieldType(self: *IRCompiler, object: *ast.Expression, name: []const u8) ?ast.TypeExpr {
+        var t = self.resolveStaticType(object) orelse return null;
         while (t == .alias) t = t.alias.type_expr.*;
-        if (t != .struct_type) return false;
+        if (t != .struct_type) return null;
         for (t.struct_type.fields) |field| {
-            if (std.mem.eql(u8, field.name.name, name)) return true;
+            if (std.mem.eql(u8, field.name.name, name)) return field.type_expr.*;
         }
-        return false;
+        return null;
     }
 
     /// Best-effort compile-time type of an expression, resolved purely from

@@ -1,0 +1,43 @@
+// std.math — numeric helpers. The Int helpers are pure Runic; Float functions
+// backed by builtins are added once those builtins exist.
+fn Void @() Void
+
+// Absolute value.
+pub fn Void abs(n: Int) Int {
+  if (n < 0) { yield 0 - n } else { yield n }
+}
+
+// Smaller of two.
+pub fn Void min(a: Int, b: Int) Int {
+  if (a < b) { yield a } else { yield b }
+}
+
+// Larger of two.
+pub fn Void max(a: Int, b: Int) Int {
+  if (a > b) { yield a } else { yield b }
+}
+
+// Constrain `n` to the inclusive range `[lo, hi]`.
+pub fn Void clamp(n: Int, lo: Int, hi: Int) Int {
+  if (n < lo) {
+    yield lo
+  } else {
+    if (n > hi) { yield hi } else { yield n }
+  }
+}
+
+// -1, 0, or 1 for a negative, zero, or positive value.
+pub fn Void sign(n: Int) Int {
+  if (n < 0) {
+    yield 0 - 1
+  } else {
+    if (n > 0) { yield 1 } else { yield 0 }
+  }
+}
+
+// Integer power `base ^ exp` for `exp >= 0` (0 for negative exponents).
+pub fn Void pow(base: Int, exp: Int) Int {
+  var result = 1
+  for (0..exp) |_| { result = result * base }
+  yield result
+}
