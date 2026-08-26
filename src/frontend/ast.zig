@@ -344,6 +344,13 @@ pub const TypeExpr = union(enum) {
         fields: []const StructField,
         decls: []const StructDecl,
         span: Span,
+        /// When true, every field occupies exactly one slot — a struct-typed
+        /// field holds an *address* to its sub-struct rather than being inlined.
+        /// Used for the dynamically-built module result struct, whose pub-export
+        /// fields (including nested module values) are each stored in one slot.
+        /// User structs inline their fields (default false), so a nested struct
+        /// field spans `slotSize` slots.
+        by_reference_fields: bool = false,
 
         pub const FieldLayout = struct {
             offset: usize,
@@ -362,7 +369,7 @@ pub const TypeExpr = union(enum) {
                         .type_expr = field.type_expr.*,
                     };
                 }
-                offset += try field.type_expr.slotSize();
+                offset += if (self.by_reference_fields) 1 else try field.type_expr.slotSize();
             }
 
             return LayoutError.FieldNotFound;
@@ -588,6 +595,7 @@ pub const TypeExpr = union(enum) {
             .type_var,
             => 1,
             .struct_type => |struct_type| blk: {
+                if (struct_type.by_reference_fields) break :blk struct_type.fields.len;
                 var size: usize = 0;
                 for (struct_type.fields) |field| {
                     size += try field.type_expr.slotSize();

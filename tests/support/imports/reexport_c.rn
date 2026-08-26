@@ -1,0 +1,2 @@
+fn Void @() Void
+pub const v = "C"

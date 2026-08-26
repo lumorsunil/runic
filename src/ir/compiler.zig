@@ -4768,6 +4768,7 @@ pub const IRCompiler = struct {
                 .span = .global,
                 .decls = &.{},
                 .fields = all_fields,
+                .by_reference_fields = true,
             } };
 
             return .fromLocation(result_ref.dereference().typed(merged_type));
@@ -6272,6 +6273,7 @@ pub const IRCompiler = struct {
             .span = .global,
             .decls = &.{},
             .fields = all_fields,
+            .by_reference_fields = true,
         } };
 
         return .fromLocation(result_ref.dereference().typed(merged_type));

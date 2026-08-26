@@ -1,0 +1,4 @@
+fn Void @() Void
+pub const a = import "reexport_a.rn"
+pub const b = import "reexport_b.rn"
+pub const c = import "reexport_c.rn"
