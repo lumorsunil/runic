@@ -192,15 +192,27 @@ new syntax), then the primitives the stdlib is actually made of.
   - [ ] **Remaining modules**: `std.path`, `std.env`, `std.math`, `std.fs`,
     `std.process`, `std.testing`.
   - **Known blockers found while authoring (fix before the modules that hit them):**
-    - **`std.path` deferred** — two distinct bugs: (1) `join` collides with the
-      built-in `[]String.join` string op (a `X.join` member callee always tries
-      the string builtin before module-member dispatch — the builtin should only
-      apply to a string/array receiver, not a module); (2) a helper that
-      `yield`s a **String variable** (vs a `yield "<interpolation>"`) through a
-      **two-level embedded** member (`std.path.basename`) fails to capture (deref
-      error) — a String-return module-member capture gap. `std.path.rn` was written
-      and verified via one-level relative import; recover it from git history / the
-      2026-08-25 session once these are fixed.
+    - **THE stdlib blocker — 3rd+ re-exported sub-module breaks (2026-08-26).**
+      A module that re-exports sub-modules via `pub const x = import "…"` — the
+      `std` root's exact pattern — only works for its **first two** public
+      members. Accessing the **3rd or later** re-exported module (`std.path.…`
+      when `std.rn` lists list, str, path) fails: the 2nd returns empty, the 3rd+
+      derefs a bad address (`0x5f`, `closeable`, …). Reproduced minimally: a root
+      with `pub const x/y/z = import "sub.rn"` → `r.x.v` ok, `r.y.v` empty,
+      `r.z.v` deref error. Plain `pub const` values (non-module) at any count are
+      fine, so it is specific to the pub-export **slot/offset layout for
+      re-exported module values** (see `compileImportExpr`'s `all_fields` /
+      pub-export slot build, `src/ir/compiler.zig`). This is why list+str (2
+      members) ship fine and any 3rd module breaks. **Fix this first — it gates
+      every remaining module.** (Earlier notes here mis-attributed this to a
+      "String-variable two-level embedded capture" gap; that was wrong — position,
+      not String returns. `std.path` itself is correct via one-level import.)
+    - **`std.path` also has** a name collision: `join` resolves to the built-in
+      `[]String.join` string op (a `X.join` member callee tries the string builtin
+      before module-member dispatch — the builtin should only apply to a
+      string/array receiver, not a module). `std.path.rn` (join/basename/dirname/
+      ext/stem/isAbsolute) was written and verified via one-level relative import;
+      recover it from the 2026-08-25 session once the two bugs above are fixed.
     - `std.list` **piping into a module-member stage** (`… | std.list.count`) isn't
       coerced (the pipeline-param coercion keys on local bindings). Call directly.
 
