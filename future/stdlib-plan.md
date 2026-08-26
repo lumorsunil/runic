@@ -199,13 +199,39 @@ new syntax), then the primitives the stdlib is actually made of.
   - [x] **String-builtin/module-member collision FIXED (2026-08-26).** `X.join`/
     `X.split`/… now check `memberIsStructField` first, so `std.path.join` calls
     the module member, not the built-in `[]String.join`.
+  - [x] **`std.math` — DONE (int helpers, 2026-08-26).** abs/min/max/clamp/sign/pow.
+    Float surface still needs the builtins below.
+  - [x] **`std.fs` — DONE (2026-08-26).** exists/isDir/isFile/readText/writeText/
+    appendText/listDir/mkdirp/remove/cwd (portable-command wrappers).
+  - [x] **`std.env` — DONE except `set` (2026-08-26).** get/getOr/has (dynamic name
+    via `printenv <name>`), home/path. `set` needs a dynamic-name env write (a
+    builtin, or dynamic `$` support).
   - [ ] **Float math builtins** — `sqrt`, `floor`, `ceil`, `round`, `trunc`, Float
-    `pow` (for `std.math`'s Float surface; everything else is pure Runic). Not started.
-  - [ ] **Remaining modules**: `std.env`, `std.math`, `std.fs`, `std.process`,
-    `std.testing`.
-  - **Known minor limitation:** `std.list` **piping into a module-member stage**
-    (`… | std.list.count`) isn't coerced (the pipeline-param coercion keys on
-    local bindings). Call directly.
+    `pow`. New IR op (mirror the string `str_op` machinery: an op enum + evaluator
+    handler + a builtin-name table + `compileCall`/`compileMember` dispatch). Once
+    done, add `std.math`'s Float surface (absF/sqrt/floor/…). Not started.
+  - [ ] **`std.process`** — BLOCKED by compiler gaps on error-union parameters:
+    inside `fn f(result: ExecutableError!String)`, neither `result.exit_code`
+    ("member access only for struct types") nor `result catch { … }` (a failed
+    command's error did not propagate through the param) works. Fix error-union
+    param inspection first, then output/status/succeeds/requireOk are easy.
+  - [ ] **`std.testing`** — BLOCKED: `assert`/`fail` must abort the process, but
+    `exit N` inside a called function only exits that function's *thread* (the
+    script continues). Needs a process-level exit primitive (or make `exit`
+    propagate out of a fn like bash). requireOk shares this need.
+  - **Compiler bugs found while authoring (each blocks cleaner stdlib code):**
+    - **Nullary String module fn in direct interpolation captures empty** —
+      `"${std.fs.cwd}"` yields empty; `const d = std.fs.cwd` then `"${d}"` works.
+      Functions *with args* are fine. Cause: `analyzeExpressionEffects` only marks
+      a `.binary` member for stdio capture when the member is a *local* fn binding,
+      not a module `fn_ref_type` field; and forcing the capture there breaks the
+      bound path — the transient vs bound capture of a `yield <String-var>` diverge.
+      Needs a real fix in the value-capture paths.
+    - **Interpolated redirect source deadlocks** — `echo "${x}" > file` hangs;
+      `echo x > file` (bare identifier) works, which is why `fs.writeText` passes
+      content unquoted. Redirect + interpolated command argument deadlock.
+    - `std.list` **piping into a module-member stage** (`… | std.list.count`) isn't
+      coerced (the pipeline-param coercion keys on local bindings). Call directly.
 
 - [ ] **Phase 4 — Deferred / later discussion.**
   - Generic containers: comptime type-returning functions (`fn Box(comptime T:
