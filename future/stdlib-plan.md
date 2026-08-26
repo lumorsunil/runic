@@ -187,34 +187,25 @@ new syntax), then the primitives the stdlib is actually made of.
     consistently.
   - [x] **`std.list` — DONE.** map/filter/reduce/count/any/all/reverse/concat/range.
   - [x] **`std.str` — DONE.** words/capitalize/isBlank/padLeft/padRight (composites).
+  - [x] **`std.path` — DONE (2026-08-26).** join/basename/dirname/ext/stem/isAbsolute.
+  - [x] **Re-export offset bug FIXED (2026-08-26).** Was THE blocker: a module
+    re-exporting sub-modules via `pub const x = import "…"` (the `std` root
+    pattern) only exposed its first two members — the 3rd+ read a wrong offset.
+    The module result struct stores each field in one slot (an address), but
+    `fieldLayout` summed each field's `slotSize` and a module-value field is a
+    `struct_type` with slotSize > 1. Fixed with `StructType.by_reference_fields`
+    (one slot per field) on the dynamically-built result structs. Now `std` can
+    hold any number of modules.
+  - [x] **String-builtin/module-member collision FIXED (2026-08-26).** `X.join`/
+    `X.split`/… now check `memberIsStructField` first, so `std.path.join` calls
+    the module member, not the built-in `[]String.join`.
   - [ ] **Float math builtins** — `sqrt`, `floor`, `ceil`, `round`, `trunc`, Float
     `pow` (for `std.math`'s Float surface; everything else is pure Runic). Not started.
-  - [ ] **Remaining modules**: `std.path`, `std.env`, `std.math`, `std.fs`,
-    `std.process`, `std.testing`.
-  - **Known blockers found while authoring (fix before the modules that hit them):**
-    - **THE stdlib blocker — 3rd+ re-exported sub-module breaks (2026-08-26).**
-      A module that re-exports sub-modules via `pub const x = import "…"` — the
-      `std` root's exact pattern — only works for its **first two** public
-      members. Accessing the **3rd or later** re-exported module (`std.path.…`
-      when `std.rn` lists list, str, path) fails: the 2nd returns empty, the 3rd+
-      derefs a bad address (`0x5f`, `closeable`, …). Reproduced minimally: a root
-      with `pub const x/y/z = import "sub.rn"` → `r.x.v` ok, `r.y.v` empty,
-      `r.z.v` deref error. Plain `pub const` values (non-module) at any count are
-      fine, so it is specific to the pub-export **slot/offset layout for
-      re-exported module values** (see `compileImportExpr`'s `all_fields` /
-      pub-export slot build, `src/ir/compiler.zig`). This is why list+str (2
-      members) ship fine and any 3rd module breaks. **Fix this first — it gates
-      every remaining module.** (Earlier notes here mis-attributed this to a
-      "String-variable two-level embedded capture" gap; that was wrong — position,
-      not String returns. `std.path` itself is correct via one-level import.)
-    - **`std.path` also has** a name collision: `join` resolves to the built-in
-      `[]String.join` string op (a `X.join` member callee tries the string builtin
-      before module-member dispatch — the builtin should only apply to a
-      string/array receiver, not a module). `std.path.rn` (join/basename/dirname/
-      ext/stem/isAbsolute) was written and verified via one-level relative import;
-      recover it from the 2026-08-25 session once the two bugs above are fixed.
-    - `std.list` **piping into a module-member stage** (`… | std.list.count`) isn't
-      coerced (the pipeline-param coercion keys on local bindings). Call directly.
+  - [ ] **Remaining modules**: `std.env`, `std.math`, `std.fs`, `std.process`,
+    `std.testing`.
+  - **Known minor limitation:** `std.list` **piping into a module-member stage**
+    (`… | std.list.count`) isn't coerced (the pipeline-param coercion keys on
+    local bindings). Call directly.
 
 - [ ] **Phase 4 — Deferred / later discussion.**
   - Generic containers: comptime type-returning functions (`fn Box(comptime T:
