@@ -38,3 +38,12 @@ echo "blank1=${std.str.isBlank "   "}"
 echo "blank2=${std.str.isBlank "x"}"
 echo "padL=${std.str.padLeft "7" 4 "0"}"
 echo "padR=${std.str.padRight "7" 4 "."}"
+
+// std.path
+echo "base=${std.path.basename "a/b/c.txt"}"
+echo "dir=${std.path.dirname "a/b/c.txt"}"
+echo "ext=${std.path.ext "a/b/c.txt"}"
+echo "stem=${std.path.stem "a/b/c.txt"}"
+echo "abs=${std.path.isAbsolute "/x"}"
+const segs = .{ ".runic", "config" }
+echo "join=${std.path.join segs}"

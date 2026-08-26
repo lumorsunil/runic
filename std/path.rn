@@ -1,0 +1,91 @@
+// std.path — pure string manipulation over `/`-separated paths. Byte-oriented;
+// no filesystem access (that is std.fs).
+fn Void @() Void
+
+// Join parts with "/", skipping empty parts. Intended for relative segments
+// (`join .{ ".runic", "config" }` -> ".runic/config").
+pub fn Void join(parts: []String) String {
+  var result: String = ""
+  for (parts) |part| {
+    if (part.len > 0) {
+      if (result.len == 0) {
+        result = part
+      } else {
+        result = "${result}/${part}"
+      }
+    }
+  }
+  yield result
+}
+
+// The last non-empty component (`a/b/c.txt` -> `c.txt`, `a/b/` -> `b`).
+pub fn Void basename(p: String) String {
+  const parts = p.split "/"
+  var result: String = ""
+  for (parts) |part| {
+    if (part.len > 0) { result = part }
+  }
+  yield result
+}
+
+// Everything but the final component (`a/b/c.txt` -> `a/b`, `c.txt` -> `.`,
+// `/a` -> `/`). Absolute paths keep their leading slash.
+pub fn Void dirname(p: String) String {
+  const parts = p.split "/"
+  const n = parts.len
+  var lastNonEmpty = 0 - 1
+  for (0..n) |i| {
+    if (parts[i].len > 0) { lastNonEmpty = i }
+  }
+  var result: String = ""
+  for (0..lastNonEmpty) |i| {
+    if (parts[i].len > 0) {
+      if (result.len == 0) {
+        result = parts[i]
+      } else {
+        result = "${result}/${parts[i]}"
+      }
+    }
+  }
+  if (result.len == 0) {
+    if (p.startsWith "/") { yield "/" } else { yield "." }
+  } else {
+    if (p.startsWith "/") { yield "/${result}" } else { yield result }
+  }
+}
+
+// Extension including the dot (`c.txt` -> `.txt`), or "" when there is none.
+// A leading dot (`.bashrc`) is not an extension.
+pub fn Void ext(p: String) String {
+  const parts = p.split "/"
+  const base = parts[parts.len - 1]
+  var dot = 0 - 1
+  for (0..base.len) |i| {
+    if ((base.slice i (i + 1)) == ".") { dot = i }
+  }
+  if (dot > 0) {
+    yield base.slice dot (base.len)
+  } else {
+    yield ""
+  }
+}
+
+// Basename without its extension (`a/b/c.txt` -> `c`).
+pub fn Void stem(p: String) String {
+  const parts = p.split "/"
+  const base = parts[parts.len - 1]
+  var dot = 0 - 1
+  for (0..base.len) |i| {
+    if ((base.slice i (i + 1)) == ".") { dot = i }
+  }
+  if (dot > 0) {
+    yield base.slice 0 dot
+  } else {
+    yield base
+  }
+}
+
+// Whether the path is absolute (starts with "/").
+pub fn Void isAbsolute(p: String) Bool {
+  yield p.startsWith "/"
+}

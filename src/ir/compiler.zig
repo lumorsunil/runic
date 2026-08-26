@@ -2288,6 +2288,19 @@ pub const IRCompiler = struct {
         };
     }
 
+    /// Whether `object`'s static type is a struct (a module value or user
+    /// struct) that declares a field named `name` — i.e. `object.name` is a real
+    /// member, so a same-named builtin (string op, `push`) must not shadow it.
+    fn memberIsStructField(self: *IRCompiler, object: *ast.Expression, name: []const u8) bool {
+        var t = self.resolveStaticType(object) orelse return false;
+        while (t == .alias) t = t.alias.type_expr.*;
+        if (t != .struct_type) return false;
+        for (t.struct_type.fields) |field| {
+            if (std.mem.eql(u8, field.name.name, name)) return true;
+        }
+        return false;
+    }
+
     /// Best-effort compile-time type of an expression, resolved purely from
     /// binding declarations and struct field layouts (no instructions emitted).
     /// Handles the shapes module-member resolution needs: a bound identifier and
@@ -3721,12 +3734,18 @@ pub const IRCompiler = struct {
 
         // String builtins with arguments (`s.contains "x"`, `s.slice 1 3`, …) —
         // a `.member` callee naming a string builtin with a matching arity. Wins
-        // over UFCS for these reserved names.
+        // over UFCS for these reserved names — *unless* the receiver is a struct
+        // (a module value or user struct) that actually declares a member of that
+        // name, e.g. `std.path.join` must call the module's `join`, not the
+        // built-in `[]String.join`.
         if (call.callee.* == .binary and call.callee.binary.op == .member and call.callee.binary.right.* == .identifier and call.redirects.len == 0) {
-            if (stringBuiltin(call.callee.binary.right.identifier.name)) |sb| {
-                if (sb.arity == @as(u8, @intCast(call.arguments.len)) and sb.arity > 0) {
-                    const object = try self.compileExpression(call.callee.binary.left);
-                    return self.compileStrOp(source, object, sb, call.arguments);
+            const member_name = call.callee.binary.right.identifier.name;
+            if (!self.memberIsStructField(call.callee.binary.left, member_name)) {
+                if (stringBuiltin(member_name)) |sb| {
+                    if (sb.arity == @as(u8, @intCast(call.arguments.len)) and sb.arity > 0) {
+                        const object = try self.compileExpression(call.callee.binary.left);
+                        return self.compileStrOp(source, object, sb, call.arguments);
+                    }
                 }
             }
             // `arr.push value` — append to an array, yielding a new array.

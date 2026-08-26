@@ -21,6 +21,7 @@ pub const modules = [_]Module{
     .{ .path = ":std", .source = @embedFile("std/std.rn") },
     .{ .path = ":std/list", .source = @embedFile("std/list.rn") },
     .{ .path = ":std/str", .source = @embedFile("std/str.rn") },
+    .{ .path = ":std/path", .source = @embedFile("std/path.rn") },
 };
 
 /// The embedded source for a virtual std path, or null if none matches.
