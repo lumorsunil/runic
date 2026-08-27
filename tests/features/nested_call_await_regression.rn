@@ -1,0 +1,26 @@
+// A statement-position call inside a function must complete before the function
+// returns — including a call in an if-branch, and its own nested `exit`.
+// Regression: a function's last statement (and an if-branch's) is compiled as an
+// expression, so a nested Void call's thread wasn't awaited; the caller raced
+// ahead (its next statement ran, and a delegated `exit` landed too late). Here
+// `guard false` delegates to `stop`, whose `exit` must abort before "after".
+fn Void @() Void
+
+fn Void stop() Void {
+  echo "stopping"
+  exit 0
+}
+
+fn Void guard(ok: Bool) Void {
+  if (ok) {
+    echo "ok"
+  } else {
+    stop
+  }
+}
+
+echo "before"
+guard true
+echo "middle"
+guard false
+echo "after (must not print)"

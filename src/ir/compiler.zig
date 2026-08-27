@@ -4990,16 +4990,22 @@ pub const IRCompiler = struct {
         try self.jmp(source, null, false, after_addr);
         try self.setLabel(else_addr.local_addr.label, .abs);
         var result_type = if (else_branch == .condition) mergedResultType(condition, then) else null;
+        // A branch that yields a (discardable) thread handle — e.g. a nested Void
+        // call — must keep the merged result typed as a thread so a Void-function
+        // body waits on it (see compileFnDecl) instead of racing the caller.
+        var branch_is_thread = then.isType(thread_type);
         switch (else_branch) {
             .expr => |expr_| {
                 const else_ = try self.compileExpression(expr_);
                 try self.set(source, result, stableResultSource(else_));
                 result_type = mergedResultType(then, else_);
+                if (else_.isType(thread_type)) branch_is_thread = true;
             },
             .if_expr => |if_expr_| {
                 const else_ = try self.compileIf(source, if_expr_.*);
                 try self.set(source, result, stableResultSource(else_));
                 result_type = mergedResultType(then, else_);
+                if (else_.isType(thread_type)) branch_is_thread = true;
             },
             .condition => {},
         }
@@ -5007,7 +5013,7 @@ pub const IRCompiler = struct {
         try self.setLabel(after_addr.local_addr.label, .abs);
         try self.set(source, .initRegister(.r2), .from(result.dereference()));
 
-        return .fromLocation(ir.Location.initRegister(.r2).typed(result_type));
+        return .fromLocation(ir.Location.initRegister(.r2).typed(if (branch_is_thread) thread_type else result_type));
     }
 
     fn compileIfNoElse(
@@ -6524,6 +6530,20 @@ pub const IRCompiler = struct {
                     r = .fromLocation(ir.Location.initRegister(.r2).typed(r.typeExpr()));
                 },
                 else => {},
+            }
+            // A Void function discards its body's value. If that value is a thread
+            // handle — a nested Void call, e.g. the last statement of an if-branch
+            // (compiled as an expression, so it skips the statement-level wait) —
+            // wait for it, so the callee's side effects and any nested `exit`
+            // finish before this function returns instead of racing the caller.
+            const is_void_fn = if (fn_decl.return_type) |rt| rt.* == .void else true;
+            if (is_void_fn and r.isType(thread_type)) {
+                const stable = if (r.source.isRegister(.r))
+                    try self.compileResultSaveR(source, r)
+                else
+                    r;
+                if (isWaitable(stable)) |loc| try self.wait(source, loc);
+                r = .fromValue(.void);
             }
             break :blk r;
         } else try self.compileExpression(fn_decl.body);
