@@ -1,0 +1,21 @@
+// A command with an interpolated argument and a file redirect used to deadlock:
+// `echo "${x}" > file` hung (a literal or a pipe worked). The redirect drain
+// closed the file before the command connected its stdout, so the output went
+// nowhere. Fixed by keeping the redirect pipe open until the command finishes.
+// Uses a fixed temp path, cleaned first, and reads content back for determinism.
+fn Void @() Void
+
+const p = "/tmp/runic_interp_redirect_test.txt"
+rm "-f" p
+
+// interpolated arg + truncating redirect
+const x = "interpolated"
+echo "${x}" > p
+echo "after-truncate=${cat p}"
+
+// text around an interpolation, appended
+echo "wrapped-${x}-end" >> p
+echo "after-append=${cat p}"
+
+rm "-f" p
+echo "done"

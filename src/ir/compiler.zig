@@ -4236,6 +4236,12 @@ pub const IRCompiler = struct {
                     const redirect_target = try self.compileExpression(path_target.value);
                     const redirect_pipe_ref = try self.newRef(source, if (stream_fd == 1) "stdout_redirect_pipe" else "stderr_redirect_pipe");
                     try self.pipe(source, redirect_pipe_ref);
+                    // Keep the redirect pipe open until its source (the command's
+                    // stdout) connects and closes. Without this, a drain that runs
+                    // before the command connects — e.g. when interpolated arguments
+                    // delay the exec — sees no source, closes the file immediately,
+                    // and the command's output then has nowhere to go (deadlock).
+                    try self.pipeOpt(source, redirect_pipe_ref.dereference(), .keep_open, .fromValue(.fromBoolean(true)));
                     try self.pipeFile(
                         source,
                         redirect_pipe_ref.dereference(),
@@ -4341,6 +4347,13 @@ pub const IRCompiler = struct {
         );
         try self.comment("wait from {s}", .{@src().fn_name});
         try self.wait(source, exec_handle_ref.dereference());
+
+        // The command has finished (and connected its stdout). Clear the redirect
+        // pipe's keep_open flag set at creation, so its drain closes the file once
+        // the (now-EOF) source drains, instead of spinning forever.
+        if (has_stdout_file_redirect) {
+            try self.pipeOpt(source, self.threadStdout(), .keep_open, .fromValue(.fromBoolean(false)));
+        }
 
         try self.setClosureIdentifiers();
         self.current_instruction_set = prev_instr_set;
