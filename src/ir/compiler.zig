@@ -3771,6 +3771,14 @@ pub const IRCompiler = struct {
             {
                 return self.compileExecutableCall(source, .void, call.arguments[0], call.arguments[1..], call.redirects);
             }
+            // `setenv name value` — set a dynamically-named environment variable
+            // (backs std.env.set). Shadowable by a local binding.
+            if (std.mem.eql(u8, name, "setenv") and
+                call.arguments.len == 2 and
+                self.lookup(name, .{ .shallow = false }) == null)
+            {
+                return self.compileBuiltinSetEnv(source, call.arguments);
+            }
         }
 
         // String builtins with arguments (`s.contains "x"`, `s.slice 1 3`, …) —
@@ -4156,6 +4164,31 @@ pub const IRCompiler = struct {
 
         try self.addInstruction(.init(.from(source), .{ .cd = path }));
         return .fromLocation(.initRegister(.r));
+    }
+
+    /// `setenv name value` builtin: set the environment variable named by the
+    /// runtime string `name` to `value` in the current subshell context (the
+    /// dynamic-name counterpart of `$NAME = value`). Backs `std.env.set`.
+    fn compileBuiltinSetEnv(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        arguments: []const *ast.Expression,
+    ) Error!Result {
+        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        const name = try self.compileExpression(arguments[0]);
+        const name_ref = try self.newRef(source, "setenv_name");
+        try self.set(source, name_ref, stableResultSource(name));
+        const value = try self.compileExpression(arguments[1]);
+        const value_ref = try self.newRef(source, "setenv_value");
+        try self.set(source, value_ref, stableResultSource(value));
+
+        try self.addInstruction(.init(.from(source), .{ .set_env = .{
+            .name = "",
+            .name_source = .from(name_ref.dereference()),
+            .value = .from(value_ref.dereference()),
+        } }));
+        return .fromValue(.void);
     }
 
     fn compileSubshell(

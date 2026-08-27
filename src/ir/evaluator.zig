@@ -1658,14 +1658,22 @@ pub const IREvaluator = struct {
             .set_env => |set_env| {
                 const ctx = self.context.getSubshellContextPtr(thread.private.subshell_context);
                 const env_map = try self.getOrCreateSubshellEnv(ctx);
+                // A dynamic name (`env.set name value`) is materialized; otherwise
+                // the static `$NAME = …` name is used directly.
+                const owned_name: ?[]u8 = if (set_env.name_source) |ns|
+                    try self.materializeOwnedString(thread, try self.resolveValueSource(thread, ns))
+                else
+                    null;
+                defer if (owned_name) |n| self.allocator.free(n);
+                const name: []const u8 = owned_name orelse set_env.name;
                 const value = try self.resolveValueSource(thread, set_env.value);
                 if (value == .null) {
-                    _ = env_map.swapRemove(set_env.name);
+                    _ = env_map.swapRemove(name);
                     return .cont;
                 }
                 const text = try self.materializeOwnedString(thread, value);
                 defer self.allocator.free(text);
-                try env_map.put(set_env.name, text);
+                try env_map.put(name, text);
                 return .cont;
             },
             .pipe => |instr_pipe| {

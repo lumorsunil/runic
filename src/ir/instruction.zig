@@ -707,14 +707,22 @@ pub const Instruction = struct {
     };
 
     pub const SetEnv = struct {
+        /// Static variable name (`$NAME = …`). Ignored when `name_source` is set.
         name: []const u8,
+        /// A runtime-computed variable name (the `env.set name value` builtin),
+        /// materialized to a string at evaluation. When null, `name` is used.
+        name_source: ?ValueSource = null,
         value: ValueSource,
 
         pub fn format(
             self: @This(),
             writer: *std.Io.Writer,
         ) std.Io.Writer.Error!void {
-            try writer.print("{s} {f}", .{ self.name, self.value });
+            if (self.name_source) |ns| {
+                try writer.print("{f} {f}", .{ ns, self.value });
+            } else {
+                try writer.print("{s} {f}", .{ self.name, self.value });
+            }
         }
     };
 

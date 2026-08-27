@@ -1,0 +1,21 @@
+// `setenv name value` sets a dynamically-named environment variable in the
+// current subshell context (the dynamic-name counterpart of `$NAME = value`),
+// visible to later `$NAME` reads, child processes, and std.env. Backs
+// std.env.set. Deterministic: the script sets and reads its own variables.
+fn Void @() Void
+
+// literal name
+setenv "RUNIC_SETENV_A" "alpha"
+echo "a=${$RUNIC_SETENV_A orelse "unset"}"
+
+// dynamic name from a binding
+const n = "RUNIC_SETENV_B"
+setenv n "beta"
+echo "b=${$RUNIC_SETENV_B orelse "unset"}"
+
+// overwrite
+setenv "RUNIC_SETENV_A" "alpha2"
+echo "a2=${$RUNIC_SETENV_A orelse "unset"}"
+
+// visible to a child process
+printenv "RUNIC_SETENV_B"
