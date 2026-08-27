@@ -4308,8 +4308,17 @@ pub const IRCompiler = struct {
         self.current_instruction_set = exec_instr_set;
         try self.scopes.push(self.allocator, .closure);
 
+        // Compile every argument into its own stable ref first, then push them
+        // all. Building an interpolated (multi-segment) string argument leaves
+        // its own ref on the stack; interleaving those refs with the pushed
+        // argument values would make `exec` pop the wrong slots — so an
+        // `echo "${x}" "${y}"` argument list must be pushed contiguously, after
+        // every argument is built.
+        const arg_value_refs = try self.allocator.alloc(ir.Location, arguments.len);
+        defer self.allocator.free(arg_value_refs);
         var it = std.mem.reverseIterator(arguments);
-        while (it.next()) |arg_expr| {
+        var arg_i: usize = 0;
+        while (it.next()) |arg_expr| : (arg_i += 1) {
             var arg = try self.compileExpression(arg_expr);
             if (arg.isType(execution_result_struct_type)) {
                 const arg_ref = try self.newRef(source, "exec_result_arg");
@@ -4321,7 +4330,12 @@ pub const IRCompiler = struct {
                     .{ .dereference = true },
                 ));
             }
-            try self.push(source, arg.source);
+            const value_ref = try self.newRef(source, "exec_arg");
+            try self.set(source, value_ref, arg.source);
+            arg_value_refs[arg_i] = value_ref.dereference();
+        }
+        for (arg_value_refs) |value_ref| {
+            try self.push(source, .from(value_ref));
         }
         if (executable_expr) |exe_expr| {
             const exe = try self.compileExpression(exe_expr);
