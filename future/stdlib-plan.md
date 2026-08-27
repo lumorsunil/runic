@@ -205,10 +205,10 @@ new syntax), then the primitives the stdlib is actually made of.
     Float: absF/sqrt/floor/ceil/round/trunc/powF (backed by the Float builtins).
   - [x] **`std.fs` — DONE (2026-08-26).** exists/isDir/isFile/readText/writeText/
     appendText/listDir/mkdirp/remove/cwd (portable-command wrappers).
-  - [~] **`std.env` — get/getOr/has/home/path DONE (2026-08-26); `set` pending.**
-    **DECISION (2026-08-27): implement `set` as a builtin `env.set name value`**
-    (no new `$`-assignment syntax), backed by the existing `set_env` IR
-    instruction so it updates the current subshell context. To do after the bugs.
+  - [x] **`std.env` — DONE (`set` added 2026-08-27).** get/getOr/has/home/path,
+    plus **set** — a `setenv name value` builtin (dynamic-name counterpart of
+    `$NAME = value`; `SetEnv.name_source`) wrapped by `std.env.set`. Full surface.
+    Test: setenv_regression.
   - [x] **Float math builtins — DONE (2026-08-27).** `float_op` IR instruction
     (mirrors `str_op`): UFCS `x.sqrt`/`x.floor`/`x.ceil`/`x.round`/`x.trunc` and
     `x.powF y`. `std.math`'s Float surface wraps them.
