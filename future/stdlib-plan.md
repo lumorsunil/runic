@@ -215,7 +215,15 @@ new syntax), then the primitives the stdlib is actually made of.
   - [x] **Process-exit fix — DONE (2026-08-27).** `exit` in a function now
     terminates the whole program (a new `process_exit` instruction/step result);
     previously it only closed that function's thread. Test: function_exit_regression.
-  - [ ] **`std.process`** — needs an **API redesign**, not just a bug fix. Its
+  - [ ] **`std.process` — DEFERRED pending a deeper result-model rethink
+    (2026-08-27).** Design note from the API discussion: a function/command result
+    is not "either an error or one payload" — a call can **yield many values and
+    then terminate with an error**. The right model is a result carrying *both*
+    the full stream of yielded values *and* an eventual terminal error, and error
+    handling (D7's error-union view) should be reconsidered under that model.
+    Revisit `std.process` (and `catch`/`try` semantics) then; not now. The
+    concrete blockers below stand under the current model.
+  - [ ] **`std.process` (current-model blockers)** — needs an **API redesign**, not just a bug fix. Its
     spec takes `ExecutableError!String`, but the error-union view and the struct
     view are incompatible: `result catch {…}` needs the error union, while
     `result.exit_code`/`status` needs the execution struct — and a value has only
