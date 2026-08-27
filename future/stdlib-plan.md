@@ -185,9 +185,11 @@ new syntax), then the primitives the stdlib is actually made of.
     module-member calls value-capture by return type; array `.len` stabilized;
     for-loop capture binds the *element* type; `String`/`[]String`/`""` type
     consistently.
-  - [x] **`std.list` — DONE.** map/filter/reduce/count/any/all/reverse/concat/range.
+  - [x] **`std.list` — DONE.** map/filter/reduce/count/any/all/find/contains/
+    reverse/concat/range/sort (full spec surface).
   - [x] **`std.str` — DONE.** words/capitalize/isBlank/padLeft/padRight (composites).
-  - [x] **`std.path` — DONE (2026-08-26).** join/basename/dirname/ext/stem/isAbsolute.
+  - [x] **`std.path` — DONE.** join/basename/dirname/ext/stem/isAbsolute/normalize
+    (full spec surface; normalize added 2026-08-27).
   - [x] **Re-export offset bug FIXED (2026-08-26).** Was THE blocker: a module
     re-exporting sub-modules via `pub const x = import "…"` (the `std` root
     pattern) only exposed its first two members — the 3rd+ read a wrong offset.
