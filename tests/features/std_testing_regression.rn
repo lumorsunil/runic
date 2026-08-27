@@ -1,0 +1,9 @@
+// std.testing assertions that all pass (exit 0). The failure path (abort with
+// exit 1) is exercised by function_exit_regression's `exit` semantics.
+const std = import "std"
+
+std.testing.assert true "true holds"
+std.testing.assertEq 42 42 "ints equal"
+std.testing.assertEq "abc" "abc" "strings equal"
+std.testing.assertContains "hello world" "o w"
+echo "all assertions passed"
