@@ -3046,6 +3046,14 @@ pub const IRCompiler = struct {
             }
         }
 
+        // No-argument Float builtins (`x.sqrt`, `x.floor`, …). Skipped when the
+        // receiver is a struct declaring that member (so a module member wins).
+        if (floatBuiltin(member.member.name)) |fb| {
+            if (fb.arity == 0 and !self.memberIsStructField(member.object, member.member.name)) {
+                return self.compileFloatOp(source, object, fb, &.{});
+            }
+        }
+
         const object_type = object.typeExpr() orelse {
             try self.reportSourceError(
                 source,
@@ -3768,6 +3776,12 @@ pub const IRCompiler = struct {
                     if (sb.arity == @as(u8, @intCast(call.arguments.len)) and sb.arity > 0) {
                         const object = try self.compileExpression(call.callee.binary.left);
                         return self.compileStrOp(source, object, sb, call.arguments);
+                    }
+                }
+                if (floatBuiltin(member_name)) |fb| {
+                    if (fb.arity == @as(u8, @intCast(call.arguments.len)) and fb.arity > 0) {
+                        const object = try self.compileExpression(call.callee.binary.left);
+                        return self.compileFloatOp(source, object, fb, call.arguments);
                     }
                 }
             }
@@ -4578,6 +4592,54 @@ pub const IRCompiler = struct {
             .result = result_ref.dereference(),
         } }));
         return .fromLocation(result_ref.dereference().typed(sb.result));
+    }
+
+    const FloatBuiltin = struct {
+        op: ir.Instruction.FloatOp.Op,
+        arity: u8,
+    };
+
+    /// Maps a method name to its Float-math builtin descriptor (UFCS over the
+    /// operand: `x.sqrt`, `x.floor`, `x.pow y`), or null. All yield a Float.
+    fn floatBuiltin(name: []const u8) ?FloatBuiltin {
+        const eql = std.mem.eql;
+        if (eql(u8, name, "sqrt")) return .{ .op = .sqrt, .arity = 0 };
+        if (eql(u8, name, "floor")) return .{ .op = .floor, .arity = 0 };
+        if (eql(u8, name, "ceil")) return .{ .op = .ceil, .arity = 0 };
+        if (eql(u8, name, "round")) return .{ .op = .round, .arity = 0 };
+        if (eql(u8, name, "trunc")) return .{ .op = .trunc, .arity = 0 };
+        if (eql(u8, name, "powF")) return .{ .op = .pow, .arity = 1 };
+        return null;
+    }
+
+    /// Compiles a Float-math builtin: stabilizes the operand and its optional
+    /// argument, then emits a `float_op` yielding a Float.
+    fn compileFloatOp(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        object: Result,
+        fb: FloatBuiltin,
+        args: []const *ast.Expression,
+    ) Error!Result {
+        const operand_ref = try self.newRef(source, "float_operand");
+        try self.set(source, operand_ref, stableResultSource(object));
+
+        var arg0: ir.ValueSource = .fromValue(.void);
+        if (args.len > 0) {
+            const arg_result = try self.compileExpression(args[0]);
+            const arg_ref = try self.newRef(source, "float_arg");
+            try self.set(source, arg_ref, stableResultSource(arg_result));
+            arg0 = .from(arg_ref.dereference());
+        }
+
+        const result_ref = try self.newRef(source, "float_result");
+        try self.addInstruction(.init(.from(source), .{ .float_op = .{
+            .op = fb.op,
+            .operand = .from(operand_ref.dereference()),
+            .arg0 = arg0,
+            .result = result_ref.dereference(),
+        } }));
+        return .fromLocation(result_ref.dereference().typed(.global(.float)));
     }
 
     fn tryUfcsRewrite(

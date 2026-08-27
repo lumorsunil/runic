@@ -113,6 +113,9 @@ pub const Instruction = struct {
         /// applies a string builtin (`s.len`, `s.upper`, `s.contains "x"`, …) to
         /// the operand string, with up to two arguments, storing the result.
         str_op: StrOp,
+        /// applies a Float math builtin (`x.sqrt`, `x.floor`, `x.pow y`, …) to the
+        /// operand, with an optional argument, storing the Float result.
+        float_op: FloatOp,
         /// `arr.push value` — allocates a new array (`[len+1, …elements, value]`)
         /// and stores its base address in `result`.
         array_push: ArrayPush,
@@ -373,6 +376,27 @@ pub const Instruction = struct {
 
         pub fn format(self: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
             try w.print("{f} = str.{t}({f}, {f}, {f})", .{ self.result, self.op, self.operand, self.arg0, self.arg1 });
+        }
+    };
+
+    pub const FloatOp = struct {
+        op: Op,
+        operand: ValueSource,
+        /// The second operand for `pow`; ignored by the one-argument ops.
+        arg0: ValueSource,
+        result: Location,
+
+        pub const Op = enum {
+            sqrt,
+            floor,
+            ceil,
+            round,
+            trunc,
+            pow,
+        };
+
+        pub fn format(self: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
+            try w.print("{f} = float.{t}({f}, {f})", .{ self.result, self.op, self.operand, self.arg0 });
         }
     };
 

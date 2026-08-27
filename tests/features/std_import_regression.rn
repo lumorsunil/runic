@@ -54,3 +54,9 @@ echo "min=${std.math.min 3 8} max=${std.math.max 3 8}"
 echo "clamp=${std.math.clamp 15 0 10}"
 echo "sign=${std.math.sign (0 - 3)}${std.math.sign 0}${std.math.sign 7}"
 echo "pow=${std.math.pow 2 8}"
+
+// std.math Float surface (backed by builtins)
+echo "sqrt=${std.math.sqrt 16.0}"
+echo "floor=${std.math.floor 3.9} ceil=${std.math.ceil 3.1}"
+echo "absF=${std.math.absF (0.0 - 4.5)}"
+echo "powF=${std.math.powF 3.0 3.0}"

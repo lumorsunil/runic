@@ -1417,6 +1417,22 @@ pub const IREvaluator = struct {
                 try self.setLocation(thread, ap.result, new_base);
                 return .cont;
             },
+            .float_op => |float_op| {
+                const x = (try self.resolveValueSource(thread, float_op.operand)).toFloat() orelse return Error.UnsupportedType;
+                const result: f64 = switch (float_op.op) {
+                    .sqrt => @sqrt(x),
+                    .floor => @floor(x),
+                    .ceil => @ceil(x),
+                    .round => @round(x),
+                    .trunc => @trunc(x),
+                    .pow => blk: {
+                        const y = (try self.resolveValueSource(thread, float_op.arg0)).toFloat() orelse return Error.UnsupportedType;
+                        break :blk std.math.pow(f64, x, y);
+                    },
+                };
+                try self.setLocation(thread, float_op.result, .{ .float = result });
+                return .cont;
+            },
             .make_err => |make_err| {
                 const payload_ptr: ?*const ir.Value = if (make_err.payload) |payload| blk: {
                     const value = try self.resolveValueSource(thread, payload);
