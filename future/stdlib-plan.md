@@ -199,17 +199,16 @@ new syntax), then the primitives the stdlib is actually made of.
   - [x] **String-builtin/module-member collision FIXED (2026-08-26).** `X.join`/
     `X.split`/… now check `memberIsStructField` first, so `std.path.join` calls
     the module member, not the built-in `[]String.join`.
-  - [x] **`std.math` — DONE (int helpers, 2026-08-26).** abs/min/max/clamp/sign/pow.
-    Float surface still needs the builtins below.
+  - [x] **`std.math` — DONE (2026-08-27).** Int: abs/min/max/clamp/sign/pow.
+    Float: absF/sqrt/floor/ceil/round/trunc/powF (backed by the Float builtins).
   - [x] **`std.fs` — DONE (2026-08-26).** exists/isDir/isFile/readText/writeText/
     appendText/listDir/mkdirp/remove/cwd (portable-command wrappers).
   - [x] **`std.env` — DONE except `set` (2026-08-26).** get/getOr/has (dynamic name
     via `printenv <name>`), home/path. `set` needs a dynamic-name env write (a
     builtin, or dynamic `$` support).
-  - [ ] **Float math builtins** — `sqrt`, `floor`, `ceil`, `round`, `trunc`, Float
-    `pow`. New IR op (mirror the string `str_op` machinery: an op enum + evaluator
-    handler + a builtin-name table + `compileCall`/`compileMember` dispatch). Once
-    done, add `std.math`'s Float surface (absF/sqrt/floor/…). Not started.
+  - [x] **Float math builtins — DONE (2026-08-27).** `float_op` IR instruction
+    (mirrors `str_op`): UFCS `x.sqrt`/`x.floor`/`x.ceil`/`x.round`/`x.trunc` and
+    `x.powF y`. `std.math`'s Float surface wraps them.
   - [x] **`std.testing` — DONE (2026-08-27).** assert/assertEq/assertContains/fail,
     aborting via `exit 1`. Unblocked by the process-exit fix below.
   - [x] **Process-exit fix — DONE (2026-08-27).** `exit` in a function now
