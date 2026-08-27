@@ -60,3 +60,18 @@ echo "sqrt=${std.math.sqrt 16.0}"
 echo "floor=${std.math.floor 3.9} ceil=${std.math.ceil 3.1}"
 echo "absF=${std.math.absF (0.0 - 4.5)}"
 echo "powF=${std.math.powF 3.0 3.0}"
+
+// std.list additions: find / contains / sort
+fn Void gt3(n: Int) Bool { yield n > 3 }
+fn Void less(a: Int, b: Int) Bool { yield a < b }
+echo "find=${std.list.find nums gt3 orelse 0}"
+echo "contains3=${std.list.contains nums 3}"
+echo "contains9=${std.list.contains nums 9}"
+const unsorted = .{ 3, 1, 2 }
+const sorted = std.list.sort unsorted less
+echo "sort=${sorted[0]}${sorted[1]}${sorted[2]}"
+
+// std.path.normalize
+echo "norm1=${std.path.normalize "a/b/../c"}"
+echo "norm2=${std.path.normalize "/x/./y//z"}"
+echo "norm3=${std.path.normalize "/a/../.."}"

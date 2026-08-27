@@ -46,6 +46,32 @@ pub fn Void all(xs: []T, pred: fn(T) Bool) Bool {
   yield ok
 }
 
+// The first element satisfying `pred`, or absent.
+pub fn Void find(xs: []T, pred: fn(T) Bool) ?T {
+  var result: ?T = null
+  var found = false
+  for (xs) |x| {
+    if (found) {
+      // keep the first match
+    } else {
+      if (pred x) {
+        result = x
+        found = true
+      }
+    }
+  }
+  yield result
+}
+
+// Whether `target` is present (scalar/string equality).
+pub fn Void contains(xs: []T, target: T) Bool {
+  var found = false
+  for (xs) |x| {
+    if (x == target) { found = true }
+  }
+  yield found
+}
+
 // A reversed copy.
 pub fn Void reverse(xs: []T) []T {
   var result = .{ }
@@ -70,6 +96,35 @@ pub fn Void range(start: Int, end: Int) []Int {
   for (0..n) |_| {
     result = result.push i
     i = i + 1
+  }
+  yield result
+}
+
+// A copy sorted by `lt` (a stable insertion sort: `lt a b` means `a` before `b`).
+pub fn Void sort(xs: []T, lt: fn(T, T) Bool) []T {
+  var result = .{ }
+  for (xs) |x| {
+    var out = .{ }
+    var inserted = false
+    for (result) |r| {
+      if (inserted) {
+        out = out.push r
+      } else {
+        if (lt x r) {
+          out = out.push x
+          out = out.push r
+          inserted = true
+        } else {
+          out = out.push r
+        }
+      }
+    }
+    if (inserted) {
+      // already placed
+    } else {
+      out = out.push x
+    }
+    result = out
   }
   yield result
 }

@@ -28,3 +28,10 @@ sqrt=4
 floor=3 ceil=4
 absF=4.5
 powF=27
+find=4
+contains3=0
+contains9=1
+sort=123
+norm1=a/c
+norm2=/x/y/z
+norm3=/

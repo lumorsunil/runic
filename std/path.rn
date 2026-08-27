@@ -89,3 +89,62 @@ pub fn Void stem(p: String) String {
 pub fn Void isAbsolute(p: String) Bool {
   yield p.startsWith "/"
 }
+
+// Lexically normalize: collapse `//`, drop `.`, and resolve `..` against prior
+// components (never above root for an absolute path). Purely textual — no
+// filesystem or symlink resolution.
+pub fn Void normalize(p: String) String {
+  const absolute = p.startsWith "/"
+  const parts = p.split "/"
+  var stack = .{ }
+  for (parts) |part| {
+    if (part.len == 0) {
+      // skip `//` and leading/trailing slashes
+    } else {
+      if (part == ".") {
+        // skip a no-op component
+      } else {
+        if (part == "..") {
+          const n = stack.len
+          if (n > 0) {
+            const top = stack[n - 1]
+            if (top == "..") {
+              // can't cancel a `..`; keep going up
+              stack = stack.push ".."
+            } else {
+              // pop the last component
+              var rebuilt = .{ }
+              for (0..(n - 1)) |i| { rebuilt = rebuilt.push stack[i] }
+              stack = rebuilt
+            }
+          } else {
+            if (absolute) {
+              // `..` at root stays at root
+            } else {
+              stack = stack.push ".."
+            }
+          }
+        } else {
+          stack = stack.push part
+        }
+      }
+    }
+  }
+  var result: String = ""
+  for (stack) |c| {
+    if (result.len == 0) {
+      result = c
+    } else {
+      result = "${result}/${c}"
+    }
+  }
+  if (absolute) {
+    yield "/${result}"
+  } else {
+    if (result.len == 0) {
+      yield "."
+    } else {
+      yield result
+    }
+  }
+}
