@@ -136,6 +136,7 @@ pub const IRRunner = struct {
         }) |result| switch (result) {
             .cont, .cont_no_instr_counter_inc, .skip => continue,
             .exit => |exit_code| return exit_code,
+            .process_exit => |exit_code| return exit_code,
         };
 
         return .success;

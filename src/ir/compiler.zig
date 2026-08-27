@@ -1100,17 +1100,34 @@ pub const IRCompiler = struct {
         source: anytype,
         value: Result,
     ) Error!void {
-        const exit_code: ExitCode = @as(?ExitCode, switch (value.source) {
+        const exit_code = try self.resolveExitCode(source, value) orelse return;
+        return self.addInstruction(.init(.from(source), .exit_(exit_code)));
+    }
+
+    /// The user-facing `exit` statement: terminates the whole program from any
+    /// thread (a plain `.exit` from a forked function thread would only close
+    /// that thread and let the script continue).
+    pub fn processExit_(
+        self: *IRCompiler,
+        source: anytype,
+        value: Result,
+    ) Error!void {
+        const exit_code = try self.resolveExitCode(source, value) orelse return;
+        return self.addInstruction(.init(.from(source), .processExit_(exit_code)));
+    }
+
+    fn resolveExitCode(self: *IRCompiler, source: anytype, value: Result) Error!?ExitCode {
+        const code: ?ExitCode = switch (value.source) {
             .value => |v| switch (v) {
                 .integer => |x| .fromByte(@intCast(@mod(x, 256))),
                 .exit_code => |exit_code| exit_code,
                 else => null,
             },
             else => null,
-        }) orelse {
-            return self.reportSourceError(source, Error.UnsupportedExitCodeExpression, .@"error", "value type \"{t}\" cannot be coerced into an exit code", .{value.source});
         };
-        return self.addInstruction(.init(.from(source), .exit_(exit_code)));
+        if (code) |c| return c;
+        try self.reportSourceError(source, Error.UnsupportedExitCodeExpression, .@"error", "value type \"{t}\" cannot be coerced into an exit code", .{value.source});
+        return null;
     }
 
     pub fn exitWith(
@@ -1629,7 +1646,7 @@ pub const IRCompiler = struct {
             try self.compileExpression(value)
         else
             .fromValue(.{ .exit_code = .success });
-        try self.exit_(source, result);
+        try self.processExit_(source, result);
         return .fromValue(.void);
     }
 

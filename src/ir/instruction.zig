@@ -155,8 +155,12 @@ pub const Instruction = struct {
         stream: Location,
         /// allocates n number of values on the heap, stores address in %r
         alloc: usize,
-        /// exits the process
+        /// closes the current thread with the given exit code (the whole program
+        /// only when this is the main thread)
         exit: ExitCode,
+        /// terminates the whole program with the given exit code, from any thread
+        /// (the user-facing `exit` statement — like bash `exit` inside a function)
+        process_exit: ExitCode,
         /// exits the process with an exit code resolved from a value source
         exit_with: ValueSource,
         /// resolves the exit code from an execution result or handles struct and stores it in result
@@ -204,6 +208,10 @@ pub const Instruction = struct {
             return .{ .exit = exit_code };
         }
 
+        pub fn processExit_(exit_code: ExitCode) @This() {
+            return .{ .process_exit = exit_code };
+        }
+
         pub fn exitWith_(value: ValueSource) @This() {
             return .{ .exit_with = value };
         }
@@ -236,7 +244,7 @@ pub const Instruction = struct {
 
         pub fn format(self: @This(), w: *std.Io.Writer) !void {
             switch (self) {
-                inline .push, .exit, .exit_with, .jmp, .fork, .set, .pipe_fwd, .pipe_file, .pipe_write, .wait, .stream, .pipe, .pipe_opt, .ath, .log, .cmp, .resolve_exit_code, .cd, .get_env, .set_env, .emit_lines, .pipe_dequeue => |t| try w.print("{t} {f}", .{ self, t }),
+                inline .push, .exit, .process_exit, .exit_with, .jmp, .fork, .set, .pipe_fwd, .pipe_file, .pipe_write, .wait, .stream, .pipe, .pipe_opt, .ath, .log, .cmp, .resolve_exit_code, .cd, .get_env, .set_env, .emit_lines, .pipe_dequeue => |t| try w.print("{t} {f}", .{ self, t }),
                 inline .ref, .comment, .get_module_cache, .set_module_cache => |t| try w.print("{t} {s}", .{ self, t }),
                 inline .alloc => |t| try w.print("{t} {}", .{ self, t }),
                 else => try w.print("{t}", .{self}),

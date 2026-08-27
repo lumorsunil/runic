@@ -1,0 +1,18 @@
+// `exit` inside a called function terminates the whole program (like bash
+// `exit` in a function), not just that function's thread. Regression: a plain
+// thread-close let the script continue after a function's `exit`. Uses `exit 0`
+// so the run is clean; the point is that the statements after it never run.
+fn Void @() Void
+
+fn Void stopHere(stop: Bool) Void {
+  if (stop) {
+    echo "stopping"
+    exit 0
+  }
+}
+
+echo "before"
+stopHere false
+echo "middle"
+stopHere true
+echo "after (must not print)"

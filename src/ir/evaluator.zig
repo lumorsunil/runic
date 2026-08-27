@@ -76,7 +76,10 @@ pub const Result = union(enum) {
     cont_no_instr_counter_inc,
     /// Advances instruction counter, retains thread counter (used for comments)
     skip,
+    /// Closes the current thread (only ends the program on the main thread).
     exit: runic.ExitCode,
+    /// Terminates the whole program from any thread (user `exit` statement).
+    process_exit: runic.ExitCode,
 };
 
 pub const IREvaluator = struct {
@@ -139,6 +142,12 @@ pub const IREvaluator = struct {
 
         switch (result) {
             .exit => |exit_code| try self.context.closeThread(thread.id, exit_code),
+            // `exit` statement from any thread ends the whole program.
+            .process_exit => |exit_code| {
+                try self.context.closeThread(thread.id, exit_code);
+                self.tempCloseStdIoCheck();
+                return .{ .exit = exit_code };
+            },
             .cont => self.context.threads.items[current_thread_index].incInstructionCounter(),
             .cont_no_instr_counter_inc => {},
             .skip => {
@@ -185,6 +194,12 @@ pub const IREvaluator = struct {
                     try self.context.closeThread(thread.id, exit_code);
                     self.tempCloseStdIoCheck();
                     return .{ .exit = try self.context.getMainThreadExitCode() };
+                },
+                .process_exit => |exit_code| {
+                    const thread = self.context.threads.items[0];
+                    try self.context.closeThread(thread.id, exit_code);
+                    self.tempCloseStdIoCheck();
+                    return .{ .exit = exit_code };
                 },
                 .cont => {
                     self.context.threads.items[0].incInstructionCounter();
@@ -292,6 +307,7 @@ pub const IREvaluator = struct {
                 .cont, .skip => continue,
                 .cont_no_instr_counter_inc => return Error.ContNoInstrCounterIncInAtomic,
                 .exit => |exit_code| return .{ .exit = exit_code },
+                .process_exit => |exit_code| return .{ .process_exit = exit_code },
             }
         }
 
@@ -314,6 +330,7 @@ pub const IREvaluator = struct {
                 .cont, .skip => {},
                 .cont_no_instr_counter_inc => return Error.ContNoInstrCounterIncInAtomic,
                 .exit => |exit_code| return .{ .exit = exit_code },
+                .process_exit => |exit_code| return .{ .process_exit = exit_code },
             }
             counter_ptr.* = .{ .integer = counter_ptr.integer +| 1 };
         }
@@ -1900,6 +1917,7 @@ pub const IREvaluator = struct {
                 return .cont;
             },
             .exit => |exit_code| .{ .exit = exit_code },
+            .process_exit => |exit_code| .{ .process_exit = exit_code },
             // else => Error.UnsupportedInstruction,
         };
     }
