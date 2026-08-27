@@ -3176,9 +3176,19 @@ pub const IRCompiler = struct {
         // For fn_ref_type fields, the fn_ref is a compile-time constant; return it as a value
         // directly so call compilation can emit a direct fork without runtime indirection.
         if (field_.type_expr == .fn_ref_type) {
-            return .from(ir.Value{ .fn_ref = .{
-                .fn_addr = ir.InstructionAddr.initAbs(field_.type_expr.fn_ref_type.instr_set, 0),
-            } });
+            const frt = field_.type_expr.fn_ref_type;
+            const fn_ref_value = ir.Value{ .fn_ref = .{
+                .fn_addr = ir.InstructionAddr.initAbs(frt.instr_set, 0),
+            } };
+            // A *nullary* module member (`m.cwd`, `m.greet`) is a call, like a bare
+            // nullary identifier — auto-call it in a value context so `m.f` and
+            // `${m.f}` yield its result, not the fn_ref. (A member with parameters
+            // is a function value, left for a later call with arguments.) The
+            // instruction set carries the authoritative parameter count.
+            if (mode == .read and self.instruction_sets.items[frt.instr_set].param_count == 0) {
+                return try self.compileFunctionCall(source, fn_ref_value, &.{}, &.{}, null);
+            }
+            return .from(fn_ref_value);
         }
 
         const object_ref = try self.newRef(source, "member_object_ref");
@@ -7987,6 +7997,13 @@ pub const IRCompiler = struct {
                 if (binary.op == .member and binary.right.* == .identifier) {
                     if (self.lookup(binary.right.identifier.name, .{ .shallow = false })) |b| {
                         if (b.result.isFunctionRef()) break :brk .{ .needs_stdio_capture = true };
+                    }
+                    // A nullary module-member function (`m.cwd`) is auto-called in
+                    // a value context, so its output must be captured like any call.
+                    if (self.memberFieldType(binary.left, binary.right.identifier.name)) |ft| {
+                        if (ft == .fn_ref_type and self.instruction_sets.items[ft.fn_ref_type.instr_set].param_count == 0) {
+                            break :brk .{ .needs_stdio_capture = true };
+                        }
                     }
                 }
                 var result = self.analyzeExpressionEffects(binary.left);

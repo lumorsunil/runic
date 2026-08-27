@@ -1,0 +1,5 @@
+direct=hello
+bound=hello
+two=2 plus=4
+witharg=hi bob
+boundarg=hi alice

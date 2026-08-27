@@ -1,0 +1,23 @@
+// A *nullary* module-member function is a call, like a bare nullary identifier:
+// `m.f` / `${m.f}` must yield its result, not the raw function reference.
+// Regression: a nullary String member interpolated empty (compileMember returned
+// the fn_ref and interpolation never called it). The fix must not disturb a
+// member called *with* arguments (`m.greetArg "x"`), which uses the authoritative
+// instruction-set parameter count.
+const m = import "../support/imports/nullary_members.rn"
+
+// nullary member, direct in interpolation
+echo "direct=${m.greet}"
+
+// nullary member, bound then used
+const g = m.greet
+echo "bound=${g}"
+
+// nullary member returning Int, in arithmetic
+const n = m.two
+echo "two=${n} plus=${n + n}"
+
+// member WITH an argument still receives it
+echo "witharg=${m.greetArg "bob"}"
+const r = m.greetArg "alice"
+echo "boundarg=${r}"

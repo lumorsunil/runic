@@ -1,0 +1,4 @@
+fn Void @() Void
+pub fn Void greet() String { yield "hello" }
+pub fn Void greetArg(x: String) String { yield "hi ${x}" }
+pub fn Void two() Int { yield 2 }
