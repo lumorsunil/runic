@@ -250,16 +250,32 @@ new syntax), then the primitives the stdlib is actually made of.
       multi-arg, text+interp, 5000-byte output, and inside a Void fn. Test:
       interpolated_redirect_regression. `fs.writeText` can now interpolate (still
       uses the unquoted form; either works).
-    - [ ] **Multiple interpolated args in one command all take the first's value**
-      (NEW, found 2026-08-27) — `echo "${x}" "${y}"` prints `AA AA`, not `AA BB`;
-      happens with *no* redirect too. A register/ref-reuse bug in how the exec
-      closure builds several multi-segment string args (`compileStringLiteral` /
-      the arg loop in `compileExecutableCall`). Single interpolated args are fine.
-    - [ ] **Function-call file redirect hangs** (NEW, found 2026-08-27) —
-      `myFn > "file"` (documented in features.md) hangs even for a *literal* arg;
-      the `compileRedirectStreams`/`compileFunctionCall` path lacks the redirect
-      drain the command path has. Untested/pre-existing (distinct from the command
-      redirect fix above). Command redirects, including inside functions, work.
+    - [x] **Multiple interpolated args in one command — FIXED (2026-08-27).**
+      `echo "${x}" "${y}"` printed `AA AA` (every arg took the first's value; with
+      three, off-by-one). Cause: each interpolated (multi-segment) string arg
+      leaves its `string_literal` ref on the exec-closure stack, and the old loop
+      pushed each value immediately, interleaving the refs with the pushes so
+      `exec` popped the wrong slots. Fix: compile all args into stable value refs
+      first, then push contiguously. Test: multi_interpolated_args_regression.
+    - [ ] **Function-call / block file redirect hangs** (found 2026-08-27) —
+      `myFn > "file"` and `{ … } > "file"` (documented in features.md) hang even
+      for a *literal* arg; the `compileRedirectStreams`/`compileFunctionCall`/
+      `compileBlockCallWithRedirects` path lacks the redirect drain the command
+      path has. Pre-existing, never worked; distinct from the command redirect fix.
+      **Partial attempt (reverted):** added a `compileFileRedirectDrains` helper
+      (fork a drain per file pipe with `keep_open=true`, wait the writer thread,
+      clear `keep_open`, wait the drains) + threaded the pipe location out of
+      `compileRedirectStreams`. It made the **function** case *write the file
+      correctly* but still hang (the drain's `wait` never returns), and the
+      **block** case didn't write at all. Two obstacles: (1) the redirect-pipe
+      **stack ref goes stale** across the intervening forks — the command path
+      avoids this by storing the pipe in a heap slot (`execution_handles`), so use
+      a stable location, not a raw ref; (2) the drain doesn't close after
+      `keep_open=false` here (the nested command inside the function owns the real
+      source EOF). Fixable with more care mirroring the command path's stable-slot
+      + close-inside-the-writer approach; deferred. Command redirects (incl. inside
+      a function body) work. **NOTE: features.md still claims `myFn > "file"`
+      works — update the docs or fix this.**
     - `std.list` **piping into a module-member stage** (`… | std.list.count`) isn't
       coerced (the pipeline-param coercion keys on local bindings). Call directly.
 

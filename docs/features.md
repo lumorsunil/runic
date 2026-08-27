@@ -473,7 +473,7 @@ echo "saved error" 2>"err.log"
 echo "hello" 1>&2 2>"/dev/null"
 ```
 
-**Result:** `>` / `>>` redirect stdout (truncate / append), `2>...` redirects stderr, and `1>&2` duplicates stdout onto the current stderr target. Because redirects are applied left to right, `echo "hello" 1>&2 2>"/dev/null"` still writes `hello` to the original stderr stream instead of discarding it. A Runic function call can be redirected like any command — `myFn > "file"` sends the function's stdout to a file.
+**Result:** `>` / `>>` redirect stdout (truncate / append), `2>...` redirects stderr, and `1>&2` duplicates stdout onto the current stderr target. Because redirects are applied left to right, `echo "hello" 1>&2 2>"/dev/null"` still writes `hello` to the original stderr stream instead of discarding it. (Redirecting a *function call*'s output to a file — `myFn > "file"` — is not yet supported and currently hangs; redirect the command inside the function instead, e.g. `echo "x" > "file"`.)
 
 **`>` is overloaded.** Since `>` is also the greater-than operator, Runic resolves it by the left operand: a **command** (an external executable call, a function call, a block, or a subshell) makes `>` an output redirect, while a **value** makes it the comparison. So `echo "x" > "f"` and `myFn > "f"` redirect, but `n > 2` and `count > limit` compare. `>>` and `>&` are always redirects. To compare a function's return value instead of redirecting it, bind it first: `const r = myFn; if (r > 2) ...`.
 
