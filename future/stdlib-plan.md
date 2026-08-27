@@ -210,15 +210,24 @@ new syntax), then the primitives the stdlib is actually made of.
     `pow`. New IR op (mirror the string `str_op` machinery: an op enum + evaluator
     handler + a builtin-name table + `compileCall`/`compileMember` dispatch). Once
     done, add `std.math`'s Float surface (absF/sqrt/floor/…). Not started.
-  - [ ] **`std.process`** — BLOCKED by compiler gaps on error-union parameters:
-    inside `fn f(result: ExecutableError!String)`, neither `result.exit_code`
-    ("member access only for struct types") nor `result catch { … }` (a failed
-    command's error did not propagate through the param) works. Fix error-union
-    param inspection first, then output/status/succeeds/requireOk are easy.
-  - [ ] **`std.testing`** — BLOCKED: `assert`/`fail` must abort the process, but
-    `exit N` inside a called function only exits that function's *thread* (the
-    script continues). Needs a process-level exit primitive (or make `exit`
-    propagate out of a fn like bash). requireOk shares this need.
+  - [x] **`std.testing` — DONE (2026-08-27).** assert/assertEq/assertContains/fail,
+    aborting via `exit 1`. Unblocked by the process-exit fix below.
+  - [x] **Process-exit fix — DONE (2026-08-27).** `exit` in a function now
+    terminates the whole program (a new `process_exit` instruction/step result);
+    previously it only closed that function's thread. Test: function_exit_regression.
+  - [ ] **`std.process`** — needs an **API redesign**, not just a bug fix. Its
+    spec takes `ExecutableError!String`, but the error-union view and the struct
+    view are incompatible: `result catch {…}` needs the error union, while
+    `result.exit_code`/`status` needs the execution struct — and a value has only
+    one. Confirmed: even `const r: ExecutableError!String = cat …; r.exit_code`
+    fails ("member access only for struct types"). Plus two param bugs: (a) a
+    command result passed to an `ExecutableError!String` param is NOT converted to
+    the error union, so `catch` silently treats a *failed* command as success
+    (needs argument-boundary coercion, which needs param types at the call site —
+    add them to `fn_ref_type` for module members); (b) `.exit_code` doesn't work
+    on the error-union type at all. Decide the API first (e.g. take the raw
+    command result / execution struct and derive views; or split into
+    struct-view and error-view helpers).
   - **Compiler bugs found while authoring (each blocks cleaner stdlib code):**
     - **Nullary String module fn in direct interpolation captures empty** —
       `"${std.fs.cwd}"` yields empty; `const d = std.fs.cwd` then `"${d}"` works.
@@ -230,6 +239,11 @@ new syntax), then the primitives the stdlib is actually made of.
     - **Interpolated redirect source deadlocks** — `echo "${x}" > file` hangs;
       `echo x > file` (bare identifier) works, which is why `fs.writeText` passes
       content unquoted. Redirect + interpolated command argument deadlock.
+    - **Nested statement-position call isn't awaited** — a fn `a` that calls fn
+      `b` as a statement returns before `b` finishes, so `b`'s side effects (incl.
+      `exit`) race `a`'s caller. `std.testing` inlines its `exit` to dodge this
+      (a delegated `fail` raced the next statement). Top-level statement calls
+      *are* awaited; only nested-in-a-fn-body ones are not.
     - `std.list` **piping into a module-member stage** (`… | std.list.count`) isn't
       coerced (the pipeline-param coercion keys on local bindings). Call directly.
 
