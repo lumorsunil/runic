@@ -246,14 +246,32 @@ new syntax), then the primitives the stdlib is actually made of.
       `compileIfElse` keeps a branch's thread handle typed as a thread so the wait
       catches an if-branch call. A delegated `exit` now aborts correctly (std.testing
       could de-inline, though it still inlines). Test: nested_call_await_regression.
-    - [ ] **Interpolated redirect source deadlocks** — `echo "${x}" > file` (and
-      `>>`) hangs; `echo x > file` (bare identifier) and `echo "${x}" | cmd` (pipe)
-      both work, which is why `fs.writeText` passes content unquoted. A *literal*
-      arg + file redirect works too. So it is specifically an **interpolated
-      command argument compiled inside the exec closure** (`compileExecutableCall`)
-      colliding with the stdout→file redirect stream drain — a pipe-lifecycle
-      deadlock (the redirect pipe likely never sees EOF, so the drain-thread `wait`
-      blocks). Needs a careful pipe-close fix; workaround stands.
+    - [ ] **Interpolated arg + file redirect deadlocks** — `echo "${x}" > file`
+      (and `>>`) hangs; `echo x > file` (bare id), `echo "hi" > file` (literal),
+      and `echo "${x}" | cmd` (pipe) all work — so `fs.writeText` passes content
+      unquoted. **Diagnosed (2026-08-27) via a per-instruction trace:** the child
+      process (echo) is spawned but its `wait [exec_handle]` never returns — echo
+      blocks and its output never reaches the file (created but empty), while the
+      stdout→file drain thread spins. The *only* difference from the working
+      literal case is the argument: an interpolated arg is a **multi-segment heap
+      array** built by `alloc`+`set` instructions inside the exec closure
+      (`compileExecutableCall`, args compiled at ~line 4305), whereas a literal is
+      a direct slice. That extra in-closure string-building breaks the redirect
+      drain — a green-thread **stream-scheduling / pipe-lifecycle** race (the
+      child's stdout pipe never drains, so its write blocks and the thread's exec
+      `wait` hangs). **The spawn is provably identical**: instrumenting the `.exec`
+      evaluator handler shows the same argv (`["echo","CT"]`) and the same pipe
+      handles (`stdin=0 stdout=3 stderr=2`, stdout=3 being the redirect pipe) in
+      both cases — the *only* difference is the exec thread's stack depth
+      (`stacklen=5` vs `4`), the extra slot being the interpolated string's ref.
+      So one extra slot on the exec thread's stack (from building the multi-segment
+      arg in the closure) hangs the child's `wait` even though echo is spawned
+      correctly — a stack-layout / green-thread-scheduling interaction in the exec
+      closure + redirect drain. Likely fixes to explore: build a complex arg
+      *before* the exec closure so it pushes a simple value (as a literal does),
+      keeping the closure's stack identical; or make the redirect drain buffer /
+      not depend on exec timing. Deep; needs the stream/pipe architecture owner.
+      Workaround stands.
     - `std.list` **piping into a module-member stage** (`… | std.list.count`) isn't
       coerced (the pipeline-param coercion keys on local bindings). Call directly.
 
