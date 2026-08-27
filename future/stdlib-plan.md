@@ -205,9 +205,10 @@ new syntax), then the primitives the stdlib is actually made of.
     Float: absF/sqrt/floor/ceil/round/trunc/powF (backed by the Float builtins).
   - [x] **`std.fs` — DONE (2026-08-26).** exists/isDir/isFile/readText/writeText/
     appendText/listDir/mkdirp/remove/cwd (portable-command wrappers).
-  - [x] **`std.env` — DONE except `set` (2026-08-26).** get/getOr/has (dynamic name
-    via `printenv <name>`), home/path. `set` needs a dynamic-name env write (a
-    builtin, or dynamic `$` support).
+  - [~] **`std.env` — get/getOr/has/home/path DONE (2026-08-26); `set` pending.**
+    **DECISION (2026-08-27): implement `set` as a builtin `env.set name value`**
+    (no new `$`-assignment syntax), backed by the existing `set_env` IR
+    instruction so it updates the current subshell context. To do after the bugs.
   - [x] **Float math builtins — DONE (2026-08-27).** `float_op` IR instruction
     (mirrors `str_op`): UFCS `x.sqrt`/`x.floor`/`x.ceil`/`x.round`/`x.trunc` and
     `x.powF y`. `std.math`'s Float surface wraps them.
@@ -216,27 +217,14 @@ new syntax), then the primitives the stdlib is actually made of.
   - [x] **Process-exit fix — DONE (2026-08-27).** `exit` in a function now
     terminates the whole program (a new `process_exit` instruction/step result);
     previously it only closed that function's thread. Test: function_exit_regression.
-  - [ ] **`std.process` — DEFERRED pending a deeper result-model rethink
-    (2026-08-27).** Design note from the API discussion: a function/command result
-    is not "either an error or one payload" — a call can **yield many values and
-    then terminate with an error**. The right model is a result carrying *both*
-    the full stream of yielded values *and* an eventual terminal error, and error
-    handling (D7's error-union view) should be reconsidered under that model.
-    Revisit `std.process` (and `catch`/`try` semantics) then; not now. The
-    concrete blockers below stand under the current model.
-  - [ ] **`std.process` (current-model blockers)** — needs an **API redesign**, not just a bug fix. Its
-    spec takes `ExecutableError!String`, but the error-union view and the struct
-    view are incompatible: `result catch {…}` needs the error union, while
-    `result.exit_code`/`status` needs the execution struct — and a value has only
-    one. Confirmed: even `const r: ExecutableError!String = cat …; r.exit_code`
-    fails ("member access only for struct types"). Plus two param bugs: (a) a
-    command result passed to an `ExecutableError!String` param is NOT converted to
-    the error union, so `catch` silently treats a *failed* command as success
-    (needs argument-boundary coercion, which needs param types at the call site —
-    add them to `fn_ref_type` for module members); (b) `.exit_code` doesn't work
-    on the error-union type at all. Decide the API first (e.g. take the raw
-    command result / execution struct and derive views; or split into
-    struct-view and error-view helpers).
+  - [x] **`std.process` — DROPPED (DECISION 2026-08-27).** The struct view
+    (`r.exit_code`/`r.stdout`) and the error-union view (`r catch {…}`) can't
+    coexist on one value, and the module would be thin sugar over idioms that
+    already work directly: `const r = cmd; r.exit_code` / `r.stdout` (struct view)
+    and `cmd catch {…}` / `try cmd` (error view). So `std` ships **7 modules**, not
+    8; `std.process` is intentionally omitted. (The broader result-model insight —
+    a call yields a *stream* of values *and* a terminal error — is recorded
+    separately as a future language-design direction, independent of this drop.)
   - **Compiler bugs found while authoring:**
     - [x] **Nullary String module fn in direct interpolation — FIXED (2026-08-27).**
       `"${std.fs.cwd}"` now calls it. `compileMember` auto-calls a nullary
