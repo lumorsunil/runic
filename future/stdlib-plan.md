@@ -248,32 +248,30 @@ new syntax), then the primitives the stdlib is actually made of.
       `compileIfElse` keeps a branch's thread handle typed as a thread so the wait
       catches an if-branch call. A delegated `exit` now aborts correctly (std.testing
       could de-inline, though it still inlines). Test: nested_call_await_regression.
-    - [ ] **Interpolated arg + file redirect deadlocks** — `echo "${x}" > file`
-      (and `>>`) hangs; `echo x > file` (bare id), `echo "hi" > file` (literal),
-      and `echo "${x}" | cmd` (pipe) all work — so `fs.writeText` passes content
-      unquoted. **Diagnosed (2026-08-27) via a per-instruction trace:** the child
-      process (echo) is spawned but its `wait [exec_handle]` never returns — echo
-      blocks and its output never reaches the file (created but empty), while the
-      stdout→file drain thread spins. The *only* difference from the working
-      literal case is the argument: an interpolated arg is a **multi-segment heap
-      array** built by `alloc`+`set` instructions inside the exec closure
-      (`compileExecutableCall`, args compiled at ~line 4305), whereas a literal is
-      a direct slice. That extra in-closure string-building breaks the redirect
-      drain — a green-thread **stream-scheduling / pipe-lifecycle** race (the
-      child's stdout pipe never drains, so its write blocks and the thread's exec
-      `wait` hangs). **The spawn is provably identical**: instrumenting the `.exec`
-      evaluator handler shows the same argv (`["echo","CT"]`) and the same pipe
-      handles (`stdin=0 stdout=3 stderr=2`, stdout=3 being the redirect pipe) in
-      both cases — the *only* difference is the exec thread's stack depth
-      (`stacklen=5` vs `4`), the extra slot being the interpolated string's ref.
-      So one extra slot on the exec thread's stack (from building the multi-segment
-      arg in the closure) hangs the child's `wait` even though echo is spawned
-      correctly — a stack-layout / green-thread-scheduling interaction in the exec
-      closure + redirect drain. Likely fixes to explore: build a complex arg
-      *before* the exec closure so it pushes a simple value (as a literal does),
-      keeping the closure's stack identical; or make the redirect drain buffer /
-      not depend on exec timing. Deep; needs the stream/pipe architecture owner.
-      Workaround stands.
+    - [x] **Interpolated arg + file redirect deadlock — FIXED (2026-08-27).**
+      `echo "${x}" > file` (and `>>`) hung. Traced to a timing bug: building the
+      interpolated, multi-segment string arg inside the exec closure delays the
+      command's spawn, so the stdout→file drain forwards the pipe *before* the
+      command connects its stdout; with the pipe's default `keep_open=false` the
+      drain sees no source, closes the file immediately, and exits, so the
+      command's output has nowhere to go and its `wait` hangs. Fix: create the
+      redirect pipe with `keep_open=true` (drain spins on `no_source` until the
+      command connects), then clear `keep_open` from inside the exec closure right
+      after the command's own wait (it has connected + finished by then), so the
+      drain drains the EOF source and closes the file. Verified truncate/append,
+      multi-arg, text+interp, 5000-byte output, and inside a Void fn. Test:
+      interpolated_redirect_regression. `fs.writeText` can now interpolate (still
+      uses the unquoted form; either works).
+    - [ ] **Multiple interpolated args in one command all take the first's value**
+      (NEW, found 2026-08-27) — `echo "${x}" "${y}"` prints `AA AA`, not `AA BB`;
+      happens with *no* redirect too. A register/ref-reuse bug in how the exec
+      closure builds several multi-segment string args (`compileStringLiteral` /
+      the arg loop in `compileExecutableCall`). Single interpolated args are fine.
+    - [ ] **Function-call file redirect hangs** (NEW, found 2026-08-27) —
+      `myFn > "file"` (documented in features.md) hangs even for a *literal* arg;
+      the `compileRedirectStreams`/`compileFunctionCall` path lacks the redirect
+      drain the command path has. Untested/pre-existing (distinct from the command
+      redirect fix above). Command redirects, including inside functions, work.
     - `std.list` **piping into a module-member stage** (`… | std.list.count`) isn't
       coerced (the pipeline-param coercion keys on local bindings). Call directly.
 
