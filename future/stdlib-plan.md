@@ -235,22 +235,25 @@ new syntax), then the primitives the stdlib is actually made of.
     on the error-union type at all. Decide the API first (e.g. take the raw
     command result / execution struct and derive views; or split into
     struct-view and error-view helpers).
-  - **Compiler bugs found while authoring (each blocks cleaner stdlib code):**
-    - **Nullary String module fn in direct interpolation captures empty** —
-      `"${std.fs.cwd}"` yields empty; `const d = std.fs.cwd` then `"${d}"` works.
-      Functions *with args* are fine. Cause: `analyzeExpressionEffects` only marks
-      a `.binary` member for stdio capture when the member is a *local* fn binding,
-      not a module `fn_ref_type` field; and forcing the capture there breaks the
-      bound path — the transient vs bound capture of a `yield <String-var>` diverge.
-      Needs a real fix in the value-capture paths.
-    - **Interpolated redirect source deadlocks** — `echo "${x}" > file` hangs;
-      `echo x > file` (bare identifier) works, which is why `fs.writeText` passes
-      content unquoted. Redirect + interpolated command argument deadlock.
-    - **Nested statement-position call isn't awaited** — a fn `a` that calls fn
-      `b` as a statement returns before `b` finishes, so `b`'s side effects (incl.
-      `exit`) race `a`'s caller. `std.testing` inlines its `exit` to dodge this
-      (a delegated `fail` raced the next statement). Top-level statement calls
-      *are* awaited; only nested-in-a-fn-body ones are not.
+  - **Compiler bugs found while authoring:**
+    - [x] **Nullary String module fn in direct interpolation — FIXED (2026-08-27).**
+      `"${std.fs.cwd}"` now calls it. `compileMember` auto-calls a nullary
+      `fn_ref_type` member (using the instruction set's authoritative param count),
+      and `analyzeExpressionEffects` marks it for capture. Test:
+      nullary_member_call_regression.
+    - [x] **Nested statement-position call isn't awaited — FIXED (2026-08-27).**
+      A Void function now waits on its body's thread-handle result, and
+      `compileIfElse` keeps a branch's thread handle typed as a thread so the wait
+      catches an if-branch call. A delegated `exit` now aborts correctly (std.testing
+      could de-inline, though it still inlines). Test: nested_call_await_regression.
+    - [ ] **Interpolated redirect source deadlocks** — `echo "${x}" > file` (and
+      `>>`) hangs; `echo x > file` (bare identifier) and `echo "${x}" | cmd` (pipe)
+      both work, which is why `fs.writeText` passes content unquoted. A *literal*
+      arg + file redirect works too. So it is specifically an **interpolated
+      command argument compiled inside the exec closure** (`compileExecutableCall`)
+      colliding with the stdout→file redirect stream drain — a pipe-lifecycle
+      deadlock (the redirect pipe likely never sees EOF, so the drain-thread `wait`
+      blocks). Needs a careful pipe-close fix; workaround stands.
     - `std.list` **piping into a module-member stage** (`… | std.list.count`) isn't
       coerced (the pipeline-param coercion keys on local bindings). Call directly.
 
