@@ -257,25 +257,39 @@ new syntax), then the primitives the stdlib is actually made of.
       pushed each value immediately, interleaving the refs with the pushes so
       `exec` popped the wrong slots. Fix: compile all args into stable value refs
       first, then push contiguously. Test: multi_interpolated_args_regression.
-    - [ ] **Function-call / block file redirect hangs** (found 2026-08-27) —
-      `myFn > "file"` and `{ … } > "file"` (documented in features.md) hang even
-      for a *literal* arg; the `compileRedirectStreams`/`compileFunctionCall`/
-      `compileBlockCallWithRedirects` path lacks the redirect drain the command
-      path has. Pre-existing, never worked; distinct from the command redirect fix.
-      **Partial attempt (reverted):** added a `compileFileRedirectDrains` helper
-      (fork a drain per file pipe with `keep_open=true`, wait the writer thread,
-      clear `keep_open`, wait the drains) + threaded the pipe location out of
-      `compileRedirectStreams`. It made the **function** case *write the file
-      correctly* but still hang (the drain's `wait` never returns), and the
-      **block** case didn't write at all. Two obstacles: (1) the redirect-pipe
-      **stack ref goes stale** across the intervening forks — the command path
-      avoids this by storing the pipe in a heap slot (`execution_handles`), so use
-      a stable location, not a raw ref; (2) the drain doesn't close after
-      `keep_open=false` here (the nested command inside the function owns the real
-      source EOF). Fixable with more care mirroring the command path's stable-slot
-      + close-inside-the-writer approach; deferred. Command redirects (incl. inside
-      a function body) work. **NOTE: features.md still claims `myFn > "file"`
-      works — update the docs or fix this.**
+    - [ ] **Function-call / block file redirect hangs — DEFERRED; needs an
+      architectural fix (diagnosed thoroughly 2026-08-27/28).** `myFn > "file"` and
+      `{ … } > "file"` hang even for a literal arg; the function/block redirect
+      path (`compileRedirectStreams` + `compileFunctionCall` /
+      `compileBlockCallWithRedirects`) lacks the redirect drain the command path
+      has. Never worked; distinct from — and unaffected by — the command redirect
+      fix. **Full trace-level diagnosis (two attempts, both reverted):**
+      - The writer here is a *thread* (the function/block body), which internally
+        runs a *command* (e.g. `echo`) whose stdout is the redirect pipe. Three
+        forces conflict:
+        1. **Writer exit blocks on a kept-open stdout.** A thread whose stdout pipe
+           is `keep_open=true` doesn't exit. The command path clears keep_open
+           *inside the exec closure, after the exec's own wait* — you cannot inject
+           that into a pre-compiled `fn_ref` body (only into a block body).
+        2. **Concurrent drain + `keep_open=true` stalls the inner command.** With a
+           drain reading while keep_open is true, the nested `echo`'s I/O never
+           finalizes, so its `wait` never returns → the writer thread never exits →
+           the outer `wait` (T0→writer→echo) deadlocks. (Verified: file written,
+           `keep_open=false` never reached, three threads stuck in a wait chain.)
+        3. **Drain *after* the writer exits loses the data.** The nested command's
+           `process_io` is torn down with the writer thread, so its buffered output
+           is gone before the drain reads it (file ends up empty).
+      - The command path escapes all three because the *command is the process*:
+        its `process_io` lives independently of any thread and is drained after the
+        exec's own wait. For functions/blocks the nested command's `process_io`
+        lifecycle is coupled to the enclosing thread.
+      - **Real fix (architectural, not a patch):** decouple the redirect drain from
+        the enclosing thread — e.g. connect the redirect pipe's *destination* (the
+        file) directly so it's driven by the pipe's own forwarding (as the command
+        path's file sink is), independent of when the writer thread exits; or give
+        the writer a wrapper closure that owns keep_open like the exec closure does.
+        Needs the stream/pipe architecture owner. Command redirects (incl. a command
+        *inside* a function body) work. features.md now notes the limitation.
     - `std.list` **piping into a module-member stage** (`… | std.list.count`) isn't
       coerced (the pipeline-param coercion keys on local bindings). Call directly.
 
