@@ -7987,19 +7987,28 @@ pub const IRCompiler = struct {
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
-        if (while_stmt.capture != null) {
-            try self.reportSourceError(
-                source,
-                Error.NotImplemented,
-                .@"error",
-                "while-loop optional captures (`while (opt) |v|`) are not yet supported",
-                .{},
-            );
-            return .fromValue(.void);
+        if (while_stmt.capture) |capture| {
+            if (capture.bindings.len != 1) {
+                try self.reportSourceError(
+                    source,
+                    Error.UnsupportedBindingPattern,
+                    .@"error",
+                    "while capture clauses currently require exactly one binding",
+                    .{},
+                );
+                return .fromValue(.void);
+            }
         }
 
         const after_label = try self.newLabel("while_after", .unknown);
         const cond_ref = try self.newRef(source, "while_cond");
+        // For an optional-capture loop the exit test is "the optional is present",
+        // computed into its own stable ref (allocated outside the loop so the
+        // transient-ref pop below leaves it intact).
+        const present_ref: ?ir.Location = if (while_stmt.capture != null)
+            try self.newRef(source, "while_present")
+        else
+            null;
         const while_label = try self.newLabel("while", .abs);
         const loop_stack_base = self.currentFrame().rel_stack_counter;
 
@@ -8007,13 +8016,75 @@ pub const IRCompiler = struct {
         // refs it pushed so the stack is back at a fixed base before we branch.
         const condition = try self.compileTransientExpression(source, while_stmt.condition);
         try self.set(source, cond_ref, stableResultSource(condition));
+
+        // The value the exit branch tests, plus (for a capture) the unwrapped
+        // binding to declare in the body scope.
+        var loop_cond: Result = undefined;
+        var capture_binding: ?IfCaptureBinding = null;
+        if (while_stmt.capture) |capture| {
+            const condition_type = blk: {
+                if (condition.typeExpr()) |type_expr| break :blk type_expr;
+                if (while_stmt.condition.* == .identifier) {
+                    if (self.lookup(while_stmt.condition.identifier.name, .{ .shallow = false })) |binding| {
+                        if (binding.result.typeExpr()) |type_expr| break :blk type_expr;
+                    }
+                }
+                break :blk null;
+            };
+            const child: ast.TypeExpr = switch (condition_type orelse ast.TypeExpr.global(.void)) {
+                .optional => |optional| optional.child.*,
+                else => {
+                    try self.reportSourceError(
+                        source,
+                        Error.UnsupportedExpression,
+                        .@"error",
+                        "a `while (…) |v|` capture requires an optional condition",
+                        .{},
+                    );
+                    return .fromValue(.void);
+                },
+            };
+            // present = (cond != null); loop while present, bind the unwrapped value.
+            try self.cmp(source, .not_equal, .from(cond_ref.dereference()), .fromValue(.null), present_ref.?);
+            loop_cond = try .from(present_ref.?.dereference());
+            capture_binding = .{
+                .pattern = capture.bindings[0],
+                .value = .fromLocation(cond_ref.dereference().typed(child)),
+            };
+        } else {
+            loop_cond = try .from(cond_ref.dereference());
+        }
+
         try self.popToStackBase(source, loop_stack_base);
-        try self.jmp(source, try .from(cond_ref.dereference()), false, after_label);
+        try self.jmp(source, loop_cond, false, after_label);
 
         // Body: a fresh lexical scope per iteration (loop-local bindings), with
         // its runtime slots popped at the end so they don't accumulate.
         try self.scopes.push(self.allocator, .lexical);
         const stack_before_body = self.currentFrame().rel_stack_counter;
+
+        if (capture_binding) |binding| switch (binding.pattern.*) {
+            .discard => {},
+            .identifier => |identifier| try self.compileIdentifierBinding(
+                source,
+                identifier,
+                binding.value,
+                null,
+                false,
+                .normal,
+            ),
+            else => {
+                self.scopes.pop();
+                try self.reportSourceError(
+                    source,
+                    Error.UnsupportedBindingPattern,
+                    .@"error",
+                    "while capture binding pattern not yet supported",
+                    .{},
+                );
+                return .fromValue(.void);
+            },
+        };
 
         var body_result: Result = .fromValue(.void);
         for (while_stmt.body.statements) |body_stmt| {

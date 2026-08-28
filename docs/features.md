@@ -440,8 +440,21 @@ while (i < 5) {
 ```
 
 **Result:** `while` covers the open-ended loops `for` can't express — repeat
-until a flag flips or a value crosses a threshold. (Optional-unwrap captures,
-`while (opt) |v| { … }`, are not supported yet; the body must be a brace block.)
+until a flag flips or a value crosses a threshold. (The body must be a brace
+block.)
+
+An optional condition can be unwrapped with a capture: `while (opt) |v| { … }`
+loops while `opt` is non-null, binding the unwrapped value to `v` for that
+iteration — the optional analogue of `if (opt) |v|`. Reassigning the optional in
+the body drives the loop:
+
+```rn
+var cur: ?Int = 3
+while (cur) |v| {
+  echo "v=${v}"
+  if (v <= 1) { cur = null } else { cur = v - 1 }
+}
+```
 
 ## Command vs. expression separation
 

@@ -296,14 +296,22 @@ new syntax), then the primitives the stdlib is actually made of.
     enclosing scope, body via `runBlockInNewScope`), and IR lowering
     (`compileWhileLoop`: condition stashed in a ref outside the loop so its
     transient stack refs pop back to a fixed base before the exit branch, keeping
-    the continue/exit stacks aligned). Optional-unwrap captures
-    (`while (opt) |v|`) not parsed yet — deferred. Covered by
-    `tests/features/while_loop_regression.rn`; features.md documents it. CI green
-    (13/13, 42 diag, 8 examples, 137 smoke, 3 strict).
+    the continue/exit stacks aligned). Covered by
+    `tests/features/while_loop_regression.rn`; features.md documents it.
+  - [x] **`while (opt) |v|` optional-unwrap capture — DONE (2026-08-28).** Loops
+    while the optional condition is present, binding the unwrapped value each
+    pass — the optional analogue of `if (opt) |v|`, reusing the same
+    `IfCaptureBinding` machinery. Parser now reads the optional capture clause
+    (`parseOptionalCaptureClause`); `runWhile` declares the unwrapped binding in
+    the body scope (via `resolveConditionType` → `.optional.child`, erroring on a
+    non-optional condition); `compileWhileLoop` computes `present = cond != null`
+    into a ref outside the loop, uses it as the exit test, and binds
+    `cond` typed as the child in the body. Covered by
+    `tests/features/while_capture_regression.rn`. CI green (13/13, 42 diag, 8
+    examples, 138 smoke, 3 strict).
   - Generic containers: comptime type-returning functions (`fn Box(comptime T:
     Type) Type`), reusing the Phase-2 engine.
   - Maps: `{ k: v }` literals + `Map(K, V)` type + access/keys/values.
-  - `while (opt) |v|` optional-unwrap capture (mirror `if (opt) |v|`).
   - Fuller comptime (comptime values, `@TypeOf`, type-level computation) — its
     own design conversation.
 

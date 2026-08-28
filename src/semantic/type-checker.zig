@@ -530,7 +530,57 @@ pub const TypeChecker = struct {
         // The condition is resolved in the enclosing scope; the body runs in a
         // fresh child scope so its bindings are loop-local.
         try self.runExpression(scope, while_stmt.condition);
-        try self.runBlockInNewScope(scope, &while_stmt.body);
+        const condition_type = try self.resolveConditionType(scope, while_stmt.condition);
+
+        const body_scope = try scope.addChild(self.arena.allocator(), while_stmt.body.span);
+
+        // `while (opt) |v| { … }` loops while the optional is present, binding the
+        // unwrapped value in the body scope.
+        if (while_stmt.capture) |capture| {
+            if (capture.bindings.len != 1) {
+                try self.reportSpanError(
+                    capture.span,
+                    Error.BindingPatternNotSupported,
+                    .@"error",
+                    "while capture clauses currently require exactly one binding",
+                    .{},
+                );
+                return;
+            }
+
+            const cond_type = condition_type orelse {
+                try self.reportSpanError(
+                    while_stmt.condition.span(),
+                    Error.TypeMismatch,
+                    .@"error",
+                    "a `while (…) |v|` capture requires an optional condition",
+                    .{},
+                );
+                return;
+            };
+
+            switch (cond_type.*) {
+                .optional => |optional| try self.runBindingPattern(
+                    body_scope,
+                    capture.bindings[0],
+                    optional.child,
+                    false,
+                    false,
+                ),
+                else => {
+                    try self.reportSpanError(
+                        while_stmt.condition.span(),
+                        Error.TypeMismatch,
+                        .@"error",
+                        "a `while (…) |v|` capture requires an optional condition",
+                        .{},
+                    );
+                    return;
+                },
+            }
+        }
+
+        try self.runBlock(body_scope, &while_stmt.body);
     }
 
     fn runYield(self: *TypeChecker, scope: *Scope, yield_stmt: *ast.YieldStmt) Error!void {

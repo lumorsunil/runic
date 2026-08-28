@@ -2378,8 +2378,9 @@ pub const Parser = struct {
 
     /// Parses `while (condition) { body }`. The body is a brace block; the
     /// condition is any expression, tested for truthiness each iteration (a
-    /// `Bool`, a comparison, or a command's exit status). Optional-unwrap
-    /// captures (`while (opt) |v| { … }`) are not parsed yet.
+    /// `Bool`, a comparison, or a command's exit status). An optional capture
+    /// clause (`while (opt) |v| { … }`) loops while the optional condition is
+    /// non-null, binding the unwrapped value to `v` for that iteration.
     fn parseWhileStatement(self: *Self) Error!ast.WhileStmt {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
@@ -2388,11 +2389,12 @@ pub const Parser = struct {
         _ = try self.expect(.l_paren);
         const condition = try self.parseExpression();
         _ = try self.expect(.r_paren);
+        const capture = try self.parseOptionalCaptureClause();
         const body = try self.parseBlock();
 
         return .{
             .condition = condition,
-            .capture = null,
+            .capture = capture,
             .body = body,
             .span = while_tok.span.endAt(body.span),
         };
