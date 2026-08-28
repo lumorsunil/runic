@@ -1308,6 +1308,7 @@ pub const TypeChecker = struct {
                 };
             },
             .for_expr => |for_expr| try self.validateFunctionBodyStdin(scope, for_expr.body, enclosing_stdin),
+            .comptime_expr => |comptime_expr| try self.validateFunctionBodyStdin(scope, comptime_expr.operand, enclosing_stdin),
             .match_expr => |match_expr| for (match_expr.cases) |case| {
                 try self.validateBlockStdin(scope, case.body, enclosing_stdin);
             },
@@ -1536,6 +1537,7 @@ pub const TypeChecker = struct {
             .import_expr => |*import_expr| self.runImportExpr(scope, import_expr),
             .fn_decl => |*fn_decl| self.runFnDecl(scope, fn_decl),
             .call => |*call| self.runCall(scope, call),
+            .comptime_expr => |*comptime_expr| self.runExpression(scope, comptime_expr.operand),
             .subshell => |*subshell| self.runExpression(scope, subshell.child),
             .fd => |*fd_expr| self.runFd(scope, fd_expr),
             else => return error.UnsupportedExpression,

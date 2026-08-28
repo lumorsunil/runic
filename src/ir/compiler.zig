@@ -582,6 +582,21 @@ pub const IRCompiler = struct {
     /// typed correctly for coercions. Top is the innermost function.
     stdin_type_stack: std.ArrayList(?ast.TypeExpr) = .empty,
 
+    /// Comptime evaluation state. `comptime_forcing > 0` while lowering a
+    /// `comptime` expression, which enables the comptime folder to reduce pure
+    /// function calls (off by default so ordinary calls stay runtime). Maps a
+    /// function's instruction-set index to its AST declaration so the folder can
+    /// interpret its body, and bounds recursion so a non-terminating comptime
+    /// call fails to compile instead of hanging the compiler.
+    comptime_forcing: usize = 0,
+    comptime_fn_decls: std.AutoHashMapUnmanaged(usize, *const ast.FunctionDecl) = .empty,
+    comptime_depth: usize = 0,
+    /// Recursion-depth cap for comptime call interpretation. Kept well below the
+    /// point where the interpreter's own (native) call stack would overflow, so
+    /// a non-terminating `comptime` recursion fails to compile instead of
+    /// crashing. Deeply recursive comptime algorithms beyond this are rejected.
+    const comptime_max_depth: usize = 128;
+
     pub fn init(
         io: std.Io,
         allocator: Allocator,
@@ -1899,6 +1914,7 @@ pub const IRCompiler = struct {
             .try_expr => |try_expr| self.compileTry(expr, try_expr),
             .is_expr => |is_expr| self.compileIs(expr, is_expr),
             .for_expr => |for_expr| self.compileForLoop(expr, for_expr),
+            .comptime_expr => |comptime_expr| self.compileComptimeExpr(expr, comptime_expr),
             .subshell => |subshell| self.compileSubshell(expr, subshell),
             .fd => |fd_expr| self.compileFd(expr, fd_expr),
             else => {
@@ -2104,8 +2120,174 @@ pub const IRCompiler = struct {
                 }
                 break :blk null;
             },
+            .comptime_expr => |comptime_expr| blk: {
+                // Nested `comptime` (or the operand of a top-level one): fold the
+                // operand with call-folding enabled.
+                self.comptime_forcing += 1;
+                defer self.comptime_forcing -= 1;
+                break :blk try self.evalComptimeExpression(comptime_expr.operand);
+            },
+            .call => |call| if (self.comptime_forcing > 0)
+                try self.evalComptimeCall(call)
+            else
+                null,
             else => null,
         };
+    }
+
+    /// Comptime-evaluates a pure function call (`comptime fib 10`). Resolves the
+    /// callee to a known function's AST, folds each argument, binds the
+    /// parameters in a fresh scope, and interprets the body. Returns null (not
+    /// comptime-foldable) if the callee isn't a plain function, an argument or
+    /// the body can't be folded, or the arity doesn't match.
+    fn evalComptimeCall(self: *IRCompiler, call: ast.CallExpr) Error!?Result {
+        if (call.redirects.len != 0 or call.background) return null;
+        if (call.callee.* != .identifier) return null;
+
+        const binding = self.lookup(call.callee.identifier.name, .{ .shallow = false }) orelse return null;
+        if (binding.is_mutable or binding.result.source != .value) return null;
+
+        // A bare identifier parses as a zero-arg call (`n` -> `n()`); when it
+        // names an immutable value (e.g. a bound parameter), fold to that value.
+        if (binding.result.source.value != .fn_ref) {
+            return if (call.arguments.len == 0) binding.result else null;
+        }
+
+        const instr_set = binding.result.source.value.fn_ref.fn_addr.instr_set;
+        const fn_decl = self.comptime_fn_decls.get(instr_set) orelse return null;
+
+        // Only non-variadic, identifier-parameter functions are interpretable.
+        if (fn_decl.params != ._non_variadic) return null;
+        const params = fn_decl.params._non_variadic;
+        if (params.len != call.arguments.len) return null;
+
+        // Fold arguments in the *caller's* scope, before binding parameters.
+        const arg_values = try self.allocator.alloc(Result, call.arguments.len);
+        defer self.allocator.free(arg_values);
+        for (call.arguments, arg_values) |arg_expr, *slot| {
+            slot.* = (try self.evalComptimeExpression(arg_expr)) orelse return null;
+        }
+
+        if (self.comptime_depth >= comptime_max_depth) {
+            return null;
+        }
+        self.comptime_depth += 1;
+        defer self.comptime_depth -= 1;
+
+        // A fresh scope holds the parameter bindings; the function name stays
+        // visible from the enclosing scope so recursion resolves.
+        try self.scopes.push(self.allocator, .lexical);
+        defer self.scopes.pop();
+
+        for (params, arg_values) |param, arg_value| {
+            switch (param.pattern.*) {
+                .identifier => |identifier| try self.scopes.declare(
+                    self.allocator,
+                    identifier.name,
+                    arg_value,
+                    arg_value.typeExpr(),
+                    false,
+                    .normal,
+                ),
+                .discard => {},
+                else => return null,
+            }
+        }
+
+        return switch (try self.evalComptimeBody(fn_decl.body)) {
+            .value => |result| result,
+            // A body that never yields a value isn't comptime-foldable here.
+            .fell_through, .not_foldable => null,
+        };
+    }
+
+    /// The outcome of interpreting a comptime statement/body: a `yield`ed return
+    /// value, a fall-through (statement completed without returning), or a
+    /// non-foldable construct (the whole comptime evaluation gives up).
+    const ComptimeFlow = union(enum) {
+        value: Result,
+        fell_through,
+        not_foldable,
+    };
+
+    /// Interprets a function/branch body for comptime evaluation. A `yield`
+    /// anywhere is the return value; a bare `if`/`match` whose taken branch
+    /// yields returns through it; local `const` bindings extend the scope.
+    fn evalComptimeBody(self: *IRCompiler, body: *ast.Expression) Error!ComptimeFlow {
+        switch (body.*) {
+            .block => |block| {
+                for (block.statements) |stmt| {
+                    switch (try self.evalComptimeStatement(stmt)) {
+                        .value => |result| return .{ .value = result },
+                        .fell_through => {},
+                        .not_foldable => return .not_foldable,
+                    }
+                }
+                return .fell_through;
+            },
+            // A bare-expression body (`fn … n * 2`) folds directly.
+            else => return if (try self.evalComptimeExpression(body)) |result|
+                .{ .value = result }
+            else
+                .not_foldable,
+        }
+    }
+
+    fn evalComptimeStatement(self: *IRCompiler, stmt: *ast.Statement) Error!ComptimeFlow {
+        switch (stmt.*) {
+            .yield_stmt => |yield_stmt| {
+                if (yield_stmt.fd != 1) return .not_foldable;
+                const value = (try self.evalComptimeExpression(yield_stmt.value)) orelse return .not_foldable;
+                return .{ .value = value };
+            },
+            .binding_decl => |binding_decl| {
+                if (binding_decl.is_mutable) return .not_foldable;
+                const value = (try self.evalComptimeExpression(binding_decl.initializer)) orelse return .not_foldable;
+                switch (binding_decl.pattern.*) {
+                    .identifier => |identifier| self.scopes.declare(
+                        self.allocator,
+                        identifier.name,
+                        value,
+                        value.typeExpr(),
+                        false,
+                        .normal,
+                    ) catch return .not_foldable,
+                    .discard => {},
+                    else => return .not_foldable,
+                }
+                return .fell_through;
+            },
+            .expression => |expr_stmt| return self.evalComptimeControlStatement(expr_stmt.expression),
+            else => return .not_foldable,
+        }
+    }
+
+    /// A statement-position expression during comptime interpretation. An `if`
+    /// or `match` here may yield (return) through its taken branch; anything
+    /// else with no return value simply falls through if it folds.
+    fn evalComptimeControlStatement(self: *IRCompiler, expr: *ast.Expression) Error!ComptimeFlow {
+        switch (expr.*) {
+            .if_expr => |if_expr| {
+                const condition = (try self.evalComptimeExpression(if_expr.condition)) orelse return .not_foldable;
+                const truth = self.comptimeConditionTruth(if_expr.condition, condition) orelse return .not_foldable;
+                if (truth) return self.evalComptimeBody(if_expr.then_expr);
+                if (if_expr.else_branch) |else_branch| switch (else_branch) {
+                    .expr => |else_expr| return self.evalComptimeBody(else_expr),
+                    .if_expr => |else_if| {
+                        const else_expr = try self.allocExpression(.{ .if_expr = else_if.* });
+                        return self.evalComptimeControlStatement(else_expr);
+                    },
+                    .condition => return .fell_through,
+                };
+                return .fell_through;
+            },
+            // A non-control statement expression that folds is a discarded value
+            // (falls through); one that can't fold gives up.
+            else => return if (try self.evalComptimeExpression(expr)) |_|
+                .fell_through
+            else
+                .not_foldable,
+        }
     }
 
     /// In-process typed capture of a function call that returns a structured
@@ -6633,6 +6815,11 @@ pub const IRCompiler = struct {
         const fn_ref = ir.Value{
             .fn_ref = .{ .fn_addr = ir.InstructionAddr.initAbs(instr_set, 0) },
         };
+        // Record the AST so `comptime` calls can interpret this function's body.
+        // `source.fn_decl` is a stable, arena-owned copy of `fn_decl`.
+        if (source.* == .fn_decl) {
+            try self.comptime_fn_decls.put(self.allocator, instr_set, &source.fn_decl);
+        }
         const orig_instr_set = self.current_instruction_set;
         self.current_instruction_set = instr_set;
         try self.scopes.push(self.allocator, .closure);
@@ -7847,6 +8034,39 @@ pub const IRCompiler = struct {
         }
 
         return iterations_ref;
+    }
+
+    /// Lowers `comptime <operand>`: fold the operand to a constant value with
+    /// call-folding enabled, or fail to compile. (The success path is normally
+    /// taken earlier by the automatic folder in `compileExpression`; this
+    /// handles — and reports — the case where the operand isn't reducible.)
+    fn compileComptimeExpr(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        comptime_expr: ast.ComptimeExpr,
+    ) Error!Result {
+        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        const folded = blk: {
+            self.comptime_forcing += 1;
+            defer self.comptime_forcing -= 1;
+            break :blk try self.evalComptimeExpression(comptime_expr.operand);
+        };
+
+        if (folded) |result| {
+            if (!(result.source == .value and result.source.value == .zig_string)) {
+                return result;
+            }
+        }
+
+        try self.reportSourceError(
+            source,
+            Error.UnsupportedExpression,
+            .@"error",
+            "`comptime` expression could not be evaluated at compile time",
+            .{},
+        );
+        return .fromValue(.void);
     }
 
     fn compileForLoop(

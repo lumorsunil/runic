@@ -537,6 +537,7 @@ pub const Parser = struct {
             .identifier => self.parseIdentifierExpression(),
             .kw_if => self.parseIfExpression(),
             .kw_for => self.parseForExpression(),
+            .kw_comptime => self.parseComptimeExpression(),
             .kw_match => self.parseMatchExpression(),
             .kw_try => self.parseTryExpression(),
             else => {
@@ -1790,6 +1791,24 @@ pub const Parser = struct {
                 .capture = capture,
                 .body = body,
                 .span = for_tok.span.endAt(body.span()),
+            },
+        });
+    }
+
+    /// Parses `comptime <operand>` — a prefix that forces the following
+    /// expression to be evaluated at compile time. The operand is a full
+    /// expression, so `comptime fib 10` captures the whole call.
+    fn parseComptimeExpression(self: *Self) Error!*ast.Expression {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const comptime_tok = try self.expect(.kw_comptime);
+        const operand = try self.parseExpression();
+
+        return self.allocExpression(.{
+            .comptime_expr = .{
+                .operand = operand,
+                .span = comptime_tok.span.endAt(operand.span()),
             },
         });
     }

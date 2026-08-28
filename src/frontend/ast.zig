@@ -836,6 +836,7 @@ pub const Expression = union(enum) {
     fn_decl: FunctionDecl,
     if_expr: IfExpr,
     for_expr: ForExpr,
+    comptime_expr: ComptimeExpr,
     match_expr: MatchExpr,
     try_expr: TryExpr,
     catch_expr: CatchExpr,
@@ -1975,6 +1976,23 @@ pub const WhileStmt = struct {
     capture: ?CaptureClause,
     body: Block,
     span: Span,
+};
+
+/// `comptime <operand>` — forces the operand to be evaluated at compile time,
+/// folding it to a constant value. Fails to compile if the operand cannot be
+/// reduced (e.g. it depends on runtime state or an unsupported construct).
+pub const ComptimeExpr = struct {
+    operand: *Expression,
+    span: Span,
+
+    pub fn resolveType(
+        self: *@This(),
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        scope: *semantic.Scope,
+    ) semantic.Scope.Error!?*const TypeExpr {
+        return self.operand.resolveType(io, allocator, scope);
+    }
 };
 
 pub const Assignment = struct {

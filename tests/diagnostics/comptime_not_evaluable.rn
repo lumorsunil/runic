@@ -1,0 +1,3 @@
+var n = 5
+const bad = comptime n + 1
+echo "${bad}"

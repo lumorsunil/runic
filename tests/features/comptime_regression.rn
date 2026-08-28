@@ -1,0 +1,45 @@
+// `comptime <expr>` forces compile-time evaluation, folding the expression to a
+// constant. Beyond arithmetic/logic, it can interpret pure user functions —
+// recursion, parameters, local `const` bindings, and `if`/`match` control flow.
+// The folded constant is an ordinary value usable at runtime.
+
+// Plain arithmetic folds.
+const size = comptime 4 * 1024
+echo "size=${size}"
+
+// A recursive function evaluated at compile time.
+fn Int fib(n: Int) Int {
+    if (n < 2) { yield n }
+    yield (fib (n - 1)) + (fib (n - 2))
+}
+const tenth = comptime fib 10
+echo "fib10=${tenth}"
+
+// Iterative-style recursion with early return via yield.
+fn Int fact(n: Int) Int {
+    if (n < 2) { yield 1 }
+    yield n * (fact (n - 1))
+}
+echo "fact5=${comptime fact 5}"
+
+// Multiple parameters and a local `const` in the body.
+fn Int add3(a: Int, b: Int, c: Int) Int {
+    const ab = a + b
+    yield ab + c
+}
+echo "add3=${comptime add3 10 20 12}"
+
+// `match` in a comptime body selects the arm by value.
+fn Int classify(n: Int) Int {
+    yield match (n) {
+        0 => { 100 }
+        1 => { 200 }
+        _ => { 999 }
+    }
+}
+echo "classify1=${comptime classify 1}"
+echo "classify7=${comptime classify 7}"
+
+// A comptime constant is a normal value — usable in later expressions.
+const doubled = (comptime fib 7) * 2
+echo "doubled=${doubled}"

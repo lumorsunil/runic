@@ -456,6 +456,33 @@ while (cur) |v| {
 }
 ```
 
+## Compile-time evaluation with `comptime`
+
+`comptime <expr>` forces an expression to be evaluated at compile time and
+folds it to a constant. It covers arithmetic and logic, and — crucially — can
+interpret **pure user functions**: recursion, parameters, local `const`
+bindings, and `if`/`match` control flow all run at compile time.
+
+```rn
+const size = comptime 4 * 1024        // 4096
+
+fn Int fib(n: Int) Int {
+  if (n < 2) { yield n }
+  yield (fib (n - 1)) + (fib (n - 2))
+}
+const tenth = comptime fib 10         // folded to 55 during compilation
+```
+
+The result is an ordinary value, usable anywhere a constant is — including
+inside larger expressions (`(comptime fib 7) * 2`).
+
+**Result:** work that only depends on compile-time-known inputs is done once,
+during compilation, instead of on every run. If the operand can't be reduced —
+it reads a `var`, calls an impure/unknown function, or recurses past the
+interpreter's depth limit — the program fails to compile with a clear error
+rather than silently falling back to a runtime computation. (Without the
+keyword, `fib 10` is an ordinary runtime call.)
+
 ## Command vs. expression separation
 
 Runic distinguishes between invoking external commands and evaluating expressions, reducing quoting issues by making intent explicit.

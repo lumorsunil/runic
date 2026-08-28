@@ -309,11 +309,28 @@ new syntax), then the primitives the stdlib is actually made of.
     `cond` typed as the child in the body. Covered by
     `tests/features/while_capture_regression.rn`. CI green (13/13, 42 diag, 8
     examples, 138 smoke, 3 strict).
+  - [x] **`comptime` value evaluation — DONE (2026-08-28).** `comptime <expr>`
+    forces compile-time evaluation and folds to a constant, extending the
+    existing constant-folder to **interpret pure user functions** (recursion,
+    params, local `const`, `if`/`match`). New `kw_comptime` token + `ComptimeExpr`
+    AST node; parser prefix (`parseComptimeExpression`); type-check delegates to
+    the operand. In the compiler: a `comptime_forcing` flag gates call-folding
+    (so ordinary calls stay runtime), `comptime_fn_decls` maps a function's
+    instr_set → its AST (recorded in `compileFnDecl`), and `evalComptimeCall` /
+    `evalComptimeBody` / `evalComptimeStatement` interpret the body with a
+    `ComptimeFlow` (yield=return / fall-through / not-foldable) signal. A
+    `comptime_max_depth` (128) recursion cap turns non-terminating comptime into
+    a compile error instead of a native stack overflow. A non-foldable operand
+    (reads a `var`, impure/unknown call) is a compile error. Covered by
+    `tests/features/comptime_regression.rn` +
+    `tests/diagnostics/comptime_not_evaluable.rn`; features.md documents it. CI
+    green (13/13, 44 diag, 8 examples, 139 smoke, 3 strict).
+    - Follow-ups: `@TypeOf(expr)` + a first-class `Type` value; comptime over
+      loops (`for`/`while`); larger recursion via an explicit interpreter stack.
   - Generic containers: comptime type-returning functions (`fn Box(comptime T:
-    Type) Type`), reusing the Phase-2 engine.
+    Type) Type`), reusing the Phase-2 engine (needs the `@TypeOf`/`Type` follow-up
+    above).
   - Maps: `{ k: v }` literals + `Map(K, V)` type + access/keys/values.
-  - Fuller comptime (comptime values, `@TypeOf`, type-level computation) — its
-    own design conversation.
 
 ## Open questions to resolve during implementation
 
