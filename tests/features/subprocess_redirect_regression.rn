@@ -1,0 +1,23 @@
+// Redirecting a function or block whose body runs an *external command* (not a
+// bare `yield`) sends that command's real stdout to the file. This needs a
+// concurrent drain to move the redirect pipe to the file while the command
+// runs — without it the inner command's stdout never reaches EOF and the call
+// hangs. `>` truncates and `>>` appends, matching command redirection.
+fn Void emit() Void {
+    echo "one"
+    echo "two"
+}
+
+const path = "/tmp/runic-subprocess-redirect-regression.txt"
+
+emit > "${path}"
+cat "${path}"
+
+{
+    echo "three"
+    echo "four"
+} > "${path}"
+cat "${path}"
+
+emit >> "${path}"
+cat "${path}"

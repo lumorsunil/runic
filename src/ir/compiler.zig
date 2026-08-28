@@ -3860,12 +3860,25 @@ pub const IRCompiler = struct {
         };
     }
 
-    const RedirectStreams = struct { stdout: ir.Location, stderr: ir.Location };
+    const RedirectStreams = struct {
+        stdout: ir.Location,
+        stderr: ir.Location,
+        // When a `path` redirect points a stream at a file, the redirect pipe
+        // needs a drain thread to move its data pipe→file. These record the
+        // pipe locations so the caller can spawn that drain (see
+        // `compileFileRedirectDrains`). Null when the stream isn't file-redirected.
+        stdout_file_pipe: ?ir.Location = null,
+        stderr_file_pipe: ?ir.Location = null,
+    };
 
     /// Compiles a list of redirects into the stdout/stderr stream locations a
     /// command should run with (defaulting to the thread's own streams). A
     /// `path` redirect opens a pipe-to-file; an `fd` redirect points the stream
     /// at another descriptor. Shared by block and function call redirection.
+    ///
+    /// A file-redirect pipe is created with `keep_open=true` so its drain won't
+    /// close the file before the writer connects and finishes. The caller must
+    /// spawn a drain and clear that flag via `compileFileRedirectDrains`.
     fn compileRedirectStreams(
         self: *IRCompiler,
         source: anytype,
@@ -3878,6 +3891,7 @@ pub const IRCompiler = struct {
                     const redirect_target = try self.compileExpression(path_target.value);
                     const redirect_pipe_ref = try self.newRef(source, "stdout_redirect_pipe");
                     try self.pipe(source, redirect_pipe_ref);
+                    try self.pipeOpt(source, redirect_pipe_ref.dereference(), .keep_open, .fromValue(.fromBoolean(true)));
                     try self.pipeFile(
                         source,
                         redirect_pipe_ref.dereference(),
@@ -3885,8 +3899,14 @@ pub const IRCompiler = struct {
                         redirect.mode,
                     );
                     switch (redirect.stream) {
-                        .stdout => streams.stdout = redirect_pipe_ref.dereference(),
-                        .stderr => streams.stderr = redirect_pipe_ref.dereference(),
+                        .stdout => {
+                            streams.stdout = redirect_pipe_ref.dereference();
+                            streams.stdout_file_pipe = redirect_pipe_ref.dereference();
+                        },
+                        .stderr => {
+                            streams.stderr = redirect_pipe_ref.dereference();
+                            streams.stderr_file_pipe = redirect_pipe_ref.dereference();
+                        },
                         else => {},
                     }
                 },
@@ -3906,6 +3926,82 @@ pub const IRCompiler = struct {
             }
         }
         return streams;
+    }
+
+    /// Returns true when `streams` has at least one file-redirect pipe that
+    /// needs a drain (i.e. the redirect targets a file, not another fd).
+    fn hasFileRedirect(streams: RedirectStreams) bool {
+        return streams.stdout_file_pipe != null or streams.stderr_file_pipe != null;
+    }
+
+    /// Drains a function/block's file-redirect pipes to their files. Unlike a
+    /// command (which *is* the process, so its own exec closure drives the
+    /// drain), a function or block only writes to the redirect pipe — nothing
+    /// reads the pipe's source, so the inner command's stdout never reaches EOF
+    /// and it never completes. This spawns a concurrent drain per file pipe
+    /// (`stdoutStreamSet` driving pipe→file forwarding) so the writer's output
+    /// flows out as it is produced, then — once the writer thread finishes —
+    /// clears each pipe's `keep_open` flag so the drain flushes and closes the
+    /// file, and waits the drains.
+    ///
+    /// `writer_handle` is the (stable) thread handle of the function/block
+    /// thread. The drains are forked *before* waiting it so they run
+    /// concurrently with the writer.
+    fn compileFileRedirectDrains(
+        self: *IRCompiler,
+        source: anytype,
+        writer_handle: ir.Location,
+        streams: RedirectStreams,
+    ) Error!void {
+        var stdout_drain: ?ir.Location = null;
+        var stderr_drain: ?ir.Location = null;
+
+        if (streams.stdout_file_pipe) |file_pipe| {
+            const drain = try self.fork(
+                source,
+                self.stdoutStreamSet(),
+                self.threadStdin(),
+                file_pipe,
+                self.threadStderr(),
+                .noll,
+                .inherit,
+            );
+            const drain_ref = try self.newRef(source, "stdout_redirect_drain");
+            try self.set(source, drain_ref, .from(drain));
+            stdout_drain = drain_ref.dereference().typed(thread_type);
+        }
+
+        if (streams.stderr_file_pipe) |file_pipe| {
+            const drain = try self.fork(
+                source,
+                self.stdoutStreamSet(),
+                self.threadStdin(),
+                file_pipe,
+                self.threadStderr(),
+                .noll,
+                .inherit,
+            );
+            const drain_ref = try self.newRef(source, "stderr_redirect_drain");
+            try self.set(source, drain_ref, .from(drain));
+            stderr_drain = drain_ref.dereference().typed(thread_type);
+        }
+
+        // Wait for the writer (the function/block thread) to finish. The drains
+        // run concurrently, so the writer's inner commands can complete.
+        try self.wait(source, writer_handle);
+
+        // The writer is done and has connected (and EOF'd) its stdout. Clear the
+        // keep_open flags so each drain closes its file once the source drains,
+        // instead of spinning forever.
+        if (streams.stdout_file_pipe) |file_pipe| {
+            try self.pipeOpt(source, file_pipe, .keep_open, .fromValue(.fromBoolean(false)));
+        }
+        if (streams.stderr_file_pipe) |file_pipe| {
+            try self.pipeOpt(source, file_pipe, .keep_open, .fromValue(.fromBoolean(false)));
+        }
+
+        if (stdout_drain) |drain| try self.wait(source, drain);
+        if (stderr_drain) |drain| try self.wait(source, drain);
     }
 
     fn compileBlockCallWithRedirects(
@@ -3937,7 +4033,25 @@ pub const IRCompiler = struct {
 
         try self.setClosureIdentifiers();
         self.current_instruction_set = prev_instr_set;
+        // Emit the closure's initialization block (populates captures and jumps
+        // back to the fork). Without this the create-closure jump lands in an
+        // empty set and the block thread is never actually spawned.
+        try self.compileClosureInitialization(source, spawned.closure);
         self.scopes.pop();
+
+        if (hasFileRedirect(streams)) {
+            // The block writes to a redirect pipe; drive its drain to the file
+            // and wait for both the block and the drain. The redirect consumes
+            // the block's output, so the call yields nothing (void).
+            const thread_ref = try self.newRef(source, "block_thread");
+            try self.set(source, thread_ref, .from(spawned.thread_handle));
+            try self.compileFileRedirectDrains(
+                source,
+                thread_ref.dereference().typed(thread_type),
+                streams,
+            );
+            return .fromValue(.void);
+        }
 
         return .fromLocation(spawned.thread_handle);
     }
@@ -4946,6 +5060,27 @@ pub const IRCompiler = struct {
             } };
 
             return .fromLocation(result_ref.dereference().typed(merged_type));
+        }
+
+        // A file-redirected function call (`myFn > "file"`) with no pub exports:
+        // drive the redirect pipe's drain to the file and wait for both the
+        // function and the drain. The output is consumed by the redirect, so
+        // the call yields nothing (void). Capture (`stdout_override`) never
+        // combines with a file redirect.
+        if (stdout_override == null and hasFileRedirect(streams)) {
+            // Capture the fn thread handle (in %r) into a fresh ref on top of the
+            // stack, then drive the redirect drain. Do NOT pop the closure here:
+            // the redirect pipe ref sits above `closure_ref` on the stack, so a
+            // pop would corrupt the pipe location the drain still needs. A few
+            // slots leak for the rest of this frame, which is torn down after.
+            const handle_ref = try self.newRef(source, "fn_thread");
+            try self.set(source, handle_ref, .from(handle));
+            try self.compileFileRedirectDrains(
+                source,
+                handle_ref.dereference().typed(thread_type),
+                streams,
+            );
+            return .fromValue(.void);
         }
 
         // No pub exports: original behavior — return thread handle
