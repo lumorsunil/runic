@@ -423,6 +423,26 @@ for (0..3) |i| echo "${i}"           // bare command
 if (ready) yield value else yield 0  // bare branches
 ```
 
+### Condition loops with `while`
+
+`while (condition) { … }` re-evaluates the condition at the top of each
+iteration and runs the block until it is falsy. The condition is any truthy
+expression — a `Bool`, a comparison, or a command's exit status — and the body
+is a brace block whose bindings are loop-local (re-declared each pass). A
+condition that starts false skips the body entirely; loops nest freely.
+
+```rn
+var i = 0
+while (i < 5) {
+  echo "i=${i}"
+  i = i + 1
+}
+```
+
+**Result:** `while` covers the open-ended loops `for` can't express — repeat
+until a flag flips or a value crosses a threshold. (Optional-unwrap captures,
+`while (opt) |v| { … }`, are not supported yet; the body must be a brace block.)
+
 ## Command vs. expression separation
 
 Runic distinguishes between invoking external commands and evaluating expressions, reducing quoting issues by making intent explicit.

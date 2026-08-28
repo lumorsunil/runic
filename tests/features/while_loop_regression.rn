@@ -1,0 +1,49 @@
+// `while (condition) { body }` re-evaluates the condition each iteration and
+// runs the block until it is falsy. The condition is any truthy expression (a
+// Bool, a comparison, …); the body is a brace block with loop-local bindings.
+// A condition that is false from the start skips the body entirely; loops nest.
+
+// Counted loop with a mutated counter.
+var i = 0
+while (i < 3) {
+    echo "i=${i}"
+    i = i + 1
+}
+
+// Accumulate through a loop-local `const`, re-declared each pass.
+var n = 4
+var sum = 0
+while (n > 0) {
+    const step = n * 10
+    sum = sum + step
+    n = n - 1
+}
+echo "sum=${sum}"
+
+// Never enters when the condition starts false.
+var guard = 5
+while (guard < 0) {
+    echo "unreachable"
+    guard = guard + 1
+}
+echo "after-guard"
+
+// A Bool flag flipped inside the body ends the loop.
+var running = true
+var count = 0
+while (running) {
+    count = count + 1
+    if (count >= 2) { running = false }
+}
+echo "count=${count}"
+
+// Nested loops.
+var a = 0
+while (a < 2) {
+    var b = 0
+    while (b < 2) {
+        echo "a=${a} b=${b}"
+        b = b + 1
+    }
+    a = a + 1
+}

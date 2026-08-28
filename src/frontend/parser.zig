@@ -2356,6 +2356,11 @@ pub const Parser = struct {
             return stmt;
         }
 
+        if ((try self.peekToken()).tag == .kw_while) {
+            stmt.* = .{ .while_stmt = try self.parseWhileStatement() };
+            return stmt;
+        }
+
         const expr = try self.parseExpression();
         if (try self.stream.consumeIf(.amp)) {
             try self.markExpressionBackground(expr);
@@ -2369,6 +2374,28 @@ pub const Parser = struct {
         };
         try self.consumeStatementTerminator();
         return stmt;
+    }
+
+    /// Parses `while (condition) { body }`. The body is a brace block; the
+    /// condition is any expression, tested for truthiness each iteration (a
+    /// `Bool`, a comparison, or a command's exit status). Optional-unwrap
+    /// captures (`while (opt) |v| { … }`) are not parsed yet.
+    fn parseWhileStatement(self: *Self) Error!ast.WhileStmt {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const while_tok = try self.expect(.kw_while);
+        _ = try self.expect(.l_paren);
+        const condition = try self.parseExpression();
+        _ = try self.expect(.r_paren);
+        const body = try self.parseBlock();
+
+        return .{
+            .condition = condition,
+            .capture = null,
+            .body = body,
+            .span = while_tok.span.endAt(body.span),
+        };
     }
 
     fn markExpressionBackground(self: *Self, expr: *ast.Expression) Error!void {

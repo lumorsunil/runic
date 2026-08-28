@@ -1356,6 +1356,7 @@ pub const IRCompiler = struct {
             .binding_decl => |*b| self.compileBindingDecl(stmt, b),
             .exit_stmt => |e| self.compileExit(stmt, e),
             .yield_stmt => |y| self.compileYield(stmt, y),
+            .while_stmt => |w| self.compileWhileLoop(stmt, w),
             .expression => |expr| self.compileExpressionStatement(stmt, expr.expression),
             else => {
                 try self.reportSourceError(stmt, Error.UnsupportedExpression, .@"error", "statement type \"{t}\" not yet supported", .{stmt.*});
@@ -7969,6 +7970,65 @@ pub const IRCompiler = struct {
         try self.setLabel(after_label.local_addr.label, .abs);
 
         // TODO: return something like the block compilation is doing
+        return .fromValue(.void);
+    }
+
+    /// Lowers `while (condition) { body }`: re-evaluate the condition at the top
+    /// of each iteration, exit when it is falsy, otherwise run the body and jump
+    /// back. The condition is compiled *inside* the loop so it re-runs every
+    /// pass; its truthiness is stashed in a stable ref allocated outside the loop
+    /// so the transient refs it pushes can be popped back to a fixed base before
+    /// the exit branch — keeping the compile-time and runtime stacks aligned on
+    /// both the continue and exit paths.
+    fn compileWhileLoop(
+        self: *IRCompiler,
+        source: *ast.Statement,
+        while_stmt: ast.WhileStmt,
+    ) Error!Result {
+        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        if (while_stmt.capture != null) {
+            try self.reportSourceError(
+                source,
+                Error.NotImplemented,
+                .@"error",
+                "while-loop optional captures (`while (opt) |v|`) are not yet supported",
+                .{},
+            );
+            return .fromValue(.void);
+        }
+
+        const after_label = try self.newLabel("while_after", .unknown);
+        const cond_ref = try self.newRef(source, "while_cond");
+        const while_label = try self.newLabel("while", .abs);
+        const loop_stack_base = self.currentFrame().rel_stack_counter;
+
+        // Evaluate the condition and stash its result, then drop any transient
+        // refs it pushed so the stack is back at a fixed base before we branch.
+        const condition = try self.compileTransientExpression(source, while_stmt.condition);
+        try self.set(source, cond_ref, stableResultSource(condition));
+        try self.popToStackBase(source, loop_stack_base);
+        try self.jmp(source, try .from(cond_ref.dereference()), false, after_label);
+
+        // Body: a fresh lexical scope per iteration (loop-local bindings), with
+        // its runtime slots popped at the end so they don't accumulate.
+        try self.scopes.push(self.allocator, .lexical);
+        const stack_before_body = self.currentFrame().rel_stack_counter;
+
+        var body_result: Result = .fromValue(.void);
+        for (while_stmt.body.statements) |body_stmt| {
+            body_result = try self.compileStatement(body_stmt);
+        }
+        if (isWaitable(body_result)) |loc| {
+            try self.wait(source, loc);
+        }
+
+        try self.popToStackBase(source, stack_before_body);
+        self.scopes.pop();
+
+        try self.jmp(source, null, true, while_label);
+        try self.setLabel(after_label.local_addr.label, .abs);
+
         return .fromValue(.void);
     }
 

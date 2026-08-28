@@ -517,9 +517,20 @@ pub const TypeChecker = struct {
             .binding_decl => |*binding_decl| self.runBindingDecl(scope, binding_decl),
             .exit_stmt => |*exit_stmt| self.runExit(scope, exit_stmt),
             .yield_stmt => |*yield_stmt| self.runYield(scope, yield_stmt),
+            .while_stmt => |*while_stmt| self.runWhile(scope, while_stmt),
             .expression => |*expr_stmt| self.runExpressionStatement(scope, expr_stmt),
             else => error.UnsupportedStatement,
         };
+    }
+
+    fn runWhile(self: *TypeChecker, scope: *Scope, while_stmt: *ast.WhileStmt) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.logTypeCheckTrace(@src().fn_name, while_stmt.span);
+
+        // The condition is resolved in the enclosing scope; the body runs in a
+        // fresh child scope so its bindings are loop-local.
+        try self.runExpression(scope, while_stmt.condition);
+        try self.runBlockInNewScope(scope, &while_stmt.body);
     }
 
     fn runYield(self: *TypeChecker, scope: *Scope, yield_stmt: *ast.YieldStmt) Error!void {

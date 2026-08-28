@@ -170,10 +170,13 @@ new syntax), then the primitives the stdlib is actually made of.
     deferred — needs a tilde lexer token + expansion; covered today by
     `run "${HOME}/…"`-style interpolation.
 
-- [~] **Phase 3 — The `std` module + shallow modules.** Concrete API spec (every
-  signature) is in `docs/standard-library.md` → *Module Reference*. Agreed scope
-  (2026-08-23): all eight modules; `std.str` is **composites only** (the built-in
-  string methods stay canonical); **add Float math builtins now**.
+- [x] **Phase 3 — The `std` module + shallow modules. COMPLETE (2026-08-28).**
+  Concrete API spec (every signature) is in `docs/standard-library.md` → *Module
+  Reference*. Agreed scope (2026-08-23): all eight modules; `std.str` is
+  **composites only** (the built-in string methods stay canonical); **add Float
+  math builtins now**. Full CI green (13/13, 42 diag, 8 examples, 136 smoke, 3
+  strict). All seven shipped modules, every foundational IR fix, and the entire
+  bug list below are done (`std.process` dropped by decision).
   - [x] **`import "std"` resolution — DONE (2026-08-25).** The reserved `std`
     namespace resolves to modules **embedded in the binary** (`@embedFile` via
     anonymous imports in `build.zig` → `src/frontend/std_modules.zig`), registered
@@ -283,11 +286,24 @@ new syntax), then the primitives the stdlib is actually made of.
     - `std.list` **piping into a module-member stage** (`… | std.list.count`) isn't
       coerced (the pipeline-param coercion keys on local bindings). Call directly.
 
-- [ ] **Phase 4 — Deferred / later discussion.**
+- [~] **Phase 4 — Later language growth. IN PROGRESS.**
+  - [x] **`while` loop — DONE (2026-08-28).** `while (condition) { body }`:
+    re-evaluates a truthy condition (Bool / comparison / command exit status)
+    each iteration and runs a brace block until falsy; body bindings are
+    loop-local; loops nest. The `kw_while` token + `WhileStmt` AST node already
+    existed; added the parser production (`parseWhileStatement`, wired into
+    `parseStatement`), the type-check case (`runWhile` — condition in the
+    enclosing scope, body via `runBlockInNewScope`), and IR lowering
+    (`compileWhileLoop`: condition stashed in a ref outside the loop so its
+    transient stack refs pop back to a fixed base before the exit branch, keeping
+    the continue/exit stacks aligned). Optional-unwrap captures
+    (`while (opt) |v|`) not parsed yet — deferred. Covered by
+    `tests/features/while_loop_regression.rn`; features.md documents it. CI green
+    (13/13, 42 diag, 8 examples, 137 smoke, 3 strict).
   - Generic containers: comptime type-returning functions (`fn Box(comptime T:
     Type) Type`), reusing the Phase-2 engine.
   - Maps: `{ k: v }` literals + `Map(K, V)` type + access/keys/values.
-  - `while` loop.
+  - `while (opt) |v|` optional-unwrap capture (mirror `if (opt) |v|`).
   - Fuller comptime (comptime values, `@TypeOf`, type-level computation) — its
     own design conversation.
 
