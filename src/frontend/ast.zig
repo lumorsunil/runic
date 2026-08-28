@@ -182,31 +182,22 @@ pub const TypeExpr = union(enum) {
     /// variable is permissive in type comparisons (unifies with anything).
     type_var: TypeVar,
     // lazy: LazyType,
-    /// `@TypeOf(expr)` in a type position — the compile-time type of `expr`.
-    /// Resolved by the type checker (and compiler) to the operand's static type.
-    /// A first-class `Type`: `const T = @TypeOf(x)` binds it, `x: @TypeOf(y)`
-    /// annotates, and `: T` reuses it. It never exists at runtime.
-    type_of: TypeOf,
+    /// A type capture `|T|` in a type position: binds `T` to the type occupying
+    /// that position (a binding's initializer, a call argument, or — nested — an
+    /// element/child via `[]|T|` / `?|T|`). `T` is then usable anywhere a type
+    /// is. In a generic signature it acts as a permissive type variable; in a
+    /// binding it captures the initializer's concrete type. Compile-time only.
+    type_capture: TypeCapture,
     /// A compile-time function reference pointing to a specific IR instruction set.
     /// Used for module pub fn exports so compileMember can return the fn_ref value directly.
     fn_ref_type: FnRefType,
 
-    pub const TypeOf = struct {
-        operand: *Expression,
+    pub const TypeCapture = struct {
+        name: []const u8,
         span: Span,
 
         pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
-            _ = self;
-            try writer.writeAll("@TypeOf(…)");
-        }
-
-        pub fn resolveType(
-            self: *@This(),
-            io: std.Io,
-            allocator: std.mem.Allocator,
-            scope: *semantic.Scope,
-        ) semantic.Scope.Error!?*const TypeExpr {
-            return self.operand.resolveType(io, allocator, scope);
+            try writer.print("|{s}|", .{self.name});
         }
     };
 
@@ -617,7 +608,7 @@ pub const TypeExpr = union(enum) {
             .failed,
             .fn_ref_type,
             .type_var,
-            .type_of,
+            .type_capture,
             => 1,
             .struct_type => |struct_type| blk: {
                 if (struct_type.by_reference_fields) break :blk struct_type.fields.len;

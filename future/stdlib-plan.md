@@ -327,25 +327,30 @@ new syntax), then the primitives the stdlib is actually made of.
     green (13/13, 44 diag, 8 examples, 139 smoke, 3 strict).
     - Follow-ups: comptime over loops (`for`/`while`); larger recursion via an
       explicit interpreter stack.
-  - [x] **`@TypeOf` + first-class `Type` — DONE (2026-08-28).** `@TypeOf(expr)`
-    is the compile-time type of `expr`, usable in any type position; bound to a
-    name (`const T = @TypeOf(x)`) it is a first-class compile-time type reused
-    via `: T`. A purely compile-time entity — no runtime `Value`. New
-    `type_of: TypeOf` `TypeExpr` variant; parsed in type position
-    (`parseTypeOfTypeExpr`, so `const T = @TypeOf(x)` backtracks into a
-    `TypeBindingDecl`). Type-checker resolves it via `resolveExprType` in
-    `resolveTypeExpr` (and validates the operand); permissive in
-    `validateTypeAssignment` when reached unresolved. Compiler resolves it in
-    `normalizeStringTypes` → `resolveStaticType` (extended to fold a zero-arg
-    call `p()` to the binding's type), so struct member access through a
-    `@TypeOf`-typed binding works. Composes with `?`/`[]`. Covered by
-    `tests/features/typeof_regression.rn` + `tests/diagnostics/typeof_mismatch.rn`;
-    features.md documents it. CI green (13/13, 45 diag, 8 examples, 140 smoke, 3
-    strict).
-    - Follow-ups: `@TypeOf` in a `struct { … }` field type; comparing `Type`
-      values; using a bound `Type` as a `comptime` function argument.
+  - [x] **Type captures `|T|` — DONE (2026-08-28).** `|T|` in a type position
+    binds `T` to the type there (a Zig-proposal-style capture); `T` is usable
+    anywhere a type is. In a binding it captures the initializer's concrete type;
+    in a signature it is a permissive generic type variable. Nested under the
+    built-in generic constructors it destructures: `[]|T|` binds the element
+    type, `?|T|` the child. **Replaces `@TypeOf`** (removed). Compile-time only.
+    New `type_capture: TypeCapture` `TypeExpr` variant; parsed via `.pipe` in
+    type position (`parseTypeCaptureTypeExpr`; `.pipe` made a non-terminator).
+    `collectTypeVars` registers the name; `resolveTypeExpr` resolves it to the
+    scoped concrete type or a `type_var`. Concrete binding via `bindTypeCaptures`
+    (recursive unification through `[]`/`?`/promise) in both the type-checker's
+    `runBindingDecl` and the compiler's `compileIdentifierBinding`
+    (`type_captures` map + `lookupTypeCapture`, consulted from
+    `normalizeStringTypes`). Unmatched captures (`?|T| = null`) stay type vars;
+    mismatches against a captured type are still caught. Covered by
+    `tests/features/type_capture_regression.rn` +
+    `tests/diagnostics/type_capture_mismatch.rn`; features.md documents it. CI
+    green (13/13, 45 diag, 8 examples, 140 smoke, 3 strict).
+    - Follow-ups: capture inside a `struct { … }` field type; enforcing that
+      repeated `|T|`/`T` uses in one signature agree (currently permissive);
+      user-defined generic type constructors so `Array(|T|)`-style destructuring
+      matches beyond the built-in `[]`/`?` (part of generic containers).
   - Generic containers: comptime type-returning functions (`fn Box(comptime T:
-    Type) Type`), reusing the Phase-2 engine — now has the `@TypeOf`/`Type`
+    Type) Type`), reusing the Phase-2 engine — has the capture/`type_var`
     foundation; still needs `comptime` type *params* and comptime `struct`
     construction.
   - Maps: `{ k: v }` literals + `Map(K, V)` type + access/keys/values.

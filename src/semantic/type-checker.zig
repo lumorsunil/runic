@@ -787,6 +787,45 @@ pub const TypeChecker = struct {
         };
     }
 
+    /// Whether a type expression contains a `|T|` capture anywhere.
+    fn typeExprHasCapture(type_expr: *const ast.TypeExpr) bool {
+        return switch (type_expr.*) {
+            .type_capture => true,
+            .array => |a| typeExprHasCapture(a.element),
+            .optional => |o| typeExprHasCapture(o.child),
+            .promise => |p| typeExprHasCapture(p.child),
+            else => false,
+        };
+    }
+
+    /// Unifies a `|T|`-carrying `pattern` against a concrete `subject` type,
+    /// declaring each capture's matched type in `scope` so later `: T` uses
+    /// resolve to it. Recurses through the built-in generic constructors
+    /// (`[]|T|` binds the element type, `?|T|` the child).
+    fn bindTypeCaptures(
+        self: *TypeChecker,
+        scope: *Scope,
+        pattern: *const ast.TypeExpr,
+        subject: *const ast.TypeExpr,
+    ) Error!void {
+        switch (pattern.*) {
+            .type_capture => |capture| scope.declare(
+                self.arena.allocator(),
+                ast.Identifier.global(capture.name),
+                subject,
+                false,
+                false,
+            ) catch |err| switch (err) {
+                error.IdentifierAlreadyDeclared => {},
+                else => return err,
+            },
+            .array => |a| if (subject.* == .array) try self.bindTypeCaptures(scope, a.element, subject.array.element),
+            .optional => |o| if (subject.* == .optional) try self.bindTypeCaptures(scope, o.child, subject.optional.child),
+            .promise => |p| if (subject.* == .promise) try self.bindTypeCaptures(scope, p.child, subject.promise.child),
+            else => {},
+        }
+    }
+
     fn runBindingDecl(
         self: *TypeChecker,
         scope: *Scope,
@@ -794,14 +833,6 @@ pub const TypeChecker = struct {
     ) Error!void {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, binding_decl.span);
-
-        const binding_annotation_type_expr = brk: {
-            if (binding_decl.annotation) |annotation| {
-                break :brk try self.resolveTypeExpr(scope, annotation);
-            } else {
-                break :brk null;
-            }
-        };
 
         try self.runExpression(scope, binding_decl.initializer);
 
@@ -812,6 +843,20 @@ pub const TypeChecker = struct {
             try self.resolveTypeExpr(scope, raw)
         else
             null;
+
+        // A `|T|`-carrying annotation is a capture pattern: bind its names to the
+        // initializer's concrete type, and take that concrete type as the
+        // binding's type (rather than the permissive type-variable resolution).
+        const binding_annotation_type_expr = brk: {
+            const annotation = binding_decl.annotation orelse break :brk null;
+            // Bind whatever captures structurally match the initializer, then
+            // resolve the annotation: bound captures become their concrete type,
+            // unmatched ones (e.g. `?|T| = null`) stay permissive type variables.
+            if (typeExprHasCapture(annotation)) {
+                if (initializer_type) |it| try self.bindTypeCaptures(scope, annotation, it);
+            }
+            break :brk try self.resolveTypeExpr(scope, annotation);
+        };
 
         const type_expr = binding_annotation_type_expr orelse initializer_type;
 
@@ -900,20 +945,15 @@ pub const TypeChecker = struct {
                 for (sum.members, members) |src, *dst| dst.* = try self.resolveTypeExpr(scope, src);
                 break :blk try self.allocTypeExpression(.{ .sum = .{ .members = members, .span = sum.span } });
             },
-            // `@TypeOf(expr)` resolves to the operand's static type. Resolve that
-            // further so a named/aliased result is normalized like any other.
-            .type_of => |type_of| blk: {
-                const operand_type = (try self.resolveExprType(scope, type_of.operand)) orelse {
-                    try self.reportSpanError(
-                        type_of.span,
-                        Error.TypeMismatch,
-                        .@"error",
-                        "@TypeOf: could not determine the type of the operand at compile time",
-                        .{},
-                    );
-                    break :blk type_expr;
-                };
-                break :blk try self.resolveTypeExpr(scope, operand_type);
+            // A `|T|` capture in a generic context (e.g. a function signature) is
+            // a permissive type variable, resolved like an implicit uppercase
+            // generic. Binding positions bind it to a concrete type separately
+            // (see `bindTypeCaptures`), which shadows this.
+            .type_capture => |capture| blk: {
+                if (scope.lookup(capture.name)) |binding| {
+                    if (binding.type_expr) |bound| break :blk try self.resolveTypeExpr(scope, bound);
+                }
+                break :blk try self.allocTypeExpression(.{ .type_var = .{ .name = capture.name, .span = capture.span } });
             },
             else => type_expr,
         };
@@ -1046,6 +1086,7 @@ pub const TypeChecker = struct {
                     try out.put(self.arena.allocator(), seg.name, {});
                 }
             },
+            .type_capture => |capture| try out.put(self.arena.allocator(), capture.name, {}),
             .array => |a| try self.collectTypeVars(outer, a.element, out),
             .optional => |o| try self.collectTypeVars(outer, o.child, out),
             .promise => |p| try self.collectTypeVars(outer, p.child, out),
@@ -1616,9 +1657,8 @@ pub const TypeChecker = struct {
             .sum => |sum| for (sum.members) |member| try self.runTypeExpression(scope, member),
             .err => {},
             .array => |*array| self.runTypeArray(scope, array),
-            // `@TypeOf(expr)` — validate the operand expression so its
-            // identifiers resolve; its type is computed on demand.
-            .type_of => |type_of| try self.runExpression(scope, type_of.operand),
+            // A `|T|` capture introduces a type variable; nothing to validate.
+            .type_capture => {},
             .struct_type, .module, .tuple, .function, .fn_ref_type => {},
         };
     }
@@ -2849,7 +2889,7 @@ pub const TypeChecker = struct {
             .thread => try self.runThreadMemberAccess(&member.member),
             .struct_type => |struct_type| try self.runStructMemberAccess(struct_type, &member.member),
             .error_set => |error_set| try self.runErrorSetMemberAccess(error_set, &member.member),
-            .null, .promise, .error_union, .err, .tuple, .function, .fn_ref_type, .integer, .float, .boolean, .byte, .alias, .void, .type_merge, .sum, .type_of => return error.UnsupportedMemberAccess,
+            .null, .promise, .error_union, .err, .tuple, .function, .fn_ref_type, .integer, .float, .boolean, .byte, .alias, .void, .type_merge, .sum, .type_capture => return error.UnsupportedMemberAccess,
             .module => |module| try self.runModuleMemberAccess(module, &member.member),
             .execution => |execution| try self.runExecutionMemberAccess(execution, &member.member),
             // .lazy => {
@@ -3668,7 +3708,7 @@ pub const TypeChecker = struct {
         // unresolved `@TypeOf(...)` (reached without a scope to resolve it) is
         // treated the same — its operand's type was validated at its own site.
         if (self.unaliasType(binding_type).* == .type_var or self.unaliasType(assignment_type).* == .type_var) return;
-        if (self.unaliasType(binding_type).* == .type_of or self.unaliasType(assignment_type).* == .type_of) return;
+        if (self.unaliasType(binding_type).* == .type_capture or self.unaliasType(assignment_type).* == .type_capture) return;
 
         try switch (binding_type.*) {
             .failed => {},
@@ -3766,9 +3806,9 @@ pub const TypeChecker = struct {
                 options,
             ),
             .fn_ref_type => {},
-            // Unreachable: an unresolved `@TypeOf(...)` is handled permissively
-            // by the early return above; kept for switch exhaustiveness.
-            .type_of => {},
+            // Unreachable: an unresolved `|T|` capture is handled permissively by
+            // the early return above; kept for switch exhaustiveness.
+            .type_capture => {},
             // A `||` merge is resolved to a concrete `error_set` or `sum` before
             // it is stored as a binding type, so a raw merge should not reach here.
             .type_merge => {},

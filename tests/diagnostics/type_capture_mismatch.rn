@@ -1,4 +1,3 @@
-const seed = 7
-const T = @TypeOf(seed)
+const seed: |T| = 7
 const bad: T = "not an int"
 echo "${bad}"

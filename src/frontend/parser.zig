@@ -3193,10 +3193,8 @@ pub const Parser = struct {
         if (isTypeExprTerminator(next.tag)) return null;
 
         return switch (next.tag) {
-            .identifier => if (std.mem.eql(u8, next.lexeme, "@TypeOf"))
-                self.parseTypeOfTypeExpr()
-            else
-                self.parseIdentifierTypeExpr(),
+            .identifier => self.parseIdentifierTypeExpr(),
+            .pipe => self.parseTypeCaptureTypeExpr(),
             // .kw_enum => self.parseEnumTypeExpr(),
             // .kw_union => self.parseUnionTypeExpr(),
             .kw_struct => self.parseStructTypeExpr(),
@@ -3428,22 +3426,21 @@ pub const Parser = struct {
         return .fromToken(identifier);
     }
 
-    /// Parses `@TypeOf(expr)` in a type position into a `type_of` type
-    /// expression. The operand is any value expression whose compile-time type
-    /// the construct denotes.
-    fn parseTypeOfTypeExpr(self: *Self) Error!*const ast.TypeExpr {
+    /// Parses a type capture `|T|` into a `type_capture` type expression. The
+    /// name is bound to the type occupying this position (directly, or — nested
+    /// under `[]`/`?` — to an element/child) and is usable anywhere a type is.
+    fn parseTypeCaptureTypeExpr(self: *Self) Error!*const ast.TypeExpr {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
-        const at_tok = try self.expectTokenTag(.identifier); // `@TypeOf`
-        _ = try self.expectTokenTag(.l_paren);
-        const operand = try self.parseExpression();
-        const close = try self.expectTokenTag(.r_paren);
+        const open = try self.expectTokenTag(.pipe);
+        const name = try self.parseTypeIdentifier();
+        const close = try self.expectTokenTag(.pipe);
 
         return self.allocTypeExpression(.{
-            .type_of = .{
-                .operand = operand,
-                .span = at_tok.span.endAt(close.span),
+            .type_capture = .{
+                .name = name.name,
+                .span = open.span.endAt(close.span),
             },
         });
     }
@@ -3509,7 +3506,7 @@ pub const Parser = struct {
 
     fn isTypeExprTerminator(tag: token.Tag) bool {
         return switch (tag) {
-            .l_paren, .l_brace, .l_bracket, .identifier, .star, .caret, .bang, .question, .kw_enum, .kw_error, .kw_union, .kw_struct, .kw_fn => false,
+            .l_paren, .l_brace, .l_bracket, .identifier, .star, .caret, .bang, .question, .pipe, .kw_enum, .kw_error, .kw_union, .kw_struct, .kw_fn => false,
             else => true,
         };
     }

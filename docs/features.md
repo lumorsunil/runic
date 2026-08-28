@@ -483,25 +483,35 @@ interpreter's depth limit — the program fails to compile with a clear error
 rather than silently falling back to a runtime computation. (Without the
 keyword, `fib 10` is an ordinary runtime call.)
 
-### Type-of with `@TypeOf`
+### Type captures with `|T|`
 
-`@TypeOf(expr)` is the compile-time type of `expr`, usable anywhere a type is —
-an annotation, a function parameter, or a composed type (`?@TypeOf(x)`,
-`[]@TypeOf(x)`). Bound to a name it becomes a first-class type, reused like any
-other:
+A type capture `|T|` binds `T` to the type occupying that position, and `T` is
+then usable anywhere a type is. In a binding it captures the initializer's
+concrete type; in a function signature it acts as a generic type variable (one
+definition, any argument type):
 
 ```rn
-const seed = 7
-const T = @TypeOf(seed)     // T is the type Int
+const seed: |T| = 7         // T is bound to Int
 const n: T = 5              // reused as a type
 
-var same: @TypeOf(n) = 0    // inline, in an annotation position
+fn Void say(greeting: |G|) Void {   // generic over the argument's type
+  echo "${greeting}"
+}
+```
+
+Nested under a built-in generic, `|T|` **destructures** — it matches the shape
+and binds the inner type:
+
+```rn
+fn Void firstOf(xs: []|E|) E { yield xs[0] }   // E = the element type
+var maybe: ?|M| = null                          // M = the child type
 ```
 
 **Result:** a value's type can be named and propagated without spelling it out,
-and mismatches are still caught (`const bad: T = "x"` where `T` is `Int` is a
-compile error). A `Type` is a purely compile-time entity — it never exists at
-runtime.
+generic functions are written once, and mismatches are still caught
+(`const bad: T = "x"` where `T` was captured as `Int` is a compile error). A
+captured type is a purely compile-time entity — it never exists at runtime.
+(This subsumes the earlier `@TypeOf`, which has been removed.)
 
 ## Command vs. expression separation
 

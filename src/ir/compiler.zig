@@ -591,6 +591,10 @@ pub const IRCompiler = struct {
     comptime_forcing: usize = 0,
     comptime_fn_decls: std.AutoHashMapUnmanaged(usize, *const ast.FunctionDecl) = .empty,
     comptime_depth: usize = 0,
+
+    /// Concrete types bound by `|T|` captures in binding positions (`const x:
+    /// []|T| = …` → `T` = the element type). A later `: T` resolves through here.
+    type_captures: std.StringHashMapUnmanaged(ast.TypeExpr) = .empty,
     /// Recursion-depth cap for comptime call interpretation. Kept well below the
     /// point where the interpreter's own (native) call stack would overflow, so
     /// a non-terminating `comptime` recursion fails to compile instead of
@@ -1759,9 +1763,19 @@ pub const IRCompiler = struct {
         }
 
         var result: Result = .{ .source = value };
-        // Normalize the annotation (String→[]Byte, and resolve `@TypeOf(x)` to a
-        // concrete type) so the stored binding type is usable downstream.
-        const annotated_type = if (annotation) |ann| self.normalizeStringTypes(ann.*) else null;
+        // Normalize the annotation (String→[]Byte). When it carries a `|T|`
+        // capture, unify it against the initializer's concrete type — recording
+        // the captured names — and store that concrete type for this binding so
+        // member access and later `: T` references resolve.
+        const annotated_type = if (annotation) |ann| blk: {
+            // Bind whatever captures structurally match the initializer, then
+            // normalize the annotation: matched captures resolve to the concrete
+            // type, unmatched ones (e.g. `?|T| = null`) stay type variables.
+            if (hasTypeCapture(ann.*)) {
+                if (result.typeExpr()) |init_type| self.bindTypeCaptures(ann.*, init_type);
+            }
+            break :blk self.normalizeStringTypes(ann.*);
+        } else null;
         const needs_annotated_storage = if (annotated_type) |annotation_type|
             if (result.typeExpr()) |result_type|
                 !std.meta.eql(result_type, annotation_type)
@@ -4903,11 +4917,45 @@ pub const IRCompiler = struct {
     /// parameter or `[]String` element is recognized by every string-handling
     /// site (which key on `.array` with a byte element). Non-`String` identifiers
     /// — including user struct names — are left untouched.
+    fn lookupTypeCapture(self: *IRCompiler, name: []const u8) ?ast.TypeExpr {
+        return self.type_captures.get(name);
+    }
+
+    /// Unifies a binding's annotation `pattern` against the initializer's
+    /// concrete `subject` type, recording each `|T|` capture's matched type.
+    /// Recurses through the built-in generic constructors so `[]|T|` binds `T`
+    /// to the element type and `?|T|` to the child.
+    fn bindTypeCaptures(self: *IRCompiler, pattern: ast.TypeExpr, subject: ast.TypeExpr) void {
+        switch (pattern) {
+            .type_capture => |capture| {
+                self.type_captures.put(self.allocator, capture.name, subject) catch {};
+            },
+            .array => |a| if (subject == .array) self.bindTypeCaptures(a.element.*, subject.array.element.*),
+            .optional => |o| if (subject == .optional) self.bindTypeCaptures(o.child.*, subject.optional.child.*),
+            .promise => |p| if (subject == .promise) self.bindTypeCaptures(p.child.*, subject.promise.child.*),
+            else => {},
+        }
+    }
+
+    /// Whether a type expression contains a `|T|` capture anywhere.
+    fn hasTypeCapture(t: ast.TypeExpr) bool {
+        return switch (t) {
+            .type_capture => true,
+            .array => |a| hasTypeCapture(a.element.*),
+            .optional => |o| hasTypeCapture(o.child.*),
+            .promise => |p| hasTypeCapture(p.child.*),
+            else => false,
+        };
+    }
+
     fn normalizeStringTypes(self: *IRCompiler, t: ast.TypeExpr) ast.TypeExpr {
         switch (t) {
             .identifier => |id| {
                 const segs = id.path.segments;
-                if (segs.len == 1 and std.mem.eql(u8, segs[segs.len - 1].name, "String")) return string_type;
+                if (segs.len == 1) {
+                    if (self.lookupTypeCapture(segs[0].name)) |bound| return self.normalizeStringTypes(bound);
+                    if (std.mem.eql(u8, segs[segs.len - 1].name, "String")) return string_type;
+                }
                 return t;
             },
             .array => |a| {
@@ -4920,11 +4968,12 @@ pub const IRCompiler = struct {
                 child.* = self.normalizeStringTypes(o.child.*);
                 return .{ .optional = .{ .child = child, .span = o.span } };
             },
-            // `@TypeOf(expr)` — resolve to the operand's static type so the rest
-            // of the compiler (member access, coercions) sees a concrete type.
-            .type_of => |type_of| {
-                const resolved = self.resolveStaticType(type_of.operand) orelse return t;
-                return self.normalizeStringTypes(resolved);
+            // A `|T|` capture is permissive here (like a type variable); a
+            // concrete binding position resolves it against its initializer
+            // via `bindTypeCaptures` before this is consulted.
+            .type_capture => |capture| {
+                if (self.lookupTypeCapture(capture.name)) |bound| return self.normalizeStringTypes(bound);
+                return .{ .type_var = .{ .name = capture.name, .span = capture.span } };
             },
             else => return t,
         }

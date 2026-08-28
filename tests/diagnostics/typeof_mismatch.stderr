@@ -1,7 +1,0 @@
-[error]: tests/diagnostics/typeof_mismatch.rn:3:16: expected type T, actual: String
-   1:const seed = 7
-   2:const T = @TypeOf(seed)
-   3:const bad: T = "not an int"
-   4:echo "${bad}"
-   5:
-
