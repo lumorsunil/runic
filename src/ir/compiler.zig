@@ -1759,7 +1759,9 @@ pub const IRCompiler = struct {
         }
 
         var result: Result = .{ .source = value };
-        const annotated_type = if (annotation) |ann| ann.* else null;
+        // Normalize the annotation (String→[]Byte, and resolve `@TypeOf(x)` to a
+        // concrete type) so the stored binding type is usable downstream.
+        const annotated_type = if (annotation) |ann| self.normalizeStringTypes(ann.*) else null;
         const needs_annotated_storage = if (annotated_type) |annotation_type|
             if (result.typeExpr()) |result_type|
                 !std.meta.eql(result_type, annotation_type)
@@ -2516,6 +2518,13 @@ pub const IRCompiler = struct {
         switch (expr.*) {
             .identifier => |id| {
                 const binding = self.lookup(id.name, .{ .shallow = false }) orelse return null;
+                return binding.type_expr;
+            },
+            // A bare identifier parses as a zero-arg call (`p` -> `p()`); resolve
+            // to the referenced binding's type (e.g. the operand of `@TypeOf(p)`).
+            .call => |call| {
+                if (call.arguments.len != 0 or call.callee.* != .identifier) return null;
+                const binding = self.lookup(call.callee.identifier.name, .{ .shallow = false }) orelse return null;
                 return binding.type_expr;
             },
             .binary => |b| {
@@ -4910,6 +4919,12 @@ pub const IRCompiler = struct {
                 const child = self.allocator.create(ast.TypeExpr) catch return t;
                 child.* = self.normalizeStringTypes(o.child.*);
                 return .{ .optional = .{ .child = child, .span = o.span } };
+            },
+            // `@TypeOf(expr)` — resolve to the operand's static type so the rest
+            // of the compiler (member access, coercions) sees a concrete type.
+            .type_of => |type_of| {
+                const resolved = self.resolveStaticType(type_of.operand) orelse return t;
+                return self.normalizeStringTypes(resolved);
             },
             else => return t,
         }

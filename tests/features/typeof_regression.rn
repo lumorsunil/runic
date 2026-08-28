@@ -1,0 +1,44 @@
+// `@TypeOf(expr)` is the compile-time type of `expr`, usable anywhere a type is
+// — annotations, function parameters, and composed types (`?@TypeOf`,
+// `[]@TypeOf`). Bound to a name (`const T = @TypeOf(x)`) it is a first-class
+// type reused via `: T`. It never exists at runtime.
+
+// Inline in an annotation position.
+const a = 42
+var b: @TypeOf(a) = 100
+echo "b=${b}"
+
+// Bound to a type name, then reused.
+const seed = 7
+const T = @TypeOf(seed)
+const n: T = 5
+echo "n=${n}"
+
+// String, via a bound type.
+const name: String = "hi"
+const S = @TypeOf(name)
+const greeting: S = "hello"
+echo "${greeting}"
+
+// Composed: optional and array of `@TypeOf`.
+const base = 3
+var maybe: ?@TypeOf(base) = null
+maybe = 9
+if (maybe) |v| { echo "maybe=${v}" }
+
+const elem = "x"
+const xs: []@TypeOf(elem) = .{ "a", "b" }
+for (xs) |s| { echo "xs=${s}" }
+
+// As a function parameter type.
+const anchor = 0
+fn Void show(x: @TypeOf(anchor)) Void {
+  echo "x=${x}"
+}
+show 5
+
+// Struct: `@TypeOf` of a struct value carries the layout, so member access works.
+const Point = struct { x: Int, y: Int }
+const p: Point = Point{ .x = 1, .y = 2 }
+const q: @TypeOf(p) = Point{ .x = 3, .y = 4 }
+echo "q=${q.x},${q.y}"

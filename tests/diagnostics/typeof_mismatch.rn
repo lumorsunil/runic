@@ -1,0 +1,4 @@
+const seed = 7
+const T = @TypeOf(seed)
+const bad: T = "not an int"
+echo "${bad}"

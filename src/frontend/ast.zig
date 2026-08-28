@@ -182,9 +182,33 @@ pub const TypeExpr = union(enum) {
     /// variable is permissive in type comparisons (unifies with anything).
     type_var: TypeVar,
     // lazy: LazyType,
+    /// `@TypeOf(expr)` in a type position — the compile-time type of `expr`.
+    /// Resolved by the type checker (and compiler) to the operand's static type.
+    /// A first-class `Type`: `const T = @TypeOf(x)` binds it, `x: @TypeOf(y)`
+    /// annotates, and `: T` reuses it. It never exists at runtime.
+    type_of: TypeOf,
     /// A compile-time function reference pointing to a specific IR instruction set.
     /// Used for module pub fn exports so compileMember can return the fn_ref value directly.
     fn_ref_type: FnRefType,
+
+    pub const TypeOf = struct {
+        operand: *Expression,
+        span: Span,
+
+        pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            _ = self;
+            try writer.writeAll("@TypeOf(…)");
+        }
+
+        pub fn resolveType(
+            self: *@This(),
+            io: std.Io,
+            allocator: std.mem.Allocator,
+            scope: *semantic.Scope,
+        ) semantic.Scope.Error!?*const TypeExpr {
+            return self.operand.resolveType(io, allocator, scope);
+        }
+    };
 
     pub const FnRefType = struct {
         instr_set: usize,
@@ -593,6 +617,7 @@ pub const TypeExpr = union(enum) {
             .failed,
             .fn_ref_type,
             .type_var,
+            .type_of,
             => 1,
             .struct_type => |struct_type| blk: {
                 if (struct_type.by_reference_fields) break :blk struct_type.fields.len;

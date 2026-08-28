@@ -900,6 +900,21 @@ pub const TypeChecker = struct {
                 for (sum.members, members) |src, *dst| dst.* = try self.resolveTypeExpr(scope, src);
                 break :blk try self.allocTypeExpression(.{ .sum = .{ .members = members, .span = sum.span } });
             },
+            // `@TypeOf(expr)` resolves to the operand's static type. Resolve that
+            // further so a named/aliased result is normalized like any other.
+            .type_of => |type_of| blk: {
+                const operand_type = (try self.resolveExprType(scope, type_of.operand)) orelse {
+                    try self.reportSpanError(
+                        type_of.span,
+                        Error.TypeMismatch,
+                        .@"error",
+                        "@TypeOf: could not determine the type of the operand at compile time",
+                        .{},
+                    );
+                    break :blk type_expr;
+                };
+                break :blk try self.resolveTypeExpr(scope, operand_type);
+            },
             else => type_expr,
         };
     }
@@ -1601,6 +1616,9 @@ pub const TypeChecker = struct {
             .sum => |sum| for (sum.members) |member| try self.runTypeExpression(scope, member),
             .err => {},
             .array => |*array| self.runTypeArray(scope, array),
+            // `@TypeOf(expr)` — validate the operand expression so its
+            // identifiers resolve; its type is computed on demand.
+            .type_of => |type_of| try self.runExpression(scope, type_of.operand),
             .struct_type, .module, .tuple, .function, .fn_ref_type => {},
         };
     }
@@ -2831,7 +2849,7 @@ pub const TypeChecker = struct {
             .thread => try self.runThreadMemberAccess(&member.member),
             .struct_type => |struct_type| try self.runStructMemberAccess(struct_type, &member.member),
             .error_set => |error_set| try self.runErrorSetMemberAccess(error_set, &member.member),
-            .null, .promise, .error_union, .err, .tuple, .function, .fn_ref_type, .integer, .float, .boolean, .byte, .alias, .void, .type_merge, .sum => return error.UnsupportedMemberAccess,
+            .null, .promise, .error_union, .err, .tuple, .function, .fn_ref_type, .integer, .float, .boolean, .byte, .alias, .void, .type_merge, .sum, .type_of => return error.UnsupportedMemberAccess,
             .module => |module| try self.runModuleMemberAccess(module, &member.member),
             .execution => |execution| try self.runExecutionMemberAccess(execution, &member.member),
             // .lazy => {
@@ -3646,8 +3664,11 @@ pub const TypeChecker = struct {
         try self.logTypeCheckTrace(@src().fn_name, assignment_type.span());
 
         // A generic type variable on either side unifies with anything (the
-        // runtime is dynamic; a generic function is checked permissively).
+        // runtime is dynamic; a generic function is checked permissively). An
+        // unresolved `@TypeOf(...)` (reached without a scope to resolve it) is
+        // treated the same — its operand's type was validated at its own site.
         if (self.unaliasType(binding_type).* == .type_var or self.unaliasType(assignment_type).* == .type_var) return;
+        if (self.unaliasType(binding_type).* == .type_of or self.unaliasType(assignment_type).* == .type_of) return;
 
         try switch (binding_type.*) {
             .failed => {},
@@ -3745,6 +3766,9 @@ pub const TypeChecker = struct {
                 options,
             ),
             .fn_ref_type => {},
+            // Unreachable: an unresolved `@TypeOf(...)` is handled permissively
+            // by the early return above; kept for switch exhaustiveness.
+            .type_of => {},
             // A `||` merge is resolved to a concrete `error_set` or `sum` before
             // it is stored as a binding type, so a raw merge should not reach here.
             .type_merge => {},

@@ -483,6 +483,26 @@ interpreter's depth limit — the program fails to compile with a clear error
 rather than silently falling back to a runtime computation. (Without the
 keyword, `fib 10` is an ordinary runtime call.)
 
+### Type-of with `@TypeOf`
+
+`@TypeOf(expr)` is the compile-time type of `expr`, usable anywhere a type is —
+an annotation, a function parameter, or a composed type (`?@TypeOf(x)`,
+`[]@TypeOf(x)`). Bound to a name it becomes a first-class type, reused like any
+other:
+
+```rn
+const seed = 7
+const T = @TypeOf(seed)     // T is the type Int
+const n: T = 5              // reused as a type
+
+var same: @TypeOf(n) = 0    // inline, in an annotation position
+```
+
+**Result:** a value's type can be named and propagated without spelling it out,
+and mismatches are still caught (`const bad: T = "x"` where `T` is `Int` is a
+compile error). A `Type` is a purely compile-time entity — it never exists at
+runtime.
+
 ## Command vs. expression separation
 
 Runic distinguishes between invoking external commands and evaluating expressions, reducing quoting issues by making intent explicit.

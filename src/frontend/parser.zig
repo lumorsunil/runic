@@ -3193,7 +3193,10 @@ pub const Parser = struct {
         if (isTypeExprTerminator(next.tag)) return null;
 
         return switch (next.tag) {
-            .identifier => self.parseIdentifierTypeExpr(),
+            .identifier => if (std.mem.eql(u8, next.lexeme, "@TypeOf"))
+                self.parseTypeOfTypeExpr()
+            else
+                self.parseIdentifierTypeExpr(),
             // .kw_enum => self.parseEnumTypeExpr(),
             // .kw_union => self.parseUnionTypeExpr(),
             .kw_struct => self.parseStructTypeExpr(),
@@ -3423,6 +3426,26 @@ pub const Parser = struct {
     fn parseIdentifier(self: *Self) Error!ast.Identifier {
         const identifier = try self.expectTokenTag(.identifier);
         return .fromToken(identifier);
+    }
+
+    /// Parses `@TypeOf(expr)` in a type position into a `type_of` type
+    /// expression. The operand is any value expression whose compile-time type
+    /// the construct denotes.
+    fn parseTypeOfTypeExpr(self: *Self) Error!*const ast.TypeExpr {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const at_tok = try self.expectTokenTag(.identifier); // `@TypeOf`
+        _ = try self.expectTokenTag(.l_paren);
+        const operand = try self.parseExpression();
+        const close = try self.expectTokenTag(.r_paren);
+
+        return self.allocTypeExpression(.{
+            .type_of = .{
+                .operand = operand,
+                .span = at_tok.span.endAt(close.span),
+            },
+        });
     }
 
     fn parseIdentifierTypeExpr(self: *Self) Error!*const ast.TypeExpr {
