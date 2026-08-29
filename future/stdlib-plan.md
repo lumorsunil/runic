@@ -409,7 +409,12 @@ new syntax), then the primitives the stdlib is actually made of.
       type-changing recursion.
     - Follow-ups: `${Box(Int)}` giving "Box(Int)" (currently "Box"); array-literal
       element inference so `|A|` on `.{1,2,3}` is `[]Int` not `[]Void`.
-  - Maps: `{ k: v }` literals + `Map(K, V)` type + access/keys/values.
+  - Maps — deferred; **no new special syntax** (decision 2026-08-29). Rather than
+    a `{ k: v }` literal + built-in `Map(K, V)`, build maps up from existing
+    primitives (structs, arrays/`[]T`, generic type constructors) with a mix of
+    runtime and comptime — i.e. a `Map(K, V)` implemented *in Runic* on top of
+    the language, not baked into the parser. Needs its own design pass later
+    (key hashing/equality, growth, the runtime/comptime split).
 
 ## Open questions to resolve during implementation
 
