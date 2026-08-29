@@ -600,6 +600,15 @@ pub const IRCompiler = struct {
     fn_decl_sources: std.AutoHashMapUnmanaged(usize, *ast.Expression) = .empty,
     specializations: std.StringHashMapUnmanaged(usize) = .empty,
     specializing: bool = false,
+    specialization_depth: usize = 0,
+    /// The generic instruction set currently being specialized, passed from
+    /// `maybeSpecialize` to `compileFnDecl` so it can register the (generic →
+    /// specialization) mapping once the specialization's set is created.
+    specializing_generic: ?usize = null,
+    /// Stack of in-flight specializations; a self-recursive call inside a
+    /// specialization body (its callee resolves to the generic set) is
+    /// redirected to the specialization so it recurses at the same concrete type.
+    active_specializations: std.ArrayListUnmanaged(struct { generic: usize, spec: usize }) = .empty,
 
     /// Concrete types bound by `|T|` captures in binding positions (`const x:
     /// []|T| = …` → `T` = the element type). A later `: T` resolves through here.
@@ -612,6 +621,9 @@ pub const IRCompiler = struct {
     /// a non-terminating `comptime` recursion fails to compile instead of
     /// crashing. Deeply recursive comptime algorithms beyond this are rejected.
     const comptime_max_depth: usize = 128;
+    /// Cap on nested specialization compilation, so type-changing recursion can't
+    /// specialize forever (same-type recursion is redirected, not re-specialized).
+    const specialization_max_depth: usize = 64;
 
     pub fn init(
         io: std.Io,
@@ -5024,7 +5036,7 @@ pub const IRCompiler = struct {
         instr_set: usize,
         arguments: []const *ast.Expression,
     ) Error!?usize {
-        if (self.specializing) return null;
+        if (self.specialization_depth >= specialization_max_depth) return null;
         const fn_source = self.fn_decl_sources.get(instr_set) orelse return null;
         const fn_decl = self.comptime_fn_decls.get(instr_set).?.*;
         if (fn_decl.params != ._non_variadic) return null;
@@ -5076,15 +5088,27 @@ pub const IRCompiler = struct {
 
         if (self.specializations.get(key)) |cached| return cached;
 
-        // Compile the specialization with the type variables bound.
+        // Compile the specialization with the type variables bound. Cache it
+        // under a stable key first (compileFnDecl registers the generic→spec
+        // mapping via `specializing_generic` so a self-recursive call inside the
+        // body targets this same specialization).
+        const owned_key = try self.allocator.dupe(u8, key);
+        const prev_specializing = self.specializing;
+        const prev_generic = self.specializing_generic;
         self.specializing = true;
+        self.specializing_generic = instr_set;
+        self.specialization_depth += 1;
         const result = self.compileFnDecl(fn_source, fn_decl) catch |err| {
-            self.specializing = false;
+            self.specializing = prev_specializing;
+            self.specializing_generic = prev_generic;
+            self.specialization_depth -= 1;
             return err;
         };
-        self.specializing = false;
+        self.specializing = prev_specializing;
+        self.specializing_generic = prev_generic;
+        self.specialization_depth -= 1;
         const spec_instr_set = result.source.value.fn_ref.fn_addr.instr_set;
-        try self.specializations.put(self.allocator, try self.allocator.dupe(u8, key), spec_instr_set);
+        try self.specializations.put(self.allocator, owned_key, spec_instr_set);
         return spec_instr_set;
     }
 
@@ -5511,14 +5535,25 @@ pub const IRCompiler = struct {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
         const fn_ref = fn_ref_value.fn_ref;
-        const is_self_recursive = self.current_instruction_set == fn_ref.fn_addr.instr_set;
+        var fn_addr = fn_ref.fn_addr;
+
+        // A self-recursive call inside a specialization body: its callee resolves
+        // to the generic set, so redirect it to the specialization being compiled
+        // (it then recurses at the same concrete type).
+        for (self.active_specializations.items) |as| {
+            if (fn_addr.instr_set == as.generic) {
+                fn_addr = ir.InstructionAddr.initAbs(as.spec, 0);
+                break;
+            }
+        }
+
+        const is_self_recursive = self.current_instruction_set == fn_addr.instr_set;
 
         // Monomorphization: for a non-recursive direct call, redirect to a
         // per-type specialization when the callee's `|T|` captures resolve to
         // concrete argument types (so `${T}` folds to the concrete type name).
-        var fn_addr = fn_ref.fn_addr;
         if (!is_self_recursive and stdout_override == null) {
-            if (try self.maybeSpecialize(fn_ref.fn_addr.instr_set, arguments)) |spec_instr_set| {
+            if (try self.maybeSpecialize(fn_addr.instr_set, arguments)) |spec_instr_set| {
                 fn_addr = ir.InstructionAddr.initAbs(spec_instr_set, 0);
             }
         }
@@ -7250,6 +7285,18 @@ pub const IRCompiler = struct {
             try self.comptime_fn_decls.put(self.allocator, instr_set, &source.fn_decl);
             try self.fn_decl_sources.put(self.allocator, instr_set, source);
         }
+        // While specializing, register this new set as the specialization of the
+        // generic being compiled, so a self-recursive call inside the body (whose
+        // callee resolves to the generic set) recurses into this specialization.
+        var pushed_active_specialization = false;
+        if (self.specializing_generic) |generic| {
+            try self.active_specializations.append(self.allocator, .{ .generic = generic, .spec = instr_set });
+            self.specializing_generic = null;
+            pushed_active_specialization = true;
+        }
+        defer if (pushed_active_specialization) {
+            _ = self.active_specializations.pop();
+        };
         const orig_instr_set = self.current_instruction_set;
         self.current_instruction_set = instr_set;
         try self.scopes.push(self.allocator, .closure);

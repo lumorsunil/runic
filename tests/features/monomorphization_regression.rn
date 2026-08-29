@@ -35,3 +35,15 @@ const bi: Box(Int) = Box{ .value = 7 }
 const bs: Box(String) = Box{ .value = "hey" }
 unwrapType bi
 unwrapType bs
+
+// Recursion stays at the specialized type: a self-recursive call inside a
+// specialization targets that same specialization, so `${T}` is concrete at
+// every level.
+fn Void countType(x: |T|, n: Int) Void {
+    if (n > 0) {
+        echo "level ${n} is ${T}"
+        countType x (n - 1)
+    }
+}
+countType 5 2
+countType "z" 2

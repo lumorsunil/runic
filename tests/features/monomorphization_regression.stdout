@@ -8,3 +8,7 @@ String + Float
 Bool + Int
 unwrapped 7 of type Int
 unwrapped hey of type String
+level 2 is Int
+level 1 is Int
+level 2 is String
+level 1 is String

@@ -403,9 +403,12 @@ new syntax), then the primitives the stdlib is actually made of.
       a `generic_ctor_params` registry), struct-field unification in
       `bindTypeCaptures`, application substitution in `normalizeStringTypes`, and
       struct literals now type their fields by their values.
-    - Follow-ups: monomorphize recursion; `${Box(Int)}` giving "Box(Int)"
-      (currently "Box"); array-literal element inference so `|A|` on `.{1,2,3}`
-      is `[]Int` not `[]Void`.
+    - Recursion done (2026-08-29): a self-recursive call inside a specialization
+      is redirected to that specialization (via an `active_specializations`
+      stack), so `${T}` stays concrete at every level; a depth cap bounds
+      type-changing recursion.
+    - Follow-ups: `${Box(Int)}` giving "Box(Int)" (currently "Box"); array-literal
+      element inference so `|A|` on `.{1,2,3}` is `[]Int` not `[]Void`.
   - Maps: `{ k: v }` literals + `Map(K, V)` type + access/keys/values.
 
 ## Open questions to resolve during implementation
