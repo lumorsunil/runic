@@ -1,0 +1,2 @@
+const Box(T) = struct { value: T }
+echo (Box{ .value = 5 })

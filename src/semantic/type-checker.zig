@@ -1615,6 +1615,38 @@ pub const TypeChecker = struct {
     fn runCall(self: *TypeChecker, scope: *Scope, call: *ast.CallExpr) Error!void {
         try self.runExpression(scope, call.callee);
         for (call.arguments) |arg| try self.runExpression(scope, arg);
+
+        // A bare command (an identifier callee with no scope binding — `echo`,
+        // `ls`, …) serializes each argument to a string, so a whole struct has
+        // no valid form. User functions (which have a binding) and module calls
+        // (member callees) may legitimately take struct arguments.
+        const is_command = call.callee.* == .identifier and scope.lookup(call.callee.identifier.name) == null;
+        if (is_command) {
+            for (call.arguments) |arg| {
+                // A struct-typed argument, or a generic struct literal (`Box{ … }`)
+                // whose type doesn't resolve standalone — both would fail while
+                // being serialized to a command string.
+                const is_struct = blk: {
+                    if (arg.* == .struct_literal and self.generic_type_ctors.contains(arg.struct_literal.name.name)) {
+                        break :blk true;
+                    }
+                    if (try self.resolveExprType(scope, arg)) |t| {
+                        const unaliased = self.unaliasType(t);
+                        break :blk unaliased.* == .struct_type and !isExecutionLikeStruct(unaliased.struct_type);
+                    }
+                    break :blk false;
+                };
+                if (is_struct) {
+                    try self.reportSpanError(
+                        arg.span(),
+                        Error.TypeMismatch,
+                        .@"error",
+                        "cannot pass a whole struct as a command argument; pass a field instead (e.g. value.field)",
+                        .{},
+                    );
+                }
+            }
+        }
         for (call.redirects) |*redirect| {
             switch (redirect.target) {
                 .path => |p| try self.runExpression(scope, p.value),
@@ -3442,7 +3474,25 @@ pub const TypeChecker = struct {
         try self.logTypeCheckTrace(@src().fn_name, part.span());
 
         switch (part.*) {
-            .expr => |expr| try self.runExpression(scope, expr),
+            .expr => |expr| {
+                try self.runExpression(scope, expr);
+                // A command argument is serialized to a string, so a whole struct
+                // has no valid form here — pass a field instead. (Mirrors the
+                // string-interpolation guard; without it the arg would fail at
+                // runtime while being materialized.)
+                if (try self.resolveExprType(scope, expr)) |t| {
+                    const unaliased = self.unaliasType(t);
+                    if (unaliased.* == .struct_type and !isExecutionLikeStruct(unaliased.struct_type)) {
+                        try self.reportSpanError(
+                            expr.span(),
+                            Error.TypeMismatch,
+                            .@"error",
+                            "cannot pass a whole struct as a command argument; pass a field instead (e.g. value.field)",
+                            .{},
+                        );
+                    }
+                }
+            },
             .word => {},
             .string => |*string_literal| try self.runStringLiteral(scope, string_literal),
         }
