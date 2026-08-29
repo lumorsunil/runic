@@ -7,3 +7,4 @@ type of i is Int
 type of s is String
 Int String Point
 generic type is E
+nested capture is W

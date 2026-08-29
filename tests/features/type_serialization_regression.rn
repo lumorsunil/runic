@@ -31,3 +31,9 @@ fn Void describe(x: |E|) Void {
     echo "generic type is ${E}"
 }
 describe 5
+
+// A capture nested in a generic application also resolves to the variable name
+// for now — deriving the concrete type here needs generic substitution in the
+// compiler (it doesn't crash, which is the point).
+const bx: Box(|W|) = Box{ .value = 5 }
+echo "nested capture is ${W}"

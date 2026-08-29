@@ -5065,6 +5065,9 @@ pub const IRCompiler = struct {
             .array => |a| hasTypeCapture(a.element.*),
             .optional => |o| hasTypeCapture(o.child.*),
             .promise => |p| hasTypeCapture(p.child.*),
+            .type_application => |app| for (app.args) |arg| {
+                if (hasTypeCapture(arg.*)) break true;
+            } else false,
             else => false,
         };
     }
