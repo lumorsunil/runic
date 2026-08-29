@@ -1,0 +1,6 @@
+[error]: tests/diagnostics/struct_command_word.rn:3:6: cannot pass a whole struct as a command argument; pass a field instead (e.g. value.field)
+   1:const Box(T) = struct { value: T }
+   2:const box = Box{ .value = 5 }
+   3:echo box
+   4:
+

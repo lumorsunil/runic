@@ -3835,6 +3835,15 @@ pub const TypeChecker = struct {
         };
         try self.logTypeCheckTrace(alloc_writer.written(), span);
 
+        // A generic struct literal (`Box{ … }`) has no type via the AST's own
+        // resolveType (the constructor isn't a plain scope binding). Resolve it
+        // to the constructor's body struct with its type parameters permissive.
+        if (T == *ast.Expression and expr.* == .struct_literal) {
+            if (self.generic_type_ctors.get(expr.struct_literal.name.name)) |ctor| {
+                return try self.resolveTypeExpr(scope, ctor.body);
+            }
+        }
+
         const result = try expr.resolveType(self.io, self.arena.allocator(), scope);
 
         if (T == *ast.ImportExpr) {
