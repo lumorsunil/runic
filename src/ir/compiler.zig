@@ -1772,7 +1772,15 @@ pub const IRCompiler = struct {
             // normalize the annotation: matched captures resolve to the concrete
             // type, unmatched ones (e.g. `?|T| = null`) stay type variables.
             if (hasTypeCapture(ann.*)) {
-                if (result.typeExpr()) |init_type| self.bindTypeCaptures(ann.*, init_type);
+                // Seed every capture name as a permissive type variable first, so
+                // an unmatched one (`?|T| = null`) still resolves to its name;
+                // then bind the ones that structurally match to a concrete type.
+                self.registerParamTypeVars(ann.*);
+                // Literals don't carry a type on their Result; fall back to the
+                // value's tag so a capture like `const x: |T| = 5` binds T=Int.
+                const init_type = result.typeExpr() orelse
+                    (if (result.source == .value) valueTypeExpr(result.source.value) else null);
+                if (init_type) |it| self.bindTypeCaptures(ann.*, it);
             }
             break :blk self.normalizeStringTypes(ann.*);
         } else null;
@@ -3854,6 +3862,11 @@ pub const IRCompiler = struct {
         }
 
         const source_binding = self.lookup(identifier.name, .{ .shallow = false }) orelse {
+            // A type identifier used where a value is expected serializes to the
+            // type's name (`echo "${Int}"` → "Int", a bound `|T|` → its type).
+            if (try self.typeIdentifierString(identifier.name)) |type_name| {
+                return .fromValue(type_name);
+            }
             const executable = try self.addSlice(1, identifier.name);
             return .fromValue(.{ .executable = executable.slice });
         };
@@ -4921,6 +4934,37 @@ pub const IRCompiler = struct {
         return self.type_captures.get(name);
     }
 
+    /// Registers each `|T|` capture appearing in a function parameter's type as
+    /// a permissive type variable, so a reference to `T` in the body (including
+    /// `${T}` serialization) resolves to the variable name. A concrete per-call
+    /// type would require monomorphization (not yet implemented).
+    fn registerParamTypeVars(self: *IRCompiler, t: ast.TypeExpr) void {
+        switch (t) {
+            .type_capture => |capture| {
+                if (!self.type_captures.contains(capture.name)) {
+                    self.type_captures.put(self.allocator, capture.name, .{ .type_var = .{ .name = capture.name, .span = capture.span } }) catch {};
+                }
+            },
+            .array => |a| self.registerParamTypeVars(a.element.*),
+            .optional => |o| self.registerParamTypeVars(o.child.*),
+            .promise => |p| self.registerParamTypeVars(p.child.*),
+            .type_application => |app| for (app.args) |arg| self.registerParamTypeVars(arg.*),
+            else => {},
+        }
+    }
+
+    /// A best-effort static type for a runtime value, used to seed a `|T|`
+    /// capture when the initializer's Result carries no type (e.g. a literal).
+    fn valueTypeExpr(value: ir.Value) ?ast.TypeExpr {
+        return switch (value) {
+            .integer => ast.TypeExpr.global(.integer),
+            .float => ast.TypeExpr.global(.float),
+            .exit_code => ast.TypeExpr.global(.boolean),
+            .slice => string_type,
+            else => null,
+        };
+    }
+
     /// Unifies a binding's annotation `pattern` against the initializer's
     /// concrete `subject` type, recording each `|T|` capture's matched type.
     /// Recurses through the built-in generic constructors so `[]|T|` binds `T`
@@ -4935,6 +4979,83 @@ pub const IRCompiler = struct {
             .promise => |p| if (subject == .promise) self.bindTypeCaptures(p.child.*, subject.promise.child.*),
             else => {},
         }
+    }
+
+    /// Writes a type's serialized form: a name for named/primitive types
+    /// (`Int`, `String`, `Box(Int)`), the structural form for an anonymous
+    /// struct (`struct { value: Int }`), and the composed form for `[]T` / `?T`.
+    fn writeTypeName(self: *IRCompiler, w: *std.Io.Writer, t: ast.TypeExpr) std.Io.Writer.Error!void {
+        switch (t) {
+            .integer => try w.writeAll("Int"),
+            .float => try w.writeAll("Float"),
+            .boolean => try w.writeAll("Bool"),
+            .void => try w.writeAll("Void"),
+            .null => try w.writeAll("Null"),
+            .byte => try w.writeAll("Byte"),
+            .thread => try w.writeAll("Thread"),
+            .execution => try w.writeAll("Execution"),
+            .array => |a| {
+                if (a.element.* == .byte) {
+                    try w.writeAll("String");
+                } else {
+                    try w.writeAll("[]");
+                    try self.writeTypeName(w, a.element.*);
+                }
+            },
+            .optional => |o| {
+                try w.writeByte('?');
+                try self.writeTypeName(w, o.child.*);
+            },
+            .identifier => |id| for (id.path.segments, 0..) |seg, i| {
+                if (i > 0) try w.writeByte('.');
+                try w.writeAll(seg.name);
+            },
+            .alias => |al| try self.writeTypeName(w, al.type_expr.*),
+            .type_var => |tv| try w.writeAll(tv.name),
+            .type_application => |app| {
+                try w.writeAll(app.name.name);
+                try w.writeByte('(');
+                for (app.args, 0..) |arg, i| {
+                    if (i > 0) try w.writeAll(", ");
+                    try self.writeTypeName(w, arg.*);
+                }
+                try w.writeByte(')');
+            },
+            .struct_type => |st| {
+                try w.writeAll("struct { ");
+                for (st.fields, 0..) |field, i| {
+                    if (i > 0) try w.writeAll(", ");
+                    try w.writeAll(field.name.name);
+                    try w.writeAll(": ");
+                    try self.writeTypeName(w, field.type_expr.*);
+                }
+                try w.writeAll(" }");
+            },
+            else => try w.writeAll("?"),
+        }
+    }
+
+    /// If `name` refers to a compile-time type — a primitive keyword, a declared
+    /// struct or generic constructor, an error set, or a bound `|T|` capture —
+    /// returns its serialized name as a string value (for using a type
+    /// identifier where a string is expected). Otherwise null.
+    fn typeIdentifierString(self: *IRCompiler, name: []const u8) Error!?ir.Value {
+        const primitives = [_][]const u8{ "Int", "String", "Bool", "Float", "Void", "Byte" };
+        for (primitives) |p| {
+            if (std.mem.eql(u8, name, p)) return try self.addSlice(1, p);
+        }
+        // A named struct / generic constructor / error set serializes as its name.
+        if (self.user_struct_types.contains(name) or self.error_sets.contains(name)) {
+            return try self.addSlice(1, name);
+        }
+        // A `|T|` capture bound to a concrete type serializes as that type.
+        if (self.type_captures.get(name)) |t| {
+            var alloc_writer = std.Io.Writer.Allocating.init(self.allocator);
+            defer alloc_writer.deinit();
+            try self.writeTypeName(&alloc_writer.writer, t);
+            return try self.addSlice(1, alloc_writer.written());
+        }
+        return null;
     }
 
     /// Whether a type expression contains a `|T|` capture anywhere.
@@ -6928,6 +7049,7 @@ pub const IRCompiler = struct {
 
         self.instruction_sets.items[instr_set].param_count = fn_decl.params._non_variadic.len;
         for (fn_decl.params._non_variadic) |param| {
+            if (param.type_annotation) |type_annotation| self.registerParamTypeVars(type_annotation.*);
             switch (param.pattern.*) {
                 .discard => {},
                 .identifier => |identifier| {

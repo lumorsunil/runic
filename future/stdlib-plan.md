@@ -369,7 +369,24 @@ new syntax), then the primitives the stdlib is actually made of.
       `.{ .value = 5 }` typed by result location, and inferred args (`Box(_)` /
       bare `Box`); capturing a generic's type param for downstream member access
       on the compiler side.
-  - Maps: `{ k: v }` literals + `Map(K, V)` type + access/keys/values.
+  - [x] **Type identifiers → strings — DONE (2026-08-29).** A type identifier
+    used where a string is expected (string interpolation or a bare command
+    argument) serializes to the type's name: primitives (`${Int}` → "Int"),
+    named structs / generic constructors / error sets (`${Point}`), and a bound
+    `|T|` capture (`const n: |T| = 42; ${T}` → "Int"). Anonymous structs expand
+    structurally. Compile-time only (no runtime type info). Compiler:
+    `writeTypeName` + `typeIdentifierString`, hooked into `compileIdentifier`
+    before the executable fallback; a `valueTypeExpr` seeds a capture from a
+    literal's value tag; `registerParamTypeVars` records `|T|` captures (in
+    params and unmatched binding captures) as permissive type vars so they
+    serialize to their name. Type-checker: an `is_type` binding flag
+    (`scope.declareType`) + `isTypeIdentifierExpr`, so the interpolation and
+    command-argument guards accept a type identifier instead of rejecting it as a
+    struct. Covered by `tests/features/type_serialization_regression.rn`.
+    - Follow-ups: **monomorphization** so a generic function's `|T|` serializes
+      the concrete per-call type (`describe 5` → "Int") instead of the variable
+      name "T"; `${Box(Int)}` giving "Box(Int)" (currently "Box"); array-literal
+      element inference so `|A|` on `.{1,2,3}` is `[]Int` not `[]Void`.
   - Maps: `{ k: v }` literals + `Map(K, V)` type + access/keys/values.
 
 ## Open questions to resolve during implementation

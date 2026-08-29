@@ -1,0 +1,33 @@
+// A type identifier used where a string is expected serializes to the type's
+// name — in string interpolation or as a bare command argument. Named types
+// give their name; a bound `|T|` capture gives the captured type's name. Types
+// are compile-time only, so this is a compile-time string constant.
+
+// Primitive type names.
+echo "${Int}"
+echo "${String}"
+echo "${Bool}"
+
+// A named struct type.
+const Point = struct { x: Int, y: Int }
+echo "${Point}"
+
+// A generic constructor name.
+const Box(T) = struct { value: T }
+echo "${Box}"
+
+// A `|T|` capture in a binding gives the captured concrete type.
+const i: |T| = 42
+echo "type of i is ${T}"
+const s: |U| = "hi"
+echo "type of s is ${U}"
+
+// Bare command arguments serialize the same way.
+echo Int String Point
+
+// A generic function parameter's `|T|` is a type variable (its concrete type
+// per call would need monomorphization), so it serializes to the variable name.
+fn Void describe(x: |E|) Void {
+    echo "generic type is ${E}"
+}
+describe 5

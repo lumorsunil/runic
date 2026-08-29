@@ -861,12 +861,11 @@ pub const TypeChecker = struct {
 
         const resolved_type_expr = try self.resolveTypeExpr(scope, type_binding_decl.type_expr);
 
-        scope.declare(
+        scope.declareType(
             self.arena.allocator(),
             type_binding_decl.identifier,
             resolved_type_expr,
             type_binding_decl.is_pub,
-            false,
         ) catch |err| try switch (err) {
             error.IdentifierAlreadyDeclared => {
                 try self.reportSpanError(
@@ -906,11 +905,10 @@ pub const TypeChecker = struct {
         subject: *const ast.TypeExpr,
     ) Error!void {
         switch (pattern.*) {
-            .type_capture => |capture| scope.declare(
+            .type_capture => |capture| scope.declareType(
                 self.arena.allocator(),
                 ast.Identifier.global(capture.name),
                 subject,
-                false,
                 false,
             ) catch |err| switch (err) {
                 error.IdentifierAlreadyDeclared => {},
@@ -1625,8 +1623,10 @@ pub const TypeChecker = struct {
             for (call.arguments) |arg| {
                 // A struct-typed argument, or a generic struct literal (`Box{ … }`)
                 // whose type doesn't resolve standalone — both would fail while
-                // being serialized to a command string.
+                // being serialized to a command string. A type identifier (which
+                // serializes to its name) is fine.
                 const is_struct = blk: {
+                    if (self.isTypeIdentifierExpr(scope, arg)) break :blk false;
                     if (arg.* == .struct_literal and self.generic_type_ctors.contains(arg.struct_literal.name.name)) {
                         break :blk true;
                     }
@@ -3689,6 +3689,8 @@ pub const TypeChecker = struct {
         switch (segment.*) {
             .interpolation => |expr| {
                 try self.runExpression(scope, expr);
+                // A type identifier serializes to its name — a valid String.
+                if (self.isTypeIdentifierExpr(scope, expr)) return;
                 if (try self.resolveExprType(scope, expr)) |t| {
                     // Interpolating a bare (un-narrowed) sum has no single string
                     // form — narrow it first (with `is`/`==`/match).
@@ -3810,6 +3812,31 @@ pub const TypeChecker = struct {
     fn isPointer(comptime T: type) bool {
         return switch (@typeInfo(T)) {
             .pointer => true,
+            else => false,
+        };
+    }
+
+    /// Whether `name`, in a value position, denotes a type (a primitive keyword,
+    /// a generic constructor, or a type binding / captured type variable).
+    fn isTypeIdentifierName(self: *TypeChecker, scope: *Scope, name: []const u8) bool {
+        const primitives = [_][]const u8{ "Int", "String", "Bool", "Float", "Void", "Byte" };
+        for (primitives) |p| {
+            if (std.mem.eql(u8, name, p)) return true;
+        }
+        if (self.generic_type_ctors.contains(name)) return true;
+        if (scope.lookup(name)) |binding| return binding.is_type;
+        return false;
+    }
+
+    /// Whether `expr` is a bare type identifier in a value position — an
+    /// identifier (or a zero-arg call, which is how a bare name parses) naming a
+    /// type. Such an expression serializes to the type's name, so it is a valid
+    /// String where a whole struct/error value would not be.
+    fn isTypeIdentifierExpr(self: *TypeChecker, scope: *Scope, expr: *const ast.Expression) bool {
+        return switch (expr.*) {
+            .identifier => |id| self.isTypeIdentifierName(scope, id.name),
+            .call => |call| call.arguments.len == 0 and call.callee.* == .identifier and
+                self.isTypeIdentifierName(scope, call.callee.identifier.name),
             else => false,
         };
     }

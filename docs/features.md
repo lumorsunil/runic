@@ -542,6 +542,27 @@ runtime is dynamically typed, `Box(Int)` and `Box(String)` share a single layout
 checking and capture. (Construction is currently the explicit `Box{ … }` form;
 an inferred `.{ … }` literal typed by its target is a planned addition.)
 
+### Serializing type identifiers
+
+A type identifier used where a string is expected — in string interpolation or
+as a bare command argument — serializes to the type's name. Named types give
+their name; a bound `|T|` capture gives the captured type's name:
+
+```rn
+echo "${Int}"                     // Int
+const Point = struct { x: Int }
+echo "${Point}"                   // Point
+
+const n: |T| = 42
+echo "the type is ${T}"           // the type is Int
+```
+
+**Result:** since types are compile-time only, this is a compile-time string
+constant — no runtime type information is involved. Inside a *generic function*,
+a parameter's `|T|` is a type variable whose concrete type is only known per
+call, so it serializes to the variable name (`"T"`); reporting the concrete
+per-call type would require monomorphization, which isn't implemented yet.
+
 ## Command vs. expression separation
 
 Runic distinguishes between invoking external commands and evaluating expressions, reducing quoting issues by making intent explicit.
