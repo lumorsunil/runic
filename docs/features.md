@@ -513,6 +513,35 @@ generic functions are written once, and mismatches are still caught
 captured type is a purely compile-time entity — it never exists at runtime.
 (This subsumes the earlier `@TypeOf`, which has been removed.)
 
+### Generic type constructors
+
+A type binding can take type parameters, defining a generic type constructor:
+
+```rn
+const Box(T) = struct { value: T }
+
+const b: Box(Int) = Box{ .value = 5 }   // apply with Int
+echo "${b.value}"
+```
+
+`Box(Int)` applies the constructor by substituting the argument. Combined with a
+`|T|` capture, a signature **destructures** an application to recover its type
+argument — so one function serves every instantiation:
+
+```rn
+fn Void unwrap(box: Box(|T|)) T { yield box.value }   // T = the element type
+unwrap b   // → 5
+```
+
+Multiple parameters (`const Pair(A, B) = struct { first: A, second: B }`) and
+composition (`[]Box(Int)`) work too.
+
+**Result:** reusable container and wrapper types without repetition. Because the
+runtime is dynamically typed, `Box(Int)` and `Box(String)` share a single layout
+— there is no monomorphization; the type arguments exist only for compile-time
+checking and capture. (Construction is currently the explicit `Box{ … }` form;
+an inferred `.{ … }` literal typed by its target is a planned addition.)
+
 ## Command vs. expression separation
 
 Runic distinguishes between invoking external commands and evaluating expressions, reducing quoting issues by making intent explicit.

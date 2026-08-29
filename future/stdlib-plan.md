@@ -345,14 +345,31 @@ new syntax), then the primitives the stdlib is actually made of.
     `tests/features/type_capture_regression.rn` +
     `tests/diagnostics/type_capture_mismatch.rn`; features.md documents it. CI
     green (13/13, 45 diag, 8 examples, 140 smoke, 3 strict).
-    - Follow-ups: capture inside a `struct { … }` field type; enforcing that
-      repeated `|T|`/`T` uses in one signature agree (currently permissive);
-      user-defined generic type constructors so `Array(|T|)`-style destructuring
-      matches beyond the built-in `[]`/`?` (part of generic containers).
-  - Generic containers: comptime type-returning functions (`fn Box(comptime T:
-    Type) Type`), reusing the Phase-2 engine — has the capture/`type_var`
-    foundation; still needs `comptime` type *params* and comptime `struct`
-    construction.
+    - Follow-ups: enforcing that repeated `|T|`/`T` uses in one signature agree
+      (currently permissive).
+  - [x] **Generic type constructors — DONE (2026-08-29).** `const Box(T) =
+    struct { value: T }` declares a type parameterized by `T`; `Box(Int)` applies
+    it (substitutes the arg) and `Box(|T|)` destructures an application to
+    capture the arg — so `fn unwrap(box: Box(|T|)) T { yield box.value }` serves
+    every instantiation. Multi-param (`Pair(A, B)`), composition (`[]Box(Int)`),
+    and capture-in-binding (`const c: Box(|E|) = b`) all work. No monomorphization
+    (dynamic runtime — `Box(Int)`/`Box(String)` share a layout); type args are
+    compile-time-only. New `type_application` `TypeExpr` + `params` on
+    `TypeBindingDecl`; parser handles `const Name(P…) = …` and `Name(args…)` in
+    type position. Type-checker: a `generic_type_ctors` registry,
+    `resolveTypeApplication` (resolve args → `substituteTypeParams` → resolve),
+    struct-field capture unification in `bindTypeCaptures`, and generic-aware
+    `runStructLiteral`. Compiler resolves an application to the registered
+    `user_struct_types` layout (args don't affect it). Covered by
+    `tests/features/generic_type_regression.rn` +
+    `tests/diagnostics/generic_type_undeclared.rn`; features.md documents it. CI
+    green (13/13, 46 diag, 8 examples, 141 smoke, 3 strict).
+    - Follow-ups: the comptime-function model (`fn Box(comptime T: type) type`)
+      as the underlying form (needs a `type` value); inferred construction
+      `.{ .value = 5 }` typed by result location, and inferred args (`Box(_)` /
+      bare `Box`); capturing a generic's type param for downstream member access
+      on the compiler side.
+  - Maps: `{ k: v }` literals + `Map(K, V)` type + access/keys/values.
   - Maps: `{ k: v }` literals + `Map(K, V)` type + access/keys/values.
 
 ## Open questions to resolve during implementation

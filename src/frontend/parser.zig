@@ -2856,12 +2856,24 @@ pub const Parser = struct {
 
         const start = try self.expectTokenTag(.kw_const);
         const identifier = try self.parseTypeIdentifier();
+
+        // Optional type parameters for a generic type constructor:
+        // `const Box(T) = struct { value: T }`.
+        var params: []const ast.Identifier = &.{};
+        if ((try self.peekToken()).tag == .l_paren) {
+            _ = try self.expectTokenTag(.l_paren);
+            const list = try self.parseList(.comma, parseTypeIdentifier, .{});
+            _ = try self.expectTokenTag(.r_paren);
+            params = list.payload;
+        }
+
         _ = try self.expectTokenTag(.assign);
         const type_expr = try self.parseTypeExpr();
 
         return .{
             .span = start.span.endAt(type_expr.span()),
             .identifier = identifier,
+            .params = params,
             .type_expr = type_expr,
         };
     }
@@ -3482,12 +3494,28 @@ pub const Parser = struct {
             return Error.ExpectedTypeIdentifier;
         }
 
-        // TODO: implement generic function type expressions
+        // A generic type application `Name(args…)` — e.g. `Box(Int)`, `Box(|T|)`.
+        if ((try self.peekToken()).tag == .l_paren) {
+            _ = try self.expectTokenTag(.l_paren);
+            const args = try self.parseList(.comma, parseTypeExprArg, .{});
+            const close = try self.expectTokenTag(.r_paren);
+            return self.allocTypeExpression(.{ .type_application = .{
+                .name = last_segment,
+                .args = args.payload,
+                .span = spanned_path.span.endAt(close.span),
+            } });
+        }
 
         return self.allocTypeExpression(.{ .identifier = .{
             .path = .{ .segments = spanned_path.payload, .span = spanned_path.span },
             .span = spanned_path.span,
         } });
+    }
+
+    /// A single type argument inside a `Name(args…)` application. Wraps
+    /// `parseTypeExpr` for use with `parseList` (which expects a `*const` result).
+    fn parseTypeExprArg(self: *Self) Error!*const ast.TypeExpr {
+        return self.parseTypeExpr();
     }
 
     fn parseArrayTypeExpr(self: *Self) Error!*const ast.TypeExpr {

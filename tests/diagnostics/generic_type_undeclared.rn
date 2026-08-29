@@ -1,0 +1,2 @@
+const b: Nope(Int) = Nope{ .value = 5 }
+echo "${b.value}"

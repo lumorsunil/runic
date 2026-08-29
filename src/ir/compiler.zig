@@ -4975,6 +4975,13 @@ pub const IRCompiler = struct {
                 if (self.lookupTypeCapture(capture.name)) |bound| return self.normalizeStringTypes(bound);
                 return .{ .type_var = .{ .name = capture.name, .span = capture.span } };
             },
+            // A generic application `Box(Int)` resolves to the constructor's
+            // struct layout; the args don't affect the (dynamic) runtime layout,
+            // so member access and construction use the registered struct as-is.
+            .type_application => |app| {
+                if (self.user_struct_types.get(app.name.name)) |st| return .{ .struct_type = st };
+                return t;
+            },
             else => return t,
         }
     }

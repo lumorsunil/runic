@@ -1,0 +1,35 @@
+// User-defined generic type constructors: `const Box(T) = struct { value: T }`
+// declares a type parameterized by `T`. `Box(Int)` applies it (substituting the
+// argument), and `Box(|T|)` in a signature destructures an application to
+// capture the type argument. Since the runtime is dynamic, `Box(Int)` and
+// `Box(String)` share one layout — no monomorphization.
+
+const Box(T) = struct { value: T }
+
+// Apply in an annotation; construct and read a field.
+const b: Box(Int) = Box{ .value = 5 }
+echo "b.value=${b.value}"
+
+// A generic function that captures the type argument from a `Box(|T|)` and
+// returns it — one definition, any element type.
+fn Void unwrap(box: Box(|T|)) T { yield box.value }
+const bi: Box(Int) = Box{ .value = 42 }
+const bs: Box(String) = Box{ .value = "hi" }
+echo "int=${unwrap bi} str=${unwrap bs}"
+
+// A multi-parameter constructor, capturing one of two arguments.
+const Pair(A, B) = struct { first: A, second: B }
+fn Void firstOf(p: Pair(|X|, |Y|)) X { yield p.first }
+const pr: Pair(Int, String) = Pair{ .first = 7, .second = "world" }
+echo "first=${firstOf pr} second=${pr.second}"
+
+// Capture the type argument in a binding, then reuse it.
+const c: Box(|E|) = bi
+const same: E = 100
+echo "c.value=${c.value} same=${same}"
+
+// A generic type nested inside a built-in constructor.
+const b1: Box(Int) = Box{ .value = 1 }
+const b2: Box(Int) = Box{ .value = 2 }
+const xs: []Box(Int) = .{ b1, b2 }
+for (xs) |box| { echo "xs=${box.value}" }

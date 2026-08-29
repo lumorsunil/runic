@@ -188,9 +188,30 @@ pub const TypeExpr = union(enum) {
     /// is. In a generic signature it acts as a permissive type variable; in a
     /// binding it captures the initializer's concrete type. Compile-time only.
     type_capture: TypeCapture,
+    /// An application of a user-defined generic type constructor, `Name(args…)`
+    /// (e.g. `Box(Int)`, `Box(|T|)`). Kept in application form: the type checker
+    /// substitutes the args into the constructor's body when a concrete type is
+    /// needed, and matches applications structurally (same constructor + unified
+    /// args) so `Box(|T|)` binds `T` from a `Box(Int)` value.
+    type_application: TypeApplication,
     /// A compile-time function reference pointing to a specific IR instruction set.
     /// Used for module pub fn exports so compileMember can return the fn_ref value directly.
     fn_ref_type: FnRefType,
+
+    pub const TypeApplication = struct {
+        name: Identifier,
+        args: []const *const TypeExpr,
+        span: Span,
+
+        pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try writer.print("{s}(", .{self.name.name});
+            for (self.args, 0..) |arg, i| {
+                if (i > 0) try writer.writeAll(", ");
+                try arg.format(writer);
+            }
+            try writer.writeAll(")");
+        }
+    };
 
     pub const TypeCapture = struct {
         name: []const u8,
@@ -609,6 +630,7 @@ pub const TypeExpr = union(enum) {
             .fn_ref_type,
             .type_var,
             .type_capture,
+            .type_application,
             => 1,
             .struct_type => |struct_type| blk: {
                 if (struct_type.by_reference_fields) break :blk struct_type.fields.len;
@@ -1811,6 +1833,9 @@ pub const Statement = union(enum) {
 pub const TypeBindingDecl = struct {
     is_pub: bool = true,
     identifier: Identifier,
+    /// Type parameters for a generic type constructor (`const Box(T) = …`).
+    /// Empty for an ordinary type binding.
+    params: []const Identifier = &.{},
     type_expr: *const TypeExpr,
     span: Span,
 
