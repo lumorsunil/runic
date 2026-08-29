@@ -604,6 +604,9 @@ pub const IRCompiler = struct {
     /// Concrete types bound by `|T|` captures in binding positions (`const x:
     /// []|T| = …` → `T` = the element type). A later `: T` resolves through here.
     type_captures: std.StringHashMapUnmanaged(ast.TypeExpr) = .empty,
+    /// A generic type constructor's type parameters, by name — so an application
+    /// `Box(Int)` can substitute its arguments into the registered struct body.
+    generic_ctor_params: std.StringHashMapUnmanaged([]const ast.Identifier) = .empty,
     /// Recursion-depth cap for comptime call interpretation. Kept well below the
     /// point where the interpreter's own (native) call stack would overflow, so
     /// a non-terminating `comptime` recursion fails to compile instead of
@@ -1208,7 +1211,14 @@ pub const IRCompiler = struct {
             const decl = stmt.type_binding_decl;
             switch (decl.type_expr.*) {
                 .error_set => |es| try self.error_sets.put(self.allocator, decl.identifier.name, es),
-                .struct_type => |st| try self.user_struct_types.put(self.allocator, decl.identifier.name, st),
+                .struct_type => |st| {
+                    try self.user_struct_types.put(self.allocator, decl.identifier.name, st);
+                    // Record a generic constructor's type parameters so an
+                    // application (`Box(Int)`) can substitute the arguments.
+                    if (decl.params.len > 0) {
+                        try self.generic_ctor_params.put(self.allocator, decl.identifier.name, decl.params);
+                    }
+                },
                 else => {},
             }
         }
@@ -2939,16 +2949,28 @@ pub const IRCompiler = struct {
         var slots = std.ArrayList(FieldSlot).empty;
         defer slots.deinit(self.allocator);
 
+        // Rebuild the struct type with each field typed by its supplied value
+        // (rather than the declared type, which may be a generic parameter `T`),
+        // so a `|T|` capture through this literal binds to the concrete type.
+        const concrete_fields = try self.allocator.alloc(ast.TypeExpr.StructField, struct_type.fields.len);
+
         var total: usize = 0;
-        for (struct_type.fields) |field| {
+        for (struct_type.fields, 0..) |field, i| {
             const layout = struct_type.fieldLayout(field.name.name) catch return .fromValue(.void);
             total += field.type_expr.slotSize() catch 1;
+
+            concrete_fields[i] = field;
 
             // The value supplied for this field (the type checker already
             // verified presence/typing).
             const value: Result = blk: {
                 for (struct_literal.fields) |lit_field| {
                     if (std.mem.eql(u8, lit_field.name.name, field.name.name)) {
+                        if (self.argTypeExpr(lit_field.value)) |vt| {
+                            const ft = try self.allocator.create(ast.TypeExpr);
+                            ft.* = vt;
+                            concrete_fields[i].type_expr = ft;
+                        }
                         break :blk try self.compileExpression(lit_field.value);
                     }
                 }
@@ -2967,7 +2989,9 @@ pub const IRCompiler = struct {
                 .from(slot.ref),
             );
         }
-        return .fromLocation(ir.Location.initRegister(.r).typed(.{ .struct_type = struct_type }));
+        var concrete_type = struct_type;
+        concrete_type.fields = concrete_fields;
+        return .fromLocation(ir.Location.initRegister(.r).typed(.{ .struct_type = concrete_type }));
     }
 
     /// Converts a finished command (`ExecutionResult`) into an
@@ -5080,6 +5104,74 @@ pub const IRCompiler = struct {
     /// concrete `subject` type, recording each `|T|` capture's matched type.
     /// Recurses through the built-in generic constructors so `[]|T|` binds `T`
     /// to the element type and `?|T|` to the child.
+    /// Substitutes each identifier naming one of `params` with the corresponding
+    /// `args` entry — a generic application's body substitution. Recurses through
+    /// the composite type shapes. Mirrors the type-checker's version.
+    fn substituteTypeParams(
+        self: *IRCompiler,
+        t: ast.TypeExpr,
+        params: []const ast.Identifier,
+        args: []const *const ast.TypeExpr,
+    ) Allocator.Error!ast.TypeExpr {
+        switch (t) {
+            .identifier => |named| {
+                if (named.path.segments.len == 1) {
+                    const name = named.path.segments[0].name;
+                    for (params, 0..) |param, i| {
+                        if (i < args.len and std.mem.eql(u8, param.name, name)) return args[i].*;
+                    }
+                }
+                return t;
+            },
+            .array => |a| {
+                const elem = try self.allocator.create(ast.TypeExpr);
+                elem.* = try self.substituteTypeParams(a.element.*, params, args);
+                return .{ .array = .{ .element = elem, .span = a.span } };
+            },
+            .optional => |o| {
+                const child = try self.allocator.create(ast.TypeExpr);
+                child.* = try self.substituteTypeParams(o.child.*, params, args);
+                return .{ .optional = .{ .child = child, .span = o.span } };
+            },
+            .promise => |p| {
+                const child = try self.allocator.create(ast.TypeExpr);
+                child.* = try self.substituteTypeParams(p.child.*, params, args);
+                return .{ .promise = .{ .child = child, .span = p.span } };
+            },
+            .type_application => |app| {
+                const new_args = try self.allocator.alloc(*const ast.TypeExpr, app.args.len);
+                for (app.args, new_args) |arg, *dst| {
+                    const na = try self.allocator.create(ast.TypeExpr);
+                    na.* = try self.substituteTypeParams(arg.*, params, args);
+                    dst.* = na;
+                }
+                return .{ .type_application = .{ .name = app.name, .args = new_args, .span = app.span } };
+            },
+            .struct_type => |st| {
+                const new_fields = try self.allocator.alloc(ast.TypeExpr.StructField, st.fields.len);
+                for (st.fields, new_fields) |field, *dst| {
+                    dst.* = field;
+                    const ft = try self.allocator.create(ast.TypeExpr);
+                    ft.* = try self.substituteTypeParams(field.type_expr.*, params, args);
+                    dst.type_expr = ft;
+                }
+                var new_st = st;
+                new_st.fields = new_fields;
+                return .{ .struct_type = new_st };
+            },
+            else => return t,
+        }
+    }
+
+    /// Resolves a generic application (`Box(Int)`) to the constructor's struct
+    /// body with the arguments substituted, or null when the constructor isn't a
+    /// registered generic struct.
+    fn resolveTypeApplication(self: *IRCompiler, app: ast.TypeExpr.TypeApplication) ?ast.TypeExpr {
+        const body_st = self.user_struct_types.get(app.name.name) orelse return null;
+        const params = self.generic_ctor_params.get(app.name.name) orelse &[_]ast.Identifier{};
+        return self.substituteTypeParams(.{ .struct_type = body_st }, params, app.args) catch null;
+    }
+
     fn bindTypeCaptures(self: *IRCompiler, pattern: ast.TypeExpr, subject: ast.TypeExpr) void {
         switch (pattern) {
             .type_capture => |capture| {
@@ -5088,6 +5180,25 @@ pub const IRCompiler = struct {
             .array => |a| if (subject == .array) self.bindTypeCaptures(a.element.*, subject.array.element.*),
             .optional => |o| if (subject == .optional) self.bindTypeCaptures(o.child.*, subject.optional.child.*),
             .promise => |p| if (subject == .promise) self.bindTypeCaptures(p.child.*, subject.promise.child.*),
+            // `Box(|T|)` — substitute into the body (keeping the capture), then
+            // match structurally against the subject struct.
+            .type_application => |app| {
+                if (self.resolveTypeApplication(app)) |resolved| self.bindTypeCaptures(resolved, subject);
+            },
+            .struct_type => |st| {
+                var subj = subject;
+                while (subj == .alias) subj = subj.alias.type_expr.*;
+                if (subj == .struct_type) {
+                    for (st.fields) |field| {
+                        for (subj.struct_type.fields) |sfield| {
+                            if (std.mem.eql(u8, field.name.name, sfield.name.name)) {
+                                self.bindTypeCaptures(field.type_expr.*, sfield.type_expr.*);
+                                break;
+                            }
+                        }
+                    }
+                }
+            },
             else => {},
         }
     }
@@ -5211,9 +5322,10 @@ pub const IRCompiler = struct {
                 return .{ .type_var = .{ .name = capture.name, .span = capture.span } };
             },
             // A generic application `Box(Int)` resolves to the constructor's
-            // struct layout; the args don't affect the (dynamic) runtime layout,
-            // so member access and construction use the registered struct as-is.
+            // struct body with the arguments substituted (`struct { value: Int }`),
+            // so member access, capture matching, and `${T}` see concrete fields.
             .type_application => |app| {
+                if (self.resolveTypeApplication(app)) |resolved| return self.normalizeStringTypes(resolved);
                 if (self.user_struct_types.get(app.name.name)) |st| return .{ .struct_type = st };
                 return t;
             },

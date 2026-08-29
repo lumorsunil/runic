@@ -397,11 +397,15 @@ new syntax), then the primitives the stdlib is actually made of.
     module members) falls back to the single generic compilation — so the
     existing generics (`map`/`filter`/`reduce`) are untouched. Covered by
     `tests/features/monomorphization_regression.rn`.
-    - Follow-ups: monomorphize nested-application captures (`Box(|T|)`) and
-      recursion; concrete derivation for a capture nested in a generic
-      application in a *binding* (`const b: Box(|T|) = Box{ .value = 5 }`);
-      `${Box(Int)}` giving "Box(Int)" (currently "Box"); array-literal element
-      inference so `|A|` on `.{1,2,3}` is `[]Int` not `[]Void`.
+    - Nested-application captures done (2026-08-29): `Box(|T|)` in a function
+      parameter monomorphizes, and in a binding resolves to the concrete type —
+      the compiler gained `substituteTypeParams` / `resolveTypeApplication` (over
+      a `generic_ctor_params` registry), struct-field unification in
+      `bindTypeCaptures`, application substitution in `normalizeStringTypes`, and
+      struct literals now type their fields by their values.
+    - Follow-ups: monomorphize recursion; `${Box(Int)}` giving "Box(Int)"
+      (currently "Box"); array-literal element inference so `|A|` on `.{1,2,3}`
+      is `[]Int` not `[]Void`.
   - Maps: `{ k: v }` literals + `Map(K, V)` type + access/keys/values.
 
 ## Open questions to resolve during implementation

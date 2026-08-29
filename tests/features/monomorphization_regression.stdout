@@ -6,3 +6,5 @@ hi is String
 Int + String
 String + Float
 Bool + Int
+unwrapped 7 of type Int
+unwrapped hey of type String

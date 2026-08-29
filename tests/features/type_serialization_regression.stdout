@@ -9,4 +9,4 @@ Int String Point
 generic type is Int
 generic type is String
 generic type is Float
-nested capture is W
+nested capture is Int

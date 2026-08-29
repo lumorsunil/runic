@@ -24,3 +24,14 @@ fn Void pair(a: |A|, b: |B|) Void {
 pair 1 "x"
 pair "y" 2.0
 pair true 0
+
+// A capture nested in a generic application (`Box(|T|)`) also monomorphizes:
+// the argument's concrete type flows through the constructor to the capture.
+const Box(T) = struct { value: T }
+fn Void unwrapType(b: Box(|T|)) Void {
+    echo "unwrapped ${b.value} of type ${T}"
+}
+const bi: Box(Int) = Box{ .value = 7 }
+const bs: Box(String) = Box{ .value = "hey" }
+unwrapType bi
+unwrapType bs

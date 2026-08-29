@@ -35,8 +35,8 @@ describe 5
 describe "hi"
 describe 3.14
 
-// A capture nested in a generic application also resolves to the variable name
-// for now — deriving the concrete type here needs generic substitution in the
-// compiler (it doesn't crash, which is the point).
+// A capture nested in a generic application resolves to the concrete type: the
+// application is substituted into the constructor body and matched against the
+// initializer, whose fields are typed by their values.
 const bx: Box(|W|) = Box{ .value = 5 }
 echo "nested capture is ${W}"
