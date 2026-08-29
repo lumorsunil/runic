@@ -40,3 +40,14 @@ describe 3.14
 // initializer, whose fields are typed by their values.
 const bx: Box(|W|) = Box{ .value = 5 }
 echo "nested capture is ${W}"
+
+// A generic application in value position serializes to its full form,
+// including nested applications.
+echo "${Box(Int)}"
+echo "${Box(String)}"
+echo "${Box(Box(Int))}"
+
+// An array literal infers its element type, so a capture over it is concrete.
+const nums: |N| = .{ 1, 2, 3 }
+const words: |Ws| = .{ "a", "b" }
+echo "array captures: ${N} and ${Ws}"

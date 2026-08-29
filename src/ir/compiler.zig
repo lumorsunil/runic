@@ -4019,6 +4019,17 @@ pub const IRCompiler = struct {
 
         if (call.callee.* == .identifier) {
             const name = call.callee.identifier.name;
+            // A type application *with arguments* in value position
+            // (`${Box(Int)}`) serializes to its type-application string. A bare
+            // type name (zero args) is left to `compileIdentifier`, which
+            // resolves a captured type to its bound type rather than its name.
+            if (call.arguments.len > 0 and self.isTypeName(name) and
+                self.lookup(name, .{ .shallow = false }) == null)
+            {
+                if (try self.compileTypeApplicationString(call)) |type_string| {
+                    return .fromValue(type_string);
+                }
+            }
             if (std.mem.eql(u8, name, "@src")) {
                 return self.compileIdentifier(source, call.callee.identifier);
             }
@@ -5279,6 +5290,61 @@ pub const IRCompiler = struct {
             },
             else => try w.writeAll("?"),
         }
+    }
+
+    /// Whether `name` denotes a compile-time type: a primitive keyword, a
+    /// declared struct or generic constructor, an error set, or a bound capture.
+    fn isTypeName(self: *IRCompiler, name: []const u8) bool {
+        const primitives = [_][]const u8{ "Int", "String", "Bool", "Float", "Void", "Byte" };
+        for (primitives) |p| {
+            if (std.mem.eql(u8, name, p)) return true;
+        }
+        return self.user_struct_types.contains(name) or self.error_sets.contains(name) or self.type_captures.contains(name);
+    }
+
+    /// Writes a type argument (from a `Name(args…)` application in value
+    /// position) as its type name — a bare type identifier, a bound capture, or
+    /// a nested application (`Box(String)`).
+    fn writeArgTypeName(self: *IRCompiler, w: *std.Io.Writer, arg: *ast.Expression) std.Io.Writer.Error!void {
+        switch (arg.*) {
+            .identifier => |id| {
+                if (self.type_captures.get(id.name)) |t| try self.writeTypeName(w, t) else try w.writeAll(id.name);
+            },
+            .call => |call| if (call.callee.* == .identifier) {
+                try w.writeAll(call.callee.identifier.name);
+                if (call.arguments.len > 0) {
+                    try w.writeByte('(');
+                    for (call.arguments, 0..) |a, i| {
+                        if (i > 0) try w.writeAll(", ");
+                        try self.writeArgTypeName(w, a);
+                    }
+                    try w.writeByte(')');
+                }
+            },
+            else => {},
+        }
+    }
+
+    /// Serializes a `Name(args…)` application in value position (`${Box(Int)}`)
+    /// to its type-application string, or null when the callee isn't a type.
+    fn compileTypeApplicationString(self: *IRCompiler, call: ast.CallExpr) Error!?ir.Value {
+        if (call.callee.* != .identifier) return null;
+        const name = call.callee.identifier.name;
+        if (!self.isTypeName(name)) return null;
+
+        var alloc_writer = std.Io.Writer.Allocating.init(self.allocator);
+        defer alloc_writer.deinit();
+        const w = &alloc_writer.writer;
+        try w.writeAll(name);
+        if (call.arguments.len > 0) {
+            try w.writeByte('(');
+            for (call.arguments, 0..) |arg, i| {
+                if (i > 0) try w.writeAll(", ");
+                try self.writeArgTypeName(w, arg);
+            }
+            try w.writeByte(')');
+        }
+        return try self.addSlice(1, alloc_writer.written());
     }
 
     /// If `name` refers to a compile-time type — a primitive keyword, a declared
@@ -7871,7 +7937,9 @@ pub const IRCompiler = struct {
         var element_type: ?ast.TypeExpr = null;
         for (array.elements, 1..) |element, i| {
             const result = try self.compileExpressionWithCapture(source, element);
-            element_type = result.typeExpr();
+            // Literals carry no type on their Result; fall back to the element
+            // expression's static type so `.{ 1, 2, 3 }` infers `[]Int`.
+            element_type = result.typeExpr() orelse self.argTypeExpr(element);
             try self.set(source, .initRegister(.r2), .from(array_ref.dereference()));
             try self.set(source, .initAdd(.{ .register = .r2 }, i, .{ .dereference = true }), result.source);
         }

@@ -407,8 +407,13 @@ new syntax), then the primitives the stdlib is actually made of.
       is redirected to that specialization (via an `active_specializations`
       stack), so `${T}` stays concrete at every level; a depth cap bounds
       type-changing recursion.
-    - Follow-ups: `${Box(Int)}` giving "Box(Int)" (currently "Box"); array-literal
-      element inference so `|A|` on `.{1,2,3}` is `[]Int` not `[]Void`.
+    - `${Box(Int)}` → "Box(Int)" and array-literal element inference done
+      (2026-08-29). A `Name(args…)` application in value position serializes to
+      its full form (incl. nested); array literals infer their element type from
+      the elements (`argTypeExpr` fallback), so a capture over `.{1,2,3}` is
+      `[]Int`. Remaining: **multi-argument** applications in value position
+      (`Pair(Int, String)`) don't parse — the value-grammar comma; needs a parser
+      change to accept a type-application in an expression.
   - Maps — deferred; **no new special syntax** (decision 2026-08-29). Rather than
     a `{ k: v }` literal + built-in `Map(K, V)`, build maps up from existing
     primitives (structs, arrays/`[]T`, generic type constructors) with a mix of

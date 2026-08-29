@@ -3835,7 +3835,10 @@ pub const TypeChecker = struct {
     fn isTypeIdentifierExpr(self: *TypeChecker, scope: *Scope, expr: *const ast.Expression) bool {
         return switch (expr.*) {
             .identifier => |id| self.isTypeIdentifierName(scope, id.name),
-            .call => |call| call.arguments.len == 0 and call.callee.* == .identifier and
+            // A bare type name parses as a zero-arg call; a generic application
+            // (`Box(Int)`) parses as a call to the constructor with arguments.
+            .call => |call| call.callee.* == .identifier and
+                (call.arguments.len == 0 or self.generic_type_ctors.contains(call.callee.identifier.name)) and
                 self.isTypeIdentifierName(scope, call.callee.identifier.name),
             else => false,
         };
