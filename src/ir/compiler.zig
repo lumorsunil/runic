@@ -592,6 +592,15 @@ pub const IRCompiler = struct {
     comptime_fn_decls: std.AutoHashMapUnmanaged(usize, *const ast.FunctionDecl) = .empty,
     comptime_depth: usize = 0,
 
+    /// Monomorphization. `fn_decl_sources` maps a function's instruction set to
+    /// its declaration expression (so a specialization can recompile its body);
+    /// `specializations` caches a compiled specialization per "instr_set|T=Int…"
+    /// key; `specializing` is set while compiling one, so `compileFnDecl` skips
+    /// the outer name declaration and re-registration.
+    fn_decl_sources: std.AutoHashMapUnmanaged(usize, *ast.Expression) = .empty,
+    specializations: std.StringHashMapUnmanaged(usize) = .empty,
+    specializing: bool = false,
+
     /// Concrete types bound by `|T|` captures in binding positions (`const x:
     /// []|T| = …` → `T` = the element type). A later `: T` resolves through here.
     type_captures: std.StringHashMapUnmanaged(ast.TypeExpr) = .empty,
@@ -4953,6 +4962,108 @@ pub const IRCompiler = struct {
         }
     }
 
+    /// Collects the `|T|` capture names appearing in a type into `out`.
+    fn collectCapturesInType(t: ast.TypeExpr, out: *std.ArrayList([]const u8), allocator: Allocator) Allocator.Error!void {
+        switch (t) {
+            .type_capture => |c| try out.append(allocator, c.name),
+            .array => |a| try collectCapturesInType(a.element.*, out, allocator),
+            .optional => |o| try collectCapturesInType(o.child.*, out, allocator),
+            .promise => |p| try collectCapturesInType(p.child.*, out, allocator),
+            .type_application => |app| for (app.args) |arg| try collectCapturesInType(arg.*, out, allocator),
+            else => {},
+        }
+    }
+
+    /// The compile-time static type of a call argument, when knowable.
+    fn argTypeExpr(self: *IRCompiler, arg: *ast.Expression) ?ast.TypeExpr {
+        return switch (arg.*) {
+            .literal => |lit| switch (lit) {
+                .integer => ast.TypeExpr.global(.integer),
+                .float => ast.TypeExpr.global(.float),
+                .bool => ast.TypeExpr.global(.boolean),
+                .string => string_type,
+                .null => null,
+            },
+            .identifier, .call => self.resolveStaticType(arg),
+            else => null,
+        };
+    }
+
+    /// Monomorphization: for a direct call to a top-level, non-recursive generic
+    /// function whose parameters carry `|T|` captures, compile (or reuse) a
+    /// specialization with the type variables bound to the call's concrete
+    /// argument types, and return its instruction set. Returns null (use the
+    /// generic function) when the callee isn't a specializable candidate or the
+    /// type arguments can't be determined.
+    fn maybeSpecialize(
+        self: *IRCompiler,
+        instr_set: usize,
+        arguments: []const *ast.Expression,
+    ) Error!?usize {
+        if (self.specializing) return null;
+        const fn_source = self.fn_decl_sources.get(instr_set) orelse return null;
+        const fn_decl = self.comptime_fn_decls.get(instr_set).?.*;
+        if (fn_decl.params != ._non_variadic) return null;
+        const params = fn_decl.params._non_variadic;
+        if (params.len != arguments.len) return null;
+        // Specialization recompiles the body in the current scope, so a function
+        // that captures closure variables is not a safe candidate.
+        if (self.instruction_sets.items[instr_set].closure_captures.len != 0) return null;
+
+        var capture_names = std.ArrayList([]const u8).empty;
+        defer capture_names.deinit(self.allocator);
+        for (params) |param| {
+            if (param.type_annotation) |ann| try collectCapturesInType(ann.*, &capture_names, self.allocator);
+        }
+        if (capture_names.items.len == 0) return null;
+
+        // Save any prior bindings for these names so the caller's context is
+        // restored after the specialization is compiled.
+        var saved = std.ArrayList(?ast.TypeExpr).empty;
+        defer saved.deinit(self.allocator);
+        for (capture_names.items) |name| try saved.append(self.allocator, self.type_captures.get(name));
+        defer for (capture_names.items, saved.items) |name, prior| {
+            if (prior) |p| self.type_captures.put(self.allocator, name, p) catch {} else _ = self.type_captures.remove(name);
+        };
+        for (capture_names.items) |name| _ = self.type_captures.remove(name);
+
+        // Bind each capture to its argument's concrete type.
+        for (params, arguments) |param, arg| {
+            const ann = param.type_annotation orelse continue;
+            if (!hasTypeCapture(ann.*)) continue;
+            const arg_type = self.argTypeExpr(arg) orelse return null;
+            self.bindTypeCaptures(ann.*, arg_type);
+        }
+        // Every capture must have bound to a concrete (non-variable) type.
+        for (capture_names.items) |name| {
+            const bound = self.type_captures.get(name) orelse return null;
+            if (bound == .type_var) return null;
+        }
+
+        // Build a cache key from the bound type arguments.
+        var key_writer = std.Io.Writer.Allocating.init(self.allocator);
+        defer key_writer.deinit();
+        try key_writer.writer.print("{}", .{instr_set});
+        for (capture_names.items) |name| {
+            try key_writer.writer.print("|{s}=", .{name});
+            try self.writeTypeName(&key_writer.writer, self.type_captures.get(name).?);
+        }
+        const key = key_writer.written();
+
+        if (self.specializations.get(key)) |cached| return cached;
+
+        // Compile the specialization with the type variables bound.
+        self.specializing = true;
+        const result = self.compileFnDecl(fn_source, fn_decl) catch |err| {
+            self.specializing = false;
+            return err;
+        };
+        self.specializing = false;
+        const spec_instr_set = result.source.value.fn_ref.fn_addr.instr_set;
+        try self.specializations.put(self.allocator, try self.allocator.dupe(u8, key), spec_instr_set);
+        return spec_instr_set;
+    }
+
     /// A best-effort static type for a runtime value, used to seed a `|T|`
     /// capture when the initializer's Result carries no type (e.g. a literal).
     fn valueTypeExpr(value: ir.Value) ?ast.TypeExpr {
@@ -5288,8 +5399,18 @@ pub const IRCompiler = struct {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
         const fn_ref = fn_ref_value.fn_ref;
-        const fn_addr = fn_ref.fn_addr;
-        const is_self_recursive = self.current_instruction_set == fn_addr.instr_set;
+        const is_self_recursive = self.current_instruction_set == fn_ref.fn_addr.instr_set;
+
+        // Monomorphization: for a non-recursive direct call, redirect to a
+        // per-type specialization when the callee's `|T|` captures resolve to
+        // concrete argument types (so `${T}` folds to the concrete type name).
+        var fn_addr = fn_ref.fn_addr;
+        if (!is_self_recursive and stdout_override == null) {
+            if (try self.maybeSpecialize(fn_ref.fn_addr.instr_set, arguments)) |spec_instr_set| {
+                fn_addr = ir.InstructionAddr.initAbs(spec_instr_set, 0);
+            }
+        }
+
         const self_closure_depth = if (is_self_recursive) blk: {
             const frame = try self.scopes.getFrame(0);
             break :blk if (frame.scope_type == .closure) @as(usize, 0) else try self.nearestClosureDepth();
@@ -5297,11 +5418,11 @@ pub const IRCompiler = struct {
 
         // Manual closure compilation
         // TODO: Add closure variables as well (we need to extend the function reference value to be able to understand what closure variables are needed)
-        const closure_captures = self.instruction_sets.items[fn_ref.fn_addr.instr_set].closure_captures;
+        const closure_captures = self.instruction_sets.items[fn_addr.instr_set].closure_captures;
         const closure_size = if (is_self_recursive)
             (try self.scopes.getFrame(self_closure_depth)).closure_bindings.items.len
         else
-            self.instruction_sets.items[fn_ref.fn_addr.instr_set].closure_slot_count;
+            self.instruction_sets.items[fn_addr.instr_set].closure_slot_count;
         try self.alloc(source, closure_size);
         const closure_ref = try self.newRef(source, "closure");
         try self.set(source, closure_ref, .fromLocation(.initRegister(.r)));
@@ -5382,7 +5503,7 @@ pub const IRCompiler = struct {
             .inherit,
         );
 
-        const pub_exports = self.instruction_sets.items[fn_ref.fn_addr.instr_set].pub_exports;
+        const pub_exports = self.instruction_sets.items[fn_addr.instr_set].pub_exports;
         const n_pub = pub_exports.len;
 
         if (n_pub > 0) {
@@ -7010,10 +7131,12 @@ pub const IRCompiler = struct {
         const fn_ref = ir.Value{
             .fn_ref = .{ .fn_addr = ir.InstructionAddr.initAbs(instr_set, 0) },
         };
-        // Record the AST so `comptime` calls can interpret this function's body.
-        // `source.fn_decl` is a stable, arena-owned copy of `fn_decl`.
-        if (source.* == .fn_decl) {
+        // Record the AST so `comptime` calls can interpret this function's body
+        // and monomorphization can recompile it. Skip while specializing (the
+        // generic entry is authoritative). `source.fn_decl` is arena-stable.
+        if (source.* == .fn_decl and !self.specializing) {
             try self.comptime_fn_decls.put(self.allocator, instr_set, &source.fn_decl);
+            try self.fn_decl_sources.put(self.allocator, instr_set, source);
         }
         const orig_instr_set = self.current_instruction_set;
         self.current_instruction_set = instr_set;
@@ -7176,24 +7299,28 @@ pub const IRCompiler = struct {
         self.currentInstrSet().pub_exports = try pub_exports_list.toOwnedSlice(self.allocator);
         self.current_instruction_set = orig_instr_set;
         self.scopes.pop();
+        // A specialization is called directly by instruction set; it must not
+        // re-declare the (already-declared) function name in the enclosing scope.
         if (fn_decl.name) |name| {
-            const fn_type = ast.TypeExpr{ .function = .{
-                .params = .nonVariadic(&.{}),
-                .stdin_type = fn_decl.stdin_type,
-                .return_type = fn_decl.return_type,
-                .span = fn_decl.span,
-            } };
-            try self.scopes.declare(
-                self.allocator,
-                name.name,
-                try .from(fn_ref),
-                fn_type,
-                false,
-                .normal,
-            );
-            if (fn_decl.is_pub) {
-                if (self.lookup(name.name, .{ .shallow = true })) |binding| {
-                    binding.is_pub = true;
+            if (!self.specializing) {
+                const fn_type = ast.TypeExpr{ .function = .{
+                    .params = .nonVariadic(&.{}),
+                    .stdin_type = fn_decl.stdin_type,
+                    .return_type = fn_decl.return_type,
+                    .span = fn_decl.span,
+                } };
+                try self.scopes.declare(
+                    self.allocator,
+                    name.name,
+                    try .from(fn_ref),
+                    fn_type,
+                    false,
+                    .normal,
+                );
+                if (fn_decl.is_pub) {
+                    if (self.lookup(name.name, .{ .shallow = true })) |binding| {
+                        binding.is_pub = true;
+                    }
                 }
             }
         }

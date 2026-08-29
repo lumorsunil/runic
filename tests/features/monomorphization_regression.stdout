@@ -1,0 +1,8 @@
+5 is Int
+hi is String
+3.14 is Float
+10 is Int
+20 is Int
+Int + String
+String + Float
+Bool + Int

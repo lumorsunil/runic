@@ -25,12 +25,15 @@ echo "type of s is ${U}"
 // Bare command arguments serialize the same way.
 echo Int String Point
 
-// A generic function parameter's `|T|` is a type variable (its concrete type
-// per call would need monomorphization), so it serializes to the variable name.
+// A generic function parameter's `|T|` serializes to the concrete per-call type:
+// the call is monomorphized (a specialization is compiled with the type variable
+// bound to the argument's type).
 fn Void describe(x: |E|) Void {
     echo "generic type is ${E}"
 }
 describe 5
+describe "hi"
+describe 3.14
 
 // A capture nested in a generic application also resolves to the variable name
 // for now — deriving the concrete type here needs generic substitution in the

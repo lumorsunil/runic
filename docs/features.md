@@ -559,9 +559,20 @@ echo "the type is ${T}"           // the type is Int
 
 **Result:** since types are compile-time only, this is a compile-time string
 constant — no runtime type information is involved. Inside a *generic function*,
-a parameter's `|T|` is a type variable whose concrete type is only known per
-call, so it serializes to the variable name (`"T"`); reporting the concrete
-per-call type would require monomorphization, which isn't implemented yet.
+a parameter's `|T|` reflects the concrete per-call type: a direct call is
+**monomorphized** (a specialization is compiled with the type variables bound to
+the argument types), so the same function reports the actual type at each call:
+
+```rn
+fn Void describe(x: |T|) Void { echo "${x} is a ${T}" }
+describe 5       // 5 is a Int
+describe "hi"    // hi is a String
+```
+
+Each distinct type argument gets its own specialization; the same type argument
+reuses one. (Monomorphization currently applies to direct, non-recursive calls
+whose `|T|` captures bind to a concrete argument type; other calls fall back to a
+single generic compilation, where a bare `|T|` serializes to the variable name.)
 
 ## Command vs. expression separation
 

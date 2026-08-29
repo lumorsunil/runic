@@ -6,5 +6,7 @@ Box
 type of i is Int
 type of s is String
 Int String Point
-generic type is E
+generic type is Int
+generic type is String
+generic type is Float
 nested capture is W

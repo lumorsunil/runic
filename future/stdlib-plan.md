@@ -383,13 +383,25 @@ new syntax), then the primitives the stdlib is actually made of.
     (`scope.declareType`) + `isTypeIdentifierExpr`, so the interpolation and
     command-argument guards accept a type identifier instead of rejecting it as a
     struct. Covered by `tests/features/type_serialization_regression.rn`.
-    - Follow-ups: **monomorphization** so a generic function's `|T|` serializes
-      the concrete per-call type (`describe 5` → "Int") instead of the variable
-      name "T"; concrete derivation for a capture nested in a generic application
-      (`const b: Box(|T|) = Box{ .value = 5 }` — `${T}` is best-effort "T", wants
-      "Int"; needs compiler-side generic substitution + struct-literal field
-      typing); `${Box(Int)}` giving "Box(Int)" (currently "Box"); array-literal
-      element inference so `|A|` on `.{1,2,3}` is `[]Int` not `[]Void`.
+  - [x] **Monomorphization — DONE (2026-08-29).** A direct call to a top-level,
+    non-recursive generic function whose `|T|` capture params bind to concrete
+    argument types compiles a per-type specialization (cached, one per type-arg
+    set), so a parameter's `|T|` reflects the concrete per-call type
+    (`describe 5` → "Int", `describe "hi"` → "String"). Compiler: `maybeSpecialize`
+    hooked at the top of `compileFunctionCall` redirects `fn_addr` to the
+    specialization; `fn_decl_sources` (instr_set → decl expr) + a `specializing`
+    flag let `compileFnDecl` recompile the body with the type vars pre-bound in
+    `type_captures`, skipping the outer name declaration and re-registration;
+    `argTypeExpr` + `collectCapturesInType` derive the type args. Anything not a
+    determinable direct capture (nested `Box(|T|)`, closure captures, recursion,
+    module members) falls back to the single generic compilation — so the
+    existing generics (`map`/`filter`/`reduce`) are untouched. Covered by
+    `tests/features/monomorphization_regression.rn`.
+    - Follow-ups: monomorphize nested-application captures (`Box(|T|)`) and
+      recursion; concrete derivation for a capture nested in a generic
+      application in a *binding* (`const b: Box(|T|) = Box{ .value = 5 }`);
+      `${Box(Int)}` giving "Box(Int)" (currently "Box"); array-literal element
+      inference so `|A|` on `.{1,2,3}` is `[]Int` not `[]Void`.
   - Maps: `{ k: v }` literals + `Map(K, V)` type + access/keys/values.
 
 ## Open questions to resolve during implementation
