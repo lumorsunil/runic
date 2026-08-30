@@ -7852,7 +7852,10 @@ pub const IRCompiler = struct {
                         else => {},
                     }
                 }
-                const right = try self.compileExpression(binary.right);
+                // Capture a function call's typed return by value (a struct,
+                // optional, …) on reassignment, like a `const` binding — without
+                // this, `m = mapSet m …` would store the callee's thread handle.
+                const right = try self.compileExpressionWithCapture(source, binary.right);
                 try self.set(source, left.source.location, right.source);
 
                 return .from(left.source.location);

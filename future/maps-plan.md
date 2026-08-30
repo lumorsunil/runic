@@ -75,9 +75,14 @@ A prototype (`Entry`/`Map` + `set`/`get`) compiles down to one concrete gap:
 
 ## Phasing
 
-- **Phase M0 — unblock:** fix generic struct return-type equality (#1). Small,
-  self-contained type-checker change; re-run the prototype to confirm `set`/`get`
-  type-check and run.
+- [x] **Phase M0 — unblock. DONE (2026-08-30).** Generic structs are now
+  returnable/reusable enough to build the map: fixed struct/application/type-var
+  equality in `pipeTypesEqual`, typed generic struct literals by their field
+  values (+ resolved nested `Entry(K, V)` fields), captured a `type_application`
+  return by value (`isTypedCaptureReturn`), resolved the declared return in
+  `runYield`, and made `var` reassignment value-capture a typed return. The
+  full prototype (`set`/`get`/replace, String and Int keys) runs. Covered by
+  `tests/features/generic_struct_return_regression.rn`.
 - **Phase M1 — the module:** write `std/map.rn` with `Entry`, `Map`, and
   `empty`/`set`/`get`/`has`/`keys`/`values`/`len`/`remove`. Feature tests +
   a `docs/standard-library.md` entry. Pure Runic — no compiler changes.

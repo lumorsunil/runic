@@ -1,0 +1,45 @@
+// A generic function can return a generic struct value — captured by value,
+// reused, member-accessed, and reassigned. This is what a from-primitives
+// Map(K, V) needs (Phase M0 of the maps plan): an association-list map built
+// entirely in Runic, with the types resolved at comptime and the data at
+// runtime.
+
+const Entry(K, V) = struct { key: K, value: V }
+const Map(K, V) = struct { entries: []Entry(K, V) }
+
+fn Void mapSet(m: Map(|K|, |V|), key: K, value: V) Map(K, V) {
+    var out = .{ }
+    var replaced = false
+    for (m.entries) |e| {
+        if (e.key == key) {
+            out = out.push Entry{ .key = key, .value = value }
+            replaced = true
+        } else {
+            out = out.push e
+        }
+    }
+    if (replaced) { yield Map{ .entries = out } }
+    out = out.push Entry{ .key = key, .value = value }
+    yield Map{ .entries = out }
+}
+
+fn Void mapGet(m: Map(|K|, |V|), key: K) ?V {
+    for (m.entries) |e| {
+        if (e.key == key) { yield e.value }
+    }
+    yield null
+}
+
+// String keys.
+var s: Map(String, Int) = Map{ .entries = .{ } }
+s = mapSet s "a" 1
+s = mapSet s "b" 2
+s = mapSet s "a" 99
+echo "a=${mapGet s "a" orelse 0} b=${mapGet s "b" orelse 0} c=${mapGet s "c" orelse 0}"
+echo "s.len=${s.entries.len}"
+
+// Int keys.
+var n: Map(Int, String) = Map{ .entries = .{ } }
+n = mapSet n 1 "one"
+n = mapSet n 2 "two"
+echo "1=${mapGet n 1 orelse "?"} 2=${mapGet n 2 orelse "?"} 3=${mapGet n 3 orelse "?"}"
