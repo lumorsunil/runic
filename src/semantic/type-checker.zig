@@ -599,7 +599,10 @@ pub const TypeChecker = struct {
         // appears in, including loop-capture bindings like `for (&0) |v|`.
         if (yield_stmt.fd != 1) return;
         if (self.stdout_type_stack.items.len == 0) return;
-        const declared_stdout = self.stdout_type_stack.items[self.stdout_type_stack.items.len - 1] orelse return;
+        const declared_stdout_raw = self.stdout_type_stack.items[self.stdout_type_stack.items.len - 1] orelse return;
+        // Resolve the declared type so a generic application (`Box(T)`) is
+        // compared as its substituted struct, not the raw application node.
+        const declared_stdout = try self.resolveTypeExpr(scope, declared_stdout_raw);
         const yielded = try self.resolveExprType(scope, yield_stmt.value) orelse return;
         const resolved = try self.resolvePipeType(scope, yielded) orelse return;
         if (self.pipeTypesEqual(resolved, declared_stdout)) return;
@@ -3400,10 +3403,39 @@ pub const TypeChecker = struct {
         const resolved_left = self.unaliasType(left);
         const resolved_right = self.unaliasType(right);
 
+        // A type variable (generic) unifies with anything — the same permissive
+        // treatment used elsewhere. This lets a generic function return a generic
+        // struct: `struct { value: T }` (yielded) matches `struct { value: T }`
+        // (declared) even though the two `T`s are distinct nodes.
+        if (resolved_left.* == .type_var or resolved_right.* == .type_var) return true;
+
         if (std.meta.activeTag(resolved_left.*) != std.meta.activeTag(resolved_right.*)) return false;
 
         return switch (resolved_left.*) {
             .array => |left_array| self.pipeTypesEqual(left_array.element, resolved_right.array.element),
+            // Structs compare structurally (same fields, in order, with equal
+            // types) — not by node identity, so two separately-built identical
+            // struct types (e.g. a generic constructor applied twice) are equal.
+            .struct_type => |left_st| blk: {
+                const right_st = resolved_right.struct_type;
+                if (left_st.fields.len != right_st.fields.len) break :blk false;
+                for (left_st.fields, right_st.fields) |lf, rf| {
+                    if (!std.mem.eql(u8, lf.name.name, rf.name.name)) break :blk false;
+                    if (!self.pipeTypesEqual(lf.type_expr, rf.type_expr)) break :blk false;
+                }
+                break :blk true;
+            },
+            // A generic application (`Entry(K, V)`) may remain unresolved inside a
+            // struct field; compare by constructor name and pairwise arguments.
+            .type_application => |left_app| blk: {
+                const right_app = resolved_right.type_application;
+                if (!std.mem.eql(u8, left_app.name.name, right_app.name.name)) break :blk false;
+                if (left_app.args.len != right_app.args.len) break :blk false;
+                for (left_app.args, right_app.args) |la, ra| {
+                    if (!self.pipeTypesEqual(la, ra)) break :blk false;
+                }
+                break :blk true;
+            },
             .optional => |left_optional| self.pipeTypesEqual(left_optional.child, resolved_right.optional.child),
             .promise => |left_promise| self.pipeTypesEqual(left_promise.child, resolved_right.promise.child),
             .error_union => |left_error_union| self.pipeTypesEqual(left_error_union.err_set, resolved_right.error_union.err_set) and
@@ -3866,11 +3898,28 @@ pub const TypeChecker = struct {
         try self.logTypeCheckTrace(alloc_writer.written(), span);
 
         // A generic struct literal (`Box{ … }`) has no type via the AST's own
-        // resolveType (the constructor isn't a plain scope binding). Resolve it
-        // to the constructor's body struct with its type parameters permissive.
+        // resolveType (the constructor isn't a plain scope binding). Build its
+        // type from the constructor body, typing each field by its supplied
+        // value so `Box{ .value = 5 }` is `struct { value: Int }` (not `{ T }`).
         if (T == *ast.Expression and expr.* == .struct_literal) {
             if (self.generic_type_ctors.get(expr.struct_literal.name.name)) |ctor| {
-                return try self.resolveTypeExpr(scope, ctor.body);
+                const body = self.unaliasType(try self.resolveTypeExpr(scope, ctor.body));
+                if (body.* != .struct_type) return body;
+                const new_fields = try self.arena.allocator().alloc(ast.TypeExpr.StructField, body.struct_type.fields.len);
+                for (body.struct_type.fields, new_fields) |field, *dst| {
+                    dst.* = field;
+                    for (expr.struct_literal.fields) |lit_field| {
+                        if (std.mem.eql(u8, lit_field.name.name, field.name.name)) {
+                            if (try self.resolveExprType(scope, lit_field.value)) |vt| {
+                                dst.type_expr = try self.resolveTypeExpr(scope, vt);
+                            }
+                            break;
+                        }
+                    }
+                }
+                var new_st = body.struct_type;
+                new_st.fields = new_fields;
+                return try self.allocTypeExpression(.{ .struct_type = new_st });
             }
         }
 
