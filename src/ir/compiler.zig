@@ -4129,7 +4129,18 @@ pub const IRCompiler = struct {
                     .value = .from(value_ref.dereference()),
                     .result = result_ref.dereference(),
                 } }));
-                return .fromLocation(result_ref.dereference().typed(array_type_expr));
+                // Refine an unknown element type (`var xs = .{ }` starts as
+                // `[]Void`) from the pushed value, so a later `xs[i].field` /
+                // `xs[i][j]` can resolve the element's layout.
+                var result_array_type = array_type_expr;
+                if (array_type_expr == .array and array_type_expr.array.element.* == .void) {
+                    if (value.typeExpr() orelse self.argTypeExpr(call.arguments[0])) |vt| {
+                        const element = try self.allocator.create(ast.TypeExpr);
+                        element.* = vt;
+                        result_array_type = array_type(element);
+                    }
+                }
+                return .fromLocation(result_ref.dereference().typed(result_array_type));
             }
         }
 
@@ -5055,6 +5066,18 @@ pub const IRCompiler = struct {
             .type_application => |app| for (app.args) |arg| try collectCapturesInType(arg.*, out, allocator),
             else => {},
         }
+    }
+
+    /// Whether a tracked type is still unknown — absent, `Void`, or an array
+    /// whose element type hasn't been determined (`var xs = .{ }` → `[]Void`).
+    /// Such a type may be refined when a concretely-typed value is assigned.
+    fn typeIsUnknown(t: ?ast.TypeExpr) bool {
+        const ty = t orelse return true;
+        return switch (ty) {
+            .void => true,
+            .array => |a| typeIsUnknown(a.element.*),
+            else => false,
+        };
     }
 
     /// The compile-time static type of a call argument, when knowable.
@@ -7894,6 +7917,20 @@ pub const IRCompiler = struct {
                 // this, `m = mapSet m …` would store the callee's thread handle.
                 const right = try self.compileExpressionWithCapture(source, binary.right);
                 try self.set(source, left.source.location, right.source);
+
+                // Refine a mutable variable's tracked type when the new value is
+                // concretely typed but the variable's type was still unknown
+                // (`var out = .{ }` is `[]Void`; `out = out.push Box{…}` makes it
+                // `[]Box`), so a later `out[i].field` resolves the element layout.
+                if (binary.left.* == .identifier) {
+                    if (self.lookup(binary.left.identifier.name, .{ .shallow = false })) |binding| {
+                        if (binding.is_mutable and typeIsUnknown(binding.result.typeExpr())) {
+                            if (right.typeExpr()) |rt| {
+                                binding.result = binding.result.typed(rt);
+                            }
+                        }
+                    }
+                }
 
                 return .from(left.source.location);
             },

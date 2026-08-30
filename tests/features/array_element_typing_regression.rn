@@ -1,0 +1,28 @@
+// Array indexing propagates the element type, so a value read out of an array
+// by index carries its type — enabling member access and further indexing on
+// it. Covers: an empty `.{ }` grown by `.push` (element type inferred from the
+// pushed value), member access on an indexed struct element, binding an indexed
+// element then accessing it, and nested arrays (`[][]T`) with `.len` and double
+// indexing. Deterministic output.
+const Box = struct { n: Int }
+
+// Empty literal grown by push; the element type is inferred as Box.
+var xs = .{ }
+xs = xs.push Box{ .n = 7 }
+xs = xs.push Box{ .n = 9 }
+echo "direct=${xs[1].n}"
+
+// Binding an indexed element preserves its type.
+const b = xs[0]
+echo "bound=${b.n}"
+
+// Nested arrays: element .len and double indexing.
+var rows = .{ }
+var r0 = .{ }
+r0 = r0.push 1
+rows = rows.push r0
+var r1 = .{ }
+r1 = r1.push 2
+r1 = r1.push 3
+rows = rows.push r1
+echo "rows=${rows.len} row0len=${rows[0].len} row1len=${rows[1].len} cell=${rows[1][1]}"

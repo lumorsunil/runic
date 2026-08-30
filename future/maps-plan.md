@@ -103,7 +103,18 @@ A prototype (`Entry`/`Map` + `set`/`get`) compiles down to one concrete gap:
   **Still open:** whether to also offer a mutable in-place API (see open q).
 - **Phase M3 — performance (future):** hashing for O(1) lookup — a comptime
   hash/eq dispatched per key type (buckets of entries), or a builtin fast path,
-  keeping the same `std/map` surface.
+  keeping the same `std/map` surface. **Blocked on foundational features**
+  (2026-08-30 investigation): (1) a **string hash primitive** — there's no way
+  to fold over a string's bytes in Runic today (`s.split ""` returns the whole
+  string, no byte/char access), so a String hash needs a builtin or `s.bytes`;
+  per-key-type dispatch itself already works (`if (key is String) …`, a runtime
+  test on a type-param value). (2) **Array element-type propagation through
+  indexing** — buckets must be indexed (`buckets[h]`), and indexing lost the
+  element type. **DONE (2026-08-30):** `.push` now refines an unknown (`[]Void`)
+  element type from the pushed value, and reassigning a mutable variable refines
+  its tracked type; `arr[i].field`, `arr[i][j]`, and `const b = arr[i]` now
+  resolve. Covered by `tests/features/array_element_typing_regression.rn`. Still
+  needed before M3: the string hash primitive.
 
 ## Open questions
 
