@@ -83,9 +83,15 @@ A prototype (`Entry`/`Map` + `set`/`get`) compiles down to one concrete gap:
   `runYield`, and made `var` reassignment value-capture a typed return. The
   full prototype (`set`/`get`/replace, String and Int keys) runs. Covered by
   `tests/features/generic_struct_return_regression.rn`.
-- **Phase M1 — the module:** write `std/map.rn` with `Entry`, `Map`, and
-  `empty`/`set`/`get`/`has`/`keys`/`values`/`len`/`remove`. Feature tests +
-  a `docs/standard-library.md` entry. Pure Runic — no compiler changes.
+- [x] **Phase M1 — the module. DONE (2026-08-30).** `std/map.rn` with `Entry`,
+  `Map`, and `empty`/`set`/`get`/`has`/`keys`/`values`/`len`/`remove`. Registered
+  in `std_modules.zig`, `build.zig`, and `std/std.rn`. Covered by
+  `tests/features/std_map_regression.rn` (String→Int and Int→String, replace,
+  remove) and a `docs/standard-library.md` entry. One compiler change was needed
+  after all: an imported module's own type constructors weren't registered
+  (only the main script's were), so `Map(K, V)` construction failed inside the
+  module — fixed by extracting `registerTypeDecls` and calling it on module
+  statements in `compileImportExpr`.
 - **Phase M2 — ergonomics (optional):** `Name(args){ … }` construction (#2);
   decide whether to also offer a mutable in-place API.
 - **Phase M3 — performance (future):** hashing for O(1) lookup — a comptime
