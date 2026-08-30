@@ -3384,6 +3384,32 @@ pub const IRCompiler = struct {
                 );
                 return .fromValue(.void);
             },
+            // A captured generic struct return (`const e = wrap "x" 5` where
+            // `wrap` yields `Entry(K, V)`) carries its type as an application;
+            // resolve the constructor to its (param-substituted) layout.
+            .type_application => |app| blk: {
+                const resolved = self.resolveTypeApplication(app) orelse {
+                    try self.reportSourceError(
+                        source,
+                        Error.NotImplemented,
+                        .@"error",
+                        "member access is only supported for struct types in IR",
+                        .{},
+                    );
+                    return .fromValue(.void);
+                };
+                if (resolved != .struct_type) {
+                    try self.reportSourceError(
+                        source,
+                        Error.NotImplemented,
+                        .@"error",
+                        "member access is only supported for struct types in IR",
+                        .{},
+                    );
+                    return .fromValue(.void);
+                }
+                break :blk resolved.struct_type;
+            },
             else => {
                 try self.reportSourceError(
                     source,

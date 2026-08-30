@@ -899,9 +899,18 @@ pub const Parser = struct {
                             // uppercase (type) name. Lowercase calls stay space-form.
                             if (id.isTypeIdentifier() and ahead[1].tag == .l_paren) {
                                 _ = try self.nextToken(); // consume the identifier
-                                try components.append(self.allocator, .{
-                                    .expr = try self.parseValueTypeApplication(id),
-                                });
+                                const app = try self.parseValueTypeApplication(id);
+                                // `Name(args){ … }` — explicit-type-arg struct
+                                // construction. The type arguments don't affect the
+                                // runtime layout, so we construct by name and let the
+                                // compiler infer field types from the values.
+                                if ((try self.peekToken()).tag == .l_brace) {
+                                    try components.append(self.allocator, .{
+                                        .expr = try self.parseStructLiteral(id),
+                                    });
+                                    continue;
+                                }
+                                try components.append(self.allocator, .{ .expr = app });
                                 continue;
                             }
 

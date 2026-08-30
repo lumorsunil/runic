@@ -15,7 +15,7 @@ const Map(K, V) = struct { entries: []Entry(K, V) }
 
 // An empty map.
 pub fn Void empty() Map(K, V) {
-  yield Map{ .entries = .{ } }
+  yield Map(K, V){ .entries = .{ } }
 }
 
 // The map with `key` set to `value`: replaces the entry if `key` is present,
@@ -25,15 +25,15 @@ pub fn Void set(m: Map(|K|, |V|), key: K, value: V) Map(K, V) {
   var replaced = false
   for (m.entries) |e| {
     if (e.key == key) {
-      out = out.push Entry{ .key = key, .value = value }
+      out = out.push Entry(K, V){ .key = key, .value = value }
       replaced = true
     } else {
       out = out.push e
     }
   }
-  if (replaced) { yield Map{ .entries = out } }
-  out = out.push Entry{ .key = key, .value = value }
-  yield Map{ .entries = out }
+  if (replaced) { yield Map(K, V){ .entries = out } }
+  out = out.push Entry(K, V){ .key = key, .value = value }
+  yield Map(K, V){ .entries = out }
 }
 
 // The value for `key`, or absent.
@@ -58,7 +58,7 @@ pub fn Void remove(m: Map(|K|, |V|), key: K) Map(K, V) {
   for (m.entries) |e| {
     if (e.key == key) { } else { out = out.push e }
   }
-  yield Map{ .entries = out }
+  yield Map(K, V){ .entries = out }
 }
 
 // The keys, in insertion order.

@@ -92,8 +92,15 @@ A prototype (`Entry`/`Map` + `set`/`get`) compiles down to one concrete gap:
   (only the main script's were), so `Map(K, V)` construction failed inside the
   module — fixed by extracting `registerTypeDecls` and calling it on module
   statements in `compileImportExpr`.
-- **Phase M2 — ergonomics (optional):** `Name(args){ … }` construction (#2);
-  decide whether to also offer a mutable in-place API.
+- **Phase M2 — ergonomics (optional).** `Name(args){ … }` construction: **DONE
+  (2026-08-30)** — explicit-type-arg struct construction now parses (the type
+  args don't affect layout, so it constructs by name and infers field types from
+  the values); `std/map.rn` uses it. Fixing this also surfaced and fixed a
+  pre-existing gap: member access on a *captured generic struct return*
+  (`const e = wrap "x" 5` where `wrap` yields `Entry(K, V)`) — the member-access
+  path didn't resolve a `type_application` object type to its struct layout.
+  Covered by `tests/features/generic_struct_construction_regression.rn`.
+  **Still open:** whether to also offer a mutable in-place API (see open q).
 - **Phase M3 — performance (future):** hashing for O(1) lookup — a comptime
   hash/eq dispatched per key type (buckets of entries), or a builtin fast path,
   keeping the same `std/map` surface.
