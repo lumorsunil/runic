@@ -416,12 +416,12 @@ new syntax), then the primitives the stdlib is actually made of.
       collector parses an uppercase name followed by `(args…)` as a value type
       application (`parseValueTypeApplication`), alongside the existing `Name{…}`
       struct-literal case.
-  - Maps — deferred; **no new special syntax** (decision 2026-08-29). Rather than
-    a `{ k: v }` literal + built-in `Map(K, V)`, build maps up from existing
-    primitives (structs, arrays/`[]T`, generic type constructors) with a mix of
-    runtime and comptime — i.e. a `Map(K, V)` implemented *in Runic* on top of
-    the language, not baked into the parser. Needs its own design pass later
-    (key hashing/equality, growth, the runtime/comptime split).
+  - Maps — deferred; **no new special syntax** (decision 2026-08-29). Build a
+    `Map(K, V)` *in Runic* from generic structs + arrays as a `std/map` module
+    (association list; types/dispatch at comptime, data ops at runtime). Design +
+    phasing in **`future/maps-plan.md`**. Primitives verified present; the one
+    blocker is generic-struct **return-type equality** (a generic fn can't yet
+    return a generic struct) — fix that first, then write the module.
 
 ## Open questions to resolve during implementation
 
