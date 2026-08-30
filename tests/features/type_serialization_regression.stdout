@@ -13,4 +13,6 @@ nested capture is Int
 Box(Int)
 Box(String)
 Box(Box(Int))
+Pair(Int, String)
+Pair(Box(Int), Bool)
 array captures: []Int and []String

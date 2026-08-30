@@ -894,6 +894,16 @@ pub const Parser = struct {
                                 });
                                 continue;
                             }
+                            // `Name(arg, …)` — a generic type application in value
+                            // position (e.g. `${Pair(Int, String)}`), for an
+                            // uppercase (type) name. Lowercase calls stay space-form.
+                            if (id.isTypeIdentifier() and ahead[1].tag == .l_paren) {
+                                _ = try self.nextToken(); // consume the identifier
+                                try components.append(self.allocator, .{
+                                    .expr = try self.parseValueTypeApplication(id),
+                                });
+                                continue;
+                            }
 
                             try components.append(self.allocator, .{
                                 .identifier = id,
@@ -2596,6 +2606,26 @@ pub const Parser = struct {
             },
             else => self.failExpectedTokens(tok.tag, &expected_primary_tokens),
         };
+    }
+
+    /// Parses `Name(arg, arg, …)` — a generic type application in value position
+    /// — into a call whose arguments are the comma-separated type expressions.
+    /// The compiler serializes this to a type-application string.
+    fn parseValueTypeApplication(self: *Self, callee_id: ast.Identifier) Error!*ast.Expression {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        _ = try self.expect(.l_paren);
+        const args = try self.parseList(.comma, parseExpression, .{});
+        const close = try self.expect(.r_paren);
+
+        return self.allocExpression(.{ .call = .{
+            .callee = try self.allocExpression(.{ .identifier = callee_id }),
+            .arguments = args.payload,
+            .redirects = &.{},
+            .background = false,
+            .span = callee_id.span.endAt(close.span),
+        } });
     }
 
     fn parseParenthesizedExpression(self: *Self) Error!*ast.Expression {

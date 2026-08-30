@@ -42,10 +42,13 @@ const bx: Box(|W|) = Box{ .value = 5 }
 echo "nested capture is ${W}"
 
 // A generic application in value position serializes to its full form,
-// including nested applications.
+// including nested and multi-argument applications.
 echo "${Box(Int)}"
 echo "${Box(String)}"
 echo "${Box(Box(Int))}"
+const Pair(A, B) = struct { first: A, second: B }
+echo "${Pair(Int, String)}"
+echo "${Pair(Box(Int), Bool)}"
 
 // An array literal infers its element type, so a capture over it is concrete.
 const nums: |N| = .{ 1, 2, 3 }

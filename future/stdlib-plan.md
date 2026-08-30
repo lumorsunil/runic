@@ -411,9 +411,11 @@ new syntax), then the primitives the stdlib is actually made of.
       (2026-08-29). A `Name(args…)` application in value position serializes to
       its full form (incl. nested); array literals infer their element type from
       the elements (`argTypeExpr` fallback), so a capture over `.{1,2,3}` is
-      `[]Int`. Remaining: **multi-argument** applications in value position
-      (`Pair(Int, String)`) don't parse — the value-grammar comma; needs a parser
-      change to accept a type-application in an expression.
+      `[]Int`. Multi-argument applications in value position
+      (`${Pair(Int, String)}`) also work now (2026-08-30): the binary-component
+      collector parses an uppercase name followed by `(args…)` as a value type
+      application (`parseValueTypeApplication`), alongside the existing `Name{…}`
+      struct-literal case.
   - Maps — deferred; **no new special syntax** (decision 2026-08-29). Rather than
     a `{ k: v }` literal + built-in `Map(K, V)`, build maps up from existing
     primitives (structs, arrays/`[]T`, generic type constructors) with a mix of
