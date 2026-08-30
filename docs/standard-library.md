@@ -198,6 +198,32 @@ Runic; the Float functions are backed by **new builtins** (see prerequisites).
 | `assertContains(s: String, sub: String) Void` | abort if `s` lacks `sub` |
 | `fail(msg: String) Void` | unconditional abort |
 
+### `std.map`
+
+A generic key/value map, built entirely in Runic from a generic struct over an
+array of entries (an *association list*). Types resolve at comptime (generic
+constructors + monomorphization); the data operations run at runtime. Keys are
+compared with `==`, so `Int` and `String` keys work; lookups are a linear scan
+(fine for the small maps typical in scripts). The API is **immutable**, mirroring
+`arr.push`: `set`/`remove` return a new map.
+
+| Signature | Result |
+| --- | --- |
+| `empty() Map(K, V)` | an empty map |
+| `set(m: Map(K, V), key: K, value: V) Map(K, V)` | new map with `key` → `value` (replaces or appends) |
+| `get(m: Map(K, V), key: K) ?V` | the value for `key`, or absent |
+| `has(m: Map(K, V), key: K) Bool` | whether `key` is present |
+| `remove(m: Map(K, V), key: K) Map(K, V)` | new map without `key` |
+| `keys(m: Map(K, V)) []K`, `values(m: Map(K, V)) []V` | entries in insertion order |
+| `len(m: Map(K, V)) Int` | number of entries |
+
+```rn
+var m = std.map.empty
+m = std.map.set m "a" 1
+m = std.map.set m "b" 2
+const v = std.map.get m "a" orelse 0   // 1
+```
+
 ## Language prerequisites for Phase 3
 
 Most modules are writable in Runic today. The remaining language work:

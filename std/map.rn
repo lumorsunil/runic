@@ -1,0 +1,81 @@
+// std.map — a generic key/value map, built entirely in Runic from a generic
+// struct over an array of entries (an association list). The types resolve at
+// comptime (generic constructors + monomorphization); the data operations run
+// at runtime. Keys are compared with `==`, so `Int` and `String` keys work.
+// Lookups are a linear scan — fine for the small maps typical in scripts.
+//
+// The API is immutable, mirroring `arr.push`: `set`/`remove` return a new map.
+//   var m = std.map.empty
+//   m = std.map.set m "a" 1
+//   const v = std.map.get m "a" orelse 0
+fn Void @() Void
+
+const Entry(K, V) = struct { key: K, value: V }
+const Map(K, V) = struct { entries: []Entry(K, V) }
+
+// An empty map.
+pub fn Void empty() Map(K, V) {
+  yield Map{ .entries = .{ } }
+}
+
+// The map with `key` set to `value`: replaces the entry if `key` is present,
+// otherwise appends it. Returns a new map.
+pub fn Void set(m: Map(|K|, |V|), key: K, value: V) Map(K, V) {
+  var out = .{ }
+  var replaced = false
+  for (m.entries) |e| {
+    if (e.key == key) {
+      out = out.push Entry{ .key = key, .value = value }
+      replaced = true
+    } else {
+      out = out.push e
+    }
+  }
+  if (replaced) { yield Map{ .entries = out } }
+  out = out.push Entry{ .key = key, .value = value }
+  yield Map{ .entries = out }
+}
+
+// The value for `key`, or absent.
+pub fn Void get(m: Map(|K|, |V|), key: K) ?V {
+  for (m.entries) |e| {
+    if (e.key == key) { yield e.value }
+  }
+  yield null
+}
+
+// Whether `key` is present.
+pub fn Void has(m: Map(|K|, |V|), key: K) Bool {
+  for (m.entries) |e| {
+    if (e.key == key) { yield true }
+  }
+  yield false
+}
+
+// The map without `key` (unchanged if absent).
+pub fn Void remove(m: Map(|K|, |V|), key: K) Map(K, V) {
+  var out = .{ }
+  for (m.entries) |e| {
+    if (e.key == key) { } else { out = out.push e }
+  }
+  yield Map{ .entries = out }
+}
+
+// The keys, in insertion order.
+pub fn Void keys(m: Map(|K|, |V|)) []K {
+  var out = .{ }
+  for (m.entries) |e| { out = out.push e.key }
+  yield out
+}
+
+// The values, in insertion order.
+pub fn Void values(m: Map(|K|, |V|)) []V {
+  var out = .{ }
+  for (m.entries) |e| { out = out.push e.value }
+  yield out
+}
+
+// The number of entries.
+pub fn Void len(m: Map(|K|, |V|)) Int {
+  yield m.entries.len
+}

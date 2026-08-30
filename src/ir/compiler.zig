@@ -1218,7 +1218,14 @@ pub const IRCompiler = struct {
         try self.error_sets.put(self.allocator, "ExecutableError", ast.TypeExpr.executableErrorSet);
         try self.error_sets.put(self.allocator, "ParseError", ast.TypeExpr.parseErrorSet);
 
-        for (self.script.statements) |stmt| {
+        try self.registerTypeDecls(self.script.statements);
+    }
+
+    /// Records the struct / generic-constructor / error-set type declarations in
+    /// `statements` (the main script or an imported module), so their
+    /// construction, member access, and applications resolve.
+    fn registerTypeDecls(self: *IRCompiler, statements: []const *ast.Statement) Allocator.Error!void {
+        for (statements) |stmt| {
             if (stmt.* != .type_binding_decl) continue;
             const decl = stmt.type_binding_decl;
             switch (decl.type_expr.*) {
@@ -7136,6 +7143,10 @@ pub const IRCompiler = struct {
             // Mark this module as in-flight so nested imports of the same path error
             try self.loading_set.put(self.allocator, module_path, {});
             try self.scopes.push(self.allocator, .closure);
+
+            // Register the module's type constructors / structs / error sets so a
+            // module like `std.map` can construct and apply its own `Map(K, V)`.
+            try self.registerTypeDecls(module_ast.statements);
 
             for (module_ast.statements) |stmt| {
                 _ = try self.compileStatement(stmt);

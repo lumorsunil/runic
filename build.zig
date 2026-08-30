@@ -27,6 +27,7 @@ pub fn build(b: *std.Build) void {
         "std/fs.rn",
         "std/env.rn",
         "std/testing.rn",
+        "std/map.rn",
     };
     for (std_module_files) |rel| {
         runtime.addAnonymousImport(rel, .{ .root_source_file = b.path(rel) });
