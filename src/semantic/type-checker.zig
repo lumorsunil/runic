@@ -897,6 +897,18 @@ pub const TypeChecker = struct {
         };
     }
 
+    /// Whether a type contains a generic application (`Entry(K, V)`) anywhere,
+    /// including nested under a built-in constructor.
+    fn typeExprHasApplication(type_expr: *const ast.TypeExpr) bool {
+        return switch (type_expr.*) {
+            .type_application => true,
+            .array => |a| typeExprHasApplication(a.element),
+            .optional => |o| typeExprHasApplication(o.child),
+            .promise => |p| typeExprHasApplication(p.child),
+            else => false,
+        };
+    }
+
     /// Unifies a `|T|`-carrying `pattern` against a concrete `subject` type,
     /// declaring each capture's matched type in `scope` so later `: T` uses
     /// resolve to it. Recurses through the built-in generic constructors
@@ -1075,20 +1087,20 @@ pub const TypeChecker = struct {
             },
             // `Box(Int)` — substitute the args into the constructor's body.
             .type_application => |app| try self.resolveTypeApplication(scope, app),
-            // Resolve struct field types so a capture bound in scope (e.g. the
-            // element of a `Box(|T|)` binding) becomes concrete. Only recurse
-            // when a field actually carries a capture, to avoid expanding
-            // ordinary named-struct fields.
+            // Resolve struct field types that carry a capture or a generic
+            // application (`entries: []Entry(K, V)`), so they compare as their
+            // substituted structs. Plain named-type fields are left alone (to
+            // avoid expanding — and possibly recursing into — ordinary structs).
             .struct_type => |st| blk: {
                 var any = false;
                 for (st.fields) |field| {
-                    if (typeExprHasCapture(field.type_expr)) any = true;
+                    if (typeExprHasCapture(field.type_expr) or typeExprHasApplication(field.type_expr)) any = true;
                 }
                 if (!any) break :blk type_expr;
                 const new_fields = try self.arena.allocator().alloc(ast.TypeExpr.StructField, st.fields.len);
                 for (st.fields, new_fields) |field, *dst| {
                     dst.* = field;
-                    if (typeExprHasCapture(field.type_expr)) {
+                    if (typeExprHasCapture(field.type_expr) or typeExprHasApplication(field.type_expr)) {
                         dst.type_expr = try self.resolveTypeExpr(scope, field.type_expr);
                     }
                 }
@@ -3908,14 +3920,18 @@ pub const TypeChecker = struct {
                 const new_fields = try self.arena.allocator().alloc(ast.TypeExpr.StructField, body.struct_type.fields.len);
                 for (body.struct_type.fields, new_fields) |field, *dst| {
                     dst.* = field;
+                    // Prefer the supplied value's type; fall back to the body
+                    // field. Resolve it either way, so an unresolved parameter
+                    // (`Entry(K, V)`) becomes type variables that match a concrete
+                    // declared type permissively.
+                    var field_type = field.type_expr;
                     for (expr.struct_literal.fields) |lit_field| {
                         if (std.mem.eql(u8, lit_field.name.name, field.name.name)) {
-                            if (try self.resolveExprType(scope, lit_field.value)) |vt| {
-                                dst.type_expr = try self.resolveTypeExpr(scope, vt);
-                            }
+                            if (try self.resolveExprType(scope, lit_field.value)) |vt| field_type = vt;
                             break;
                         }
                     }
+                    dst.type_expr = try self.resolveTypeExpr(scope, field_type);
                 }
                 var new_st = body.struct_type;
                 new_st.fields = new_fields;

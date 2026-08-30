@@ -2407,6 +2407,9 @@ pub const IRCompiler = struct {
             // as the array itself; a String (`[]Byte`) stays on the byte path.
             .type_var => true,
             .array => |a| a.element.* != .byte,
+            // A generic struct application (`Box(Int)`) is captured by value like
+            // any struct, so it isn't byte-serialized (which would misread it).
+            .type_application => |app| self.user_struct_types.contains(app.name.name),
             .identifier => |named| blk: {
                 const name = named.path.segments[named.path.segments.len - 1].name;
                 if (self.user_struct_types.contains(name)) break :blk true;
