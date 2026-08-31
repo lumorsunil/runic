@@ -1,0 +1,65 @@
+// std.fs — file and directory helpers, thin wrappers over portable POSIX
+// commands (each documents the command it wraps). Fallible reads return an
+// `ExecutableError!String` so callers use `catch`/`try`.
+fn Void @() Void
+
+// `test -e` — whether the path exists.
+pub fn Void exists(p: String) Bool {
+  const r = test "-e" p
+  yield (r.exit_code) == 0
+}
+
+// `test -d` — whether the path is a directory.
+pub fn Void isDir(p: String) Bool {
+  const r = test "-d" p
+  yield (r.exit_code) == 0
+}
+
+// `test -f` — whether the path is a regular file.
+pub fn Void isFile(p: String) Bool {
+  const r = test "-f" p
+  yield (r.exit_code) == 0
+}
+
+// `cat` — the file's contents, or an error if it cannot be read.
+pub fn Void readText(p: String) ExecutableError!String {
+  const r: ExecutableError!String = cat p
+  yield r
+}
+
+// Write `content` to `p`, truncating (`> p`). `content` is passed unquoted (an
+// interpolated redirect source currently deadlocks — see the stdlib plan).
+pub fn Void writeText(p: String, content: String) Void {
+  echo content > p
+}
+
+// Append `content` to `p` (`>> p`).
+pub fn Void appendText(p: String, content: String) Void {
+  echo content >> p
+}
+
+// `ls` — entry names of a directory (empty lines dropped).
+pub fn Void listDir(p: String) []String {
+  const out: String = "${ls p}"
+  var result = .{ }
+  for (out.split "\n") |line| {
+    if (line.len > 0) { result = result.push line }
+  }
+  yield result
+}
+
+// `mkdir -p` — create the directory and any missing parents.
+pub fn Void mkdirp(p: String) Void {
+  mkdir "-p" p
+}
+
+// `rm -rf` — remove a file or directory tree.
+pub fn Void remove(p: String) Void {
+  rm "-rf" p
+}
+
+// `pwd` — the current working directory (trailing newline stripped).
+pub fn Void cwd() String {
+  const d: String = "${pwd}"
+  yield d.trim
+}

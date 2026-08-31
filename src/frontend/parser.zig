@@ -537,6 +537,7 @@ pub const Parser = struct {
             .identifier => self.parseIdentifierExpression(),
             .kw_if => self.parseIfExpression(),
             .kw_for => self.parseForExpression(),
+            .kw_comptime => self.parseComptimeExpression(),
             .kw_match => self.parseMatchExpression(),
             .kw_try => self.parseTryExpression(),
             else => {
@@ -870,6 +871,12 @@ pub const Parser = struct {
 
             switch (state) {
                 .expr => {
+                    // An unquoted path command (`./x`, `/usr/bin/y`, `../z`) in
+                    // value position — consumed whole before the token switch.
+                    if (try self.tryParsePathExpression()) |path_expr| {
+                        try components.append(self.allocator, .{ .expr = path_expr });
+                        continue;
+                    }
                     switch (next.tag) {
                         .identifier => {
                             const breadcrumbInner = try self.createBreadcrumb("PBE:identifier");
@@ -885,6 +892,25 @@ pub const Parser = struct {
                                 try components.append(self.allocator, .{
                                     .expr = try self.parseStructLiteral(id),
                                 });
+                                continue;
+                            }
+                            // `Name(arg, …)` — a generic type application in value
+                            // position (e.g. `${Pair(Int, String)}`), for an
+                            // uppercase (type) name. Lowercase calls stay space-form.
+                            if (id.isTypeIdentifier() and ahead[1].tag == .l_paren) {
+                                _ = try self.nextToken(); // consume the identifier
+                                const app = try self.parseValueTypeApplication(id);
+                                // `Name(args){ … }` — explicit-type-arg struct
+                                // construction. The type arguments don't affect the
+                                // runtime layout, so we construct by name and let the
+                                // compiler infer field types from the values.
+                                if ((try self.peekToken()).tag == .l_brace) {
+                                    try components.append(self.allocator, .{
+                                        .expr = try self.parseStructLiteral(id),
+                                    });
+                                    continue;
+                                }
+                                try components.append(self.allocator, .{ .expr = app });
                                 continue;
                             }
 
@@ -1788,6 +1814,24 @@ pub const Parser = struct {
         });
     }
 
+    /// Parses `comptime <operand>` — a prefix that forces the following
+    /// expression to be evaluated at compile time. The operand is a full
+    /// expression, so `comptime fib 10` captures the whole call.
+    fn parseComptimeExpression(self: *Self) Error!*ast.Expression {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const comptime_tok = try self.expect(.kw_comptime);
+        const operand = try self.parseExpression();
+
+        return self.allocExpression(.{
+            .comptime_expr = .{
+                .operand = operand,
+                .span = comptime_tok.span.endAt(operand.span()),
+            },
+        });
+    }
+
     /// Parses the body of a control-flow construct (e.g. a `for` loop). The body
     /// may be a block (`{ ... }`) or a bare expression (`echo "${i}"`) — both
     /// handled by `parseExpression` — or a single bare statement such as
@@ -2025,7 +2069,14 @@ pub const Parser = struct {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
-        _ = try self.expectTokenTag(.dot_l_brace);
+        const start = try self.expectTokenTag(.dot_l_brace);
+
+        // Empty array literal `.{ }`.
+        self.skipNewlines();
+        if ((try self.peekToken()).tag == .r_brace) {
+            const close = try self.expectTokenTag(.r_brace);
+            return .{ .elements = &.{}, .span = start.span.endAt(close.span) };
+        }
 
         const elements = try self.parseList(.comma, parseExpression, .{ .skipNewLines = true });
 
@@ -2343,6 +2394,11 @@ pub const Parser = struct {
             return stmt;
         }
 
+        if ((try self.peekToken()).tag == .kw_while) {
+            stmt.* = .{ .while_stmt = try self.parseWhileStatement() };
+            return stmt;
+        }
+
         const expr = try self.parseExpression();
         if (try self.stream.consumeIf(.amp)) {
             try self.markExpressionBackground(expr);
@@ -2356,6 +2412,30 @@ pub const Parser = struct {
         };
         try self.consumeStatementTerminator();
         return stmt;
+    }
+
+    /// Parses `while (condition) { body }`. The body is a brace block; the
+    /// condition is any expression, tested for truthiness each iteration (a
+    /// `Bool`, a comparison, or a command's exit status). An optional capture
+    /// clause (`while (opt) |v| { … }`) loops while the optional condition is
+    /// non-null, binding the unwrapped value to `v` for that iteration.
+    fn parseWhileStatement(self: *Self) Error!ast.WhileStmt {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const while_tok = try self.expect(.kw_while);
+        _ = try self.expect(.l_paren);
+        const condition = try self.parseExpression();
+        _ = try self.expect(.r_paren);
+        const capture = try self.parseOptionalCaptureClause();
+        const body = try self.parseBlock();
+
+        return .{
+            .condition = condition,
+            .capture = capture,
+            .body = body,
+            .span = while_tok.span.endAt(body.span),
+        };
     }
 
     fn markExpressionBackground(self: *Self, expr: *ast.Expression) Error!void {
@@ -2409,9 +2489,60 @@ pub const Parser = struct {
         }
     }
 
+    /// Tokens that may appear inside an unquoted executable path
+    /// (`./scripts/start-2`, `/usr/bin/env`).
+    fn isPathToken(tag: token.Tag) bool {
+        return switch (tag) {
+            .identifier, .slash, .dot, .range, .minus, .int_literal => true,
+            else => false,
+        };
+    }
+
+    /// Option-1 path command: an unquoted executable whose name begins with a
+    /// path sigil — `/…` (absolute), `./…` or `../…` (relative). None of these can
+    /// begin an ordinary expression (`/`, `.`, `..` all need a left operand), so
+    /// there is no ambiguity with division/member-access. Consumes the contiguous
+    /// (no-whitespace) run of path tokens into a single identifier whose name is
+    /// the full path, which then flows through the normal executable machinery.
+    fn tryParsePathExpression(self: *Self) Error!?*ast.Expression {
+        const lookahead = self.peekSlice(2) catch return null;
+        if (lookahead.len == 0) return null;
+        const first = lookahead[0];
+        const adjacent = lookahead.len >= 2 and lookahead[1].span.start.offset == first.span.end.offset;
+        const is_path_start = switch (first.tag) {
+            .slash => true,
+            .dot, .range => adjacent and lookahead[1].tag == .slash,
+            else => false,
+        };
+        if (!is_path_start) return null;
+
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(self.allocator);
+        var start_span: ?token.Span = null;
+        var end_span: token.Span = first.span;
+        var expected_offset: usize = first.span.start.offset;
+        while (true) {
+            const t = self.peekToken() catch break;
+            if (!isPathToken(t.tag)) break;
+            if (start_span != null and t.span.start.offset != expected_offset) break;
+            _ = try self.nextToken();
+            try buf.appendSlice(self.allocator, t.lexeme);
+            if (start_span == null) start_span = t.span;
+            end_span = t.span;
+            expected_offset = t.span.end.offset;
+        }
+
+        const name = try self.copyToArena(u8, buf.items);
+        return try self.allocExpression(.{
+            .identifier = .{ .name = name, .span = token.Span.fromTo(start_span.?, end_span) },
+        });
+    }
+
     fn parsePrimaryExpression(self: *Self) Error!*ast.Expression {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
+
+        if (try self.tryParsePathExpression()) |path_expr| return path_expr;
 
         const expected_primary_tokens = [_]token.Tag{
             .identifier,
@@ -2484,6 +2615,26 @@ pub const Parser = struct {
             },
             else => self.failExpectedTokens(tok.tag, &expected_primary_tokens),
         };
+    }
+
+    /// Parses `Name(arg, arg, …)` — a generic type application in value position
+    /// — into a call whose arguments are the comma-separated type expressions.
+    /// The compiler serializes this to a type-application string.
+    fn parseValueTypeApplication(self: *Self, callee_id: ast.Identifier) Error!*ast.Expression {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        _ = try self.expect(.l_paren);
+        const args = try self.parseList(.comma, parseExpression, .{});
+        const close = try self.expect(.r_paren);
+
+        return self.allocExpression(.{ .call = .{
+            .callee = try self.allocExpression(.{ .identifier = callee_id }),
+            .arguments = args.payload,
+            .redirects = &.{},
+            .background = false,
+            .span = callee_id.span.endAt(close.span),
+        } });
     }
 
     fn parseParenthesizedExpression(self: *Self) Error!*ast.Expression {
@@ -2744,12 +2895,24 @@ pub const Parser = struct {
 
         const start = try self.expectTokenTag(.kw_const);
         const identifier = try self.parseTypeIdentifier();
+
+        // Optional type parameters for a generic type constructor:
+        // `const Box(T) = struct { value: T }`.
+        var params: []const ast.Identifier = &.{};
+        if ((try self.peekToken()).tag == .l_paren) {
+            _ = try self.expectTokenTag(.l_paren);
+            const list = try self.parseList(.comma, parseTypeIdentifier, .{});
+            _ = try self.expectTokenTag(.r_paren);
+            params = list.payload;
+        }
+
         _ = try self.expectTokenTag(.assign);
         const type_expr = try self.parseTypeExpr();
 
         return .{
             .span = start.span.endAt(type_expr.span()),
             .identifier = identifier,
+            .params = params,
             .type_expr = type_expr,
         };
     }
@@ -3082,9 +3245,11 @@ pub const Parser = struct {
 
         return switch (next.tag) {
             .identifier => self.parseIdentifierTypeExpr(),
+            .pipe => self.parseTypeCaptureTypeExpr(),
             // .kw_enum => self.parseEnumTypeExpr(),
             // .kw_union => self.parseUnionTypeExpr(),
             .kw_struct => self.parseStructTypeExpr(),
+            .kw_fn => self.parseFunctionTypeExpr(),
             .kw_error => self.parseErrorTypeExpr(),
             .l_bracket => self.parseArrayTypeExpr(),
             // .caret => self.parsePromiseTypeExpr(),
@@ -3187,6 +3352,45 @@ pub const Parser = struct {
         });
     }
 
+    /// A function type in type position: `fn(ParamType, …) ReturnType`. The
+    /// stdin type is left implicit (Void); the return type is optional. Used to
+    /// type a function-valued parameter (`f: fn(Int) Int`).
+    fn parseFunctionTypeExpr(self: *Self) Error!*const ast.TypeExpr {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const start = try self.expectTokenTag(.kw_fn);
+        _ = try self.expectTokenTag(.l_paren);
+
+        var params = std.ArrayList(?*const ast.TypeExpr).empty;
+        defer params.deinit(self.allocator);
+        while (true) {
+            self.skipNewlines();
+            if ((try self.peekToken()).tag == .r_paren) break;
+            const param_type = try self.parseTypeExpr();
+            try params.append(self.allocator, param_type);
+            self.skipNewlines();
+            if ((try self.peekToken()).tag == .comma) _ = try self.nextToken();
+        }
+        const close = try self.expectTokenTag(.r_paren);
+
+        var return_type: ?*const ast.TypeExpr = null;
+        var end = close.span;
+        if (try self.parseMaybeTypeExpr()) |rt| {
+            return_type = rt;
+            end = rt.span();
+        }
+
+        return self.allocTypeExpression(.{
+            .function = .{
+                .params = .{ ._non_variadic = try self.copyToArena(?*const ast.TypeExpr, params.items) },
+                .stdin_type = null,
+                .return_type = return_type,
+                .span = start.span.endAt(end),
+            },
+        });
+    }
+
     /// `struct { name: Type, … }` — a user-defined struct type. Fields are
     /// `name: Type`, separated by commas and/or newlines (trailing comma ok).
     /// Methods are free functions with an explicit receiver param (UFCS), so the
@@ -3273,6 +3477,25 @@ pub const Parser = struct {
         return .fromToken(identifier);
     }
 
+    /// Parses a type capture `|T|` into a `type_capture` type expression. The
+    /// name is bound to the type occupying this position (directly, or — nested
+    /// under `[]`/`?` — to an element/child) and is usable anywhere a type is.
+    fn parseTypeCaptureTypeExpr(self: *Self) Error!*const ast.TypeExpr {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const open = try self.expectTokenTag(.pipe);
+        const name = try self.parseTypeIdentifier();
+        const close = try self.expectTokenTag(.pipe);
+
+        return self.allocTypeExpression(.{
+            .type_capture = .{
+                .name = name.name,
+                .span = open.span.endAt(close.span),
+            },
+        });
+    }
+
     fn parseIdentifierTypeExpr(self: *Self) Error!*const ast.TypeExpr {
         const spanned_path: ast.Spanned([]ast.Identifier) = try self.parseList(
             .dot,
@@ -3310,12 +3533,28 @@ pub const Parser = struct {
             return Error.ExpectedTypeIdentifier;
         }
 
-        // TODO: implement generic function type expressions
+        // A generic type application `Name(args…)` — e.g. `Box(Int)`, `Box(|T|)`.
+        if ((try self.peekToken()).tag == .l_paren) {
+            _ = try self.expectTokenTag(.l_paren);
+            const args = try self.parseList(.comma, parseTypeExprArg, .{});
+            const close = try self.expectTokenTag(.r_paren);
+            return self.allocTypeExpression(.{ .type_application = .{
+                .name = last_segment,
+                .args = args.payload,
+                .span = spanned_path.span.endAt(close.span),
+            } });
+        }
 
         return self.allocTypeExpression(.{ .identifier = .{
             .path = .{ .segments = spanned_path.payload, .span = spanned_path.span },
             .span = spanned_path.span,
         } });
+    }
+
+    /// A single type argument inside a `Name(args…)` application. Wraps
+    /// `parseTypeExpr` for use with `parseList` (which expects a `*const` result).
+    fn parseTypeExprArg(self: *Self) Error!*const ast.TypeExpr {
+        return self.parseTypeExpr();
     }
 
     fn parseArrayTypeExpr(self: *Self) Error!*const ast.TypeExpr {
@@ -3334,7 +3573,7 @@ pub const Parser = struct {
 
     fn isTypeExprTerminator(tag: token.Tag) bool {
         return switch (tag) {
-            .l_paren, .l_brace, .l_bracket, .identifier, .star, .caret, .bang, .question, .kw_enum, .kw_error, .kw_union, .kw_struct => false,
+            .l_paren, .l_brace, .l_bracket, .identifier, .star, .caret, .bang, .question, .pipe, .kw_enum, .kw_error, .kw_union, .kw_struct, .kw_fn => false,
             else => true,
         };
     }

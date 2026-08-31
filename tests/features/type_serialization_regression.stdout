@@ -1,0 +1,18 @@
+Int
+String
+Bool
+Point
+Box
+type of i is Int
+type of s is String
+Int String Point
+generic type is Int
+generic type is String
+generic type is Float
+nested capture is Int
+Box(Int)
+Box(String)
+Box(Box(Int))
+Pair(Int, String)
+Pair(Box(Int), Bool)
+array captures: []Int and []String

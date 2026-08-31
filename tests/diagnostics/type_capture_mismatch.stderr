@@ -1,0 +1,6 @@
+[error]: tests/diagnostics/type_capture_mismatch.rn:2:16: expected type T, actual: String
+   1:const seed: |T| = 7
+   2:const bad: T = "not an int"
+   3:echo "${bad}"
+   4:
+

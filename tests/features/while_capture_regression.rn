@@ -1,0 +1,28 @@
+// `while (opt) |v| { … }` loops while the optional condition is non-null,
+// binding the unwrapped value to `v` for that iteration (the optional analogue
+// of `if (opt) |v|`). The condition is re-read each pass, so reassigning the
+// optional inside the body drives the loop; an optional that starts null skips
+// the body entirely.
+
+// Count down through an ?Int, ending the loop by assigning null.
+var cur: ?Int = 3
+while (cur) |v| {
+    echo "v=${v}"
+    if (v <= 1) { cur = null } else { cur = v - 1 }
+}
+echo "int-done"
+
+// A ?String capture binds the unwrapped String.
+var s: ?String = "a"
+while (s) |line| {
+    echo "line=${line}"
+    if (line == "a") { s = "b" } else { s = null }
+}
+echo "str-done"
+
+// An optional that starts null never enters the body.
+var empty: ?Int = null
+while (empty) |v| {
+    echo "unreachable ${v}"
+}
+echo "empty-skipped"

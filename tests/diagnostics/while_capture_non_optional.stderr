@@ -1,0 +1,8 @@
+[error]: tests/diagnostics/while_capture_non_optional.rn:2:8: a `while (…) |v|` capture requires an optional condition
+   1:var n = 5
+   2:while (n) |v| {
+   3:  echo "${v}"
+   4:  n = n - 1
+   5:}
+   6:
+

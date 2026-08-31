@@ -92,6 +92,15 @@ A working parser, type checker, and IR-based runtime are in place. The following
 - Error declarations (`error Foo = enum/union`), `try`/`catch`, and exact-value `match`
 - Background process execution via trailing `&`, with `.wait` on captured execution values
 - Module imports via `import "spec"`
+- User-defined structs and methods (UFCS)
+- **Generic type constructors and functions** — `const Box(T) = struct { … }`,
+  `|T|` type captures, and per-type **monomorphization** (including nested
+  applications and recursion)
+- **Compile-time evaluation** — `comptime <expr>` interprets pure functions at
+  compile time
+- Runtime type tests with `is`, including narrowing inside `if (x is T) { … }`
+- **Generic collections** — `std.map`, a hashed key/value map (immutable and
+  mutable APIs, insertion-order iteration)
 
 Runic aims to be familiar enough that a bash user can start using it immediately, yet principled enough to scale to large automation projects without the typical bash scripting pitfalls.
 

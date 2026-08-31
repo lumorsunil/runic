@@ -334,6 +334,7 @@ const StatementExpressionIterator = struct {
                 try cursor.appendExpr(for_expr.body);
                 try self.cursor.appendExpressions(for_expr.sources);
             },
+            .comptime_expr => |comptime_expr| try cursor.appendExpr(comptime_expr.operand),
             .executable => {},
             .subshell => |subshell| try cursor.appendExpr(subshell.child),
         }

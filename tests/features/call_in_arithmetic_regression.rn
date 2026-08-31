@@ -21,9 +21,9 @@ const p: Point = Point{ .x = 3, .y = 4 }
 const q: Point = Point{ .x = 1, .y = 2 }
 echo "p.magSq-q.magSq=${p.magSq - q.magSq}"
 
-# A UFCS call on a nested field receiver, twice in one expression (kept positive
-# — Int is unsigned, so the larger magnitude goes first).
+# A UFCS call on a nested field receiver, twice in one expression. Int is signed,
+# so a smaller-minus-larger difference is negative.
 const Seg = struct { from: Point, to: Point }
 fn Void span(s: Seg) Int { yield s.from.magSq - s.to.magSq }
-const seg: Seg = Seg{ .from = p, .to = q }
+const seg: Seg = Seg{ .from = q, .to = p }
 echo "span=${span seg}"

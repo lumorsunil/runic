@@ -1,0 +1,9 @@
+len=4
+at0=a at2=c
+part: a
+part: b
+part: c
+part: d
+whole.len=1 whole0=abc
+joined=the quick fox
+rejoined=one | two | three

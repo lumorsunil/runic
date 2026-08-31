@@ -1,0 +1,30 @@
+# Recursion returning a value (stdlib Phase 0): a self-recursive call can be
+# captured as a typed value — bound and used in arithmetic, added to another
+# recursive call, etc. Previously this crashed (closure sized 0) or byte-captured
+# the result to a string.
+fn Void @() Void
+
+fn Void sumTo(n: Int) Int {
+  if (n == 0) { yield 0 } else { yield n + sumTo (n - 1) }
+}
+echo "sumTo5=${sumTo 5}"
+
+fn Void fact(n: Int) Int {
+  if (n == 0) { yield 1 } else { yield n * fact (n - 1) }
+}
+echo "fact5=${fact 5}"
+
+# Two recursive calls in one arithmetic expression.
+fn Void fib(n: Int) Int {
+  if (n < 2) { yield n } else { yield fib (n - 1) + fib (n - 2) }
+}
+echo "fib10=${fib 10}"
+
+# Bind the recursive result, then use it.
+fn Void countUp(n: Int) Int {
+  if (n == 0) { yield 0 } else {
+    const rest = countUp (n - 1)
+    yield rest + 1
+  }
+}
+echo "countUp7=${countUp 7}"

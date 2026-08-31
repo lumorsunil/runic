@@ -1,0 +1,26 @@
+// A call through a module member (`m.fn args`) must value-capture the result
+// typed as the pub fn's declared return type — exactly like a direct call —
+// instead of degrading to a thread handle. Regression: `m.triple 5 + …` failed
+// at runtime (arithmetic on a handle) and `m.map(...).len` reported "member len
+// not found on struct". Covers scalar, generic-array, and optional returns,
+// through both a direct member and a nested (re-exported) member.
+const m = import "../support/imports/typed_returns.rn"
+const root = import "../support/imports/typed_returns_root.rn"
+
+fn Void dbl(n: Int) Int { yield n + n }
+
+// scalar Int return, used in arithmetic
+const t = m.triple 5
+echo "triple=${t} plus=${t + t}"
+
+// generic []U return, used with .len and for
+const nums = .{ 1, 2, 3 }
+const doubled = m.map nums dbl
+echo "map len=${doubled.len}"
+for (doubled) |d| { echo "  d=${d}" }
+
+// optional return, used with orelse
+echo "some=${m.maybe 7 orelse 0} none=${m.maybe 0 orelse 99}"
+
+// nested member access (root.nums.triple)
+echo "nested=${root.nums.triple 4}"

@@ -1,0 +1,46 @@
+// A type capture `|T|` binds `T` to the type occupying that position, and `T`
+// is then usable anywhere a type is. In a binding it captures the initializer's
+// concrete type; in a function signature it acts as a generic type variable.
+// Nested under a built-in generic it destructures: `[]|T|` binds the element
+// type, `?|T|` the child.
+
+// Capture in a binding, then reuse the captured type.
+const x: |T| = 42
+const y: T = 100
+echo "x=${x} y=${y}"
+
+// A String capture.
+const name: |S| = "hi"
+const greeting: S = "hello"
+echo "${greeting}"
+
+// Generic function parameter — one definition, any argument type.
+fn Void say(greeting: |G|) Void {
+    echo "${greeting}"
+}
+say "hello"
+say "world"
+
+// Destructure `[]|T|` in a parameter and return the element type.
+fn Void firstOf(xs: []|E|) E { yield xs[0] }
+const nums = .{ 5, 6, 7 }
+echo "first=${firstOf nums}"
+
+// Destructure `[]|T|` in a binding.
+const arr: []|A| = .{ "a", "b" }
+const single: A = "z"
+echo "single=${single}"
+for (arr) |s| { echo "arr=${s}" }
+
+// Destructure `?|T|` — a capture nested in an optional. A `null` initializer
+// leaves the capture a permissive type variable.
+var maybe: ?|M| = null
+maybe = 9
+if (maybe) |v| { echo "maybe=${v}" }
+
+// Capture a struct type — member access resolves through the captured type.
+const Point = struct { x: Int, y: Int }
+const p: Point = Point{ .x = 1, .y = 2 }
+const q: |P| = p
+const r: P = Point{ .x = 3, .y = 4 }
+echo "q=${q.x},${q.y} r=${r.x},${r.y}"

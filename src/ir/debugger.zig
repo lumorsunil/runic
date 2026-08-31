@@ -96,7 +96,7 @@ pub const IRDebugger = struct {
 
         switch (event) {
             .cont, .cont_no_instr_counter_inc, .skip => return .cont,
-            .exit => unreachable,
+            .exit, .process_exit => unreachable,
         }
     }
 

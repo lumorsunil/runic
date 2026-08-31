@@ -1,0 +1,8 @@
+existsDir=0
+isDir=0
+isFile=0
+content=hello
+more
+
+entryCount=2
+afterRemove=1

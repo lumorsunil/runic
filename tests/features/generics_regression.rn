@@ -1,0 +1,32 @@
+# Generics via implicit type variables (stdlib Phase 2): an uppercase name in a
+# function signature that isn't a declared type is a type variable (`T`/`U`),
+# scoped to the function. Since the runtime is dynamic, the function compiles
+# once and works for any element type; the type checker treats type variables
+# permissively.
+fn Void @() Void
+
+# A generic function used at two different element types.
+fn Void count(xs: []T) Int {
+  var n = 0
+  for (xs) |x| { n = n + 1 }
+  yield n
+}
+const nums = .{ 7, 8, 9 }
+const names = .{ "a", "b" }
+echo "count int=${count nums} count str=${count names}"
+
+# Generic first: returns the element type T.
+fn Void first(xs: []T) T { yield xs[0] }
+echo "first=${first nums}"
+
+# Generic reduce: type variables T (element) and U (accumulator) plus a
+# higher-order function.
+fn Void reduce(xs: []T, f: fn(U, T) U, init: U) U {
+  var acc = init
+  for (xs) |x| { acc = f acc x }
+  yield acc
+}
+fn Void add(a: Int, b: Int) Int { yield a + b }
+fn Void maxOf(a: Int, b: Int) Int { if (a > b) { yield a } else { yield b } }
+echo "sum=${reduce nums add 0}"
+echo "max=${reduce nums maxOf 0}"

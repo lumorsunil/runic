@@ -1,0 +1,230 @@
+# Maps — implementation plan
+
+**Decision (2026-08-29):** no new special syntax — no `{ k: v }` literal, no
+parser-baked `Map(K, V)`. Build maps up from existing primitives (generic
+structs, arrays, generic functions) as a **`std/map` module written in Runic**,
+with the types and generic dispatch handled at comptime (generic type
+constructors + monomorphization) and the data operations at runtime.
+
+## Design: association list
+
+The simplest representation that needs no hashing — an array of key/value
+entries, linear-scanned on lookup. O(n) per operation, which is fine for the
+small maps typical in scripts; hashing is a later optimization (see below).
+
+```rn
+const Entry(K, V) = struct { key: K, value: V }
+const Map(K, V)  = struct { entries: []Entry(K, V) }
+```
+
+Operations are generic functions in `std/map.rn`, monomorphized per `(K, V)`:
+
+- `empty()` → `Map(K, V){ .entries = .{} }` (or a bare-construction helper)
+- `set(m, key, value) Map(K, V)` — scan; replace the entry if the key exists,
+  else append. Returns a **new** map (immutable, matching array `.push`).
+- `get(m, key) ?V` — scan; yield the value or `null`.
+- `has(m, key) Bool`
+- `keys(m) []K`, `values(m) []V`, `len(m) Int` (`m.entries.len`)
+- `remove(m, key) Map(K, V)` — filter out the entry.
+
+Key equality uses `==`, which already works generically for `Int` and `String`
+keys (verified). Struct/array keys need structural equality — deferred.
+
+**Immutable style.** `set`/`remove` return a new map, so usage mirrors arrays:
+`var m = map.empty; m = map.set m "a" 1`. (A mutable in-place style is possible —
+struct fields are assignable through a `var` — but the immutable style is
+consistent with `arr.push` and simpler.)
+
+## Runtime / comptime split
+
+- **Comptime:** the `Map(K, V)` / `Entry(K, V)` type resolution, generic dispatch,
+  and per-`(K, V)` monomorphization of the operations. All type-level.
+- **Runtime:** the `entries` array, the linear scan, the actual `set`/`get`. All
+  value-level. Falls out naturally from generic constructors + monomorphization
+  — no special machinery.
+
+## Verified primitives (all present today)
+
+- Generic type constructors (`const Box(T) = struct { … }`) and monomorphization.
+- Generic `==` for key equality — works for `Int` and `String` (`sameKey 5 5`,
+  `sameKey "x" "x"`).
+- Array growth `arr.push x` (returns a new array), indexing, `.len`, `for`.
+- Struct field mutation through a `var` (`h.items = h.items.push 3`).
+- Optionals `?V` and `orelse`.
+
+## Blockers to fix first (compiler / type-checker)
+
+A prototype (`Entry`/`Map` + `set`/`get`) compiles down to one concrete gap:
+
+1. **Generic struct return-type equality (blocker).** A generic function can't
+   yet return a generic struct: `fn wrap(x: |T|) Box(T) { yield Box{ .value = x } }`
+   fails with a "yield type mismatch" where the yielded and declared types print
+   *identically* (`struct { value: T }`). The struct-type equality check doesn't
+   treat two type-variable fields as equal (or one side is a `type_var` and the
+   other a param identifier). Non-generic struct returns work fine. **This must
+   be fixed before the map module can be written.** Likely in the type-checker's
+   struct assignment/equality (`validateTypeAssignmentStruct` / the yield check):
+   compare struct fields structurally, treating `type_var`/param identifiers
+   permissively (as elsewhere).
+
+2. **`Name(args){ … }` construction (nice-to-have).** Constructing a generic
+   struct with explicit type args — `Entry(K, V){ .key = k, .value = v }` — does
+   not parse; only the bare `Entry{ … }` form works (which is sufficient, the
+   arguments don't affect the runtime layout). Add later for symmetry with the
+   type position.
+
+## Phasing
+
+- [x] **Phase M0 — unblock. DONE (2026-08-30).** Generic structs are now
+  returnable/reusable enough to build the map: fixed struct/application/type-var
+  equality in `pipeTypesEqual`, typed generic struct literals by their field
+  values (+ resolved nested `Entry(K, V)` fields), captured a `type_application`
+  return by value (`isTypedCaptureReturn`), resolved the declared return in
+  `runYield`, and made `var` reassignment value-capture a typed return. The
+  full prototype (`set`/`get`/replace, String and Int keys) runs. Covered by
+  `tests/features/generic_struct_return_regression.rn`.
+- [x] **Phase M1 — the module. DONE (2026-08-30).** `std/map.rn` with `Entry`,
+  `Map`, and `empty`/`set`/`get`/`has`/`keys`/`values`/`len`/`remove`. Registered
+  in `std_modules.zig`, `build.zig`, and `std/std.rn`. Covered by
+  `tests/features/std_map_regression.rn` (String→Int and Int→String, replace,
+  remove) and a `docs/standard-library.md` entry. One compiler change was needed
+  after all: an imported module's own type constructors weren't registered
+  (only the main script's were), so `Map(K, V)` construction failed inside the
+  module — fixed by extracting `registerTypeDecls` and calling it on module
+  statements in `compileImportExpr`.
+- **Phase M2 — ergonomics (optional).** `Name(args){ … }` construction: **DONE
+  (2026-08-30)** — explicit-type-arg struct construction now parses (the type
+  args don't affect layout, so it constructs by name and infers field types from
+  the values); `std/map.rn` uses it. Fixing this also surfaced and fixed a
+  pre-existing gap: member access on a *captured generic struct return*
+  (`const e = wrap "x" 5` where `wrap` yields `Entry(K, V)`) — the member-access
+  path didn't resolve a `type_application` object type to its struct layout.
+  Covered by `tests/features/generic_struct_construction_regression.rn`.
+  **Mutable API DONE (2026-08-31):** `setIn`/`removeIn` mutate the map in
+  place (a Runic struct is passed by reference), coexisting with the immutable
+  `set`/`remove`. Covered by `tests/features/std_map_mutable_regression.rn`.
+- [x] **Phase M3 — hashing for O(1) lookup. DONE (2026-08-31).** `std/map.rn` is
+  now a hashed map: keys hash into a fixed number of buckets (each a small
+  association list scanned on collision), with a parallel ordered entries list
+  preserving insertion order for `keys`/`values`. Same public surface and
+  behavior as M1 (its test output is unchanged); collisions and
+  interpolated-vs-literal key lookup are covered. Getting here needed a chain of
+  foundational fixes, all landed and each broadly useful beyond maps:
+  `s.bytes` (byte access) · `is`-narrowing (`if (x is String)` narrows `x`) ·
+  array element-type propagation through indexing (incl. struct-field arrays and
+  call indices) · integer `%` yields Int (not Float) · **interpolated strings
+  flatten to real `String` values** (the last blocker — a built string was an
+  `.addr` rope that `is String` rejected, so hashing diverged between built and
+  literal keys).
+  Historical blocker analysis (all resolved) follows.
+
+- **Resize-on-load-factor: investigated and REJECTED (2026-08-31).** A working
+  resize version (grow + rehash at load 3/4, parameterizing the bucket index by
+  the current bucket count) was implemented and made correct — but it is **~25×
+  slower** than the fixed-count map (22 keys: ~1s fixed vs ~25s resizing), and a
+  64-bucket map times out entirely. Root cause: an immutable `set` rebuilds the
+  bucket array with `arr.push` in a loop, which is **O(buckets²)** (each push
+  copies the whole growing array), so *more* buckets makes *every* `set`
+  quadratically slower — the opposite of helpful, since `set` (immutable rebuild
+  + typed-return capture) already dominates and `get`/`has` are the only O(1)
+  beneficiaries. In this interpreter's cost model a **fixed small bucket count is
+  optimal**; growing it is counterproductive.
+
+  **Follow-up (2026-08-31): `arr.with` + in-place linear buffers landed, and
+  resize is STILL rejected — now with the definitive root cause.**
+  - `arr.with index value` — O(n) immutable element update, used by `std.map`.
+  - **In-place linear buffers** — a `var x = .{ }` grown only via `x = x.push e`
+    / `x = x.with i e`, read only as `x[i]`/`for(x)`/`x.len`, and escaping only in
+    a final `yield`, is uniquely owned, so it's mutated **in place** (amortized
+    O(1)). This turns O(n²) build loops into O(n) (building 3000 elements: 5.6s →
+    1.0s) — a big general win for `keys`/`values`/`std.list`/any builder. Gated by
+    a conservative whole-function analysis that bails on anything it can't model.
+    (The return mechanism itself was checked and is already O(1) — a typed pipe
+    stores the struct's addr, no deep copy; the earlier "return serialization"
+    guess was wrong.)
+  - **Why resize is still O(n²):** the map's `set` does `m.buckets.with idx …`,
+    but `m` is a *parameter* (not a linear local), so it copies the O(buckets)
+    array on every `set`. A resizing map grows buckets → O(n²) to build; a fixed
+    bucket count keeps `set` at O(fixed) → O(n). In-place mutation can't apply
+    here: `m` is shared with the caller across the call boundary, so mutating its
+    buckets in place would corrupt the caller's map. The true prerequisite is
+    **uniqueness/linearity that flows across a call** (move the map into `set`,
+    mutate, return) — full linear types, well beyond this work. **The map stays
+    fixed-count.**
+
+- **Phase M3 — performance (original notes).** hashing for O(1) lookup — a
+  comptime hash/eq dispatched per key type (buckets of entries), or a builtin
+  fast path, keeping the same `std/map` surface. **Blocked on foundational
+  features**
+  (2026-08-30 investigation): (1) a **string hash primitive** — there's no way
+  to fold over a string's bytes in Runic today (`s.split ""` returns the whole
+  string, no byte/char access), so a String hash needs a builtin or `s.bytes`;
+  per-key-type dispatch itself already works (`if (key is String) …`, a runtime
+  test on a type-param value). (2) **Array element-type propagation through
+  indexing** — buckets must be indexed (`buckets[h]`), and indexing lost the
+  element type. **DONE (2026-08-30):** `.push` now refines an unknown (`[]Void`)
+  element type from the pushed value, and reassigning a mutable variable refines
+  its tracked type; `arr[i].field`, `arr[i][j]`, and `const b = arr[i]` now
+  resolve. Covered by `tests/features/array_element_typing_regression.rn`.
+
+  **Byte access DONE (2026-08-31):** `s.bytes` yields a string's bytes as
+  `[]Int`, so a hash can be folded from primitives (a polynomial rolling hash
+  works — Runic has no bitwise `^`, so FNV-1a-style xor is out; use `*`/`+`/`%`).
+  Covered by `tests/features/string_bytes_regression.rn`.
+
+  **`is`-narrowing DONE (2026-08-31):** inside `if (key is String) { … }` the
+  subject narrows to the tested type, so `key.bytes`/`key.upper` resolve and the
+  hash can be folded **inline** on the narrowed key (no helper → sidesteps the
+  call-boundary bug below). Covered by `tests/features/is_narrowing_regression.rn`.
+
+  **Struct-field / call-index array typing DONE (2026-08-31):** `m.buckets[i]`
+  and `arr[hash key]` now resolve (mutable reassignment refines `type_expr`; an
+  inline-call index is captured). So the bucketed `Map`/`Bucket`/`Entry`
+  representation constructs and reads with literal indices.
+
+  **Integer modulo fix DONE (2026-08-31):** the real blocker turned out to be
+  `int % int` returning **Float** (the slow arithmetic path forced float), so a
+  hash bucket `h % n` couldn't index an array (`addr + Float`). `%` now yields an
+  Int for integer operands (using `@mod`, so `x % n` ∈ `[0, n)` for positive `n`).
+  Covered by `tests/features/integer_modulo_regression.rn`.
+
+  **All M3 compiler/runtime blockers are now cleared.** The full bucketed
+  prototype runs end-to-end (`Map`/`Bucket`/`Entry`, inline `is`-narrowed hashing,
+  String and Int keys, replace-in-place). One pre-existing bug remains *noted but
+  sidestepped*: array-returning string ops (`.bytes`/`.split`) on a string passed
+  one hop as a function argument yield empty — inline hashing avoids it.
+
+  **Hashed `std/map.rn` v2 was written** (buckets for O(1) lookup + a parallel
+  ordered entries list to preserve insertion order; fixed bucket count, resize
+  deferred). It passes the M1 test (literal keys) and the bucketed prototype runs
+  — kept at `future/map-hashed-prototype.rn`.
+
+  **But it is NOT shipped: a deeper soundness bug blocks it.** `is String` returns
+  **false for a runtime-built string** (interpolation, concatenation) — those are
+  `.addr`-backed byte sequences, and `is_type`'s `.string` case only matches
+  `.slice`/`.zig_string`. An `.addr` heap sequence is structurally
+  indistinguishable from a `[]Int`/`[]String` array at runtime, so `is_type`
+  can't soundly say "this addr is a String." Consequence: `bucketOf` on an
+  interpolated key (`"k${i}"`) takes the wrong branch, so hashing is inconsistent
+  between literal and built keys and lookups miss. The M1 association list is
+  **correct** for all keys (it uses `==`, which compares by content), so `std.map`
+  stays on M1 — shipping the hashed v2 would be a regression.
+
+  **This `is`-on-built-strings bug is general, not map-specific:** it also makes
+  the shipped `is`-narrowing unsound for runtime-built strings (`if (s is String)`
+  where `s` was interpolated → false). Fixing it is the real prerequisite for a
+  hashed map. Options: (a) normalize interpolated/concatenated strings to a
+  `.slice`/`.zig_string` representation so `is String` recognizes them (the sound
+  fix, but touches interpolation); (b) tag heap byte-strings distinctly from
+  arrays so `is_type` can tell them apart. Not attempted yet.
+
+  Design decision already made for v2 (iteration order): keep insertion order via
+  a parallel ordered list alongside the buckets.
+
+## Open questions
+
+- **Key types beyond `Int`/`String`:** how far to push generic equality (structs,
+  arrays). Start with what `==` supports; document the limit.
+- ~~**Immutable vs mutable API** (or both).~~ Resolved: both — immutable
+  `set`/`remove` and mutable `setIn`/`removeIn`.
+- **Iteration order:** insertion order (an association list preserves it for free).

@@ -1,0 +1,24 @@
+// Explicit-type-argument construction of a generic struct: `Name(A, B){ … }`,
+// symmetric with the type position (`Name(A, B)`). The type arguments don't
+// affect the runtime layout; the compiler infers field types from the values.
+// Covers construction at top level, inside a generic function (with |T| capture
+// params), member access on a captured generic struct return, and that a plain
+// value type application (no braces) still resolves. Deterministic output.
+const Entry(K, V) = struct { key: K, value: V }
+const Pair(A, B) = struct { first: A, second: B }
+
+// Top-level explicit-arg construction.
+const p = Pair(Int, String){ .first = 1, .second = "hi" }
+echo "p ${p.first} ${p.second}"
+
+// Inside a generic function, constructing the declared generic return.
+fn Void wrap(k: |K|, v: |V|) Entry(K, V) {
+  yield Entry(K, V){ .key = k, .value = v }
+}
+
+// Member access on a captured generic struct return (const binding).
+const e = wrap "x" 5
+echo "e ${e.key}=${e.value}"
+
+// A plain value type application (no braces) still serializes.
+echo "type=${Pair(Int, String)}"

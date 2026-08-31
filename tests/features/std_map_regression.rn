@@ -1,0 +1,40 @@
+// std.map — a generic hashed map built in Runic (buckets for O(1) lookup, a
+// parallel ordered list for insertion-order iteration). Exercises the full
+// surface (empty/set/get/has/len/keys/values/remove) with both String→Int and
+// Int→String maps, including replacing an existing key and removing one, plus
+// more entries than buckets (collisions) and interpolated keys that must hash
+// identically to the same literal. Output is deterministic content.
+const std = import "std"
+
+var m = std.map.empty
+m = std.map.set m "a" 1
+m = std.map.set m "b" 2
+m = std.map.set m "a" 99
+
+echo "a=${std.map.get m "a" orelse 0} b=${std.map.get m "b" orelse 0} c=${std.map.get m "c" orelse 0}"
+echo "len=${std.map.len m} has-a=${std.map.has m "a"} has-z=${std.map.has m "z"}"
+
+const ks = std.map.keys m
+const vs = std.map.values m
+echo "k0=${ks[0]} k1=${ks[1]} v0=${vs[0]} v1=${vs[1]}"
+
+m = std.map.remove m "a"
+echo "afterRemove len=${std.map.len m} a=${std.map.get m "a" orelse 0} b=${std.map.get m "b" orelse 0}"
+
+var im = std.map.empty
+im = std.map.set im 10 "ten"
+im = std.map.set im 20 "twenty"
+echo "10=${std.map.get im 10 orelse "?"} 20=${std.map.get im 20 orelse "?"} 30=${std.map.get im 30 orelse "?"}"
+
+// More keys than buckets forces collisions; keys are built by interpolation but
+// looked up by literal, which must hash the same. Iteration stays in insertion
+// order.
+var big = std.map.empty
+var i = 0
+while (i < 25) {
+  big = std.map.set big "k${i}" (i * 10)
+  i = i + 1
+}
+echo "bigLen=${std.map.len big} k0=${std.map.get big "k0" orelse 0} k12=${std.map.get big "k12" orelse 0} k24=${std.map.get big "k24" orelse 0} miss=${std.map.get big "nope" orelse 0}"
+const bk = std.map.keys big
+echo "first=${bk[0]} thirteenth=${bk[12]} last=${bk[24]}"

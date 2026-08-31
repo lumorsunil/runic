@@ -1,0 +1,77 @@
+// The reserved `import "std"` resolves to the bundled, embedded standard
+// library (no filesystem lookup); modules are public members (`std.list.*`).
+// Bool renders in the exit-code convention: true -> "0", false -> "1".
+const std = import "std"
+
+fn Void dbl(n: Int) Int { yield n + n }
+fn Void isEven(n: Int) Bool { yield (n % 2) == 0 }
+fn Void add(a: Int, b: Int) Int { yield a + b }
+
+const nums = .{ 1, 2, 3, 4, 5 }
+
+const doubled = std.list.map nums dbl
+echo "map=${doubled.len}"
+
+const evens = std.list.filter nums isEven
+echo "filter=${evens.len}"
+
+echo "reduce=${std.list.reduce nums add 0}"
+echo "count=${std.list.count nums}"
+
+const r = std.list.reverse nums
+echo "reverse=${r[0]}${r[4]}"
+
+const c = std.list.concat nums evens
+echo "concat=${c.len}"
+
+const rng = std.list.range 2 6
+echo "range=${rng.len}:${rng[0]}:${rng[3]}"
+
+echo "any=${std.list.any nums isEven}"
+echo "all=${std.list.all nums isEven}"
+
+// std.str composites
+const w = std.str.words "  a   b c "
+echo "words=${w.len}"
+echo "cap=${std.str.capitalize "hello"}"
+echo "blank1=${std.str.isBlank "   "}"
+echo "blank2=${std.str.isBlank "x"}"
+echo "padL=${std.str.padLeft "7" 4 "0"}"
+echo "padR=${std.str.padRight "7" 4 "."}"
+
+// std.path
+echo "base=${std.path.basename "a/b/c.txt"}"
+echo "dir=${std.path.dirname "a/b/c.txt"}"
+echo "ext=${std.path.ext "a/b/c.txt"}"
+echo "stem=${std.path.stem "a/b/c.txt"}"
+echo "abs=${std.path.isAbsolute "/x"}"
+const segs = .{ ".runic", "config" }
+echo "join=${std.path.join segs}"
+
+// std.math
+echo "abs=${std.math.abs (0 - 5)}"
+echo "min=${std.math.min 3 8} max=${std.math.max 3 8}"
+echo "clamp=${std.math.clamp 15 0 10}"
+echo "sign=${std.math.sign (0 - 3)}${std.math.sign 0}${std.math.sign 7}"
+echo "pow=${std.math.pow 2 8}"
+
+// std.math Float surface (backed by builtins)
+echo "sqrt=${std.math.sqrt 16.0}"
+echo "floor=${std.math.floor 3.9} ceil=${std.math.ceil 3.1}"
+echo "absF=${std.math.absF (0.0 - 4.5)}"
+echo "powF=${std.math.powF 3.0 3.0}"
+
+// std.list additions: find / contains / sort
+fn Void gt3(n: Int) Bool { yield n > 3 }
+fn Void less(a: Int, b: Int) Bool { yield a < b }
+echo "find=${std.list.find nums gt3 orelse 0}"
+echo "contains3=${std.list.contains nums 3}"
+echo "contains9=${std.list.contains nums 9}"
+const unsorted = .{ 3, 1, 2 }
+const sorted = std.list.sort unsorted less
+echo "sort=${sorted[0]}${sorted[1]}${sorted[2]}"
+
+// std.path.normalize
+echo "norm1=${std.path.normalize "a/b/../c"}"
+echo "norm2=${std.path.normalize "/x/./y//z"}"
+echo "norm3=${std.path.normalize "/a/../.."}"

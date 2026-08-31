@@ -1,0 +1,26 @@
+// std.map's mutable variants: `setIn`/`removeIn` update the map in place (a
+// struct is passed by reference), so the caller's map changes without a
+// reassignment. Same semantics as `set`/`remove`; the immutable and mutable
+// styles coexist. Deterministic output.
+const std = import "std"
+
+var m = std.map.empty
+std.map.setIn m "a" 1
+std.map.setIn m "b" 2
+std.map.setIn m "a" 99
+echo "a=${std.map.get m "a" orelse 0} b=${std.map.get m "b" orelse 0} c=${std.map.get m "c" orelse 0}"
+echo "len=${std.map.len m} has-a=${std.map.has m "a"} has-z=${std.map.has m "z"}"
+
+const ks = std.map.keys m
+echo "k0=${ks[0]} k1=${ks[1]}"
+
+std.map.removeIn m "a"
+echo "afterRemove len=${std.map.len m} a=${std.map.get m "a" orelse 0} b=${std.map.get m "b" orelse 0}"
+
+// Int keys, and mutating inside a loop.
+var counts = std.map.empty
+for (.{ 1, 2, 2, 3, 2, 1 }) |n| {
+  const cur = std.map.get counts n orelse 0
+  std.map.setIn counts n (cur + 1)
+}
+echo "count1=${std.map.get counts 1 orelse 0} count2=${std.map.get counts 2 orelse 0} count3=${std.map.get counts 3 orelse 0} len=${std.map.len counts}"

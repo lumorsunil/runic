@@ -1,0 +1,4 @@
+args: x y
+args: from-var
+got args: captured
+

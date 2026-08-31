@@ -15,6 +15,24 @@ pub fn build(b: *std.Build) void {
     });
     runtime.addImport("runic", runtime);
 
+    // Embed the bundled standard-library sources (repo-root `std/`) so
+    // `src/frontend/std_modules.zig` can `@embedFile` them by these names. Keep
+    // this list in sync with the `modules` table in `std_modules.zig`.
+    const std_module_files = [_][]const u8{
+        "std/std.rn",
+        "std/list.rn",
+        "std/str.rn",
+        "std/path.rn",
+        "std/math.rn",
+        "std/fs.rn",
+        "std/env.rn",
+        "std/testing.rn",
+        "std/map.rn",
+    };
+    for (std_module_files) |rel| {
+        runtime.addAnonymousImport(rel, .{ .root_source_file = b.path(rel) });
+    }
+
     const lsp = b.addModule("runic_lsp", .{
         .root_source_file = b.path("src/lsp/root.zig"),
         .target = target,

@@ -1,0 +1,5 @@
+a=99 b=2 c=0
+len=2 has-a=0 has-z=1
+k0=a k1=b
+afterRemove len=1 a=0 b=2
+count1=2 count2=3 count3=1 len=3

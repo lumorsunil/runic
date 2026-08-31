@@ -1,0 +1,5 @@
+applyOnce dbl 5 = 10
+applyOnce inc 5 = 6
+twice inc 5 = 7
+twice dbl 3 = 12
+combine add 4 7 = 11

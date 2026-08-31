@@ -1,0 +1,11 @@
+// A module that re-exports sub-modules via `pub const x = import "…"` must expose
+// every re-exported module, not just the first two. Regression: a module value
+// occupies one slot (it stores an address to its sub-struct), but the result
+// struct's field offsets summed each field's slotSize — and a module-value field
+// is itself a struct with slotSize > 1 — so the 2nd re-export read the 1st's
+// value and the 3rd+ dereferenced a bad address. This is the `std` root pattern
+// (`std.list`, `std.str`, `std.path`, …), so it gated every module past the 2nd.
+const r = import "../support/imports/reexport_root.rn"
+echo "a=${r.a.v}"
+echo "b=${r.b.v}"
+echo "c=${r.c.v}"

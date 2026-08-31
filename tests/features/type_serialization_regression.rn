@@ -1,0 +1,56 @@
+// A type identifier used where a string is expected serializes to the type's
+// name — in string interpolation or as a bare command argument. Named types
+// give their name; a bound `|T|` capture gives the captured type's name. Types
+// are compile-time only, so this is a compile-time string constant.
+
+// Primitive type names.
+echo "${Int}"
+echo "${String}"
+echo "${Bool}"
+
+// A named struct type.
+const Point = struct { x: Int, y: Int }
+echo "${Point}"
+
+// A generic constructor name.
+const Box(T) = struct { value: T }
+echo "${Box}"
+
+// A `|T|` capture in a binding gives the captured concrete type.
+const i: |T| = 42
+echo "type of i is ${T}"
+const s: |U| = "hi"
+echo "type of s is ${U}"
+
+// Bare command arguments serialize the same way.
+echo Int String Point
+
+// A generic function parameter's `|T|` serializes to the concrete per-call type:
+// the call is monomorphized (a specialization is compiled with the type variable
+// bound to the argument's type).
+fn Void describe(x: |E|) Void {
+    echo "generic type is ${E}"
+}
+describe 5
+describe "hi"
+describe 3.14
+
+// A capture nested in a generic application resolves to the concrete type: the
+// application is substituted into the constructor body and matched against the
+// initializer, whose fields are typed by their values.
+const bx: Box(|W|) = Box{ .value = 5 }
+echo "nested capture is ${W}"
+
+// A generic application in value position serializes to its full form,
+// including nested and multi-argument applications.
+echo "${Box(Int)}"
+echo "${Box(String)}"
+echo "${Box(Box(Int))}"
+const Pair(A, B) = struct { first: A, second: B }
+echo "${Pair(Int, String)}"
+echo "${Pair(Box(Int), Bool)}"
+
+// An array literal infers its element type, so a capture over it is concrete.
+const nums: |N| = .{ 1, 2, 3 }
+const words: |Ws| = .{ "a", "b" }
+echo "array captures: ${N} and ${Ws}"

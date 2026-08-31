@@ -1,0 +1,17 @@
+// std — the Runic standard library root. `const std = import "std"` resolves
+// here (a bundled, reserved import); each standard module is a public member.
+//
+//   const std = import "std"
+//   const doubled = std.list.map xs dbl
+//
+// Modules are kept narrow and mostly written in Runic. See docs/standard-library.md.
+fn Void @() Void
+
+pub const list = import "std/list"
+pub const str = import "std/str"
+pub const path = import "std/path"
+pub const math = import "std/math"
+pub const fs = import "std/fs"
+pub const env = import "std/env"
+pub const testing = import "std/testing"
+pub const map = import "std/map"

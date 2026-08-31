@@ -1,0 +1,19 @@
+// Float-math builtins as UFCS methods: sqrt/floor/ceil/round/trunc (no arg) and
+// powF (one arg). Backed by the `float_op` IR instruction; each yields a Float.
+fn Void @() Void
+
+const x = 9.0
+echo "sqrt=${x.sqrt}"
+
+const y = 2.7
+echo "floor=${y.floor} ceil=${y.ceil} round=${y.round} trunc=${y.trunc}"
+
+const neg = 0.0 - 3.2
+echo "negFloor=${neg.floor} negCeil=${neg.ceil}"
+
+const base = 2.0
+echo "powF=${base.powF 10.0}"
+
+// chains with arithmetic (result is a real Float)
+const s = 16.0
+echo "sqrtPlus=${s.sqrt + 1.0}"

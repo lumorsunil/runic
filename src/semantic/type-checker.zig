@@ -18,6 +18,9 @@ pub const TypeChecker = struct {
     logging_enabled: bool,
     document_store: *DocumentStore,
     modules: std.StringArrayHashMapUnmanaged(*Scope),
+    /// User-defined generic type constructors (`const Box(T) = struct { … }`),
+    /// keyed by name. A `Box(Int)` application substitutes the args into `body`.
+    generic_type_ctors: std.StringHashMapUnmanaged(GenericTypeCtor) = .empty,
     env: ?*std.process.Environ.Map = null,
     /// Strict mode (`--strict`): also require handling of command failures
     /// (`ExecutableError`), which are otherwise exempt (bash-like exit-code
@@ -517,9 +520,70 @@ pub const TypeChecker = struct {
             .binding_decl => |*binding_decl| self.runBindingDecl(scope, binding_decl),
             .exit_stmt => |*exit_stmt| self.runExit(scope, exit_stmt),
             .yield_stmt => |*yield_stmt| self.runYield(scope, yield_stmt),
+            .while_stmt => |*while_stmt| self.runWhile(scope, while_stmt),
             .expression => |*expr_stmt| self.runExpressionStatement(scope, expr_stmt),
             else => error.UnsupportedStatement,
         };
+    }
+
+    fn runWhile(self: *TypeChecker, scope: *Scope, while_stmt: *ast.WhileStmt) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.logTypeCheckTrace(@src().fn_name, while_stmt.span);
+
+        // The condition is resolved in the enclosing scope; the body runs in a
+        // fresh child scope so its bindings are loop-local.
+        try self.runExpression(scope, while_stmt.condition);
+        const condition_type = try self.resolveConditionType(scope, while_stmt.condition);
+
+        const body_scope = try scope.addChild(self.arena.allocator(), while_stmt.body.span);
+
+        // `while (opt) |v| { … }` loops while the optional is present, binding the
+        // unwrapped value in the body scope.
+        if (while_stmt.capture) |capture| {
+            if (capture.bindings.len != 1) {
+                try self.reportSpanError(
+                    capture.span,
+                    Error.BindingPatternNotSupported,
+                    .@"error",
+                    "while capture clauses currently require exactly one binding",
+                    .{},
+                );
+                return;
+            }
+
+            const cond_type = condition_type orelse {
+                try self.reportSpanError(
+                    while_stmt.condition.span(),
+                    Error.TypeMismatch,
+                    .@"error",
+                    "a `while (…) |v|` capture requires an optional condition",
+                    .{},
+                );
+                return;
+            };
+
+            switch (cond_type.*) {
+                .optional => |optional| try self.runBindingPattern(
+                    body_scope,
+                    capture.bindings[0],
+                    optional.child,
+                    false,
+                    false,
+                ),
+                else => {
+                    try self.reportSpanError(
+                        while_stmt.condition.span(),
+                        Error.TypeMismatch,
+                        .@"error",
+                        "a `while (…) |v|` capture requires an optional condition",
+                        .{},
+                    );
+                    return;
+                },
+            }
+        }
+
+        try self.runBlock(body_scope, &while_stmt.body);
     }
 
     fn runYield(self: *TypeChecker, scope: *Scope, yield_stmt: *ast.YieldStmt) Error!void {
@@ -535,7 +599,10 @@ pub const TypeChecker = struct {
         // appears in, including loop-capture bindings like `for (&0) |v|`.
         if (yield_stmt.fd != 1) return;
         if (self.stdout_type_stack.items.len == 0) return;
-        const declared_stdout = self.stdout_type_stack.items[self.stdout_type_stack.items.len - 1] orelse return;
+        const declared_stdout_raw = self.stdout_type_stack.items[self.stdout_type_stack.items.len - 1] orelse return;
+        // Resolve the declared type so a generic application (`Box(T)`) is
+        // compared as its substituted struct, not the raw application node.
+        const declared_stdout = try self.resolveTypeExpr(scope, declared_stdout_raw);
         const yielded = try self.resolveExprType(scope, yield_stmt.value) orelse return;
         const resolved = try self.resolvePipeType(scope, yielded) orelse return;
         if (self.pipeTypesEqual(resolved, declared_stdout)) return;
@@ -694,6 +761,87 @@ pub const TypeChecker = struct {
         if (exit_stmt.value) |value| try self.runExpression(scope, value);
     }
 
+    pub const GenericTypeCtor = struct {
+        params: []const ast.Identifier,
+        body: *const ast.TypeExpr,
+    };
+
+    /// Returns a copy of `type_expr` with each identifier that names one of
+    /// `params` replaced by the corresponding entry in `args` — the core of a
+    /// generic type application (`Box(Int)` substitutes `Int` for `T` in the
+    /// constructor's body). Recurses through the composite type shapes.
+    fn substituteTypeParams(
+        self: *TypeChecker,
+        type_expr: *const ast.TypeExpr,
+        params: []const ast.Identifier,
+        args: []const *const ast.TypeExpr,
+    ) Error!*const ast.TypeExpr {
+        switch (type_expr.*) {
+            .identifier => |named| {
+                if (named.path.segments.len == 1) {
+                    const name = named.path.segments[0].name;
+                    for (params, 0..) |param, i| {
+                        if (i < args.len and std.mem.eql(u8, param.name, name)) return args[i];
+                    }
+                }
+                return type_expr;
+            },
+            .array => |a| return self.allocTypeExpression(.{ .array = .{
+                .element = try self.substituteTypeParams(a.element, params, args),
+                .span = a.span,
+            } }),
+            .optional => |o| return self.allocTypeExpression(.{ .optional = .{
+                .child = try self.substituteTypeParams(o.child, params, args),
+                .span = o.span,
+            } }),
+            .promise => |p| return self.allocTypeExpression(.{ .promise = .{
+                .child = try self.substituteTypeParams(p.child, params, args),
+                .span = p.span,
+            } }),
+            .type_application => |app| {
+                const new_args = try self.arena.allocator().alloc(*const ast.TypeExpr, app.args.len);
+                for (app.args, new_args) |arg, *dst| dst.* = try self.substituteTypeParams(arg, params, args);
+                return self.allocTypeExpression(.{ .type_application = .{ .name = app.name, .args = new_args, .span = app.span } });
+            },
+            .struct_type => |st| {
+                const new_fields = try self.arena.allocator().alloc(ast.TypeExpr.StructField, st.fields.len);
+                for (st.fields, new_fields) |field, *dst| {
+                    dst.* = field;
+                    dst.type_expr = try self.substituteTypeParams(field.type_expr, params, args);
+                }
+                var new_st = st;
+                new_st.fields = new_fields;
+                return self.allocTypeExpression(.{ .struct_type = new_st });
+            },
+            else => return type_expr,
+        }
+    }
+
+    /// Resolves a `Name(args…)` application against a registered generic
+    /// constructor: substitutes the args into its body, then resolves the result.
+    fn resolveTypeApplication(
+        self: *TypeChecker,
+        scope: *Scope,
+        app: ast.TypeExpr.TypeApplication,
+    ) Error!*const ast.TypeExpr {
+        const ctor = self.generic_type_ctors.get(app.name.name) orelse {
+            try self.reportSpanError(
+                app.span,
+                Error.IdentifierNotFound,
+                .@"error",
+                "generic type {s} not declared",
+                .{app.name.name},
+            );
+            return self.allocTypeExpression(.{ .failed = .{ .span = app.span } });
+        };
+        // Resolve the arguments first (`Int` → the primitive, a bound capture →
+        // its concrete type) so the substituted field types are concrete.
+        const resolved_args = try self.arena.allocator().alloc(*const ast.TypeExpr, app.args.len);
+        for (app.args, resolved_args) |arg, *dst| dst.* = try self.resolveTypeExpr(scope, arg);
+        const substituted = try self.substituteTypeParams(ctor.body, ctor.params, resolved_args);
+        return self.resolveTypeExpr(scope, substituted);
+    }
+
     fn runTypeBindingDecl(
         self: *TypeChecker,
         scope: *Scope,
@@ -702,16 +850,25 @@ pub const TypeChecker = struct {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, type_binding_decl.span);
 
+        // A generic type constructor (`const Box(T) = …`) is registered by name;
+        // each `Box(Int)` application substitutes the args into its body.
+        if (type_binding_decl.params.len > 0) {
+            try self.generic_type_ctors.put(self.arena.allocator(), type_binding_decl.identifier.name, .{
+                .params = type_binding_decl.params,
+                .body = type_binding_decl.type_expr,
+            });
+            return;
+        }
+
         try self.runTypeExpression(scope, type_binding_decl.type_expr);
 
         const resolved_type_expr = try self.resolveTypeExpr(scope, type_binding_decl.type_expr);
 
-        scope.declare(
+        scope.declareType(
             self.arena.allocator(),
             type_binding_decl.identifier,
             resolved_type_expr,
             type_binding_decl.is_pub,
-            false,
         ) catch |err| try switch (err) {
             error.IdentifierAlreadyDeclared => {
                 try self.reportSpanError(
@@ -726,6 +883,79 @@ pub const TypeChecker = struct {
         };
     }
 
+    /// Whether a type expression contains a `|T|` capture anywhere.
+    fn typeExprHasCapture(type_expr: *const ast.TypeExpr) bool {
+        return switch (type_expr.*) {
+            .type_capture => true,
+            .array => |a| typeExprHasCapture(a.element),
+            .optional => |o| typeExprHasCapture(o.child),
+            .promise => |p| typeExprHasCapture(p.child),
+            .type_application => |app| for (app.args) |arg| {
+                if (typeExprHasCapture(arg)) break true;
+            } else false,
+            else => false,
+        };
+    }
+
+    /// Whether a type contains a generic application (`Entry(K, V)`) anywhere,
+    /// including nested under a built-in constructor.
+    fn typeExprHasApplication(type_expr: *const ast.TypeExpr) bool {
+        return switch (type_expr.*) {
+            .type_application => true,
+            .array => |a| typeExprHasApplication(a.element),
+            .optional => |o| typeExprHasApplication(o.child),
+            .promise => |p| typeExprHasApplication(p.child),
+            else => false,
+        };
+    }
+
+    /// Unifies a `|T|`-carrying `pattern` against a concrete `subject` type,
+    /// declaring each capture's matched type in `scope` so later `: T` uses
+    /// resolve to it. Recurses through the built-in generic constructors
+    /// (`[]|T|` binds the element type, `?|T|` the child).
+    fn bindTypeCaptures(
+        self: *TypeChecker,
+        scope: *Scope,
+        pattern: *const ast.TypeExpr,
+        subject: *const ast.TypeExpr,
+    ) Error!void {
+        switch (pattern.*) {
+            .type_capture => |capture| scope.declareType(
+                self.arena.allocator(),
+                ast.Identifier.global(capture.name),
+                subject,
+                false,
+            ) catch |err| switch (err) {
+                error.IdentifierAlreadyDeclared => {},
+                else => return err,
+            },
+            .array => |a| if (subject.* == .array) try self.bindTypeCaptures(scope, a.element, subject.array.element),
+            .optional => |o| if (subject.* == .optional) try self.bindTypeCaptures(scope, o.child, subject.optional.child),
+            .promise => |p| if (subject.* == .promise) try self.bindTypeCaptures(scope, p.child, subject.promise.child),
+            // `Box(|T|)` — substitute into the constructor body (keeping the
+            // capture), then match structurally against the subject.
+            .type_application => |app| {
+                if (self.generic_type_ctors.get(app.name.name)) |ctor| {
+                    const substituted = try self.substituteTypeParams(ctor.body, ctor.params, app.args);
+                    try self.bindTypeCaptures(scope, substituted, subject);
+                }
+            },
+            // Match a struct pattern field-by-field against the subject struct.
+            .struct_type => |st| if (self.unaliasType(subject).* == .struct_type) {
+                const subject_st = self.unaliasType(subject).struct_type;
+                for (st.fields) |field| {
+                    for (subject_st.fields) |sfield| {
+                        if (std.mem.eql(u8, field.name.name, sfield.name.name)) {
+                            try self.bindTypeCaptures(scope, field.type_expr, sfield.type_expr);
+                            break;
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
     fn runBindingDecl(
         self: *TypeChecker,
         scope: *Scope,
@@ -733,14 +963,6 @@ pub const TypeChecker = struct {
     ) Error!void {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, binding_decl.span);
-
-        const binding_annotation_type_expr = brk: {
-            if (binding_decl.annotation) |annotation| {
-                break :brk try self.resolveTypeExpr(scope, annotation);
-            } else {
-                break :brk null;
-            }
-        };
 
         try self.runExpression(scope, binding_decl.initializer);
 
@@ -751,6 +973,20 @@ pub const TypeChecker = struct {
             try self.resolveTypeExpr(scope, raw)
         else
             null;
+
+        // A `|T|`-carrying annotation is a capture pattern: bind its names to the
+        // initializer's concrete type, and take that concrete type as the
+        // binding's type (rather than the permissive type-variable resolution).
+        const binding_annotation_type_expr = brk: {
+            const annotation = binding_decl.annotation orelse break :brk null;
+            // Bind whatever captures structurally match the initializer, then
+            // resolve the annotation: bound captures become their concrete type,
+            // unmatched ones (e.g. `?|T| = null`) stay permissive type variables.
+            if (typeExprHasCapture(annotation)) {
+                if (initializer_type) |it| try self.bindTypeCaptures(scope, annotation, it);
+            }
+            break :brk try self.resolveTypeExpr(scope, annotation);
+        };
 
         const type_expr = binding_annotation_type_expr orelse initializer_type;
 
@@ -813,12 +1049,64 @@ pub const TypeChecker = struct {
                 },
             }),
             .type_merge => |merge| try self.resolveTypeMerge(scope, merge),
+            // Resolve a function type's parts so any type variables in a generic
+            // signature are baked into the stored type (as `.type_var`), rather
+            // than left as raw identifiers that a call site would fail to resolve.
+            .function => |function| blk: {
+                const params: ast.TypeExpr.FunctionType.Parameters = switch (function.params) {
+                    ._non_variadic => |ps| pblk: {
+                        const out = try self.arena.allocator().alloc(?*const ast.TypeExpr, ps.len);
+                        for (ps, out) |p, *dst| dst.* = if (p) |pt| try self.resolveTypeExpr(scope, pt) else null;
+                        break :pblk .{ ._non_variadic = out };
+                    },
+                    ._variadic => |p| .{ ._variadic = if (p) |pt| try self.resolveTypeExpr(scope, pt) else null },
+                };
+                break :blk try self.allocTypeExpression(.{ .function = .{
+                    .params = params,
+                    .stdin_type = if (function.stdin_type) |st| try self.resolveTypeExpr(scope, st) else null,
+                    .return_type = if (function.return_type) |rt| try self.resolveTypeExpr(scope, rt) else null,
+                    .span = function.span,
+                } });
+            },
             // Resolve each member so a sum that arrives with raw member
             // identifiers (e.g. a function call's return type) compares correctly.
             .sum => |sum| blk: {
                 const members = try self.arena.allocator().alloc(*const ast.TypeExpr, sum.members.len);
                 for (sum.members, members) |src, *dst| dst.* = try self.resolveTypeExpr(scope, src);
                 break :blk try self.allocTypeExpression(.{ .sum = .{ .members = members, .span = sum.span } });
+            },
+            // A `|T|` capture in a generic context (e.g. a function signature) is
+            // a permissive type variable, resolved like an implicit uppercase
+            // generic. Binding positions bind it to a concrete type separately
+            // (see `bindTypeCaptures`), which shadows this.
+            .type_capture => |capture| blk: {
+                if (scope.lookup(capture.name)) |binding| {
+                    if (binding.type_expr) |bound| break :blk try self.resolveTypeExpr(scope, bound);
+                }
+                break :blk try self.allocTypeExpression(.{ .type_var = .{ .name = capture.name, .span = capture.span } });
+            },
+            // `Box(Int)` — substitute the args into the constructor's body.
+            .type_application => |app| try self.resolveTypeApplication(scope, app),
+            // Resolve struct field types that carry a capture or a generic
+            // application (`entries: []Entry(K, V)`), so they compare as their
+            // substituted structs. Plain named-type fields are left alone (to
+            // avoid expanding — and possibly recursing into — ordinary structs).
+            .struct_type => |st| blk: {
+                var any = false;
+                for (st.fields) |field| {
+                    if (typeExprHasCapture(field.type_expr) or typeExprHasApplication(field.type_expr)) any = true;
+                }
+                if (!any) break :blk type_expr;
+                const new_fields = try self.arena.allocator().alloc(ast.TypeExpr.StructField, st.fields.len);
+                for (st.fields, new_fields) |field, *dst| {
+                    dst.* = field;
+                    if (typeExprHasCapture(field.type_expr) or typeExprHasApplication(field.type_expr)) {
+                        dst.type_expr = try self.resolveTypeExpr(scope, field.type_expr);
+                    }
+                }
+                var new_st = st;
+                new_st.fields = new_fields;
+                break :blk try self.allocTypeExpression(.{ .struct_type = new_st });
             },
             else => type_expr,
         };
@@ -936,6 +1224,45 @@ pub const TypeChecker = struct {
         return self.pipeTypesEqual(ra, rb);
     }
 
+    /// Walks a signature type expression and records each uppercase identifier
+    /// that isn't a declared type in `outer` — a candidate implicit type variable.
+    fn collectTypeVars(
+        self: *TypeChecker,
+        outer: *Scope,
+        type_expr: *const ast.TypeExpr,
+        out: *std.StringHashMapUnmanaged(void),
+    ) Error!void {
+        switch (type_expr.*) {
+            .identifier => |named| {
+                const seg = named.path.segments[0];
+                if (seg.isTypeIdentifier() and outer.lookup(seg.name) == null) {
+                    try out.put(self.arena.allocator(), seg.name, {});
+                }
+            },
+            .type_capture => |capture| try out.put(self.arena.allocator(), capture.name, {}),
+            .type_application => |app| for (app.args) |arg| try self.collectTypeVars(outer, arg, out),
+            .array => |a| try self.collectTypeVars(outer, a.element, out),
+            .optional => |o| try self.collectTypeVars(outer, o.child, out),
+            .promise => |p| try self.collectTypeVars(outer, p.child, out),
+            .sum => |s| for (s.members) |m| try self.collectTypeVars(outer, m, out),
+            .type_merge => |m| {
+                try self.collectTypeVars(outer, m.lhs, out);
+                try self.collectTypeVars(outer, m.rhs, out);
+            },
+            .function => |f| {
+                if (f.stdin_type) |st| try self.collectTypeVars(outer, st, out);
+                if (f.return_type) |rt| try self.collectTypeVars(outer, rt, out);
+                switch (f.params) {
+                    ._non_variadic => |ps| for (ps) |p| {
+                        if (p) |pt| try self.collectTypeVars(outer, pt, out);
+                    },
+                    ._variadic => |p| if (p) |pt| try self.collectTypeVars(outer, pt, out),
+                }
+            },
+            else => {},
+        }
+    }
+
     fn resolveTypeIdentifierToAlias(
         self: *TypeChecker,
         scope: *Scope,
@@ -944,6 +1271,15 @@ pub const TypeChecker = struct {
         const name = identifier.path.segments[0].name;
 
         const binding = scope.lookup(name) orelse {
+            // An unresolved *uppercase* type name is an implicit generic type
+            // variable (e.g. `T`/`U` in a generic signature, or that signature
+            // re-resolved at a call site outside the function scope). Since the
+            // runtime is dynamic, it is permissive — resolve it to a type_var
+            // rather than reporting "not declared". (A lowercase unknown name is
+            // still an error.)
+            if (identifier.path.segments[0].isTypeIdentifier()) {
+                return try self.allocTypeExpression(.{ .type_var = .{ .name = name, .span = identifier.span } });
+            }
             try self.reportSpanError(
                 identifier.span,
                 Error.IdentifierNotFound,
@@ -1009,17 +1345,46 @@ pub const TypeChecker = struct {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, fn_decl.span);
 
+        const fn_scope = try scope.addChild(self.arena.allocator(), fn_decl.span);
+
+        // Implicit generics: an uppercase type name in the signature that isn't a
+        // declared type is a type variable, scoped to this function (e.g. `T`/`U`
+        // in `fn map(xs: []T, f: fn(T) U) []U`). Declare them in the function
+        // scope first, so the signature resolves (no "type T not declared") and —
+        // resolved *in the function scope* — the type variables are baked into the
+        // stored function type as `.type_var`, so a call site never re-resolves a
+        // raw `T`/`U`.
+        {
+            var type_vars: std.StringHashMapUnmanaged(void) = .empty;
+            defer type_vars.deinit(self.arena.allocator());
+            if (fn_decl.stdin_type) |st| try self.collectTypeVars(scope, st, &type_vars);
+            switch (fn_decl.params) {
+                ._non_variadic => |params| for (params) |param| {
+                    if (param.type_annotation) |ta| try self.collectTypeVars(scope, ta, &type_vars);
+                },
+                ._variadic => |param| if (param.type_annotation) |ta| try self.collectTypeVars(scope, ta, &type_vars),
+            }
+            if (fn_decl.return_type) |rt| try self.collectTypeVars(scope, rt, &type_vars);
+            var it = type_vars.keyIterator();
+            while (it.next()) |name| {
+                const marker = try self.allocTypeExpression(.{ .type_var = .{ .name = name.*, .span = fn_decl.span } });
+                try fn_scope.declare(self.arena.allocator(), .{ .name = name.*, .span = fn_decl.span }, marker, false, false);
+            }
+        }
+
         if (fn_decl.name) |identifier| {
+            // Resolve the function's type in the function scope so type variables
+            // are baked in, then expose the binding in the outer scope.
+            const raw_fn_type = try self.resolveExprType(fn_scope, fn_decl);
+            const resolved_fn_type = if (raw_fn_type) |t| try self.resolveTypeExpr(fn_scope, t) else null;
             try scope.declare(
                 self.arena.allocator(),
                 identifier,
-                try self.resolveExprType(scope, fn_decl),
+                resolved_fn_type,
                 fn_decl.is_pub,
                 false,
             );
         }
-
-        const fn_scope = try scope.addChild(self.arena.allocator(), fn_decl.span);
 
         if (fn_decl.stdin_type) |stdin_type| {
             const resolved = try self.resolveTypeExpr(fn_scope, stdin_type);
@@ -1153,6 +1518,7 @@ pub const TypeChecker = struct {
                 };
             },
             .for_expr => |for_expr| try self.validateFunctionBodyStdin(scope, for_expr.body, enclosing_stdin),
+            .comptime_expr => |comptime_expr| try self.validateFunctionBodyStdin(scope, comptime_expr.operand, enclosing_stdin),
             .match_expr => |match_expr| for (match_expr.cases) |case| {
                 try self.validateBlockStdin(scope, case.body, enclosing_stdin);
             },
@@ -1262,6 +1628,40 @@ pub const TypeChecker = struct {
     fn runCall(self: *TypeChecker, scope: *Scope, call: *ast.CallExpr) Error!void {
         try self.runExpression(scope, call.callee);
         for (call.arguments) |arg| try self.runExpression(scope, arg);
+
+        // A bare command (an identifier callee with no scope binding — `echo`,
+        // `ls`, …) serializes each argument to a string, so a whole struct has
+        // no valid form. User functions (which have a binding) and module calls
+        // (member callees) may legitimately take struct arguments.
+        const is_command = call.callee.* == .identifier and scope.lookup(call.callee.identifier.name) == null;
+        if (is_command) {
+            for (call.arguments) |arg| {
+                // A struct-typed argument, or a generic struct literal (`Box{ … }`)
+                // whose type doesn't resolve standalone — both would fail while
+                // being serialized to a command string. A type identifier (which
+                // serializes to its name) is fine.
+                const is_struct = blk: {
+                    if (self.isTypeIdentifierExpr(scope, arg)) break :blk false;
+                    if (arg.* == .struct_literal and self.generic_type_ctors.contains(arg.struct_literal.name.name)) {
+                        break :blk true;
+                    }
+                    if (try self.resolveExprType(scope, arg)) |t| {
+                        const unaliased = self.unaliasType(t);
+                        break :blk unaliased.* == .struct_type and !isExecutionLikeStruct(unaliased.struct_type);
+                    }
+                    break :blk false;
+                };
+                if (is_struct) {
+                    try self.reportSpanError(
+                        arg.span(),
+                        Error.TypeMismatch,
+                        .@"error",
+                        "cannot pass a whole struct as a command argument; pass a field instead (e.g. value.field)",
+                        .{},
+                    );
+                }
+            }
+        }
         for (call.redirects) |*redirect| {
             switch (redirect.target) {
                 .path => |p| try self.runExpression(scope, p.value),
@@ -1381,6 +1781,7 @@ pub const TypeChecker = struct {
             .import_expr => |*import_expr| self.runImportExpr(scope, import_expr),
             .fn_decl => |*fn_decl| self.runFnDecl(scope, fn_decl),
             .call => |*call| self.runCall(scope, call),
+            .comptime_expr => |*comptime_expr| self.runExpression(scope, comptime_expr.operand),
             .subshell => |*subshell| self.runExpression(scope, subshell.child),
             .fd => |*fd_expr| self.runFd(scope, fd_expr),
             else => return error.UnsupportedExpression,
@@ -1429,6 +1830,7 @@ pub const TypeChecker = struct {
             .identifier => |*identifier| self.runTypeIdentifier(scope, identifier),
             .alias => |*alias| self.runTypeAlias(alias),
             .failed => {},
+            .type_var => {},
             .void, .integer, .float, .boolean, .byte, .null, .execution, .thread => {},
             .optional, .promise => |prefix| try self.runTypeExpression(scope, prefix.child),
             .error_union => |error_union| {
@@ -1443,6 +1845,10 @@ pub const TypeChecker = struct {
             .sum => |sum| for (sum.members) |member| try self.runTypeExpression(scope, member),
             .err => {},
             .array => |*array| self.runTypeArray(scope, array),
+            // A `|T|` capture introduces a type variable; nothing to validate.
+            .type_capture => {},
+            // A `Box(args…)` application is validated where it resolves.
+            .type_application => {},
             .struct_type, .module, .tuple, .function, .fn_ref_type => {},
         };
     }
@@ -1525,8 +1931,19 @@ pub const TypeChecker = struct {
 
         for (for_expr.sources, for_expr.capture.bindings) |source, pattern| {
             try self.runExpression(scope, source);
-            const type_expr = try self.resolveExprType(scope, source);
-            try self.runBindingPattern(for_scope, pattern, type_expr, false, false);
+            const source_type = try self.resolveExprType(scope, source);
+            // The capture binds to one *element*, so unwrap an array source to
+            // its element type (`[]String` → `String`). A non-array source (a
+            // range `0..n`, `&0` stdin) already resolves to the element type.
+            const element_type: ?*const ast.TypeExpr = blk: {
+                const st = source_type orelse break :blk null;
+                const unaliased = self.unaliasType(st);
+                if (unaliased.* != .array) break :blk source_type;
+                // Resolve the element so a named primitive element (`[]Int` whose
+                // element parsed as the identifier `Int`) normalizes to its tag.
+                break :blk try self.resolveTypeExpr(scope, unaliased.array.element);
+            };
+            try self.runBindingPattern(for_scope, pattern, element_type, false, false);
         }
 
         try self.runExpression(for_scope, for_expr.body);
@@ -2655,13 +3072,14 @@ pub const TypeChecker = struct {
 
         switch (object_type.*) {
             .failed => {},
+            .type_var => {},
             .identifier => return error.UnresolvedTypeLiteral,
             .optional => return error.MemberAccessOnOptional,
             .array => |array| try self.runArrayMemberAccess(array, &member.member),
             .thread => try self.runThreadMemberAccess(&member.member),
             .struct_type => |struct_type| try self.runStructMemberAccess(struct_type, &member.member),
             .error_set => |error_set| try self.runErrorSetMemberAccess(error_set, &member.member),
-            .null, .promise, .error_union, .err, .tuple, .function, .fn_ref_type, .integer, .float, .boolean, .byte, .alias, .void, .type_merge, .sum => return error.UnsupportedMemberAccess,
+            .null, .promise, .error_union, .err, .tuple, .function, .fn_ref_type, .integer, .float, .boolean, .byte, .alias, .void, .type_merge, .sum, .type_capture, .type_application => return error.UnsupportedMemberAccess,
             .module => |module| try self.runModuleMemberAccess(module, &member.member),
             .execution => |execution| try self.runExecutionMemberAccess(execution, &member.member),
             // .lazy => {
@@ -2842,8 +3260,29 @@ pub const TypeChecker = struct {
         const resolved_target_type = target_type orelse return null;
 
         return switch (resolved_target_type.*) {
-            .function => |function| try self.resolvePipeType(scope, function.stdin_type),
+            .function => |function| blk: {
+                const stdin = try self.resolvePipeType(scope, function.stdin_type);
+                // Pipeline↔param coercion: a function with a Void (or absent)
+                // stdin and exactly one parameter accepts the upstream value in
+                // that parameter, so the parameter type is its effective input.
+                const void_stdin = stdin == null or self.unaliasType(stdin.?).* == .void;
+                if (void_stdin) {
+                    if (singleParamType(function)) |pt| {
+                        break :blk try self.resolvePipeType(scope, pt);
+                    }
+                }
+                break :blk stdin;
+            },
             else => null,
+        };
+    }
+
+    /// The single parameter's declared type for a one-parameter function, else
+    /// null (zero, many, variadic, or untyped-parameter functions).
+    fn singleParamType(function: ast.TypeExpr.FunctionType) ?*const ast.TypeExpr {
+        return switch (function.params) {
+            ._non_variadic => |params| if (params.len == 1) params[0] else null,
+            ._variadic => null,
         };
     }
 
@@ -2976,10 +3415,39 @@ pub const TypeChecker = struct {
         const resolved_left = self.unaliasType(left);
         const resolved_right = self.unaliasType(right);
 
+        // A type variable (generic) unifies with anything — the same permissive
+        // treatment used elsewhere. This lets a generic function return a generic
+        // struct: `struct { value: T }` (yielded) matches `struct { value: T }`
+        // (declared) even though the two `T`s are distinct nodes.
+        if (resolved_left.* == .type_var or resolved_right.* == .type_var) return true;
+
         if (std.meta.activeTag(resolved_left.*) != std.meta.activeTag(resolved_right.*)) return false;
 
         return switch (resolved_left.*) {
             .array => |left_array| self.pipeTypesEqual(left_array.element, resolved_right.array.element),
+            // Structs compare structurally (same fields, in order, with equal
+            // types) — not by node identity, so two separately-built identical
+            // struct types (e.g. a generic constructor applied twice) are equal.
+            .struct_type => |left_st| blk: {
+                const right_st = resolved_right.struct_type;
+                if (left_st.fields.len != right_st.fields.len) break :blk false;
+                for (left_st.fields, right_st.fields) |lf, rf| {
+                    if (!std.mem.eql(u8, lf.name.name, rf.name.name)) break :blk false;
+                    if (!self.pipeTypesEqual(lf.type_expr, rf.type_expr)) break :blk false;
+                }
+                break :blk true;
+            },
+            // A generic application (`Entry(K, V)`) may remain unresolved inside a
+            // struct field; compare by constructor name and pairwise arguments.
+            .type_application => |left_app| blk: {
+                const right_app = resolved_right.type_application;
+                if (!std.mem.eql(u8, left_app.name.name, right_app.name.name)) break :blk false;
+                if (left_app.args.len != right_app.args.len) break :blk false;
+                for (left_app.args, right_app.args) |la, ra| {
+                    if (!self.pipeTypesEqual(la, ra)) break :blk false;
+                }
+                break :blk true;
+            },
             .optional => |left_optional| self.pipeTypesEqual(left_optional.child, resolved_right.optional.child),
             .promise => |left_promise| self.pipeTypesEqual(left_promise.child, resolved_right.promise.child),
             .error_union => |left_error_union| self.pipeTypesEqual(left_error_union.err_set, resolved_right.error_union.err_set) and
@@ -3050,7 +3518,25 @@ pub const TypeChecker = struct {
         try self.logTypeCheckTrace(@src().fn_name, part.span());
 
         switch (part.*) {
-            .expr => |expr| try self.runExpression(scope, expr),
+            .expr => |expr| {
+                try self.runExpression(scope, expr);
+                // A command argument is serialized to a string, so a whole struct
+                // has no valid form here — pass a field instead. (Mirrors the
+                // string-interpolation guard; without it the arg would fail at
+                // runtime while being materialized.)
+                if (try self.resolveExprType(scope, expr)) |t| {
+                    const unaliased = self.unaliasType(t);
+                    if (unaliased.* == .struct_type and !isExecutionLikeStruct(unaliased.struct_type)) {
+                        try self.reportSpanError(
+                            expr.span(),
+                            Error.TypeMismatch,
+                            .@"error",
+                            "cannot pass a whole struct as a command argument; pass a field instead (e.g. value.field)",
+                            .{},
+                        );
+                    }
+                }
+            },
             .word => {},
             .string => |*string_literal| try self.runStringLiteral(scope, string_literal),
         }
@@ -3076,6 +3562,14 @@ pub const TypeChecker = struct {
         try self.logTypeCheckTrace(@src().fn_name, struct_literal.span);
 
         for (struct_literal.fields) |field| try self.runExpression(scope, field.value);
+
+        // A generic constructor (`Box{ … }` for `const Box(T) = struct { … }`):
+        // validate against the body struct with its type parameters permissive.
+        if (self.generic_type_ctors.get(struct_literal.name.name)) |ctor| {
+            const resolved = self.unaliasType(try self.resolveTypeExpr(scope, ctor.body));
+            if (resolved.* == .struct_type) try self.runStructValueLiteral(scope, resolved.struct_type, struct_literal);
+            return;
+        }
 
         const binding = scope.lookup(struct_literal.name.name) orelse {
             try self.reportSpanError(
@@ -3239,6 +3733,8 @@ pub const TypeChecker = struct {
         switch (segment.*) {
             .interpolation => |expr| {
                 try self.runExpression(scope, expr);
+                // A type identifier serializes to its name — a valid String.
+                if (self.isTypeIdentifierExpr(scope, expr)) return;
                 if (try self.resolveExprType(scope, expr)) |t| {
                     // Interpolating a bare (un-narrowed) sum has no single string
                     // form — narrow it first (with `is`/`==`/match).
@@ -3364,6 +3860,34 @@ pub const TypeChecker = struct {
         };
     }
 
+    /// Whether `name`, in a value position, denotes a type (a primitive keyword,
+    /// a generic constructor, or a type binding / captured type variable).
+    fn isTypeIdentifierName(self: *TypeChecker, scope: *Scope, name: []const u8) bool {
+        const primitives = [_][]const u8{ "Int", "String", "Bool", "Float", "Void", "Byte" };
+        for (primitives) |p| {
+            if (std.mem.eql(u8, name, p)) return true;
+        }
+        if (self.generic_type_ctors.contains(name)) return true;
+        if (scope.lookup(name)) |binding| return binding.is_type;
+        return false;
+    }
+
+    /// Whether `expr` is a bare type identifier in a value position — an
+    /// identifier (or a zero-arg call, which is how a bare name parses) naming a
+    /// type. Such an expression serializes to the type's name, so it is a valid
+    /// String where a whole struct/error value would not be.
+    fn isTypeIdentifierExpr(self: *TypeChecker, scope: *Scope, expr: *const ast.Expression) bool {
+        return switch (expr.*) {
+            .identifier => |id| self.isTypeIdentifierName(scope, id.name),
+            // A bare type name parses as a zero-arg call; a generic application
+            // (`Box(Int)`) parses as a call to the constructor with arguments.
+            .call => |call| call.callee.* == .identifier and
+                (call.arguments.len == 0 or self.generic_type_ctors.contains(call.callee.identifier.name)) and
+                self.isTypeIdentifierName(scope, call.callee.identifier.name),
+            else => false,
+        };
+    }
+
     fn resolveExprType(
         self: *TypeChecker,
         scope: *Scope,
@@ -3384,6 +3908,36 @@ pub const TypeChecker = struct {
             else => alloc_writer.writer.writeAll(@typeName(T)),
         };
         try self.logTypeCheckTrace(alloc_writer.written(), span);
+
+        // A generic struct literal (`Box{ … }`) has no type via the AST's own
+        // resolveType (the constructor isn't a plain scope binding). Build its
+        // type from the constructor body, typing each field by its supplied
+        // value so `Box{ .value = 5 }` is `struct { value: Int }` (not `{ T }`).
+        if (T == *ast.Expression and expr.* == .struct_literal) {
+            if (self.generic_type_ctors.get(expr.struct_literal.name.name)) |ctor| {
+                const body = self.unaliasType(try self.resolveTypeExpr(scope, ctor.body));
+                if (body.* != .struct_type) return body;
+                const new_fields = try self.arena.allocator().alloc(ast.TypeExpr.StructField, body.struct_type.fields.len);
+                for (body.struct_type.fields, new_fields) |field, *dst| {
+                    dst.* = field;
+                    // Prefer the supplied value's type; fall back to the body
+                    // field. Resolve it either way, so an unresolved parameter
+                    // (`Entry(K, V)`) becomes type variables that match a concrete
+                    // declared type permissively.
+                    var field_type = field.type_expr;
+                    for (expr.struct_literal.fields) |lit_field| {
+                        if (std.mem.eql(u8, lit_field.name.name, field.name.name)) {
+                            if (try self.resolveExprType(scope, lit_field.value)) |vt| field_type = vt;
+                            break;
+                        }
+                    }
+                    dst.type_expr = try self.resolveTypeExpr(scope, field_type);
+                }
+                var new_st = body.struct_type;
+                new_st.fields = new_fields;
+                return try self.allocTypeExpression(.{ .struct_type = new_st });
+            }
+        }
 
         const result = try expr.resolveType(self.io, self.arena.allocator(), scope);
 
@@ -3454,8 +4008,16 @@ pub const TypeChecker = struct {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, assignment_type.span());
 
+        // A generic type variable on either side unifies with anything (the
+        // runtime is dynamic; a generic function is checked permissively). An
+        // unresolved `@TypeOf(...)` (reached without a scope to resolve it) is
+        // treated the same — its operand's type was validated at its own site.
+        if (self.unaliasType(binding_type).* == .type_var or self.unaliasType(assignment_type).* == .type_var) return;
+        if (self.unaliasType(binding_type).* == .type_capture or self.unaliasType(assignment_type).* == .type_capture) return;
+
         try switch (binding_type.*) {
             .failed => {},
+            .type_var => {},
             .thread => unreachable,
             .void => |*void_| self.validateTypeAssignmentVoid(
                 void_,
@@ -3549,6 +4111,13 @@ pub const TypeChecker = struct {
                 options,
             ),
             .fn_ref_type => {},
+            // Unreachable: an unresolved `|T|` capture is handled permissively by
+            // the early return above; kept for switch exhaustiveness.
+            .type_capture => {},
+            // A `Box(args…)` application is resolved to a concrete type before it
+            // is stored as a binding type, so a raw application should not reach
+            // here; kept for exhaustiveness.
+            .type_application => {},
             // A `||` merge is resolved to a concrete `error_set` or `sum` before
             // it is stored as a binding type, so a raw merge should not reach here.
             .type_merge => {},

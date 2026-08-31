@@ -66,8 +66,24 @@ pub const Scope = struct {
         };
     }
 
+    /// Declares a binding that names a *type* (a type binding, a captured type
+    /// variable, …) rather than a value. Used so a type identifier in a value
+    /// context can serialize to its name instead of being read as a value.
+    pub fn declareType(
+        self: *Scope,
+        allocator: std.mem.Allocator,
+        identifier: ast.Identifier,
+        type_expr: ?*const ast.TypeExpr,
+        is_pub: bool,
+    ) Error!void {
+        try self.declare(allocator, identifier, type_expr, is_pub, false);
+        self.bindings.getPtr(identifier.name).?.is_type = true;
+    }
+
     pub const Binding = struct {
         identifier: ast.Identifier,
+        /// True when this binding names a type (not a value).
+        is_type: bool = false,
         /// The current *flow* type — the refined view at this program point
         /// (narrowed by `is`/comparison, or by a `var` reassignment). This is
         /// what reads of the binding resolve to.

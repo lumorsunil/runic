@@ -1,0 +1,17 @@
+# Function values (Phase 0): a function that declares parameters can be bound to
+# a value (`const f = dbl`, no call happens) and called later (`f x`). A nullary
+# function reference is still called immediately.
+fn Void @() Void
+
+fn Void dbl(n: Int) Int { yield n + n }
+const f = dbl
+echo "f5=${f 5} f10=${f 10}"
+
+fn Void add1(n: Int) Int { yield n + 1 }
+const g = add1
+echo "g via value: ${g 41}"
+
+# A nullary function reference is called (it has no params to wait for).
+fn Void answer() Int { yield 42 }
+const a = answer
+echo "answer=${a}"

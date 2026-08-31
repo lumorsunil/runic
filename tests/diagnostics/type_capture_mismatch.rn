@@ -1,0 +1,3 @@
+const seed: |T| = 7
+const bad: T = "not an int"
+echo "${bad}"

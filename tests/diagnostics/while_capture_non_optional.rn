@@ -1,0 +1,5 @@
+var n = 5
+while (n) |v| {
+  echo "${v}"
+  n = n - 1
+}

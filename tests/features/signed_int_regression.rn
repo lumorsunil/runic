@@ -1,0 +1,23 @@
+# Signed integers (Phase 0): Int is a signed i64. Subtraction can go negative,
+# negative literals and unary negation work, and parseInt reads negatives.
+fn Void @() Void
+
+# Subtraction that goes negative (previously underflowed to 0 as unsigned).
+const d = 3 - 5
+echo "d=${d}"
+
+# Negative literal, and using it in further arithmetic.
+const n: Int = -7
+echo "n=${n} n+10=${n + 10}"
+
+# Unary negation of a binding and of a parenthesized expression.
+const a = 5
+echo "neg_a=${-a} neg_expr=${-(3 * 4)}"
+
+# parseInt of a negative string.
+const parsed = echo "-42" | parseInt catch 0
+echo "parsed=${parsed}"
+
+# A function returning a negative value, used across the call boundary.
+fn Void delta(a: Int, b: Int) Int { yield a - b }
+echo "delta=${delta 2 9}"

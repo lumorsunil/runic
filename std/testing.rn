@@ -1,0 +1,43 @@
+// std.testing — assertions for `.rn` module and CLI smoke tests. A failed
+// assertion writes a message to stderr and aborts the whole run (`exit 1`).
+//
+// Each assertion inlines its abort rather than delegating to `fail`: a nested
+// statement-position call is not awaited before the outer function returns, so
+// a delegated `exit` would race the caller's next statement.
+fn Void @() Void
+
+// Unconditionally abort with `msg`.
+pub fn Void fail(msg: String) Void {
+  echo "assertion failed: ${msg}" 1>&2
+  exit 1
+}
+
+// Abort with `msg` unless `cond` holds.
+pub fn Void assert(cond: Bool, msg: String) Void {
+  if (cond) {
+    // ok
+  } else {
+    echo "assertion failed: ${msg}" 1>&2
+    exit 1
+  }
+}
+
+// Abort with `msg` unless `a` equals `b` (scalar/string equality).
+pub fn Void assertEq(a: T, b: T, msg: String) Void {
+  if (a == b) {
+    // ok
+  } else {
+    echo "assertion failed: ${msg}" 1>&2
+    exit 1
+  }
+}
+
+// Abort unless `s` contains `sub`.
+pub fn Void assertContains(s: String, sub: String) Void {
+  if (s.contains sub) {
+    // ok
+  } else {
+    echo "assertion failed: \"${s}\" does not contain \"${sub}\"" 1>&2
+    exit 1
+  }
+}

@@ -1,0 +1,10 @@
+# Typed array element access (Phase 0): a parameter typed `[]Int` yields `Int`
+# when indexed, so it can be used in arithmetic (previously `xs[0]` mis-resolved
+# to `[]Int` and the yield type-checked wrong).
+fn Void @() Void
+
+fn Void firstOf(xs: []Int) Int { yield xs[0] }
+fn Void sum3(xs: []Int) Int { yield xs[0] + xs[1] + xs[2] }
+
+const nums = .{ 7, 8, 9 }
+echo "first=${firstOf nums} sum=${sum3 nums}"

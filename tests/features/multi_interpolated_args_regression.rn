@@ -1,0 +1,15 @@
+// Multiple interpolated string arguments to one command must each keep their own
+// value. Regression: `echo "${x}" "${y}"` printed "AA AA" (every interpolated
+// arg took the first's value), because building each multi-segment string left a
+// ref on the stack, interleaved with the pushed argument values, so `exec`
+// popped the wrong slots. Fixed by pushing all argument values contiguously.
+fn Void @() Void
+
+const x = "one"
+const y = "two"
+const z = "three"
+
+echo "${x}" "${y}"
+echo "${x}" "${y}" "${z}"
+echo "${x}" "lit" "${y}"
+echo "a-${x}" "b-${y}"

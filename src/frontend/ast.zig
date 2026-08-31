@@ -176,14 +176,72 @@ pub const TypeExpr = union(enum) {
     execution: PrimitiveType,
     thread: PrimitiveType,
     failed: FailedType,
+    /// An implicit generic type variable (an uppercase name in a function
+    /// signature that isn't a declared type, e.g. `T`/`U` in `map`). Since the
+    /// runtime is dynamically typed, a generic function compiles once; a type
+    /// variable is permissive in type comparisons (unifies with anything).
+    type_var: TypeVar,
     // lazy: LazyType,
+    /// A type capture `|T|` in a type position: binds `T` to the type occupying
+    /// that position (a binding's initializer, a call argument, or — nested — an
+    /// element/child via `[]|T|` / `?|T|`). `T` is then usable anywhere a type
+    /// is. In a generic signature it acts as a permissive type variable; in a
+    /// binding it captures the initializer's concrete type. Compile-time only.
+    type_capture: TypeCapture,
+    /// An application of a user-defined generic type constructor, `Name(args…)`
+    /// (e.g. `Box(Int)`, `Box(|T|)`). Kept in application form: the type checker
+    /// substitutes the args into the constructor's body when a concrete type is
+    /// needed, and matches applications structurally (same constructor + unified
+    /// args) so `Box(|T|)` binds `T` from a `Box(Int)` value.
+    type_application: TypeApplication,
     /// A compile-time function reference pointing to a specific IR instruction set.
     /// Used for module pub fn exports so compileMember can return the fn_ref value directly.
     fn_ref_type: FnRefType,
 
+    pub const TypeApplication = struct {
+        name: Identifier,
+        args: []const *const TypeExpr,
+        span: Span,
+
+        pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try writer.print("{s}(", .{self.name.name});
+            for (self.args, 0..) |arg, i| {
+                if (i > 0) try writer.writeAll(", ");
+                try arg.format(writer);
+            }
+            try writer.writeAll(")");
+        }
+    };
+
+    pub const TypeCapture = struct {
+        name: []const u8,
+        span: Span,
+
+        pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try writer.print("|{s}|", .{self.name});
+        }
+    };
+
     pub const FnRefType = struct {
         instr_set: usize,
         span: Span,
+        /// The referenced function's declared return type, when known. Carried so
+        /// a call through a module member (`m.fn args`) can value-capture the
+        /// yielded result typed as its return type, exactly like a direct call.
+        return_type: ?*const TypeExpr = null,
+        /// The referenced function's declared parameter count, when known, so a
+        /// call site can tell a zero-arg *reference* (`const f = m.fn`) from a
+        /// nullary *call*.
+        param_count: ?usize = null,
+    };
+
+    pub const TypeVar = struct {
+        name: []const u8,
+        span: Span,
+
+        pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try writer.writeAll(self.name);
+        }
     };
 
     pub fn global(comptime tag: std.meta.Tag(@This())) @This() {
@@ -322,6 +380,13 @@ pub const TypeExpr = union(enum) {
         fields: []const StructField,
         decls: []const StructDecl,
         span: Span,
+        /// When true, every field occupies exactly one slot — a struct-typed
+        /// field holds an *address* to its sub-struct rather than being inlined.
+        /// Used for the dynamically-built module result struct, whose pub-export
+        /// fields (including nested module values) are each stored in one slot.
+        /// User structs inline their fields (default false), so a nested struct
+        /// field spans `slotSize` slots.
+        by_reference_fields: bool = false,
 
         pub const FieldLayout = struct {
             offset: usize,
@@ -340,7 +405,7 @@ pub const TypeExpr = union(enum) {
                         .type_expr = field.type_expr.*,
                     };
                 }
-                offset += try field.type_expr.slotSize();
+                offset += if (self.by_reference_fields) 1 else try field.type_expr.slotSize();
             }
 
             return LayoutError.FieldNotFound;
@@ -563,8 +628,12 @@ pub const TypeExpr = union(enum) {
             .identifier,
             .failed,
             .fn_ref_type,
+            .type_var,
+            .type_capture,
+            .type_application,
             => 1,
             .struct_type => |struct_type| blk: {
+                if (struct_type.by_reference_fields) break :blk struct_type.fields.len;
                 var size: usize = 0;
                 for (struct_type.fields) |field| {
                     size += try field.type_expr.slotSize();
@@ -805,6 +874,7 @@ pub const Expression = union(enum) {
     fn_decl: FunctionDecl,
     if_expr: IfExpr,
     for_expr: ForExpr,
+    comptime_expr: ComptimeExpr,
     match_expr: MatchExpr,
     try_expr: TryExpr,
     catch_expr: CatchExpr,
@@ -1054,21 +1124,29 @@ pub const UnaryExpr = struct {
     span: Span,
 
     pub fn resolveType(
-        _: *@This(),
-        _: std.Io,
-        _: std.mem.Allocator,
-        _: *semantic.Scope,
+        self: *@This(),
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        scope: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
-        return null;
+        return switch (self.op) {
+            // `-x` has the operand's numeric type; `!x` is a Bool.
+            .negate => self.operand.resolveType(io, allocator, scope),
+            .logical_not => &boolTypeExpr,
+        };
     }
 };
 
+const boolTypeExpr = TypeExpr{ .boolean = .{ .span = .global } };
+
 pub const UnaryOp = enum {
     logical_not,
+    negate,
 
     pub fn fromToken(tok: token.Token) ?@This() {
         return switch (tok.tag) {
             .bang => .logical_not,
+            .minus => .negate,
             else => null,
         };
     }
@@ -1090,6 +1168,14 @@ pub const BinaryExpr = struct {
         const right_type = try self.right.resolveType(io, allocator, scope);
 
         return switch (self.op) {
+            // Comparisons and logical ops produce a Bool, not the operand type.
+            .equal,
+            .not_equal,
+            .greater,
+            .greater_equal,
+            .less,
+            .less_equal,
+            => &boolTypeExpr,
             .assign, .add_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign => left_type,
             .@"orelse" => blk: {
                 if (left_type) |lt| switch (lt.*) {
@@ -1160,6 +1246,16 @@ pub const BinaryExpr = struct {
                     .error_set => |es| break :blk if (es.variant(field_name) != null) resolved else null,
                     else => break :blk null,
                 }
+            },
+            // `xs[i]` yields the array's element type, not the array type.
+            .array_access => blk: {
+                const lt = left_type orelse break :blk null;
+                var resolved = lt;
+                while (resolved.* == .alias) resolved = resolved.alias.type_expr;
+                break :blk switch (resolved.*) {
+                    .array => |array| array.element,
+                    else => null,
+                };
             },
             else => left_type,
         };
@@ -1737,6 +1833,9 @@ pub const Statement = union(enum) {
 pub const TypeBindingDecl = struct {
     is_pub: bool = true,
     identifier: Identifier,
+    /// Type parameters for a generic type constructor (`const Box(T) = …`).
+    /// Empty for an ordinary type binding.
+    params: []const Identifier = &.{},
     type_expr: *const TypeExpr,
     span: Span,
 
@@ -1918,6 +2017,23 @@ pub const WhileStmt = struct {
     capture: ?CaptureClause,
     body: Block,
     span: Span,
+};
+
+/// `comptime <operand>` — forces the operand to be evaluated at compile time,
+/// folding it to a constant value. Fails to compile if the operand cannot be
+/// reduced (e.g. it depends on runtime state or an unsupported construct).
+pub const ComptimeExpr = struct {
+    operand: *Expression,
+    span: Span,
+
+    pub fn resolveType(
+        self: *@This(),
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        scope: *semantic.Scope,
+    ) semantic.Scope.Error!?*const TypeExpr {
+        return self.operand.resolveType(io, allocator, scope);
+    }
 };
 
 pub const Assignment = struct {

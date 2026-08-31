@@ -1,0 +1,7 @@
+b.value=5
+int=42 str=hi
+first=7 second=world
+c.value=42 same=100
+xs=1
+xs=2
+inferred=99 unwrapped=99

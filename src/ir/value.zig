@@ -13,7 +13,9 @@ const InstructionAddr = @import("instruction-addr.zig").InstructionAddr;
 pub const Value = union(enum) {
     void,
     null,
-    uinteger: usize,
+    /// The language `Int` — a signed 64-bit integer. (Addresses/handles use the
+    /// dedicated `.addr`/`.pipe`/… arms; this is the numeric value type.)
+    integer: i64,
     // TODO: decide on f32 or f64?
     float: f64,
     slice: Slice,
@@ -46,7 +48,7 @@ pub const Value = union(enum) {
 
     pub fn deinit(self: *@This(), allocator: Allocator) void {
         switch (self.*) {
-            .void, .null, .location, .uinteger, .slice, .executable, .exit_code, .addr, .thread => {},
+            .void, .null, .location, .integer, .slice, .executable, .exit_code, .addr, .thread => {},
             .strct => |strct| strct.deinit(allocator),
             .stream => |stream| allocator.free(stream),
         }
@@ -54,7 +56,7 @@ pub const Value = union(enum) {
 
     pub fn isNumber(self: @This()) bool {
         return switch (self) {
-            .uinteger => true,
+            .integer => true,
             .float => true,
             else => false,
         };
@@ -62,7 +64,7 @@ pub const Value = union(enum) {
 
     pub fn toFloat(self: @This()) ?f64 {
         return switch (self) {
-            .uinteger => |uinteger| @floatFromInt(uinteger),
+            .integer => |integer| @floatFromInt(integer),
             .float => |float| float,
             else => null,
         };
@@ -272,8 +274,8 @@ pub const Value = union(enum) {
         };
     }
 
-    pub fn fromInteger(integer: usize) @This() {
-        return .{ .uinteger = integer };
+    pub fn fromInteger(value: anytype) @This() {
+        return .{ .integer = @intCast(value) };
     }
 
     pub const ToStreamError = Allocator.Error || error{UnsupportedStreamCast};
@@ -297,7 +299,7 @@ pub const Value = union(enum) {
     ) DeserializeError!@This() {
         return switch (tag) {
             .void => .void,
-            .uinteger => .{ .uinteger = try r.takeInt(usize, endian) },
+            .integer => .{ .integer = try r.takeInt(i64, endian) },
             .float => .{ .float = std.mem.bytesAsValue(f64, try r.takeArray(8)).* },
             .addr => .{ .addr = try r.takeInt(usize, endian) },
             .thread => .{ .thread = try r.takeInt(usize, endian) },
@@ -316,7 +318,7 @@ pub const Value = union(enum) {
             .void => {},
             .stream => |stream| try w.writeAll(&std.mem.toBytes(stream)),
             .register, .dereference => unreachable,
-            inline .uinteger => |t| try w.writeInt(@TypeOf(t), t, endian),
+            inline .integer => |t| try w.writeInt(@TypeOf(t), t, endian),
             inline else => |t| {
                 if (std.meta.hasMethod(@TypeOf(t), "serialize")) {
                     return t.serialize(w);

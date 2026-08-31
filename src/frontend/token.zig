@@ -165,6 +165,7 @@ pub const Tag = enum {
     kw_match,
     kw_exit,
     kw_yield,
+    kw_comptime,
 
     // Module/interop keywords
     /// Module import keyword.
@@ -257,6 +258,7 @@ pub const Tag = enum {
             .kw_match => "match",
             .kw_exit => "exit",
             .kw_yield => "yield",
+            .kw_comptime => "comptime",
             .kw_import => "import",
             .kw_try => "try",
             .kw_catch => "catch",
@@ -300,6 +302,7 @@ const keyword_map = std.StaticStringMap(Tag).initComptime(.{
     .{ "match", .kw_match },
     .{ "exit", .kw_exit },
     .{ "yield", .kw_yield },
+    .{ "comptime", .kw_comptime },
     .{ "import", .kw_import },
     .{ "try", .kw_try },
     .{ "catch", .kw_catch },

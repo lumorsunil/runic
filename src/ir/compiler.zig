@@ -63,6 +63,12 @@ pub const execution_result_struct_type = ast.TypeExpr{ .struct_type = .{
 
 pub const thread_type = ast.TypeExpr.global(.thread);
 pub const string_element_type = ast.TypeExpr.global(.byte);
+const int_element_type = ast.TypeExpr.global(.integer);
+pub const int_array_type = ast.TypeExpr{ .array = .{
+    .element = &int_element_type,
+    .span = .global,
+} };
+const push_fallback_element = ast.TypeExpr{ .void = .{ .span = .global } };
 pub const string_type = ast.TypeExpr{ .array = .{
     .element = &string_element_type,
     .span = .global,
@@ -484,6 +490,10 @@ const Scope = struct {
 const InstructionSet = struct {
     instructions: std.ArrayList(ir.Instruction) = .empty,
     frames: std.ArrayList(StackFrame) = .empty,
+    /// Number of declared parameters (for `_non_variadic`). Lets a zero-arg
+    /// reference to a parameter-taking function resolve to a function *value*
+    /// (`const f = dbl`) instead of being called with no arguments.
+    param_count: usize = 0,
     closure_slot_count: usize = 0,
     closure_captures: []const ClosureCapture = &.{},
     pub_exports: []const PubExport = &.{},
@@ -576,6 +586,53 @@ pub const IRCompiler = struct {
     /// Stack of enclosing functions' declared stdin types, so `&0` can be
     /// typed correctly for coercions. Top is the innermost function.
     stdin_type_stack: std.ArrayList(?ast.TypeExpr) = .empty,
+
+    /// Comptime evaluation state. `comptime_forcing > 0` while lowering a
+    /// `comptime` expression, which enables the comptime folder to reduce pure
+    /// function calls (off by default so ordinary calls stay runtime). Maps a
+    /// function's instruction-set index to its AST declaration so the folder can
+    /// interpret its body, and bounds recursion so a non-terminating comptime
+    /// call fails to compile instead of hanging the compiler.
+    comptime_forcing: usize = 0,
+    comptime_fn_decls: std.AutoHashMapUnmanaged(usize, *const ast.FunctionDecl) = .empty,
+    comptime_depth: usize = 0,
+
+    /// Monomorphization. `fn_decl_sources` maps a function's instruction set to
+    /// its declaration expression (so a specialization can recompile its body);
+    /// `specializations` caches a compiled specialization per "instr_set|T=Int…"
+    /// key; `specializing` is set while compiling one, so `compileFnDecl` skips
+    /// the outer name declaration and re-registration.
+    fn_decl_sources: std.AutoHashMapUnmanaged(usize, *ast.Expression) = .empty,
+    specializations: std.StringHashMapUnmanaged(usize) = .empty,
+    specializing: bool = false,
+    specialization_depth: usize = 0,
+    /// The generic instruction set currently being specialized, passed from
+    /// `maybeSpecialize` to `compileFnDecl` so it can register the (generic →
+    /// specialization) mapping once the specialization's set is created.
+    specializing_generic: ?usize = null,
+    /// Stack of in-flight specializations; a self-recursive call inside a
+    /// specialization body (its callee resolves to the generic set) is
+    /// redirected to the specialization so it recurses at the same concrete type.
+    active_specializations: std.ArrayListUnmanaged(struct { generic: usize, spec: usize }) = .empty,
+
+    /// Concrete types bound by `|T|` captures in binding positions (`const x:
+    /// []|T| = …` → `T` = the element type). A later `: T` resolves through here.
+    type_captures: std.StringHashMapUnmanaged(ast.TypeExpr) = .empty,
+    /// Names of the current function's `var` locals that are linear buffers —
+    /// safe to grow in place via `array_push_inplace` (see analyzeLinearBuffers).
+    /// Recomputed per function body; saved/restored around nested functions.
+    linear_buffers: std.StringHashMapUnmanaged(void) = .empty,
+    /// A generic type constructor's type parameters, by name — so an application
+    /// `Box(Int)` can substitute its arguments into the registered struct body.
+    generic_ctor_params: std.StringHashMapUnmanaged([]const ast.Identifier) = .empty,
+    /// Recursion-depth cap for comptime call interpretation. Kept well below the
+    /// point where the interpreter's own (native) call stack would overflow, so
+    /// a non-terminating `comptime` recursion fails to compile instead of
+    /// crashing. Deeply recursive comptime algorithms beyond this are rejected.
+    const comptime_max_depth: usize = 128;
+    /// Cap on nested specialization compilation, so type-changing recursion can't
+    /// specialize forever (same-type recursion is redirected, not re-specialized).
+    const specialization_max_depth: usize = 64;
 
     pub fn init(
         io: std.Io,
@@ -1095,17 +1152,34 @@ pub const IRCompiler = struct {
         source: anytype,
         value: Result,
     ) Error!void {
-        const exit_code: ExitCode = @as(?ExitCode, switch (value.source) {
+        const exit_code = try self.resolveExitCode(source, value) orelse return;
+        return self.addInstruction(.init(.from(source), .exit_(exit_code)));
+    }
+
+    /// The user-facing `exit` statement: terminates the whole program from any
+    /// thread (a plain `.exit` from a forked function thread would only close
+    /// that thread and let the script continue).
+    pub fn processExit_(
+        self: *IRCompiler,
+        source: anytype,
+        value: Result,
+    ) Error!void {
+        const exit_code = try self.resolveExitCode(source, value) orelse return;
+        return self.addInstruction(.init(.from(source), .processExit_(exit_code)));
+    }
+
+    fn resolveExitCode(self: *IRCompiler, source: anytype, value: Result) Error!?ExitCode {
+        const code: ?ExitCode = switch (value.source) {
             .value => |v| switch (v) {
-                .uinteger => |x| .fromByte(@intCast(@mod(x, 256))),
+                .integer => |x| .fromByte(@intCast(@mod(x, 256))),
                 .exit_code => |exit_code| exit_code,
                 else => null,
             },
             else => null,
-        }) orelse {
-            return self.reportSourceError(source, Error.UnsupportedExitCodeExpression, .@"error", "value type \"{t}\" cannot be coerced into an exit code", .{value.source});
         };
-        return self.addInstruction(.init(.from(source), .exit_(exit_code)));
+        if (code) |c| return c;
+        try self.reportSourceError(source, Error.UnsupportedExitCodeExpression, .@"error", "value type \"{t}\" cannot be coerced into an exit code", .{value.source});
+        return null;
     }
 
     pub fn exitWith(
@@ -1153,12 +1227,26 @@ pub const IRCompiler = struct {
         try self.error_sets.put(self.allocator, "ExecutableError", ast.TypeExpr.executableErrorSet);
         try self.error_sets.put(self.allocator, "ParseError", ast.TypeExpr.parseErrorSet);
 
-        for (self.script.statements) |stmt| {
+        try self.registerTypeDecls(self.script.statements);
+    }
+
+    /// Records the struct / generic-constructor / error-set type declarations in
+    /// `statements` (the main script or an imported module), so their
+    /// construction, member access, and applications resolve.
+    fn registerTypeDecls(self: *IRCompiler, statements: []const *ast.Statement) Allocator.Error!void {
+        for (statements) |stmt| {
             if (stmt.* != .type_binding_decl) continue;
             const decl = stmt.type_binding_decl;
             switch (decl.type_expr.*) {
                 .error_set => |es| try self.error_sets.put(self.allocator, decl.identifier.name, es),
-                .struct_type => |st| try self.user_struct_types.put(self.allocator, decl.identifier.name, st),
+                .struct_type => |st| {
+                    try self.user_struct_types.put(self.allocator, decl.identifier.name, st);
+                    // Record a generic constructor's type parameters so an
+                    // application (`Box(Int)`) can substitute the arguments.
+                    if (decl.params.len > 0) {
+                        try self.generic_ctor_params.put(self.allocator, decl.identifier.name, decl.params);
+                    }
+                },
                 else => {},
             }
         }
@@ -1265,7 +1353,7 @@ pub const IRCompiler = struct {
         args: []const []const u8,
     ) Error!ir.ValueSource {
         try self.alloc(null, args.len + 1);
-        try self.set(null, .initAbs(.{ .register = .r }, .{ .dereference = true }), .fromValue(.{ .uinteger = args.len }));
+        try self.set(null, .initAbs(.{ .register = .r }, .{ .dereference = true }), .fromValue(.{ .integer = @as(i64, @intCast(args.len)) }));
 
         const array_ref = try self.newRef(null, "script_args");
         try self.set(null, array_ref, .fromLocation(.initRegister(.r)));
@@ -1334,6 +1422,7 @@ pub const IRCompiler = struct {
             .binding_decl => |*b| self.compileBindingDecl(stmt, b),
             .exit_stmt => |e| self.compileExit(stmt, e),
             .yield_stmt => |y| self.compileYield(stmt, y),
+            .while_stmt => |w| self.compileWhileLoop(stmt, w),
             .expression => |expr| self.compileExpressionStatement(stmt, expr.expression),
             else => {
                 try self.reportSourceError(stmt, Error.UnsupportedExpression, .@"error", "statement type \"{t}\" not yet supported", .{stmt.*});
@@ -1421,6 +1510,9 @@ pub const IRCompiler = struct {
 
         const name = call.callee.identifier.name;
         if (std.mem.eql(u8, name, "cd")) return false;
+        // `run` computes its executable from the first argument; it must go
+        // through the general call path, not the static-name direct exec.
+        if (std.mem.eql(u8, name, "run")) return false;
         for (call.arguments) |arg| {
             if (!isSimpleExecArgument(arg)) return false;
         }
@@ -1621,7 +1713,7 @@ pub const IRCompiler = struct {
             try self.compileExpression(value)
         else
             .fromValue(.{ .exit_code = .success });
-        try self.exit_(source, result);
+        try self.processExit_(source, result);
         return .fromValue(.void);
     }
 
@@ -1718,7 +1810,27 @@ pub const IRCompiler = struct {
         }
 
         var result: Result = .{ .source = value };
-        const annotated_type = if (annotation) |ann| ann.* else null;
+        // Normalize the annotation (String→[]Byte). When it carries a `|T|`
+        // capture, unify it against the initializer's concrete type — recording
+        // the captured names — and store that concrete type for this binding so
+        // member access and later `: T` references resolve.
+        const annotated_type = if (annotation) |ann| blk: {
+            // Bind whatever captures structurally match the initializer, then
+            // normalize the annotation: matched captures resolve to the concrete
+            // type, unmatched ones (e.g. `?|T| = null`) stay type variables.
+            if (hasTypeCapture(ann.*)) {
+                // Seed every capture name as a permissive type variable first, so
+                // an unmatched one (`?|T| = null`) still resolves to its name;
+                // then bind the ones that structurally match to a concrete type.
+                self.registerParamTypeVars(ann.*);
+                // Literals don't carry a type on their Result; fall back to the
+                // value's tag so a capture like `const x: |T| = 5` binds T=Int.
+                const init_type = result.typeExpr() orelse
+                    (if (result.source == .value) valueTypeExpr(result.source.value) else null);
+                if (init_type) |it| self.bindTypeCaptures(ann.*, it);
+            }
+            break :blk self.normalizeStringTypes(ann.*);
+        } else null;
         const needs_annotated_storage = if (annotated_type) |annotation_type|
             if (result.typeExpr()) |result_type|
                 !std.meta.eql(result_type, annotation_type)
@@ -1873,6 +1985,7 @@ pub const IRCompiler = struct {
             .try_expr => |try_expr| self.compileTry(expr, try_expr),
             .is_expr => |is_expr| self.compileIs(expr, is_expr),
             .for_expr => |for_expr| self.compileForLoop(expr, for_expr),
+            .comptime_expr => |comptime_expr| self.compileComptimeExpr(expr, comptime_expr),
             .subshell => |subshell| self.compileSubshell(expr, subshell),
             .fd => |fd_expr| self.compileFd(expr, fd_expr),
             else => {
@@ -1944,7 +2057,7 @@ pub const IRCompiler = struct {
         if (left.source != .value or right.source != .value) return false;
         return switch (left.source.value) {
             .null => right.source.value == .null,
-            .uinteger => |l| right.source.value == .uinteger and l == right.source.value.uinteger,
+            .integer => |l| right.source.value == .integer and l == right.source.value.integer,
             .float => |l| right.source.value == .float and l == right.source.value.float,
             .exit_code => |l| right.source.value == .exit_code and l.toBoolean() == right.source.value.exit_code.toBoolean(),
             .zig_string => |l| right.source.value == .zig_string and std.mem.eql(u8, l, right.source.value.zig_string),
@@ -1997,6 +2110,10 @@ pub const IRCompiler = struct {
                 break :blk switch (unary.op) {
                     .logical_not => if (operand.source.isValueTag(.exit_code))
                         Result.fromValue(.fromBoolean(!operand.source.value.exit_code.toBoolean()))
+                    else
+                        null,
+                    .negate => if (evaluateArithmetic(.sub, .fromValue(.{ .integer = 0 }), operand.source)) |folded|
+                        Result.fromValue(folded)
                     else
                         null,
                 };
@@ -2074,8 +2191,174 @@ pub const IRCompiler = struct {
                 }
                 break :blk null;
             },
+            .comptime_expr => |comptime_expr| blk: {
+                // Nested `comptime` (or the operand of a top-level one): fold the
+                // operand with call-folding enabled.
+                self.comptime_forcing += 1;
+                defer self.comptime_forcing -= 1;
+                break :blk try self.evalComptimeExpression(comptime_expr.operand);
+            },
+            .call => |call| if (self.comptime_forcing > 0)
+                try self.evalComptimeCall(call)
+            else
+                null,
             else => null,
         };
+    }
+
+    /// Comptime-evaluates a pure function call (`comptime fib 10`). Resolves the
+    /// callee to a known function's AST, folds each argument, binds the
+    /// parameters in a fresh scope, and interprets the body. Returns null (not
+    /// comptime-foldable) if the callee isn't a plain function, an argument or
+    /// the body can't be folded, or the arity doesn't match.
+    fn evalComptimeCall(self: *IRCompiler, call: ast.CallExpr) Error!?Result {
+        if (call.redirects.len != 0 or call.background) return null;
+        if (call.callee.* != .identifier) return null;
+
+        const binding = self.lookup(call.callee.identifier.name, .{ .shallow = false }) orelse return null;
+        if (binding.is_mutable or binding.result.source != .value) return null;
+
+        // A bare identifier parses as a zero-arg call (`n` -> `n()`); when it
+        // names an immutable value (e.g. a bound parameter), fold to that value.
+        if (binding.result.source.value != .fn_ref) {
+            return if (call.arguments.len == 0) binding.result else null;
+        }
+
+        const instr_set = binding.result.source.value.fn_ref.fn_addr.instr_set;
+        const fn_decl = self.comptime_fn_decls.get(instr_set) orelse return null;
+
+        // Only non-variadic, identifier-parameter functions are interpretable.
+        if (fn_decl.params != ._non_variadic) return null;
+        const params = fn_decl.params._non_variadic;
+        if (params.len != call.arguments.len) return null;
+
+        // Fold arguments in the *caller's* scope, before binding parameters.
+        const arg_values = try self.allocator.alloc(Result, call.arguments.len);
+        defer self.allocator.free(arg_values);
+        for (call.arguments, arg_values) |arg_expr, *slot| {
+            slot.* = (try self.evalComptimeExpression(arg_expr)) orelse return null;
+        }
+
+        if (self.comptime_depth >= comptime_max_depth) {
+            return null;
+        }
+        self.comptime_depth += 1;
+        defer self.comptime_depth -= 1;
+
+        // A fresh scope holds the parameter bindings; the function name stays
+        // visible from the enclosing scope so recursion resolves.
+        try self.scopes.push(self.allocator, .lexical);
+        defer self.scopes.pop();
+
+        for (params, arg_values) |param, arg_value| {
+            switch (param.pattern.*) {
+                .identifier => |identifier| try self.scopes.declare(
+                    self.allocator,
+                    identifier.name,
+                    arg_value,
+                    arg_value.typeExpr(),
+                    false,
+                    .normal,
+                ),
+                .discard => {},
+                else => return null,
+            }
+        }
+
+        return switch (try self.evalComptimeBody(fn_decl.body)) {
+            .value => |result| result,
+            // A body that never yields a value isn't comptime-foldable here.
+            .fell_through, .not_foldable => null,
+        };
+    }
+
+    /// The outcome of interpreting a comptime statement/body: a `yield`ed return
+    /// value, a fall-through (statement completed without returning), or a
+    /// non-foldable construct (the whole comptime evaluation gives up).
+    const ComptimeFlow = union(enum) {
+        value: Result,
+        fell_through,
+        not_foldable,
+    };
+
+    /// Interprets a function/branch body for comptime evaluation. A `yield`
+    /// anywhere is the return value; a bare `if`/`match` whose taken branch
+    /// yields returns through it; local `const` bindings extend the scope.
+    fn evalComptimeBody(self: *IRCompiler, body: *ast.Expression) Error!ComptimeFlow {
+        switch (body.*) {
+            .block => |block| {
+                for (block.statements) |stmt| {
+                    switch (try self.evalComptimeStatement(stmt)) {
+                        .value => |result| return .{ .value = result },
+                        .fell_through => {},
+                        .not_foldable => return .not_foldable,
+                    }
+                }
+                return .fell_through;
+            },
+            // A bare-expression body (`fn … n * 2`) folds directly.
+            else => return if (try self.evalComptimeExpression(body)) |result|
+                .{ .value = result }
+            else
+                .not_foldable,
+        }
+    }
+
+    fn evalComptimeStatement(self: *IRCompiler, stmt: *ast.Statement) Error!ComptimeFlow {
+        switch (stmt.*) {
+            .yield_stmt => |yield_stmt| {
+                if (yield_stmt.fd != 1) return .not_foldable;
+                const value = (try self.evalComptimeExpression(yield_stmt.value)) orelse return .not_foldable;
+                return .{ .value = value };
+            },
+            .binding_decl => |binding_decl| {
+                if (binding_decl.is_mutable) return .not_foldable;
+                const value = (try self.evalComptimeExpression(binding_decl.initializer)) orelse return .not_foldable;
+                switch (binding_decl.pattern.*) {
+                    .identifier => |identifier| self.scopes.declare(
+                        self.allocator,
+                        identifier.name,
+                        value,
+                        value.typeExpr(),
+                        false,
+                        .normal,
+                    ) catch return .not_foldable,
+                    .discard => {},
+                    else => return .not_foldable,
+                }
+                return .fell_through;
+            },
+            .expression => |expr_stmt| return self.evalComptimeControlStatement(expr_stmt.expression),
+            else => return .not_foldable,
+        }
+    }
+
+    /// A statement-position expression during comptime interpretation. An `if`
+    /// or `match` here may yield (return) through its taken branch; anything
+    /// else with no return value simply falls through if it folds.
+    fn evalComptimeControlStatement(self: *IRCompiler, expr: *ast.Expression) Error!ComptimeFlow {
+        switch (expr.*) {
+            .if_expr => |if_expr| {
+                const condition = (try self.evalComptimeExpression(if_expr.condition)) orelse return .not_foldable;
+                const truth = self.comptimeConditionTruth(if_expr.condition, condition) orelse return .not_foldable;
+                if (truth) return self.evalComptimeBody(if_expr.then_expr);
+                if (if_expr.else_branch) |else_branch| switch (else_branch) {
+                    .expr => |else_expr| return self.evalComptimeBody(else_expr),
+                    .if_expr => |else_if| {
+                        const else_expr = try self.allocExpression(.{ .if_expr = else_if.* });
+                        return self.evalComptimeControlStatement(else_expr);
+                    },
+                    .condition => return .fell_through,
+                };
+                return .fell_through;
+            },
+            // A non-control statement expression that folds is a discarded value
+            // (falls through); one that can't fold gives up.
+            else => return if (try self.evalComptimeExpression(expr)) |_|
+                .fell_through
+            else
+                .not_foldable,
+        }
     }
 
     /// In-process typed capture of a function call that returns a structured
@@ -2135,6 +2418,14 @@ pub const IRCompiler = struct {
     fn isTypedCaptureReturn(self: *IRCompiler, t: *const ast.TypeExpr) bool {
         return switch (t.*) {
             .error_union, .optional, .sum, .type_merge, .struct_type, .integer, .float, .boolean => true,
+            // A generic result (`type_var`) is captured by value — preserve
+            // whatever it is. A real array (`[]T`, element not `Byte`) is captured
+            // as the array itself; a String (`[]Byte`) stays on the byte path.
+            .type_var => true,
+            .array => |a| a.element.* != .byte,
+            // A generic struct application (`Box(Int)`) is captured by value like
+            // any struct, so it isn't byte-serialized (which would misread it).
+            .type_application => |app| self.user_struct_types.contains(app.name.name),
             .identifier => |named| blk: {
                 const name = named.path.segments[named.path.segments.len - 1].name;
                 if (self.user_struct_types.contains(name)) break :blk true;
@@ -2149,6 +2440,17 @@ pub const IRCompiler = struct {
         source: anytype,
         expr: *ast.Expression,
     ) Error!?Result {
+        // A call through a module member (`m.fn args`, `std.list.map xs f`) whose
+        // pub fn declares a typed-capturable return. The fn_ref and its return
+        // type come from the member's `fn_ref_type` (no receiver is prepended —
+        // unlike UFCS, a module member is not a method on its object).
+        if (try self.moduleMemberFnRef(expr)) |mm| {
+            if (self.isTypedCaptureReturn(mm.return_type)) {
+                return try self.emitTypedValueCapture(source, expr, mm.fn_ref_value, mm.arguments, &.{}, mm.return_type);
+            }
+            return null;
+        }
+
         const info = (try self.capturableCallInfo(expr)) orelse return null;
         if (info.redirects.len != 0) return null;
 
@@ -2161,10 +2463,33 @@ pub const IRCompiler = struct {
         const return_type_ptr = fn_type.function.return_type orelse return null;
         if (!self.isTypedCaptureReturn(return_type_ptr)) return null;
         const fn_ref_value = binding.result.source.value;
+        // A zero-arg reference to a function that declares parameters is a
+        // function *value* (`const f = dbl`), not a call to capture.
+        if (info.arguments.len == 0 and
+            self.instruction_sets.items[fn_ref_value.fn_ref.fn_addr.instr_set].param_count > 0)
+        {
+            return null;
+        }
         // pub exports change the call's result shape (a struct, already waited);
         // keep those on the existing path.
         if (self.instruction_sets.items[fn_ref_value.fn_ref.fn_addr.instr_set].pub_exports.len != 0) return null;
 
+        return try self.emitTypedValueCapture(source, expr, fn_ref_value, info.arguments, info.redirects, return_type_ptr);
+    }
+
+    /// Emits an in-process typed value capture of a function call: fork with a
+    /// `typed` stdout pipe, wait, then dequeue the single yielded value into %r
+    /// typed as `return_type_ptr`. Shared by the local-binding and module-member
+    /// capture paths.
+    fn emitTypedValueCapture(
+        self: *IRCompiler,
+        source: anytype,
+        expr: *ast.Expression,
+        fn_ref_value: ir.Value,
+        arguments: []const *ast.Expression,
+        redirects: []const ast.Redirection,
+        return_type_ptr: *const ast.TypeExpr,
+    ) Error!Result {
         // Mirror the byte-capture path's stack contract: leave exactly
         // `capture_temp_ref_count` temporary refs on top and return the result
         // in %r, so every caller (pop-5 or binding) stays balanced.
@@ -2177,8 +2502,8 @@ pub const IRCompiler = struct {
         const call_result = try self.compileFunctionCall(
             expr,
             fn_ref_value,
-            info.arguments,
-            info.redirects,
+            arguments,
+            redirects,
             pipe_ref.dereference(),
         );
 
@@ -2197,6 +2522,95 @@ pub const IRCompiler = struct {
         // Dequeue the single yielded value (the error union) into %r.
         try self.addInstruction(.init(.from(source), .{ .pipe_dequeue = pipe_ref.dereference() }));
         return try .from(ir.Location.initRegister(.r).typed(return_type_ptr.*));
+    }
+
+    const ModuleMemberFnRef = struct {
+        fn_ref_value: ir.Value,
+        return_type: *const ast.TypeExpr,
+        arguments: []const *ast.Expression,
+    };
+
+    /// If `expr` is a call whose callee is a module member naming a pub fn (a
+    /// `fn_ref_type` field with a known return type) — `m.fn args` or a nested
+    /// `std.list.map xs f` — returns its fn_ref, return type, and the *raw*
+    /// arguments (no receiver prepended). Returns null otherwise. Resolves the
+    /// callee's type statically (via bindings/fields), emitting no instructions.
+    fn moduleMemberFnRef(self: *IRCompiler, expr: *ast.Expression) Error!?ModuleMemberFnRef {
+        const callee: *ast.Expression, const arguments: []const *ast.Expression = switch (expr.*) {
+            .call => |call| blk: {
+                if (call.background or call.redirects.len != 0) return null;
+                break :blk .{ call.callee, call.arguments };
+            },
+            .binary => .{ expr, &.{} },
+            else => return null,
+        };
+        if (callee.* != .binary or callee.binary.op != .member or callee.binary.right.* != .identifier) return null;
+
+        const callee_type = self.resolveStaticType(callee) orelse return null;
+        if (callee_type != .fn_ref_type) return null;
+        const frt = callee_type.fn_ref_type;
+        const return_type = frt.return_type orelse return null;
+
+        // A zero-arg reference to a fn that declares parameters is a function
+        // *value* (`const f = m.fn`), not a call — leave it to the value path.
+        if (arguments.len == 0 and (frt.param_count orelse 0) > 0) return null;
+
+        return .{
+            .fn_ref_value = .{ .fn_ref = .{ .fn_addr = ir.InstructionAddr.initAbs(frt.instr_set, 0) } },
+            .return_type = return_type,
+            .arguments = arguments,
+        };
+    }
+
+    /// Whether `object`'s static type is a struct (a module value or user
+    /// struct) that declares a field named `name` — i.e. `object.name` is a real
+    /// member, so a same-named builtin (string op, `push`) must not shadow it.
+    fn memberIsStructField(self: *IRCompiler, object: *ast.Expression, name: []const u8) bool {
+        return self.memberFieldType(object, name) != null;
+    }
+
+    /// The static type of `object.name` when `object` resolves to a struct that
+    /// declares a field `name`; null otherwise. No instructions emitted.
+    fn memberFieldType(self: *IRCompiler, object: *ast.Expression, name: []const u8) ?ast.TypeExpr {
+        var t = self.resolveStaticType(object) orelse return null;
+        while (t == .alias) t = t.alias.type_expr.*;
+        if (t != .struct_type) return null;
+        for (t.struct_type.fields) |field| {
+            if (std.mem.eql(u8, field.name.name, name)) return field.type_expr.*;
+        }
+        return null;
+    }
+
+    /// Best-effort compile-time type of an expression, resolved purely from
+    /// binding declarations and struct field layouts (no instructions emitted).
+    /// Handles the shapes module-member resolution needs: a bound identifier and
+    /// nested `object.member` field access. Returns null when the type is not
+    /// statically known this way.
+    fn resolveStaticType(self: *IRCompiler, expr: *ast.Expression) ?ast.TypeExpr {
+        switch (expr.*) {
+            .identifier => |id| {
+                const binding = self.lookup(id.name, .{ .shallow = false }) orelse return null;
+                return binding.type_expr;
+            },
+            // A bare identifier parses as a zero-arg call (`p` -> `p()`); resolve
+            // to the referenced binding's type (e.g. the operand of `@TypeOf(p)`).
+            .call => |call| {
+                if (call.arguments.len != 0 or call.callee.* != .identifier) return null;
+                const binding = self.lookup(call.callee.identifier.name, .{ .shallow = false }) orelse return null;
+                return binding.type_expr;
+            },
+            .binary => |b| {
+                if (b.op != .member or b.right.* != .identifier) return null;
+                var object_type = self.resolveStaticType(b.left) orelse return null;
+                while (object_type == .alias) object_type = object_type.alias.type_expr.*;
+                if (object_type != .struct_type) return null;
+                for (object_type.struct_type.fields) |field| {
+                    if (std.mem.eql(u8, field.name.name, b.right.identifier.name)) return field.type_expr.*;
+                }
+                return null;
+            },
+            else => return null,
+        }
     }
 
     fn compileExpressionWithCapture(
@@ -2566,16 +2980,28 @@ pub const IRCompiler = struct {
         var slots = std.ArrayList(FieldSlot).empty;
         defer slots.deinit(self.allocator);
 
+        // Rebuild the struct type with each field typed by its supplied value
+        // (rather than the declared type, which may be a generic parameter `T`),
+        // so a `|T|` capture through this literal binds to the concrete type.
+        const concrete_fields = try self.allocator.alloc(ast.TypeExpr.StructField, struct_type.fields.len);
+
         var total: usize = 0;
-        for (struct_type.fields) |field| {
+        for (struct_type.fields, 0..) |field, i| {
             const layout = struct_type.fieldLayout(field.name.name) catch return .fromValue(.void);
             total += field.type_expr.slotSize() catch 1;
+
+            concrete_fields[i] = field;
 
             // The value supplied for this field (the type checker already
             // verified presence/typing).
             const value: Result = blk: {
                 for (struct_literal.fields) |lit_field| {
                     if (std.mem.eql(u8, lit_field.name.name, field.name.name)) {
+                        if (self.argTypeExpr(lit_field.value)) |vt| {
+                            const ft = try self.allocator.create(ast.TypeExpr);
+                            ft.* = vt;
+                            concrete_fields[i].type_expr = ft;
+                        }
                         break :blk try self.compileExpression(lit_field.value);
                     }
                 }
@@ -2594,7 +3020,9 @@ pub const IRCompiler = struct {
                 .from(slot.ref),
             );
         }
-        return .fromLocation(ir.Location.initRegister(.r).typed(.{ .struct_type = struct_type }));
+        var concrete_type = struct_type;
+        concrete_type.fields = concrete_fields;
+        return .fromLocation(ir.Location.initRegister(.r).typed(.{ .struct_type = concrete_type }));
     }
 
     /// Converts a finished command (`ExecutionResult`) into an
@@ -2881,6 +3309,29 @@ pub const IRCompiler = struct {
         }
 
         const object = try self.compileExpression(member.object);
+
+        // String builtins with no arguments (`s.len`, `s.upper`, `s.trim`, …).
+        // `len` also names an array's length, so it only applies to a string
+        // receiver; the transform/predicate names apply to any (materialized)
+        // value. A string may be untyped (a bare literal), so a missing type is
+        // treated as a string here.
+        if (stringBuiltin(member.member.name)) |sb| {
+            if (sb.arity == 0) {
+                const obj_is_string = if (object.typeExpr()) |t| self.typeIsString(t) else true;
+                if (!sb.string_only_receiver or obj_is_string) {
+                    return self.compileStrOp(source, object, sb, &.{});
+                }
+            }
+        }
+
+        // No-argument Float builtins (`x.sqrt`, `x.floor`, …). Skipped when the
+        // receiver is a struct declaring that member (so a module member wins).
+        if (floatBuiltin(member.member.name)) |fb| {
+            if (fb.arity == 0 and !self.memberIsStructField(member.object, member.member.name)) {
+                return self.compileFloatOp(source, object, fb, &.{});
+            }
+        }
+
         const object_type = object.typeExpr() orelse {
             try self.reportSourceError(
                 source,
@@ -2916,15 +3367,18 @@ pub const IRCompiler = struct {
                     return .fromValue(.void);
                 }
 
+                // The length lives at slot 0 of the heap array, addressed through
+                // %r2 — a volatile register. Copy it into a fresh stable ref so a
+                // later access (or arithmetic on the bound length, `xs.len - 1`)
+                // doesn't read through a clobbered %r2. Mirrors the struct-field
+                // read below.
                 try self.set(source, .initRegister(.r2), object.source);
-
-                return .fromLocation(.initAbs(
+                const len_ref = try self.newRef(source, "array_len");
+                try self.set(source, len_ref, .fromLocation(.initAbs(
                     .{ .register = .r2 },
-                    .{
-                        .dereference = true,
-                        .type_expr = .global(.integer),
-                    },
-                ));
+                    .{ .dereference = true, .type_expr = .global(.integer) },
+                )));
+                return .fromLocation(len_ref.dereference().typed(.global(.integer)));
             },
             .struct_type => |struct_type| struct_type,
             // A binding annotated with a user struct's name carries the type as
@@ -2938,6 +3392,32 @@ pub const IRCompiler = struct {
                     .{},
                 );
                 return .fromValue(.void);
+            },
+            // A captured generic struct return (`const e = wrap "x" 5` where
+            // `wrap` yields `Entry(K, V)`) carries its type as an application;
+            // resolve the constructor to its (param-substituted) layout.
+            .type_application => |app| blk: {
+                const resolved = self.resolveTypeApplication(app) orelse {
+                    try self.reportSourceError(
+                        source,
+                        Error.NotImplemented,
+                        .@"error",
+                        "member access is only supported for struct types in IR",
+                        .{},
+                    );
+                    return .fromValue(.void);
+                };
+                if (resolved != .struct_type) {
+                    try self.reportSourceError(
+                        source,
+                        Error.NotImplemented,
+                        .@"error",
+                        "member access is only supported for struct types in IR",
+                        .{},
+                    );
+                    return .fromValue(.void);
+                }
+                break :blk resolved.struct_type;
             },
             else => {
                 try self.reportSourceError(
@@ -3000,9 +3480,19 @@ pub const IRCompiler = struct {
         // For fn_ref_type fields, the fn_ref is a compile-time constant; return it as a value
         // directly so call compilation can emit a direct fork without runtime indirection.
         if (field_.type_expr == .fn_ref_type) {
-            return .from(ir.Value{ .fn_ref = .{
-                .fn_addr = ir.InstructionAddr.initAbs(field_.type_expr.fn_ref_type.instr_set, 0),
-            } });
+            const frt = field_.type_expr.fn_ref_type;
+            const fn_ref_value = ir.Value{ .fn_ref = .{
+                .fn_addr = ir.InstructionAddr.initAbs(frt.instr_set, 0),
+            } };
+            // A *nullary* module member (`m.cwd`, `m.greet`) is a call, like a bare
+            // nullary identifier — auto-call it in a value context so `m.f` and
+            // `${m.f}` yield its result, not the fn_ref. (A member with parameters
+            // is a function value, left for a later call with arguments.) The
+            // instruction set carries the authoritative parameter count.
+            if (mode == .read and self.instruction_sets.items[frt.instr_set].param_count == 0) {
+                return try self.compileFunctionCall(source, fn_ref_value, &.{}, &.{}, null);
+            }
+            return .from(fn_ref_value);
         }
 
         const object_ref = try self.newRef(source, "member_object_ref");
@@ -3209,6 +3699,12 @@ pub const IRCompiler = struct {
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
+        // Empty literal (`""`) — no segments; still a String, not a 0-length
+        // struct (the multi-segment path below would mistype it).
+        if (string_literal.segments.len == 0) {
+            return .from(try self.addSlice(1, ""));
+        }
+
         if (string_literal.segments.len == 1) {
             const decoded = try self.decodeStringLiteralText(string_literal.segments[0].text.payload);
             defer self.allocator.free(decoded);
@@ -3220,7 +3716,7 @@ pub const IRCompiler = struct {
         try self.set(
             source,
             .initAbs(.{ .register = .r }, .{ .dereference = true }),
-            .fromValue(.{ .uinteger = string_literal.segments.len }),
+            .fromValue(.{ .integer = @as(i64, @intCast(string_literal.segments.len)) }),
         );
         try self.set(source, ref, .fromLocation(.initRegister(.r)));
         // const s_tream = try self.allocator.alloc(ir.Value, string_literal.segments.len);
@@ -3268,9 +3764,22 @@ pub const IRCompiler = struct {
             },
         };
 
-        // return .fromValue(.{ .stream = s_tream });
-        // return .fromValue(.{ .stream = undefined });
-        return .from(ref.dereference());
+        // Flatten the segment rope (a heap sequence at `ref`) into a single
+        // contiguous string, so an interpolated string is a real `[]Byte` value
+        // like a literal — not an `.addr`-backed sequence indistinguishable from
+        // an array. This makes `is String`, `.bytes`, and value-hashing behave
+        // the same for built and literal strings. Uses `join` with an empty
+        // separator (concatenating every materialized segment).
+        const empty_sep = try self.addSlice(1, "");
+        const flat_ref = try self.newRef(source, "interp_flat");
+        try self.addInstruction(.init(.from(source), .{ .str_op = .{
+            .op = .join,
+            .operand = .from(ref.dereference()),
+            .arg0 = .fromValue(empty_sep),
+            .arg1 = .fromValue(.void),
+            .result = flat_ref.dereference(),
+        } }));
+        return .fromLocation(flat_ref.dereference().typed(string_type));
     }
 
     fn decodeStringLiteralText(self: *IRCompiler, encoded: []const u8) Allocator.Error![]u8 {
@@ -3334,7 +3843,7 @@ pub const IRCompiler = struct {
     }
 
     fn parseInt(text: []const u8) std.fmt.ParseIntError!ir.Value {
-        return .{ .uinteger = try std.fmt.parseInt(usize, text, 10) };
+        return .{ .integer = try std.fmt.parseInt(i64, text, 10) };
     }
 
     fn parseFloat(text: []const u8) std.fmt.ParseFloatError!ir.Value {
@@ -3456,6 +3965,11 @@ pub const IRCompiler = struct {
         }
 
         const source_binding = self.lookup(identifier.name, .{ .shallow = false }) orelse {
+            // A type identifier used where a value is expected serializes to the
+            // type's name (`echo "${Int}"` → "Int", a bound `|T|` → its type).
+            if (try self.typeIdentifierString(identifier.name)) |type_name| {
+                return .fromValue(type_name);
+            }
             const executable = try self.addSlice(1, identifier.name);
             return .fromValue(.{ .executable = executable.slice });
         };
@@ -3563,11 +4077,130 @@ pub const IRCompiler = struct {
 
         if (call.callee.* == .identifier) {
             const name = call.callee.identifier.name;
+            // A type application *with arguments* in value position
+            // (`${Box(Int)}`) serializes to its type-application string. A bare
+            // type name (zero args) is left to `compileIdentifier`, which
+            // resolves a captured type to its bound type rather than its name.
+            if (call.arguments.len > 0 and self.isTypeName(name) and
+                self.lookup(name, .{ .shallow = false }) == null)
+            {
+                if (try self.compileTypeApplicationString(call)) |type_string| {
+                    return .fromValue(type_string);
+                }
+            }
             if (std.mem.eql(u8, name, "@src")) {
                 return self.compileIdentifier(source, call.callee.identifier);
             }
             if (std.mem.eql(u8, name, "cd") and self.lookup(name, .{ .shallow = false }) == null) {
                 return self.compileBuiltinCd(source, call.arguments);
+            }
+            // `run "path" args…` — execute an executable at a runtime-computed
+            // path (a variable, interpolation, or a spaced path a bare command
+            // token can't express). The first argument is the executable; the
+            // rest are its arguments.
+            if (std.mem.eql(u8, name, "run") and
+                call.arguments.len >= 1 and
+                self.lookup(name, .{ .shallow = false }) == null)
+            {
+                return self.compileExecutableCall(source, .void, call.arguments[0], call.arguments[1..], call.redirects);
+            }
+            // `setenv name value` — set a dynamically-named environment variable
+            // (backs std.env.set). Shadowable by a local binding.
+            if (std.mem.eql(u8, name, "setenv") and
+                call.arguments.len == 2 and
+                self.lookup(name, .{ .shallow = false }) == null)
+            {
+                return self.compileBuiltinSetEnv(source, call.arguments);
+            }
+        }
+
+        // String builtins with arguments (`s.contains "x"`, `s.slice 1 3`, …) —
+        // a `.member` callee naming a string builtin with a matching arity. Wins
+        // over UFCS for these reserved names — *unless* the receiver is a struct
+        // (a module value or user struct) that actually declares a member of that
+        // name, e.g. `std.path.join` must call the module's `join`, not the
+        // built-in `[]String.join`.
+        if (call.callee.* == .binary and call.callee.binary.op == .member and call.callee.binary.right.* == .identifier and call.redirects.len == 0) {
+            const member_name = call.callee.binary.right.identifier.name;
+            if (!self.memberIsStructField(call.callee.binary.left, member_name)) {
+                if (stringBuiltin(member_name)) |sb| {
+                    if (sb.arity == @as(u8, @intCast(call.arguments.len)) and sb.arity > 0) {
+                        const object = try self.compileExpression(call.callee.binary.left);
+                        return self.compileStrOp(source, object, sb, call.arguments);
+                    }
+                }
+                if (floatBuiltin(member_name)) |fb| {
+                    if (fb.arity == @as(u8, @intCast(call.arguments.len)) and fb.arity > 0) {
+                        const object = try self.compileExpression(call.callee.binary.left);
+                        return self.compileFloatOp(source, object, fb, call.arguments);
+                    }
+                }
+            }
+            // `arr.push value` — append to an array, yielding a new array.
+            if (std.mem.eql(u8, call.callee.binary.right.identifier.name, "push") and call.arguments.len == 1) {
+                const object = try self.compileExpression(call.callee.binary.left);
+                const array_type_expr = object.typeExpr() orelse array_type(&push_fallback_element);
+                const array_ref = try self.newRef(source, "push_array");
+                try self.set(source, array_ref, stableResultSource(object));
+                const value = try self.compileExpression(call.arguments[0]);
+                const value_ref = try self.newRef(source, "push_value");
+                try self.set(source, value_ref, stableResultSource(value));
+                const result_ref = try self.newRef(source, "push_result");
+                try self.addInstruction(.init(.from(source), .{ .array_push = .{
+                    .array = .from(array_ref.dereference()),
+                    .value = .from(value_ref.dereference()),
+                    .result = result_ref.dereference(),
+                } }));
+                // Refine an unknown element type (`var xs = .{ }` starts as
+                // `[]Void`) from the pushed value, so a later `xs[i].field` /
+                // `xs[i][j]` can resolve the element's layout.
+                var result_array_type = array_type_expr;
+                if (array_type_expr == .array and array_type_expr.array.element.* == .void) {
+                    if (value.typeExpr() orelse self.argTypeExpr(call.arguments[0])) |vt| {
+                        const element = try self.allocator.create(ast.TypeExpr);
+                        element.* = vt;
+                        result_array_type = array_type(element);
+                    }
+                }
+                return .fromLocation(result_ref.dereference().typed(result_array_type));
+            }
+            // `arr.with index value` — a new array with element `index` replaced,
+            // copied once (O(n)), yielding a new array. The immutable analog of an
+            // in-place `arr[i] = v`; unlike a rebuild-with-push loop it is O(n),
+            // not O(n²), for updating one element. Named `with` (not `set`) so it
+            // never collides with a user/module function called `set` — which the
+            // typed-capture path would otherwise resolve first (bypassing this).
+            if (std.mem.eql(u8, call.callee.binary.right.identifier.name, "with") and
+                call.arguments.len == 2 and
+                !self.memberIsStructField(call.callee.binary.left, "with"))
+            {
+                const object = try self.compileExpression(call.callee.binary.left);
+                const array_type_expr = object.typeExpr() orelse array_type(&push_fallback_element);
+                const array_ref = try self.newRef(source, "with_array");
+                try self.set(source, array_ref, stableResultSource(object));
+                const value = try self.compileExpression(call.arguments[1]);
+                const value_ref = try self.newRef(source, "with_value");
+                try self.set(source, value_ref, stableResultSource(value));
+                const index = try self.compileExpression(call.arguments[0]);
+                const index_ref = try self.newRef(source, "with_index");
+                try self.set(source, index_ref, stableResultSource(index));
+                const result_ref = try self.newRef(source, "with_result");
+                try self.addInstruction(.init(.from(source), .{ .array_set = .{
+                    .array = .from(array_ref.dereference()),
+                    .index = .from(index_ref.dereference()),
+                    .value = .from(value_ref.dereference()),
+                    .result = result_ref.dereference(),
+                } }));
+                // Refine an unknown element type from the stored value, mirroring push.
+                var result_array_type = array_type_expr;
+                if (array_type_expr == .array and array_type_expr.array.element.* == .void) {
+                    if (value.typeExpr() orelse self.argTypeExpr(call.arguments[1])) |vt| {
+                        const element = try self.allocator.create(ast.TypeExpr);
+                        element.* = vt;
+                        result_array_type = array_type(element);
+                    }
+                }
+                return .fromLocation(result_ref.dereference().typed(result_array_type));
             }
         }
 
@@ -3580,23 +4213,54 @@ pub const IRCompiler = struct {
 
         const callee = try self.compileExpression(call.callee);
 
+        // Indirect call: a function-valued location (a `fn(...)`-typed parameter)
+        // called with arguments. The target function is only known at runtime.
+        if (callee.source == .location and call.arguments.len > 0 and call.redirects.len == 0) {
+            if (callee.typeExpr()) |t| {
+                if (t == .function) {
+                    const rt: ?ast.TypeExpr = if (t.function.return_type) |r| r.* else null;
+                    return self.compileIndirectCall(source, callee.source.location, rt, call.arguments);
+                }
+            }
+        }
+
         return switch (callee.source) {
             .value => |v| switch (v) {
-                .executable => self.compileExecutableCall(source, v, call.arguments, call.redirects),
-                .fn_ref => self.compileFunctionCall(source, v, call.arguments, call.redirects, null),
-                .slice, .stream, .addr, .void, .null, .uinteger, .float, .strct, .exit_code, .pipe, .thread, .closeable, .err => .from(v),
+                .executable => self.compileExecutableCall(source, v, null, call.arguments, call.redirects),
+                // A zero-arg reference to a function that declares parameters is a
+                // function *value* (`const f = dbl`), not a call — yield the fn_ref
+                // so it can be called later (`f x`). A nullary function is called.
+                .fn_ref => if (call.arguments.len == 0 and call.redirects.len == 0 and
+                    self.instruction_sets.items[v.fn_ref.fn_addr.instr_set].param_count > 0)
+                    .from(v)
+                else
+                    self.compileFunctionCall(source, v, call.arguments, call.redirects, null),
+                .slice, .stream, .addr, .void, .null, .integer, .float, .strct, .exit_code, .pipe, .thread, .closeable, .err => .from(v),
                 .zig_string => Error.UnsupportedValueType,
             },
             .location => |loc| .from(loc),
         };
     }
 
-    const RedirectStreams = struct { stdout: ir.Location, stderr: ir.Location };
+    const RedirectStreams = struct {
+        stdout: ir.Location,
+        stderr: ir.Location,
+        // When a `path` redirect points a stream at a file, the redirect pipe
+        // needs a drain thread to move its data pipe→file. These record the
+        // pipe locations so the caller can spawn that drain (see
+        // `compileFileRedirectDrains`). Null when the stream isn't file-redirected.
+        stdout_file_pipe: ?ir.Location = null,
+        stderr_file_pipe: ?ir.Location = null,
+    };
 
     /// Compiles a list of redirects into the stdout/stderr stream locations a
     /// command should run with (defaulting to the thread's own streams). A
     /// `path` redirect opens a pipe-to-file; an `fd` redirect points the stream
     /// at another descriptor. Shared by block and function call redirection.
+    ///
+    /// A file-redirect pipe is created with `keep_open=true` so its drain won't
+    /// close the file before the writer connects and finishes. The caller must
+    /// spawn a drain and clear that flag via `compileFileRedirectDrains`.
     fn compileRedirectStreams(
         self: *IRCompiler,
         source: anytype,
@@ -3609,6 +4273,7 @@ pub const IRCompiler = struct {
                     const redirect_target = try self.compileExpression(path_target.value);
                     const redirect_pipe_ref = try self.newRef(source, "stdout_redirect_pipe");
                     try self.pipe(source, redirect_pipe_ref);
+                    try self.pipeOpt(source, redirect_pipe_ref.dereference(), .keep_open, .fromValue(.fromBoolean(true)));
                     try self.pipeFile(
                         source,
                         redirect_pipe_ref.dereference(),
@@ -3616,8 +4281,14 @@ pub const IRCompiler = struct {
                         redirect.mode,
                     );
                     switch (redirect.stream) {
-                        .stdout => streams.stdout = redirect_pipe_ref.dereference(),
-                        .stderr => streams.stderr = redirect_pipe_ref.dereference(),
+                        .stdout => {
+                            streams.stdout = redirect_pipe_ref.dereference();
+                            streams.stdout_file_pipe = redirect_pipe_ref.dereference();
+                        },
+                        .stderr => {
+                            streams.stderr = redirect_pipe_ref.dereference();
+                            streams.stderr_file_pipe = redirect_pipe_ref.dereference();
+                        },
                         else => {},
                     }
                 },
@@ -3637,6 +4308,82 @@ pub const IRCompiler = struct {
             }
         }
         return streams;
+    }
+
+    /// Returns true when `streams` has at least one file-redirect pipe that
+    /// needs a drain (i.e. the redirect targets a file, not another fd).
+    fn hasFileRedirect(streams: RedirectStreams) bool {
+        return streams.stdout_file_pipe != null or streams.stderr_file_pipe != null;
+    }
+
+    /// Drains a function/block's file-redirect pipes to their files. Unlike a
+    /// command (which *is* the process, so its own exec closure drives the
+    /// drain), a function or block only writes to the redirect pipe — nothing
+    /// reads the pipe's source, so the inner command's stdout never reaches EOF
+    /// and it never completes. This spawns a concurrent drain per file pipe
+    /// (`stdoutStreamSet` driving pipe→file forwarding) so the writer's output
+    /// flows out as it is produced, then — once the writer thread finishes —
+    /// clears each pipe's `keep_open` flag so the drain flushes and closes the
+    /// file, and waits the drains.
+    ///
+    /// `writer_handle` is the (stable) thread handle of the function/block
+    /// thread. The drains are forked *before* waiting it so they run
+    /// concurrently with the writer.
+    fn compileFileRedirectDrains(
+        self: *IRCompiler,
+        source: anytype,
+        writer_handle: ir.Location,
+        streams: RedirectStreams,
+    ) Error!void {
+        var stdout_drain: ?ir.Location = null;
+        var stderr_drain: ?ir.Location = null;
+
+        if (streams.stdout_file_pipe) |file_pipe| {
+            const drain = try self.fork(
+                source,
+                self.stdoutStreamSet(),
+                self.threadStdin(),
+                file_pipe,
+                self.threadStderr(),
+                .noll,
+                .inherit,
+            );
+            const drain_ref = try self.newRef(source, "stdout_redirect_drain");
+            try self.set(source, drain_ref, .from(drain));
+            stdout_drain = drain_ref.dereference().typed(thread_type);
+        }
+
+        if (streams.stderr_file_pipe) |file_pipe| {
+            const drain = try self.fork(
+                source,
+                self.stdoutStreamSet(),
+                self.threadStdin(),
+                file_pipe,
+                self.threadStderr(),
+                .noll,
+                .inherit,
+            );
+            const drain_ref = try self.newRef(source, "stderr_redirect_drain");
+            try self.set(source, drain_ref, .from(drain));
+            stderr_drain = drain_ref.dereference().typed(thread_type);
+        }
+
+        // Wait for the writer (the function/block thread) to finish. The drains
+        // run concurrently, so the writer's inner commands can complete.
+        try self.wait(source, writer_handle);
+
+        // The writer is done and has connected (and EOF'd) its stdout. Clear the
+        // keep_open flags so each drain closes its file once the source drains,
+        // instead of spinning forever.
+        if (streams.stdout_file_pipe) |file_pipe| {
+            try self.pipeOpt(source, file_pipe, .keep_open, .fromValue(.fromBoolean(false)));
+        }
+        if (streams.stderr_file_pipe) |file_pipe| {
+            try self.pipeOpt(source, file_pipe, .keep_open, .fromValue(.fromBoolean(false)));
+        }
+
+        if (stdout_drain) |drain| try self.wait(source, drain);
+        if (stderr_drain) |drain| try self.wait(source, drain);
     }
 
     fn compileBlockCallWithRedirects(
@@ -3668,7 +4415,25 @@ pub const IRCompiler = struct {
 
         try self.setClosureIdentifiers();
         self.current_instruction_set = prev_instr_set;
+        // Emit the closure's initialization block (populates captures and jumps
+        // back to the fork). Without this the create-closure jump lands in an
+        // empty set and the block thread is never actually spawned.
+        try self.compileClosureInitialization(source, spawned.closure);
         self.scopes.pop();
+
+        if (hasFileRedirect(streams)) {
+            // The block writes to a redirect pipe; drive its drain to the file
+            // and wait for both the block and the drain. The redirect consumes
+            // the block's output, so the call yields nothing (void).
+            const thread_ref = try self.newRef(source, "block_thread");
+            try self.set(source, thread_ref, .from(spawned.thread_handle));
+            try self.compileFileRedirectDrains(
+                source,
+                thread_ref.dereference().typed(thread_type),
+                streams,
+            );
+            return .fromValue(.void);
+        }
 
         return .fromLocation(spawned.thread_handle);
     }
@@ -3897,6 +4662,31 @@ pub const IRCompiler = struct {
         return .fromLocation(.initRegister(.r));
     }
 
+    /// `setenv name value` builtin: set the environment variable named by the
+    /// runtime string `name` to `value` in the current subshell context (the
+    /// dynamic-name counterpart of `$NAME = value`). Backs `std.env.set`.
+    fn compileBuiltinSetEnv(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        arguments: []const *ast.Expression,
+    ) Error!Result {
+        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        const name = try self.compileExpression(arguments[0]);
+        const name_ref = try self.newRef(source, "setenv_name");
+        try self.set(source, name_ref, stableResultSource(name));
+        const value = try self.compileExpression(arguments[1]);
+        const value_ref = try self.newRef(source, "setenv_value");
+        try self.set(source, value_ref, stableResultSource(value));
+
+        try self.addInstruction(.init(.from(source), .{ .set_env = .{
+            .name = "",
+            .name_source = .from(name_ref.dereference()),
+            .value = .from(value_ref.dereference()),
+        } }));
+        return .fromValue(.void);
+    }
+
     fn compileSubshell(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -3926,6 +4716,10 @@ pub const IRCompiler = struct {
         self: *IRCompiler,
         source: *ast.Expression,
         executable: ir.Value,
+        // When non-null, the executable is a runtime string produced by this
+        // expression (`run "path" …`) rather than the static `executable` value;
+        // it is compiled inside the exec closure alongside the arguments.
+        executable_expr: ?*ast.Expression,
         arguments: []const *ast.Expression,
         redirects: []const ast.Redirection,
     ) Error!Result {
@@ -3971,6 +4765,12 @@ pub const IRCompiler = struct {
                     const redirect_target = try self.compileExpression(path_target.value);
                     const redirect_pipe_ref = try self.newRef(source, if (stream_fd == 1) "stdout_redirect_pipe" else "stderr_redirect_pipe");
                     try self.pipe(source, redirect_pipe_ref);
+                    // Keep the redirect pipe open until its source (the command's
+                    // stdout) connects and closes. Without this, a drain that runs
+                    // before the command connects — e.g. when interpolated arguments
+                    // delay the exec — sees no source, closes the file immediately,
+                    // and the command's output then has nowhere to go (deadlock).
+                    try self.pipeOpt(source, redirect_pipe_ref.dereference(), .keep_open, .fromValue(.fromBoolean(true)));
                     try self.pipeFile(
                         source,
                         redirect_pipe_ref.dereference(),
@@ -4037,8 +4837,17 @@ pub const IRCompiler = struct {
         self.current_instruction_set = exec_instr_set;
         try self.scopes.push(self.allocator, .closure);
 
+        // Compile every argument into its own stable ref first, then push them
+        // all. Building an interpolated (multi-segment) string argument leaves
+        // its own ref on the stack; interleaving those refs with the pushed
+        // argument values would make `exec` pop the wrong slots — so an
+        // `echo "${x}" "${y}"` argument list must be pushed contiguously, after
+        // every argument is built.
+        const arg_value_refs = try self.allocator.alloc(ir.Location, arguments.len);
+        defer self.allocator.free(arg_value_refs);
         var it = std.mem.reverseIterator(arguments);
-        while (it.next()) |arg_expr| {
+        var arg_i: usize = 0;
+        while (it.next()) |arg_expr| : (arg_i += 1) {
             var arg = try self.compileExpression(arg_expr);
             if (arg.isType(execution_result_struct_type)) {
                 const arg_ref = try self.newRef(source, "exec_result_arg");
@@ -4050,10 +4859,20 @@ pub const IRCompiler = struct {
                     .{ .dereference = true },
                 ));
             }
-            try self.push(source, arg.source);
+            const value_ref = try self.newRef(source, "exec_arg");
+            try self.set(source, value_ref, arg.source);
+            arg_value_refs[arg_i] = value_ref.dereference();
         }
-        try self.push(source, .from(executable));
-        try self.push(source, .fromValue(.{ .uinteger = arguments.len }));
+        for (arg_value_refs) |value_ref| {
+            try self.push(source, .from(value_ref));
+        }
+        if (executable_expr) |exe_expr| {
+            const exe = try self.compileExpression(exe_expr);
+            try self.push(source, exe.source);
+        } else {
+            try self.push(source, .from(executable));
+        }
+        try self.push(source, .fromValue(.{ .integer = @as(i64, @intCast(arguments.len)) }));
 
         const exec_handle = try self.exec_(source, arguments.len, false);
         const exec_handle_ref = try self.newRef(source, "exec_handle");
@@ -4071,6 +4890,13 @@ pub const IRCompiler = struct {
         );
         try self.comment("wait from {s}", .{@src().fn_name});
         try self.wait(source, exec_handle_ref.dereference());
+
+        // The command has finished (and connected its stdout). Clear the redirect
+        // pipe's keep_open flag set at creation, so its drain closes the file once
+        // the (now-EOF) source drains, instead of spinning forever.
+        if (has_stdout_file_redirect) {
+            try self.pipeOpt(source, self.threadStdout(), .keep_open, .fromValue(.fromBoolean(false)));
+        }
 
         try self.setClosureIdentifiers();
         self.current_instruction_set = prev_instr_set;
@@ -4226,6 +5052,591 @@ pub const IRCompiler = struct {
     /// `method` names a function in scope. Returns null when there is no such
     /// function (so the caller falls back to field access / its normal path).
     /// The receiver AST node is reused as arg 0, so it is evaluated exactly once.
+    const StringBuiltin = struct {
+        op: ir.Instruction.StrOp.Op,
+        arity: u8,
+        result: ast.TypeExpr,
+        /// Only applies to string receivers (e.g. `len`, which also names the
+        /// array length). String-only names (`upper`, `contains`, …) apply to
+        /// any receiver, materialized to bytes.
+        string_only_receiver: bool,
+    };
+
+    /// Maps a method name to its string-builtin descriptor (UFCS over Zig string
+    /// ops), or null. Result types: `Int` for len/indexOf, `Bool` for the
+    /// predicates, `String` for the transforms.
+    fn stringBuiltin(name: []const u8) ?StringBuiltin {
+        const int_t = ast.TypeExpr.global(.integer);
+        const bool_t = ast.TypeExpr.global(.boolean);
+        const eql = std.mem.eql;
+        if (eql(u8, name, "len")) return .{ .op = .len, .arity = 0, .result = int_t, .string_only_receiver = true };
+        if (eql(u8, name, "upper")) return .{ .op = .upper, .arity = 0, .result = string_type, .string_only_receiver = false };
+        if (eql(u8, name, "lower")) return .{ .op = .lower, .arity = 0, .result = string_type, .string_only_receiver = false };
+        if (eql(u8, name, "trim")) return .{ .op = .trim, .arity = 0, .result = string_type, .string_only_receiver = false };
+        if (eql(u8, name, "trimStart")) return .{ .op = .trim_start, .arity = 0, .result = string_type, .string_only_receiver = false };
+        if (eql(u8, name, "trimEnd")) return .{ .op = .trim_end, .arity = 0, .result = string_type, .string_only_receiver = false };
+        if (eql(u8, name, "contains")) return .{ .op = .contains, .arity = 1, .result = bool_t, .string_only_receiver = false };
+        if (eql(u8, name, "startsWith")) return .{ .op = .starts_with, .arity = 1, .result = bool_t, .string_only_receiver = false };
+        if (eql(u8, name, "endsWith")) return .{ .op = .ends_with, .arity = 1, .result = bool_t, .string_only_receiver = false };
+        if (eql(u8, name, "indexOf")) return .{ .op = .index_of, .arity = 1, .result = int_t, .string_only_receiver = false };
+        if (eql(u8, name, "slice")) return .{ .op = .slice, .arity = 2, .result = string_type, .string_only_receiver = false };
+        if (eql(u8, name, "repeat")) return .{ .op = .repeat, .arity = 1, .result = string_type, .string_only_receiver = false };
+        if (eql(u8, name, "replace")) return .{ .op = .replace, .arity = 2, .result = string_type, .string_only_receiver = false };
+        if (eql(u8, name, "bytes")) return .{ .op = .bytes, .arity = 0, .result = int_array_type, .string_only_receiver = true };
+        if (eql(u8, name, "split")) return .{ .op = .split, .arity = 1, .result = array_type(&string_type), .string_only_receiver = false };
+        if (eql(u8, name, "join")) return .{ .op = .join, .arity = 1, .result = string_type, .string_only_receiver = false };
+        return null;
+    }
+
+    /// True when a compile-time type denotes the string type (`[]Byte`).
+    /// Normalizes the `String`-named type identifier to the structural string
+    /// type (`[]Byte`), recursing through arrays and optionals, so a `String`
+    /// parameter or `[]String` element is recognized by every string-handling
+    /// site (which key on `.array` with a byte element). Non-`String` identifiers
+    /// — including user struct names — are left untouched.
+    fn lookupTypeCapture(self: *IRCompiler, name: []const u8) ?ast.TypeExpr {
+        return self.type_captures.get(name);
+    }
+
+    /// Registers each `|T|` capture appearing in a function parameter's type as
+    /// a permissive type variable, so a reference to `T` in the body (including
+    /// `${T}` serialization) resolves to the variable name. A concrete per-call
+    /// type would require monomorphization (not yet implemented).
+    fn registerParamTypeVars(self: *IRCompiler, t: ast.TypeExpr) void {
+        switch (t) {
+            .type_capture => |capture| {
+                if (!self.type_captures.contains(capture.name)) {
+                    self.type_captures.put(self.allocator, capture.name, .{ .type_var = .{ .name = capture.name, .span = capture.span } }) catch {};
+                }
+            },
+            .array => |a| self.registerParamTypeVars(a.element.*),
+            .optional => |o| self.registerParamTypeVars(o.child.*),
+            .promise => |p| self.registerParamTypeVars(p.child.*),
+            .type_application => |app| for (app.args) |arg| self.registerParamTypeVars(arg.*),
+            else => {},
+        }
+    }
+
+    /// Collects the `|T|` capture names appearing in a type into `out`.
+    fn collectCapturesInType(t: ast.TypeExpr, out: *std.ArrayList([]const u8), allocator: Allocator) Allocator.Error!void {
+        switch (t) {
+            .type_capture => |c| try out.append(allocator, c.name),
+            .array => |a| try collectCapturesInType(a.element.*, out, allocator),
+            .optional => |o| try collectCapturesInType(o.child.*, out, allocator),
+            .promise => |p| try collectCapturesInType(p.child.*, out, allocator),
+            .type_application => |app| for (app.args) |arg| try collectCapturesInType(arg.*, out, allocator),
+            else => {},
+        }
+    }
+
+    /// Whether a tracked type is still unknown — absent, `Void`, or an array
+    /// whose element type hasn't been determined (`var xs = .{ }` → `[]Void`).
+    /// Such a type may be refined when a concretely-typed value is assigned.
+    fn typeIsUnknown(t: ?ast.TypeExpr) bool {
+        const ty = t orelse return true;
+        return switch (ty) {
+            .void => true,
+            .array => |a| typeIsUnknown(a.element.*),
+            else => false,
+        };
+    }
+
+    /// The compile-time static type of a call argument, when knowable.
+    fn argTypeExpr(self: *IRCompiler, arg: *ast.Expression) ?ast.TypeExpr {
+        return switch (arg.*) {
+            .literal => |lit| switch (lit) {
+                .integer => ast.TypeExpr.global(.integer),
+                .float => ast.TypeExpr.global(.float),
+                .bool => ast.TypeExpr.global(.boolean),
+                .string => string_type,
+                .null => null,
+            },
+            .identifier, .call => self.resolveStaticType(arg),
+            else => null,
+        };
+    }
+
+    /// Monomorphization: for a direct call to a top-level, non-recursive generic
+    /// function whose parameters carry `|T|` captures, compile (or reuse) a
+    /// specialization with the type variables bound to the call's concrete
+    /// argument types, and return its instruction set. Returns null (use the
+    /// generic function) when the callee isn't a specializable candidate or the
+    /// type arguments can't be determined.
+    fn maybeSpecialize(
+        self: *IRCompiler,
+        instr_set: usize,
+        arguments: []const *ast.Expression,
+    ) Error!?usize {
+        if (self.specialization_depth >= specialization_max_depth) return null;
+        const fn_source = self.fn_decl_sources.get(instr_set) orelse return null;
+        const fn_decl = self.comptime_fn_decls.get(instr_set).?.*;
+        if (fn_decl.params != ._non_variadic) return null;
+        const params = fn_decl.params._non_variadic;
+        if (params.len != arguments.len) return null;
+        // Specialization recompiles the body in the current scope, so a function
+        // that captures closure variables is not a safe candidate.
+        if (self.instruction_sets.items[instr_set].closure_captures.len != 0) return null;
+
+        var capture_names = std.ArrayList([]const u8).empty;
+        defer capture_names.deinit(self.allocator);
+        for (params) |param| {
+            if (param.type_annotation) |ann| try collectCapturesInType(ann.*, &capture_names, self.allocator);
+        }
+        if (capture_names.items.len == 0) return null;
+
+        // Save any prior bindings for these names so the caller's context is
+        // restored after the specialization is compiled.
+        var saved = std.ArrayList(?ast.TypeExpr).empty;
+        defer saved.deinit(self.allocator);
+        for (capture_names.items) |name| try saved.append(self.allocator, self.type_captures.get(name));
+        defer for (capture_names.items, saved.items) |name, prior| {
+            if (prior) |p| self.type_captures.put(self.allocator, name, p) catch {} else _ = self.type_captures.remove(name);
+        };
+        for (capture_names.items) |name| _ = self.type_captures.remove(name);
+
+        // Bind each capture to its argument's concrete type.
+        for (params, arguments) |param, arg| {
+            const ann = param.type_annotation orelse continue;
+            if (!hasTypeCapture(ann.*)) continue;
+            const arg_type = self.argTypeExpr(arg) orelse return null;
+            self.bindTypeCaptures(ann.*, arg_type);
+        }
+        // Every capture must have bound to a concrete (non-variable) type.
+        for (capture_names.items) |name| {
+            const bound = self.type_captures.get(name) orelse return null;
+            if (bound == .type_var) return null;
+        }
+
+        // Build a cache key from the bound type arguments.
+        var key_writer = std.Io.Writer.Allocating.init(self.allocator);
+        defer key_writer.deinit();
+        try key_writer.writer.print("{}", .{instr_set});
+        for (capture_names.items) |name| {
+            try key_writer.writer.print("|{s}=", .{name});
+            try self.writeTypeName(&key_writer.writer, self.type_captures.get(name).?);
+        }
+        const key = key_writer.written();
+
+        if (self.specializations.get(key)) |cached| return cached;
+
+        // Compile the specialization with the type variables bound. Cache it
+        // under a stable key first (compileFnDecl registers the generic→spec
+        // mapping via `specializing_generic` so a self-recursive call inside the
+        // body targets this same specialization).
+        const owned_key = try self.allocator.dupe(u8, key);
+        const prev_specializing = self.specializing;
+        const prev_generic = self.specializing_generic;
+        self.specializing = true;
+        self.specializing_generic = instr_set;
+        self.specialization_depth += 1;
+        const result = self.compileFnDecl(fn_source, fn_decl) catch |err| {
+            self.specializing = prev_specializing;
+            self.specializing_generic = prev_generic;
+            self.specialization_depth -= 1;
+            return err;
+        };
+        self.specializing = prev_specializing;
+        self.specializing_generic = prev_generic;
+        self.specialization_depth -= 1;
+        const spec_instr_set = result.source.value.fn_ref.fn_addr.instr_set;
+        try self.specializations.put(self.allocator, owned_key, spec_instr_set);
+        return spec_instr_set;
+    }
+
+    /// A best-effort static type for a runtime value, used to seed a `|T|`
+    /// capture when the initializer's Result carries no type (e.g. a literal).
+    fn valueTypeExpr(value: ir.Value) ?ast.TypeExpr {
+        return switch (value) {
+            .integer => ast.TypeExpr.global(.integer),
+            .float => ast.TypeExpr.global(.float),
+            .exit_code => ast.TypeExpr.global(.boolean),
+            .slice => string_type,
+            else => null,
+        };
+    }
+
+    /// Unifies a binding's annotation `pattern` against the initializer's
+    /// concrete `subject` type, recording each `|T|` capture's matched type.
+    /// Recurses through the built-in generic constructors so `[]|T|` binds `T`
+    /// to the element type and `?|T|` to the child.
+    /// Substitutes each identifier naming one of `params` with the corresponding
+    /// `args` entry — a generic application's body substitution. Recurses through
+    /// the composite type shapes. Mirrors the type-checker's version.
+    fn substituteTypeParams(
+        self: *IRCompiler,
+        t: ast.TypeExpr,
+        params: []const ast.Identifier,
+        args: []const *const ast.TypeExpr,
+    ) Allocator.Error!ast.TypeExpr {
+        switch (t) {
+            .identifier => |named| {
+                if (named.path.segments.len == 1) {
+                    const name = named.path.segments[0].name;
+                    for (params, 0..) |param, i| {
+                        if (i < args.len and std.mem.eql(u8, param.name, name)) return args[i].*;
+                    }
+                }
+                return t;
+            },
+            .array => |a| {
+                const elem = try self.allocator.create(ast.TypeExpr);
+                elem.* = try self.substituteTypeParams(a.element.*, params, args);
+                return .{ .array = .{ .element = elem, .span = a.span } };
+            },
+            .optional => |o| {
+                const child = try self.allocator.create(ast.TypeExpr);
+                child.* = try self.substituteTypeParams(o.child.*, params, args);
+                return .{ .optional = .{ .child = child, .span = o.span } };
+            },
+            .promise => |p| {
+                const child = try self.allocator.create(ast.TypeExpr);
+                child.* = try self.substituteTypeParams(p.child.*, params, args);
+                return .{ .promise = .{ .child = child, .span = p.span } };
+            },
+            .type_application => |app| {
+                const new_args = try self.allocator.alloc(*const ast.TypeExpr, app.args.len);
+                for (app.args, new_args) |arg, *dst| {
+                    const na = try self.allocator.create(ast.TypeExpr);
+                    na.* = try self.substituteTypeParams(arg.*, params, args);
+                    dst.* = na;
+                }
+                return .{ .type_application = .{ .name = app.name, .args = new_args, .span = app.span } };
+            },
+            .struct_type => |st| {
+                const new_fields = try self.allocator.alloc(ast.TypeExpr.StructField, st.fields.len);
+                for (st.fields, new_fields) |field, *dst| {
+                    dst.* = field;
+                    const ft = try self.allocator.create(ast.TypeExpr);
+                    ft.* = try self.substituteTypeParams(field.type_expr.*, params, args);
+                    dst.type_expr = ft;
+                }
+                var new_st = st;
+                new_st.fields = new_fields;
+                return .{ .struct_type = new_st };
+            },
+            else => return t,
+        }
+    }
+
+    /// Resolves a generic application (`Box(Int)`) to the constructor's struct
+    /// body with the arguments substituted, or null when the constructor isn't a
+    /// registered generic struct.
+    fn resolveTypeApplication(self: *IRCompiler, app: ast.TypeExpr.TypeApplication) ?ast.TypeExpr {
+        const body_st = self.user_struct_types.get(app.name.name) orelse return null;
+        const params = self.generic_ctor_params.get(app.name.name) orelse &[_]ast.Identifier{};
+        return self.substituteTypeParams(.{ .struct_type = body_st }, params, app.args) catch null;
+    }
+
+    fn bindTypeCaptures(self: *IRCompiler, pattern: ast.TypeExpr, subject: ast.TypeExpr) void {
+        switch (pattern) {
+            .type_capture => |capture| {
+                self.type_captures.put(self.allocator, capture.name, subject) catch {};
+            },
+            .array => |a| if (subject == .array) self.bindTypeCaptures(a.element.*, subject.array.element.*),
+            .optional => |o| if (subject == .optional) self.bindTypeCaptures(o.child.*, subject.optional.child.*),
+            .promise => |p| if (subject == .promise) self.bindTypeCaptures(p.child.*, subject.promise.child.*),
+            // `Box(|T|)` — substitute into the body (keeping the capture), then
+            // match structurally against the subject struct.
+            .type_application => |app| {
+                if (self.resolveTypeApplication(app)) |resolved| self.bindTypeCaptures(resolved, subject);
+            },
+            .struct_type => |st| {
+                var subj = subject;
+                while (subj == .alias) subj = subj.alias.type_expr.*;
+                if (subj == .struct_type) {
+                    for (st.fields) |field| {
+                        for (subj.struct_type.fields) |sfield| {
+                            if (std.mem.eql(u8, field.name.name, sfield.name.name)) {
+                                self.bindTypeCaptures(field.type_expr.*, sfield.type_expr.*);
+                                break;
+                            }
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    /// Writes a type's serialized form: a name for named/primitive types
+    /// (`Int`, `String`, `Box(Int)`), the structural form for an anonymous
+    /// struct (`struct { value: Int }`), and the composed form for `[]T` / `?T`.
+    fn writeTypeName(self: *IRCompiler, w: *std.Io.Writer, t: ast.TypeExpr) std.Io.Writer.Error!void {
+        switch (t) {
+            .integer => try w.writeAll("Int"),
+            .float => try w.writeAll("Float"),
+            .boolean => try w.writeAll("Bool"),
+            .void => try w.writeAll("Void"),
+            .null => try w.writeAll("Null"),
+            .byte => try w.writeAll("Byte"),
+            .thread => try w.writeAll("Thread"),
+            .execution => try w.writeAll("Execution"),
+            .array => |a| {
+                if (a.element.* == .byte) {
+                    try w.writeAll("String");
+                } else {
+                    try w.writeAll("[]");
+                    try self.writeTypeName(w, a.element.*);
+                }
+            },
+            .optional => |o| {
+                try w.writeByte('?');
+                try self.writeTypeName(w, o.child.*);
+            },
+            .identifier => |id| for (id.path.segments, 0..) |seg, i| {
+                if (i > 0) try w.writeByte('.');
+                try w.writeAll(seg.name);
+            },
+            .alias => |al| try self.writeTypeName(w, al.type_expr.*),
+            .type_var => |tv| try w.writeAll(tv.name),
+            .type_application => |app| {
+                try w.writeAll(app.name.name);
+                try w.writeByte('(');
+                for (app.args, 0..) |arg, i| {
+                    if (i > 0) try w.writeAll(", ");
+                    try self.writeTypeName(w, arg.*);
+                }
+                try w.writeByte(')');
+            },
+            .struct_type => |st| {
+                try w.writeAll("struct { ");
+                for (st.fields, 0..) |field, i| {
+                    if (i > 0) try w.writeAll(", ");
+                    try w.writeAll(field.name.name);
+                    try w.writeAll(": ");
+                    try self.writeTypeName(w, field.type_expr.*);
+                }
+                try w.writeAll(" }");
+            },
+            else => try w.writeAll("?"),
+        }
+    }
+
+    /// Whether `name` denotes a compile-time type: a primitive keyword, a
+    /// declared struct or generic constructor, an error set, or a bound capture.
+    fn isTypeName(self: *IRCompiler, name: []const u8) bool {
+        const primitives = [_][]const u8{ "Int", "String", "Bool", "Float", "Void", "Byte" };
+        for (primitives) |p| {
+            if (std.mem.eql(u8, name, p)) return true;
+        }
+        return self.user_struct_types.contains(name) or self.error_sets.contains(name) or self.type_captures.contains(name);
+    }
+
+    /// Writes a type argument (from a `Name(args…)` application in value
+    /// position) as its type name — a bare type identifier, a bound capture, or
+    /// a nested application (`Box(String)`).
+    fn writeArgTypeName(self: *IRCompiler, w: *std.Io.Writer, arg: *ast.Expression) std.Io.Writer.Error!void {
+        switch (arg.*) {
+            .identifier => |id| {
+                if (self.type_captures.get(id.name)) |t| try self.writeTypeName(w, t) else try w.writeAll(id.name);
+            },
+            .call => |call| if (call.callee.* == .identifier) {
+                try w.writeAll(call.callee.identifier.name);
+                if (call.arguments.len > 0) {
+                    try w.writeByte('(');
+                    for (call.arguments, 0..) |a, i| {
+                        if (i > 0) try w.writeAll(", ");
+                        try self.writeArgTypeName(w, a);
+                    }
+                    try w.writeByte(')');
+                }
+            },
+            else => {},
+        }
+    }
+
+    /// Serializes a `Name(args…)` application in value position (`${Box(Int)}`)
+    /// to its type-application string, or null when the callee isn't a type.
+    fn compileTypeApplicationString(self: *IRCompiler, call: ast.CallExpr) Error!?ir.Value {
+        if (call.callee.* != .identifier) return null;
+        const name = call.callee.identifier.name;
+        if (!self.isTypeName(name)) return null;
+
+        var alloc_writer = std.Io.Writer.Allocating.init(self.allocator);
+        defer alloc_writer.deinit();
+        const w = &alloc_writer.writer;
+        try w.writeAll(name);
+        if (call.arguments.len > 0) {
+            try w.writeByte('(');
+            for (call.arguments, 0..) |arg, i| {
+                if (i > 0) try w.writeAll(", ");
+                try self.writeArgTypeName(w, arg);
+            }
+            try w.writeByte(')');
+        }
+        return try self.addSlice(1, alloc_writer.written());
+    }
+
+    /// If `name` refers to a compile-time type — a primitive keyword, a declared
+    /// struct or generic constructor, an error set, or a bound `|T|` capture —
+    /// returns its serialized name as a string value (for using a type
+    /// identifier where a string is expected). Otherwise null.
+    fn typeIdentifierString(self: *IRCompiler, name: []const u8) Error!?ir.Value {
+        const primitives = [_][]const u8{ "Int", "String", "Bool", "Float", "Void", "Byte" };
+        for (primitives) |p| {
+            if (std.mem.eql(u8, name, p)) return try self.addSlice(1, p);
+        }
+        // A named struct / generic constructor / error set serializes as its name.
+        if (self.user_struct_types.contains(name) or self.error_sets.contains(name)) {
+            return try self.addSlice(1, name);
+        }
+        // A `|T|` capture bound to a concrete type serializes as that type.
+        if (self.type_captures.get(name)) |t| {
+            var alloc_writer = std.Io.Writer.Allocating.init(self.allocator);
+            defer alloc_writer.deinit();
+            try self.writeTypeName(&alloc_writer.writer, t);
+            return try self.addSlice(1, alloc_writer.written());
+        }
+        return null;
+    }
+
+    /// Whether a type expression contains a `|T|` capture anywhere.
+    fn hasTypeCapture(t: ast.TypeExpr) bool {
+        return switch (t) {
+            .type_capture => true,
+            .array => |a| hasTypeCapture(a.element.*),
+            .optional => |o| hasTypeCapture(o.child.*),
+            .promise => |p| hasTypeCapture(p.child.*),
+            .type_application => |app| for (app.args) |arg| {
+                if (hasTypeCapture(arg.*)) break true;
+            } else false,
+            else => false,
+        };
+    }
+
+    fn normalizeStringTypes(self: *IRCompiler, t: ast.TypeExpr) ast.TypeExpr {
+        switch (t) {
+            .identifier => |id| {
+                const segs = id.path.segments;
+                if (segs.len == 1) {
+                    if (self.lookupTypeCapture(segs[0].name)) |bound| return self.normalizeStringTypes(bound);
+                    if (std.mem.eql(u8, segs[segs.len - 1].name, "String")) return string_type;
+                }
+                return t;
+            },
+            .array => |a| {
+                const elem = self.allocator.create(ast.TypeExpr) catch return t;
+                elem.* = self.normalizeStringTypes(a.element.*);
+                return .{ .array = .{ .element = elem, .span = a.span } };
+            },
+            .optional => |o| {
+                const child = self.allocator.create(ast.TypeExpr) catch return t;
+                child.* = self.normalizeStringTypes(o.child.*);
+                return .{ .optional = .{ .child = child, .span = o.span } };
+            },
+            // A `|T|` capture is permissive here (like a type variable); a
+            // concrete binding position resolves it against its initializer
+            // via `bindTypeCaptures` before this is consulted.
+            .type_capture => |capture| {
+                if (self.lookupTypeCapture(capture.name)) |bound| return self.normalizeStringTypes(bound);
+                return .{ .type_var = .{ .name = capture.name, .span = capture.span } };
+            },
+            // A generic application `Box(Int)` resolves to the constructor's
+            // struct body with the arguments substituted (`struct { value: Int }`),
+            // so member access, capture matching, and `${T}` see concrete fields.
+            .type_application => |app| {
+                if (self.resolveTypeApplication(app)) |resolved| return self.normalizeStringTypes(resolved);
+                if (self.user_struct_types.get(app.name.name)) |st| return .{ .struct_type = st };
+                return t;
+            },
+            else => return t,
+        }
+    }
+
+    fn typeIsString(_: *IRCompiler, type_expr: ast.TypeExpr) bool {
+        var t = type_expr;
+        while (t == .alias) t = t.alias.type_expr.*;
+        if (t == .array and t.array.element.* == .byte) return true;
+        // A `String`-named element (e.g. the element type of a `[]String`
+        // parameter) arrives as the unresolved identifier rather than the
+        // structural `[]Byte`.
+        if (t == .identifier) {
+            const segs = t.identifier.path.segments;
+            return segs.len == 1 and std.mem.eql(u8, segs[segs.len - 1].name, "String");
+        }
+        return false;
+    }
+
+    /// Compiles a string builtin: stabilizes the receiver (operand) and its args,
+    /// then emits a `str_op`. The receiver is already compiled (`object`); `args`
+    /// are the (0–2) argument expressions.
+    fn compileStrOp(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        object: Result,
+        sb: StringBuiltin,
+        args: []const *ast.Expression,
+    ) Error!Result {
+        const operand_ref = try self.newRef(source, "str_operand");
+        try self.set(source, operand_ref, stableResultSource(object));
+
+        var arg_sources = [_]ir.ValueSource{ .fromValue(.void), .fromValue(.void) };
+        for (args, 0..) |arg, i| {
+            const arg_result = try self.compileExpression(arg);
+            const arg_ref = try self.newRef(source, "str_arg");
+            try self.set(source, arg_ref, stableResultSource(arg_result));
+            arg_sources[i] = .from(arg_ref.dereference());
+        }
+
+        const result_ref = try self.newRef(source, "str_result");
+        try self.addInstruction(.init(.from(source), .{ .str_op = .{
+            .op = sb.op,
+            .operand = .from(operand_ref.dereference()),
+            .arg0 = arg_sources[0],
+            .arg1 = arg_sources[1],
+            .result = result_ref.dereference(),
+        } }));
+        return .fromLocation(result_ref.dereference().typed(sb.result));
+    }
+
+    const FloatBuiltin = struct {
+        op: ir.Instruction.FloatOp.Op,
+        arity: u8,
+    };
+
+    /// Maps a method name to its Float-math builtin descriptor (UFCS over the
+    /// operand: `x.sqrt`, `x.floor`, `x.pow y`), or null. All yield a Float.
+    fn floatBuiltin(name: []const u8) ?FloatBuiltin {
+        const eql = std.mem.eql;
+        if (eql(u8, name, "sqrt")) return .{ .op = .sqrt, .arity = 0 };
+        if (eql(u8, name, "floor")) return .{ .op = .floor, .arity = 0 };
+        if (eql(u8, name, "ceil")) return .{ .op = .ceil, .arity = 0 };
+        if (eql(u8, name, "round")) return .{ .op = .round, .arity = 0 };
+        if (eql(u8, name, "trunc")) return .{ .op = .trunc, .arity = 0 };
+        if (eql(u8, name, "powF")) return .{ .op = .pow, .arity = 1 };
+        return null;
+    }
+
+    /// Compiles a Float-math builtin: stabilizes the operand and its optional
+    /// argument, then emits a `float_op` yielding a Float.
+    fn compileFloatOp(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        object: Result,
+        fb: FloatBuiltin,
+        args: []const *ast.Expression,
+    ) Error!Result {
+        const operand_ref = try self.newRef(source, "float_operand");
+        try self.set(source, operand_ref, stableResultSource(object));
+
+        var arg0: ir.ValueSource = .fromValue(.void);
+        if (args.len > 0) {
+            const arg_result = try self.compileExpression(args[0]);
+            const arg_ref = try self.newRef(source, "float_arg");
+            try self.set(source, arg_ref, stableResultSource(arg_result));
+            arg0 = .from(arg_ref.dereference());
+        }
+
+        const result_ref = try self.newRef(source, "float_result");
+        try self.addInstruction(.init(.from(source), .{ .float_op = .{
+            .op = fb.op,
+            .operand = .from(operand_ref.dereference()),
+            .arg0 = arg0,
+            .result = result_ref.dereference(),
+        } }));
+        return .fromLocation(result_ref.dereference().typed(.global(.float)));
+    }
+
     fn tryUfcsRewrite(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -4244,6 +5655,59 @@ pub const IRCompiler = struct {
         return try self.compileFunctionCall(source, binding.result.source.value, full, redirects, null);
     }
 
+    /// Indirect call `f x …`: the callee is a *function value* known only at
+    /// runtime (a function-typed parameter). Forks the fn_ref read from the
+    /// callee location, passing the arguments in the closure, and captures the
+    /// yielded value. Closure size is the argument count — valid for a
+    /// capture-free (top-level) function, which is what a HOF receives.
+    fn compileIndirectCall(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        callee_loc: ir.Location,
+        return_type: ?ast.TypeExpr,
+        args: []const *ast.Expression,
+    ) Error!Result {
+        const fn_ref_ref = try self.newRef(source, "indirect_fn");
+        try self.set(source, fn_ref_ref, .from(callee_loc));
+
+        const pipe_ref = try self.newRef(source, "indirect_pipe");
+        try self.pipe(source, pipe_ref.dereference());
+        try self.pipeOpt(source, pipe_ref.dereference(), .typed, .fromValue(.fromBoolean(true)));
+
+        const arg_refs = try self.allocator.alloc(ir.Location, args.len);
+        defer self.allocator.free(arg_refs);
+        for (args, arg_refs) |arg, *ar| {
+            const arg_value = try self.compileExpression(arg);
+            const r = try self.newRef(source, "indirect_arg");
+            try self.set(source, r, stableResultSource(arg_value));
+            ar.* = r.dereference();
+        }
+
+        try self.alloc(source, args.len);
+        const closure_ref = try self.newRef(source, "indirect_closure");
+        try self.set(source, closure_ref, .fromLocation(.initRegister(.r)));
+        for (arg_refs, 0..) |ar, i| {
+            try self.set(source, .initRegister(.r), .from(closure_ref.dereference()));
+            try self.set(source, .initAdd(.{ .register = .r }, i, .{ .dereference = true }), .from(ar));
+        }
+
+        try self.addInstruction(.init(.from(source), .{ .fork = .{
+            .dest = ir.InstructionAddr.initAbs(0, 0),
+            .dest_from = fn_ref_ref.dereference(),
+            .stdin = self.threadStdin(),
+            .stdout = pipe_ref.dereference(),
+            .stderr = self.threadStderr(),
+            .closure = closure_ref.dereference(),
+            .subshell = .inherit,
+        } }));
+        const thread_ref = try self.newRef(source, "indirect_thread");
+        try self.set(source, thread_ref, .fromLocation(.initRegister(.r)));
+        try self.wait(source, thread_ref.dereference().typed(thread_type));
+
+        try self.addInstruction(.init(.from(source), .{ .pipe_dequeue = pipe_ref.dereference() }));
+        return .fromLocation(ir.Location.initRegister(.r).typed(return_type orelse .global(.void)));
+    }
+
     fn compileFunctionCall(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -4257,8 +5721,29 @@ pub const IRCompiler = struct {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
         const fn_ref = fn_ref_value.fn_ref;
-        const fn_addr = fn_ref.fn_addr;
+        var fn_addr = fn_ref.fn_addr;
+
+        // A self-recursive call inside a specialization body: its callee resolves
+        // to the generic set, so redirect it to the specialization being compiled
+        // (it then recurses at the same concrete type).
+        for (self.active_specializations.items) |as| {
+            if (fn_addr.instr_set == as.generic) {
+                fn_addr = ir.InstructionAddr.initAbs(as.spec, 0);
+                break;
+            }
+        }
+
         const is_self_recursive = self.current_instruction_set == fn_addr.instr_set;
+
+        // Monomorphization: for a non-recursive direct call, redirect to a
+        // per-type specialization when the callee's `|T|` captures resolve to
+        // concrete argument types (so `${T}` folds to the concrete type name).
+        if (!is_self_recursive and stdout_override == null) {
+            if (try self.maybeSpecialize(fn_addr.instr_set, arguments)) |spec_instr_set| {
+                fn_addr = ir.InstructionAddr.initAbs(spec_instr_set, 0);
+            }
+        }
+
         const self_closure_depth = if (is_self_recursive) blk: {
             const frame = try self.scopes.getFrame(0);
             break :blk if (frame.scope_type == .closure) @as(usize, 0) else try self.nearestClosureDepth();
@@ -4266,11 +5751,11 @@ pub const IRCompiler = struct {
 
         // Manual closure compilation
         // TODO: Add closure variables as well (we need to extend the function reference value to be able to understand what closure variables are needed)
-        const closure_captures = self.instruction_sets.items[fn_ref.fn_addr.instr_set].closure_captures;
+        const closure_captures = self.instruction_sets.items[fn_addr.instr_set].closure_captures;
         const closure_size = if (is_self_recursive)
             (try self.scopes.getFrame(self_closure_depth)).closure_bindings.items.len
         else
-            self.instruction_sets.items[fn_ref.fn_addr.instr_set].closure_slot_count;
+            self.instruction_sets.items[fn_addr.instr_set].closure_slot_count;
         try self.alloc(source, closure_size);
         const closure_ref = try self.newRef(source, "closure");
         try self.set(source, closure_ref, .fromLocation(.initRegister(.r)));
@@ -4351,7 +5836,7 @@ pub const IRCompiler = struct {
             .inherit,
         );
 
-        const pub_exports = self.instruction_sets.items[fn_ref.fn_addr.instr_set].pub_exports;
+        const pub_exports = self.instruction_sets.items[fn_addr.instr_set].pub_exports;
         const n_pub = pub_exports.len;
 
         if (n_pub > 0) {
@@ -4389,10 +5874,7 @@ pub const IRCompiler = struct {
             for (pub_exports, 0..) |pub_export, i| {
                 const field_type_ptr = try self.allocator.create(ast.TypeExpr);
                 if (pub_export.fn_ref_value) |fn_ref_val| {
-                    field_type_ptr.* = .{ .fn_ref_type = .{
-                        .instr_set = fn_ref_val.fn_ref.fn_addr.instr_set,
-                        .span = .global,
-                    } };
+                    field_type_ptr.* = .{ .fn_ref_type = try self.fnRefTypeFor(fn_ref_val, pub_export.type_expr) };
                 } else {
                     field_type_ptr.* = pub_export.type_expr orelse .global(.integer);
                 }
@@ -4406,9 +5888,31 @@ pub const IRCompiler = struct {
                 .span = .global,
                 .decls = &.{},
                 .fields = all_fields,
+                .by_reference_fields = true,
             } };
 
             return .fromLocation(result_ref.dereference().typed(merged_type));
+        }
+
+        // A file-redirected function call (`myFn > "file"`) with no pub exports:
+        // drive the redirect pipe's drain to the file and wait for both the
+        // function and the drain. The output is consumed by the redirect, so
+        // the call yields nothing (void). Capture (`stdout_override`) never
+        // combines with a file redirect.
+        if (stdout_override == null and hasFileRedirect(streams)) {
+            // Capture the fn thread handle (in %r) into a fresh ref on top of the
+            // stack, then drive the redirect drain. Do NOT pop the closure here:
+            // the redirect pipe ref sits above `closure_ref` on the stack, so a
+            // pop would corrupt the pipe location the drain still needs. A few
+            // slots leak for the rest of this frame, which is torn down after.
+            const handle_ref = try self.newRef(source, "fn_thread");
+            try self.set(source, handle_ref, .from(handle));
+            try self.compileFileRedirectDrains(
+                source,
+                handle_ref.dereference().typed(thread_type),
+                streams,
+            );
+            return .fromValue(.void);
         }
 
         // No pub exports: original behavior — return thread handle
@@ -4419,6 +5923,63 @@ pub const IRCompiler = struct {
         return .fromLocation(
             ir.Location.initRegister(.r).typed(handle.options.type_expr),
         );
+    }
+
+    /// A saved binding type, restored after a narrowed `if (x is T)` then-branch.
+    const NarrowGuard = struct {
+        binding: *Scope.Binding,
+        saved_result: Result,
+    };
+
+    /// The canonical compiler type an `is T` test narrows its subject to in the
+    /// then-branch (`String` → `[]Byte`, primitive identifiers → the primitive,
+    /// a user struct name → itself). Null when the type isn't a narrowable kind.
+    fn resolveTestedType(self: *IRCompiler, type_expr: *const ast.TypeExpr) ?ast.TypeExpr {
+        return switch (type_expr.*) {
+            .identifier => |named| {
+                const n = named.path.segments[named.path.segments.len - 1].name;
+                if (std.mem.eql(u8, n, "String")) return string_type;
+                if (std.mem.eql(u8, n, "Int")) return ast.TypeExpr.global(.integer);
+                if (std.mem.eql(u8, n, "Float")) return ast.TypeExpr.global(.float);
+                if (std.mem.eql(u8, n, "Bool")) return ast.TypeExpr.global(.boolean);
+                if (self.user_struct_types.contains(n)) return type_expr.*;
+                return null;
+            },
+            .integer, .float, .boolean => type_expr.*,
+            .array => |a| if (a.element.* == .byte) string_type else type_expr.*,
+            else => null,
+        };
+    }
+
+    /// When `condition` is `x is T` on a plain identifier, narrows `x`'s binding
+    /// to `T` for the duration of the then-branch (so `x.upper` / `x.bytes`
+    /// resolve inside `if (x is String)`), returning a guard to restore it.
+    fn narrowConditionSubject(self: *IRCompiler, condition: *ast.Expression) ?NarrowGuard {
+        if (condition.* != .is_expr) return null;
+        const is_expr = condition.is_expr;
+        const name = subjectIdentifierName(is_expr.subject) orelse return null;
+        const narrowed = self.resolveTestedType(is_expr.type_expr) orelse return null;
+        const binding = self.lookup(name, .{ .shallow = false }) orelse return null;
+        const guard = NarrowGuard{ .binding = binding, .saved_result = binding.result };
+        binding.result = binding.result.typed(narrowed);
+        return guard;
+    }
+
+    /// The bound name a narrowing subject refers to. A bare identifier in value
+    /// position parses as a nullary call, so unwrap that too.
+    fn subjectIdentifierName(expr: *ast.Expression) ?[]const u8 {
+        return switch (expr.*) {
+            .identifier => |id| id.name,
+            .call => |call| if (call.arguments.len == 0 and call.callee.* == .identifier)
+                call.callee.identifier.name
+            else
+                null,
+            else => null,
+        };
+    }
+
+    fn restoreNarrow(guard: ?NarrowGuard) void {
+        if (guard) |g| g.binding.result = g.saved_result;
     }
 
     fn compileIf(
@@ -4507,22 +6068,30 @@ pub const IRCompiler = struct {
         const else_addr = try self.newLabel("if_else", .unknown);
 
         try self.jmp(source, condition, false, else_addr);
+        const narrow = self.narrowConditionSubject(if_expr.condition);
         const then = try self.compileIfBranchExpression(source, if_expr.then_expr, if_condition.capture_binding);
+        restoreNarrow(narrow);
         try self.set(source, result, stableResultSource(then));
         try self.popToStackBase(source, branch_stack_base);
         try self.jmp(source, null, false, after_addr);
         try self.setLabel(else_addr.local_addr.label, .abs);
         var result_type = if (else_branch == .condition) mergedResultType(condition, then) else null;
+        // A branch that yields a (discardable) thread handle — e.g. a nested Void
+        // call — must keep the merged result typed as a thread so a Void-function
+        // body waits on it (see compileFnDecl) instead of racing the caller.
+        var branch_is_thread = then.isType(thread_type);
         switch (else_branch) {
             .expr => |expr_| {
                 const else_ = try self.compileExpression(expr_);
                 try self.set(source, result, stableResultSource(else_));
                 result_type = mergedResultType(then, else_);
+                if (else_.isType(thread_type)) branch_is_thread = true;
             },
             .if_expr => |if_expr_| {
                 const else_ = try self.compileIf(source, if_expr_.*);
                 try self.set(source, result, stableResultSource(else_));
                 result_type = mergedResultType(then, else_);
+                if (else_.isType(thread_type)) branch_is_thread = true;
             },
             .condition => {},
         }
@@ -4530,7 +6099,7 @@ pub const IRCompiler = struct {
         try self.setLabel(after_addr.local_addr.label, .abs);
         try self.set(source, .initRegister(.r2), .from(result.dereference()));
 
-        return .fromLocation(ir.Location.initRegister(.r2).typed(result_type));
+        return .fromLocation(ir.Location.initRegister(.r2).typed(if (branch_is_thread) thread_type else result_type));
     }
 
     fn compileIfNoElse(
@@ -4551,7 +6120,9 @@ pub const IRCompiler = struct {
         const after_addr = try self.newLabel("if_after", .unknown);
         const branch_stack_base = self.currentFrame().rel_stack_counter;
         try self.jmp(source, condition, false, after_addr);
+        const narrow = self.narrowConditionSubject(if_expr.condition);
         const then_result = try self.compileIfBranchExpression(source, if_expr.then_expr, if_condition.capture_binding);
+        restoreNarrow(narrow);
         if (isWaitable(then_result)) |loc| {
             try self.wait(source, loc);
         }
@@ -5459,6 +7030,56 @@ pub const IRCompiler = struct {
         return typeExprIsNamed(out_type, "Int") or typeExprIsNamed(out_type, "Float");
     }
 
+    /// Pipeline↔param coercion: a stage that is a zero-arg reference to a
+    /// single-parameter function receives the upstream value in that parameter.
+    /// Collects stdin into a value, binds it to the parameter, and calls the
+    /// function (whose output flows to the stage's stdout). Returns null when the
+    /// stage isn't such a reference (fall back to normal stage compilation).
+    fn tryCompilePipelineParamStage(self: *IRCompiler, source: *ast.Expression, stage_expr: *ast.Expression) Error!?Result {
+        const callee: *ast.Expression = switch (stage_expr.*) {
+            .call => |call| if (call.arguments.len == 0 and call.redirects.len == 0) call.callee else return null,
+            .identifier => stage_expr,
+            else => return null,
+        };
+        if (callee.* != .identifier) return null;
+        const binding = self.lookup(callee.identifier.name, .{ .shallow = false }) orelse return null;
+        if (!binding.result.isFunctionRef()) return null;
+        const fn_ref = binding.result.source.value;
+        if (self.instruction_sets.items[fn_ref.fn_ref.fn_addr.instr_set].param_count != 1) return null;
+
+        // The single parameter's type. `collect_stdin` (== `&0`) dequeues the
+        // upstream value typed when the boundary is typed (Int/Float/…) and as a
+        // String byte blob otherwise, matching the parameter type either way.
+        const param_type: ast.TypeExpr = blk: {
+            if (binding.type_expr) |t| if (t == .function) switch (t.function.params) {
+                ._non_variadic => |ps| if (ps.len == 1) {
+                    if (ps[0]) |pt| break :blk pt.*;
+                },
+                ._variadic => {},
+            };
+            break :blk string_type;
+        };
+
+        // Collect the upstream value and bind it to the single parameter.
+        try self.addInstruction(.init(.from(source), .collect_stdin));
+        const input_ref = try self.newRef(source, "pipe_param_input");
+        try self.set(source, input_ref, .fromLocation(.initRegister(.r)));
+
+        const input_name = "\x00pipe_param_input";
+        try self.scopes.declare(
+            self.allocator,
+            input_name,
+            try .from(input_ref.dereference().typed(param_type)),
+            param_type,
+            false,
+            .normal,
+        );
+        const arg_expr = try self.allocator.create(ast.Expression);
+        arg_expr.* = .{ .identifier = .{ .name = input_name, .span = source.span() } };
+
+        return try self.compileFunctionCall(source, fn_ref, &.{arg_expr}, &.{}, null);
+    }
+
     fn compilePipeline(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -5560,7 +7181,12 @@ pub const IRCompiler = struct {
                 null;
             const pushed_stdin = i > 0;
             if (pushed_stdin) try self.stdin_type_stack.append(self.allocator, inferred_stdin);
-            const result = try self.compileExpression(stage_expr);
+            // Only a receiver stage (not the producer at i==0) can bind stdin to
+            // a parameter.
+            const result = if (i > 0)
+                (try self.tryCompilePipelineParamStage(source, stage_expr)) orelse try self.compileExpression(stage_expr)
+            else
+                try self.compileExpression(stage_expr);
             if (pushed_stdin) _ = self.stdin_type_stack.pop();
 
             // A stage's value is no longer auto-pushed to stdout; output is
@@ -5595,7 +7221,8 @@ pub const IRCompiler = struct {
             self.allocator,
             self.stageStdoutType(pipeline.stages[last_idx - 1]),
         );
-        const result = try self.compileExpression(pipeline.stages[last_idx]);
+        const result = (try self.tryCompilePipelineParamStage(source, pipeline.stages[last_idx])) orelse
+            try self.compileExpression(pipeline.stages[last_idx]);
         if (last_pushed_stdin) _ = self.stdin_type_stack.pop();
         if (isWaitable(result)) |loc| {
             try self.comment("wait from {s} (last stage)", .{@src().fn_name});
@@ -5687,6 +7314,10 @@ pub const IRCompiler = struct {
             // Mark this module as in-flight so nested imports of the same path error
             try self.loading_set.put(self.allocator, module_path, {});
             try self.scopes.push(self.allocator, .closure);
+
+            // Register the module's type constructors / structs / error sets so a
+            // module like `std.map` can construct and apply its own `Map(K, V)`.
+            try self.registerTypeDecls(module_ast.statements);
 
             for (module_ast.statements) |stmt| {
                 _ = try self.compileStatement(stmt);
@@ -5840,10 +7471,7 @@ pub const IRCompiler = struct {
         for (pub_exports, 0..) |pub_export, i| {
             const field_type_ptr = try self.allocator.create(ast.TypeExpr);
             if (pub_export.fn_ref_value) |fn_ref_val| {
-                field_type_ptr.* = .{ .fn_ref_type = .{
-                    .instr_set = fn_ref_val.fn_ref.fn_addr.instr_set,
-                    .span = .global,
-                } };
+                field_type_ptr.* = .{ .fn_ref_type = try self.fnRefTypeFor(fn_ref_val, pub_export.type_expr) };
             } else {
                 field_type_ptr.* = pub_export.type_expr orelse .global(.integer);
             }
@@ -5857,9 +7485,37 @@ pub const IRCompiler = struct {
             .span = .global,
             .decls = &.{},
             .fields = all_fields,
+            .by_reference_fields = true,
         } };
 
         return .fromLocation(result_ref.dereference().typed(merged_type));
+    }
+
+    /// Builds the `fn_ref_type` for a module pub-fn field, carrying the function's
+    /// declared return type and parameter count (recovered from its `.function`
+    /// binding type) so a call through the member can value-capture the result
+    /// typed as its return type, exactly like a direct call.
+    fn fnRefTypeFor(
+        self: *IRCompiler,
+        fn_ref_val: ir.Value,
+        binding_type: ?ast.TypeExpr,
+    ) Error!ast.TypeExpr.FnRefType {
+        var return_type: ?*const ast.TypeExpr = null;
+        var param_count: ?usize = null;
+        if (binding_type) |bt| if (bt == .function) {
+            return_type = bt.function.return_type;
+            param_count = switch (bt.function.params) {
+                ._non_variadic => |ps| ps.len,
+                ._variadic => null,
+            };
+        };
+        _ = self;
+        return .{
+            .instr_set = fn_ref_val.fn_ref.fn_addr.instr_set,
+            .span = .global,
+            .return_type = return_type,
+            .param_count = param_count,
+        };
     }
 
     fn compileFnDecl(
@@ -5873,16 +7529,49 @@ pub const IRCompiler = struct {
         const fn_ref = ir.Value{
             .fn_ref = .{ .fn_addr = ir.InstructionAddr.initAbs(instr_set, 0) },
         };
+        // Record the AST so `comptime` calls can interpret this function's body
+        // and monomorphization can recompile it. Skip while specializing (the
+        // generic entry is authoritative). `source.fn_decl` is arena-stable.
+        if (source.* == .fn_decl and !self.specializing) {
+            try self.comptime_fn_decls.put(self.allocator, instr_set, &source.fn_decl);
+            try self.fn_decl_sources.put(self.allocator, instr_set, source);
+        }
+        // While specializing, register this new set as the specialization of the
+        // generic being compiled, so a self-recursive call inside the body (whose
+        // callee resolves to the generic set) recurses into this specialization.
+        var pushed_active_specialization = false;
+        if (self.specializing_generic) |generic| {
+            try self.active_specializations.append(self.allocator, .{ .generic = generic, .spec = instr_set });
+            self.specializing_generic = null;
+            pushed_active_specialization = true;
+        }
+        defer if (pushed_active_specialization) {
+            _ = self.active_specializations.pop();
+        };
         const orig_instr_set = self.current_instruction_set;
         self.current_instruction_set = instr_set;
         try self.scopes.push(self.allocator, .closure);
 
         if (fn_decl.name) |name| {
+            // Give the (self-visible) function binding a `.function` type carrying
+            // its return type, so a recursive call in the body can be value-captured
+            // by type (`const rest = cd (n - 1)` keeps `rest` typed as the return,
+            // usable in arithmetic — not byte-flattened to a string).
+            const param_types = try self.allocator.alloc(?*const ast.TypeExpr, fn_decl.params._non_variadic.len);
+            for (fn_decl.params._non_variadic, param_types) |param, *pt| {
+                pt.* = param.type_annotation;
+            }
+            const fn_type = ast.TypeExpr{ .function = .{
+                .params = .{ ._non_variadic = param_types },
+                .stdin_type = fn_decl.stdin_type,
+                .return_type = fn_decl.return_type,
+                .span = fn_decl.span,
+            } };
             try self.scopes.declare(
                 self.allocator,
                 name.name,
                 try .from(fn_ref),
-                null,
+                fn_type,
                 false,
                 .normal,
             );
@@ -5894,7 +7583,9 @@ pub const IRCompiler = struct {
         try self.stdin_type_stack.append(self.allocator, if (fn_decl.stdin_type) |st| st.* else null);
         defer _ = self.stdin_type_stack.pop();
 
+        self.instruction_sets.items[instr_set].param_count = fn_decl.params._non_variadic.len;
         for (fn_decl.params._non_variadic) |param| {
+            if (param.type_annotation) |type_annotation| self.registerParamTypeVars(type_annotation.*);
             switch (param.pattern.*) {
                 .discard => {},
                 .identifier => |identifier| {
@@ -5902,7 +7593,7 @@ pub const IRCompiler = struct {
                         .mutable(identifier, .normal),
                         0,
                         false,
-                        if (param.type_annotation) |type_annotation| type_annotation.* else null,
+                        if (param.type_annotation) |type_annotation| self.normalizeStringTypes(type_annotation.*) else null,
                     );
                 },
                 .tuple, .record => {
@@ -5918,6 +7609,13 @@ pub const IRCompiler = struct {
             }
         }
 
+        // Seed the closure slot count with the parameters so a recursive call
+        // compiled *inside the body* (e.g. a value-captured `cd (n - 1)`, whose
+        // fork is emitted from a nested capture wrapper where `is_self_recursive`
+        // is false) allocates a closure large enough for the arguments. The final
+        // count (params + captured closure variables) is set after the body.
+        self.currentInstrSet().closure_slot_count = fn_decl.params._non_variadic.len;
+
         // TODO: closure bindings, how do we manage them (non-parameters)?
         // TODO: figure out how to be able to call async functions multiple times and have the result not be overwritten in a ref
         //
@@ -5926,6 +7624,14 @@ pub const IRCompiler = struct {
         // pub-export epilogue below.  For non-block bodies fall back to compileExpression.
         const result = if (fn_decl.body.* == .block) blk: {
             const block = fn_decl.body.block;
+            // Identify this body's linear-buffer vars (grown in place). Saved and
+            // restored so a nested function's analysis doesn't leak out.
+            const saved_linear = self.linear_buffers;
+            self.linear_buffers = self.analyzeLinearBuffers(block.statements);
+            defer {
+                self.linear_buffers.deinit(self.allocator);
+                self.linear_buffers = saved_linear;
+            }
             var r: Result = .fromValue(.void);
             for (block.statements[0..block.statements.len -| 1]) |stmt| {
                 _ = try self.compileStatement(stmt);
@@ -5944,6 +7650,20 @@ pub const IRCompiler = struct {
                     r = .fromLocation(ir.Location.initRegister(.r2).typed(r.typeExpr()));
                 },
                 else => {},
+            }
+            // A Void function discards its body's value. If that value is a thread
+            // handle — a nested Void call, e.g. the last statement of an if-branch
+            // (compiled as an expression, so it skips the statement-level wait) —
+            // wait for it, so the callee's side effects and any nested `exit`
+            // finish before this function returns instead of racing the caller.
+            const is_void_fn = if (fn_decl.return_type) |rt| rt.* == .void else true;
+            if (is_void_fn and r.isType(thread_type)) {
+                const stable = if (r.source.isRegister(.r))
+                    try self.compileResultSaveR(source, r)
+                else
+                    r;
+                if (isWaitable(stable)) |loc| try self.wait(source, loc);
+                r = .fromValue(.void);
             }
             break :blk r;
         } else try self.compileExpression(fn_decl.body);
@@ -5997,24 +7717,28 @@ pub const IRCompiler = struct {
         self.currentInstrSet().pub_exports = try pub_exports_list.toOwnedSlice(self.allocator);
         self.current_instruction_set = orig_instr_set;
         self.scopes.pop();
+        // A specialization is called directly by instruction set; it must not
+        // re-declare the (already-declared) function name in the enclosing scope.
         if (fn_decl.name) |name| {
-            const fn_type = ast.TypeExpr{ .function = .{
-                .params = .nonVariadic(&.{}),
-                .stdin_type = fn_decl.stdin_type,
-                .return_type = fn_decl.return_type,
-                .span = fn_decl.span,
-            } };
-            try self.scopes.declare(
-                self.allocator,
-                name.name,
-                try .from(fn_ref),
-                fn_type,
-                false,
-                .normal,
-            );
-            if (fn_decl.is_pub) {
-                if (self.lookup(name.name, .{ .shallow = true })) |binding| {
-                    binding.is_pub = true;
+            if (!self.specializing) {
+                const fn_type = ast.TypeExpr{ .function = .{
+                    .params = .nonVariadic(&.{}),
+                    .stdin_type = fn_decl.stdin_type,
+                    .return_type = fn_decl.return_type,
+                    .span = fn_decl.span,
+                } };
+                try self.scopes.declare(
+                    self.allocator,
+                    name.name,
+                    try .from(fn_ref),
+                    fn_type,
+                    false,
+                    .normal,
+                );
+                if (fn_decl.is_pub) {
+                    if (self.lookup(name.name, .{ .shallow = true })) |binding| {
+                        binding.is_pub = true;
+                    }
                 }
             }
         }
@@ -6051,6 +7775,17 @@ pub const IRCompiler = struct {
                 }
                 const negated = try self.neg(source, result.source.location, .initRegister(.r));
                 return .from(negated.typed(.{ .boolean = .{ .span = .global } }));
+            },
+            // `-x` is `0 - x` — works for Int and Float via the arithmetic path.
+            .negate => {
+                const operand = try self.compileArithmeticOperand(source, unary.operand);
+                const zero = ir.ValueSource.fromValue(.{ .integer = 0 });
+                if (evaluateArithmetic(.sub, zero, operand.source)) |folded| {
+                    return .from(folded);
+                }
+                const ref = try self.newRef(source, "neg_result");
+                try self.ath(source, .subtract, zero, operand.source, ref);
+                return .from(ref.dereference());
             },
         }
     }
@@ -6149,6 +7884,220 @@ pub const IRCompiler = struct {
             return .from(ref.dereference().typed(type_expr));
         }
         return (try self.compileExpression(expr)).dereference();
+    }
+
+    /// The variable name an expression refers to, if it is a bare identifier or a
+    /// nullary call to one (`x` parses as `x()`). Null otherwise.
+    fn asVarName(expr: *ast.Expression) ?[]const u8 {
+        return switch (expr.*) {
+            .identifier => |id| id.name,
+            .call => |c| if (c.arguments.len == 0 and c.callee.* == .identifier)
+                c.callee.identifier.name
+            else
+                null,
+            else => null,
+        };
+    }
+
+    const AssignMut = struct {
+        name: []const u8,
+        kind: enum { push, with },
+        index: ?*ast.Expression,
+        value: *ast.Expression,
+    };
+
+    /// Matches an in-place-form mutation `x = x.push e` or `x = x.with i e` (any
+    /// var `x`, LHS and receiver the same). Used to recognize the allowed
+    /// mutations during linear-buffer analysis and to emit the in-place op.
+    fn matchAssignMutation(expr: *ast.Expression) ?AssignMut {
+        if (expr.* != .binary) return null;
+        return matchAssignMutationBinary(expr.binary);
+    }
+
+    fn matchAssignMutationBinary(b: ast.BinaryExpr) ?AssignMut {
+        if (b.op != .assign) return null;
+        const name = asVarName(b.left) orelse return null;
+        if (b.right.* != .call) return null;
+        const call = b.right.call;
+        if (call.redirects.len != 0) return null;
+        if (call.callee.* != .binary) return null;
+        const callee = call.callee.binary;
+        if (callee.op != .member or callee.right.* != .identifier) return null;
+        const recv = asVarName(callee.left) orelse return null;
+        if (!std.mem.eql(u8, recv, name)) return null;
+        const method = callee.right.identifier.name;
+        if (std.mem.eql(u8, method, "push") and call.arguments.len == 1)
+            return .{ .name = name, .kind = .push, .index = null, .value = call.arguments[0] };
+        if (std.mem.eql(u8, method, "with") and call.arguments.len == 2)
+            return .{ .name = name, .kind = .with, .index = call.arguments[0], .value = call.arguments[1] };
+        return null;
+    }
+
+    const LinScan = struct {
+        cand: *std.StringHashMapUnmanaged(void),
+        disq: *std.StringHashMapUnmanaged(void),
+        alloc: std.mem.Allocator,
+        recognized: bool = true,
+        // `strict`: escapes disqualify (used for all but the final statement).
+        // When false (final statement), only in-place mutations disqualify — an
+        // escape there is safe because nothing mutates the buffer afterward.
+        strict: bool = true,
+
+        fn disqualify(self: *LinScan, name: []const u8) void {
+            if (self.cand.contains(name)) self.disq.put(self.alloc, name, {}) catch {
+                self.recognized = false;
+            };
+        }
+    };
+
+    /// Identifies the `var x = .{ }` locals in a function body that are linear
+    /// buffers, safe to grow in place: mutated only via `x = x.push e`, otherwise
+    /// used only as reads (`x[i]`, `for(x)`, `x.len`), and escaping (a bare `x`
+    /// anywhere else) only in the final statement — so no mutation follows an
+    /// escape. Bails (returns empty) on any construct the walker doesn't fully
+    /// recognize, so anything unmodeled is simply not optimized.
+    fn analyzeLinearBuffers(self: *IRCompiler, statements: []const *ast.Statement) std.StringHashMapUnmanaged(void) {
+        var candidates: std.StringHashMapUnmanaged(void) = .empty;
+        const gpa = self.allocator;
+        for (statements) |s| {
+            if (s.* != .binding_decl) continue;
+            const bd = s.binding_decl;
+            if (!bd.is_mutable or bd.pattern.* != .identifier) continue;
+            if (bd.initializer.* != .array or bd.initializer.array.elements.len != 0) continue;
+            candidates.put(gpa, bd.pattern.identifier.name, {}) catch {
+                candidates.deinit(gpa);
+                return .empty;
+            };
+        }
+        if (candidates.count() == 0) return candidates;
+
+        var disq: std.StringHashMapUnmanaged(void) = .empty;
+        defer disq.deinit(gpa);
+        var scan: LinScan = .{ .cand = &candidates, .disq = &disq, .alloc = gpa };
+
+        const n = statements.len;
+        for (statements, 0..) |s, i| {
+            scan.strict = (i + 1 != n);
+            linScanStmt(&scan, s);
+        }
+        if (!scan.recognized) {
+            candidates.deinit(gpa);
+            return .empty;
+        }
+        var it = disq.keyIterator();
+        while (it.next()) |k| _ = candidates.remove(k.*);
+        return candidates;
+    }
+
+    fn linScanStmt(scan: *LinScan, s: *ast.Statement) void {
+        switch (s.*) {
+            .binding_decl => |bd| linScanExpr(scan, bd.initializer),
+            .expression => |es| {
+                if (matchAssignMutation(es.expression)) |ap| {
+                    // In-place mutation. Allowed before the final statement; in the
+                    // final statement it disqualifies (a mutation could then follow
+                    // an escape across loop iterations).
+                    if (!scan.strict) scan.disqualify(ap.name);
+                    if (ap.index) |ix| linScanExpr(scan, ix);
+                    linScanExpr(scan, ap.value);
+                } else {
+                    linScanExpr(scan, es.expression);
+                }
+            },
+            .yield_stmt => |y| linScanExpr(scan, y.value),
+            .exit_stmt => |e| if (e.value) |v| linScanExpr(scan, v),
+            .while_stmt => |w| {
+                linScanExpr(scan, w.condition);
+                for (w.body.statements) |bs| linScanStmt(scan, bs);
+            },
+            .type_binding_decl => {},
+            .bash_block => scan.recognized = false,
+        }
+    }
+
+    /// A read of a bare linear-buffer var (`x[i]` target, `for (x)` source,
+    /// `x.len` object) does not alias it — allow it. Anything else is walked.
+    fn linReadBase(scan: *LinScan, e: *ast.Expression) void {
+        if (asVarName(e)) |name| {
+            if (scan.cand.contains(name)) return;
+        }
+        linScanExpr(scan, e);
+    }
+
+    fn linScanExpr(scan: *LinScan, e: *ast.Expression) void {
+        switch (e.*) {
+            .identifier => |id| if (scan.strict) scan.disqualify(id.name),
+            .literal, .env_var, .path, .fd => {},
+            .array => |a| for (a.elements) |el| linScanExpr(scan, el),
+            .struct_literal => |sl| for (sl.fields) |f| linScanExpr(scan, f.value),
+            .unary => |u| linScanExpr(scan, u.operand),
+            .is_expr => |ie| linScanExpr(scan, ie.subject),
+            .index => |ix| {
+                linReadBase(scan, ix.target);
+                linScanExpr(scan, ix.index);
+            },
+            .member => |m| {
+                if (std.mem.eql(u8, m.member.name, "len")) linReadBase(scan, m.object) else linScanExpr(scan, m.object);
+            },
+            .call => |c| {
+                // A bare var (`x`, parsed `x()`) used as a value is an escape.
+                if (asVarName(e)) |vn| {
+                    if (scan.strict) scan.disqualify(vn);
+                } else {
+                    linScanExpr(scan, c.callee);
+                    for (c.arguments) |a| linScanExpr(scan, a);
+                }
+            },
+            .binary => |b| switch (b.op) {
+                .array_access => {
+                    linReadBase(scan, b.left);
+                    linScanExpr(scan, b.right);
+                },
+                .member => {
+                    if (b.right.* == .identifier and std.mem.eql(u8, b.right.identifier.name, "len"))
+                        linReadBase(scan, b.left)
+                    else
+                        linScanExpr(scan, b.left);
+                },
+                .assign => {
+                    // A non-in-place reassignment of a candidate breaks its
+                    // uniqueness (it now aliases the RHS) — disqualify it.
+                    if (asVarName(b.left)) |vn| scan.disqualify(vn);
+                    linScanExpr(scan, b.right);
+                },
+                else => {
+                    linScanExpr(scan, b.left);
+                    linScanExpr(scan, b.right);
+                },
+            },
+            .if_expr => |ife| linScanIf(scan, ife),
+            .for_expr => |f| {
+                for (f.sources) |src| linReadBase(scan, src);
+                linScanExpr(scan, f.body);
+            },
+            .block => |blk| for (blk.statements) |st| linScanStmt(scan, st),
+            // Constructs that could hide an aliasing use we don't model: bail, so
+            // the whole function is left unoptimized (safe).
+            else => scan.recognized = false,
+        }
+    }
+
+    fn linScanIf(scan: *LinScan, ife: ast.IfExpr) void {
+        linScanExpr(scan, ife.condition);
+        linScanExpr(scan, ife.then_expr);
+        if (ife.else_branch) |eb| switch (eb) {
+            .expr => |ex| linScanExpr(scan, ex),
+            .if_expr => |ip| linScanIf(scan, ip.*),
+            .condition => {},
+        };
+    }
+
+    /// Matches `x = x.push e` / `x = x.with i e` where `x` is a linear-buffer var
+    /// (analyzeLinearBuffers), so the mutation can be done in place.
+    fn matchInplaceBuffer(self: *IRCompiler, binary: ast.BinaryExpr) ?AssignMut {
+        const m = matchAssignMutationBinary(binary) orelse return null;
+        if (!self.linear_buffers.contains(m.name)) return null;
+        return m;
     }
 
     fn compileBinary(
@@ -6287,6 +8236,59 @@ pub const IRCompiler = struct {
                     return .from(value_ref.dereference().typed(value.typeExpr()));
                 }
 
+                // In-place mutation of a linear buffer: `x = x.push e` (grow into
+                // spare capacity, amortized O(1)) or `x = x.with i e` (overwrite an
+                // element in place, O(1)) — `x` is uniquely owned
+                // (analyzeLinearBuffers), so no other reference observes it.
+                if (self.matchInplaceBuffer(binary)) |m| {
+                    const buf = try self.compileExpression(binary.left);
+                    if (buf.source == .location) {
+                        const array_type_expr = buf.typeExpr() orelse array_type(&push_fallback_element);
+                        const array_ref = try self.newRef(source, "inplace_array");
+                        try self.set(source, array_ref, stableResultSource(buf));
+                        const value = try self.compileExpression(m.value);
+                        const value_ref = try self.newRef(source, "inplace_value");
+                        try self.set(source, value_ref, stableResultSource(value));
+                        const result_ref = try self.newRef(source, "inplace_result");
+                        if (m.kind == .with) {
+                            const index = try self.compileExpression(m.index.?);
+                            const index_ref = try self.newRef(source, "inplace_index");
+                            try self.set(source, index_ref, stableResultSource(index));
+                            try self.addInstruction(.init(.from(source), .{ .array_set_inplace = .{
+                                .array = .from(array_ref.dereference()),
+                                .index = .from(index_ref.dereference()),
+                                .value = .from(value_ref.dereference()),
+                                .result = result_ref.dereference(),
+                            } }));
+                        } else try self.addInstruction(.init(.from(source), .{ .array_push_inplace = .{
+                            .array = .from(array_ref.dereference()),
+                            .value = .from(value_ref.dereference()),
+                            .result = result_ref.dereference(),
+                        } }));
+                        var result_array_type = array_type_expr;
+                        if (array_type_expr == .array and array_type_expr.array.element.* == .void) {
+                            if (value.typeExpr() orelse self.argTypeExpr(m.value)) |vt| {
+                                const element = try self.allocator.create(ast.TypeExpr);
+                                element.* = vt;
+                                result_array_type = array_type(element);
+                            }
+                        }
+                        const typed_result = result_ref.dereference().typed(result_array_type);
+                        try self.set(source, buf.source.location, .from(typed_result));
+                        if (binary.left.* == .identifier) {
+                            if (self.lookup(binary.left.identifier.name, .{ .shallow = false })) |binding| {
+                                if (binding.is_mutable and
+                                    (typeIsUnknown(binding.result.typeExpr()) or typeIsUnknown(binding.type_expr)))
+                                {
+                                    binding.result = binding.result.typed(result_array_type);
+                                    binding.type_expr = result_array_type;
+                                }
+                            }
+                        }
+                        return .from(buf.source.location);
+                    }
+                }
+
                 const left = try self.compileExpression(binary.left);
                 if (left.source == .location and binary.right.* == .binary) {
                     const right_binary = binary.right.binary;
@@ -6307,8 +8309,31 @@ pub const IRCompiler = struct {
                         else => {},
                     }
                 }
-                const right = try self.compileExpression(binary.right);
+                // Capture a function call's typed return by value (a struct,
+                // optional, …) on reassignment, like a `const` binding — without
+                // this, `m = mapSet m …` would store the callee's thread handle.
+                const right = try self.compileExpressionWithCapture(source, binary.right);
                 try self.set(source, left.source.location, right.source);
+
+                // Refine a mutable variable's tracked type when the new value is
+                // concretely typed but the variable's type was still unknown
+                // (`var out = .{ }` is `[]Void`; `out = out.push Box{…}` makes it
+                // `[]Box`), so a later `out[i].field` resolves the element layout.
+                // Update both the `result` (read via compileIdentifier) and
+                // `type_expr` (read via resolveStaticType, e.g. when the variable
+                // becomes a struct-literal field value).
+                if (binary.left.* == .identifier) {
+                    if (self.lookup(binary.left.identifier.name, .{ .shallow = false })) |binding| {
+                        if (binding.is_mutable and
+                            (typeIsUnknown(binding.result.typeExpr()) or typeIsUnknown(binding.type_expr)))
+                        {
+                            if (right.typeExpr()) |rt| {
+                                binding.result = binding.result.typed(rt);
+                                binding.type_expr = rt;
+                            }
+                        }
+                    }
+                }
 
                 return .from(left.source.location);
             },
@@ -6336,7 +8361,10 @@ pub const IRCompiler = struct {
                 const element_type = left_type.array.element.*;
                 const left_ref = try self.newRef(source, "array_access_left_ref");
                 try self.set(source, left_ref, left.source);
-                const right = try self.compileExpression(binary.right);
+                // The index may be a function call whose result is delivered as a
+                // thread/pipe to await (e.g. `arr[hash key]`); capture it so the
+                // arithmetic below adds a materialized integer, not a handle.
+                const right = try self.compileArithmeticOperand(source, binary.right);
                 try self.set(source, .initRegister(.r2), .from(left_ref.dereference()));
 
                 try self.addInstruction(.init(.from(source), .{ .ath = .{
@@ -6389,13 +8417,15 @@ pub const IRCompiler = struct {
         array: ast.ArrayLiteral,
     ) Error!Result {
         try self.alloc(source, array.elements.len + 1);
-        try self.set(source, .initAbs(.{ .register = .r }, .{ .dereference = true }), .fromValue(.{ .uinteger = array.elements.len }));
+        try self.set(source, .initAbs(.{ .register = .r }, .{ .dereference = true }), .fromValue(.{ .integer = @as(i64, @intCast(array.elements.len)) }));
         const array_ref = try self.newRef(source, "array");
         try self.set(source, array_ref, .fromLocation(.initRegister(.r)));
         var element_type: ?ast.TypeExpr = null;
         for (array.elements, 1..) |element, i| {
             const result = try self.compileExpressionWithCapture(source, element);
-            element_type = result.typeExpr();
+            // Literals carry no type on their Result; fall back to the element
+            // expression's static type so `.{ 1, 2, 3 }` infers `[]Int`.
+            element_type = result.typeExpr() orelse self.argTypeExpr(element);
             try self.set(source, .initRegister(.r2), .from(array_ref.dereference()));
             try self.set(source, .initAdd(.{ .register = .r2 }, i, .{ .dereference = true }), result.source);
         }
@@ -6454,8 +8484,8 @@ pub const IRCompiler = struct {
                         range_limit_ref = range_limit_ref_;
                     }
                     if (range.inclusive_end) {
-                        try self.ath(source, .add, .from(range_limit_ref.?.dereference()), .fromValue(.{ .uinteger = 1 }), range_limit_ref.?);
-                        try self.ath(source, .add, .from(len_ref.?.dereference()), .fromValue(.{ .uinteger = 1 }), len_ref.?);
+                        try self.ath(source, .add, .from(range_limit_ref.?.dereference()), .fromValue(.{ .integer = 1 }), range_limit_ref.?);
+                        try self.ath(source, .add, .from(len_ref.?.dereference()), .fromValue(.{ .integer = 1 }), len_ref.?);
                     }
                 }
 
@@ -6491,7 +8521,7 @@ pub const IRCompiler = struct {
                     .base_ref = source_ref,
                     .len_ref = len_ref,
                     .range_limit_ref = null,
-                    .value_type = source_result.typeExpr().?.array.element.*,
+                    .value_type = self.normalizeStringTypes(source_result.typeExpr().?.array.element.*),
                 };
             },
         }
@@ -7042,6 +9072,39 @@ pub const IRCompiler = struct {
         return iterations_ref;
     }
 
+    /// Lowers `comptime <operand>`: fold the operand to a constant value with
+    /// call-folding enabled, or fail to compile. (The success path is normally
+    /// taken earlier by the automatic folder in `compileExpression`; this
+    /// handles — and reports — the case where the operand isn't reducible.)
+    fn compileComptimeExpr(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        comptime_expr: ast.ComptimeExpr,
+    ) Error!Result {
+        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        const folded = blk: {
+            self.comptime_forcing += 1;
+            defer self.comptime_forcing -= 1;
+            break :blk try self.evalComptimeExpression(comptime_expr.operand);
+        };
+
+        if (folded) |result| {
+            if (!(result.source == .value and result.source.value == .zig_string)) {
+                return result;
+            }
+        }
+
+        try self.reportSourceError(
+            source,
+            Error.UnsupportedExpression,
+            .@"error",
+            "`comptime` expression could not be evaluated at compile time",
+            .{},
+        );
+        return .fromValue(.void);
+    }
+
     fn compileForLoop(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -7089,7 +9152,7 @@ pub const IRCompiler = struct {
         }
 
         const counter_ref = try self.newRef(source, "for_counter");
-        try self.set(source, counter_ref, .fromValue(.{ .uinteger = 0 }));
+        try self.set(source, counter_ref, .fromValue(.{ .integer = 0 }));
         const iterations_ref = try self.compileForIterationsRef(source, for_sources) orelse {
             try self.reportSourceError(source, Error.NotImplemented, .@"error", "for loops require at least one finite source", .{});
             return .fromValue(.void);
@@ -7155,7 +9218,7 @@ pub const IRCompiler = struct {
             source,
             .add,
             .from(counter_ref.dereference()),
-            .fromValue(.{ .uinteger = 1 }),
+            .fromValue(.{ .integer = 1 }),
             counter_ref,
         );
         try self.jmp(source, null, true, for_label);
@@ -7163,6 +9226,136 @@ pub const IRCompiler = struct {
         try self.setLabel(after_label.local_addr.label, .abs);
 
         // TODO: return something like the block compilation is doing
+        return .fromValue(.void);
+    }
+
+    /// Lowers `while (condition) { body }`: re-evaluate the condition at the top
+    /// of each iteration, exit when it is falsy, otherwise run the body and jump
+    /// back. The condition is compiled *inside* the loop so it re-runs every
+    /// pass; its truthiness is stashed in a stable ref allocated outside the loop
+    /// so the transient refs it pushes can be popped back to a fixed base before
+    /// the exit branch — keeping the compile-time and runtime stacks aligned on
+    /// both the continue and exit paths.
+    fn compileWhileLoop(
+        self: *IRCompiler,
+        source: *ast.Statement,
+        while_stmt: ast.WhileStmt,
+    ) Error!Result {
+        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        if (while_stmt.capture) |capture| {
+            if (capture.bindings.len != 1) {
+                try self.reportSourceError(
+                    source,
+                    Error.UnsupportedBindingPattern,
+                    .@"error",
+                    "while capture clauses currently require exactly one binding",
+                    .{},
+                );
+                return .fromValue(.void);
+            }
+        }
+
+        const after_label = try self.newLabel("while_after", .unknown);
+        const cond_ref = try self.newRef(source, "while_cond");
+        // For an optional-capture loop the exit test is "the optional is present",
+        // computed into its own stable ref (allocated outside the loop so the
+        // transient-ref pop below leaves it intact).
+        const present_ref: ?ir.Location = if (while_stmt.capture != null)
+            try self.newRef(source, "while_present")
+        else
+            null;
+        const while_label = try self.newLabel("while", .abs);
+        const loop_stack_base = self.currentFrame().rel_stack_counter;
+
+        // Evaluate the condition and stash its result, then drop any transient
+        // refs it pushed so the stack is back at a fixed base before we branch.
+        const condition = try self.compileTransientExpression(source, while_stmt.condition);
+        try self.set(source, cond_ref, stableResultSource(condition));
+
+        // The value the exit branch tests, plus (for a capture) the unwrapped
+        // binding to declare in the body scope.
+        var loop_cond: Result = undefined;
+        var capture_binding: ?IfCaptureBinding = null;
+        if (while_stmt.capture) |capture| {
+            const condition_type = blk: {
+                if (condition.typeExpr()) |type_expr| break :blk type_expr;
+                if (while_stmt.condition.* == .identifier) {
+                    if (self.lookup(while_stmt.condition.identifier.name, .{ .shallow = false })) |binding| {
+                        if (binding.result.typeExpr()) |type_expr| break :blk type_expr;
+                    }
+                }
+                break :blk null;
+            };
+            const child: ast.TypeExpr = switch (condition_type orelse ast.TypeExpr.global(.void)) {
+                .optional => |optional| optional.child.*,
+                else => {
+                    try self.reportSourceError(
+                        source,
+                        Error.UnsupportedExpression,
+                        .@"error",
+                        "a `while (…) |v|` capture requires an optional condition",
+                        .{},
+                    );
+                    return .fromValue(.void);
+                },
+            };
+            // present = (cond != null); loop while present, bind the unwrapped value.
+            try self.cmp(source, .not_equal, .from(cond_ref.dereference()), .fromValue(.null), present_ref.?);
+            loop_cond = try .from(present_ref.?.dereference());
+            capture_binding = .{
+                .pattern = capture.bindings[0],
+                .value = .fromLocation(cond_ref.dereference().typed(child)),
+            };
+        } else {
+            loop_cond = try .from(cond_ref.dereference());
+        }
+
+        try self.popToStackBase(source, loop_stack_base);
+        try self.jmp(source, loop_cond, false, after_label);
+
+        // Body: a fresh lexical scope per iteration (loop-local bindings), with
+        // its runtime slots popped at the end so they don't accumulate.
+        try self.scopes.push(self.allocator, .lexical);
+        const stack_before_body = self.currentFrame().rel_stack_counter;
+
+        if (capture_binding) |binding| switch (binding.pattern.*) {
+            .discard => {},
+            .identifier => |identifier| try self.compileIdentifierBinding(
+                source,
+                identifier,
+                binding.value,
+                null,
+                false,
+                .normal,
+            ),
+            else => {
+                self.scopes.pop();
+                try self.reportSourceError(
+                    source,
+                    Error.UnsupportedBindingPattern,
+                    .@"error",
+                    "while capture binding pattern not yet supported",
+                    .{},
+                );
+                return .fromValue(.void);
+            },
+        };
+
+        var body_result: Result = .fromValue(.void);
+        for (while_stmt.body.statements) |body_stmt| {
+            body_result = try self.compileStatement(body_stmt);
+        }
+        if (isWaitable(body_result)) |loc| {
+            try self.wait(source, loc);
+        }
+
+        try self.popToStackBase(source, stack_before_body);
+        self.scopes.pop();
+
+        try self.jmp(source, null, true, while_label);
+        try self.setLabel(after_label.local_addr.label, .abs);
+
         return .fromValue(.void);
     }
 
@@ -7263,7 +9456,7 @@ pub const IRCompiler = struct {
     ) Error!Result {
         const iter_ref = try self.newRef(source, "for_counter");
         if (for_source.zero_based_range) {
-            try self.set(source, iter_ref, .fromValue(.{ .uinteger = 0 }));
+            try self.set(source, iter_ref, .fromValue(.{ .integer = 0 }));
         } else {
             try self.set(source, iter_ref, .from(for_source.start_ref.?.dereference()));
         }
@@ -7367,7 +9560,7 @@ pub const IRCompiler = struct {
             source,
             .add,
             .from(iter_ref.dereference()),
-            .fromValue(.{ .uinteger = 1 }),
+            .fromValue(.{ .integer = 1 }),
             iter_ref,
         );
         try self.jmp(source, null, true, for_label);
@@ -7407,6 +9600,13 @@ pub const IRCompiler = struct {
                     if (self.lookup(binary.right.identifier.name, .{ .shallow = false })) |b| {
                         if (b.result.isFunctionRef()) break :brk .{ .needs_stdio_capture = true };
                     }
+                    // A nullary module-member function (`m.cwd`) is auto-called in
+                    // a value context, so its output must be captured like any call.
+                    if (self.memberFieldType(binary.left, binary.right.identifier.name)) |ft| {
+                        if (ft == .fn_ref_type and self.instruction_sets.items[ft.fn_ref_type.instr_set].param_count == 0) {
+                            break :brk .{ .needs_stdio_capture = true };
+                        }
+                    }
                 }
                 var result = self.analyzeExpressionEffects(binary.left);
                 result.merge(self.analyzeExpressionEffects(binary.right));
@@ -7416,6 +9616,13 @@ pub const IRCompiler = struct {
             .array => .{ .needs_stdio_capture = false },
             else => .{},
         };
+    }
+
+    /// The declared parameter count of a fn_ref value source, or null if the
+    /// source isn't a compile-time fn_ref.
+    fn fnRefParamCount(self: *IRCompiler, source: ir.ValueSource) ?usize {
+        if (source != .value or source.value != .fn_ref) return null;
+        return self.instruction_sets.items[source.value.fn_ref.fn_addr.instr_set].param_count;
     }
 
     fn callNeedsStdioCapture(self: *IRCompiler, call: ast.CallExpr) bool {
@@ -7434,7 +9641,11 @@ pub const IRCompiler = struct {
                 // *function* call also produces output to capture in a value
                 // context; a known *variable* read must NOT be captured.
                 const binding = self.lookup(identifier.name, .{ .shallow = false }) orelse break :blk true;
-                break :blk binding.result.isFunctionRef();
+                if (!binding.result.isFunctionRef()) break :blk false;
+                // A zero-arg reference to a function that declares parameters is
+                // a function *value* (`const f = dbl`), not a call — no output.
+                if (self.fnRefParamCount(binding.result.source)) |pc| if (pc > 0) break :blk false;
+                break :blk true;
             },
             else => true,
         };

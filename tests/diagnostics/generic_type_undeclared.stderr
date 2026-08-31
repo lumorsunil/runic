@@ -1,0 +1,10 @@
+[error]: tests/diagnostics/generic_type_undeclared.rn:1:22: type 'Nope' is not declared
+   1:const b: Nope(Int) = Nope{ .value = 5 }
+   2:echo "${b.value}"
+   3:
+
+[error]: tests/diagnostics/generic_type_undeclared.rn:1:10: generic type Nope not declared
+   1:const b: Nope(Int) = Nope{ .value = 5 }
+   2:echo "${b.value}"
+   3:
+

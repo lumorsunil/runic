@@ -1,0 +1,36 @@
+// Iterating a typed array binds the capture to the *element* type, and concrete
+// `String`/`[]String` values type consistently. Regressions fixed together:
+//  - `for (xs) |x|` over `[]Int`/`[]String` mis-bound `x` to the whole array
+//    type (type error: "expected Int, actual: []Int").
+//  - a `String` parameter / `[]String` element wasn't recognized as a string,
+//    so `x.len` failed ("member access is only supported for struct types").
+//  - the empty string literal `""` mistyped as a 0-length struct.
+fn Void @() Void
+
+// []Int element used directly in arithmetic and comparison.
+fn Void sumPos(xs: []Int) Int {
+  var total = 0
+  for (xs) |x| { if (x > 0) { total = total + x } }
+  yield total
+}
+const ns = .{ 3, 0, 4, 5 }
+echo "sumPos=${sumPos ns}"
+
+// []String element used as a string (`.len`), plus an empty-string accumulator.
+fn Void joinNonEmpty(parts: []String) String {
+  var result: String = ""
+  for (parts) |part| {
+    if (part.len > 0) {
+      if (result.len == 0) { result = part } else { result = "${result}-${part}" }
+    }
+  }
+  yield result
+}
+const ps = .{ "a", "", "b", "c" }
+echo "join=${joinNonEmpty ps}"
+
+// A String parameter's `.len` and empty-string `.len`.
+fn Void widthOf(s: String) Int { yield s.len }
+echo "width=${widthOf "hello"}"
+const e = ""
+echo "emptyLen=${e.len}"

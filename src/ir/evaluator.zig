@@ -12,11 +12,11 @@ const compiler = runic.ir.compiler;
 
 const FastUIntSource = union(enum) {
     ptr: *ir.Value,
-    immediate: usize,
+    immediate: i64,
 
-    fn get(self: @This()) usize {
+    fn get(self: @This()) i64 {
         return switch (self) {
-            .ptr => |ptr| ptr.uinteger,
+            .ptr => |ptr| ptr.integer,
             .immediate => |value| value,
         };
     }
@@ -76,7 +76,10 @@ pub const Result = union(enum) {
     cont_no_instr_counter_inc,
     /// Advances instruction counter, retains thread counter (used for comments)
     skip,
+    /// Closes the current thread (only ends the program on the main thread).
     exit: runic.ExitCode,
+    /// Terminates the whole program from any thread (user `exit` statement).
+    process_exit: runic.ExitCode,
 };
 
 pub const IREvaluator = struct {
@@ -139,6 +142,12 @@ pub const IREvaluator = struct {
 
         switch (result) {
             .exit => |exit_code| try self.context.closeThread(thread.id, exit_code),
+            // `exit` statement from any thread ends the whole program.
+            .process_exit => |exit_code| {
+                try self.context.closeThread(thread.id, exit_code);
+                self.tempCloseStdIoCheck();
+                return .{ .exit = exit_code };
+            },
             .cont => self.context.threads.items[current_thread_index].incInstructionCounter(),
             .cont_no_instr_counter_inc => {},
             .skip => {
@@ -185,6 +194,12 @@ pub const IREvaluator = struct {
                     try self.context.closeThread(thread.id, exit_code);
                     self.tempCloseStdIoCheck();
                     return .{ .exit = try self.context.getMainThreadExitCode() };
+                },
+                .process_exit => |exit_code| {
+                    const thread = self.context.threads.items[0];
+                    try self.context.closeThread(thread.id, exit_code);
+                    self.tempCloseStdIoCheck();
+                    return .{ .exit = exit_code };
                 },
                 .cont => {
                     self.context.threads.items[0].incInstructionCounter();
@@ -263,14 +278,14 @@ pub const IREvaluator = struct {
         const body_left = self.resolveFastUIntSource(thread.*, body.a) orelse return false;
         const body_right = self.resolveFastUIntSource(thread.*, body.b) orelse return false;
 
-        while (counter_ptr.uinteger < limit.get()) {
-            body_dest.* = .{ .uinteger = switch (body.op) {
+        while (counter_ptr.integer < limit.get()) {
+            body_dest.* = .{ .integer = switch (body.op) {
                 .add => body_left.get() +| body_right.get(),
                 .sub => body_left.get() -| body_right.get(),
                 .mul => body_left.get() *| body_right.get(),
                 else => return false,
             } };
-            counter_ptr.* = .{ .uinteger = counter_ptr.uinteger +| 1 };
+            counter_ptr.* = .{ .integer = counter_ptr.integer +| 1 };
         }
 
         if (!try self.setFastLocation(thread.*, cmp.result, .fromBoolean(false))) {
@@ -292,6 +307,7 @@ pub const IREvaluator = struct {
                 .cont, .skip => continue,
                 .cont_no_instr_counter_inc => return Error.ContNoInstrCounterIncInAtomic,
                 .exit => |exit_code| return .{ .exit = exit_code },
+                .process_exit => |exit_code| return .{ .process_exit = exit_code },
             }
         }
 
@@ -305,17 +321,18 @@ pub const IREvaluator = struct {
     ) Error!Result {
         while (true) {
             const counter_ptr = self.resolveFastUIntPointer(thread, counted_loop.counter.dereference()) orelse return Error.UnsupportedInstruction;
-            if (counter_ptr.* != .uinteger) return Error.UnsupportedInstruction;
+            if (counter_ptr.* != .integer) return Error.UnsupportedInstruction;
 
             const limit = self.resolveFastUIntSource(thread, counted_loop.limit) orelse return Error.UnsupportedInstruction;
-            if (counter_ptr.uinteger >= limit.get()) break;
+            if (counter_ptr.integer >= limit.get()) break;
 
             switch (try self.runAtomicInstructionSet(thread, counted_loop.body_instr_set)) {
                 .cont, .skip => {},
                 .cont_no_instr_counter_inc => return Error.ContNoInstrCounterIncInAtomic,
                 .exit => |exit_code| return .{ .exit = exit_code },
+                .process_exit => |exit_code| return .{ .process_exit = exit_code },
             }
-            counter_ptr.* = .{ .uinteger = counter_ptr.uinteger +| 1 };
+            counter_ptr.* = .{ .integer = counter_ptr.integer +| 1 };
         }
 
         return .cont;
@@ -525,8 +542,8 @@ pub const IREvaluator = struct {
             .addr => |addr| self.resolveAddrPointer(thread, addr, mod),
             // .register => |reg| switch (reg.abs) {
             //     .ic => DereferenceValueError.UnsupportedDereferenceValueType,
-            //     .sf => .{ .uinteger = reg.applyMod(thread.private.stack_frame) },
-            //     .sc => .{ .uinteger = reg.applyMod(thread.private.stack.items.len) },
+            //     .sf => .{ .integer = reg.applyMod(thread.private.stack_frame) },
+            //     .sc => .{ .integer = reg.applyMod(thread.private.stack.items.len) },
             //     .r => thread.private.result_register,
             // },
             // .dereference => |der| self.resolveLocation(thread, .init(
@@ -693,7 +710,7 @@ pub const IREvaluator = struct {
     ) ?FastUIntSource {
         return switch (source) {
             .value => |value| switch (value) {
-                .uinteger => |uinteger| .{ .immediate = uinteger },
+                .integer => |integer| .{ .immediate = integer },
                 else => null,
             },
             .location => |loc| .{ .ptr = self.resolveFastUIntPointer(thread, loc) orelse return null },
@@ -715,12 +732,12 @@ pub const IREvaluator = struct {
             else => return false,
         };
 
-        if (left.* != .uinteger or right.* != .uinteger or dest.* != .uinteger) return false;
+        if (left.* != .integer or right.* != .integer or dest.* != .integer) return false;
 
         dest.* = switch (ath.op) {
-            .add => .{ .uinteger = left.uinteger +| right.uinteger },
-            .sub => .{ .uinteger = left.uinteger -| right.uinteger },
-            .mul => .{ .uinteger = left.uinteger *| right.uinteger },
+            .add => .{ .integer = left.integer +| right.integer },
+            .sub => .{ .integer = left.integer -| right.integer },
+            .mul => .{ .integer = left.integer *| right.integer },
             else => return false,
         };
 
@@ -741,15 +758,15 @@ pub const IREvaluator = struct {
             else => return false,
         };
 
-        if (left.* != .uinteger or right.* != .uinteger) return false;
+        if (left.* != .integer or right.* != .integer) return false;
 
         const result = switch (cmp.op) {
-            .eq => left.uinteger == right.uinteger,
-            .ne => left.uinteger != right.uinteger,
-            .gt => left.uinteger > right.uinteger,
-            .gte => left.uinteger >= right.uinteger,
-            .lt => left.uinteger < right.uinteger,
-            .lte => left.uinteger <= right.uinteger,
+            .eq => left.integer == right.integer,
+            .ne => left.integer != right.integer,
+            .gt => left.integer > right.integer,
+            .gte => left.integer >= right.integer,
+            .lt => left.integer < right.integer,
+            .lte => left.integer <= right.integer,
         };
 
         return self.setFastLocation(thread, cmp.result, .fromBoolean(result));
@@ -903,7 +920,7 @@ pub const IREvaluator = struct {
 
         const resolved = try self.resolveValueSource(thread, value);
         return switch (resolved) {
-            .uinteger => |x| .fromByte(@intCast(@mod(x, 256))),
+            .integer => |x| .fromByte(@intCast(@mod(x, 256))),
             .exit_code => |exit_code| exit_code,
             .closeable => |handle| (try self.context.getCloseable(handle)).getResult() orelse Error.MissingCloseableResult,
             else => error.UnsupportedExitCodeType,
@@ -1117,13 +1134,13 @@ pub const IREvaluator = struct {
                 // Ensure %r holds an Int. When it already does (e.g. an in-process
                 // typed value received via `&0`), pass it through unchanged; an
                 // EOF read (`.null`, stream consumed/closed) also passes through.
-                if (thread.private.result_register == .uinteger) return .cont;
+                if (thread.private.result_register == .integer) return .cont;
                 if (thread.private.result_register == .null) return .cont;
                 var text_writer = std.Io.Writer.Allocating.init(self.allocator);
                 defer text_writer.deinit();
                 try self.materializeString(thread, thread.private.result_register, &text_writer.writer);
                 const trimmed = std.mem.trim(u8, text_writer.written(), " \t\r\n");
-                const parsed = std.fmt.parseInt(usize, trimmed, 10) catch {
+                const parsed = std.fmt.parseInt(i64, trimmed, 10) catch {
                     // A bad parse is a catchable `ParseError.Invalid` value
                     // (`parseInt: ParseError!Int`), not a hard runtime abort.
                     thread.private.result_register = .{ .err = .{
@@ -1133,7 +1150,7 @@ pub const IREvaluator = struct {
                     } };
                     return .cont;
                 };
-                thread.private.result_register = .{ .uinteger = parsed };
+                thread.private.result_register = .{ .integer = parsed };
                 return .cont;
             },
             .parse_float => {
@@ -1233,11 +1250,11 @@ pub const IREvaluator = struct {
                 return .cont;
             },
             .inc => {
-                thread.private.result_register_2 = evaluateArithmetic(.add, .fromValue(thread.private.result_register_2), .fromValue(.{ .uinteger = 1 })).?;
+                thread.private.result_register_2 = evaluateArithmetic(.add, .fromValue(thread.private.result_register_2), .fromValue(.{ .integer = 1 })).?;
                 return .cont;
             },
             .dec => {
-                thread.private.result_register_2 = evaluateArithmetic(.sub, .fromValue(thread.private.result_register_2), .fromValue(.{ .uinteger = 1 })).?;
+                thread.private.result_register_2 = evaluateArithmetic(.sub, .fromValue(thread.private.result_register_2), .fromValue(.{ .integer = 1 })).?;
                 return .cont;
             },
             .neg => |neg| {
@@ -1265,7 +1282,7 @@ pub const IREvaluator = struct {
             .is_type => |is_type| {
                 const operand = try self.resolveLocation(thread, is_type.operand);
                 const matches = switch (is_type.tag) {
-                    .int => operand == .uinteger,
+                    .int => operand == .integer,
                     .float => operand == .float,
                     // Bool is carried as an exit code (see the compiler).
                     .boolean => operand == .exit_code,
@@ -1273,6 +1290,227 @@ pub const IREvaluator = struct {
                     .string => operand == .zig_string or operand == .slice,
                 };
                 try self.setLocation(thread, is_type.result, .fromBoolean(matches));
+                return .cont;
+            },
+            .str_op => |str_op| {
+                // `join`'s receiver is an array of strings, not a string, so it
+                // is handled before materializing the operand.
+                if (str_op.op == .join) {
+                    const arr = try self.resolveValueSource(thread, str_op.operand);
+                    const base = arr.addr;
+                    const count: usize = @intCast(thread.shared.heapGet(base).?.integer);
+                    var jsep = std.Io.Writer.Allocating.init(self.allocator);
+                    defer jsep.deinit();
+                    try self.materializeString(thread, try self.resolveValueSource(thread, str_op.arg0), &jsep.writer);
+                    const sep = jsep.written();
+                    var out = std.Io.Writer.Allocating.init(self.allocator);
+                    defer out.deinit();
+                    for (0..count) |i| {
+                        if (i > 0) try out.writer.writeAll(sep);
+                        try self.materializeString(thread, thread.shared.heapGet(base + 1 + i).?, &out.writer);
+                    }
+                    try self.setLocation(thread, str_op.result, .{ .zig_string = try self.allocator.dupe(u8, out.written()) });
+                    return .cont;
+                }
+
+                var sbuf = std.Io.Writer.Allocating.init(self.allocator);
+                defer sbuf.deinit();
+                try self.materializeString(thread, try self.resolveValueSource(thread, str_op.operand), &sbuf.writer);
+                const s = sbuf.written();
+                const ws = " \t\r\n";
+
+                const result: ir.Value = switch (str_op.op) {
+                    .len => .{ .integer = @intCast(s.len) },
+                    .upper => try self.strMapAlloc(s, std.ascii.toUpper),
+                    .lower => try self.strMapAlloc(s, std.ascii.toLower),
+                    .trim => .{ .zig_string = try self.allocator.dupe(u8, std.mem.trim(u8, s, ws)) },
+                    .trim_start => .{ .zig_string = try self.allocator.dupe(u8, std.mem.trimStart(u8, s, ws)) },
+                    .trim_end => .{ .zig_string = try self.allocator.dupe(u8, std.mem.trimEnd(u8, s, ws)) },
+                    .contains, .starts_with, .ends_with, .index_of => blk: {
+                        var abuf = std.Io.Writer.Allocating.init(self.allocator);
+                        defer abuf.deinit();
+                        try self.materializeString(thread, try self.resolveValueSource(thread, str_op.arg0), &abuf.writer);
+                        const a = abuf.written();
+                        break :blk switch (str_op.op) {
+                            .contains => ir.Value.fromBoolean(std.mem.indexOf(u8, s, a) != null),
+                            .starts_with => ir.Value.fromBoolean(std.mem.startsWith(u8, s, a)),
+                            .ends_with => ir.Value.fromBoolean(std.mem.endsWith(u8, s, a)),
+                            .index_of => ir.Value{ .integer = if (std.mem.indexOf(u8, s, a)) |i| @intCast(i) else -1 },
+                            else => unreachable,
+                        };
+                    },
+                    .slice => blk: {
+                        const len_i: i64 = @intCast(s.len);
+                        const start = (try self.resolveValueSource(thread, str_op.arg0)).integer;
+                        const end = (try self.resolveValueSource(thread, str_op.arg1)).integer;
+                        const lo = @min(@max(start, 0), len_i);
+                        const hi = @min(@max(end, lo), len_i);
+                        break :blk ir.Value{ .zig_string = try self.allocator.dupe(u8, s[@intCast(lo)..@intCast(hi)]) };
+                    },
+                    .repeat => blk: {
+                        const count = (try self.resolveValueSource(thread, str_op.arg0)).integer;
+                        const n: usize = @intCast(@max(count, 0));
+                        const out = try self.allocator.alloc(u8, s.len * n);
+                        for (0..n) |i| @memcpy(out[i * s.len ..][0..s.len], s);
+                        break :blk ir.Value{ .zig_string = out };
+                    },
+                    .replace => blk: {
+                        var nbuf = std.Io.Writer.Allocating.init(self.allocator);
+                        defer nbuf.deinit();
+                        var hbuf = std.Io.Writer.Allocating.init(self.allocator);
+                        defer hbuf.deinit();
+                        try self.materializeString(thread, try self.resolveValueSource(thread, str_op.arg0), &nbuf.writer);
+                        try self.materializeString(thread, try self.resolveValueSource(thread, str_op.arg1), &hbuf.writer);
+                        const needle = nbuf.written();
+                        const with = hbuf.written();
+                        if (needle.len == 0) break :blk ir.Value{ .zig_string = try self.allocator.dupe(u8, s) };
+                        const count = std.mem.count(u8, s, needle);
+                        const out = try self.allocator.alloc(u8, s.len - needle.len * count + with.len * count);
+                        _ = std.mem.replace(u8, s, needle, with, out);
+                        break :blk ir.Value{ .zig_string = out };
+                    },
+                    .split => blk: {
+                        var sepbuf = std.Io.Writer.Allocating.init(self.allocator);
+                        defer sepbuf.deinit();
+                        try self.materializeString(thread, try self.resolveValueSource(thread, str_op.arg0), &sepbuf.writer);
+                        const sep = sepbuf.written();
+
+                        var parts = std.ArrayList([]const u8).empty;
+                        defer parts.deinit(self.allocator);
+                        if (sep.len == 0) {
+                            try parts.append(self.allocator, s);
+                        } else {
+                            var it = std.mem.splitSequence(u8, s, sep);
+                            while (it.next()) |part| try parts.append(self.allocator, part);
+                        }
+
+                        // Build a runtime array: slot 0 = length, slots 1.. = the
+                        // (owned) string parts.
+                        const base_val = try thread.shared.alloc(self.allocator, parts.items.len + 1);
+                        const base = base_val.addr;
+                        thread.shared.heapGetPtr(base).?.* = .{ .integer = @intCast(parts.items.len) };
+                        for (parts.items, 0..) |part, i| {
+                            thread.shared.heapGetPtr(base + 1 + i).?.* = .{ .zig_string = try self.allocator.dupe(u8, part) };
+                        }
+                        break :blk base_val;
+                    },
+                    .bytes => blk: {
+                        // Build a runtime `[]Int`: slot 0 = length, slots 1.. =
+                        // each byte widened to an Int. Enables byte-level work in
+                        // Runic (e.g. a string hash) without char indexing.
+                        const base_val = try thread.shared.alloc(self.allocator, s.len + 1);
+                        const base = base_val.addr;
+                        thread.shared.heapGetPtr(base).?.* = .{ .integer = @intCast(s.len) };
+                        for (s, 0..) |byte, i| {
+                            thread.shared.heapGetPtr(base + 1 + i).?.* = .{ .integer = @intCast(byte) };
+                        }
+                        break :blk base_val;
+                    },
+                    .join => unreachable, // handled above
+                };
+                try self.setLocation(thread, str_op.result, result);
+                return .cont;
+            },
+            .array_push => |ap| {
+                const arr = try self.resolveValueSource(thread, ap.array);
+                const value = try self.resolveValueSource(thread, ap.value);
+                // An empty/absent array (`.void`) starts a fresh one.
+                const len: usize = if (arr == .addr)
+                    @intCast(thread.shared.heapGet(arr.addr).?.integer)
+                else
+                    0;
+                const new_base = try thread.shared.alloc(self.allocator, len + 2);
+                const nb = new_base.addr;
+                thread.shared.heapGetPtr(nb).?.* = .{ .integer = @intCast(len + 1) };
+                if (arr == .addr) {
+                    for (0..len) |i| thread.shared.heapGetPtr(nb + 1 + i).?.* = thread.shared.heapGet(arr.addr + 1 + i).?;
+                }
+                thread.shared.heapGetPtr(nb + 1 + len).?.* = value;
+                try self.setLocation(thread, ap.result, new_base);
+                return .cont;
+            },
+            .array_push_inplace => |ap| {
+                const arr = try self.resolveValueSource(thread, ap.array);
+                const value = try self.resolveValueSource(thread, ap.value);
+                const len: usize = if (arr == .addr)
+                    @intCast(thread.shared.heapGet(arr.addr).?.integer)
+                else
+                    0;
+                const cap: usize = if (arr == .addr)
+                    (thread.shared.array_capacities.get(arr.addr) orelse len)
+                else
+                    0;
+                if (arr == .addr and len < cap) {
+                    // Spare capacity: append in place (O(1)). The array is linear,
+                    // so no other reference observes the mutation.
+                    thread.shared.heapGetPtr(arr.addr + 1 + len).?.* = value;
+                    thread.shared.heapGetPtr(arr.addr).?.* = .{ .integer = @intCast(len + 1) };
+                    try self.setLocation(thread, ap.result, arr);
+                    return .cont;
+                }
+                // Full (or empty/absent): reallocate with doubled capacity, copy,
+                // append, and record the new capacity.
+                const new_cap = if (cap < 4) @as(usize, 4) else cap * 2;
+                const new_base = try thread.shared.alloc(self.allocator, new_cap + 1);
+                const nb = new_base.addr;
+                thread.shared.heapGetPtr(nb).?.* = .{ .integer = @intCast(len + 1) };
+                if (arr == .addr) {
+                    for (0..len) |i| thread.shared.heapGetPtr(nb + 1 + i).?.* = thread.shared.heapGet(arr.addr + 1 + i).?;
+                }
+                thread.shared.heapGetPtr(nb + 1 + len).?.* = value;
+                try thread.shared.array_capacities.put(self.allocator, nb, new_cap);
+                try self.setLocation(thread, ap.result, new_base);
+                return .cont;
+            },
+            .array_set => |as| {
+                const arr = try self.resolveValueSource(thread, as.array);
+                const index = try self.resolveValueSource(thread, as.index);
+                const value = try self.resolveValueSource(thread, as.value);
+                const len: usize = if (arr == .addr)
+                    @intCast(thread.shared.heapGet(arr.addr).?.integer)
+                else
+                    0;
+                // Copy the array once, then overwrite the one element (if in range).
+                const new_base = try thread.shared.alloc(self.allocator, len + 1);
+                const nb = new_base.addr;
+                thread.shared.heapGetPtr(nb).?.* = .{ .integer = @intCast(len) };
+                if (arr == .addr) {
+                    for (0..len) |i| thread.shared.heapGetPtr(nb + 1 + i).?.* = thread.shared.heapGet(arr.addr + 1 + i).?;
+                }
+                if (index == .integer and index.integer >= 0 and index.integer < len) {
+                    thread.shared.heapGetPtr(nb + 1 + @as(usize, @intCast(index.integer))).?.* = value;
+                }
+                try self.setLocation(thread, as.result, new_base);
+                return .cont;
+            },
+            .array_set_inplace => |as| {
+                const arr = try self.resolveValueSource(thread, as.array);
+                const index = try self.resolveValueSource(thread, as.index);
+                const value = try self.resolveValueSource(thread, as.value);
+                if (arr == .addr and index == .integer and index.integer >= 0) {
+                    const len: usize = @intCast(thread.shared.heapGet(arr.addr).?.integer);
+                    if (index.integer < len) {
+                        // Linear array: write the element in place (O(1)).
+                        thread.shared.heapGetPtr(arr.addr + 1 + @as(usize, @intCast(index.integer))).?.* = value;
+                    }
+                }
+                try self.setLocation(thread, as.result, arr);
+                return .cont;
+            },
+            .float_op => |float_op| {
+                const x = (try self.resolveValueSource(thread, float_op.operand)).toFloat() orelse return Error.UnsupportedType;
+                const result: f64 = switch (float_op.op) {
+                    .sqrt => @sqrt(x),
+                    .floor => @floor(x),
+                    .ceil => @ceil(x),
+                    .round => @round(x),
+                    .trunc => @trunc(x),
+                    .pow => blk: {
+                        const y = (try self.resolveValueSource(thread, float_op.arg0)).toFloat() orelse return Error.UnsupportedType;
+                        break :blk std.math.pow(f64, x, y);
+                    },
+                };
+                try self.setLocation(thread, float_op.result, .{ .float = result });
                 return .cont;
             },
             .make_err => |make_err| {
@@ -1309,7 +1547,7 @@ pub const IREvaluator = struct {
             .exec => |exec| {
                 _ = exec;
 
-                const argv_len = thread.private.stack.pop().?.uinteger + 1;
+                const argv_len: usize = @intCast(thread.private.stack.pop().?.integer + 1);
                 // const context_loc = thread.private.stack.pop().?;
                 // const context = (try self.resolveValue(thread, context_loc)).strct;
                 // const argv_value = context.fields[0];
@@ -1500,14 +1738,22 @@ pub const IREvaluator = struct {
             .set_env => |set_env| {
                 const ctx = self.context.getSubshellContextPtr(thread.private.subshell_context);
                 const env_map = try self.getOrCreateSubshellEnv(ctx);
+                // A dynamic name (`env.set name value`) is materialized; otherwise
+                // the static `$NAME = …` name is used directly.
+                const owned_name: ?[]u8 = if (set_env.name_source) |ns|
+                    try self.materializeOwnedString(thread, try self.resolveValueSource(thread, ns))
+                else
+                    null;
+                defer if (owned_name) |n| self.allocator.free(n);
+                const name: []const u8 = owned_name orelse set_env.name;
                 const value = try self.resolveValueSource(thread, set_env.value);
                 if (value == .null) {
-                    _ = env_map.swapRemove(set_env.name);
+                    _ = env_map.swapRemove(name);
                     return .cont;
                 }
                 const text = try self.materializeOwnedString(thread, value);
                 defer self.allocator.free(text);
-                try env_map.put(set_env.name, text);
+                try env_map.put(name, text);
                 return .cont;
             },
             .pipe => |instr_pipe| {
@@ -1621,7 +1867,12 @@ pub const IREvaluator = struct {
                     return Error.MissingSpawnedThreadContext;
                 };
 
-                new_thread.setInstructionCounter(try self.resolveAddr(thread, fork.dest));
+                const dest_addr: ir.ResolvedInstructionAddr = if (fork.dest_from) |loc| blk: {
+                    const fn_val = try self.resolveLocation(thread, loc);
+                    if (fn_val != .fn_ref) return Error.UnsupportedInstruction;
+                    break :blk .init(fn_val.fn_ref.fn_addr.instr_set, 0);
+                } else try self.resolveAddr(thread, fork.dest);
+                new_thread.setInstructionCounter(dest_addr);
 
                 thread.private.result_register = .{ .thread = new_thread_handle };
 
@@ -1770,6 +2021,7 @@ pub const IREvaluator = struct {
                 return .cont;
             },
             .exit => |exit_code| .{ .exit = exit_code },
+            .process_exit => |exit_code| .{ .process_exit = exit_code },
             // else => Error.UnsupportedInstruction,
         };
     }
@@ -1856,55 +2108,63 @@ pub const IREvaluator = struct {
     ) ?ir.Value {
         switch (op) {
             .add => {
-                if (left.isValueTag(.uinteger) and right.isValueTag(.uinteger)) {
-                    return .{ .uinteger = left.value.uinteger +| right.value.uinteger };
+                if (left.isValueTag(.integer) and right.isValueTag(.integer)) {
+                    return .{ .integer = left.value.integer +| right.value.integer };
                 } else if (left.isValueTag(.float) and right.isValueTag(.float)) {
                     return .{ .float = left.value.float + right.value.float };
-                } else if (left.isValueTag(.uinteger) and right.isValueTag(.float)) {
-                    const float_left: f64 = @floatFromInt(left.value.uinteger);
+                } else if (left.isValueTag(.integer) and right.isValueTag(.float)) {
+                    const float_left: f64 = @floatFromInt(left.value.integer);
                     return .{ .float = float_left + right.value.float };
-                } else if (left.isValueTag(.float) and right.isValueTag(.uinteger)) {
-                    const float_right: f64 = @floatFromInt(right.value.uinteger);
+                } else if (left.isValueTag(.float) and right.isValueTag(.integer)) {
+                    const float_right: f64 = @floatFromInt(right.value.integer);
                     return .{ .float = left.value.float + float_right };
-                } else if (left.isValueTag(.addr) and right.isValueTag(.uinteger)) {
-                    return .{ .addr = left.value.addr +| right.value.uinteger };
+                } else if (left.isValueTag(.addr) and right.isValueTag(.integer)) {
+                    return .{ .addr = left.value.addr +| @as(usize, @intCast(right.value.integer)) };
                 }
             },
             .sub => {
-                if (left.isValueTag(.uinteger) and right.isValueTag(.uinteger)) {
-                    return .{ .uinteger = left.value.uinteger -| right.value.uinteger };
+                if (left.isValueTag(.integer) and right.isValueTag(.integer)) {
+                    return .{ .integer = left.value.integer -| right.value.integer };
                 } else if (left.isValueTag(.float) and right.isValueTag(.float)) {
                     return .{ .float = left.value.float - right.value.float };
-                } else if (left.isValueTag(.uinteger) and right.isValueTag(.float)) {
-                    const float_left: f64 = @floatFromInt(left.value.uinteger);
+                } else if (left.isValueTag(.integer) and right.isValueTag(.float)) {
+                    const float_left: f64 = @floatFromInt(left.value.integer);
                     return .{ .float = float_left - right.value.float };
-                } else if (left.isValueTag(.float) and right.isValueTag(.uinteger)) {
-                    const float_right: f64 = @floatFromInt(right.value.uinteger);
+                } else if (left.isValueTag(.float) and right.isValueTag(.integer)) {
+                    const float_right: f64 = @floatFromInt(right.value.integer);
                     return .{ .float = left.value.float - float_right };
                 }
             },
             .mul => {
-                if (left.isValueTag(.uinteger) and right.isValueTag(.uinteger)) {
-                    return .{ .uinteger = left.value.uinteger *| right.value.uinteger };
+                if (left.isValueTag(.integer) and right.isValueTag(.integer)) {
+                    return .{ .integer = left.value.integer *| right.value.integer };
                 } else if (left.isValueTag(.float) and right.isValueTag(.float)) {
                     return .{ .float = left.value.float * right.value.float };
-                } else if (left.isValueTag(.uinteger) and right.isValueTag(.float)) {
-                    const float_left: f64 = @floatFromInt(left.value.uinteger);
+                } else if (left.isValueTag(.integer) and right.isValueTag(.float)) {
+                    const float_left: f64 = @floatFromInt(left.value.integer);
                     return .{ .float = float_left * right.value.float };
-                } else if (left.isValueTag(.float) and right.isValueTag(.uinteger)) {
-                    const float_right: f64 = @floatFromInt(right.value.uinteger);
+                } else if (left.isValueTag(.float) and right.isValueTag(.integer)) {
+                    const float_right: f64 = @floatFromInt(right.value.integer);
                     return .{ .float = left.value.float * float_right };
                 }
             },
             .div => {
-                const float_left: f64 = if (left.isValueTag(.uinteger)) @floatFromInt(left.value.uinteger) else if (left.isValueTag(.float)) left.value.float else return null;
-                const float_right: f64 = if (right.isValueTag(.uinteger)) @floatFromInt(right.value.uinteger) else if (right.isValueTag(.float)) right.value.float else return null;
+                const float_left: f64 = if (left.isValueTag(.integer)) @floatFromInt(left.value.integer) else if (left.isValueTag(.float)) left.value.float else return null;
+                const float_right: f64 = if (right.isValueTag(.integer)) @floatFromInt(right.value.integer) else if (right.isValueTag(.float)) right.value.float else return null;
 
                 return .{ .float = float_left / float_right };
             },
             .mod => {
-                const float_left: f64 = if (left.isValueTag(.uinteger)) @floatFromInt(left.value.uinteger) else if (left.isValueTag(.float)) left.value.float else return null;
-                const float_right: f64 = if (right.isValueTag(.uinteger)) @floatFromInt(right.value.uinteger) else if (right.isValueTag(.float)) right.value.float else return null;
+                // Integer remainder stays an integer (like +, -, *), so it can
+                // index arrays and feed hashes; only a float operand widens to
+                // float. `@mod` takes the sign of the divisor, so `x % n` with a
+                // positive `n` is always in `[0, n)` — handy for bucket indices.
+                if (left.isValueTag(.integer) and right.isValueTag(.integer)) {
+                    if (right.value.integer == 0) return null;
+                    return .{ .integer = @mod(left.value.integer, right.value.integer) };
+                }
+                const float_left: f64 = if (left.isValueTag(.integer)) @floatFromInt(left.value.integer) else if (left.isValueTag(.float)) left.value.float else return null;
+                const float_right: f64 = if (right.isValueTag(.integer)) @floatFromInt(right.value.integer) else if (right.isValueTag(.float)) right.value.float else return null;
 
                 return .{ .float = @mod(float_left, float_right) };
             },
@@ -2060,7 +2320,7 @@ pub const IREvaluator = struct {
         };
         const heap_value = try self.heapValueAt(heap_addr);
         return switch (heap_value) {
-            .uinteger => |len| .{ .heap_addr = heap_addr, .len = len },
+            .integer => |len| .{ .heap_addr = heap_addr, .len = @intCast(len) },
             else => null,
         };
     }
@@ -2080,6 +2340,13 @@ pub const IREvaluator = struct {
             const element = try self.heapValueAt(heap_addr + i + 1);
             try self.materializeString(thread, element, w);
         }
+    }
+
+    /// Duplicates `s` and applies a per-byte map, returning an owned zig_string.
+    fn strMapAlloc(self: *IREvaluator, s: []const u8, comptime f: fn (u8) u8) !ir.Value {
+        const out = try self.allocator.dupe(u8, s);
+        for (out) |*c| c.* = f(c.*);
+        return .{ .zig_string = out };
     }
 
     fn materializeString(
@@ -2105,7 +2372,7 @@ pub const IREvaluator = struct {
                 const string = try self.getSlice(slice);
                 try w.writeAll(string);
             },
-            inline .uinteger, .float => |t| try w.print("{}", .{t}),
+            inline .integer, .float => |t| try w.print("{}", .{t}),
             .addr => |addr| {
                 if (try self.maybeHeapSequenceLen(addr)) |seq| {
                     try self.materializeHeapSequence(thread, seq.heap_addr, seq.len, null, w);
@@ -2365,7 +2632,7 @@ test "evaluator fast arithmetic path updates ref destination" {
 
     try fixture.context.addMainThread(null);
     const thread = fixture.context.getCurrentThread().?;
-    try thread.private.stack.appendSlice(allocator, &.{ .{ .uinteger = 4 }, .{ .uinteger = 7 } });
+    try thread.private.stack.appendSlice(allocator, &.{ .{ .integer = 4 }, .{ .integer = 7 } });
 
     const left = ir.Location.initAbs(.{ .ref = .{ .name = "left", .rel_stack_addr = 0 } }, .{});
     const right = ir.Location.initAbs(.{ .ref = .{ .name = "right", .rel_stack_addr = 1 } }, .{});
@@ -2381,7 +2648,7 @@ test "evaluator fast arithmetic path updates ref destination" {
         else => unreachable,
     }
 
-    try std.testing.expectEqual(@as(u64, 11), thread.private.stack.items[1].uinteger);
+    try std.testing.expectEqual(@as(u64, 11), thread.private.stack.items[1].integer);
 }
 
 test "evaluator fast arithmetic path updates closure destination" {
@@ -2413,21 +2680,21 @@ test "evaluator fast arithmetic path updates closure destination" {
         else => unreachable,
     };
     thread.private.stack.items[3] = .fromAddr(closure_addr);
-    fixture.context.shared.heapGetPtr(closure_addr).?.* = .{ .uinteger = 4 };
+    fixture.context.shared.heapGetPtr(closure_addr).?.* = .{ .integer = 4 };
 
     const closure_slot = ir.Location.initAbs(.closure, .{}).dereference();
 
     switch (try evaluator.runInstruction(thread, .init(null, .{ .ath = .{
         .op = .add,
         .a = .fromLocation(closure_slot),
-        .b = .fromValue(.{ .uinteger = 7 }),
+        .b = .fromValue(.{ .integer = 7 }),
         .result = closure_slot,
     } }))) {
         .cont => {},
         else => unreachable,
     }
 
-    try std.testing.expectEqual(@as(u64, 11), fixture.context.shared.heapGet(closure_addr).?.uinteger);
+    try std.testing.expectEqual(@as(u64, 11), fixture.context.shared.heapGet(closure_addr).?.integer);
 }
 
 test "evaluator fast compare path updates register destination" {
@@ -2450,8 +2717,8 @@ test "evaluator fast compare path updates register destination" {
 
     try fixture.context.addMainThread(null);
     const thread = fixture.context.getCurrentThread().?;
-    thread.private.result_register = .{ .uinteger = 9 };
-    thread.private.result_register_2 = .{ .uinteger = 3 };
+    thread.private.result_register = .{ .integer = 9 };
+    thread.private.result_register_2 = .{ .integer = 3 };
 
     switch (try evaluator.runInstruction(thread, .init(null, .{ .cmp = .{
         .op = .gt,
@@ -2489,7 +2756,7 @@ test "evaluator fast compare path reads dereferenced refs" {
 
     try fixture.context.addMainThread(null);
     const thread = fixture.context.getCurrentThread().?;
-    try thread.private.stack.appendSlice(allocator, &.{ .{ .uinteger = 3 }, .{ .uinteger = 7 } });
+    try thread.private.stack.appendSlice(allocator, &.{ .{ .integer = 3 }, .{ .integer = 7 } });
 
     const left = ir.Location.initAbs(.{ .ref = .{ .name = "left", .rel_stack_addr = 0 } }, .{});
     const right = ir.Location.initAbs(.{ .ref = .{ .name = "right", .rel_stack_addr = 1 } }, .{});
@@ -2531,9 +2798,9 @@ test "evaluator fused range loop updates accumulator and exits loop" {
     try fixture.context.addMainThread(null);
     const thread = fixture.context.getCurrentThreadPtr().?;
     try thread.private.stack.appendSlice(allocator, &.{
-        .{ .uinteger = 0 },
-        .{ .uinteger = 5 },
-        .{ .uinteger = 0 },
+        .{ .integer = 0 },
+        .{ .integer = 5 },
+        .{ .integer = 0 },
     });
 
     const total = ir.Location.initAbs(.{ .ref = .{ .name = "total", .rel_stack_addr = 0 } }, .{});
@@ -2561,7 +2828,7 @@ test "evaluator fused range loop updates accumulator and exits loop" {
         .init(null, .{ .ath = .{
             .op = .add,
             .a = .fromLocation(counter.dereference()),
-            .b = .fromValue(.{ .uinteger = 1 }),
+            .b = .fromValue(.{ .integer = 1 }),
             .result = counter,
         } }),
         .init(null, .{ .jmp = .{
@@ -2572,8 +2839,8 @@ test "evaluator fused range loop updates accumulator and exits loop" {
     };
 
     try std.testing.expect(try evaluator.tryRunFastRangeLoop(thread, &instructions));
-    try std.testing.expectEqual(@as(u64, 10), thread.private.stack.items[0].uinteger);
-    try std.testing.expectEqual(@as(u64, 5), thread.private.stack.items[2].uinteger);
+    try std.testing.expectEqual(@as(u64, 10), thread.private.stack.items[0].integer);
+    try std.testing.expectEqual(@as(u64, 5), thread.private.stack.items[2].integer);
     try std.testing.expectEqual(@as(usize, 5), thread.getCurrentInstructionAddr().local_addr);
     try std.testing.expect(switch (thread.private.result_register_2) {
         .exit_code => |exit_code| !exit_code.toBoolean(),

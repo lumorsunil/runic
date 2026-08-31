@@ -1,0 +1,21 @@
+// `is`-narrowing: inside `if (x is T) { … }`, the subject `x` is treated as `T`
+// in the then-branch, so type-specific operations (`x.upper`, `x.bytes`) resolve
+// — while the else-branch keeps the original type. Works for a sum-typed binding
+// (`Int || String`) and for a generic `|T|` parameter. Deterministic output.
+const v: Int || String = "hello"
+if (v is String) { echo "sum-str=${v.upper} bytes=${v.bytes.len}" } else { echo "sum-int=${v + 1}" }
+
+const n: Int || String = 41
+if (n is String) { echo "n-str=${n.upper}" } else { echo "n-int=${n + 1}" }
+
+// A generic parameter narrowed per branch: String → hash its bytes, Int → itself.
+fn Void hashKey(key: |K|) Int {
+  if (key is String) {
+    var h = 0
+    for (key.bytes) |b| { h = h * 31 + b; h = h % 1000000007 }
+    yield h
+  } else {
+    yield key
+  }
+}
+echo "abc=${hashKey "abc"} abd=${hashKey "abd"} abc-again=${hashKey "abc"} int=${hashKey 42}"

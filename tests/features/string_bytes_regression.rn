@@ -1,0 +1,21 @@
+// `s.bytes` exposes a string's bytes as `[]Int`, one Int per byte — enabling
+// byte-level work in Runic (a string hash, checksums) without char indexing.
+// Covers: length and indexing on the byte array, folding over the bytes with
+// `for`, an empty string, and a polynomial rolling hash built from it (a
+// deterministic function of the bytes). Deterministic output.
+const bs = "abc".bytes
+echo "len=${bs.len} b0=${bs[0]} b1=${bs[1]} b2=${bs[2]}"
+
+var sum = 0
+for ("hello".bytes) |b| { sum = sum + b }
+echo "sum=${sum}"
+
+echo "empty=${"".bytes.len}"
+
+// A polynomial rolling hash over the bytes (only *, +, % — no bitwise ops).
+fn Void hashStr(s: String) Int {
+  var h = 0
+  for (s.bytes) |b| { h = h * 31 + b; h = h % 1000000007 }
+  yield h
+}
+echo "abc=${hashStr "abc"} abd=${hashStr "abd"} abc-again=${hashStr "abc"}"

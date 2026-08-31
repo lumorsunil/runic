@@ -5,6 +5,7 @@ const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 const ExitCode = @import("../runtime/exit_code.zig").ExitCode;
 const DocumentStore = @import("../document_store.zig").DocumentStore;
+const std_modules = @import("std_modules.zig");
 
 const MAX_DOCUMENT_LEN = 4 * 1024 * 1024;
 
@@ -96,10 +97,27 @@ pub const FrontendDocumentStore = struct {
         const entry = try self.map.getOrPut(self.arena.allocator(), resolvedPath);
 
         if (!entry.found_existing) {
-            entry.value_ptr.* = try self.loadDocument(resolvedPath);
+            // Bundled standard-library modules (`:std`, `:std/list`, …) are
+            // embedded in the binary, not on disk — load their source from the
+            // embed table rather than the filesystem.
+            if (std_modules.source(resolvedPath)) |embedded| {
+                entry.value_ptr.* = try self.newDocument(resolvedPath, embedded);
+            } else {
+                entry.value_ptr.* = try self.loadDocument(resolvedPath);
+            }
         }
 
         return entry.value_ptr.*;
+    }
+
+    fn newDocument(self: *FrontendDocumentStore, path: []const u8, source: []const u8) !*Document {
+        const document = try self.arena.allocator().create(Document);
+        document.* = .{
+            .path = path,
+            .source = source,
+            .parser = .init(self.io, self.allocator, self.env_map, &self.document_store),
+        };
+        return document;
     }
 
     pub fn putDocument(
@@ -166,6 +184,17 @@ pub fn resolveModulePath(
     importer: []const u8,
     moduleName: []const u8,
 ) ![]const u8 {
+    // The reserved `std` namespace resolves to the bundled, embedded modules
+    // under the `:std` virtual path — independent of the importer's location.
+    // `import "std"` → `:std`; `import "std/<name>"` → `:std/<name>`.
+    if (std.mem.eql(u8, moduleName, "std") or std.mem.startsWith(u8, moduleName, "std/")) {
+        const trimmed = if (std.mem.endsWith(u8, moduleName, ".rn"))
+            moduleName[0 .. moduleName.len - ".rn".len]
+        else
+            moduleName;
+        return std.mem.concat(allocator, u8, &.{ ":", trimmed });
+    }
+
     const dirname = std.fs.path.dirname(importer) orelse "./";
     const relative = try std.fs.path.join(allocator, &.{ dirname, moduleName });
     defer allocator.free(relative);

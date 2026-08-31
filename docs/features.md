@@ -76,6 +76,43 @@ echo "${nested}"
 
 **Result:** The first `pwd` prints `/tmp`, the nested subshell prints `/`, and once the subshell exits the parent context still reports `/tmp`. Calling `cd` with no argument uses the current subshell's `HOME` value.
 
+### Executables outside `PATH`
+
+A bare command word (`git`, `ls`) is looked up on `PATH` or in the current
+directory, so a program at a *sub*path — `scripts/start`, `tools/build/gen` —
+can't be named as a bare word (`scripts/start` would parse as the division
+`scripts / start`). Runic offers two unambiguous ways to run one:
+
+**Path sigil.** A command word that *starts* with a path sigil — `./`, `../`,
+or `/` — is parsed whole as a single executable path, arguments follow as usual:
+
+```rn
+./scripts/start "arg0" "arg1"     // relative to the current directory
+../tools/build/gen "out"          // parent-relative
+/usr/bin/env                      // absolute
+```
+
+The sigil requirement is what keeps it unambiguous: `/`, `./`, and `../` can't
+begin an ordinary expression, so `a / b` (division) and `a.b` (member access)
+are unaffected — only a leading sigil selects the path form. A bare relative
+subpath (`scripts/start`, no sigil) still parses as division; write `./scripts/start`
+or use `run`.
+
+**`run` builtin.** When the path is computed at runtime — a variable, an
+interpolated string, or anything a static command word can't express — `run`
+takes the executable as its first argument and the rest as its arguments:
+
+```rn
+run "scripts/start" "arg0"        // literal path (no sigil needed)
+const bin = "tools/build/gen"
+run bin "out"                     // path from a variable
+const version = run bin "--version"   // captures output like any command
+```
+
+`run` produces the same `ExecutableError!String` value view as any command, so
+its result can be captured, piped, and error-handled identically. (A local
+binding named `run` shadows the builtin.)
+
 ### Errors as first-class types
 
 Runic treats `error` like Zig: an error set is a type, declared with `const`, whose variants may be opaque or carry a typed payload.
@@ -386,6 +423,157 @@ for (0..3) |i| echo "${i}"           // bare command
 if (ready) yield value else yield 0  // bare branches
 ```
 
+### Condition loops with `while`
+
+`while (condition) { … }` re-evaluates the condition at the top of each
+iteration and runs the block until it is falsy. The condition is any truthy
+expression — a `Bool`, a comparison, or a command's exit status — and the body
+is a brace block whose bindings are loop-local (re-declared each pass). A
+condition that starts false skips the body entirely; loops nest freely.
+
+```rn
+var i = 0
+while (i < 5) {
+  echo "i=${i}"
+  i = i + 1
+}
+```
+
+**Result:** `while` covers the open-ended loops `for` can't express — repeat
+until a flag flips or a value crosses a threshold. (The body must be a brace
+block.)
+
+An optional condition can be unwrapped with a capture: `while (opt) |v| { … }`
+loops while `opt` is non-null, binding the unwrapped value to `v` for that
+iteration — the optional analogue of `if (opt) |v|`. Reassigning the optional in
+the body drives the loop:
+
+```rn
+var cur: ?Int = 3
+while (cur) |v| {
+  echo "v=${v}"
+  if (v <= 1) { cur = null } else { cur = v - 1 }
+}
+```
+
+## Compile-time evaluation with `comptime`
+
+`comptime <expr>` forces an expression to be evaluated at compile time and
+folds it to a constant. It covers arithmetic and logic, and — crucially — can
+interpret **pure user functions**: recursion, parameters, local `const`
+bindings, and `if`/`match` control flow all run at compile time.
+
+```rn
+const size = comptime 4 * 1024        // 4096
+
+fn Int fib(n: Int) Int {
+  if (n < 2) { yield n }
+  yield (fib (n - 1)) + (fib (n - 2))
+}
+const tenth = comptime fib 10         // folded to 55 during compilation
+```
+
+The result is an ordinary value, usable anywhere a constant is — including
+inside larger expressions (`(comptime fib 7) * 2`).
+
+**Result:** work that only depends on compile-time-known inputs is done once,
+during compilation, instead of on every run. If the operand can't be reduced —
+it reads a `var`, calls an impure/unknown function, or recurses past the
+interpreter's depth limit — the program fails to compile with a clear error
+rather than silently falling back to a runtime computation. (Without the
+keyword, `fib 10` is an ordinary runtime call.)
+
+### Type captures with `|T|`
+
+A type capture `|T|` binds `T` to the type occupying that position, and `T` is
+then usable anywhere a type is. In a binding it captures the initializer's
+concrete type; in a function signature it acts as a generic type variable (one
+definition, any argument type):
+
+```rn
+const seed: |T| = 7         // T is bound to Int
+const n: T = 5              // reused as a type
+
+fn Void say(greeting: |G|) Void {   // generic over the argument's type
+  echo "${greeting}"
+}
+```
+
+Nested under a built-in generic, `|T|` **destructures** — it matches the shape
+and binds the inner type:
+
+```rn
+fn Void firstOf(xs: []|E|) E { yield xs[0] }   // E = the element type
+var maybe: ?|M| = null                          // M = the child type
+```
+
+**Result:** a value's type can be named and propagated without spelling it out,
+generic functions are written once, and mismatches are still caught
+(`const bad: T = "x"` where `T` was captured as `Int` is a compile error). A
+captured type is a purely compile-time entity — it never exists at runtime.
+(This subsumes the earlier `@TypeOf`, which has been removed.)
+
+### Generic type constructors
+
+A type binding can take type parameters, defining a generic type constructor:
+
+```rn
+const Box(T) = struct { value: T }
+
+const b: Box(Int) = Box{ .value = 5 }   // apply with Int
+echo "${b.value}"
+```
+
+`Box(Int)` applies the constructor by substituting the argument. Combined with a
+`|T|` capture, a signature **destructures** an application to recover its type
+argument — so one function serves every instantiation:
+
+```rn
+fn Void unwrap(box: Box(|T|)) T { yield box.value }   // T = the element type
+unwrap b   // → 5
+```
+
+Multiple parameters (`const Pair(A, B) = struct { first: A, second: B }`) and
+composition (`[]Box(Int)`) work too.
+
+**Result:** reusable container and wrapper types without repetition. Because the
+runtime is dynamically typed, `Box(Int)` and `Box(String)` share a single layout
+— there is no monomorphization; the type arguments exist only for compile-time
+checking and capture. (Construction is currently the explicit `Box{ … }` form;
+an inferred `.{ … }` literal typed by its target is a planned addition.)
+
+### Serializing type identifiers
+
+A type identifier used where a string is expected — in string interpolation or
+as a bare command argument — serializes to the type's name. Named types give
+their name; a bound `|T|` capture gives the captured type's name:
+
+```rn
+echo "${Int}"                     // Int
+const Point = struct { x: Int }
+echo "${Point}"                   // Point
+
+const n: |T| = 42
+echo "the type is ${T}"           // the type is Int
+```
+
+**Result:** since types are compile-time only, this is a compile-time string
+constant — no runtime type information is involved. Inside a *generic function*,
+a parameter's `|T|` reflects the concrete per-call type: a direct call is
+**monomorphized** (a specialization is compiled with the type variables bound to
+the argument types), so the same function reports the actual type at each call:
+
+```rn
+fn Void describe(x: |T|) Void { echo "${x} is a ${T}" }
+describe 5       // 5 is a Int
+describe "hi"    // hi is a String
+```
+
+Each distinct type argument gets its own specialization; the same type argument
+reuses one. (Monomorphization currently applies to direct, non-recursive calls
+whose `|T|` captures bind to a concrete argument type; other calls fall back to a
+single generic compilation, where a bare `|T|` serializes to the variable name.)
+
 ## Command vs. expression separation
 
 Runic distinguishes between invoking external commands and evaluating expressions, reducing quoting issues by making intent explicit.
@@ -436,7 +624,7 @@ echo "saved error" 2>"err.log"
 echo "hello" 1>&2 2>"/dev/null"
 ```
 
-**Result:** `>` / `>>` redirect stdout (truncate / append), `2>...` redirects stderr, and `1>&2` duplicates stdout onto the current stderr target. Because redirects are applied left to right, `echo "hello" 1>&2 2>"/dev/null"` still writes `hello` to the original stderr stream instead of discarding it. A Runic function call can be redirected like any command — `myFn > "file"` sends the function's stdout to a file.
+**Result:** `>` / `>>` redirect stdout (truncate / append), `2>...` redirects stderr, and `1>&2` duplicates stdout onto the current stderr target. Because redirects are applied left to right, `echo "hello" 1>&2 2>"/dev/null"` still writes `hello` to the original stderr stream instead of discarding it. Redirecting a *function call* or a *block*'s output to a file — `myFn > "file"`, `{ … } > "file"` — is also supported, including when the body runs external commands (their real stdout is drained to the file), and both `>` and `>>` apply.
 
 **`>` is overloaded.** Since `>` is also the greater-than operator, Runic resolves it by the left operand: a **command** (an external executable call, a function call, a block, or a subshell) makes `>` an output redirect, while a **value** makes it the comparison. So `echo "x" > "f"` and `myFn > "f"` redirect, but `n > 2` and `count > limit` compare. `>>` and `>&` are always redirects. To compare a function's return value instead of redirecting it, bind it first: `const r = myFn; if (r > 2) ...`.
 

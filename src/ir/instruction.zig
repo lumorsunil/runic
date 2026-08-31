@@ -110,6 +110,23 @@ pub const Instruction = struct {
         /// sets result to a boolean: whether operand's runtime value is of the
         /// given type tag (the `x is T` operator / sum narrowing)
         is_type: IsType,
+        /// applies a string builtin (`s.len`, `s.upper`, `s.contains "x"`, …) to
+        /// the operand string, with up to two arguments, storing the result.
+        str_op: StrOp,
+        /// applies a Float math builtin (`x.sqrt`, `x.floor`, `x.pow y`, …) to the
+        /// operand, with an optional argument, storing the Float result.
+        float_op: FloatOp,
+        /// `arr.push value` — allocates a new array (`[len+1, …elements, value]`)
+        /// and stores its base address in `result`.
+        array_push: ArrayPush,
+        /// Like `array_push` but grows the array in place when it has spare
+        /// capacity (amortized O(1)), only emitted for a linear (uniquely-owned)
+        /// array — see the compiler's linear-buffer analysis.
+        array_push_inplace: ArrayPush,
+        array_set: ArraySet,
+        /// Like `array_set` but writes the element in place (no copy), only
+        /// emitted for a linear (uniquely-owned) array — see the compiler.
+        array_set_inplace: ArraySet,
         /// constructs an error value (boxing the runtime payload, if any)
         make_err: MakeErr,
         /// sets result to a boolean: whether operand is an error value whose
@@ -149,8 +166,12 @@ pub const Instruction = struct {
         stream: Location,
         /// allocates n number of values on the heap, stores address in %r
         alloc: usize,
-        /// exits the process
+        /// closes the current thread with the given exit code (the whole program
+        /// only when this is the main thread)
         exit: ExitCode,
+        /// terminates the whole program with the given exit code, from any thread
+        /// (the user-facing `exit` statement — like bash `exit` inside a function)
+        process_exit: ExitCode,
         /// exits the process with an exit code resolved from a value source
         exit_with: ValueSource,
         /// resolves the exit code from an execution result or handles struct and stores it in result
@@ -173,7 +194,7 @@ pub const Instruction = struct {
         /// blocks (retries) until the stdin pipe signals completion (keep_open=false).
         /// stores the result in %r.
         collect_stdin,
-        /// parses the string in %r into an Int (uinteger) value, trimming
+        /// parses the string in %r into an Int (integer) value, trimming
         /// surrounding whitespace. stores the result in %r. invalid input is a
         /// runtime error.
         parse_int,
@@ -196,6 +217,10 @@ pub const Instruction = struct {
 
         pub fn exit_(exit_code: ExitCode) @This() {
             return .{ .exit = exit_code };
+        }
+
+        pub fn processExit_(exit_code: ExitCode) @This() {
+            return .{ .process_exit = exit_code };
         }
 
         pub fn exitWith_(value: ValueSource) @This() {
@@ -230,7 +255,7 @@ pub const Instruction = struct {
 
         pub fn format(self: @This(), w: *std.Io.Writer) !void {
             switch (self) {
-                inline .push, .exit, .exit_with, .jmp, .fork, .set, .pipe_fwd, .pipe_file, .pipe_write, .wait, .stream, .pipe, .pipe_opt, .ath, .log, .cmp, .resolve_exit_code, .cd, .get_env, .set_env, .emit_lines, .pipe_dequeue => |t| try w.print("{t} {f}", .{ self, t }),
+                inline .push, .exit, .process_exit, .exit_with, .jmp, .fork, .set, .pipe_fwd, .pipe_file, .pipe_write, .wait, .stream, .pipe, .pipe_opt, .ath, .log, .cmp, .resolve_exit_code, .cd, .get_env, .set_env, .emit_lines, .pipe_dequeue => |t| try w.print("{t} {f}", .{ self, t }),
                 inline .ref, .comment, .get_module_cache, .set_module_cache => |t| try w.print("{t} {s}", .{ self, t }),
                 inline .alloc => |t| try w.print("{t} {}", .{ self, t }),
                 else => try w.print("{t}", .{self}),
@@ -330,6 +355,81 @@ pub const Instruction = struct {
         operand: Location,
         tag: TypeTag,
         result: Location,
+    };
+
+    pub const StrOp = struct {
+        op: Op,
+        operand: ValueSource,
+        arg0: ValueSource,
+        arg1: ValueSource,
+        result: Location,
+
+        pub const Op = enum {
+            len,
+            upper,
+            lower,
+            trim,
+            trim_start,
+            trim_end,
+            contains,
+            starts_with,
+            ends_with,
+            index_of,
+            slice,
+            repeat,
+            replace,
+            split,
+            join,
+            bytes,
+        };
+
+        pub fn format(self: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
+            try w.print("{f} = str.{t}({f}, {f}, {f})", .{ self.result, self.op, self.operand, self.arg0, self.arg1 });
+        }
+    };
+
+    pub const FloatOp = struct {
+        op: Op,
+        operand: ValueSource,
+        /// The second operand for `pow`; ignored by the one-argument ops.
+        arg0: ValueSource,
+        result: Location,
+
+        pub const Op = enum {
+            sqrt,
+            floor,
+            ceil,
+            round,
+            trunc,
+            pow,
+        };
+
+        pub fn format(self: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
+            try w.print("{f} = float.{t}({f}, {f})", .{ self.result, self.op, self.operand, self.arg0 });
+        }
+    };
+
+    pub const ArrayPush = struct {
+        array: ValueSource,
+        value: ValueSource,
+        result: Location,
+
+        pub fn format(self: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
+            try w.print("{f} = push({f}, {f})", .{ self.result, self.array, self.value });
+        }
+    };
+
+    /// `arr.set(index, value)` — a new array with element `index` replaced,
+    /// copied once (O(n)). Out-of-range indices leave the copy unchanged.
+    pub const ArraySet = struct {
+        array: ValueSource,
+        index: ValueSource,
+        value: ValueSource,
+        result: Location,
+
+        pub fn format(self: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
+            try w.print("{f} = set({f}, {f}, {f})", .{ self.result, self.array, self.index, self.value });
+        }
     };
 
     pub fn BinaryOperation(comptime OpType: type) type {
@@ -534,6 +634,10 @@ pub const Instruction = struct {
 
     pub const Fork = struct {
         dest: InstructionAddr,
+        /// When set, the target instruction set is read at runtime from the
+        /// fn_ref value at this location (an indirect call `f x`), overriding
+        /// `dest`'s instr_set.
+        dest_from: ?Location = null,
         stdin: Location,
         stdout: Location,
         stderr: Location,
@@ -625,14 +729,22 @@ pub const Instruction = struct {
     };
 
     pub const SetEnv = struct {
+        /// Static variable name (`$NAME = …`). Ignored when `name_source` is set.
         name: []const u8,
+        /// A runtime-computed variable name (the `env.set name value` builtin),
+        /// materialized to a string at evaluation. When null, `name` is used.
+        name_source: ?ValueSource = null,
         value: ValueSource,
 
         pub fn format(
             self: @This(),
             writer: *std.Io.Writer,
         ) std.Io.Writer.Error!void {
-            try writer.print("{s} {f}", .{ self.name, self.value });
+            if (self.name_source) |ns| {
+                try writer.print("{f} {f}", .{ ns, self.value });
+            } else {
+                try writer.print("{s} {f}", .{ self.name, self.value });
+            }
         }
     };
 

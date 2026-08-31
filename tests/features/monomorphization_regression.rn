@@ -1,0 +1,49 @@
+// A direct call to a generic function with `|T|` capture parameters is
+// monomorphized: a specialization is compiled with the type variables bound to
+// the call's concrete argument types. So a type variable used as a value (e.g.
+// `${T}` serialization) reflects the actual per-call type, with no runtime type
+// information — each distinct type argument gets its own specialization, and the
+// same type argument reuses one.
+
+// One type parameter, three call types → three specializations.
+fn Void describe(x: |T|) Void {
+    echo "${x} is ${T}"
+}
+describe 5
+describe "hi"
+describe 3.14
+
+// The same type argument reuses the cached specialization.
+describe 10
+describe 20
+
+// Multiple type parameters bind independently.
+fn Void pair(a: |A|, b: |B|) Void {
+    echo "${A} + ${B}"
+}
+pair 1 "x"
+pair "y" 2.0
+pair true 0
+
+// A capture nested in a generic application (`Box(|T|)`) also monomorphizes:
+// the argument's concrete type flows through the constructor to the capture.
+const Box(T) = struct { value: T }
+fn Void unwrapType(b: Box(|T|)) Void {
+    echo "unwrapped ${b.value} of type ${T}"
+}
+const bi: Box(Int) = Box{ .value = 7 }
+const bs: Box(String) = Box{ .value = "hey" }
+unwrapType bi
+unwrapType bs
+
+// Recursion stays at the specialized type: a self-recursive call inside a
+// specialization targets that same specialization, so `${T}` is concrete at
+// every level.
+fn Void countType(x: |T|, n: Int) Void {
+    if (n > 0) {
+        echo "level ${n} is ${T}"
+        countType x (n - 1)
+    }
+}
+countType 5 2
+countType "z" 2
