@@ -3760,9 +3760,22 @@ pub const IRCompiler = struct {
             },
         };
 
-        // return .fromValue(.{ .stream = s_tream });
-        // return .fromValue(.{ .stream = undefined });
-        return .from(ref.dereference());
+        // Flatten the segment rope (a heap sequence at `ref`) into a single
+        // contiguous string, so an interpolated string is a real `[]Byte` value
+        // like a literal — not an `.addr`-backed sequence indistinguishable from
+        // an array. This makes `is String`, `.bytes`, and value-hashing behave
+        // the same for built and literal strings. Uses `join` with an empty
+        // separator (concatenating every materialized segment).
+        const empty_sep = try self.addSlice(1, "");
+        const flat_ref = try self.newRef(source, "interp_flat");
+        try self.addInstruction(.init(.from(source), .{ .str_op = .{
+            .op = .join,
+            .operand = .from(ref.dereference()),
+            .arg0 = .fromValue(empty_sep),
+            .arg1 = .fromValue(.void),
+            .result = flat_ref.dereference(),
+        } }));
+        return .fromLocation(flat_ref.dereference().typed(string_type));
     }
 
     fn decodeStringLiteralText(self: *IRCompiler, encoded: []const u8) Allocator.Error![]u8 {

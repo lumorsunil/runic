@@ -1,0 +1,27 @@
+// An interpolated (runtime-built) string is a real `String` value, identical in
+// behavior to a literal: it is recognized by `is String`, supports `.bytes` and
+// other string ops, equals the same literal, and hashes the same. Previously a
+// built string was an `.addr`-backed segment rope that `is String` rejected and
+// `.bytes` couldn't read, so equal literal/built strings behaved differently.
+// Deterministic output.
+const j = 6
+const built: String = "k${j}"
+const lit: String = "k6"
+
+echo "eq=${built == lit} builtLen=${built.bytes.len} litLen=${lit.bytes.len}"
+
+// `is String` on a built string in a generic function (narrowed branch).
+fn Void byteSum(x: |T|) Int {
+  if (x is String) {
+    var h = 0
+    for (x.bytes) |b| { h = h + b }
+    yield h
+  } else {
+    yield 0 - 1
+  }
+}
+echo "sumBuilt=${byteSum "k${j}"} sumLit=${byteSum "k6"} sumInt=${byteSum 42}"
+
+// A built string round-trips through string ops.
+const g = "greeting_${1 + 1}"
+echo "upper=${g.upper} startsGreet=${g.startsWith "greeting"}"
