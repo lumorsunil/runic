@@ -14,6 +14,76 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 _Nothing yet._
 
+## [0.7.0] — 2026-08-31
+
+The **stdlib-foundations** release: the language features that let the standard
+library be written in Runic itself (generics, comptime, `while`), plus the first
+generic collection — a hashed `std.map` — and the performance and correctness
+fixes discovered while building it.
+
+### Added
+
+- **Generic type constructors and monomorphization.** Declare generic types with
+  `const Box(T) = struct { value: T }` and generic functions with `|T|` type
+  captures (`fn wrap(x: |T|) Box(T) { … }`). Calls are **monomorphized** per
+  concrete type — direct, multi-parameter, nested applications (`Box(Pair(K,V))`),
+  and recursion. Construct with explicit type args, `Box(Int){ .value = 1 }`, or
+  bare `Box{ … }`. A type in value position serializes to its name
+  (`"${Box(Int)}"` → `Box(Int)`).
+- **`std.map` — a generic hashed key/value map.** O(1)-average lookup via hashed
+  buckets, with insertion-order iteration. `empty`/`set`/`get`/`has`/`remove`/
+  `keys`/`values`/`len`, plus mutable in-place variants `setIn`/`removeIn`. `Int`
+  and `String` keys (a String is hashed over its bytes; an interpolated key
+  hashes identically to the same literal).
+- **`comptime` value evaluation** — `comptime <expr>` interprets pure user
+  functions at compile time.
+- **`while` loop**, including `while (opt) |v| { … }` optional-unwrap capture.
+- **`is`-type narrowing.** Inside `if (x is String) { … }`, `x` is treated as the
+  tested type, so type-specific operations (`x.upper`, `x.bytes`) resolve there.
+- **`s.bytes`** — a string's bytes as `[]Int`, enabling byte-level work (hashing,
+  checksums) in pure Runic.
+- **`arr.with i v`** — a new array with element `i` replaced (immutable element
+  update, the analog of `arr[i] = v`).
+- **Float math builtins** — `sqrt`/`floor`/`ceil`/`round`/`trunc` and `powF`,
+  surfaced through `std.math`.
+- **`setenv name value`** builtin (backs `std.env.set`) for dynamically-named
+  environment writes.
+- Standard-library additions: `std.math` Float surface, `std.env.set`, and
+  completed `std.list` (`find`/`contains`/`sort`) and `std.path` (`normalize`).
+
+### Changed
+
+- **Integer remainder yields `Int`.** `int % int` was a `Float`; it is now an
+  `Int` (like `+`/`-`/`*`), so it can index arrays and feed hashes. A float
+  operand still widens the result.
+- **Interpolated strings are real `String` values.** A built string (`"k${i}"`,
+  concatenations) is now a contiguous `[]Byte` — recognized by `is String`,
+  readable by `.bytes`, and consistent under `==` and hashing — instead of an
+  internal segment rope.
+- **Array indexing propagates the element type**, so `arr[i].field`, `arr[i][j]`,
+  nested `[][]T`, and `const b = arr[i]` resolve the element's layout.
+
+### Fixed
+
+- Generic struct return-type equality and value-transport, so a generic function
+  can return and reuse a generic struct.
+- A `Void` function's nested call (including in an `if` branch) is awaited before
+  the function returns, instead of racing the caller.
+- Nullary module-member functions are auto-called in value position
+  (`std.env.cwd`, not a function reference).
+- Multiple interpolated command arguments keep their own values; an interpolated
+  command argument combined with a file redirect no longer deadlocks.
+- A function's / block's file redirects (`myFn > "out"`) are drained to the file.
+
+### Performance
+
+- **In-place linear array buffers.** A `var x = .{ }` grown only via
+  `x = x.push e` / `x = x.with i e`, read only as `x[i]`/`for(x)`/`x.len`, and
+  escaping only in a final `yield`, is uniquely owned and grown **in place**
+  (amortized O(1)) instead of copied each push — turning O(n²) build loops into
+  O(n) (building 3000 elements: ~5.6s → ~1.0s). Gated by a conservative analysis
+  that leaves anything it can't prove unique untouched.
+
 ## [0.6.1] — 2026-08-20
 
 ### Fixed
