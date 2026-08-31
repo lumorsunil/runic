@@ -5870,6 +5870,63 @@ pub const IRCompiler = struct {
         );
     }
 
+    /// A saved binding type, restored after a narrowed `if (x is T)` then-branch.
+    const NarrowGuard = struct {
+        binding: *Scope.Binding,
+        saved_result: Result,
+    };
+
+    /// The canonical compiler type an `is T` test narrows its subject to in the
+    /// then-branch (`String` → `[]Byte`, primitive identifiers → the primitive,
+    /// a user struct name → itself). Null when the type isn't a narrowable kind.
+    fn resolveTestedType(self: *IRCompiler, type_expr: *const ast.TypeExpr) ?ast.TypeExpr {
+        return switch (type_expr.*) {
+            .identifier => |named| {
+                const n = named.path.segments[named.path.segments.len - 1].name;
+                if (std.mem.eql(u8, n, "String")) return string_type;
+                if (std.mem.eql(u8, n, "Int")) return ast.TypeExpr.global(.integer);
+                if (std.mem.eql(u8, n, "Float")) return ast.TypeExpr.global(.float);
+                if (std.mem.eql(u8, n, "Bool")) return ast.TypeExpr.global(.boolean);
+                if (self.user_struct_types.contains(n)) return type_expr.*;
+                return null;
+            },
+            .integer, .float, .boolean => type_expr.*,
+            .array => |a| if (a.element.* == .byte) string_type else type_expr.*,
+            else => null,
+        };
+    }
+
+    /// When `condition` is `x is T` on a plain identifier, narrows `x`'s binding
+    /// to `T` for the duration of the then-branch (so `x.upper` / `x.bytes`
+    /// resolve inside `if (x is String)`), returning a guard to restore it.
+    fn narrowConditionSubject(self: *IRCompiler, condition: *ast.Expression) ?NarrowGuard {
+        if (condition.* != .is_expr) return null;
+        const is_expr = condition.is_expr;
+        const name = subjectIdentifierName(is_expr.subject) orelse return null;
+        const narrowed = self.resolveTestedType(is_expr.type_expr) orelse return null;
+        const binding = self.lookup(name, .{ .shallow = false }) orelse return null;
+        const guard = NarrowGuard{ .binding = binding, .saved_result = binding.result };
+        binding.result = binding.result.typed(narrowed);
+        return guard;
+    }
+
+    /// The bound name a narrowing subject refers to. A bare identifier in value
+    /// position parses as a nullary call, so unwrap that too.
+    fn subjectIdentifierName(expr: *ast.Expression) ?[]const u8 {
+        return switch (expr.*) {
+            .identifier => |id| id.name,
+            .call => |call| if (call.arguments.len == 0 and call.callee.* == .identifier)
+                call.callee.identifier.name
+            else
+                null,
+            else => null,
+        };
+    }
+
+    fn restoreNarrow(guard: ?NarrowGuard) void {
+        if (guard) |g| g.binding.result = g.saved_result;
+    }
+
     fn compileIf(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -5956,7 +6013,9 @@ pub const IRCompiler = struct {
         const else_addr = try self.newLabel("if_else", .unknown);
 
         try self.jmp(source, condition, false, else_addr);
+        const narrow = self.narrowConditionSubject(if_expr.condition);
         const then = try self.compileIfBranchExpression(source, if_expr.then_expr, if_condition.capture_binding);
+        restoreNarrow(narrow);
         try self.set(source, result, stableResultSource(then));
         try self.popToStackBase(source, branch_stack_base);
         try self.jmp(source, null, false, after_addr);
@@ -6006,7 +6065,9 @@ pub const IRCompiler = struct {
         const after_addr = try self.newLabel("if_after", .unknown);
         const branch_stack_base = self.currentFrame().rel_stack_counter;
         try self.jmp(source, condition, false, after_addr);
+        const narrow = self.narrowConditionSubject(if_expr.condition);
         const then_result = try self.compileIfBranchExpression(source, if_expr.then_expr, if_condition.capture_binding);
+        restoreNarrow(narrow);
         if (isWaitable(then_result)) |loc| {
             try self.wait(source, loc);
         }
