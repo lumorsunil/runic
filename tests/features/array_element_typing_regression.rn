@@ -26,3 +26,14 @@ r1 = r1.push 2
 r1 = r1.push 3
 rows = rows.push r1
 echo "rows=${rows.len} row0len=${rows[0].len} row1len=${rows[1].len} cell=${rows[1][1]}"
+
+// An array stored in a struct field, then read back and indexed — the field's
+// element type flows through indexing to member access.
+const Holder = struct { items: []Box }
+const h = Holder{ .items = xs }
+echo "field=${h.items[1].n}"
+
+// An inline function call as the index is captured (materialized), not left as
+// a handle that arithmetic can't add.
+fn Void one() Int { yield 1 }
+echo "callIndex=${xs[one].n}"

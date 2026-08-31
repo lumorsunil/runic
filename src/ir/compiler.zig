@@ -7989,11 +7989,17 @@ pub const IRCompiler = struct {
                 // concretely typed but the variable's type was still unknown
                 // (`var out = .{ }` is `[]Void`; `out = out.push Box{…}` makes it
                 // `[]Box`), so a later `out[i].field` resolves the element layout.
+                // Update both the `result` (read via compileIdentifier) and
+                // `type_expr` (read via resolveStaticType, e.g. when the variable
+                // becomes a struct-literal field value).
                 if (binary.left.* == .identifier) {
                     if (self.lookup(binary.left.identifier.name, .{ .shallow = false })) |binding| {
-                        if (binding.is_mutable and typeIsUnknown(binding.result.typeExpr())) {
+                        if (binding.is_mutable and
+                            (typeIsUnknown(binding.result.typeExpr()) or typeIsUnknown(binding.type_expr)))
+                        {
                             if (right.typeExpr()) |rt| {
                                 binding.result = binding.result.typed(rt);
+                                binding.type_expr = rt;
                             }
                         }
                     }
@@ -8025,7 +8031,10 @@ pub const IRCompiler = struct {
                 const element_type = left_type.array.element.*;
                 const left_ref = try self.newRef(source, "array_access_left_ref");
                 try self.set(source, left_ref, left.source);
-                const right = try self.compileExpression(binary.right);
+                // The index may be a function call whose result is delivered as a
+                // thread/pipe to await (e.g. `arr[hash key]`); capture it so the
+                // arithmetic below adds a materialized integer, not a handle.
+                const right = try self.compileArithmeticOperand(source, binary.right);
                 try self.set(source, .initRegister(.r2), .from(left_ref.dereference()));
 
                 try self.addInstruction(.init(.from(source), .{ .ath = .{
