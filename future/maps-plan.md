@@ -113,8 +113,32 @@ A prototype (`Entry`/`Map` + `set`/`get`) compiles down to one concrete gap:
   element type. **DONE (2026-08-30):** `.push` now refines an unknown (`[]Void`)
   element type from the pushed value, and reassigning a mutable variable refines
   its tracked type; `arr[i].field`, `arr[i][j]`, and `const b = arr[i]` now
-  resolve. Covered by `tests/features/array_element_typing_regression.rn`. Still
-  needed before M3: the string hash primitive.
+  resolve. Covered by `tests/features/array_element_typing_regression.rn`.
+
+  **Byte access DONE (2026-08-31):** `s.bytes` yields a string's bytes as
+  `[]Int`, so a hash can be folded from primitives (a polynomial rolling hash
+  works — Runic has no bitwise `^`, so FNV-1a-style xor is out; use `*`/`+`/`%`).
+  Covered by `tests/features/string_bytes_regression.rn`.
+
+  **Two blockers remain before a String-key hash map can be written** (found
+  2026-08-31 while wiring the hash in):
+  1. **`is` does not narrow the static type.** Inside `if (key is String) { … }`,
+     `key` still has type `K` (a `type_var`), so `key.bytes` fails with "member
+     access is only supported for struct types in IR" — the string builtin isn't
+     recognized on a non-String static type. Need `is`-narrowing (the sum-types
+     plan already flags narrowing as a later phase) so `key.bytes`/`key.len`
+     resolve in the taken branch.
+  2. **Array-returning string ops break across a call boundary.** A `hashStr(s:
+     String)` helper works when called directly, but `f(s)` where `f` does
+     `s.bytes`/`s.split` and `s` arrived as a *function argument* yields empty.
+     Reproduces with `.split` too, so it's a **pre-existing** cross-function
+     transport bug for array-returning str-ops, independent of `s.bytes`. Because
+     a map's `set`/`get` must hash their `key` param (one hop into a hash
+     helper), this blocks the clean design; inlining the fold doesn't help either
+     while blocker #1 stands.
+
+  Net: byte access and array indexing are in; M3 now waits on `is`-narrowing and
+  the array-through-call-boundary fix.
 
 ## Open questions
 
