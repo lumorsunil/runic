@@ -126,10 +126,21 @@ A prototype (`Entry`/`Map` + `set`/`get`) compiles down to one concrete gap:
   quadratically slower — the opposite of helpful, since `set` (immutable rebuild
   + typed-return capture) already dominates and `get`/`has` are the only O(1)
   beneficiaries. In this interpreter's cost model a **fixed small bucket count is
-  optimal**; growing it is counterproductive. Prerequisite for revisiting resize
-  (and for faster immutable maps generally): an **O(n) immutable array update /
-  bulk builder** (copy-with-one-change, or a persistent vector) to replace the
-  O(n²) push-in-a-loop rebuild. Until then the fixed-count map stands.
+  optimal**; growing it is counterproductive.
+
+  **Follow-up (2026-08-31): added `arr.with` (O(n) immutable element update), but
+  resize is *still* rejected — for a deeper reason.** `arr.with index value`
+  copies once (O(n)) instead of the O(n²) push-in-a-loop rebuild, and `std.map`
+  now uses it, so `set` is O(buckets + n) and the fixed-16 map is faster (25 keys
+  ~1s). But a 64-bucket map with `arr.with` and *no* resize still times out —
+  because the real dominant cost isn't the per-array copy, it's the **typed
+  value-capture that serializes the whole returned map (every bucket) through a
+  pipe on each `m = std.map.set …`**. That cost scales with bucket count
+  regardless of `arr.with`, so more buckets → slower `set`. The true prerequisite
+  for a resizing map is a **cheaper function-return mechanism** (returning a
+  large structure without deep-serializing it through the capture pipe) — a
+  runtime change well beyond an array primitive. `arr.with` is shipped and useful
+  regardless; the map stays fixed-count.
 
 - **Phase M3 — performance (original notes).** hashing for O(1) lookup — a
   comptime hash/eq dispatched per key type (buckets of entries), or a builtin
