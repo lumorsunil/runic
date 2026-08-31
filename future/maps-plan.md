@@ -100,7 +100,9 @@ A prototype (`Entry`/`Map` + `set`/`get`) compiles down to one concrete gap:
   (`const e = wrap "x" 5` where `wrap` yields `Entry(K, V)`) — the member-access
   path didn't resolve a `type_application` object type to its struct layout.
   Covered by `tests/features/generic_struct_construction_regression.rn`.
-  **Still open:** whether to also offer a mutable in-place API (see open q).
+  **Mutable API DONE (2026-08-31):** `setIn`/`removeIn` mutate the map in
+  place (a Runic struct is passed by reference), coexisting with the immutable
+  `set`/`remove`. Covered by `tests/features/std_map_mutable_regression.rn`.
 - [x] **Phase M3 — hashing for O(1) lookup. DONE (2026-08-31).** `std/map.rn` is
   now a hashed map: keys hash into a fixed number of buckets (each a small
   association list scanned on collision), with a parallel ordered entries list
@@ -223,5 +225,6 @@ A prototype (`Entry`/`Map` + `set`/`get`) compiles down to one concrete gap:
 
 - **Key types beyond `Int`/`String`:** how far to push generic equality (structs,
   arrays). Start with what `==` supports; document the limit.
-- **Immutable vs mutable API** (or both).
+- ~~**Immutable vs mutable API** (or both).~~ Resolved: both — immutable
+  `set`/`remove` and mutable `setIn`/`removeIn`.
 - **Iteration order:** insertion order (an association list preserves it for free).

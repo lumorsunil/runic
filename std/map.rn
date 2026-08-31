@@ -14,6 +14,10 @@
 //   m = std.map.set m "a" 1
 //   const v = std.map.get m "a" orelse 0
 //
+// Mutable variants `setIn`/`removeIn` update the map in place instead (a struct
+// is passed by reference, so the caller's map changes), for when reassigning is
+// inconvenient: `std.map.setIn m "a" 1`.
+//
 // The bucket count is fixed. A resize-on-load-factor scheme was tried and found
 // counterproductive here: every `set` returns a whole new map through the typed
 // value-capture path, whose cost scales with the bucket count, so *more* buckets
@@ -82,6 +86,36 @@ pub fn Void set(m: Map(|K|, |V|), key: K, value: V) Map(K, V) {
   yield Map(K, V){ .buckets = newBuckets, .order = newOrder }
 }
 
+// Mutable variant of `set`: updates `m` in place (a Runic struct is passed by
+// reference, so the caller's map sees the change) and returns nothing. Use it
+// when you hold a `var` map and don't want to reassign — `std.map.setIn m k v`
+// instead of `m = std.map.set m k v`. Same replace-or-append semantics.
+pub fn Void setIn(m: Map(|K|, |V|), key: K, value: V) Void {
+  const nb = m.buckets.len
+  const idx = bucketFor key nb
+  const bucket = m.buckets[idx]
+  const entry = Entry(K, V){ .key = key, .value = value }
+  var bpos = 0 - 1
+  var bi = 0
+  for (bucket.entries) |e| {
+    if (e.key == key) { bpos = bi }
+    bi = bi + 1
+  }
+  if (bpos < 0) {
+    m.buckets = m.buckets.with idx Bucket(K, V){ .entries = bucket.entries.push entry }
+    m.order = m.order.push entry
+  } else {
+    m.buckets = m.buckets.with idx Bucket(K, V){ .entries = bucket.entries.with bpos entry }
+    var opos = 0
+    var oi = 0
+    for (m.order) |e| {
+      if (e.key == key) { opos = oi }
+      oi = oi + 1
+    }
+    m.order = m.order.with opos entry
+  }
+}
+
 // The value for `key`, or absent.
 pub fn Void get(m: Map(|K|, |V|), key: K) ?V {
   const idx = bucketFor key m.buckets.len
@@ -116,6 +150,22 @@ pub fn Void remove(m: Map(|K|, |V|), key: K) Map(K, V) {
     if (e.key == key) { } else { newOrder = newOrder.push e }
   }
   yield Map(K, V){ .buckets = newBuckets, .order = newOrder }
+}
+
+// Mutable variant of `remove`: deletes `key` from `m` in place (no return).
+pub fn Void removeIn(m: Map(|K|, |V|), key: K) Void {
+  const idx = bucketFor key m.buckets.len
+  const bucket = m.buckets[idx]
+  var ents = .{ }
+  for (bucket.entries) |e| {
+    if (e.key == key) { } else { ents = ents.push e }
+  }
+  m.buckets = m.buckets.with idx Bucket(K, V){ .entries = ents }
+  var newOrder = .{ }
+  for (m.order) |e| {
+    if (e.key == key) { } else { newOrder = newOrder.push e }
+  }
+  m.order = newOrder
 }
 
 // The keys, in insertion order.

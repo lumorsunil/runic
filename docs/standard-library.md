@@ -220,12 +220,20 @@ count is fixed for now; resize-on-load-factor is a future refinement.)
 | `remove(m: Map(K, V), key: K) Map(K, V)` | new map without `key` |
 | `keys(m: Map(K, V)) []K`, `values(m: Map(K, V)) []V` | entries in insertion order |
 | `len(m: Map(K, V)) Int` | number of entries |
+| `setIn(m: Map(K, V), key: K, value: V) Void` | *mutable*: set `key` → `value` in place |
+| `removeIn(m: Map(K, V), key: K) Void` | *mutable*: delete `key` in place |
+
+`setIn`/`removeIn` mutate the map in place (a struct is passed by reference), for
+when reassigning is inconvenient — e.g. accumulating inside a loop.
 
 ```rn
 var m = std.map.empty
 m = std.map.set m "a" 1
 m = std.map.set m "b" 2
 const v = std.map.get m "a" orelse 0   // 1
+
+var counts = std.map.empty              // mutable style
+for (xs) |x| { std.map.setIn counts x ((std.map.get counts x orelse 0) + 1) }
 ```
 
 ## Language prerequisites for Phase 3
