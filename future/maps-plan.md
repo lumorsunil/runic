@@ -101,9 +101,25 @@ A prototype (`Entry`/`Map` + `set`/`get`) compiles down to one concrete gap:
   path didn't resolve a `type_application` object type to its struct layout.
   Covered by `tests/features/generic_struct_construction_regression.rn`.
   **Still open:** whether to also offer a mutable in-place API (see open q).
-- **Phase M3 — performance (future):** hashing for O(1) lookup — a comptime
-  hash/eq dispatched per key type (buckets of entries), or a builtin fast path,
-  keeping the same `std/map` surface. **Blocked on foundational features**
+- [x] **Phase M3 — hashing for O(1) lookup. DONE (2026-08-31).** `std/map.rn` is
+  now a hashed map: keys hash into a fixed number of buckets (each a small
+  association list scanned on collision), with a parallel ordered entries list
+  preserving insertion order for `keys`/`values`. Same public surface and
+  behavior as M1 (its test output is unchanged); collisions and
+  interpolated-vs-literal key lookup are covered. Getting here needed a chain of
+  foundational fixes, all landed and each broadly useful beyond maps:
+  `s.bytes` (byte access) · `is`-narrowing (`if (x is String)` narrows `x`) ·
+  array element-type propagation through indexing (incl. struct-field arrays and
+  call indices) · integer `%` yields Int (not Float) · **interpolated strings
+  flatten to real `String` values** (the last blocker — a built string was an
+  `.addr` rope that `is String` rejected, so hashing diverged between built and
+  literal keys). Resize-on-load-factor is the remaining future refinement.
+  Historical blocker analysis (all resolved) follows.
+
+- **Phase M3 — performance (original notes).** hashing for O(1) lookup — a
+  comptime hash/eq dispatched per key type (buckets of entries), or a builtin
+  fast path, keeping the same `std/map` surface. **Blocked on foundational
+  features**
   (2026-08-30 investigation): (1) a **string hash primitive** — there's no way
   to fold over a string's bytes in Runic today (`s.split ""` returns the whole
   string, no byte/char access), so a String hash needs a builtin or `s.bytes`;
