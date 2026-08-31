@@ -618,6 +618,10 @@ pub const IRCompiler = struct {
     /// Concrete types bound by `|T|` captures in binding positions (`const x:
     /// []|T| = …` → `T` = the element type). A later `: T` resolves through here.
     type_captures: std.StringHashMapUnmanaged(ast.TypeExpr) = .empty,
+    /// Names of the current function's `var` locals that are linear buffers —
+    /// safe to grow in place via `array_push_inplace` (see analyzeLinearBuffers).
+    /// Recomputed per function body; saved/restored around nested functions.
+    linear_buffers: std.StringHashMapUnmanaged(void) = .empty,
     /// A generic type constructor's type parameters, by name — so an application
     /// `Box(Int)` can substitute its arguments into the registered struct body.
     generic_ctor_params: std.StringHashMapUnmanaged([]const ast.Identifier) = .empty,
@@ -7620,6 +7624,14 @@ pub const IRCompiler = struct {
         // pub-export epilogue below.  For non-block bodies fall back to compileExpression.
         const result = if (fn_decl.body.* == .block) blk: {
             const block = fn_decl.body.block;
+            // Identify this body's linear-buffer vars (grown in place). Saved and
+            // restored so a nested function's analysis doesn't leak out.
+            const saved_linear = self.linear_buffers;
+            self.linear_buffers = self.analyzeLinearBuffers(block.statements);
+            defer {
+                self.linear_buffers.deinit(self.allocator);
+                self.linear_buffers = saved_linear;
+            }
             var r: Result = .fromValue(.void);
             for (block.statements[0..block.statements.len -| 1]) |stmt| {
                 _ = try self.compileStatement(stmt);
@@ -7874,6 +7886,217 @@ pub const IRCompiler = struct {
         return (try self.compileExpression(expr)).dereference();
     }
 
+    /// The variable name an expression refers to, if it is a bare identifier or a
+    /// nullary call to one (`x` parses as `x()`). Null otherwise.
+    fn asVarName(expr: *ast.Expression) ?[]const u8 {
+        return switch (expr.*) {
+            .identifier => |id| id.name,
+            .call => |c| if (c.arguments.len == 0 and c.callee.* == .identifier)
+                c.callee.identifier.name
+            else
+                null,
+            else => null,
+        };
+    }
+
+    const AssignPush = struct { name: []const u8, value: *ast.Expression };
+
+    /// Matches `x = x.push e` (any var `x`), returning `x` and `e`. Used to
+    /// recognize in-place-mutation statements during linear-buffer analysis.
+    fn matchAssignPush(expr: *ast.Expression) ?AssignPush {
+        if (expr.* != .binary or expr.binary.op != .assign) return null;
+        const b = expr.binary;
+        const name = asVarName(b.left) orelse return null;
+        if (b.right.* != .call) return null;
+        const call = b.right.call;
+        if (call.arguments.len != 1 or call.redirects.len != 0) return null;
+        if (call.callee.* != .binary) return null;
+        const callee = call.callee.binary;
+        if (callee.op != .member or callee.right.* != .identifier) return null;
+        if (!std.mem.eql(u8, callee.right.identifier.name, "push")) return null;
+        const recv = asVarName(callee.left) orelse return null;
+        if (!std.mem.eql(u8, recv, name)) return null;
+        return .{ .name = name, .value = call.arguments[0] };
+    }
+
+    const LinScan = struct {
+        cand: *std.StringHashMapUnmanaged(void),
+        disq: *std.StringHashMapUnmanaged(void),
+        alloc: std.mem.Allocator,
+        recognized: bool = true,
+        // `strict`: escapes disqualify (used for all but the final statement).
+        // When false (final statement), only in-place mutations disqualify — an
+        // escape there is safe because nothing mutates the buffer afterward.
+        strict: bool = true,
+
+        fn disqualify(self: *LinScan, name: []const u8) void {
+            if (self.cand.contains(name)) self.disq.put(self.alloc, name, {}) catch {
+                self.recognized = false;
+            };
+        }
+    };
+
+    /// Identifies the `var x = .{ }` locals in a function body that are linear
+    /// buffers, safe to grow in place: mutated only via `x = x.push e`, otherwise
+    /// used only as reads (`x[i]`, `for(x)`, `x.len`), and escaping (a bare `x`
+    /// anywhere else) only in the final statement — so no mutation follows an
+    /// escape. Bails (returns empty) on any construct the walker doesn't fully
+    /// recognize, so anything unmodeled is simply not optimized.
+    fn analyzeLinearBuffers(self: *IRCompiler, statements: []const *ast.Statement) std.StringHashMapUnmanaged(void) {
+        var candidates: std.StringHashMapUnmanaged(void) = .empty;
+        const gpa = self.allocator;
+        for (statements) |s| {
+            if (s.* != .binding_decl) continue;
+            const bd = s.binding_decl;
+            if (!bd.is_mutable or bd.pattern.* != .identifier) continue;
+            if (bd.initializer.* != .array or bd.initializer.array.elements.len != 0) continue;
+            candidates.put(gpa, bd.pattern.identifier.name, {}) catch {
+                candidates.deinit(gpa);
+                return .empty;
+            };
+        }
+        if (candidates.count() == 0) return candidates;
+
+        var disq: std.StringHashMapUnmanaged(void) = .empty;
+        defer disq.deinit(gpa);
+        var scan: LinScan = .{ .cand = &candidates, .disq = &disq, .alloc = gpa };
+
+        const n = statements.len;
+        for (statements, 0..) |s, i| {
+            scan.strict = (i + 1 != n);
+            linScanStmt(&scan, s);
+        }
+        if (!scan.recognized) {
+            candidates.deinit(gpa);
+            return .empty;
+        }
+        var it = disq.keyIterator();
+        while (it.next()) |k| _ = candidates.remove(k.*);
+        return candidates;
+    }
+
+    fn linScanStmt(scan: *LinScan, s: *ast.Statement) void {
+        switch (s.*) {
+            .binding_decl => |bd| linScanExpr(scan, bd.initializer),
+            .expression => |es| {
+                if (matchAssignPush(es.expression)) |ap| {
+                    // In-place mutation. Allowed before the final statement; in the
+                    // final statement it disqualifies (a mutation could then follow
+                    // an escape across loop iterations).
+                    if (!scan.strict) scan.disqualify(ap.name);
+                    linScanExpr(scan, ap.value);
+                } else {
+                    linScanExpr(scan, es.expression);
+                }
+            },
+            .yield_stmt => |y| linScanExpr(scan, y.value),
+            .exit_stmt => |e| if (e.value) |v| linScanExpr(scan, v),
+            .while_stmt => |w| {
+                linScanExpr(scan, w.condition);
+                for (w.body.statements) |bs| linScanStmt(scan, bs);
+            },
+            .type_binding_decl => {},
+            .bash_block => scan.recognized = false,
+        }
+    }
+
+    /// A read of a bare linear-buffer var (`x[i]` target, `for (x)` source,
+    /// `x.len` object) does not alias it — allow it. Anything else is walked.
+    fn linReadBase(scan: *LinScan, e: *ast.Expression) void {
+        if (asVarName(e)) |name| {
+            if (scan.cand.contains(name)) return;
+        }
+        linScanExpr(scan, e);
+    }
+
+    fn linScanExpr(scan: *LinScan, e: *ast.Expression) void {
+        switch (e.*) {
+            .identifier => |id| if (scan.strict) scan.disqualify(id.name),
+            .literal, .env_var, .path, .fd => {},
+            .array => |a| for (a.elements) |el| linScanExpr(scan, el),
+            .struct_literal => |sl| for (sl.fields) |f| linScanExpr(scan, f.value),
+            .unary => |u| linScanExpr(scan, u.operand),
+            .is_expr => |ie| linScanExpr(scan, ie.subject),
+            .index => |ix| {
+                linReadBase(scan, ix.target);
+                linScanExpr(scan, ix.index);
+            },
+            .member => |m| {
+                if (std.mem.eql(u8, m.member.name, "len")) linReadBase(scan, m.object) else linScanExpr(scan, m.object);
+            },
+            .call => |c| {
+                // A bare var (`x`, parsed `x()`) used as a value is an escape.
+                if (asVarName(e)) |vn| {
+                    if (scan.strict) scan.disqualify(vn);
+                } else {
+                    linScanExpr(scan, c.callee);
+                    for (c.arguments) |a| linScanExpr(scan, a);
+                }
+            },
+            .binary => |b| switch (b.op) {
+                .array_access => {
+                    linReadBase(scan, b.left);
+                    linScanExpr(scan, b.right);
+                },
+                .member => {
+                    if (b.right.* == .identifier and std.mem.eql(u8, b.right.identifier.name, "len"))
+                        linReadBase(scan, b.left)
+                    else
+                        linScanExpr(scan, b.left);
+                },
+                .assign => {
+                    // A non-in-place reassignment of a candidate breaks its
+                    // uniqueness (it now aliases the RHS) — disqualify it.
+                    if (asVarName(b.left)) |vn| scan.disqualify(vn);
+                    linScanExpr(scan, b.right);
+                },
+                else => {
+                    linScanExpr(scan, b.left);
+                    linScanExpr(scan, b.right);
+                },
+            },
+            .if_expr => |ife| linScanIf(scan, ife),
+            .for_expr => |f| {
+                for (f.sources) |src| linReadBase(scan, src);
+                linScanExpr(scan, f.body);
+            },
+            .block => |blk| for (blk.statements) |st| linScanStmt(scan, st),
+            // Constructs that could hide an aliasing use we don't model: bail, so
+            // the whole function is left unoptimized (safe).
+            else => scan.recognized = false,
+        }
+    }
+
+    fn linScanIf(scan: *LinScan, ife: ast.IfExpr) void {
+        linScanExpr(scan, ife.condition);
+        linScanExpr(scan, ife.then_expr);
+        if (ife.else_branch) |eb| switch (eb) {
+            .expr => |ex| linScanExpr(scan, ex),
+            .if_expr => |ip| linScanIf(scan, ip.*),
+            .condition => {},
+        };
+    }
+
+    const InplaceMatch = struct { value: *ast.Expression };
+
+    /// Matches `x = x.push e` where `x` is a linear-buffer var (see
+    /// analyzeLinearBuffers), so the push can grow the array in place. The LHS and
+    /// the push receiver must be the same linear var.
+    fn matchInplaceBuffer(self: *IRCompiler, binary: ast.BinaryExpr) ?InplaceMatch {
+        const name = asVarName(binary.left) orelse return null;
+        if (!self.linear_buffers.contains(name)) return null;
+        if (binary.right.* != .call) return null;
+        const call = binary.right.call;
+        if (call.arguments.len != 1 or call.redirects.len != 0) return null;
+        if (call.callee.* != .binary) return null;
+        const callee = call.callee.binary;
+        if (callee.op != .member or callee.right.* != .identifier) return null;
+        if (!std.mem.eql(u8, callee.right.identifier.name, "push")) return null;
+        const recv = asVarName(callee.left) orelse return null;
+        if (!std.mem.eql(u8, recv, name)) return null;
+        return .{ .value = call.arguments[0] };
+    }
+
     fn compileBinary(
         self: *IRCompiler,
         source: anytype,
@@ -8008,6 +8231,48 @@ pub const IRCompiler = struct {
                     const slot = try self.compileMemberBinary(source, binary.left.binary, .lvalue);
                     try self.set(source, slot.source.location, .from(value_ref.dereference()));
                     return .from(value_ref.dereference().typed(value.typeExpr()));
+                }
+
+                // In-place growth of a linear buffer: `x = x.push e` where `x` is
+                // a uniquely-owned `var` array (analyzeLinearBuffers), so the
+                // append reuses spare capacity (amortized O(1)) instead of copying.
+                if (self.matchInplaceBuffer(binary)) |m| {
+                    const buf = try self.compileExpression(binary.left);
+                    if (buf.source == .location) {
+                        const array_type_expr = buf.typeExpr() orelse array_type(&push_fallback_element);
+                        const array_ref = try self.newRef(source, "inplace_array");
+                        try self.set(source, array_ref, stableResultSource(buf));
+                        const value = try self.compileExpression(m.value);
+                        const value_ref = try self.newRef(source, "inplace_value");
+                        try self.set(source, value_ref, stableResultSource(value));
+                        const result_ref = try self.newRef(source, "inplace_result");
+                        try self.addInstruction(.init(.from(source), .{ .array_push_inplace = .{
+                            .array = .from(array_ref.dereference()),
+                            .value = .from(value_ref.dereference()),
+                            .result = result_ref.dereference(),
+                        } }));
+                        var result_array_type = array_type_expr;
+                        if (array_type_expr == .array and array_type_expr.array.element.* == .void) {
+                            if (value.typeExpr() orelse self.argTypeExpr(m.value)) |vt| {
+                                const element = try self.allocator.create(ast.TypeExpr);
+                                element.* = vt;
+                                result_array_type = array_type(element);
+                            }
+                        }
+                        const typed_result = result_ref.dereference().typed(result_array_type);
+                        try self.set(source, buf.source.location, .from(typed_result));
+                        if (binary.left.* == .identifier) {
+                            if (self.lookup(binary.left.identifier.name, .{ .shallow = false })) |binding| {
+                                if (binding.is_mutable and
+                                    (typeIsUnknown(binding.result.typeExpr()) or typeIsUnknown(binding.type_expr)))
+                                {
+                                    binding.result = binding.result.typed(result_array_type);
+                                    binding.type_expr = result_array_type;
+                                }
+                            }
+                        }
+                        return .from(buf.source.location);
+                    }
                 }
 
                 const left = try self.compileExpression(binary.left);

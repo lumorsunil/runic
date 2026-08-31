@@ -133,6 +133,7 @@ pub const IRProgramContext = struct {
         self.pipe_threads_to_remove.deinit(self.allocator);
         self.thread_exit_codes.deinit(self.allocator);
         self.shared.heap.deinit(self.allocator);
+        self.shared.array_capacities.deinit(self.allocator);
         for (self.subshell_contexts.values()) |*ctx| {
             ctx.deinit(self.allocator);
         }
@@ -474,6 +475,11 @@ pub const IRSharedContext = struct {
     struct_types: []const Value.Struct.Type,
     heap: std.ArrayListUnmanaged(Value) = .empty,
     current_heap_addr: usize,
+    /// Spare allocated capacity for arrays grown in place (`array_push_inplace`).
+    /// Maps an array's base addr to the number of element slots allocated after
+    /// the length header, so an append can reuse the tail instead of copying.
+    /// Only linear (uniquely-owned) arrays are grown in place — see the compiler.
+    array_capacities: std.AutoHashMapUnmanaged(usize, usize) = .empty,
 
     pub fn dataSize(self: @This()) usize {
         if (self.data.len == 0) return 0;

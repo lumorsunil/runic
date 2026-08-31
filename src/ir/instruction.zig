@@ -119,6 +119,10 @@ pub const Instruction = struct {
         /// `arr.push value` — allocates a new array (`[len+1, …elements, value]`)
         /// and stores its base address in `result`.
         array_push: ArrayPush,
+        /// Like `array_push` but grows the array in place when it has spare
+        /// capacity (amortized O(1)), only emitted for a linear (uniquely-owned)
+        /// array — see the compiler's linear-buffer analysis.
+        array_push_inplace: ArrayPush,
         array_set: ArraySet,
         /// constructs an error value (boxing the runtime payload, if any)
         make_err: MakeErr,

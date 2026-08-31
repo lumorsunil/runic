@@ -1429,6 +1429,39 @@ pub const IREvaluator = struct {
                 try self.setLocation(thread, ap.result, new_base);
                 return .cont;
             },
+            .array_push_inplace => |ap| {
+                const arr = try self.resolveValueSource(thread, ap.array);
+                const value = try self.resolveValueSource(thread, ap.value);
+                const len: usize = if (arr == .addr)
+                    @intCast(thread.shared.heapGet(arr.addr).?.integer)
+                else
+                    0;
+                const cap: usize = if (arr == .addr)
+                    (thread.shared.array_capacities.get(arr.addr) orelse len)
+                else
+                    0;
+                if (arr == .addr and len < cap) {
+                    // Spare capacity: append in place (O(1)). The array is linear,
+                    // so no other reference observes the mutation.
+                    thread.shared.heapGetPtr(arr.addr + 1 + len).?.* = value;
+                    thread.shared.heapGetPtr(arr.addr).?.* = .{ .integer = @intCast(len + 1) };
+                    try self.setLocation(thread, ap.result, arr);
+                    return .cont;
+                }
+                // Full (or empty/absent): reallocate with doubled capacity, copy,
+                // append, and record the new capacity.
+                const new_cap = if (cap < 4) @as(usize, 4) else cap * 2;
+                const new_base = try thread.shared.alloc(self.allocator, new_cap + 1);
+                const nb = new_base.addr;
+                thread.shared.heapGetPtr(nb).?.* = .{ .integer = @intCast(len + 1) };
+                if (arr == .addr) {
+                    for (0..len) |i| thread.shared.heapGetPtr(nb + 1 + i).?.* = thread.shared.heapGet(arr.addr + 1 + i).?;
+                }
+                thread.shared.heapGetPtr(nb + 1 + len).?.* = value;
+                try thread.shared.array_capacities.put(self.allocator, nb, new_cap);
+                try self.setLocation(thread, ap.result, new_base);
+                return .cont;
+            },
             .array_set => |as| {
                 const arr = try self.resolveValueSource(thread, as.array);
                 const index = try self.resolveValueSource(thread, as.index);

@@ -1,0 +1,42 @@
+// A `var x = .{ }` grown only via `x = x.push e`, read only via `x[i]`/`for`/
+// `.len`, and escaping only in a final `yield`, is a linear buffer: it is grown
+// in place (amortized O(1)) instead of copied each push (O(n²)). This must not
+// change any observable result — in particular, a buffer that escapes earlier
+// (bound, passed, or stored) is NOT optimized, so aliases keep the old contents.
+// Deterministic output.
+
+// Build-in-a-loop-and-return: the optimized case.
+fn Void build(n: Int) []Int {
+  var out = .{ }
+  var i = 0
+  while (i < n) { out = out.push (i * i); i = i + 1 }
+  yield out
+}
+const sq = build 6
+echo "sq len=${sq.len} sq0=${sq[0]} sq3=${sq[3]} sq5=${sq[5]}"
+
+// Reading the buffer while building it stays correct.
+fn Void sumBuilt() Int {
+  var xs = .{ }
+  xs = xs.push 10
+  xs = xs.push 20
+  xs = xs.push 30
+  var s = 0
+  var i = 0
+  while (i < xs.len) { s = s + xs[i]; i = i + 1 }
+  yield s
+}
+echo "sum=${sumBuilt}"
+
+// Escape before mutation: the snapshot must NOT see later pushes (so the buffer
+// is left unoptimized). `observe` captures the length at that moment.
+fn Void observe(a: []Int) Int { yield a.len }
+fn Void escapeThenMutate() Int {
+  var xs = .{ }
+  xs = xs.push 1
+  const snap = observe xs
+  xs = xs.push 2
+  xs = xs.push 3
+  yield snap
+}
+echo "snapshot=${escapeThenMutate}"
