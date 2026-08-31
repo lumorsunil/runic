@@ -372,6 +372,7 @@ pub const Instruction = struct {
             replace,
             split,
             join,
+            bytes,
         };
 
         pub fn format(self: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {

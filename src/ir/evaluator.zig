@@ -1394,6 +1394,18 @@ pub const IREvaluator = struct {
                         }
                         break :blk base_val;
                     },
+                    .bytes => blk: {
+                        // Build a runtime `[]Int`: slot 0 = length, slots 1.. =
+                        // each byte widened to an Int. Enables byte-level work in
+                        // Runic (e.g. a string hash) without char indexing.
+                        const base_val = try thread.shared.alloc(self.allocator, s.len + 1);
+                        const base = base_val.addr;
+                        thread.shared.heapGetPtr(base).?.* = .{ .integer = @intCast(s.len) };
+                        for (s, 0..) |byte, i| {
+                            thread.shared.heapGetPtr(base + 1 + i).?.* = .{ .integer = @intCast(byte) };
+                        }
+                        break :blk base_val;
+                    },
                     .join => unreachable, // handled above
                 };
                 try self.setLocation(thread, str_op.result, result);

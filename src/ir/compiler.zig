@@ -63,6 +63,11 @@ pub const execution_result_struct_type = ast.TypeExpr{ .struct_type = .{
 
 pub const thread_type = ast.TypeExpr.global(.thread);
 pub const string_element_type = ast.TypeExpr.global(.byte);
+const int_element_type = ast.TypeExpr.global(.integer);
+pub const int_array_type = ast.TypeExpr{ .array = .{
+    .element = &int_element_type,
+    .span = .global,
+} };
 const push_fallback_element = ast.TypeExpr{ .void = .{ .span = .global } };
 pub const string_type = ast.TypeExpr{ .array = .{
     .element = &string_element_type,
@@ -5022,6 +5027,7 @@ pub const IRCompiler = struct {
         if (eql(u8, name, "slice")) return .{ .op = .slice, .arity = 2, .result = string_type, .string_only_receiver = false };
         if (eql(u8, name, "repeat")) return .{ .op = .repeat, .arity = 1, .result = string_type, .string_only_receiver = false };
         if (eql(u8, name, "replace")) return .{ .op = .replace, .arity = 2, .result = string_type, .string_only_receiver = false };
+        if (eql(u8, name, "bytes")) return .{ .op = .bytes, .arity = 0, .result = int_array_type, .string_only_receiver = true };
         if (eql(u8, name, "split")) return .{ .op = .split, .arity = 1, .result = array_type(&string_type), .string_only_receiver = false };
         if (eql(u8, name, "join")) return .{ .op = .join, .arity = 1, .result = string_type, .string_only_receiver = false };
         return null;
