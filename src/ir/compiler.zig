@@ -7899,24 +7899,38 @@ pub const IRCompiler = struct {
         };
     }
 
-    const AssignPush = struct { name: []const u8, value: *ast.Expression };
+    const AssignMut = struct {
+        name: []const u8,
+        kind: enum { push, with },
+        index: ?*ast.Expression,
+        value: *ast.Expression,
+    };
 
-    /// Matches `x = x.push e` (any var `x`), returning `x` and `e`. Used to
-    /// recognize in-place-mutation statements during linear-buffer analysis.
-    fn matchAssignPush(expr: *ast.Expression) ?AssignPush {
-        if (expr.* != .binary or expr.binary.op != .assign) return null;
-        const b = expr.binary;
+    /// Matches an in-place-form mutation `x = x.push e` or `x = x.with i e` (any
+    /// var `x`, LHS and receiver the same). Used to recognize the allowed
+    /// mutations during linear-buffer analysis and to emit the in-place op.
+    fn matchAssignMutation(expr: *ast.Expression) ?AssignMut {
+        if (expr.* != .binary) return null;
+        return matchAssignMutationBinary(expr.binary);
+    }
+
+    fn matchAssignMutationBinary(b: ast.BinaryExpr) ?AssignMut {
+        if (b.op != .assign) return null;
         const name = asVarName(b.left) orelse return null;
         if (b.right.* != .call) return null;
         const call = b.right.call;
-        if (call.arguments.len != 1 or call.redirects.len != 0) return null;
+        if (call.redirects.len != 0) return null;
         if (call.callee.* != .binary) return null;
         const callee = call.callee.binary;
         if (callee.op != .member or callee.right.* != .identifier) return null;
-        if (!std.mem.eql(u8, callee.right.identifier.name, "push")) return null;
         const recv = asVarName(callee.left) orelse return null;
         if (!std.mem.eql(u8, recv, name)) return null;
-        return .{ .name = name, .value = call.arguments[0] };
+        const method = callee.right.identifier.name;
+        if (std.mem.eql(u8, method, "push") and call.arguments.len == 1)
+            return .{ .name = name, .kind = .push, .index = null, .value = call.arguments[0] };
+        if (std.mem.eql(u8, method, "with") and call.arguments.len == 2)
+            return .{ .name = name, .kind = .with, .index = call.arguments[0], .value = call.arguments[1] };
+        return null;
     }
 
     const LinScan = struct {
@@ -7979,11 +7993,12 @@ pub const IRCompiler = struct {
         switch (s.*) {
             .binding_decl => |bd| linScanExpr(scan, bd.initializer),
             .expression => |es| {
-                if (matchAssignPush(es.expression)) |ap| {
+                if (matchAssignMutation(es.expression)) |ap| {
                     // In-place mutation. Allowed before the final statement; in the
                     // final statement it disqualifies (a mutation could then follow
                     // an escape across loop iterations).
                     if (!scan.strict) scan.disqualify(ap.name);
+                    if (ap.index) |ix| linScanExpr(scan, ix);
                     linScanExpr(scan, ap.value);
                 } else {
                     linScanExpr(scan, es.expression);
@@ -8077,24 +8092,12 @@ pub const IRCompiler = struct {
         };
     }
 
-    const InplaceMatch = struct { value: *ast.Expression };
-
-    /// Matches `x = x.push e` where `x` is a linear-buffer var (see
-    /// analyzeLinearBuffers), so the push can grow the array in place. The LHS and
-    /// the push receiver must be the same linear var.
-    fn matchInplaceBuffer(self: *IRCompiler, binary: ast.BinaryExpr) ?InplaceMatch {
-        const name = asVarName(binary.left) orelse return null;
-        if (!self.linear_buffers.contains(name)) return null;
-        if (binary.right.* != .call) return null;
-        const call = binary.right.call;
-        if (call.arguments.len != 1 or call.redirects.len != 0) return null;
-        if (call.callee.* != .binary) return null;
-        const callee = call.callee.binary;
-        if (callee.op != .member or callee.right.* != .identifier) return null;
-        if (!std.mem.eql(u8, callee.right.identifier.name, "push")) return null;
-        const recv = asVarName(callee.left) orelse return null;
-        if (!std.mem.eql(u8, recv, name)) return null;
-        return .{ .value = call.arguments[0] };
+    /// Matches `x = x.push e` / `x = x.with i e` where `x` is a linear-buffer var
+    /// (analyzeLinearBuffers), so the mutation can be done in place.
+    fn matchInplaceBuffer(self: *IRCompiler, binary: ast.BinaryExpr) ?AssignMut {
+        const m = matchAssignMutationBinary(binary) orelse return null;
+        if (!self.linear_buffers.contains(m.name)) return null;
+        return m;
     }
 
     fn compileBinary(
@@ -8233,9 +8236,10 @@ pub const IRCompiler = struct {
                     return .from(value_ref.dereference().typed(value.typeExpr()));
                 }
 
-                // In-place growth of a linear buffer: `x = x.push e` where `x` is
-                // a uniquely-owned `var` array (analyzeLinearBuffers), so the
-                // append reuses spare capacity (amortized O(1)) instead of copying.
+                // In-place mutation of a linear buffer: `x = x.push e` (grow into
+                // spare capacity, amortized O(1)) or `x = x.with i e` (overwrite an
+                // element in place, O(1)) — `x` is uniquely owned
+                // (analyzeLinearBuffers), so no other reference observes it.
                 if (self.matchInplaceBuffer(binary)) |m| {
                     const buf = try self.compileExpression(binary.left);
                     if (buf.source == .location) {
@@ -8246,7 +8250,17 @@ pub const IRCompiler = struct {
                         const value_ref = try self.newRef(source, "inplace_value");
                         try self.set(source, value_ref, stableResultSource(value));
                         const result_ref = try self.newRef(source, "inplace_result");
-                        try self.addInstruction(.init(.from(source), .{ .array_push_inplace = .{
+                        if (m.kind == .with) {
+                            const index = try self.compileExpression(m.index.?);
+                            const index_ref = try self.newRef(source, "inplace_index");
+                            try self.set(source, index_ref, stableResultSource(index));
+                            try self.addInstruction(.init(.from(source), .{ .array_set_inplace = .{
+                                .array = .from(array_ref.dereference()),
+                                .index = .from(index_ref.dereference()),
+                                .value = .from(value_ref.dereference()),
+                                .result = result_ref.dereference(),
+                            } }));
+                        } else try self.addInstruction(.init(.from(source), .{ .array_push_inplace = .{
                             .array = .from(array_ref.dereference()),
                             .value = .from(value_ref.dereference()),
                             .result = result_ref.dereference(),

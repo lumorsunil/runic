@@ -40,3 +40,15 @@ fn Void escapeThenMutate() Int {
   yield snap
 }
 echo "snapshot=${escapeThenMutate}"
+
+// A linear buffer updated in place with `x = x.with i e` too.
+fn Void buildAndPatch() []Int {
+  var xs = .{ }
+  var i = 0
+  while (i < 4) { xs = xs.push (i + 1); i = i + 1 }
+  xs = xs.with 0 100
+  xs = xs.with 3 400
+  yield xs
+}
+const p = buildAndPatch
+echo "patch=${p[0]} ${p[1]} ${p[2]} ${p[3]}"

@@ -124,6 +124,9 @@ pub const Instruction = struct {
         /// array — see the compiler's linear-buffer analysis.
         array_push_inplace: ArrayPush,
         array_set: ArraySet,
+        /// Like `array_set` but writes the element in place (no copy), only
+        /// emitted for a linear (uniquely-owned) array — see the compiler.
+        array_set_inplace: ArraySet,
         /// constructs an error value (boxing the runtime payload, if any)
         make_err: MakeErr,
         /// sets result to a boolean: whether operand is an error value whose

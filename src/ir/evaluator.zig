@@ -1483,6 +1483,20 @@ pub const IREvaluator = struct {
                 try self.setLocation(thread, as.result, new_base);
                 return .cont;
             },
+            .array_set_inplace => |as| {
+                const arr = try self.resolveValueSource(thread, as.array);
+                const index = try self.resolveValueSource(thread, as.index);
+                const value = try self.resolveValueSource(thread, as.value);
+                if (arr == .addr and index == .integer and index.integer >= 0) {
+                    const len: usize = @intCast(thread.shared.heapGet(arr.addr).?.integer);
+                    if (index.integer < len) {
+                        // Linear array: write the element in place (O(1)).
+                        thread.shared.heapGetPtr(arr.addr + 1 + @as(usize, @intCast(index.integer))).?.* = value;
+                    }
+                }
+                try self.setLocation(thread, as.result, arr);
+                return .cont;
+            },
             .float_op => |float_op| {
                 const x = (try self.resolveValueSource(thread, float_op.operand)).toFloat() orelse return Error.UnsupportedType;
                 const result: f64 = switch (float_op.op) {
