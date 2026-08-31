@@ -120,25 +120,34 @@ A prototype (`Entry`/`Map` + `set`/`get`) compiles down to one concrete gap:
   works — Runic has no bitwise `^`, so FNV-1a-style xor is out; use `*`/`+`/`%`).
   Covered by `tests/features/string_bytes_regression.rn`.
 
-  **Two blockers remain before a String-key hash map can be written** (found
-  2026-08-31 while wiring the hash in):
-  1. **`is` does not narrow the static type.** Inside `if (key is String) { … }`,
-     `key` still has type `K` (a `type_var`), so `key.bytes` fails with "member
-     access is only supported for struct types in IR" — the string builtin isn't
-     recognized on a non-String static type. Need `is`-narrowing (the sum-types
-     plan already flags narrowing as a later phase) so `key.bytes`/`key.len`
-     resolve in the taken branch.
-  2. **Array-returning string ops break across a call boundary.** A `hashStr(s:
-     String)` helper works when called directly, but `f(s)` where `f` does
-     `s.bytes`/`s.split` and `s` arrived as a *function argument* yields empty.
-     Reproduces with `.split` too, so it's a **pre-existing** cross-function
-     transport bug for array-returning str-ops, independent of `s.bytes`. Because
-     a map's `set`/`get` must hash their `key` param (one hop into a hash
-     helper), this blocks the clean design; inlining the fold doesn't help either
-     while blocker #1 stands.
+  **`is`-narrowing DONE (2026-08-31):** inside `if (key is String) { … }` the
+  subject narrows to the tested type, so `key.bytes`/`key.upper` resolve and the
+  hash can be folded **inline** on the narrowed key (no helper → sidesteps the
+  call-boundary bug below). Covered by `tests/features/is_narrowing_regression.rn`.
 
-  Net: byte access and array indexing are in; M3 now waits on `is`-narrowing and
-  the array-through-call-boundary fix.
+  **Struct-field / call-index array typing DONE (2026-08-31):** `m.buckets[i]`
+  and `arr[hash key]` now resolve (mutable reassignment refines `type_expr`; an
+  inline-call index is captured). So the bucketed `Map`/`Bucket`/`Entry`
+  representation constructs and reads with literal indices.
+
+  **Remaining M3 blockers** (found 2026-08-31 prototyping the bucketed map):
+  1. **Array-returning string ops break across a call boundary** (pre-existing;
+     reproduces with `.split`): `f(s)` where `f` does `s.bytes`/`s.split` on a
+     string *passed as an argument* yields empty. Sidesteppable for the hash by
+     folding inline (thanks to `is`-narrowing), but still a real bug.
+  2. **Indexing with a control-flow function return fails at runtime.** `arr[j]`
+     where `j` derives (even through `+0`) from a function whose result flows
+     through an `if`/`for` (e.g. `bidx key`) raises `UnsupportedBinaryExpression`
+     — the value carries a "needs-await" nature the array-index arithmetic path
+     doesn't resolve, though the same value prints and adds fine in interpolation.
+     This is the immediate blocker for `get`/`set` doing `m.buckets[bidx key]`.
+     A workaround (materialize the hash into a plain local first) may exist but
+     wasn't confirmed; the clean fix is to await/​materialize a waitable index in
+     `array_access` (or fix how such returns are stored).
+
+  Net: `s.bytes`, `is`-narrowing, and struct-field/​call-index array typing are
+  in. A bucketed hash map is close but blocked on #2 (control-flow return used as
+  an array index). #1 is sidesteppable via inline hashing.
 
 ## Open questions
 
