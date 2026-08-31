@@ -142,13 +142,32 @@ A prototype (`Entry`/`Map` + `set`/`get`) compiles down to one concrete gap:
   sidestepped*: array-returning string ops (`.bytes`/`.split`) on a string passed
   one hop as a function argument yield empty — inline hashing avoids it.
 
-  **What's left for M3 is writing the module itself** (`std/map.rn` v2), plus one
-  design decision — see Open questions: **iteration order.** The M1 association
-  list preserves insertion order (`keys`/`values`); a pure bucketed map iterates
-  in bucket/hash order. To keep the documented insertion-order contract, the
-  hashed map would also carry an ordered entries list (buckets for O(1) lookup,
-  list for iteration) — more bookkeeping in `set`/`remove`. Resize-on-load-factor
-  is deferred (a fixed bucket count is fine for script-sized maps).
+  **Hashed `std/map.rn` v2 was written** (buckets for O(1) lookup + a parallel
+  ordered entries list to preserve insertion order; fixed bucket count, resize
+  deferred). It passes the M1 test (literal keys) and the bucketed prototype runs
+  — kept at `future/map-hashed-prototype.rn`.
+
+  **But it is NOT shipped: a deeper soundness bug blocks it.** `is String` returns
+  **false for a runtime-built string** (interpolation, concatenation) — those are
+  `.addr`-backed byte sequences, and `is_type`'s `.string` case only matches
+  `.slice`/`.zig_string`. An `.addr` heap sequence is structurally
+  indistinguishable from a `[]Int`/`[]String` array at runtime, so `is_type`
+  can't soundly say "this addr is a String." Consequence: `bucketOf` on an
+  interpolated key (`"k${i}"`) takes the wrong branch, so hashing is inconsistent
+  between literal and built keys and lookups miss. The M1 association list is
+  **correct** for all keys (it uses `==`, which compares by content), so `std.map`
+  stays on M1 — shipping the hashed v2 would be a regression.
+
+  **This `is`-on-built-strings bug is general, not map-specific:** it also makes
+  the shipped `is`-narrowing unsound for runtime-built strings (`if (s is String)`
+  where `s` was interpolated → false). Fixing it is the real prerequisite for a
+  hashed map. Options: (a) normalize interpolated/concatenated strings to a
+  `.slice`/`.zig_string` representation so `is String` recognizes them (the sound
+  fix, but touches interpolation); (b) tag heap byte-strings distinctly from
+  arrays so `is_type` can tell them apart. Not attempted yet.
+
+  Design decision already made for v2 (iteration order): keep insertion order via
+  a parallel ordered list alongside the buckets.
 
 ## Open questions
 
