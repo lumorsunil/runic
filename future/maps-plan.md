@@ -113,8 +113,23 @@ A prototype (`Entry`/`Map` + `set`/`get`) compiles down to one concrete gap:
   call indices) · integer `%` yields Int (not Float) · **interpolated strings
   flatten to real `String` values** (the last blocker — a built string was an
   `.addr` rope that `is String` rejected, so hashing diverged between built and
-  literal keys). Resize-on-load-factor is the remaining future refinement.
+  literal keys).
   Historical blocker analysis (all resolved) follows.
+
+- **Resize-on-load-factor: investigated and REJECTED (2026-08-31).** A working
+  resize version (grow + rehash at load 3/4, parameterizing the bucket index by
+  the current bucket count) was implemented and made correct — but it is **~25×
+  slower** than the fixed-count map (22 keys: ~1s fixed vs ~25s resizing), and a
+  64-bucket map times out entirely. Root cause: an immutable `set` rebuilds the
+  bucket array with `arr.push` in a loop, which is **O(buckets²)** (each push
+  copies the whole growing array), so *more* buckets makes *every* `set`
+  quadratically slower — the opposite of helpful, since `set` (immutable rebuild
+  + typed-return capture) already dominates and `get`/`has` are the only O(1)
+  beneficiaries. In this interpreter's cost model a **fixed small bucket count is
+  optimal**; growing it is counterproductive. Prerequisite for revisiting resize
+  (and for faster immutable maps generally): an **O(n) immutable array update /
+  bulk builder** (copy-with-one-change, or a persistent vector) to replace the
+  O(n²) push-in-a-loop rebuild. Until then the fixed-count map stands.
 
 - **Phase M3 — performance (original notes).** hashing for O(1) lookup — a
   comptime hash/eq dispatched per key type (buckets of entries), or a builtin
