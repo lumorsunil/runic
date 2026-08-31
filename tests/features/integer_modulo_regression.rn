@@ -1,0 +1,21 @@
+// Integer remainder yields an Int (like +, -, *), so it can index an array and
+// feed a hash; a float operand still widens the result to Float. `%` uses `@mod`
+// (sign of the divisor), so `x % n` with positive `n` lands in `[0, n)`.
+// Deterministic output.
+echo "int=${11 % 3} zeroRem=${12 % 4} floatL=${7.5 % 2.0} mixed=${7 % 2.0}"
+
+// The Int result indexes an array directly (an addr + Int offset).
+var arr = .{ 10, 20, 30, 40, 50 }
+echo "byMod=${arr[7 % 5]}"
+
+// A hash folded from bytes, reduced with `%`, used as a bucket index.
+fn Void bucketOf(key: |K|) Int {
+  if (key is String) {
+    var h = 0
+    for (key.bytes) |b| { h = h * 31 + b; h = h % 1000000007 }
+    yield h % 5
+  } else {
+    yield key % 5
+  }
+}
+echo "bs=${arr[bucketOf "hello"]} bi=${arr[bucketOf 12]}"

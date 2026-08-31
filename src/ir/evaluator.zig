@@ -2087,6 +2087,14 @@ pub const IREvaluator = struct {
                 return .{ .float = float_left / float_right };
             },
             .mod => {
+                // Integer remainder stays an integer (like +, -, *), so it can
+                // index arrays and feed hashes; only a float operand widens to
+                // float. `@mod` takes the sign of the divisor, so `x % n` with a
+                // positive `n` is always in `[0, n)` — handy for bucket indices.
+                if (left.isValueTag(.integer) and right.isValueTag(.integer)) {
+                    if (right.value.integer == 0) return null;
+                    return .{ .integer = @mod(left.value.integer, right.value.integer) };
+                }
                 const float_left: f64 = if (left.isValueTag(.integer)) @floatFromInt(left.value.integer) else if (left.isValueTag(.float)) left.value.float else return null;
                 const float_right: f64 = if (right.isValueTag(.integer)) @floatFromInt(right.value.integer) else if (right.isValueTag(.float)) right.value.float else return null;
 
