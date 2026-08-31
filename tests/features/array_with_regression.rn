@@ -1,0 +1,29 @@
+// `arr.with index value` returns a new array with element `index` replaced,
+// copied once (O(n)) — the immutable analog of `arr[i] = v`. The original array
+// is unchanged; an out-of-range index yields an unchanged copy. Works for Int,
+// String, and struct elements, and on an array read from a struct field.
+// Deterministic output.
+var xs = .{ 10, 20, 30, 40 }
+const ys = xs.with 2 99
+echo "ys=${ys[0]} ${ys[1]} ${ys[2]} ${ys[3]} len=${ys.len}"
+echo "xs-unchanged=${xs[2]}"
+
+// Out-of-range index → unchanged copy.
+const zs = xs.with 9 7
+echo "zs=${zs[0]} ${zs[3]} len=${zs.len}"
+
+// Struct elements, and a computed index.
+const P = struct { n: Int }
+var ps = .{ }
+ps = ps.push P{ .n = 1 }
+ps = ps.push P{ .n = 2 }
+ps = ps.push P{ .n = 3 }
+const i = 1 + 1
+const qs = ps.with i P{ .n = 100 }
+echo "qs=${qs[0].n} ${qs[1].n} ${qs[2].n}"
+
+// An array read from a struct field.
+const Box = struct { items: []Int }
+const b = Box{ .items = xs }
+const nb = b.items.with 0 5
+echo "field=${nb[0]} ${nb[1]}"

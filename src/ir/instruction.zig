@@ -119,6 +119,7 @@ pub const Instruction = struct {
         /// `arr.push value` — allocates a new array (`[len+1, …elements, value]`)
         /// and stores its base address in `result`.
         array_push: ArrayPush,
+        array_set: ArraySet,
         /// constructs an error value (boxing the runtime payload, if any)
         make_err: MakeErr,
         /// sets result to a boolean: whether operand is an error value whose
@@ -408,6 +409,19 @@ pub const Instruction = struct {
 
         pub fn format(self: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
             try w.print("{f} = push({f}, {f})", .{ self.result, self.array, self.value });
+        }
+    };
+
+    /// `arr.set(index, value)` — a new array with element `index` replaced,
+    /// copied once (O(n)). Out-of-range indices leave the copy unchanged.
+    pub const ArraySet = struct {
+        array: ValueSource,
+        index: ValueSource,
+        value: ValueSource,
+        result: Location,
+
+        pub fn format(self: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
+            try w.print("{f} = set({f}, {f}, {f})", .{ self.result, self.array, self.index, self.value });
         }
     };
 

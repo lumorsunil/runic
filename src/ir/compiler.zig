@@ -4160,6 +4160,44 @@ pub const IRCompiler = struct {
                 }
                 return .fromLocation(result_ref.dereference().typed(result_array_type));
             }
+            // `arr.with index value` — a new array with element `index` replaced,
+            // copied once (O(n)), yielding a new array. The immutable analog of an
+            // in-place `arr[i] = v`; unlike a rebuild-with-push loop it is O(n),
+            // not O(n²), for updating one element. Named `with` (not `set`) so it
+            // never collides with a user/module function called `set` — which the
+            // typed-capture path would otherwise resolve first (bypassing this).
+            if (std.mem.eql(u8, call.callee.binary.right.identifier.name, "with") and
+                call.arguments.len == 2 and
+                !self.memberIsStructField(call.callee.binary.left, "with"))
+            {
+                const object = try self.compileExpression(call.callee.binary.left);
+                const array_type_expr = object.typeExpr() orelse array_type(&push_fallback_element);
+                const array_ref = try self.newRef(source, "with_array");
+                try self.set(source, array_ref, stableResultSource(object));
+                const value = try self.compileExpression(call.arguments[1]);
+                const value_ref = try self.newRef(source, "with_value");
+                try self.set(source, value_ref, stableResultSource(value));
+                const index = try self.compileExpression(call.arguments[0]);
+                const index_ref = try self.newRef(source, "with_index");
+                try self.set(source, index_ref, stableResultSource(index));
+                const result_ref = try self.newRef(source, "with_result");
+                try self.addInstruction(.init(.from(source), .{ .array_set = .{
+                    .array = .from(array_ref.dereference()),
+                    .index = .from(index_ref.dereference()),
+                    .value = .from(value_ref.dereference()),
+                    .result = result_ref.dereference(),
+                } }));
+                // Refine an unknown element type from the stored value, mirroring push.
+                var result_array_type = array_type_expr;
+                if (array_type_expr == .array and array_type_expr.array.element.* == .void) {
+                    if (value.typeExpr() orelse self.argTypeExpr(call.arguments[1])) |vt| {
+                        const element = try self.allocator.create(ast.TypeExpr);
+                        element.* = vt;
+                        result_array_type = array_type(element);
+                    }
+                }
+                return .fromLocation(result_ref.dereference().typed(result_array_type));
+            }
         }
 
         // UFCS method call: `recv.method args…` ≡ `method(recv, args…)` when

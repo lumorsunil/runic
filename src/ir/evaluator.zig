@@ -1429,6 +1429,27 @@ pub const IREvaluator = struct {
                 try self.setLocation(thread, ap.result, new_base);
                 return .cont;
             },
+            .array_set => |as| {
+                const arr = try self.resolveValueSource(thread, as.array);
+                const index = try self.resolveValueSource(thread, as.index);
+                const value = try self.resolveValueSource(thread, as.value);
+                const len: usize = if (arr == .addr)
+                    @intCast(thread.shared.heapGet(arr.addr).?.integer)
+                else
+                    0;
+                // Copy the array once, then overwrite the one element (if in range).
+                const new_base = try thread.shared.alloc(self.allocator, len + 1);
+                const nb = new_base.addr;
+                thread.shared.heapGetPtr(nb).?.* = .{ .integer = @intCast(len) };
+                if (arr == .addr) {
+                    for (0..len) |i| thread.shared.heapGetPtr(nb + 1 + i).?.* = thread.shared.heapGet(arr.addr + 1 + i).?;
+                }
+                if (index == .integer and index.integer >= 0 and index.integer < len) {
+                    thread.shared.heapGetPtr(nb + 1 + @as(usize, @intCast(index.integer))).?.* = value;
+                }
+                try self.setLocation(thread, as.result, new_base);
+                return .cont;
+            },
             .float_op => |float_op| {
                 const x = (try self.resolveValueSource(thread, float_op.operand)).toFloat() orelse return Error.UnsupportedType;
                 const result: f64 = switch (float_op.op) {
