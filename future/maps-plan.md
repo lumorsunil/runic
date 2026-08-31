@@ -130,24 +130,25 @@ A prototype (`Entry`/`Map` + `set`/`get`) compiles down to one concrete gap:
   inline-call index is captured). So the bucketed `Map`/`Bucket`/`Entry`
   representation constructs and reads with literal indices.
 
-  **Remaining M3 blockers** (found 2026-08-31 prototyping the bucketed map):
-  1. **Array-returning string ops break across a call boundary** (pre-existing;
-     reproduces with `.split`): `f(s)` where `f` does `s.bytes`/`s.split` on a
-     string *passed as an argument* yields empty. Sidesteppable for the hash by
-     folding inline (thanks to `is`-narrowing), but still a real bug.
-  2. **Indexing with a control-flow function return fails at runtime.** `arr[j]`
-     where `j` derives (even through `+0`) from a function whose result flows
-     through an `if`/`for` (e.g. `bidx key`) raises `UnsupportedBinaryExpression`
-     — the value carries a "needs-await" nature the array-index arithmetic path
-     doesn't resolve, though the same value prints and adds fine in interpolation.
-     This is the immediate blocker for `get`/`set` doing `m.buckets[bidx key]`.
-     A workaround (materialize the hash into a plain local first) may exist but
-     wasn't confirmed; the clean fix is to await/​materialize a waitable index in
-     `array_access` (or fix how such returns are stored).
+  **Integer modulo fix DONE (2026-08-31):** the real blocker turned out to be
+  `int % int` returning **Float** (the slow arithmetic path forced float), so a
+  hash bucket `h % n` couldn't index an array (`addr + Float`). `%` now yields an
+  Int for integer operands (using `@mod`, so `x % n` ∈ `[0, n)` for positive `n`).
+  Covered by `tests/features/integer_modulo_regression.rn`.
 
-  Net: `s.bytes`, `is`-narrowing, and struct-field/​call-index array typing are
-  in. A bucketed hash map is close but blocked on #2 (control-flow return used as
-  an array index). #1 is sidesteppable via inline hashing.
+  **All M3 compiler/runtime blockers are now cleared.** The full bucketed
+  prototype runs end-to-end (`Map`/`Bucket`/`Entry`, inline `is`-narrowed hashing,
+  String and Int keys, replace-in-place). One pre-existing bug remains *noted but
+  sidestepped*: array-returning string ops (`.bytes`/`.split`) on a string passed
+  one hop as a function argument yield empty — inline hashing avoids it.
+
+  **What's left for M3 is writing the module itself** (`std/map.rn` v2), plus one
+  design decision — see Open questions: **iteration order.** The M1 association
+  list preserves insertion order (`keys`/`values`); a pure bucketed map iterates
+  in bucket/hash order. To keep the documented insertion-order contract, the
+  hashed map would also carry an ordered entries list (buckets for O(1) lookup,
+  list for iteration) — more bookkeeping in `set`/`remove`. Resize-on-load-factor
+  is deferred (a fixed bucket count is fine for script-sized maps).
 
 ## Open questions
 
