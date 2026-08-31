@@ -3,3 +3,5 @@ len=2 has-a=0 has-z=1
 k0=a k1=b v0=99 v1=2
 afterRemove len=1 a=0 b=2
 10=ten 20=twenty 30=?
+bigLen=25 k0=0 k12=120 k24=240 miss=0
+first=k0 thirteenth=k12 last=k24

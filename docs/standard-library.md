@@ -200,12 +200,16 @@ Runic; the Float functions are backed by **new builtins** (see prerequisites).
 
 ### `std.map`
 
-A generic key/value map, built entirely in Runic from a generic struct over an
-array of entries (an *association list*). Types resolve at comptime (generic
-constructors + monomorphization); the data operations run at runtime. Keys are
-compared with `==`, so `Int` and `String` keys work; lookups are a linear scan
-(fine for the small maps typical in scripts). The API is **immutable**, mirroring
-`arr.push`: `set`/`remove` return a new map.
+A generic key/value map, built entirely in Runic. Keys are hashed into a fixed
+number of buckets (each a small association list scanned on collision), so
+lookups are O(1) on average; a parallel ordered list preserves **insertion
+order** for `keys`/`values` (and `set` on an existing key keeps its position).
+Types resolve at comptime (generic constructors + monomorphization); the data
+operations run at runtime. Keys are compared with `==` and hashed by value, so
+`Int` and `String` keys work — a `String` is hashed over its bytes, so an
+interpolated key hashes identically to the same literal. The API is
+**immutable**, mirroring `arr.push`: `set`/`remove` return a new map. (The bucket
+count is fixed for now; resize-on-load-factor is a future refinement.)
 
 | Signature | Result |
 | --- | --- |

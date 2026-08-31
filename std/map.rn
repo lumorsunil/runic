@@ -1,44 +1,91 @@
-// std.map — a generic key/value map, built entirely in Runic from a generic
-// struct over an array of entries (an association list). The types resolve at
-// comptime (generic constructors + monomorphization); the data operations run
-// at runtime. Keys are compared with `==`, so `Int` and `String` keys work.
-// Lookups are a linear scan — fine for the small maps typical in scripts.
+// std.map — a generic key/value map, built entirely in Runic. Lookups are O(1)
+// on average: keys are hashed into a fixed number of buckets, each a small
+// association list scanned on collision. Iteration (`keys`/`values`) preserves
+// insertion order via a parallel ordered list; `set` on an existing key keeps
+// its original position. Keys are compared with `==` and hashed by value, so
+// `Int` and `String` keys work (a String is hashed over its bytes).
 //
 // The API is immutable, mirroring `arr.push`: `set`/`remove` return a new map.
 //   var m = std.map.empty
 //   m = std.map.set m "a" 1
 //   const v = std.map.get m "a" orelse 0
+//
+// The bucket count is fixed (no resize yet), which is ample for the small maps
+// typical in scripts; resize-on-load-factor is a future refinement.
 fn Void @() Void
 
 const Entry(K, V) = struct { key: K, value: V }
-const Map(K, V) = struct { entries: []Entry(K, V) }
+const Bucket(K, V) = struct { entries: []Entry(K, V) }
+const Map(K, V) = struct { buckets: []Bucket(K, V), order: []Entry(K, V) }
 
-// An empty map.
-pub fn Void empty() Map(K, V) {
-  yield Map(K, V){ .entries = .{ } }
+// The bucket a key falls into: an Int in [0, 16). Strings are hashed over their
+// bytes with a polynomial rolling hash (Runic has no bitwise ops, so `*`/`+`/`%`
+// only); Ints hash to themselves. `%` with a positive divisor is non-negative.
+fn Void bucketOf(key: |K|) Int {
+  if (key is String) {
+    var h = 0
+    for (key.bytes) |b| { h = h * 31 + b; h = h % 1000000007 }
+    yield h % 16
+  } else {
+    yield key % 16
+  }
 }
 
-// The map with `key` set to `value`: replaces the entry if `key` is present,
-// otherwise appends it. Returns a new map.
+// An empty map: 16 empty buckets and an empty order.
+pub fn Void empty() Map(K, V) {
+  var bs = .{ }
+  var i = 0
+  while (i < 16) {
+    bs = bs.push Bucket(K, V){ .entries = .{ } }
+    i = i + 1
+  }
+  yield Map(K, V){ .buckets = bs, .order = .{ } }
+}
+
+// The map with `key` set to `value`: replaces the entry if `key` is present
+// (keeping its iteration position), otherwise appends it. Returns a new map.
 pub fn Void set(m: Map(|K|, |V|), key: K, value: V) Map(K, V) {
-  var out = .{ }
-  var replaced = false
-  for (m.entries) |e| {
-    if (e.key == key) {
-      out = out.push Entry(K, V){ .key = key, .value = value }
-      replaced = true
+  const idx = bucketOf key
+  var newBuckets = .{ }
+  var i = 0
+  for (m.buckets) |bucket| {
+    if (i == idx) {
+      var ents = .{ }
+      var replaced = false
+      for (bucket.entries) |e| {
+        if (e.key == key) {
+          ents = ents.push Entry(K, V){ .key = key, .value = value }
+          replaced = true
+        } else {
+          ents = ents.push e
+        }
+      }
+      if (replaced) { } else { ents = ents.push Entry(K, V){ .key = key, .value = value } }
+      newBuckets = newBuckets.push Bucket(K, V){ .entries = ents }
     } else {
-      out = out.push e
+      newBuckets = newBuckets.push bucket
+    }
+    i = i + 1
+  }
+  var newOrder = .{ }
+  var found = false
+  for (m.order) |e| {
+    if (e.key == key) {
+      newOrder = newOrder.push Entry(K, V){ .key = key, .value = value }
+      found = true
+    } else {
+      newOrder = newOrder.push e
     }
   }
-  if (replaced) { yield Map(K, V){ .entries = out } }
-  out = out.push Entry(K, V){ .key = key, .value = value }
-  yield Map(K, V){ .entries = out }
+  if (found) { } else { newOrder = newOrder.push Entry(K, V){ .key = key, .value = value } }
+  yield Map(K, V){ .buckets = newBuckets, .order = newOrder }
 }
 
 // The value for `key`, or absent.
 pub fn Void get(m: Map(|K|, |V|), key: K) ?V {
-  for (m.entries) |e| {
+  const idx = bucketOf key
+  const bucket = m.buckets[idx]
+  for (bucket.entries) |e| {
     if (e.key == key) { yield e.value }
   }
   yield null
@@ -46,36 +93,53 @@ pub fn Void get(m: Map(|K|, |V|), key: K) ?V {
 
 // Whether `key` is present.
 pub fn Void has(m: Map(|K|, |V|), key: K) Bool {
-  for (m.entries) |e| {
+  const idx = bucketOf key
+  const bucket = m.buckets[idx]
+  for (bucket.entries) |e| {
     if (e.key == key) { yield true }
   }
   yield false
 }
 
-// The map without `key` (unchanged if absent).
+// The map without `key` (unchanged if absent). Returns a new map.
 pub fn Void remove(m: Map(|K|, |V|), key: K) Map(K, V) {
-  var out = .{ }
-  for (m.entries) |e| {
-    if (e.key == key) { } else { out = out.push e }
+  const idx = bucketOf key
+  var newBuckets = .{ }
+  var i = 0
+  for (m.buckets) |bucket| {
+    if (i == idx) {
+      var ents = .{ }
+      for (bucket.entries) |e| {
+        if (e.key == key) { } else { ents = ents.push e }
+      }
+      newBuckets = newBuckets.push Bucket(K, V){ .entries = ents }
+    } else {
+      newBuckets = newBuckets.push bucket
+    }
+    i = i + 1
   }
-  yield Map(K, V){ .entries = out }
+  var newOrder = .{ }
+  for (m.order) |e| {
+    if (e.key == key) { } else { newOrder = newOrder.push e }
+  }
+  yield Map(K, V){ .buckets = newBuckets, .order = newOrder }
 }
 
 // The keys, in insertion order.
 pub fn Void keys(m: Map(|K|, |V|)) []K {
   var out = .{ }
-  for (m.entries) |e| { out = out.push e.key }
+  for (m.order) |e| { out = out.push e.key }
   yield out
 }
 
 // The values, in insertion order.
 pub fn Void values(m: Map(|K|, |V|)) []V {
   var out = .{ }
-  for (m.entries) |e| { out = out.push e.value }
+  for (m.order) |e| { out = out.push e.value }
   yield out
 }
 
 // The number of entries.
 pub fn Void len(m: Map(|K|, |V|)) Int {
-  yield m.entries.len
+  yield m.order.len
 }
