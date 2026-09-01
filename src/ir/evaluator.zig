@@ -1483,6 +1483,30 @@ pub const IREvaluator = struct {
                 try self.setLocation(thread, as.result, new_base);
                 return .cont;
             },
+            .array_slice => |sl| {
+                const arr = try self.resolveValueSource(thread, sl.array);
+                const len: i64 = if (arr == .addr)
+                    thread.shared.heapGet(arr.addr).?.integer
+                else
+                    0;
+                const start_raw = (try self.resolveValueSource(thread, sl.start)).integer;
+                const end_raw = (try self.resolveValueSource(thread, sl.end)).integer;
+                // Clamp to [0, len]; an empty/inverted range yields an empty array.
+                const lo: i64 = @min(@max(start_raw, 0), len);
+                const hi: i64 = @min(@max(end_raw, lo), len);
+                const out_len: usize = @intCast(hi - lo);
+                const new_base = try thread.shared.alloc(self.allocator, out_len + 1);
+                const nb = new_base.addr;
+                thread.shared.heapGetPtr(nb).?.* = .{ .integer = @intCast(out_len) };
+                if (arr == .addr) {
+                    for (0..out_len) |i| {
+                        thread.shared.heapGetPtr(nb + 1 + i).?.* =
+                            thread.shared.heapGet(arr.addr + 1 + @as(usize, @intCast(lo)) + i).?;
+                    }
+                }
+                try self.setLocation(thread, sl.result, new_base);
+                return .cont;
+            },
             .array_set_inplace => |as| {
                 const arr = try self.resolveValueSource(thread, as.array);
                 const index = try self.resolveValueSource(thread, as.index);

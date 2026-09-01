@@ -1,0 +1,22 @@
+// Slicing with a range index: `x[a..b]` is the half-open sub-range (a new array
+// or string), `x[a..]` runs to the end, `x[..b]` from the start, `x[..]` is the
+// whole thing. Bounds are clamped to [0, len] (out-of-range / inverted ranges
+// yield an empty result). Plain indexing `x[i]` is unchanged. Deterministic.
+const a = .{ 10, 20, 30, 40, 50 }
+const mid = a[1..3]
+echo "mid=${mid[0]} ${mid[1]} len=${mid.len}"
+echo "tail=${(a[3..]).len} head=${(a[..2]).len} whole=${(a[..]).len}"
+echo "clamp oob=${(a[2..99]).len} inverted=${(a[3..1]).len}"
+echo "index still=${a[4]}"
+
+// A slice of a var-grown array; element access on the slice result works.
+var xs = .{ }
+xs = xs.push 100
+xs = xs.push 200
+xs = xs.push 300
+const sub = xs[1..3]
+echo "varsub=${sub[0]} ${sub[1]} len=${sub.len}"
+
+// String slicing.
+const s = "hello world"
+echo "s01=${s[0..5]} s6=${s[6..]} sall=${s[..]}"
