@@ -56,7 +56,7 @@ Runic is not a shell — it does not replace bash as an interactive environment.
 ## Core ideas
 
 1. **Modern syntax surface**: brace-delimited blocks with required keywords, eliminating the mix of `then`, `fi`, `do`, and `done`. Bindings use `const` (immutable) and `var` (mutable).
-2. **Data primitives**: strings, numbers, booleans, arrays, and maps with predictable coercion rules and convenient literals. Type names must always begin with a capital letter (`String`, `Int`, `Float`, `Bool`, `Void`) so they stand out from value identifiers. Array and record literals use Zig-style anonymous syntax: `.{ "a", "b" }` and `.{ .key = value }`.
+2. **Data primitives**: strings, numbers, booleans, and arrays with predictable coercion rules. Type names must always begin with a capital letter (`String`, `Int`, `Float`, `Bool`, `Void`) so they stand out from value identifiers. Array literals use Zig-style anonymous syntax — `.{ "a", "b" }` — and structs are constructed by name — `Point{ .x = 1, .y = 2 }`. There is no map literal; use `std.map`.
 3. **Command vs. expression separation**: explicit operators differentiate when you're invoking a program versus evaluating a language expression, reducing quoting headaches.
 4. **Functions as pipeline stages**: function declarations carry both a stdin type and a stdout type — `fn StdinType name(params) StdoutType { ... }` — making data flow through pipelines explicit. Functions are called like commands: `check_git` or `greet "world"`.
 5. **Error-aware pipelines**: pipeline execution surfaces per-stage exit codes, allowing guarded chaining without `set -e` footguns.
@@ -83,8 +83,8 @@ A working parser, type checker, and IR-based runtime are in place. The following
   not auto-pushed, so a stage that consumes its input without yielding produces
   no output.
 - String interpolation (`${ }`) and block capture
-- Process handle access (`.stdout`, `.stderr`, `.status.ok`, `.status.exit_code`)
-- File redirection (`>`, `>>`) and stream capture (`1>var`, `2>var`)
+- Process handle access (`.stdout`, `.stderr`, `.exit_code`)
+- File redirection (`>`, `>>`) and file-descriptor duplication (`1>&2`)
 - Builtin `cd` with subshell-local working-directory updates
 - Explicit environment access via `$NAME`, with mutable updates scoped to the current subshell
 - Optional types via `?T`, `null`, `orelse`, `.?`, and captured `if` unwrapping
@@ -106,11 +106,11 @@ Runic aims to be familiar enough that a bash user can start using it immediately
 
 ## Implementation language & tooling
 
-The runtime and CLI are implemented in Zig (tested with Zig 0.15.1). Zig's build system drives the project layout: `src/` hosts the reusable language/runtime modules, while `cmd/runic/` exposes the CLI entry point that imports those modules.
+The runtime and CLI are implemented in Zig (tested with Zig 0.16.0). Zig's build system drives the project layout: `src/` hosts the reusable language/runtime modules, while `cmd/runic/` exposes the CLI entry point that imports those modules.
 
 ### Toolchain requirements
 
-- Install Zig 0.15.1 (matching the `build.zig` defaults). Confirm with `zig version`.
+- Install Zig 0.16.0 (see `minimum_zig_version` in `build.zig.zon`). Confirm with `zig version`.
 - Ensure `zig` and `zig fmt` are on your `PATH`; every script in `scripts/` expects the CLI to be invocable directly.
 - Optional environment variables `RUNIC_LANG=zig` and `RUNIC_REPO_ROOT=/path/to/runic` are exported automatically by `scripts/run_ci.rn`, but you can set them manually when calling the stage scripts yourself.
 
@@ -251,7 +251,7 @@ Use these switches with either a script path or `--eval` to watch commands execu
 
 Sample Runic scripts live under `examples/`. Run them with `zig build run -- examples/<script>.rn`.
 
-- `examples/pipelines_and_handles.rn` — command pipelines, process handle inspection (`.stdout`, `.stderr`, `.status`), and `&&`/`||` chaining. Use `--trace pipeline --trace process` to see per-stage detail.
+- `examples/pipelines_and_handles.rn` — command pipelines, process handle inspection (`.stdout`, `.stderr`, `.exit_code`), and `&&`/`||` chaining. Use `--trace pipeline --trace process` to see per-stage detail.
 - `examples/data_and_flow.rn` — `const`/`var` bindings with type annotations, `.{ }` array literals, `for` loops over ranges and arrays, arithmetic, and comparisons.
 - `examples/functions_and_closures.rn` — function declarations with stdin/stdout types, single-expression bodies, closures over outer variables, and recursion.
 

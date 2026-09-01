@@ -1,5 +1,9 @@
 # Typed pipes — update summary
 
+> **⚠️ Historical document.** A narrative record of the typed-pipes work as
+> shipped in 0.2.0; **not** a current reference. Some terminology is dated (e.g.
+> `@stdin`, now `&0`). For current behavior see `docs/features.md`.
+
 _Shipped in **0.2.0**._
 
 This document is a narrative overview of the **typed pipes** work. It complements

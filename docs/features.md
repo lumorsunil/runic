@@ -7,30 +7,29 @@ This document captures the current surface area of the Runic language and mirror
 Shell-friendly commands remain the primary abstraction. Every bare word starts a command, and pipes behave like bash but surface structured results.
 
 ```rn
-echo "hello world" | upper
+echo "hello world" | tr "a-z" "A-Z"
 ```
 
 **Result:** Prints `HELLO WORLD` to STDOUT while capturing exit codes for each pipeline stage so they can be inspected programmatically.
 
 ## Strong, predictable data semantics
 
-Variables are typed, immutable by default, and only change through explicit `var` declarations. Arrays and maps use literal syntax that sidesteps legacy word-splitting quirks.
+Variables are typed, immutable by default, and only change through explicit `var` declarations. Array literals use Zig-style anonymous syntax that sidesteps legacy word-splitting quirks. (There is no map literal; use `std.map` — see the standard-library docs.)
 
 ```rn
 const greeting = "hello"
 var count = 2
-const items = ["apples", "oranges"]
-const vars = { greeting: greeting, total: count }
+const items = .{ "apples", "oranges" }
 ```
 
-**Result:** `greeting` cannot be reassigned, `count` can be incremented intentionally, and the literals preserve their structure when passed between commands or functions.
+**Result:** `greeting` cannot be reassigned, `count` can be incremented intentionally, and the literal preserves its structure when passed between commands or functions.
 
-Type annotations are available when you need to nail down a binding’s shape. Append `: Type` after the variable name so the compiler can enforce conversions up front.
+Type annotations are available when you need to nail down a binding’s shape. Append `: Type` after the variable name so the compiler can enforce conversions up front. Type names always begin with a capital letter (`String`, `Int`, `Float`, `Bool`, `Void`).
 
 ```rn
-const greeting: Str = "hello"
+const greeting: String = "hello"
 var retries: Int = 2
-const config: Map(Str, Int) = { port: 8080 }
+const scores: []Int = .{ 90, 80 }
 ```
 
 **Result:** Each declaration advertises its type at the point of definition, catching mismatches such as assigning a string to `retries` before the script ever runs.
@@ -591,11 +590,8 @@ Starting a program returns a structured execution value. Binding a command captu
 ```rn
 const sync_proc = git "status" "--short"
 echo "${sync_proc.stdout}" // already finished, STDOUT buffered
-echo "${sync_proc.status.exit_code}"
-
-const { stdout: sync_stdout, stderr: sync_stderr, exit_code: sync_exit_code } = git "status" "--short"
-git "status" "--short" 1>$status_stdout
-git "status" "--short" 2>$status_stderr
+echo "${sync_proc.stderr}"
+echo "${sync_proc.exit_code}"
 
 const combined = printf "hello\n" && printf "warning\n" >&2
 echo "${combined.stdout}"
@@ -610,7 +606,7 @@ async_proc.wait
 echo "${async_proc.stdout}"
 ```
 
-**Result:** Binding `const proc = <command ...>` executes the program synchronously and returns its buffered output plus exit metadata. You can destructure the execution value to grab only `stdout`, `stderr`, or `exit_code`, or append the `1>var`/`2>var` shorthand to redirect a single stream directly into a variable while still receiving the same execution value for status checks. When command-producing expressions are chained with `&&`, `||`, or `;`, the resulting bound value still exposes the buffered `stdout`, `stderr`, and exit metadata from the evaluated expression. Appending `&` runs the work in the background; when you bind that value, its output is still buffered rather than printed immediately, and `.wait` blocks until it finishes.
+**Result:** Binding `const proc = <command ...>` executes the program synchronously and returns its buffered output plus exit metadata, read as `proc.stdout`, `proc.stderr`, and `proc.exit_code`. When command-producing expressions are chained with `&&`, `||`, or `;`, the resulting bound value still exposes the buffered `stdout`, `stderr`, and exit metadata from the evaluated expression. Appending `&` runs the work in the background; when you bind that value, its output is still buffered rather than printed immediately, and `.wait` blocks until it finishes.
 
 ### File descriptor redirects
 

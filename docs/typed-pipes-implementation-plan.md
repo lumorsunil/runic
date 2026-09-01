@@ -1,5 +1,10 @@
 # Typed Pipes Implementation Plan
 
+> **⚠️ Historical document.** This is a record of how typed pipes were built; it
+> is **not** a current reference. Terminology is dated — notably `@stdin`, which
+> was renamed to `&0`. For current behavior see `docs/features.md` (the
+> "Typed pipeline boundaries" section) and the runtime code.
+
 ## Requirements
 
 Typed pipes make function stdin and stdout types meaningful across pipeline

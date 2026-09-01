@@ -4,7 +4,7 @@ Runic targets bash users who want safer defaults without abandoning the command-
 
 ## Prerequisites
 
-1. Install Zig 0.15.1 and build the CLI (`zig build`). The resulting binary lives at `zig-out/bin/runic`.
+1. Install Zig 0.16.0 and build the CLI (`zig build`). The resulting binary lives at `zig-out/bin/runic`.
 2. Skim the `README.md` sections on building, running tests, and authoring modules so you know how to iterate locally.
 3. Read through your target script and note where it relies on bash-specific features such as implicit word splitting, `set -euo pipefail`, or sourced helper files.
 
@@ -12,7 +12,7 @@ Runic targets bash users who want safer defaults without abandoning the command-
 
 1. **Stage the script in `examples/` (optional).** Keeping the original and Runic versions next to each other makes diffing behavior easier while the interpreter is still evolving.
 2. **Translate declarations and control flow first.** Replace `VAR=value` with typed bindings and explicit env access (`const home = $HOME orelse "/tmp"` or `$HOME = "/tmp/home"`) and re-express functions with `fn`. Use the explicit `if`/`for` syntax shown in `features.md`.
-3. **Keep commands command-like.** Runic preserves the “bare words launch binaries” rule, so start by copying pipelines verbatim. When you need to transform data, pivot into expressions explicitly—`let files = ls src | lines()`—to avoid quoting pitfalls.
+3. **Keep commands command-like.** Runic preserves the “bare words launch binaries” rule, so start by copying pipelines verbatim. When you need to transform data, pivot into expressions explicitly—`const files = ls "src" | lines`—to avoid quoting pitfalls.
 4. **Handle errors intentionally.** Instead of `set -e`, rely on typed errors and `try`/`catch`. Pipelines expose rich status objects, so branch on failures instead of reading `$?`.
 5. **Convert sourced helpers into modules.** Shared functions should move into plain `.rn` files that are imported with `import "..."`. Keep imported modules parameterless and expose reusable bindings via `pub` declarations.
 6. **Validate incrementally.** Run `zig build run -- path/to/script.rn --trace pipeline` to confirm each stage behaves as expected. Add CLI smoke tests under `tests/cli_*.sh` to lock in regressions as soon as the interpreter reaches parity with your use case.

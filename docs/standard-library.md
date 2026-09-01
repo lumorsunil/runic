@@ -73,9 +73,9 @@ surfaces that will churn.
 | `std.path`    | Path manipulation — join, basename/dirname, extension, normalize.         |
 | `std.env`     | Explicit environment lookup, fallback, and scoped updates around `$NAME`. |
 | `std.fs`      | File and directory helpers (wrapping `test`/`cat`/`ls`/… commands).        |
-| `std.process` | Command execution results — status, captured output, require-ok.          |
 | `std.math`    | Numeric helpers (`abs`/`min`/`max`/`clamp` + Float `sqrt`/`floor`/…).      |
 | `std.testing` | Assertions for `.rn` module and CLI smoke tests.                          |
+| `std.map`     | A generic hashed key/value map (immutable + mutable APIs).                 |
 
 **Conventions.** Functions use the space-call form (`std.list.map xs f`), camelCase
 names, and explicit input/output types. A fallible operation returns an **error
@@ -162,16 +162,11 @@ return `ExecutableError!…` so callers use `catch`/`try`.
 | `remove(p: String) ExecutableError!Void` | `rm -rf` | delete |
 | `cwd() String` | builtin `pwd` | current directory |
 
-### `std.process`
-
-Helpers around a command's `ExecutableError!String` value view.
-
-| Signature | Result |
-| --- | --- |
-| `output(result: ExecutableError!String) String` | captured stdout, or "" on failure |
-| `status(result: ExecutableError!String) Int` | exit code (0 on success) |
-| `succeeds(result: ExecutableError!String) Bool` | exited 0 |
-| `requireOk(result: ExecutableError!String, msg: String) String` | output, or abort with `msg` |
+> **Note.** An earlier `std.process` module (helpers around a command's
+> `ExecutableError!String` value view) was **dropped** pending a rethink of the
+> result model — see `future/stdlib-plan.md`. Handle command results directly
+> with the error union today: `const out = git "status" "--short" catch "";` or
+> inspect `proc.exit_code` on a bound execution value.
 
 ### `std.math`
 
@@ -274,12 +269,12 @@ interface:
 git "status" "--short"
 ```
 
-Combine the two when a library helper handles the reusable policy and the
-external command does the domain-specific work:
+Handle a command's success/failure through its `ExecutableError!String` value
+view — `catch` a default, or bind the execution value and check `.exit_code`:
 
 ```rn
-const result = git "status" "--short"
-std.process.require_ok(result, "git status failed")
+const summary = git "status" "--short" catch ""
+std.testing.assert (summary != "") "git status failed"
 ```
 
 ## Design Rules
