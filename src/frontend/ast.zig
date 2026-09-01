@@ -1176,7 +1176,7 @@ pub const BinaryExpr = struct {
             .less,
             .less_equal,
             => &boolTypeExpr,
-            .assign, .add_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign => left_type,
+            .assign, .add_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign, .or_assign, .and_assign => left_type,
             .@"orelse" => blk: {
                 if (left_type) |lt| switch (lt.*) {
                     .optional => |optional| break :blk optional.child,
@@ -1295,6 +1295,8 @@ pub const BinaryOp = union(enum) {
     mul_assign,
     div_assign,
     rem_assign,
+    or_assign,
+    and_assign,
     /// Sequential execution: run left then right, result is right's result.
     /// Created by `parseBinding` when `;` follows a command expression initializer.
     sequence,
@@ -1329,6 +1331,8 @@ pub const BinaryOp = union(enum) {
             .mul_assign => 0,
             .div_assign => 0,
             .rem_assign => 0,
+            .or_assign => 0,
+            .and_assign => 0,
             .sequence => 1,
         };
     }
@@ -1371,6 +1375,8 @@ pub const BinaryOp = union(enum) {
             .mul_assign => .mul_assign,
             .div_assign => .div_assign,
             .rem_assign => .rem_assign,
+            .or_assign => .or_assign,
+            .and_assign => .and_assign,
             else => null,
         };
     }
@@ -1384,7 +1390,7 @@ pub const BinaryOp = union(enum) {
 
     pub fn isAssignment(self: @This()) bool {
         return switch (self) {
-            .assign, .add_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign => true,
+            .assign, .add_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign, .or_assign, .and_assign => true,
             else => false,
         };
     }
@@ -1396,6 +1402,8 @@ pub const BinaryOp = union(enum) {
             .mul_assign => .multiply,
             .div_assign => .divide,
             .rem_assign => .remainder,
+            .or_assign => .logical_or,
+            .and_assign => .logical_and,
             else => @panic("shouldn't happen <|:)-|--<"),
         };
     }

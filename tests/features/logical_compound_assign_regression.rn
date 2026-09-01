@@ -1,0 +1,24 @@
+// `||=` and `&&=` are compound-assignment sugar: `x ||= y` is `x = x || y` and
+// `x &&= y` is `x = x && y` (same short-circuit semantics as `||`/`&&`). Handy
+// for accumulating a running OR/AND in a loop. Bool prints as an exit code
+// (true → 0, false → 1). Deterministic output.
+var ok = false
+ok ||= true
+echo "ok=${ok}"
+
+var all = true
+all &&= false
+echo "all=${all}"
+
+// Accumulate "any element equals 2" with ||=.
+var found = false
+for (.{ 1, 2, 3 }) |n| {
+  found ||= (n == 2)
+}
+echo "found=${found}"
+
+// Accumulate "all comparisons hold" with &&=.
+var valid = true
+valid &&= (1 < 2)
+valid &&= (3 < 2)
+echo "valid=${valid}"

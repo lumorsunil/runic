@@ -34,6 +34,15 @@ const scores: []Int = .{ 90, 80 }
 
 **Result:** Each declaration advertises its type at the point of definition, catching mismatches such as assigning a string to `retries` before the script ever runs.
 
+A `var` can be updated with a **compound assignment**, which applies an operator to its current value: `+=`, `-=`, `*=`, `/=`, `%=` for arithmetic, and `||=`, `&&=` for logical values (`x ||= y` is exactly `x = x || y`, with the same short-circuit behavior).
+
+```rn
+var total = 0
+total += 5              // total = total + 5  → 5
+var found = false
+found ||= (total > 3)   // found = found || (total > 3)  → true
+```
+
 ### Environment variables
 
 Environment variables are explicit. Use `$NAME` to read an environment entry as `?String`, and `$NAME = ...` to update the current subshell context so later child processes inherit the new value. Bare identifiers like `HOME` are normal Runic bindings and are distinct from `$HOME`.

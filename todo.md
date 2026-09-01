@@ -83,7 +83,8 @@
 - [x] (re-)assignment
 - [x] arithmetic
 - [x] assignment modifiers (+=, -=, \*=, /=, %=)
-- [ ] more assignment modifiers (||=, &&=)
+- [x] more assignment modifiers (||=, &&=) — done; desugar to `x = x || y` /
+      `x = x && y`, alongside the existing `+=`/`-=`/`*=`/`/=`/`%=`
 - [ ] more binary operators
   - [ ] \*\* (exponentation)
   - [ ] << (bit shift left)

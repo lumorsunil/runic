@@ -8337,7 +8337,7 @@ pub const IRCompiler = struct {
 
                 return .from(left.source.location);
             },
-            .add_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign => {
+            .add_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign, .or_assign, .and_assign => {
                 const right = try self.allocator.create(ast.Expression);
                 right.* = .{ .binary = .{
                     .op = binary.op.unwrapAssign(),
