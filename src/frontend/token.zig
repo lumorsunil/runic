@@ -188,6 +188,8 @@ pub const Tag = enum {
     plus,
     minus,
     star,
+    /// Exponent "**".
+    star_star,
     slash,
     dollar,
     percent,
@@ -227,6 +229,9 @@ pub const Tag = enum {
     greater_equal,
     less,
     less_equal,
+    /// Bit shift-left "<<". (Shift-right reuses `append_redirect` "&gt;&gt;",
+    /// disambiguated from output-append by the IR compiler.)
+    shift_left,
     arrow, // "->"
     fat_arrow, // "=>"
     l_paren,

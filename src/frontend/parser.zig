@@ -1038,7 +1038,7 @@ pub const Parser = struct {
                             state = .expr;
                             continue;
                         },
-                        .equal_equal, .bang_equal, .fd_source_truncate_redirect, .fd_source_append_redirect, .greater, .append_redirect, .redirect_fd, .greater_equal, .less, .less_equal, .plus, .minus, .star, .slash, .percent, .kw_and, .kw_or, .kw_orelse, .pipe_pipe, .amp_amp, .pipe, .dot, .assign, .plus_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign => {
+                        .equal_equal, .bang_equal, .fd_source_truncate_redirect, .fd_source_append_redirect, .greater, .append_redirect, .redirect_fd, .greater_equal, .less, .less_equal, .shift_left, .plus, .minus, .star, .star_star, .slash, .percent, .kw_and, .kw_or, .kw_orelse, .pipe_pipe, .amp_amp, .pipe, .dot, .assign, .plus_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign => {
                             const breadcrumbInner = try self.createBreadcrumb("PBE:op");
                             defer breadcrumbInner.end();
                             try components.append(self.allocator, .{
@@ -1151,17 +1151,17 @@ pub const Parser = struct {
                     },
                 },
             },
-            // Note: `.greater` (`>`) is intentionally NOT folded here. It is
-            // ambiguous with the greater-than comparison, so it stays a
-            // `.binary{.greater}` and the IR compiler decides — based on whether
-            // the left operand is a command — whether it is a redirect or a
-            // comparison. The explicit redirect operators below are never
-            // comparisons, so they always fold.
-            .append_redirect, .fd_source_truncate_redirect, .fd_source_append_redirect => redirect: {
+            // Note: `.greater` (`>`) and `.append_redirect` (`>>`) are
+            // intentionally NOT folded here. Both are ambiguous — `>` with the
+            // greater-than comparison, `>>` with the shift-right operator — so
+            // they stay `.binary` nodes and the IR compiler decides, based on
+            // whether the left operand is a command, whether each is a redirect
+            // or an arithmetic operator. The fd-prefixed redirect operators
+            // below (`1>`, `2>>`, …) are never arithmetic, so they always fold.
+            .fd_source_truncate_redirect, .fd_source_append_redirect => redirect: {
                 const mode: ast.RedirectionMode = switch (binary.binary.op) {
                     .fd_source_truncate_redirect => .truncate,
                     .fd_source_append_redirect => .append,
-                    .append_redirect => .append,
                     else => unreachable,
                 };
                 const path = try coerceRedirectionTargetExpression(right);

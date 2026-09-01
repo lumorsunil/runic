@@ -85,14 +85,16 @@
 - [x] assignment modifiers (+=, -=, \*=, /=, %=)
 - [ ] more assignment modifiers (||=, &&=)
 - [ ] more binary operators
-  - [ ] \*\* (exponentation)
-  - [ ] << (bit shift left)
-  - [ ] \>> (bit shift right)
-  - [ ] & (bitwise and)
-  - [ ] | (bitwise or)
-  - [ ] ^ (bitwise xor)
+  - [x] \*\* (exponentation)
+  - [x] << (bit shift left)
+  - [x] \>> (bit shift right) — overloaded with append-redirect: a command on
+        the left appends, a value on the left shifts (resolved in the IR, like `>`)
+  - [ ] & (bitwise and) — spelling collides with `&` background / `&0` fd refs
+  - [ ] | (bitwise or) — spelling collides with the `|` pipe operator (blocked
+        unless spelled differently)
+  - [ ] ^ (bitwise xor) — spelling collides with the `^` promise prefix
 - [ ] unary operators
-  - [ ] ~ (bitwise negation)
+  - [ ] ~ (bitwise negation) — token free, but needs unary-operator plumbing
 - [x] boolean algebra
 - [x] comparisons (numeric)
 - [x] string concatenation

@@ -1,0 +1,9 @@
+pow=1024 zero=1 sat=9223372036854775807
+shl=16 shr=64
+mix=256
+prec=24
+arith=-4
+fpow=3 negexp=0.25
+reassign=5
+first
+second

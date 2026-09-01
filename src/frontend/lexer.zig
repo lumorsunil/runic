@@ -475,6 +475,9 @@ pub const Lexer = struct {
     fn lexStar(self: *Lexer) token.Token {
         const start = self.mark();
         _ = self.advance();
+        if (self.match('*')) {
+            return self.finish(.startAt(start), .star_star);
+        }
         if (self.match('=')) {
             return self.finish(.startAt(start), .mul_assign);
         }
@@ -538,6 +541,9 @@ pub const Lexer = struct {
     fn lexLess(self: *Lexer) token.Token {
         const start = self.mark();
         _ = self.advance();
+        if (self.match('<')) {
+            return self.finish(.startAt(start), .shift_left);
+        }
         if (self.match('=')) {
             return self.finish(.startAt(start), .less_equal);
         }

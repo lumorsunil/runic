@@ -2894,7 +2894,10 @@ pub const TypeChecker = struct {
         // un-narrowed case. Comparison/relational ops are intentionally allowed:
         // they are how you narrow (`if (x > 5)`, `if (x == 0)`).
         switch (binary.op) {
-            .add, .subtract, .multiply, .divide, .remainder => {
+            // `.append_redirect` is `>>`: a shift-right when both operands are
+            // values (a command-left `>>` is an append-redirect, handled in the
+            // IR, and its operands are never sums).
+            .add, .subtract, .multiply, .divide, .remainder, .power, .shift_left, .append_redirect => {
                 try self.rejectBareSum(binary.left, left_type, "use in arithmetic");
                 try self.rejectBareSum(binary.right, right_type, "use in arithmetic");
             },

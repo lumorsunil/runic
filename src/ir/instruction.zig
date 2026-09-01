@@ -467,6 +467,9 @@ pub const Instruction = struct {
         mul,
         div,
         mod,
+        pow,
+        shl,
+        shr,
 
         pub fn from(binary_op: ast.BinaryOp) @This() {
             return switch (binary_op) {
@@ -475,6 +478,10 @@ pub const Instruction = struct {
                 .multiply => .mul,
                 .divide => .div,
                 .remainder => .mod,
+                .power => .pow,
+                .shift_left => .shl,
+                // `>>` reuses the append-redirect op; as arithmetic it is shr.
+                .append_redirect => .shr,
                 else => unreachable,
             };
         }
@@ -489,6 +496,9 @@ pub const Instruction = struct {
                 .mul => "*",
                 .div => "/",
                 .mod => "%",
+                .pow => "**",
+                .shl => "<<",
+                .shr => ">>",
             });
         }
     };

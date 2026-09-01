@@ -2168,6 +2168,42 @@ pub const IREvaluator = struct {
 
                 return .{ .float = @mod(float_left, float_right) };
             },
+            .pow => {
+                // Integer base with a non-negative integer exponent stays an
+                // integer (saturating on overflow, like +/-/*); anything else
+                // (float operand or negative exponent) widens to float.
+                if (left.isValueTag(.integer) and right.isValueTag(.integer) and right.value.integer >= 0) {
+                    const base = left.value.integer;
+                    const exp = right.value.integer;
+                    const result = std.math.powi(i64, base, exp) catch {
+                        const negative = base < 0 and @mod(exp, 2) == 1;
+                        return .{ .integer = if (negative) std.math.minInt(i64) else std.math.maxInt(i64) };
+                    };
+                    return .{ .integer = result };
+                }
+                const float_left: f64 = if (left.isValueTag(.integer)) @floatFromInt(left.value.integer) else if (left.isValueTag(.float)) left.value.float else return null;
+                const float_right: f64 = if (right.isValueTag(.integer)) @floatFromInt(right.value.integer) else if (right.isValueTag(.float)) right.value.float else return null;
+                return .{ .float = std.math.pow(f64, float_left, float_right) };
+            },
+            .shl, .shr => {
+                // Bit shifts are integer-only. A negative shift count flips the
+                // direction; a count of 64+ clears the value (an arithmetic
+                // right shift of a negative value settles at -1).
+                if (!left.isValueTag(.integer) or !right.isValueTag(.integer)) return null;
+                const value = left.value.integer;
+                var amount = right.value.integer;
+                var shift_left = op == .shl;
+                if (amount < 0) {
+                    shift_left = !shift_left;
+                    amount = -amount;
+                }
+                if (shift_left) {
+                    if (amount >= 64) return .{ .integer = 0 };
+                    return .{ .integer = value <<| @as(u6, @intCast(amount)) };
+                }
+                if (amount >= 64) return .{ .integer = if (value < 0) -1 else 0 };
+                return .{ .integer = value >> @as(u6, @intCast(amount)) };
+            },
         }
 
         return null;
