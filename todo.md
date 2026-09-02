@@ -221,7 +221,11 @@
 
 ## parser
 
-- [ ] parse error bail and continue
+- [x] parse error bail and continue — top-level statement recovery: a failed
+      statement records a diagnostic, resyncs at the next boundary (newline/`;`),
+      and continues, so multiple independent errors are reported at once
+      (recovery is top-level only; nested-construct errors fail their enclosing
+      statement)
   - when parsing fails entirely in a statement or expression, look for the next expression terminator and continue parsing from there, storing the error for later diagnostics
   - still produce a valid ast for the type checker to use
   - [x] in progress

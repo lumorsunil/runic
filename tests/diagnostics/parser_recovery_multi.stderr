@@ -1,0 +1,14 @@
+[error]: tests/diagnostics/parser_recovery_multi.rn:1:14: expected value, actual: newline
+   1:const a = 1 +
+   2:echo "still parsed"
+   3:const b = )
+   4:echo "and this too"
+   5:
+
+[error]: tests/diagnostics/parser_recovery_multi.rn:3:11: expected value, actual: r_paren
+   1:const a = 1 +
+   2:echo "still parsed"
+   3:const b = )
+   4:echo "and this too"
+   5:
+
