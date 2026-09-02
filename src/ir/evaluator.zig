@@ -1176,6 +1176,31 @@ pub const IREvaluator = struct {
                 thread.private.result_register = .{ .float = parsed };
                 return .cont;
             },
+            .parse_bool => {
+                // A value that is already a Bool (represented as an exit code)
+                // or an EOF read (`.null`) passes through unchanged; otherwise
+                // parse the text "true"/"false" (case-insensitive, trimmed).
+                if (thread.private.result_register == .exit_code) return .cont;
+                if (thread.private.result_register == .null) return .cont;
+                var text_writer = std.Io.Writer.Allocating.init(self.allocator);
+                defer text_writer.deinit();
+                try self.materializeString(thread, thread.private.result_register, &text_writer.writer);
+                const trimmed = std.mem.trim(u8, text_writer.written(), " \t\r\n");
+                if (std.ascii.eqlIgnoreCase(trimmed, "true")) {
+                    thread.private.result_register = .fromBoolean(true);
+                } else if (std.ascii.eqlIgnoreCase(trimmed, "false")) {
+                    thread.private.result_register = .fromBoolean(false);
+                } else {
+                    // A bad parse is a catchable `ParseError.Invalid` value
+                    // (`parseBool: ParseError!Bool`), not a hard runtime abort.
+                    thread.private.result_register = .{ .err = .{
+                        .set = "ParseError",
+                        .variant = "Invalid",
+                        .payload = null,
+                    } };
+                }
+                return .cont;
+            },
             .emit_lines => |pipe_location| {
                 // `lines`: frame a byte stream into per-line values. Split the
                 // collected input in %r by '\n' and emit each non-empty line.

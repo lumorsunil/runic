@@ -882,9 +882,12 @@ fn Int square() Int {
 `parseInt` maps per value, so it works on a single value (`echo "10" | parseInt`)
 or a framed stream (`… | lines | parseInt`). `parseFloat`
 (`fn String parseFloat() Float`) is the `Float` counterpart and behaves the same
-way. A custom stage that should process every value uses the `for (&0) |v| {
-... }` form — a stage that reads `&0` once (e.g. `const n = &0`) consumes only
-the first value.
+way, and `parseBool` (`fn String parseBool() Bool`) parses the text `true`/`false`
+(case-insensitive, whitespace-trimmed) into a `Bool`. Each is `ParseError!T`, so
+a bad parse is a value a surrounding `catch`/`try` handles (`echo "maybe" |
+parseBool catch false`). A custom stage that should process every value uses the
+`for (&0) |v| { ... }` form — a stage that reads `&0` once (e.g. `const n = &0`)
+consumes only the first value.
 
 ### Mixed executable and typed-function pipelines
 
