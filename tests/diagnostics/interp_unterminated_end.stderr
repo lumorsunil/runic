@@ -1,0 +1,4 @@
+[error]: tests/diagnostics/interp_unterminated_end.rn:1:20: expected string interp end got: newline
+   1:echo "${x + "oops}"
+   2:
+

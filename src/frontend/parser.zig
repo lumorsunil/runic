@@ -419,8 +419,13 @@ pub const Parser = struct {
             // A thrown lexer error (e.g. an unterminated string) skips
             // `reportParseError`, so without this the script comes back `null`
             // with no diagnostics — a silent exit. Record one so the user sees a
-            // real message pointing at where lexing stopped.
-            if (self.diagnostics.items.len == 0) self.recordThrownError(err);
+            // real message pointing at where lexing stopped. But only when
+            // `compileResult`'s expected-token fallback can't describe it
+            // (`expected_token_count == 0`); otherwise that fallback builds a
+            // better, span-accurate message (e.g. "expected string interp end").
+            if (self.diagnostics.items.len == 0 and self.expected_token_count == 0) {
+                self.recordThrownError(err);
+            }
             break :brk null;
         });
     }
