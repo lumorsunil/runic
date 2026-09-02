@@ -3334,6 +3334,13 @@ pub const IRCompiler = struct {
             }
         }
 
+        // No-argument Int builtins (`x.bnot`), same rules.
+        if (intBuiltin(member.member.name)) |ib| {
+            if (ib.arity == 0 and !self.memberIsStructField(member.object, member.member.name)) {
+                return self.compileIntOp(source, object, ib, &.{});
+            }
+        }
+
         const object_type = object.typeExpr() orelse {
             try self.reportSourceError(
                 source,
@@ -4126,6 +4133,12 @@ pub const IRCompiler = struct {
                     if (fb.arity == @as(u8, @intCast(call.arguments.len)) and fb.arity > 0) {
                         const object = try self.compileExpression(call.callee.binary.left);
                         return self.compileFloatOp(source, object, fb, call.arguments);
+                    }
+                }
+                if (intBuiltin(member_name)) |ib| {
+                    if (ib.arity == @as(u8, @intCast(call.arguments.len)) and ib.arity > 0) {
+                        const object = try self.compileExpression(call.callee.binary.left);
+                        return self.compileIntOp(source, object, ib, call.arguments);
                     }
                 }
             }
@@ -5598,6 +5611,52 @@ pub const IRCompiler = struct {
         if (eql(u8, name, "trunc")) return .{ .op = .trunc, .arity = 0 };
         if (eql(u8, name, "powF")) return .{ .op = .pow, .arity = 1 };
         return null;
+    }
+
+    const IntBuiltin = struct {
+        op: ir.Instruction.IntOp.Op,
+        arity: u8,
+    };
+
+    /// Maps a method name to its bitwise Int builtin (UFCS over the operand:
+    /// `x.band y`, `x.bor y`, `x.bxor y`, `x.bnot`), or null. All yield an Int.
+    fn intBuiltin(name: []const u8) ?IntBuiltin {
+        const eql = std.mem.eql;
+        if (eql(u8, name, "band")) return .{ .op = .band, .arity = 1 };
+        if (eql(u8, name, "bor")) return .{ .op = .bor, .arity = 1 };
+        if (eql(u8, name, "bxor")) return .{ .op = .bxor, .arity = 1 };
+        if (eql(u8, name, "bnot")) return .{ .op = .bnot, .arity = 0 };
+        return null;
+    }
+
+    /// Compiles a bitwise Int builtin: stabilizes the operand and its optional
+    /// argument, then emits an `int_op` yielding an Int.
+    fn compileIntOp(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        object: Result,
+        ib: IntBuiltin,
+        args: []const *ast.Expression,
+    ) Error!Result {
+        const operand_ref = try self.newRef(source, "int_operand");
+        try self.set(source, operand_ref, stableResultSource(object));
+
+        var arg0: ir.ValueSource = .fromValue(.void);
+        if (args.len > 0) {
+            const arg_result = try self.compileExpression(args[0]);
+            const arg_ref = try self.newRef(source, "int_arg");
+            try self.set(source, arg_ref, stableResultSource(arg_result));
+            arg0 = .from(arg_ref.dereference());
+        }
+
+        const result_ref = try self.newRef(source, "int_result");
+        try self.addInstruction(.init(.from(source), .{ .int_op = .{
+            .op = ib.op,
+            .operand = .from(operand_ref.dereference()),
+            .arg0 = arg0,
+            .result = result_ref.dereference(),
+        } }));
+        return .fromLocation(result_ref.dereference().typed(.global(.integer)));
     }
 
     /// Compiles a Float-math builtin: stabilizes the operand and its optional

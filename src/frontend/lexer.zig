@@ -350,12 +350,13 @@ pub const Lexer = struct {
             }
         }
 
-        if (self.peekIs('.')) {
-            if (!self.peekNextIs('.')) {
-                has_dot = true;
-                _ = self.advance(); // consume '.'
-                _ = self.consumeDigits(null);
-            }
+        // A `.` is the decimal point only when a digit follows it (`6.5`). A `.`
+        // followed by a letter is member access on an integer (`6.band`), and
+        // `..` is a range — both leave the `.` for the next token.
+        if (self.peekIs('.') and self.peekNextIsDigit()) {
+            has_dot = true;
+            _ = self.advance(); // consume '.'
+            _ = self.consumeDigits(null);
         }
 
         if (self.peekIs('e') or self.peekIs('E')) {
@@ -713,6 +714,12 @@ pub const Lexer = struct {
         const next_index = self.index + 1;
         if (next_index >= self.source.len) return false;
         return self.source[next_index] == needle;
+    }
+
+    fn peekNextIsDigit(self: *Lexer) bool {
+        const next_index = self.index + 1;
+        if (next_index >= self.source.len) return false;
+        return std.ascii.isDigit(self.source[next_index]);
     }
 
     fn match(self: *Lexer, expected: u8) bool {

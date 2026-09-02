@@ -47,6 +47,17 @@ echo "${9 ** 0.5}"           // 3 — a fractional/negative exponent widens to F
 
 **Result:** `**` and the shifts keep integer operands `Int` — exponent saturates at the `Int` bounds on overflow, and shifting by 64 or more clears the value; a `Float` operand or a negative exponent widens `**` to `Float`. `**` binds tighter than `*`, and the shifts sit just below `+`/`-`; both shifts share one tier, so a run of same-tier operators is left-associative (`2 ** 3 ** 2` is `(2 ** 3) ** 2 == 64`, and `1024 >> 3 << 1 == 256`). Note `>>` is overloaded with append-redirect — see [*File descriptor redirects*](#file-descriptor-redirects) — but a value on the left always makes it the shift.
 
+**Bitwise** operations are `Int` methods (UFCS), like the `Float` math builtins — this keeps them clear of the `&`/`|`/`^` symbols, which are already the background/fd, pipe, and promise-prefix syntax:
+
+```rn
+const low = value.band 255          // bitwise AND   (a.band b)
+const set  = low.bor 16             // bitwise OR    (a.bor b)
+const tog  = set.bxor 4             // bitwise XOR   (a.bxor b)
+const inv  = tog.bnot               // bitwise NOT   (a.bnot; two's complement)
+```
+
+**Result:** each yields an `Int`; `band`/`bor`/`bxor` take one argument, `bnot` none. They compose (`(a.band mask).bor bit`) and pair naturally with the shifts. Method calls work on integer literals too — `6.band 3` — since `.` before a letter is member access, not a decimal point (`6.5` is still a float).
+
 ### Slicing
 
 An array or string can be **sliced** with a range index — `x[a..b]` is the

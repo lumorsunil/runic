@@ -92,17 +92,22 @@
 - [x] assignment modifiers (+=, -=, \*=, /=, %=)
 - [x] more assignment modifiers (||=, &&=) — done; desugar to `x = x || y` /
       `x = x && y`, alongside the existing `+=`/`-=`/`*=`/`/=`/`%=`
-- [ ] more binary operators
+- [x] more binary operators
   - [x] \*\* (exponentation)
   - [x] << (bit shift left)
   - [x] \>> (bit shift right) — overloaded with append-redirect: a command on
         the left appends, a value on the left shifts (resolved in the IR, like `>`)
-  - [ ] & (bitwise and) — spelling collides with `&` background / `&0` fd refs
-  - [ ] | (bitwise or) — spelling collides with the `|` pipe operator (blocked
-        unless spelled differently)
-  - [ ] ^ (bitwise xor) — spelling collides with the `^` promise prefix
-- [ ] unary operators
-  - [ ] ~ (bitwise negation) — token free, but needs unary-operator plumbing
+  - [x] bitwise and/or/xor/not — the `&`/`|`/`^` symbols collide with
+        background/fd, pipe, and the promise prefix, so these are Int methods
+        (UFCS) instead: `a.band b`, `a.bor b`, `a.bxor b`, `a.bnot` (mirrors the
+        Float math builtins). Also fixed the lexer so `N.method` on an int
+        literal is member access, not a `N.` float.
+- [x] unary operators
+  - [x] bitwise negation — `x.bnot` (method form, see above)
+- [ ] numeric literal bases: hex `0x`, binary `0b`, octal `0o` — the lexer is
+      decimal-only today (`0x10` lexes as int `0` + identifier `x10`); a natural
+      companion to the bitwise ops for masks. Add to `lexNumber` + parse the
+      literal with base 0 in the compiler.
 - [x] boolean algebra
 - [x] comparisons (numeric)
 - [x] string concatenation

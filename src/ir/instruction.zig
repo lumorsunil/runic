@@ -116,6 +116,9 @@ pub const Instruction = struct {
         /// applies a Float math builtin (`x.sqrt`, `x.floor`, `x.pow y`, …) to the
         /// operand, with an optional argument, storing the Float result.
         float_op: FloatOp,
+        /// applies a bitwise Int builtin (`x.band y`, `x.bor y`, `x.bxor y`,
+        /// `x.bnot`) to the operand, storing the Int result.
+        int_op: IntOp,
         /// `arr.push value` — allocates a new array (`[len+1, …elements, value]`)
         /// and stores its base address in `result`.
         array_push: ArrayPush,
@@ -414,6 +417,20 @@ pub const Instruction = struct {
 
         pub fn format(self: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
             try w.print("{f} = float.{t}({f}, {f})", .{ self.result, self.op, self.operand, self.arg0 });
+        }
+    };
+
+    pub const IntOp = struct {
+        op: Op,
+        operand: ValueSource,
+        /// The second operand for `band`/`bor`/`bxor`; ignored by `bnot`.
+        arg0: ValueSource,
+        result: Location,
+
+        pub const Op = enum { band, bor, bxor, bnot };
+
+        pub fn format(self: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
+            try w.print("{f} = int.{t}({f}, {f})", .{ self.result, self.op, self.operand, self.arg0 });
         }
     };
 

@@ -1589,6 +1589,27 @@ pub const IREvaluator = struct {
                 try self.setLocation(thread, float_op.result, .{ .float = result });
                 return .cont;
             },
+            .int_op => |int_op| {
+                const operand = try self.resolveValueSource(thread, int_op.operand);
+                if (operand != .integer) return Error.UnsupportedType;
+                const x = operand.integer;
+                const result: i64 = switch (int_op.op) {
+                    .bnot => ~x,
+                    .band, .bor, .bxor => blk: {
+                        const arg = try self.resolveValueSource(thread, int_op.arg0);
+                        if (arg != .integer) return Error.UnsupportedType;
+                        const y = arg.integer;
+                        break :blk switch (int_op.op) {
+                            .band => x & y,
+                            .bor => x | y,
+                            .bxor => x ^ y,
+                            .bnot => unreachable,
+                        };
+                    },
+                };
+                try self.setLocation(thread, int_op.result, .{ .integer = result });
+                return .cont;
+            },
             .make_err => |make_err| {
                 const payload_ptr: ?*const ir.Value = if (make_err.payload) |payload| blk: {
                     const value = try self.resolveValueSource(thread, payload);
