@@ -1,0 +1,21 @@
+// A `$(...)` subshell body is a statement sequence, not just a single
+// expression: `;`-separated and newline-separated commands both run, and the
+// subshell captures their combined stdout. A lone expression still works, and
+// cd isolation still holds across a multi-statement body.
+const semi = $(echo "a"; echo "b")
+echo "semi=[${semi}]"
+
+const nl = $(
+  echo "one"
+  echo "two"
+)
+echo "nl=[${nl}]"
+
+const single = $(echo "solo")
+echo "single=[${single}]"
+
+// A multi-statement subshell that cds does not leak into the parent.
+const before = pwd | tr "-d" "\n"
+const _ = $(cd "/"; echo "inside")
+const after = pwd | tr "-d" "\n"
+echo "cd-isolated=${before == after}"

@@ -2344,12 +2344,25 @@ pub const Parser = struct {
         defer breadcrumb.end();
 
         const open = try self.expect(.dollar_l_paren);
-        const child = try self.parseExpression();
-        const close = try self.expect(.r_paren);
+        // A subshell body is a statement sequence, like a `(...)` group — so
+        // `$(echo "a"; echo "b")` and newline-separated commands work, not just
+        // a single expression. `parseStatementsUntil` consumes the closing `)`.
+        // A lone expression stays its own child; multiple statements (or a
+        // non-expression) are wrapped in a block whose combined stdout the
+        // subshell captures.
+        const statements = try self.parseStatementsUntil(.r_paren);
+
+        const child = if (statements.payload.len == 1 and statements.payload[0].* == .expression)
+            statements.payload[0].expression.expression
+        else
+            try self.allocExpression(.{ .block = ast.Block{
+                .statements = statements.payload,
+                .span = statements.span,
+            } });
 
         return self.allocExpression(.{ .subshell = .{
             .child = child,
-            .span = open.span.endAt(close.span),
+            .span = open.span.endAt(statements.span),
         } });
     }
 
