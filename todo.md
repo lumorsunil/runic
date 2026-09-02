@@ -100,7 +100,7 @@
 - [x] string concatenation
   - [ ] maybe ban?
 - [x] array literals
-- [ ] slicing
+- [x] slicing — `x[a..b]` array/string slices (open ends `x[a..]`/`x[..b]`), bounds clamped
 - [x] array element accessor
 - [x] if
 - [x] for loops

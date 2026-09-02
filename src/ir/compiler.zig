@@ -8120,6 +8120,53 @@ pub const IRCompiler = struct {
         return m;
     }
 
+    /// `x[start..end]` — a new array (or string) of the half-open range. A String
+    /// reuses the byte-level `slice` str_op; any other array uses `array_slice`.
+    /// An omitted end (`x[a..]`) passes a saturating sentinel that clamps to the
+    /// length at runtime.
+    fn compileSlice(self: *IRCompiler, source: anytype, binary: ast.BinaryExpr) Error!Result {
+        const range = binary.right.range;
+        const target = try self.compileExpression(binary.left);
+        // A bare string literal carries no ast type (it is a raw `.slice` value);
+        // treat an unknown type as a string (arrays are always typed).
+        const maybe_type = target.typeExpr();
+        const is_string = if (maybe_type) |t| self.typeIsString(t) else true;
+        const array_ref = try self.newRef(source, "slice_array");
+        try self.set(source, array_ref, stableResultSource(target));
+
+        const start = try self.compileArithmeticOperand(source, range.start);
+        const start_ref = try self.newRef(source, "slice_start");
+        try self.set(source, start_ref, stableResultSource(start));
+
+        const end_src: ir.ValueSource = if (range.end) |end_expr| blk: {
+            const end = try self.compileArithmeticOperand(source, end_expr);
+            const end_ref = try self.newRef(source, "slice_end");
+            try self.set(source, end_ref, stableResultSource(end));
+            break :blk .from(end_ref.dereference());
+        } else .fromValue(.{ .integer = std.math.maxInt(i64) });
+
+        const result_ref = try self.newRef(source, "slice_result");
+        if (is_string) {
+            try self.addInstruction(.init(.from(source), .{ .str_op = .{
+                .op = .slice,
+                .operand = .from(array_ref.dereference()),
+                .arg0 = .from(start_ref.dereference()),
+                .arg1 = end_src,
+                .result = result_ref.dereference(),
+            } }));
+            return .fromLocation(result_ref.dereference().typed(string_type));
+        }
+        const target_type = maybe_type.?;
+        if (target_type != .array) return Error.UnsupportedBinaryOperation;
+        try self.addInstruction(.init(.from(source), .{ .array_slice = .{
+            .array = .from(array_ref.dereference()),
+            .start = .from(start_ref.dereference()),
+            .end = end_src,
+            .result = result_ref.dereference(),
+        } }));
+        return .fromLocation(result_ref.dereference().typed(target_type));
+    }
+
     fn compileBinary(
         self: *IRCompiler,
         source: anytype,
@@ -8395,6 +8442,9 @@ pub const IRCompiler = struct {
                 });
             },
             .array_access => {
+                // `x[a..b]` — a range-valued index is a slice, not an element read.
+                if (binary.right.* == .range) return self.compileSlice(source, binary);
+
                 const array_access_ref = try self.newRef(source, "array_access_ref");
 
                 const left = try self.compileExpression(binary.left);

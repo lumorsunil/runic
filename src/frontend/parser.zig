@@ -1073,14 +1073,38 @@ pub const Parser = struct {
                             }
                         },
                         .l_bracket => {
-                            _ = try self.nextToken();
+                            const open = try self.nextToken();
                             try components.append(self.allocator, .{
                                 .op = token.Spanned(ast.BinaryOp).fromToken(next) orelse @panic("shouldn't happen <:)-|-<"),
                             });
                             state.advance();
-                            try components.append(self.allocator, .{
-                                .expr = try self.parseExpression(),
-                            });
+                            // `x[i]` — index; `x[a..b]` / `x[a..]` / `x[..b]` /
+                            // `x[..]` — slice, carried as a range-valued index.
+                            const start: ?*ast.Expression = if ((try self.peekToken()).tag == .range)
+                                null
+                            else
+                                try self.parseExpression();
+                            if ((try self.peekToken()).tag == .range) {
+                                const dots = try self.nextToken();
+                                const end: ?*ast.Expression = if ((try self.peekToken()).tag == .r_bracket)
+                                    null
+                                else
+                                    try self.parseExpression();
+                                const start_expr = start orelse try self.allocExpression(.{
+                                    .literal = .{ .integer = .{ .text = "0", .span = dots.span } },
+                                });
+                                const end_span = if (end) |e| e.span() else dots.span;
+                                try components.append(self.allocator, .{
+                                    .expr = try self.allocExpression(.{ .range = .{
+                                        .start = start_expr,
+                                        .end = end,
+                                        .inclusive_end = false,
+                                        .span = open.span.endAt(end_span),
+                                    } }),
+                                });
+                            } else {
+                                try components.append(self.allocator, .{ .expr = start.? });
+                            }
                             _ = try self.expectTokenTag(.r_bracket);
                             continue;
                         },

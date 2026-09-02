@@ -47,6 +47,24 @@ echo "${9 ** 0.5}"           // 3 — a fractional/negative exponent widens to F
 
 **Result:** `**` and the shifts keep integer operands `Int` — exponent saturates at the `Int` bounds on overflow, and shifting by 64 or more clears the value; a `Float` operand or a negative exponent widens `**` to `Float`. `**` binds tighter than `*`, and the shifts sit just below `+`/`-`; both shifts share one tier, so a run of same-tier operators is left-associative (`2 ** 3 ** 2` is `(2 ** 3) ** 2 == 64`, and `1024 >> 3 << 1 == 256`). Note `>>` is overloaded with append-redirect — see [*File descriptor redirects*](#file-descriptor-redirects) — but a value on the left always makes it the shift.
 
+### Slicing
+
+An array or string can be **sliced** with a range index — `x[a..b]` is the
+half-open sub-range (a new array/string), and either bound may be omitted:
+
+```rn
+const xs = .{ 10, 20, 30, 40, 50 }
+const mid  = xs[1..3]   // .{ 20, 30 }   (half-open: includes 1, excludes 3)
+const tail = xs[2..]    // .{ 30, 40, 50 }
+const head = xs[..2]    // .{ 10, 20 }
+const word = "hello world"[0..5]   // "hello"
+```
+
+**Result:** `x[a..b]` copies the elements/bytes in `[a, b)`; `x[a..]` runs to the
+end and `x[..b]` from the start (`x[..]` is a full copy). Bounds are clamped to
+`[0, len]`, so an out-of-range or inverted range yields an empty result rather
+than an error. Plain indexing `x[i]` is unchanged.
+
 ### Environment variables
 
 Environment variables are explicit. Use `$NAME` to read an environment entry as `?String`, and `$NAME = ...` to update the current subshell context so later child processes inherit the new value. Bare identifiers like `HOME` are normal Runic bindings and are distinct from `$HOME`.

@@ -127,6 +127,9 @@ pub const Instruction = struct {
         /// Like `array_set` but writes the element in place (no copy), only
         /// emitted for a linear (uniquely-owned) array — see the compiler.
         array_set_inplace: ArraySet,
+        /// `arr[start..end]` — a new array of the half-open element range,
+        /// copied. Bounds are clamped to `[0, len]`.
+        array_slice: ArraySlice,
         /// constructs an error value (boxing the runtime payload, if any)
         make_err: MakeErr,
         /// sets result to a boolean: whether operand is an error value whose
@@ -429,6 +432,17 @@ pub const Instruction = struct {
 
         pub fn format(self: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
             try w.print("{f} = set({f}, {f}, {f})", .{ self.result, self.array, self.index, self.value });
+        }
+    };
+
+    pub const ArraySlice = struct {
+        array: ValueSource,
+        start: ValueSource,
+        end: ValueSource,
+        result: Location,
+
+        pub fn format(self: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
+            try w.print("{f} = slice({f}, {f}, {f})", .{ self.result, self.array, self.start, self.end });
         }
     };
 

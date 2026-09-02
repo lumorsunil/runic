@@ -1247,11 +1247,13 @@ pub const BinaryExpr = struct {
                     else => break :blk null,
                 }
             },
-            // `xs[i]` yields the array's element type, not the array type.
+            // `xs[i]` yields the array's element type; `xs[a..b]` (a range index)
+            // is a slice and yields the whole array/string type.
             .array_access => blk: {
                 const lt = left_type orelse break :blk null;
                 var resolved = lt;
                 while (resolved.* == .alias) resolved = resolved.alias.type_expr;
+                if (self.right.* == .range) break :blk resolved;
                 break :blk switch (resolved.*) {
                     .array => |array| array.element,
                     else => null,
