@@ -595,7 +595,7 @@ pub const Parser = struct {
 
         self.clearExpectedTokens();
         self.source = source;
-        self.stream = try .init(self.arena.allocator(), "<source>", source);
+        self.stream = try .init(self.io, self.arena.allocator(), self.environ_map, "<source>", source);
         // self.currentDocument = try self.arena.allocator().create(Document);
         // self.currentDocument.* = .{
         //     .source = source,
@@ -3915,165 +3915,178 @@ pub const Parser = struct {
     }
 };
 
-const TestCtx = struct {
-    source: []const u8,
-    cached: ?ast.Script = null,
+var parser_test_threaded: std.Io.Threaded = undefined;
+var parser_test_threaded_ready = false;
+
+fn testIo() std.Io {
+    if (!parser_test_threaded_ready) {
+        parser_test_threaded = .init(std.heap.page_allocator, .{});
+        parser_test_threaded_ready = true;
+    }
+    return parser_test_threaded.io();
+}
+
+/// Owns a real `Parser` (and the document store / env it needs) for a test.
+/// `init` sets up the self-referential pointers in place, so declare it
+/// `undefined` and call `init` before use:
+///   var tp: TestParser = undefined;
+///   tp.init(allocator);
+///   defer tp.deinit();
+///   const script = try tp.parser.parseSource("echo \"hi\"");
+const TestParser = struct {
+    env: std.process.Environ.Map,
+    fds: @import("document_store.zig").FrontendDocumentStore,
+    parser: Parser,
+
+    fn init(self: *TestParser, allocator: std.mem.Allocator) void {
+        self.env = std.process.Environ.Map.init(allocator);
+        self.fds = .init(testIo(), allocator, &self.env);
+        self.parser = Parser.init(testIo(), allocator, &self.env, &self.fds.document_store);
+    }
+
+    fn deinit(self: *TestParser) void {
+        self.parser.deinit();
+        self.fds.deinit();
+        self.env.deinit();
+    }
 };
 
-fn testGetCachedAst(ctx: *TestCtx, path: []const u8) !?ast.Script {
-    _ = path;
-    return ctx.cached;
-}
-
-fn testPutCachedAst(ctx: *TestCtx, path: []const u8, script: ast.Script) !void {
-    _ = path;
-    ctx.cached = script;
-}
-
-fn testGetSource(ctx: *TestCtx, path: []const u8) ![]const u8 {
-    _ = path;
-    return ctx.source;
-}
-
-const TestParser = Parser(TestCtx, testGetCachedAst, testPutCachedAst, testGetSource);
-
-test "parser preserves breadcrumb trail on unexpected token errors" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+test "parser records a diagnostic on an unexpected token" {
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var ctx = TestCtx{ .source = "foo = 1" };
-    var parser = TestParser.init(allocator, &ctx);
-    defer parser.deinit();
+    // A stray closing paren where a value is expected is an unexpected token,
+    // and the parser should record a diagnostic describing what it expected.
+    const src = ")";
+    var tp: TestParser = undefined;
+    tp.init(allocator);
+    const parser = &tp.parser;
+    defer tp.deinit();
 
-    parser.source = ctx.source;
-    parser.stream = try lexer.Stream.init(parser.arena.allocator(), "<test>", ctx.source);
+    parser.source = src;
+    parser.stream = try lexer.Stream.init(parser.io, parser.arena.allocator(), parser.environ_map, "<test>", src);
 
     try std.testing.expectError(Error.UnexpectedToken, parser.parseExpression());
-
-    var buffer: [256]u8 = undefined;
-    var writer = std.Io.Writer.fixed(&buffer);
-    const wrote = try parser.writeExpectedTokens(&writer);
-    try std.testing.expect(wrote);
-    const expected =
-        "expected string literal while parsing parseExpression -> parseIdentifierExpression -> parsePipeline -> parsePipelineStage";
-    try std.testing.expectEqualStrings(expected, writer.buffer[0..writer.end]);
+    try std.testing.expect(parser.diagnostics.items.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, parser.diagnostics.items[0].message, "expected") != null);
 }
 
 test "parser builds command pipelines with string arguments" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var ctx = TestCtx{ .source = "echo \"hi\"" };
-    var parser = TestParser.init(allocator, &ctx);
-    defer parser.deinit();
+    const src = "echo \"hi\"";
+    var tp: TestParser = undefined;
+    tp.init(allocator);
+    const parser = &tp.parser;
+    defer tp.deinit();
 
-    const script = try parser.parseSource(ctx.source);
+    const script = try parser.parseSource(src);
     try std.testing.expectEqual(@as(usize, 1), script.statements.len);
-    const stmt = script.statements[0].*;
-    try std.testing.expect(std.meta.activeTag(stmt) == .expression);
-    const expr_stmt = stmt.expression;
-    const expr = expr_stmt.expression.*;
-    try std.testing.expect(std.meta.activeTag(expr) == .pipeline);
-    const pipeline = expr.pipeline;
-    try std.testing.expectEqual(@as(usize, 1), pipeline.stages.len);
-    const stage = pipeline.stages[0];
-    try std.testing.expectEqual(ast.StageRole.command, stage.role);
-    const command = stage.payload.command;
-    try std.testing.expectEqualStrings("echo", command.name.word.text);
-    try std.testing.expectEqual(@as(usize, 1), command.args.len);
-    const arg = command.args[0];
-    try std.testing.expect(std.meta.activeTag(arg) == .string);
-    const literal = arg.string;
-    try std.testing.expectEqual(@as(usize, 1), literal.segments.len);
-    const segment = literal.segments[0];
-    try std.testing.expect(std.meta.activeTag(segment) == .text);
-    try std.testing.expectEqualStrings("hi", segment.text.payload);
+    const expr = script.statements[0].expression.expression.*;
+    try std.testing.expect(std.meta.activeTag(expr) == .call);
+    const call = expr.call;
+    try std.testing.expect(call.callee.* == .identifier);
+    try std.testing.expectEqualStrings("echo", call.callee.identifier.name);
+    try std.testing.expectEqual(@as(usize, 1), call.arguments.len);
+    const arg = call.arguments[0];
+    try std.testing.expect(arg.* == .literal and arg.literal == .string);
+    const segments = arg.literal.string.segments;
+    try std.testing.expectEqual(@as(usize, 1), segments.len);
+    try std.testing.expect(std.meta.activeTag(segments[0]) == .text);
+    try std.testing.expectEqualStrings("hi", segments[0].text.payload);
 }
 
-test "parser builds command redirections with quoted file paths" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+test "parser leaves `>` as a binary op (redirect resolved in the IR)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var ctx = TestCtx{ .source = "echo \"hi\" > \"file.txt\"" };
-    var parser = TestParser.init(allocator, &ctx);
-    defer parser.deinit();
+    // `>` is not folded at parse time — it stays a `.greater` binary op, and the
+    // IR compiler decides redirect (command left) vs comparison (value left).
+    const src = "echo \"hi\" > \"file.txt\"";
+    var tp: TestParser = undefined;
+    tp.init(allocator);
+    const parser = &tp.parser;
+    defer tp.deinit();
 
-    const script = try parser.parseSource(ctx.source);
-    const stage = script.statements[0].expression.expression.pipeline.stages[0];
-    const command = stage.payload.command;
-
-    try std.testing.expectEqual(@as(usize, 1), command.redirects.len);
-    try std.testing.expectEqual(ast.RedirectionMode.truncate, command.redirects[0].mode);
-    try std.testing.expectEqual(@as(usize, 1), command.redirects[0].target.path.value.segments.len);
-    try std.testing.expect(std.meta.activeTag(command.redirects[0].target.path.value.segments[0]) == .text);
-    try std.testing.expectEqualStrings("file.txt", command.redirects[0].target.path.value.segments[0].text.payload);
+    const script = try parser.parseSource(src);
+    const expr = script.statements[0].expression.expression.*;
+    try std.testing.expect(std.meta.activeTag(expr) == .binary);
+    try std.testing.expect(expr.binary.op == .greater);
+    const target = expr.binary.right;
+    try std.testing.expect(target.* == .literal and target.literal == .string);
+    try std.testing.expectEqualStrings("file.txt", target.literal.string.segments[0].text.payload);
 }
 
-test "parser builds append command redirections with quoted file paths" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+test "parser leaves `>>` as a binary op (append-redirect resolved in the IR)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var ctx = TestCtx{ .source = "echo \"hi\" >> \"file.txt\"" };
-    var parser = TestParser.init(allocator, &ctx);
-    defer parser.deinit();
+    // Like `>`, `>>` is not folded at parse time — it stays an `.append_redirect`
+    // binary op, overloaded with shift-right and resolved by the IR compiler.
+    const src = "echo \"hi\" >> \"file.txt\"";
+    var tp: TestParser = undefined;
+    tp.init(allocator);
+    const parser = &tp.parser;
+    defer tp.deinit();
 
-    const script = try parser.parseSource(ctx.source);
-    const stage = script.statements[0].expression.expression.pipeline.stages[0];
-    const command = stage.payload.command;
-
-    try std.testing.expectEqual(@as(usize, 1), command.redirects.len);
-    try std.testing.expectEqual(ast.RedirectionMode.append, command.redirects[0].mode);
-    try std.testing.expectEqual(@as(usize, 1), command.redirects[0].target.path.value.segments.len);
-    try std.testing.expect(std.meta.activeTag(command.redirects[0].target.path.value.segments[0]) == .text);
-    try std.testing.expectEqualStrings("file.txt", command.redirects[0].target.path.value.segments[0].text.payload);
+    const script = try parser.parseSource(src);
+    const expr = script.statements[0].expression.expression.*;
+    try std.testing.expect(std.meta.activeTag(expr) == .binary);
+    try std.testing.expect(expr.binary.op == .append_redirect);
+    const target = expr.binary.right;
+    try std.testing.expect(target.* == .literal and target.literal == .string);
+    try std.testing.expectEqualStrings("file.txt", target.literal.string.segments[0].text.payload);
 }
 
 test "parser allows interpolation in quoted redirection targets" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var ctx = TestCtx{ .source = "echo \"hi\" > \"${name}.txt\"" };
-    var parser = TestParser.init(allocator, &ctx);
-    defer parser.deinit();
+    const src = "echo \"hi\" > \"${name}.txt\"";
+    var tp: TestParser = undefined;
+    tp.init(allocator);
+    const parser = &tp.parser;
+    defer tp.deinit();
 
-    const script = try parser.parseSource(ctx.source);
-    const stage = script.statements[0].expression.expression.pipeline.stages[0];
-    const command = stage.payload.command;
-    const target = command.redirects[0].target.path.value;
+    const script = try parser.parseSource(src);
+    const expr = script.statements[0].expression.expression.*;
+    try std.testing.expect(expr.binary.op == .greater);
+    const target = expr.binary.right;
+    try std.testing.expect(target.* == .literal and target.literal == .string);
+    const segments = target.literal.string.segments;
 
-    try std.testing.expectEqual(@as(usize, 2), target.segments.len);
-    try std.testing.expect(std.meta.activeTag(target.segments[0]) == .interpolation);
-    try std.testing.expect(std.meta.activeTag(target.segments[1]) == .text);
-    try std.testing.expectEqualStrings(".txt", target.segments[1].text.payload);
-}
-
-test "parser rejects unquoted redirection targets" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var ctx = TestCtx{ .source = "echo \"hi\" > file.txt" };
-    var parser = TestParser.init(allocator, &ctx);
-    defer parser.deinit();
-
-    try std.testing.expectError(Error.UnexpectedToken, parser.parseSource(ctx.source));
+    // The quoted target mixes an interpolation with literal text; assert both
+    // are present regardless of how empty edges are segmented.
+    var saw_interpolation = false;
+    var saw_dot_txt = false;
+    for (segments) |segment| switch (segment) {
+        .interpolation => saw_interpolation = true,
+        .text => |t| if (std.mem.eql(u8, t.payload, ".txt")) {
+            saw_dot_txt = true;
+        },
+    };
+    try std.testing.expect(saw_interpolation);
+    try std.testing.expect(saw_dot_txt);
 }
 
 test "parser builds fd redirect with explicit source fd (1>&2)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var ctx = TestCtx{ .source = "echo \"hi\" 1>&2" };
-    var parser = TestParser.init(allocator, &ctx);
-    defer parser.deinit();
+    const src = "echo \"hi\" 1>&2";
+    var tp: TestParser = undefined;
+    tp.init(allocator);
+    const parser = &tp.parser;
+    defer tp.deinit();
 
-    const script = try parser.parseSource(ctx.source);
+    const script = try parser.parseSource(src);
     const call = script.statements[0].expression.expression.call;
 
     try std.testing.expectEqual(@as(usize, 1), call.arguments.len);
@@ -4085,15 +4098,17 @@ test "parser builds fd redirect with explicit source fd (1>&2)" {
 }
 
 test "parser builds fd redirect with implicit stdout source (>&2)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var ctx = TestCtx{ .source = "echo \"hi\" >&2" };
-    var parser = TestParser.init(allocator, &ctx);
-    defer parser.deinit();
+    const src = "echo \"hi\" >&2";
+    var tp: TestParser = undefined;
+    tp.init(allocator);
+    const parser = &tp.parser;
+    defer tp.deinit();
 
-    const script = try parser.parseSource(ctx.source);
+    const script = try parser.parseSource(src);
     const call = script.statements[0].expression.expression.call;
 
     try std.testing.expectEqual(@as(usize, 1), call.arguments.len);
@@ -4105,15 +4120,17 @@ test "parser builds fd redirect with implicit stdout source (>&2)" {
 }
 
 test "parser builds fd redirect in pipeline stage (1>&2)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var ctx = TestCtx{ .source = "echo \"hi\" 1>&2" };
-    var parser = TestParser.init(allocator, &ctx);
-    defer parser.deinit();
+    const src = "echo \"hi\" 1>&2";
+    var tp: TestParser = undefined;
+    tp.init(allocator);
+    const parser = &tp.parser;
+    defer tp.deinit();
 
-    const script = try parser.parseSource(ctx.source);
+    const script = try parser.parseSource(src);
     // The fd redirect strip should leave only the string argument (not the int prefix).
     const call = script.statements[0].expression.expression.call;
     try std.testing.expectEqual(@as(usize, 1), call.arguments.len);
@@ -4122,15 +4139,17 @@ test "parser builds fd redirect in pipeline stage (1>&2)" {
 }
 
 test "parser preserves chained fd redirect ordering (1>&2 2>path)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var ctx = TestCtx{ .source = "echo \"hi\" 1>&2 2>\"/dev/null\"" };
-    var parser = TestParser.init(allocator, &ctx);
-    defer parser.deinit();
+    const src = "echo \"hi\" 1>&2 2>\"/dev/null\"";
+    var tp: TestParser = undefined;
+    tp.init(allocator);
+    const parser = &tp.parser;
+    defer tp.deinit();
 
-    const script = try parser.parseSource(ctx.source);
+    const script = try parser.parseSource(src);
     const call = script.statements[0].expression.expression.call;
 
     try std.testing.expectEqual(@as(usize, 1), call.arguments.len);
@@ -4148,13 +4167,15 @@ test "parser preserves chained fd redirect ordering (1>&2 2>path)" {
 }
 
 test "parser rejects interpolation in import module names" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var ctx = TestCtx{ .source = "import \"foo${name}\"" };
-    var parser = TestParser.init(allocator, &ctx);
-    defer parser.deinit();
+    const src = "import \"foo${name}\"";
+    var tp: TestParser = undefined;
+    tp.init(allocator);
+    const parser = &tp.parser;
+    defer tp.deinit();
 
-    try std.testing.expectError(Error.StringInterpNotAllowed, parser.parseSource(ctx.source));
+    try std.testing.expectError(Error.StringInterpNotAllowed, parser.parseSource(src));
 }

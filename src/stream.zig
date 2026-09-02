@@ -1182,9 +1182,20 @@ pub fn Stream(comptime T: type) type {
     };
 }
 
+var stream_test_threaded: std.Io.Threaded = undefined;
+var stream_test_threaded_ready = false;
+
+fn testIo() std.Io {
+    if (!stream_test_threaded_ready) {
+        stream_test_threaded = .init(std.heap.page_allocator, .{});
+        stream_test_threaded_ready = true;
+    }
+    return stream_test_threaded.io();
+}
+
 test "late destination connection flushes buffered data and propagates EOF" {
     const allocator = std.testing.allocator;
-    var tracer = Tracer.init(allocator, .{ .echo_to_stdout = false });
+    var tracer = Tracer.init(testIo(), allocator, .{ .echo_to_stdout = false });
     defer tracer.deinit();
 
     const stream = try Stream(u8).initReaderWriter(allocator, "late-connect", .{}, &tracer);

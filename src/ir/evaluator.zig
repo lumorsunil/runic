@@ -2557,6 +2557,13 @@ fn testIo() std.Io {
     return test_threaded.io();
 }
 
+var test_env: ?std.process.Environ.Map = null;
+
+fn testEnvMap() *std.process.Environ.Map {
+    if (test_env == null) test_env = std.process.Environ.Map.init(std.heap.page_allocator);
+    return &test_env.?;
+}
+
 fn initTestEvaluator(
     allocator: Allocator,
 ) !struct {
@@ -2717,7 +2724,7 @@ test "evaluator materializeString reports missing pipe handle" {
         .tracer = &fixture.tracer,
     }, &fixture.context);
 
-    try fixture.context.addMainThread(null);
+    try fixture.context.addMainThread(testEnvMap());
     const thread = fixture.context.getCurrentThread().?;
     var writer = std.Io.Writer.Allocating.init(allocator);
     defer writer.deinit();
@@ -2746,7 +2753,7 @@ test "evaluator fast arithmetic path updates ref destination" {
         .tracer = &fixture.tracer,
     }, &fixture.context);
 
-    try fixture.context.addMainThread(null);
+    try fixture.context.addMainThread(testEnvMap());
     const thread = fixture.context.getCurrentThread().?;
     try thread.private.stack.appendSlice(allocator, &.{ .{ .integer = 4 }, .{ .integer = 7 } });
 
@@ -2764,7 +2771,7 @@ test "evaluator fast arithmetic path updates ref destination" {
         else => unreachable,
     }
 
-    try std.testing.expectEqual(@as(u64, 11), thread.private.stack.items[1].integer);
+    try std.testing.expectEqual(@as(i64, 11), thread.private.stack.items[1].integer);
 }
 
 test "evaluator fast arithmetic path updates closure destination" {
@@ -2785,7 +2792,7 @@ test "evaluator fast arithmetic path updates closure destination" {
         .tracer = &fixture.tracer,
     }, &fixture.context);
 
-    try fixture.context.addMainThread(null);
+    try fixture.context.addMainThread(testEnvMap());
     const thread = fixture.context.getCurrentThread().?;
     try thread.private.stack.resize(allocator, 4);
     @memset(thread.private.stack.items, .void);
@@ -2798,11 +2805,11 @@ test "evaluator fast arithmetic path updates closure destination" {
     thread.private.stack.items[3] = .fromAddr(closure_addr);
     fixture.context.shared.heapGetPtr(closure_addr).?.* = .{ .integer = 4 };
 
-    const closure_slot = ir.Location.initAbs(.closure, .{}).dereference();
+    const closure_slot = ir.Location.initAbs(.closure, .{});
 
     switch (try evaluator.runInstruction(thread, .init(null, .{ .ath = .{
         .op = .add,
-        .a = .fromLocation(closure_slot),
+        .a = .fromLocation(closure_slot.dereference()),
         .b = .fromValue(.{ .integer = 7 }),
         .result = closure_slot,
     } }))) {
@@ -2810,7 +2817,7 @@ test "evaluator fast arithmetic path updates closure destination" {
         else => unreachable,
     }
 
-    try std.testing.expectEqual(@as(u64, 11), fixture.context.shared.heapGet(closure_addr).?.integer);
+    try std.testing.expectEqual(@as(i64, 11), fixture.context.shared.heapGet(closure_addr).?.integer);
 }
 
 test "evaluator fast compare path updates register destination" {
@@ -2831,7 +2838,7 @@ test "evaluator fast compare path updates register destination" {
         .tracer = &fixture.tracer,
     }, &fixture.context);
 
-    try fixture.context.addMainThread(null);
+    try fixture.context.addMainThread(testEnvMap());
     const thread = fixture.context.getCurrentThread().?;
     thread.private.result_register = .{ .integer = 9 };
     thread.private.result_register_2 = .{ .integer = 3 };
@@ -2870,7 +2877,7 @@ test "evaluator fast compare path reads dereferenced refs" {
         .tracer = &fixture.tracer,
     }, &fixture.context);
 
-    try fixture.context.addMainThread(null);
+    try fixture.context.addMainThread(testEnvMap());
     const thread = fixture.context.getCurrentThread().?;
     try thread.private.stack.appendSlice(allocator, &.{ .{ .integer = 3 }, .{ .integer = 7 } });
 
@@ -2911,7 +2918,7 @@ test "evaluator fused range loop updates accumulator and exits loop" {
         .tracer = &fixture.tracer,
     }, &fixture.context);
 
-    try fixture.context.addMainThread(null);
+    try fixture.context.addMainThread(testEnvMap());
     const thread = fixture.context.getCurrentThreadPtr().?;
     try thread.private.stack.appendSlice(allocator, &.{
         .{ .integer = 0 },
@@ -2933,7 +2940,7 @@ test "evaluator fused range loop updates accumulator and exits loop" {
         .init(null, .{ .jmp = .{
             .cond = .fromLocation(.initRegister(.r2)),
             .jump_if = false,
-            .dest = .init(0, .{ .abs = 5 }),
+            .dest = .initAbs(0, 5),
         } }),
         .init(null, .{ .ath = .{
             .op = .add,
@@ -2950,13 +2957,13 @@ test "evaluator fused range loop updates accumulator and exits loop" {
         .init(null, .{ .jmp = .{
             .cond = null,
             .jump_if = false,
-            .dest = .init(0, .{ .abs = 0 }),
+            .dest = .initAbs(0, 0),
         } }),
     };
 
     try std.testing.expect(try evaluator.tryRunFastRangeLoop(thread, &instructions));
-    try std.testing.expectEqual(@as(u64, 10), thread.private.stack.items[0].integer);
-    try std.testing.expectEqual(@as(u64, 5), thread.private.stack.items[2].integer);
+    try std.testing.expectEqual(@as(i64, 10), thread.private.stack.items[0].integer);
+    try std.testing.expectEqual(@as(i64, 5), thread.private.stack.items[2].integer);
     try std.testing.expectEqual(@as(usize, 5), thread.getCurrentInstructionAddr().local_addr);
     try std.testing.expect(switch (thread.private.result_register_2) {
         .exit_code => |exit_code| !exit_code.toBoolean(),

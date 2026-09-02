@@ -920,8 +920,26 @@ fn endsWithNewline(source: []const u8) bool {
     return last == '\n' or last == '\r';
 }
 
+var lexer_test_threaded: std.Io.Threaded = undefined;
+var lexer_test_threaded_ready = false;
+
+fn testIo() std.Io {
+    if (!lexer_test_threaded_ready) {
+        lexer_test_threaded = .init(std.heap.page_allocator, .{});
+        lexer_test_threaded_ready = true;
+    }
+    return lexer_test_threaded.io();
+}
+
+var lexer_test_env: ?std.process.Environ.Map = null;
+
+fn testEnv() *std.process.Environ.Map {
+    if (lexer_test_env == null) lexer_test_env = std.process.Environ.Map.init(std.heap.page_allocator);
+    return &lexer_test_env.?;
+}
+
 test "lexer tokenizes declarations and synthesizes trailing newline" {
-    var lexer = try Lexer.init(std.testing.allocator, "main.rn", "const foo = 42");
+    var lexer = try Lexer.init(testIo(), std.testing.allocator, testEnv(), "main.rn", "const foo = 42");
     defer lexer.deinit();
 
     const expected_tags = [_]token.Tag{ .kw_const, .identifier, .assign, .int_literal, .newline, .eof };
@@ -943,7 +961,7 @@ test "lexer tokenizes declarations and synthesizes trailing newline" {
 
 test "lexer balances nested braces inside string interpolation" {
     const source = "\"prefix ${foo {bar}} tail\"";
-    var lexer = try Lexer.init(std.testing.allocator, "interpolation.rn", source);
+    var lexer = try Lexer.init(testIo(), std.testing.allocator, testEnv(), "interpolation.rn", source);
     defer lexer.deinit();
 
     const expected = [_]struct { tag: token.Tag, lexeme: []const u8 }{
@@ -970,7 +988,7 @@ test "lexer balances nested braces inside string interpolation" {
 
 test "lexer keeps array literal and indexing inside interpolation" {
     const source = "\"${.{1,2,3}[0]}\"";
-    var lexer = try Lexer.init(std.testing.allocator, "interpolation-array.rn", source);
+    var lexer = try Lexer.init(testIo(), std.testing.allocator, testEnv(), "interpolation-array.rn", source);
     defer lexer.deinit();
 
     const expected = [_]struct { tag: token.Tag, lexeme: []const u8 }{
@@ -1001,7 +1019,7 @@ test "lexer keeps array literal and indexing inside interpolation" {
 }
 
 test "lexer restores succesfully" {
-    var lexer = try Stream.init(std.testing.allocator, "main.rn", "// comment\n\necho \"${a}\"");
+    var lexer = try Stream.init(testIo(), std.testing.allocator, testEnv(), "main.rn", "// comment\n\necho \"${a}\"");
     defer lexer.deinit();
 
     const expected_tags = [_]token.Tag{ .newline, .newline, .identifier, .string_start, .string_text, .string_interp_start, .identifier, .string_interp_end, .string_end };
@@ -1043,7 +1061,7 @@ test "lexer restores succesfully" {
 }
 
 test "lexer restores succesfully - peek" {
-    var lexer = try Stream.init(std.testing.allocator, "main.rn", "// comment\n\necho \"${a}\"");
+    var lexer = try Stream.init(testIo(), std.testing.allocator, testEnv(), "main.rn", "// comment\n\necho \"${a}\"");
     defer lexer.deinit();
 
     const expected_peeked_tags = [_]token.Tag{ .newline, .newline, .identifier };
@@ -1065,7 +1083,7 @@ test "lexer restores succesfully - peek" {
 }
 
 test "lexer restores succesfully - peek and next" {
-    var lexer = try Stream.init(std.testing.allocator, "main.rn", "// comment\n\necho \"${a}\"");
+    var lexer = try Stream.init(testIo(), std.testing.allocator, testEnv(), "main.rn", "// comment\n\necho \"${a}\"");
     defer lexer.deinit();
 
     const expected_peeked_tags = [_]token.Tag{ .newline, .identifier, .string_start, .string_text, .string_interp_start, .identifier };
