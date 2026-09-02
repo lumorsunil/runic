@@ -439,7 +439,9 @@
 - [x] escaped double quotes print as \"
 - [ ] `$(sleep 0.5; echo "after")` produces a parsing error
 - [x] syntax highlighting for match
-- [ ] `true "hello` is parsed as a call with `true` as the callee
+- [x] `true "hello` is parsed as a call with `true` as the callee — an
+      unterminated string now reports a clear lexer diagnostic instead of
+      exiting silently (thrown lexer errors are recorded as diagnostics)
 - [x] scripts/run_ci.rn fails with: `Type checker failed to run: error.UnsupportedStatement`
 - [x] scripts/run_ci.rn fails to detect Zig when repo-root paths are built from env-backed strings
 - [x] assigning a bound string or execution result into an env var does not populate the env var correctly
