@@ -572,6 +572,9 @@ pub const Lexer = struct {
         const start = self.mark();
         _ = self.advance();
         if (self.match('|')) {
+            if (self.match('=')) {
+                return self.finish(.startAt(start), .or_assign);
+            }
             return self.finish(.startAt(start), .pipe_pipe);
         }
         return self.finish(.startAt(start), .pipe);
@@ -581,6 +584,9 @@ pub const Lexer = struct {
         const start = self.mark();
         _ = self.advance();
         if (self.match('&')) {
+            if (self.match('=')) {
+                return self.finish(.startAt(start), .and_assign);
+            }
             return self.finish(.startAt(start), .amp_amp);
         }
         // `&0`/`&1`/`&2` — a file-descriptor reference (stdin/stdout/stderr).

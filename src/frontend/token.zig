@@ -198,6 +198,8 @@ pub const Tag = enum {
     mul_assign,
     div_assign,
     rem_assign,
+    or_assign,
+    and_assign,
     /// Promise prefix "^".
     caret,
     amp,

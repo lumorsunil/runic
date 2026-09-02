@@ -65,6 +65,17 @@ end and `x[..b]` from the start (`x[..]` is a full copy). Bounds are clamped to
 `[0, len]`, so an out-of-range or inverted range yields an empty result rather
 than an error. Plain indexing `x[i]` is unchanged.
 
+### Compound assignment
+
+A `var` can be updated with a **compound assignment**, which applies an operator to its current value: `+=`, `-=`, `*=`, `/=`, `%=` for arithmetic, and `||=`, `&&=` for logical values (`x ||= y` is exactly `x = x || y`, with the same short-circuit behavior).
+
+```rn
+var total = 0
+total += 5              // total = total + 5  → 5
+var found = false
+found ||= (total > 3)   // found = found || (total > 3)  → true
+```
+
 ### Environment variables
 
 Environment variables are explicit. Use `$NAME` to read an environment entry as `?String`, and `$NAME = ...` to update the current subshell context so later child processes inherit the new value. Bare identifiers like `HOME` are normal Runic bindings and are distinct from `$HOME`.
