@@ -4,6 +4,7 @@ mix=256
 prec=24
 arith=-4
 fpow=3 negexp=0.25
+unary=5 -4 7
 reassign=5
 first
 second

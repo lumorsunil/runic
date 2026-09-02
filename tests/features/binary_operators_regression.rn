@@ -16,8 +16,10 @@ echo "prec=${3 * 2 ** 3}"
 const neg = 0 - 8
 echo "arith=${neg >> 1}"
 
-// Float exponent: fractional and negative exponents widen to Float.
-echo "fpow=${9 ** 0.5} negexp=${2 ** (0 - 2)}"
+// Float exponent: fractional and negative exponents widen to Float. A unary
+// minus is accepted directly after a binary operator (no parens needed).
+echo "fpow=${9 ** 0.5} negexp=${2 ** -2}"
+echo "unary=${3 - -2} ${2 * -2} ${10 + -3}"
 
 // Reassignment with a shift on the same binding (in-place accumulation path).
 var n = 5

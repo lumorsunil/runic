@@ -877,6 +877,13 @@ pub const Parser = struct {
                         try components.append(self.allocator, .{ .expr = path_expr });
                         continue;
                     }
+                    // A unary prefix (`-x`, `!x`) in value position — including
+                    // after a binary operator (`2 ** -2`, `3 - -2`). Delegates to
+                    // the same helper as a leading unary, so binding is uniform.
+                    if (try self.parseMaybeUnaryExpression()) |unary_expr| {
+                        try components.append(self.allocator, .{ .expr = unary_expr });
+                        continue;
+                    }
                     switch (next.tag) {
                         .identifier => {
                             const breadcrumbInner = try self.createBreadcrumb("PBE:identifier");
