@@ -3852,7 +3852,9 @@ pub const IRCompiler = struct {
     }
 
     fn parseInt(text: []const u8) std.fmt.ParseIntError!ir.Value {
-        return .{ .integer = try std.fmt.parseInt(i64, text, 10) };
+        // Base 0 auto-detects `0x`/`0o`/`0b` prefixes; a bare or leading-zero
+        // number stays decimal (Zig does not treat `042` as octal).
+        return .{ .integer = try std.fmt.parseInt(i64, text, 0) };
     }
 
     fn parseFloat(text: []const u8) std.fmt.ParseFloatError!ir.Value {

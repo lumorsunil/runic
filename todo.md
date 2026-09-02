@@ -104,10 +104,9 @@
         literal is member access, not a `N.` float.
 - [x] unary operators
   - [x] bitwise negation — `x.bnot` (method form, see above)
-- [ ] numeric literal bases: hex `0x`, binary `0b`, octal `0o` — the lexer is
-      decimal-only today (`0x10` lexes as int `0` + identifier `x10`); a natural
-      companion to the bitwise ops for masks. Add to `lexNumber` + parse the
-      literal with base 0 in the compiler.
+- [x] numeric literal bases: hex `0x`, binary `0b`, octal `0o` — lexed in
+      `lexNumber` and parsed with base 0 (a leading zero is not octal; `042` is
+      decimal). Floats/exponents unaffected.
 - [x] boolean algebra
 - [x] comparisons (numeric)
 - [x] string concatenation

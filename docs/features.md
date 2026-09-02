@@ -58,6 +58,8 @@ const inv  = tog.bnot               // bitwise NOT   (a.bnot; two's complement)
 
 **Result:** each yields an `Int`; `band`/`bor`/`bxor` take one argument, `bnot` none. They compose (`(a.band mask).bor bit`) and pair naturally with the shifts. Method calls work on integer literals too — `6.band 3` — since `.` before a letter is member access, not a decimal point (`6.5` is still a float).
 
+Integer literals may be written in **hex** (`0x1f`), **octal** (`0o17`), or **binary** (`0b1010`) as well as decimal — handy for masks (`value.band 0x0f`). A leading zero does not imply octal: `042` is decimal `42`.
+
 ### Slicing
 
 An array or string can be **sliced** with a range index — `x[a..b]` is the

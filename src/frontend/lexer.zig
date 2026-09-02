@@ -311,6 +311,29 @@ pub const Lexer = struct {
     fn lexNumber(self: *Lexer) token.Token {
         const start = self.location();
         const start_index = self.index;
+
+        // Non-decimal integer literals: `0x…` (hex), `0o…` (octal), `0b…`
+        // (binary). The `0`-prefixed form is unambiguous with a bare `0`.
+        if (self.peekIs('0') and self.index + 1 < self.source.len) {
+            const radix: ?u8 = switch (self.source[self.index + 1]) {
+                'x', 'X' => 16,
+                'o', 'O' => 8,
+                'b', 'B' => 2,
+                else => null,
+            };
+            if (radix) |r| {
+                _ = self.advance(); // '0'
+                _ = self.advance(); // base marker
+                self.consumeRadixDigits(r);
+                const lexeme = self.source[start_index..self.index];
+                return .{
+                    .tag = .int_literal,
+                    .lexeme = lexeme,
+                    .span = .{ .start = start, .end = self.location() },
+                };
+            }
+        }
+
         var has_dot = false;
         var has_exponent = false;
 
@@ -714,6 +737,19 @@ pub const Lexer = struct {
         const next_index = self.index + 1;
         if (next_index >= self.source.len) return false;
         return self.source[next_index] == needle;
+    }
+
+    fn consumeRadixDigits(self: *Lexer, radix: u8) void {
+        while (self.peek()) |ch| {
+            const valid = switch (radix) {
+                16 => (ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f') or (ch >= 'A' and ch <= 'F'),
+                8 => ch >= '0' and ch <= '7',
+                2 => ch == '0' or ch == '1',
+                else => ch >= '0' and ch <= '9',
+            };
+            if (!valid) break;
+            _ = self.advance();
+        }
     }
 
     fn peekNextIsDigit(self: *Lexer) bool {
