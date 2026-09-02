@@ -7080,6 +7080,17 @@ pub const IRCompiler = struct {
         return try self.compileFunctionCall(source, fn_ref, &.{arg_expr}, &.{}, null);
     }
 
+    /// A bare `&0` used as a pipeline stage forwards its stdin straight through
+    /// to its stdout (so `&0 | cat` pipes the enclosing function's stdin into
+    /// `cat`), instead of reading stdin as a single value. Returns null when the
+    /// stage is not a readable-fd (`&0`) expression, so normal stage compilation
+    /// applies.
+    fn tryCompileFdForwardStage(self: *IRCompiler, source: *ast.Expression, stage_expr: *ast.Expression) Error!?Result {
+        if (stage_expr.* != .fd or stage_expr.fd.fd != 0) return null;
+        try self.pipeFwd(source, self.threadStdin(), self.threadStdout());
+        return .fromValue(.void);
+    }
+
     fn compilePipeline(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -7182,8 +7193,10 @@ pub const IRCompiler = struct {
             const pushed_stdin = i > 0;
             if (pushed_stdin) try self.stdin_type_stack.append(self.allocator, inferred_stdin);
             // Only a receiver stage (not the producer at i==0) can bind stdin to
-            // a parameter.
-            const result = if (i > 0)
+            // a parameter. A bare `&0` stage forwards stdin to stdout.
+            const result = if (try self.tryCompileFdForwardStage(source, stage_expr)) |fwd|
+                fwd
+            else if (i > 0)
                 (try self.tryCompilePipelineParamStage(source, stage_expr)) orelse try self.compileExpression(stage_expr)
             else
                 try self.compileExpression(stage_expr);
@@ -7221,7 +7234,8 @@ pub const IRCompiler = struct {
             self.allocator,
             self.stageStdoutType(pipeline.stages[last_idx - 1]),
         );
-        const result = (try self.tryCompilePipelineParamStage(source, pipeline.stages[last_idx])) orelse
+        const result = (try self.tryCompileFdForwardStage(source, pipeline.stages[last_idx])) orelse
+            (try self.tryCompilePipelineParamStage(source, pipeline.stages[last_idx])) orelse
             try self.compileExpression(pipeline.stages[last_idx]);
         if (last_pushed_stdin) _ = self.stdin_type_stack.pop();
         if (isWaitable(result)) |loc| {

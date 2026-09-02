@@ -1,0 +1,22 @@
+// A bare `&0` used as a pipeline stage forwards the enclosing function's stdin
+// straight into the pipeline, instead of reading it as a single value. So
+// `&0 | cmd` pipes stdin into an external command, and `&0` composes with
+// further stages. Reading `&0` as a value (`yield &0`) is unchanged.
+fn String passthrough() String { &0 | cat }
+echo "hello world" | passthrough
+
+fn String upcase() String { &0 | tr "a-z" "A-Z" }
+echo "shout" | upcase
+
+// `&0` as the first of several stages.
+fn String bytes() String { &0 | cat | wc "-c" }
+printf "abc" | bytes
+
+// Multi-line input streams through.
+fn String each() String { &0 | grep "keep" }
+printf "drop\nkeep me\ndrop\n" | each
+
+// Empty stdin terminates cleanly (no hang, no output).
+fn String maybe() String { &0 | cat }
+printf "" | maybe
+echo "done"

@@ -827,6 +827,26 @@ fn Int consume_once() Int {
 echo "7" | parseInt | consume_once   // prints 7
 ```
 
+#### Forwarding stdin into a pipeline with `&0 |`
+
+Used as a **pipeline stage** rather than read as a value, a bare `&0` forwards
+the function's stdin straight into the pipeline — so you can hand it to an
+external command (or a further stage) without materializing it first:
+
+```rn
+fn String shout() String {
+    &0 | tr "a-z" "A-Z"
+}
+
+echo "hello" | shout   // prints HELLO
+```
+
+**Result:** `&0` pipes the function's stdin into `tr`, whose output becomes the
+function's output. It composes with more stages (`&0 | cat | wc "-c"`), streams
+line by line, and terminates cleanly on empty input. This is distinct from
+reading `&0` as a value (`const s = &0`, `yield &0`) above — the meaning is set
+by whether `&0` appears as a pipeline stage or in a value position.
+
 #### Consuming a live stream with `for (&0)`
 
 When the upstream stage `yield`s many values over its lifetime, the downstream

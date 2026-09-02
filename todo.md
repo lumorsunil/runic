@@ -39,7 +39,8 @@
   replacing `@stdin`
   - [x] `&0` — reads the function's stdin as a typed value (String/Int)
   - [x] `yield &2 expr` — write to stderr
-  - [ ] `&0 | cat` — pipe stdin directly into a command
+  - [x] `&0 | cat` — a bare `&0` pipeline stage forwards the function's stdin
+    into the pipeline (distinct from reading `&0` as a value)
 - [x] `yield` keyword — explicit output (stdout by default, `yield &2` for stderr)
 - [ ] typed pipes
   - [x] type-check pipe boundary compatibility (exact match)
