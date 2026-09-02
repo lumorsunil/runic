@@ -67,6 +67,7 @@ pub const Error =
         MissingSpawnedThreadContext,
         InvalidInt,
         InvalidFloat,
+        CommandNotFound,
     };
 
 pub const Result = union(enum) {
@@ -387,6 +388,29 @@ pub const IREvaluator = struct {
         return .{ .argv = argv, .owned = owned };
     }
 
+    /// Reports a missing executable the way bash does — the command name and
+    /// where it was invoked — with a precise message, then returns
+    /// `error.CommandNotFound`. The runner leaves that error un-decorated (it is
+    /// already reported here), so an unbound identifier used as a command no
+    /// longer surfaces as a bare `error.FileNotFound`.
+    fn reportCommandNotFound(self: *IREvaluator, thread: ir.context.IRThreadContext, name: []const u8) Error {
+        _ = self;
+        if (thread.currentInstruction()) |instr| {
+            if (instr.source) |source| {
+                const span = source.span();
+                std.log.err("{s}:{}:{}: command not found: '{s}'", .{
+                    span.start.file,
+                    span.start.line,
+                    span.start.column,
+                    name,
+                });
+                return error.CommandNotFound;
+            }
+        }
+        std.log.err("command not found: '{s}'", .{name});
+        return error.CommandNotFound;
+    }
+
     fn spawnSimpleExec(
         self: *IREvaluator,
         thread: ir.context.IRThreadContext,
@@ -420,14 +444,17 @@ pub const IREvaluator = struct {
         try flushInheritedChildOutput(stdout_pipe, stdout_behavior);
         try flushInheritedChildOutput(stderr_pipe, stderr_behavior);
 
-        const child = try std.process.spawn(io, .{
+        const child = std.process.spawn(io, .{
             .argv = argv_slice,
             .environ_map = &ctx.env,
             .cwd = if (ctx.cwd) |c| .{ .path = c } else .inherit,
             .stdin = stdin_behavior,
             .stdout = stdout_behavior,
             .stderr = stderr_behavior,
-        });
+        }) catch |err| switch (err) {
+            error.FileNotFound => return self.reportCommandNotFound(thread, argv_slice[0]),
+            else => return err,
+        };
 
         const child_ptr = try self.allocator.create(std.process.Child);
         child_ptr.* = child;
@@ -1605,15 +1632,19 @@ pub const IREvaluator = struct {
                 try flushInheritedChildOutput(stdout_pipe, stdout_behavior);
                 try flushInheritedChildOutput(stderr_pipe, stderr_behavior);
 
-                const child = try self.allocator.create(std.process.Child);
-                child.* = try std.process.spawn(io, .{
+                const spawned = std.process.spawn(io, .{
                     .argv = argv_slice,
                     .environ_map = &ctx.env,
                     .cwd = if (ctx.cwd) |c| .{ .path = c } else .inherit,
                     .stdin = stdin_behavior,
                     .stdout = stdout_behavior,
                     .stderr = stderr_behavior,
-                });
+                }) catch |err| switch (err) {
+                    error.FileNotFound => return self.reportCommandNotFound(thread, argv_slice[0]),
+                    else => return err,
+                };
+                const child = try self.allocator.create(std.process.Child);
+                child.* = spawned;
                 thread.private.process = child;
 
                 // TODO: memory management

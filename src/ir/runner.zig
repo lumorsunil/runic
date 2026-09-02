@@ -112,7 +112,7 @@ pub const IRRunner = struct {
             // the point they occur (e.g. InvalidInt/InvalidFloat name the
             // offending input); don't also emit the generic "Error evaluating"
             // line for those.
-            if (err == error.InvalidInt or err == error.InvalidFloat) return err;
+            if (err == error.InvalidInt or err == error.InvalidFloat or err == error.CommandNotFound) return err;
 
             if (current_instr) |ci| {
                 if (ci.source) |source| {
