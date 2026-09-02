@@ -20,7 +20,12 @@
   the same escaping model should apply to identifiers as well
 - [ ] support invoking dotted executable names such as `cmd.exe`, and decide
   how that syntax coexists with `.` member access
-- [ ] trying to call a command as an identifier that is not bound will result in unknown identifier error
+- [x] trying to call a command as an identifier that is not bound will result
+      in unknown identifier error — a missing executable now reports
+      `command not found: '<name>'` with the call's source location (a clean
+      `CommandNotFound`) instead of a bare `error.FileNotFound`. (A statically
+      unbound bare word can't be told from a valid external command, so this is
+      a runtime diagnostic, at both the sync and async spawn sites.)
 - [ ] all executables can be thought of as runic functions with the signature:
       `fn Stream(String) <exec-name>(...[]String) Stream(String)`
 

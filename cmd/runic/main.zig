@@ -15,9 +15,9 @@ pub fn main(init: std.process.Init) !void {
     const exit_code = mainImpl(init) catch |err| {
         // Errors that already printed a precise, user-facing message at the
         // point of failure (e.g. InvalidInt/InvalidFloat name the offending
-        // input and location) skip the generic footer so the user sees one
-        // clean line.
-        if (err != error.InvalidInt and err != error.InvalidFloat) {
+        // input and location; CommandNotFound names the missing command) skip
+        // the generic footer so the user sees one clean line.
+        if (err != error.InvalidInt and err != error.InvalidFloat and err != error.CommandNotFound) {
             std.log.err("runic exited with error: {t}", .{err});
         }
         std.process.exit(1);
