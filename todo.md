@@ -61,7 +61,8 @@
     downstream `for (&0)` / `parseInt` processes one line at a time
   - [x] `parseFloat` builtin (`fn String parseFloat() Float`); maps per value
     like `parseInt`, shares `compileParseMapStage`
-  - [ ] other parse builtins (e.g. `parseBool`)
+  - [x] `parseBool` builtin (`fn String parseBool() ParseError!Bool`); parses
+    "true"/"false" (case-insensitive), maps per value like parseInt/parseFloat
   - [ ] streaming `lines` (currently buffers all input before splitting) and
     other framers / custom delimiters
   - [x] in-process typed transport for scalars (Int/Float pass between stages

@@ -3962,6 +3962,15 @@ pub const IRCompiler = struct {
             return .fromValue(.void);
         }
 
+        // parseBool builtin (`fn String parseBool() ParseError!Bool`): maps each
+        // input value to a Bool, parsing the text "true"/"false".
+        if (std.mem.eql(u8, identifier.name, "parseBool") and
+            self.lookup(identifier.name, .{ .shallow = false }) == null)
+        {
+            try self.compileParseMapStage(source, "parse_bool", .parse_bool, ast.TypeExpr.global(.boolean));
+            return .fromValue(.void);
+        }
+
         // lines builtin (`fn String lines() String`): reads the whole byte
         // stdin and frames it into per-line values — each non-empty line is
         // enqueued as a separate value onto the (typed) stdout pipe, so a
@@ -6682,6 +6691,7 @@ pub const IRCompiler = struct {
         // of String values. All use typed (queue) transport.
         if (self.isBuiltinStage(stage, "parseInt") or
             self.isBuiltinStage(stage, "parseFloat") or
+            self.isBuiltinStage(stage, "parseBool") or
             self.isBuiltinStage(stage, "lines"))
         {
             return .exact_typed;
@@ -6724,7 +6734,7 @@ pub const IRCompiler = struct {
         // they accept a typed (framed) stream from `lines`. (An executable/byte
         // upstream still forces the byte path via the upstream's output kind,
         // where they read the whole blob as a single value.)
-        if (self.isBuiltinStage(stage, "parseInt") or self.isBuiltinStage(stage, "parseFloat")) return .exact_typed;
+        if (self.isBuiltinStage(stage, "parseInt") or self.isBuiltinStage(stage, "parseFloat") or self.isBuiltinStage(stage, "parseBool")) return .exact_typed;
         // A block stage declares no stdin type — it adapts to the upstream
         // stage (its `&0` is typed by inference). Treat it as permissive so the
         // upstream's output kind decides the boundary; an executable upstream
@@ -6774,6 +6784,7 @@ pub const IRCompiler = struct {
 
         if (self.isBuiltinStage(stage, "parseInt")) return .global(.integer);
         if (self.isBuiltinStage(stage, "parseFloat")) return .global(.float);
+        if (self.isBuiltinStage(stage, "parseBool")) return .global(.boolean);
         // `lines` frames its byte input into per-line String values.
         if (self.isBuiltinStage(stage, "lines")) return string_type;
 
@@ -6823,6 +6834,7 @@ pub const IRCompiler = struct {
             for (stages) |stage| {
                 if (self.isBuiltinStage(stage, "parseInt")) break :blk .{ .set = &ast.TypeExpr.parseErrorType, .payload = .global(.integer) };
                 if (self.isBuiltinStage(stage, "parseFloat")) break :blk .{ .set = &ast.TypeExpr.parseErrorType, .payload = .global(.float) };
+                if (self.isBuiltinStage(stage, "parseBool")) break :blk .{ .set = &ast.TypeExpr.parseErrorType, .payload = .global(.boolean) };
                 const callee = switch (stage.*) {
                     .call => |call| call.callee,
                     else => stage,
@@ -7040,7 +7052,7 @@ pub const IRCompiler = struct {
         // needs the typed (queue) path even though it carries String values.
         if (self.isBuiltinStage(upstream, "lines")) return true;
         const out_type = self.stageStdoutType(upstream) orelse return false;
-        return typeExprIsNamed(out_type, "Int") or typeExprIsNamed(out_type, "Float");
+        return typeExprIsNamed(out_type, "Int") or typeExprIsNamed(out_type, "Float") or typeExprIsNamed(out_type, "Bool");
     }
 
     /// Pipeline↔param coercion: a stage that is a zero-arg reference to a

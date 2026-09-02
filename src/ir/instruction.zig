@@ -205,6 +205,11 @@ pub const Instruction = struct {
         /// whitespace. stores the result in %r. invalid input is a runtime
         /// error. an existing Float (or EOF `.null`) passes through unchanged.
         parse_float,
+        /// parses the string in %r into a Bool value (`true`/`false`,
+        /// case-insensitive, whitespace-trimmed) and stores it in %r. invalid
+        /// input is a catchable `ParseError.Invalid`. an existing Bool
+        /// (`.exit_code`) or an EOF read (`.null`) passes through unchanged.
+        parse_bool,
         /// splits the string in %r by '\n' and enqueues each non-empty line as a
         /// separate value onto the given pipe's typed queue (framing a byte
         /// stream into per-line values). used by the `lines` builtin.
