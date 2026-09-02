@@ -439,7 +439,8 @@
 - [x] arrays will executable calls as elements cannot be accessed with element access operator
 - [x] pipelines are broken again
 - [x] escaped double quotes print as \"
-- [ ] `$(sleep 0.5; echo "after")` produces a parsing error
+- [x] `$(sleep 0.5; echo "after")` produces a parsing error — subshell bodies
+      now parse a statement sequence (`;`/newline-separated), like `(...)`
 - [x] syntax highlighting for match
 - [ ] `true "hello` is parsed as a call with `true` as the callee
 - [x] scripts/run_ci.rn fails with: `Type checker failed to run: error.UnsupportedStatement`
