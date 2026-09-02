@@ -2894,21 +2894,17 @@ pub const TypeChecker = struct {
         // type here (via the scoped shadow binding), so this only rejects the
         // un-narrowed case. Comparison/relational ops are intentionally allowed:
         // they are how you narrow (`if (x > 5)`, `if (x == 0)`).
-        switch (binary.op) {
-            // `.append_redirect` is `>>`: a shift-right when both operands are
-            // values (a command-left `>>` is an append-redirect, handled in the
-            // IR, and its operands are never sums).
-            .add, .subtract, .multiply, .divide, .remainder, .power, .shift_left, .append_redirect => {
-                try self.rejectBareSum(binary.left, left_type, "use in arithmetic");
-                try self.rejectBareSum(binary.right, right_type, "use in arithmetic");
-            },
+        // Arithmetic (and `>>` shift-right) can't be applied to a bare sum;
+        // narrow it first. `.shift_or_append` is `>>` on values (a command-left
+        // `>>` is an append-redirect handled in the IR, never a sum).
+        if (binary.op.isArithmetic() or binary.op.category() == .shift_or_append) {
+            try self.rejectBareSum(binary.left, left_type, "use in arithmetic");
+            try self.rejectBareSum(binary.right, right_type, "use in arithmetic");
+        } else if (binary.op.isComparison()) {
             // Comparing a sum to a value that can never share a member is almost
-            // always a mistake (the result is constant). Reject it when the
-            // intersection is empty. (`==`/`!=`/relational double as narrowing.)
-            .equal, .not_equal, .less, .less_equal, .greater, .greater_equal => {
-                try self.rejectEmptyComparison(binary.left, left_type, binary.right, right_type);
-            },
-            else => {},
+            // always a mistake (the result is constant); reject an empty
+            // intersection. (`==`/`!=`/relational double as narrowing.)
+            try self.rejectEmptyComparison(binary.left, left_type, binary.right, right_type);
         }
 
         // Member access parses as a `.member` binary op (e.g. `MyError.Nope`).

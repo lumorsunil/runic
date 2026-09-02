@@ -2120,6 +2120,27 @@ pub const IRCompiler = struct {
                 };
             },
             .binary => |binary| blk: {
+                // Arithmetic and `>>` shift-right fold when both operands fold.
+                if (binary.op.isArithmetic() or binary.op.category() == .shift_or_append) {
+                    const left = (try self.evalComptimeExpression(binary.left)) orelse break :blk null;
+                    const right = (try self.evalComptimeExpression(binary.right)) orelse break :blk null;
+                    break :blk if (evaluateArithmetic(.from(binary.op), left.source, right.source)) |result|
+                        .fromValue(result)
+                    else
+                        null;
+                }
+                if (binary.op.isComparison()) {
+                    const left = (try self.evalComptimeExpression(binary.left)) orelse break :blk null;
+                    const right = (try self.evalComptimeExpression(binary.right)) orelse break :blk null;
+                    if (evaluateCompare(.from(binary.op), left.source, right.source)) |result| {
+                        break :blk .fromValue(result);
+                    }
+                    if (binary.op == .equal or binary.op == .not_equal) {
+                        const equal = self.comptimeValueEql(left, right);
+                        break :blk .fromValue(.fromBoolean(if (binary.op == .equal) equal else !equal));
+                    }
+                    break :blk null;
+                }
                 switch (binary.op) {
                     .logical_and, .logical_or => {
                         const left = (try self.evalComptimeExpression(binary.left)) orelse break :blk null;
@@ -2137,36 +2158,6 @@ pub const IRCompiler = struct {
                             break :blk (try self.evalComptimeExpression(binary.right)) orelse break :blk null;
                         }
                         break :blk left;
-                    },
-                    .add, .subtract, .multiply, .divide, .remainder, .power, .shift_left => {
-                        const left = (try self.evalComptimeExpression(binary.left)) orelse break :blk null;
-                        const right = (try self.evalComptimeExpression(binary.right)) orelse break :blk null;
-                        break :blk if (evaluateArithmetic(.from(binary.op), left.source, right.source)) |result|
-                            .fromValue(result)
-                        else
-                            null;
-                    },
-                    // `>>` between comptime values is shift-right (a command
-                    // left, i.e. a redirect, never reaches comptime folding).
-                    .append_redirect => {
-                        const left = (try self.evalComptimeExpression(binary.left)) orelse break :blk null;
-                        const right = (try self.evalComptimeExpression(binary.right)) orelse break :blk null;
-                        break :blk if (evaluateArithmetic(.from(binary.op), left.source, right.source)) |result|
-                            .fromValue(result)
-                        else
-                            null;
-                    },
-                    .greater, .greater_equal, .less, .less_equal, .equal, .not_equal => {
-                        const left = (try self.evalComptimeExpression(binary.left)) orelse break :blk null;
-                        const right = (try self.evalComptimeExpression(binary.right)) orelse break :blk null;
-                        if (evaluateCompare(.from(binary.op), left.source, right.source)) |result| {
-                            break :blk .fromValue(result);
-                        }
-                        if (binary.op == .equal or binary.op == .not_equal) {
-                            const equal = self.comptimeValueEql(left, right);
-                            break :blk .fromValue(.fromBoolean(if (binary.op == .equal) equal else !equal));
-                        }
-                        break :blk null;
                     },
                     else => break :blk null,
                 }
@@ -6986,13 +6977,14 @@ pub const IRCompiler = struct {
                 else => null,
             },
             // Arithmetic preserves the operand's numeric type.
-            .binary => |binary| switch (binary.op) {
-                .add, .subtract, .multiply, .divide, .remainder, .power, .shift_left => self.inferYieldValueType(binary.left, captures),
+            .binary => |binary| if (binary.op.isArithmetic())
+                self.inferYieldValueType(binary.left, captures)
                 // `>>` between values is shift-right (Int); a command-left `>>`
                 // is a redirect and would not reach yield-type inference.
-                .append_redirect => ast.TypeExpr.global(.integer),
-                else => null,
-            },
+            else if (binary.op.category() == .shift_or_append)
+                ast.TypeExpr.global(.integer)
+            else
+                null,
             // `&0` carries the stage's inferred stdin type (pushed by the
             // pipeline compiler before the stage is classified/compiled).
             .fd => |fd_expr| if (fd_expr.fd == 0 and self.stdin_type_stack.items.len > 0)
@@ -8176,6 +8168,46 @@ pub const IRCompiler = struct {
         return .fromLocation(result_ref.dereference().typed(target_type));
     }
 
+    /// Lowers an arithmetic binary (`+ - * / % ** <<`) or `>>` shift-right. A
+    /// command-left `>>` (`.append_redirect`) is instead an append-redirect.
+    fn compileArithmeticBinary(self: *IRCompiler, source: anytype, binary: ast.BinaryExpr) Error!Result {
+        if (binary.op.category() == .shift_or_append) {
+            if (try self.greaterRedirectCall(binary)) |call_expr| {
+                return self.compileExpression(call_expr);
+            }
+        }
+
+        const left = try self.compileArithmeticOperand(source, binary.left);
+        const right = try self.compileArithmeticOperand(source, binary.right);
+
+        if (evaluateArithmetic(.from(binary.op), left.source, right.source)) |comptime_result| {
+            return .from(comptime_result);
+        }
+
+        const ref = try self.newRef(source, "ath_result");
+        try self.ath(source, binary.op, left.source, right.source, ref);
+        return .from(ref.dereference());
+    }
+
+    /// Lowers a comparison (`> >= < <= == !=`). A command-left `>` is an output
+    /// redirect, not a comparison.
+    fn compileComparisonBinary(self: *IRCompiler, source: anytype, binary: ast.BinaryExpr) Error!Result {
+        if (try self.greaterRedirectCall(binary)) |call_expr| {
+            return self.compileExpression(call_expr);
+        }
+
+        const left = try self.compileExpression(binary.left);
+        const right = try self.compileExpression(binary.right);
+
+        if (evaluateCompare(.from(binary.op), left.source, right.source)) |comptime_result| {
+            return .from(comptime_result);
+        }
+
+        const ref = try self.newRef(source, "cmp_result");
+        try self.cmp(source, binary.op, left.source, right.source, ref);
+        return .from(ref.dereference());
+    }
+
     fn compileBinary(
         self: *IRCompiler,
         source: anytype,
@@ -8184,40 +8216,10 @@ pub const IRCompiler = struct {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
         switch (binary.op) {
-            .add, .subtract, .multiply, .divide, .remainder, .power, .shift_left => {
-                const left = try self.compileArithmeticOperand(source, binary.left);
-                const right = try self.compileArithmeticOperand(source, binary.right);
-
-                if (evaluateArithmetic(.from(binary.op), left.source, right.source)) |comptime_result| {
-                    return .from(comptime_result);
-                }
-
-                const ref = try self.newRef(source, "ath_result");
-
-                try self.ath(source, binary.op, left.source, right.source, ref);
-
-                return .from(ref.dereference());
-            },
-            // `>>` is overloaded: a command on the left makes it an output
-            // append-redirect, a value makes it the shift-right operator.
-            .append_redirect => {
-                if (try self.greaterRedirectCall(binary)) |call_expr| {
-                    return self.compileExpression(call_expr);
-                }
-
-                const left = try self.compileArithmeticOperand(source, binary.left);
-                const right = try self.compileArithmeticOperand(source, binary.right);
-
-                if (evaluateArithmetic(.from(binary.op), left.source, right.source)) |comptime_result| {
-                    return .from(comptime_result);
-                }
-
-                const ref = try self.newRef(source, "ath_result");
-
-                try self.ath(source, binary.op, left.source, right.source, ref);
-
-                return .from(ref.dereference());
-            },
+            // Arithmetic, plus `>>` shift-right (`.append_redirect`, which is an
+            // append-redirect instead when its left is a command).
+            .add, .subtract, .multiply, .divide, .remainder, .power, .shift_left, .append_redirect => return self.compileArithmeticBinary(source, binary),
+            .greater, .greater_equal, .less, .less_equal, .equal, .not_equal => return self.compileComparisonBinary(source, binary),
             .logical_and, .logical_or, .sequence => {
                 // `errorUnion || fallback` discards the error; `errorUnion && next`
                 // is a monadic guard. Handle the non-capture cases here; everything
@@ -8240,25 +8242,6 @@ pub const IRCompiler = struct {
             },
             .@"orelse" => {
                 return self.compileOrelseBinary(source, binary);
-            },
-            .greater, .greater_equal, .less, .less_equal, .equal, .not_equal => {
-                // A command-left `>` is an output redirect, not a comparison.
-                if (try self.greaterRedirectCall(binary)) |call_expr| {
-                    return self.compileExpression(call_expr);
-                }
-
-                const left = try self.compileExpression(binary.left);
-                const right = try self.compileExpression(binary.right);
-
-                if (evaluateCompare(.from(binary.op), left.source, right.source)) |comptime_result| {
-                    return .from(comptime_result);
-                }
-
-                const ref = try self.newRef(source, "cmp_result");
-
-                try self.cmp(source, binary.op, left.source, right.source, ref);
-
-                return .from(ref.dereference());
             },
             .fd_source_truncate_redirect, .fd_source_append_redirect, .redirect_fd => return Error.UnsupportedBinaryOperation,
             .assign => {
@@ -8388,23 +8371,21 @@ pub const IRCompiler = struct {
                 const left = try self.compileExpression(binary.left);
                 if (left.source == .location and binary.right.* == .binary) {
                     const right_binary = binary.right.binary;
-                    switch (right_binary.op) {
-                        // `.append_redirect` here is `x = x >> n` (shift-right):
-                        // the left is a mutable binding, never a command.
-                        .add, .subtract, .multiply, .divide, .remainder, .power, .shift_left, .append_redirect => {
-                            if (expressionsStructurallyEqual(binary.left, right_binary.left)) {
-                                const right_operand = (try self.compileExpression(right_binary.right)).dereference();
-                                try self.ath(
-                                    source,
-                                    right_binary.op,
-                                    left.source,
-                                    right_operand.source,
-                                    left.source.location,
-                                );
-                                return .from(left.source.location);
-                            }
-                        },
-                        else => {},
+                    // `x = x <arith> n` in place. `.shift_or_append` here is
+                    // `x = x >> n` (shift-right): the left is a mutable binding,
+                    // never a command.
+                    if (right_binary.op.isArithmetic() or right_binary.op.category() == .shift_or_append) {
+                        if (expressionsStructurallyEqual(binary.left, right_binary.left)) {
+                            const right_operand = (try self.compileExpression(right_binary.right)).dereference();
+                            try self.ath(
+                                source,
+                                right_binary.op,
+                                left.source,
+                                right_operand.source,
+                                left.source.location,
+                            );
+                            return .from(left.source.location);
+                        }
                     }
                 }
                 // Capture a function call's typed return by value (a struct,
