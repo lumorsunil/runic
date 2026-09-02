@@ -43,7 +43,10 @@ exist.
 
 Current focus areas:
 
-- parser error recovery and better diagnostics after the first parse failure
+- ~~parser error recovery and better diagnostics after the first parse
+  failure~~ — top-level statement recovery landed; a failed statement now
+  resyncs and parsing continues, so multiple errors report at once. Nested
+  (in-construct) recovery is still future work.
 - remaining gaps in function behavior, especially stdin/stdout semantics and
   piping through functions/blocks
 - cleanup of execution-result behavior across more expression forms

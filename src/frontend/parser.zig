@@ -182,23 +182,133 @@ pub const Parser = struct {
             return .errDiagnostics(self.diagnostics.items, script);
         }
 
-        if (script == null and self.expected_token_count > 0) {
-            var buf: [512]u8 = undefined;
-            var writer = std.Io.Writer.fixed(&buf);
-            _ = self.writeExpectedTokens(&writer) catch {};
-            const span = self.unexpected_token_span orelse token.Span.fromLocs(token.Location.global, token.Location.global);
-            const message = self.arena.allocator().dupe(u8, writer.buffer[0..writer.end]) catch "unexpected token";
-            self.diagnostics.append(self.arena.allocator(), .{
-                .err = Error.UnexpectedToken,
-                .span_ = span,
-                .message = message,
-            }) catch {};
-            if (self.diagnostics.items.len > 0) {
-                return .errDiagnostics(self.diagnostics.items, script);
-            }
+        if (script == null and self.recordExpectedTokenDiagnostic()) {
+            return .errDiagnostics(self.diagnostics.items, script);
         }
 
         return .fromScript(script);
+    }
+
+    /// Records a diagnostic synthesized from the parser's pending expected-token
+    /// state ("expected X got Y"). Returns true when one was recorded (i.e.
+    /// there was pending state), false when there is nothing to describe.
+    fn recordExpectedTokenDiagnostic(self: *Self) bool {
+        if (self.expected_token_count == 0) return false;
+        var buf: [512]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buf);
+        _ = self.writeExpectedTokens(&writer) catch {};
+        const span = self.unexpected_token_span orelse token.Span.fromLocs(token.Location.global, token.Location.global);
+        const message = self.arena.allocator().dupe(u8, writer.buffer[0..writer.end]) catch "unexpected token";
+        self.diagnostics.append(self.arena.allocator(), .{
+            .err = Error.UnexpectedToken,
+            .span_ = span,
+            .message = message,
+        }) catch {};
+        return true;
+    }
+
+    /// Records a diagnostic for a statement that failed to parse, if the failing
+    /// path did not already report one. Prefers the accurate expected-token
+    /// message; otherwise (a lexer error raised directly, with no expected-token
+    /// context) points at the current position with a per-kind message.
+    fn recordParseFailure(self: *Self, err: Error) void {
+        if (self.recordExpectedTokenDiagnostic()) {
+            self.clearExpectedTokens();
+            return;
+        }
+        const message: []const u8 = switch (err) {
+            error.UnterminatedString => "unterminated string literal (missing closing '\"')",
+            error.UnterminatedBlockComment => "unterminated block comment (missing closing '*/')",
+            error.NewlineInStringNotAllowed => "unexpected newline in string literal; a string may not span lines",
+            error.UnexpectedCharacter => "unexpected character",
+            error.UnexpectedEOF => "unexpected end of file",
+            else => @errorName(err),
+        };
+        const span: ast.Span = if (self.currentToken()) |tok| tok.span else blk: {
+            const loc = token.Location{
+                .file = self.path,
+                .line = self.stream.lexer.line,
+                .column = self.stream.lexer.column,
+                .offset = self.stream.lexer.index,
+            };
+            break :blk token.Span.fromLocs(loc, loc);
+        };
+        self.diagnostics.append(self.arena.allocator(), .{
+            .err = err,
+            .span_ = span,
+            .message = message,
+        }) catch {};
+    }
+
+    /// Panic-mode resynchronization: consumes tokens up to and including the
+    /// next statement boundary (a newline or `;`), so parsing can continue after
+    /// a failed statement. Stops at EOF, or if the lexer raises an error (which
+    /// the caller then surfaces).
+    fn recoverToStatementBoundary(self: *Self) void {
+        while (true) {
+            const tok = self.peekToken() catch return;
+            switch (tok.tag) {
+                .eof => return,
+                .newline, .semicolon => {
+                    _ = self.nextToken() catch {};
+                    return;
+                },
+                else => _ = self.nextToken() catch return,
+            }
+        }
+    }
+
+    /// Maximum diagnostics collected via recovery before parsing stops, so a
+    /// pathological input can't produce an unbounded error list.
+    const max_recovery_errors = 25;
+
+    /// Top-level statement parsing with panic-mode error recovery. A statement
+    /// that fails records a diagnostic and the parser resynchronizes at the next
+    /// statement boundary before continuing, so a script with several
+    /// independent errors reports all of them rather than only the first.
+    /// Recovery is top-level only: an error inside a nested construct fails its
+    /// enclosing top-level statement, which then recovers. Collected diagnostics
+    /// live on `self.diagnostics`, which `compileResult` surfaces.
+    fn parseTopLevelStatements(self: *Self) Error!ast.Spanned([]const *ast.Statement) {
+        const open = try self.peekToken();
+        var parsed = std.ArrayList(*ast.Statement).empty;
+        defer parsed.deinit(self.allocator);
+        var end_span = open.span;
+
+        while (true) {
+            self.skipNewlines();
+            const next = self.peekToken() catch |err| {
+                self.recordParseFailure(err);
+                break;
+            };
+            if (next.tag == .eof) {
+                _ = self.nextToken() catch {};
+                end_span = next.span;
+                break;
+            }
+
+            const before_diags = self.diagnostics.items.len;
+            const before_offset = next.span.start.offset;
+            if (self.parseStatement()) |stmt| {
+                parsed.append(self.allocator, stmt) catch {};
+                end_span = stmt.span();
+            } else |err| {
+                if (self.diagnostics.items.len == before_diags) self.recordParseFailure(err);
+                if (self.diagnostics.items.len >= max_recovery_errors) break;
+                self.recoverToStatementBoundary();
+                // Guarantee forward progress so a token the recovery couldn't
+                // pass (e.g. a persistent lexer error) can't spin the loop.
+                const after = self.peekToken() catch break;
+                if (after.tag != .eof and after.span.start.offset == before_offset) {
+                    _ = self.nextToken() catch break;
+                }
+            }
+        }
+
+        return .{
+            .payload = try self.copyToArena(*ast.Statement, parsed.items),
+            .span = .{ .start = open.span.start, .end = end_span.end },
+        };
     }
 
     pub fn expectedTokens(self: *const Self) []const token.Tag {
@@ -442,7 +552,14 @@ pub const Parser = struct {
         self.clearExpectedTokens();
 
         const signature = try self.parseMaybeScriptSignature();
-        const statements = try self.parseStatementsUntil(.eof);
+        const statements = try self.parseTopLevelStatements();
+
+        // If recovery collected any diagnostics, fail the parse rather than
+        // caching or returning a partial AST — matching the pre-recovery
+        // contract (a parse with errors yields no script). The collected
+        // diagnostics live on `self.diagnostics`, which `compileResult`
+        // surfaces after the caught error, so all of them are still reported.
+        if (self.diagnostics.items.len > 0) return Error.UnexpectedToken;
 
         const script = ast.Script{
             .signature = signature,
