@@ -210,24 +210,28 @@ pub const Parser = struct {
         return true;
     }
 
-    /// Records a diagnostic for a statement that failed to parse, if the failing
-    /// path did not already report one. Prefers the accurate expected-token
-    /// message; otherwise (a lexer error raised directly, with no expected-token
-    /// context) points at the current position with a per-kind message.
-    fn recordParseFailure(self: *Self, err: Error) void {
+    /// Records a diagnostic for an error thrown out of parsing/lexing that was
+    /// not already reported (the streaming lexer raises errors directly rather
+    /// than via `reportParseError`). Prefers the accurate expected-token message
+    /// when the parser has pending state; a lexer error (no such context) gets a
+    /// per-kind message anchored at the lexer's current position — where lexing
+    /// stopped. Takes `anyerror` so a thrown document-store error can be carried
+    /// too (`Diagnostic.err` is informational; rendering uses message/span).
+    fn recordParseFailure(self: *Self, err: anyerror) void {
         if (self.recordExpectedTokenDiagnostic()) {
             self.clearExpectedTokens();
             return;
         }
-        const message: []const u8 = switch (err) {
-            error.UnterminatedString => "unterminated string literal (missing closing '\"')",
-            error.UnterminatedBlockComment => "unterminated block comment (missing closing '*/')",
-            error.NewlineInStringNotAllowed => "unexpected newline in string literal; a string may not span lines",
-            error.UnexpectedCharacter => "unexpected character",
-            error.UnexpectedEOF => "unexpected end of file",
-            else => @errorName(err),
+        const Info = struct { msg: []const u8, lexical: bool };
+        const info: Info = switch (err) {
+            error.UnterminatedString => .{ .msg = "unterminated string literal (missing closing '\"')", .lexical = true },
+            error.UnterminatedBlockComment => .{ .msg = "unterminated block comment (missing closing '*/')", .lexical = true },
+            error.NewlineInStringNotAllowed => .{ .msg = "unexpected newline in string literal; a string may not span lines", .lexical = true },
+            error.UnexpectedCharacter => .{ .msg = "unexpected character", .lexical = true },
+            error.UnexpectedEOF => .{ .msg = "unexpected end of file", .lexical = false },
+            else => .{ .msg = @errorName(err), .lexical = false },
         };
-        const span: ast.Span = if (self.currentToken()) |tok| tok.span else blk: {
+        const span: ast.Span = if (info.lexical) blk: {
             const loc = token.Location{
                 .file = self.path,
                 .line = self.stream.lexer.line,
@@ -235,11 +239,14 @@ pub const Parser = struct {
                 .offset = self.stream.lexer.index,
             };
             break :blk token.Span.fromLocs(loc, loc);
-        };
+        } else if (self.currentToken()) |tok|
+            tok.span
+        else
+            token.Span.fromLocs(token.Location.global, token.Location.global);
         self.diagnostics.append(self.arena.allocator(), .{
             .err = err,
             .span_ = span,
-            .message = message,
+            .message = info.msg,
         }) catch {};
     }
 
@@ -526,44 +533,15 @@ pub const Parser = struct {
     pub fn parseScript(self: *Self, path: []const u8) Result {
         return self.compileResult(self.parseScriptInner(path) catch |err| brk: {
             self.log("error: {}", .{err}) catch {};
-            // A thrown lexer error (e.g. an unterminated string) skips
+            // A thrown lexer error that escaped the top-level recovery loop
+            // (e.g. one raised while parsing the script signature) skips
             // `reportParseError`, so without this the script comes back `null`
-            // with no diagnostics — a silent exit. Record one so the user sees a
-            // real message pointing at where lexing stopped. But only when
-            // `compileResult`'s expected-token fallback can't describe it
-            // (`expected_token_count == 0`); otherwise that fallback builds a
-            // better, span-accurate message (e.g. "expected string interp end").
-            if (self.diagnostics.items.len == 0 and self.expected_token_count == 0) {
-                self.recordThrownError(err);
-            }
+            // with no diagnostics — a silent exit. Record one (recovery-recorded
+            // errors already populate `diagnostics`, so this only fires when
+            // nothing was reported yet).
+            if (self.diagnostics.items.len == 0) self.recordParseFailure(err);
             break :brk null;
         });
-    }
-
-    /// Records a diagnostic for an error thrown out of parsing/lexing that was
-    /// not already reported (the streaming lexer raises errors directly rather
-    /// than via `reportParseError`). Lexical errors are anchored at the lexer's
-    /// current position; anything else falls back to a global span.
-    fn recordThrownError(self: *Self, err: anyerror) void {
-        const Info = struct { msg: []const u8, lexical: bool };
-        const info: Info = switch (err) {
-            error.UnterminatedString => .{ .msg = "unterminated string literal (missing closing '\"')", .lexical = true },
-            error.UnterminatedBlockComment => .{ .msg = "unterminated block comment (missing closing '*/')", .lexical = true },
-            error.NewlineInStringNotAllowed => .{ .msg = "unexpected newline in string literal; a string may not span lines", .lexical = true },
-            error.UnexpectedCharacter => .{ .msg = "unexpected character", .lexical = true },
-            else => .{ .msg = @errorName(err), .lexical = false },
-        };
-        const loc: token.Location = if (info.lexical) .{
-            .file = self.path,
-            .line = self.stream.lexer.line,
-            .column = self.stream.lexer.column,
-            .offset = self.stream.lexer.index,
-        } else token.Location.global;
-        self.diagnostics.append(self.arena.allocator(), .{
-            .err = err,
-            .span_ = token.Span.fromLocs(loc, loc),
-            .message = info.msg,
-        }) catch {};
     }
 
     fn parseScriptInner(self: *Self, path: []const u8) !ast.Script {
