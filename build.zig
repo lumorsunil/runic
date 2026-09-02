@@ -98,4 +98,19 @@ pub fn build(b: *std.Build) void {
     lsp_protocol_tests.root_module.addImport("runic", runtime);
     const lsp_protocol_runner = b.addRunArtifact(lsp_protocol_tests);
     test_step.dependOn(&lsp_protocol_runner.step);
+
+    // Semantic-layer unit tests. Kept in a dedicated file that imports the
+    // `runic` module so its tests actually run (test declarations in the
+    // runtime module's own imported files are not currently pulled into the
+    // runtime test binary — see the note in tests/type_checker_test.zig).
+    const type_checker_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/type_checker_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    type_checker_tests.root_module.addImport("runic", runtime);
+    const type_checker_runner = b.addRunArtifact(type_checker_tests);
+    test_step.dependOn(&type_checker_runner.step);
 }

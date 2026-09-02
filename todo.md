@@ -224,6 +224,16 @@
   - long term goal: Runic should be able to drive its own contributor/test/tooling workflows instead of depending on shell wrappers
 - [ ] add first-class regression coverage for `scripts/run_ci.rn`
 - [ ] move Neovim tree-sitter/parser registration out of `editor/neovim/syntax/runic.vim` into a more appropriate plugin/setup file
+- [ ] resurrect the runtime module's unit tests. `zig build test` does not pull
+      test declarations from the runtime module's imported files (only the
+      `runic`-module-importing test files under `tests/` run), so the in-file
+      tests in frontend/lexer.zig, frontend/parser.zig, ir/evaluator.zig,
+      ir/compiler.zig, ir/context.zig, frontend/diagnostics.zig, mem/rc.zig,
+      mem/split.zig, and stream.zig have been dead and have bit-rotted against
+      later API changes (they no longer compile — `GeneralPurposeAllocator`
+      removed, `lexer.Stream.init` arity changed, `ArrayList.init` removed,
+      etc.). Bring each back up to date and wire it to run (e.g. a `tests/`
+      file per module importing `runic`, like tests/type_checker_test.zig).
 
 ## parser
 
