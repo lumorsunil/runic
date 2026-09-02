@@ -1,5 +1,6 @@
 const std = @import("std");
 const ast = @import("../frontend/ast.zig");
+const builtins = @import("../builtins.zig");
 const rainbow = @import("../rainbow.zig");
 const DocumentStore = @import("../document_store.zig").DocumentStore;
 const token = @import("../frontend/token.zig");
@@ -4626,68 +4627,44 @@ const GlobalTypes = struct {
     }
 };
 
-/// Stable storage for the `parseInt` builtin's function type:
-/// `fn String parseInt() ParseError!Int` — a bad parse is a catchable error.
-const parse_int_byte_type = ast.TypeExpr{ .byte = .{ .span = .global } };
-const parse_int_string_type = ast.TypeExpr{ .array = .{ .element = &parse_int_byte_type, .span = .global } };
-const parse_int_payload_type = ast.TypeExpr{ .integer = .{ .span = .global } };
-const parse_int_return_type = ast.TypeExpr{ .error_union = .{
-    .err_set = &ast.TypeExpr.parseErrorType,
-    .payload = &parse_int_payload_type,
-    .span = .global,
-} };
-const parse_int_fn_type = ast.TypeExpr{ .function = .{
-    .params = .nonVariadic(&.{}),
-    .stdin_type = &parse_int_string_type,
-    .return_type = &parse_int_return_type,
-    .span = .global,
-} };
+// Builtin function signatures, generated from the shared `builtins` registry so
+// a builtin is declared in exactly one place. Each is `fn String name() R`,
+// where R is `ParseError!output` for a fallible (parse) builtin and `output`
+// otherwise. These are top-level comptime consts, so the `&…[i]` pointers below
+// are static and safe to hand to the scope at runtime.
+const builtin_output_types: [builtins.all.len]ast.TypeExpr = blk: {
+    var arr: [builtins.all.len]ast.TypeExpr = undefined;
+    for (builtins.all, 0..) |b, i| arr[i] = b.outputType();
+    break :blk arr;
+};
 
-/// Stable storage for the `parseFloat` builtin's function type:
-/// `fn String parseFloat() ParseError!Float`.
-const parse_float_byte_type = ast.TypeExpr{ .byte = .{ .span = .global } };
-const parse_float_string_type = ast.TypeExpr{ .array = .{ .element = &parse_float_byte_type, .span = .global } };
-const parse_float_payload_type = ast.TypeExpr{ .float = .{ .span = .global } };
-const parse_float_return_type = ast.TypeExpr{ .error_union = .{
-    .err_set = &ast.TypeExpr.parseErrorType,
-    .payload = &parse_float_payload_type,
-    .span = .global,
-} };
-const parse_float_fn_type = ast.TypeExpr{ .function = .{
-    .params = .nonVariadic(&.{}),
-    .stdin_type = &parse_float_string_type,
-    .return_type = &parse_float_return_type,
-    .span = .global,
-} };
+const builtin_return_types: [builtins.all.len]ast.TypeExpr = blk: {
+    var arr: [builtins.all.len]ast.TypeExpr = undefined;
+    for (builtins.all, 0..) |b, i| {
+        arr[i] = if (b.fallible())
+            ast.TypeExpr{ .error_union = .{
+                .err_set = &ast.TypeExpr.parseErrorType,
+                .payload = &builtin_output_types[i],
+                .span = .global,
+            } }
+        else
+            builtin_output_types[i];
+    }
+    break :blk arr;
+};
 
-/// Stable storage for the `parseBool` builtin's function type:
-/// `fn String parseBool() ParseError!Bool` — accepts the text "true"/"false"
-/// (case-insensitive); anything else is a catchable `ParseError.Invalid`.
-const parse_bool_byte_type = ast.TypeExpr{ .byte = .{ .span = .global } };
-const parse_bool_string_type = ast.TypeExpr{ .array = .{ .element = &parse_bool_byte_type, .span = .global } };
-const parse_bool_payload_type = ast.TypeExpr{ .boolean = .{ .span = .global } };
-const parse_bool_return_type = ast.TypeExpr{ .error_union = .{
-    .err_set = &ast.TypeExpr.parseErrorType,
-    .payload = &parse_bool_payload_type,
-    .span = .global,
-} };
-const parse_bool_fn_type = ast.TypeExpr{ .function = .{
-    .params = .nonVariadic(&.{}),
-    .stdin_type = &parse_bool_string_type,
-    .return_type = &parse_bool_return_type,
-    .span = .global,
-} };
-
-/// Stable storage for the `lines` builtin's function type:
-/// `fn String lines() String` — frames a byte stream into per-line values.
-const lines_byte_type = ast.TypeExpr{ .byte = .{ .span = .global } };
-const lines_string_type = ast.TypeExpr{ .array = .{ .element = &lines_byte_type, .span = .global } };
-const lines_fn_type = ast.TypeExpr{ .function = .{
-    .params = .nonVariadic(&.{}),
-    .stdin_type = &lines_string_type,
-    .return_type = &lines_string_type,
-    .span = .global,
-} };
+const builtin_fn_types: [builtins.all.len]ast.TypeExpr = blk: {
+    var arr: [builtins.all.len]ast.TypeExpr = undefined;
+    for (builtins.all, 0..) |_, i| {
+        arr[i] = ast.TypeExpr{ .function = .{
+            .params = .nonVariadic(&.{}),
+            .stdin_type = &builtins.string_type,
+            .return_type = &builtin_return_types[i],
+            .span = .global,
+        } };
+    }
+    break :blk arr;
+};
 
 const global_scope_definitions = [_]Definition{
     .init("Void", GlobalTypes.Void),
@@ -4702,12 +4679,14 @@ const global_scope_definitions = [_]Definition{
     .init("ParseError", ast.TypeExpr.parseErrorType),
 };
 
-/// Builtin value bindings (not types) available in every module's global scope.
-const global_value_definitions = [_]Definition{
-    .{ .identifier = .{ .name = "parseInt", .span = .global }, .type_expr = &parse_int_fn_type },
-    .{ .identifier = .{ .name = "parseFloat", .span = .global }, .type_expr = &parse_float_fn_type },
-    .{ .identifier = .{ .name = "parseBool", .span = .global }, .type_expr = &parse_bool_fn_type },
-    .{ .identifier = .{ .name = "lines", .span = .global }, .type_expr = &lines_fn_type },
+/// Builtin value bindings (not types) available in every module's global scope,
+/// generated from the shared `builtins` registry.
+const global_value_definitions = blk: {
+    var defs: [builtins.all.len]Definition = undefined;
+    for (builtins.all, 0..) |b, i| {
+        defs[i] = .{ .identifier = .{ .name = b.name, .span = .global }, .type_expr = &builtin_fn_types[i] };
+    }
+    break :blk defs;
 };
 
 fn addGlobalScope(allocator: std.mem.Allocator, scope: *Scope) !*Scope {
