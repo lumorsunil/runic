@@ -46,7 +46,11 @@ The next major capability after completions is navigation.
 
 Current planned work:
 
-- go-to-definition
+- go-to-definition — **working for the common cases:** local bindings,
+  function parameters, the nearest shadowing binding, function-call → function
+  declaration, and struct field/decl member access (`p.x` → the field
+  declaration, which takes precedence over an unrelated same-named binding).
+  Regression-tested in `tests/lsp_protocol.zig`.
 - more reliable identifier-to-symbol resolution
 - possibly document links where they clearly help navigation
 
