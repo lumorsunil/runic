@@ -378,6 +378,21 @@ pub const Server = struct {
             scope = self.workspace.type_checker.modules.get(owned_path);
         }
 
+        // Trailing-dot recovery: a member access with an empty member (the cursor
+        // right after `.`) is a syntax error, so the document never type-checked
+        // and no scope is available. Re-check a repaired copy under a scratch
+        // document to recover a scope for the object being completed. The scratch
+        // document must stay open until after completion reads the scope (its
+        // bindings reference the scratch AST), then it is closed here.
+        var scratch_cleanup: ?[]const u8 = null;
+        defer if (scratch_cleanup) |scratch_uri| {
+            self.documents.close(scratch_uri, self.workspace) catch {};
+            self.allocator.free(scratch_uri);
+        };
+        if (scope == null and trailingMemberDot(text_slice, loc.offset)) {
+            scope = self.recoverTrailingDotScope(owned_path, text_slice, loc, &scratch_cleanup) catch null;
+        }
+
         const doc_symbols = if (doc) |d| d.symbols.items else &[_]symbols.Symbol{};
         const workspace_symbols = self.workspace.symbolSlice();
 
@@ -397,6 +412,53 @@ pub const Server = struct {
         defer matches.deinit();
 
         try self.sendCompletionResult(id, matches.items.items);
+    }
+
+    /// True when `offset` sits immediately after a `.` that follows an
+    /// identifier — i.e. the cursor is at an empty member access (`obj.`),
+    /// the case that fails to parse and needs scope recovery.
+    fn trailingMemberDot(text: []const u8, offset: usize) bool {
+        if (offset == 0 or offset > text.len) return false;
+        if (text[offset - 1] != '.') return false;
+        if (offset < 2) return false;
+        return runic.lexer.isIdentifierContinue(text[offset - 2]);
+    }
+
+    /// Recovers a scope for a completion whose document does not parse because
+    /// of a trailing member dot. Inserts a placeholder identifier so the member
+    /// access parses, type-checks the repaired text as a scratch document in the
+    /// same directory (keeping relative imports resolvable), and returns the
+    /// recovered scope. On success `*cleanup_out` receives the scratch document
+    /// URI, which the caller must close and free once it has finished using the
+    /// returned scope (its bindings reference the scratch document's AST).
+    fn recoverTrailingDotScope(
+        self: *Server,
+        real_path: []const u8,
+        text: []const u8,
+        loc: runic.token.Location,
+        cleanup_out: *?[]const u8,
+    ) !?*runic.semantic.Scope {
+        const placeholder = "__runic_lsp_completion__";
+        const repaired = try std.fmt.allocPrint(self.allocator, "{s}{s}{s}", .{
+            text[0..loc.offset],
+            placeholder,
+            text[loc.offset..],
+        });
+        defer self.allocator.free(repaired);
+
+        const dir = std.fs.path.dirname(real_path) orelse ".";
+        const scratch_path = try std.fs.path.join(self.allocator, &.{ dir, ".runic-lsp-completion.rn" });
+        defer self.allocator.free(scratch_path);
+
+        const scratch_uri = try self.documents.resolveUri(scratch_path);
+        errdefer self.allocator.free(scratch_uri);
+
+        try self.documents.openOrReplace(scratch_uri, scratch_path, repaired, 0, .parse_and_type_check);
+        cleanup_out.* = scratch_uri;
+
+        var scratch_loc = loc;
+        scratch_loc.file = scratch_path;
+        return self.workspace.type_checker.getScopeFromLoc(scratch_loc);
     }
 
     fn handleHover(

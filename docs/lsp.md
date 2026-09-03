@@ -32,12 +32,14 @@ The main usability gap is completion quality.
 
 Near-term improvements:
 
-- member-access completions — chained access (`a.b.c`) now resolves each
-  segment's type (struct fields, including named-type fields, and imported
-  module members), not just the immediate object. Known limitation: this needs
-  the document to parse, so completion triggered on a bare trailing dot (which
-  is a syntax error) still falls back to the loose text heuristic; recovering a
-  scope for the incomplete expression is a separate follow-up.
+- member-access completions — chained access (`a.b.c`) resolves each segment's
+  type (struct fields, including named-type fields, and imported module
+  members), not just the immediate object. Completion triggered on a bare
+  trailing dot (`obj.`), which is a syntax error that leaves the document
+  unparseable, is handled by recovering a scope: a repaired copy (with a
+  placeholder member) is type-checked as a throwaway scratch document in the
+  same directory — keeping relative imports resolvable — and closed again once
+  the scope has been read.
 - richer completion metadata such as symbol kind and signature/detail text
 - ~~snippets for common constructs like `const`, `var`, and `fn`~~ **done:**
   the `import`/`const`/`var`/`fn` keyword completions now insert snippets with
