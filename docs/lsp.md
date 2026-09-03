@@ -43,7 +43,9 @@ Near-term improvements:
   placeholder member) is type-checked as a throwaway scratch document in the
   same directory — keeping relative imports resolvable — and closed again once
   the scope has been read.
-- richer completion metadata such as symbol kind and signature/detail text
+- ~~richer completion metadata such as symbol kind and signature/detail text~~
+  **done:** function completions show their call signature (`(name: String,
+  times: Int) Void`) and struct-field completions show the field's type
 - ~~snippets for common constructs like `const`, `var`, and `fn`~~ **done:**
   the `import`/`const`/`var`/`fn` keyword completions now insert snippets with
   tab stops (e.g. `const ${1:name} = ${2:value}`), gated on the client's

@@ -75,7 +75,11 @@ pub fn collectSymbols(
                         if (fn_decl.name) |name| {
                             const children = try fnParamChildren(allocator, detail, fn_decl);
                             errdefer freeChildren(allocator, children);
-                            try appendSymbolFull(allocator, list, .function, name.name, detail, name.span, fn_decl.span, children);
+                            // Detail shows the call signature (params + return
+                            // type) rather than the file path.
+                            const signature = try functionSignature(allocator, fn_decl);
+                            defer allocator.free(signature);
+                            try appendSymbolFull(allocator, list, .function, name.name, signature, name.span, fn_decl.span, children);
                         }
                     },
                     else => {},
@@ -211,6 +215,33 @@ fn structChildren(
     }
 
     return children.toOwnedSlice(allocator);
+}
+
+/// Formats a function's call signature, e.g. `(name: String, times: Int) Void`,
+/// for use as completion/outline detail text.
+fn functionSignature(allocator: Allocator, fn_decl: ast.FunctionDecl) ![]u8 {
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+
+    try w.writeAll("(");
+    const params = switch (fn_decl.params) {
+        ._non_variadic => |ps| ps,
+        ._variadic => |p| @as([]const *ast.Parameter, &.{p}),
+    };
+    for (params, 0..) |param, i| {
+        if (i > 0) try w.writeAll(", ");
+        switch (param.pattern.*) {
+            .identifier => |identifier| try w.writeAll(identifier.name),
+            .discard => try w.writeAll("_"),
+            else => try w.writeAll("?"),
+        }
+        if (param.type_annotation) |type_annotation| try w.print(": {f}", .{type_annotation});
+    }
+    try w.writeAll(")");
+    if (fn_decl.return_type) |return_type| try w.print(" {f}", .{return_type});
+
+    return aw.toOwnedSlice();
 }
 
 /// Builds child symbols for a function's parameters.

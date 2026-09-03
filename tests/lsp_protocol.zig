@@ -1150,6 +1150,91 @@ test "lsp member completion shows execution result members" {
     try std.testing.expect(first_kind == .integer);
 }
 
+test "lsp completion shows a function's signature as detail" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\fn Void greet(name: String, times: Int) Void {
+        \\    echo "hi"
+        \\}
+        \\gr
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        // Cursor after the `gr` prefix on line 3.
+        try makeCompletionRequest(allocator, 12, uri, 3, 2),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 12);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const items = parsed.value.object.get("result").?.object.get("items").?.array.items;
+    var greet_detail: ?[]const u8 = null;
+    for (items) |item| {
+        if (std.mem.eql(u8, item.object.get("label").?.string, "greet")) {
+            greet_detail = if (item.object.get("detail")) |d| d.string else null;
+        }
+    }
+    try std.testing.expect(greet_detail != null);
+    try std.testing.expectEqualStrings("(name: String, times: Int) Void", greet_detail.?);
+}
+
+test "lsp member completion shows a struct field's type as detail" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\const Point = struct { x: Int, y: String }
+        \\const p = Point{ .x = 1, .y = "a" }
+        \\echo "${p.}"
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeCompletionRequest(allocator, 12, uri, 2, 10),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 12);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const items = parsed.value.object.get("result").?.object.get("items").?.array.items;
+    var x_detail: ?[]const u8 = null;
+    var y_detail: ?[]const u8 = null;
+    for (items) |item| {
+        const label = item.object.get("label").?.string;
+        const detail = if (item.object.get("detail")) |d| d.string else null;
+        if (std.mem.eql(u8, label, "x")) x_detail = detail;
+        if (std.mem.eql(u8, label, "y")) y_detail = detail;
+    }
+    try std.testing.expect(x_detail != null and y_detail != null);
+    try std.testing.expectEqualStrings("Int", x_detail.?);
+    try std.testing.expectEqualStrings("String", y_detail.?);
+}
+
 test "lsp chained member completion resolves nested struct fields" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
