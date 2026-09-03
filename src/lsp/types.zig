@@ -711,6 +711,13 @@ pub const TextDocumentSyncKind = enum(u32) {
     full = 1,
     /// Documents are synced by sending the full content on open. After that only incremental updates to the document are sent.
     incremental = 2,
+
+    pub fn jsonStringify(
+        self: @This(),
+        stringify: *std.json.Stringify,
+    ) std.json.Stringify.Error!void {
+        try stringify.write(@intFromEnum(self));
+    }
 };
 
 /// Options specific to a notebook plus its cells to be synced to the server.
@@ -1706,6 +1713,13 @@ pub const SymbolKind = enum(u32) {
     operator = 25,
     typeParameter = 26,
     keyword = 27,
+
+    pub fn jsonStringify(
+        self: @This(),
+        stringify: *std.json.Stringify,
+    ) std.json.Stringify.Error!void {
+        try stringify.write(@intFromEnum(self));
+    }
 };
 
 pub const DocumentSymbol = struct {
@@ -1726,6 +1740,13 @@ pub const DiagnosticSeverity = enum(u32) {
     information = 3,
     /// Reports a hint.
     hint = 4,
+
+    pub fn jsonStringify(
+        self: @This(),
+        stringify: *std.json.Stringify,
+    ) std.json.Stringify.Error!void {
+        try stringify.write(@intFromEnum(self));
+    }
 };
 
 /// Structure to capture a description for an error code.
@@ -1748,6 +1769,13 @@ pub const DiagnosticTag = enum(u32) {
     ///
     /// Clients are allowed to rendered diagnostics with this tag strike through.
     deprecated = 2,
+
+    pub fn jsonStringify(
+        self: @This(),
+        stringify: *std.json.Stringify,
+    ) std.json.Stringify.Error!void {
+        try stringify.write(@intFromEnum(self));
+    }
 };
 
 pub const ResponseError = struct {

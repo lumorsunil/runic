@@ -106,6 +106,50 @@ test "lsp document symbols include real ranges" {
     try std.testing.expect(end.get("character").?.integer > start.get("character").?.integer);
 }
 
+test "lsp document symbols include top-level functions" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\const budget = 50
+        \\fn Void greet(name: String) Void {
+        \\    echo "hi ${name}"
+        \\}
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeDocumentSymbolRequest(allocator, 2, uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const syms = parsed.value.object.get("result").?.array.items;
+    var saw_budget = false;
+    var greet_kind: ?i64 = null;
+    for (syms) |s| {
+        const name = s.object.get("name").?.string;
+        if (std.mem.eql(u8, name, "budget")) saw_budget = true;
+        if (std.mem.eql(u8, name, "greet")) greet_kind = s.object.get("kind").?.integer;
+    }
+
+    try std.testing.expect(saw_budget);
+    // The function appears in the outline with LSP SymbolKind.Function (12).
+    try std.testing.expectEqual(@as(?i64, 12), greet_kind);
+}
+
 test "lsp rename returns concrete same-file edits" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
@@ -642,6 +686,12 @@ test "lsp publishes diagnostics for invalid source" {
     try std.testing.expectEqualStrings(uri, params.get("uri").?.string);
     const diagnostics = params.get("diagnostics").?.array.items;
     try std.testing.expect(diagnostics.len > 0);
+    // Severity must serialize as the numeric DiagnosticSeverity code, not the
+    // enum tag name — clients rely on the number to colour the diagnostic.
+    if (diagnostics[0].object.get("severity")) |sev| {
+        try std.testing.expect(sev == .integer);
+        try std.testing.expect(sev.integer >= 1 and sev.integer <= 4);
+    }
 }
 
 test "lsp didChange and completion stay quiet on stderr" {

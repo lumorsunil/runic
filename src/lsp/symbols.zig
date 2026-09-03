@@ -47,8 +47,21 @@ pub fn collectSymbols(
             .bash_block, .while_stmt => {
                 // Not Yet Implemented,
             },
-            .exit_stmt, .yield_stmt, .expression => {
+            .exit_stmt, .yield_stmt => {
                 // Does not produce symbols
+            },
+            .expression => |expr_stmt| {
+                // A top-level named function declaration parses as an expression
+                // statement wrapping a `fn_decl`. Surface it as a symbol so it
+                // appears in the outline, workspace search, and completions.
+                switch (expr_stmt.expression.*) {
+                    .fn_decl => |fn_decl| {
+                        if (fn_decl.name) |name| {
+                            try appendSymbol(allocator, list, .function, name.name, detail, name.span);
+                        }
+                    },
+                    else => {},
+                }
             },
             // TODO: implement?
             .type_binding_decl => {},
