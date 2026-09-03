@@ -54,7 +54,10 @@ adding broad new feature surface.
 Current concerns:
 
 - occasional high CPU usage after extended sessions
-- LSP degradation or failure after running for a while
+- LSP degradation or failure after running for a while — **partly addressed:**
+  the workspace type checker reused a single arena freed only at shutdown, so
+  analysis memory grew per edit; it is now reset (and open documents re-checked)
+  on each change, bounding memory to one pass over the open set.
 - continued memory/leak/crash hardening during restarts and document churn
 
 ### 4. Better alignment with the language pipeline
