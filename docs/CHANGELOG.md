@@ -12,7 +12,54 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **Exponent and bit shifts** — `**`, `<<`, `>>`. Integer operands stay `Int`
+  (`**` saturates on overflow; shifting by 64+ clears; `>>` of a negative is
+  arithmetic); a `Float` operand or negative exponent widens `**` to `Float`.
+  `>>` is overloaded with append-redirect — a command on the left appends, a
+  value shifts (resolved in the IR, like `>`).
+- **Bitwise operations as `Int` methods** — `a.band b`, `a.bor b`, `a.bxor b`,
+  `a.bnot` (the `&`/`|`/`^` symbols are taken by background/fd, pipe, and the
+  promise prefix). Method calls work on integer literals too (`6.band 3`).
+- **`||=` and `&&=`** compound assignment, alongside `+=`/`-=`/`*=`/`/=`/`%=`.
+- **Array/string slicing** — `x[a..b]` (half-open), `x[a..]`, `x[..b]`, `x[..]`;
+  bounds are clamped so an out-of-range or inverted range is empty.
+- **Hex / octal / binary integer literals** — `0x1f`, `0o17`, `0b1010`. A
+  leading zero is not octal (`042` is decimal).
+- **`parseBool`** pipeline builtin (`fn String parseBool() ParseError!Bool`) —
+  parses `"true"`/`"false"` (case-insensitive), mapping per value like
+  `parseInt`/`parseFloat`.
+- **`$(a; b)` subshell statement sequences** — a `$(...)` body is a statement
+  sequence like `(...)`, not just a single expression.
+- **`&0 | cmd`** — a bare `&0` used as a pipeline stage forwards the function's
+  stdin into the pipeline (distinct from reading `&0` as a value).
+
+### Changed
+
+- A unary prefix is now accepted directly after a binary operator (`2 ** -2`,
+  `3 - -2`), matching the leading-unary behavior.
+- `.` before a letter on an integer literal is member access, not a decimal
+  point, so `6.band 3` works (`6.5` is still a float).
+
+### Fixed
+
+- **Parser error recovery** — a failed top-level statement now resynchronizes
+  and parsing continues, so multiple independent errors are reported per run.
+- **Unterminated string / block comment** now produce a clear diagnostic
+  pointing at the source, instead of exiting silently.
+- **Missing executable** reports `command not found: '<name>'` with the call's
+  source location, instead of a bare `error.FileNotFound`.
+
+### Internal
+
+- A shared **builtin registry** and a single **binary-operator classification
+  table** replace logic that was duplicated across the compiler and type
+  checker.
+- The unit-test suite was **resurrected and expanded**: `zig build test` went
+  from 13 to 70 tests after the runtime module's in-file tests (lexer, parser,
+  type checker, IR compiler, evaluator) were wired to run and brought up to
+  date, plus a new type-checker test harness.
 
 ## [0.7.0] — 2026-08-31
 

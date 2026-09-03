@@ -13,14 +13,46 @@ Runic already has:
 
 - a lexer, parser, AST, semantic/type-checking pipeline, and IR compiler
 - script execution through the `runic` CLI
-- feature and diagnostics regression suites under `tests/`
+- feature and diagnostics regression suites under `tests/`, plus in-source unit
+  tests for the lexer, parser, type checker, IR compiler, and evaluator
 - a working `runic-lsp` binary with document management, diagnostics, hover,
   and basic completion support
 - a command/process model with pipelines, execution-result values, redirects,
-  imports, functions, closures, optionals, matching, and background execution
+  imports, functions, closures, optionals, sum types, error sets/unions,
+  `match`, and background execution
+- an expression surface with the usual arithmetic plus `**`, bit shifts
+  `<<`/`>>`, bitwise Int methods (`.band`/`.bor`/`.bxor`/`.bnot`), compound
+  assignment (`+=` … `%=`, `||=`, `&&=`), array/string slicing, and hex/octal/
+  binary integer literals
+- a small standard library (`std.map`, `std.list`, `std.str`, …) and pipeline
+  builtins (`parseInt`/`parseFloat`/`parseBool`/`lines`)
 
 Runic is still experimental. Language design and implementation details are
 expected to keep moving while the core model stabilizes.
+
+## Recently Landed (2026-09)
+
+A cycle of feature work and engineering-health work:
+
+- **Language:** exponent `**` and bit shifts `<<`/`>>` (with `>>` overloaded
+  with append-redirect, resolved in the IR); bitwise ops as Int methods;
+  `||=`/`&&=`; array/string slicing; hex/octal/binary literals; `$(a; b)`
+  subshell statement sequences; a bare `&0` pipeline stage that forwards stdin;
+  `parseBool`; unary-prefix-after-binary parsing.
+- **Diagnostics:** top-level parser error recovery (report multiple errors per
+  parse); clear diagnostics for unterminated strings/block comments;
+  `command not found: '<name>'` instead of a bare `FileNotFound`.
+- **Engineering health:** a shared builtin registry and a single binary-operator
+  classification table (both replacing scattered per-site logic); and the unit
+  test suite was resurrected and expanded — `zig build test` went from 13 tests
+  (only the LSP protocol suite ran) to 70, after the runtime module's ~48
+  in-file tests were wired to run and brought back up to date.
+
+A known constraint discovered this cycle: `compiler.zig` is large (~10k lines)
+but cannot be cleanly split in current Zig — `usingnamespace` was removed and
+non-`pub` methods are not callable across files, so a struct's methods can't be
+spread across files. The mitigation is to keep the file from growing (the
+registry/table work helps) rather than to shatter it.
 
 ## Planning Principles
 
@@ -44,11 +76,13 @@ exist.
 Current focus areas:
 
 - ~~parser error recovery and better diagnostics after the first parse
-  failure~~ — top-level statement recovery landed; a failed statement now
-  resyncs and parsing continues, so multiple errors report at once. Nested
-  (in-construct) recovery is still future work.
+  failure~~ — landed: top-level statement recovery reports multiple errors per
+  parse; unterminated string/block-comment diagnostics; and a missing
+  executable reports `command not found` instead of a bare `FileNotFound`.
+  Nested (in-construct) recovery is still future work.
 - remaining gaps in function behavior, especially stdin/stdout semantics and
-  piping through functions/blocks
+  piping through functions/blocks (a bare `&0` stage can now forward stdin into
+  a pipeline; first-class/anonymous blocks are still open — see Theme 3)
 - cleanup of execution-result behavior across more expression forms
 - better handling of background execution, pipes, and edge-case cleanup
 - reducing semantic mismatches between documented behavior and actual runtime
@@ -105,10 +139,17 @@ areas that are already partially designed or partially implemented.
 
 Likely near- to mid-term candidates:
 
-- richer pattern matching
+- ~~additional operators and assignment forms~~ — substantially done: `**`,
+  `<<`/`>>`, bitwise Int methods, `||=`/`&&=`, slicing, hex/octal/binary
+  literals. (Symbolic bitwise operators were deliberately *not* added — `&`/`|`/
+  `^` collide with background/fd, pipe, and the promise prefix, so bitwise ops
+  are methods instead.)
+- richer pattern matching (regex/glob patterns in `match`)
 - more complete type-expression support
-- additional operators and assignment forms
-- improved function references / partial application support
+- improved function references / partial application (`&add 5`) — needs a
+  design call on the `&` sigil first
+- first-class / anonymous blocks — bare `{ … }` is already an eager
+  expression-block, so a lambda form needs distinct syntax; a design decision
 - better user-defined struct/type support
 - support escaping whitespace in bareword executable/identifier syntax so
   commands or names containing spaces can be represented without immediately
