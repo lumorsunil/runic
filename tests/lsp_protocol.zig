@@ -1038,6 +1038,53 @@ test "lsp member completion shows execution result members" {
     try std.testing.expect(first_kind == .integer);
 }
 
+test "lsp chained member completion resolves nested struct fields" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\const Inner = struct { value: Int, label: String }
+        \\const Outer = struct { inner: Inner }
+        \\const o = Outer{ .inner = Inner{ .value = 1, .label = "x" } }
+        \\echo "${o.inner.v}"
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        // Cursor right after `v` in `o.inner.v` (inside interpolation) on line 3.
+        try makeCompletionRequest(allocator, 12, uri, 3, 17),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 12);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const items = parsed.value.object.get("result").?.object.get("items").?.array.items;
+    var saw_value = false;
+    var saw_inner = false;
+    for (items) |item| {
+        const label = item.object.get("label").?.string;
+        if (std.mem.eql(u8, label, "value")) saw_value = true;
+        if (std.mem.eql(u8, label, "inner")) saw_inner = true;
+    }
+
+    // The chain resolved through `Inner`, so its `value` field completes (the
+    // `v` prefix filters out `label`)...
+    try std.testing.expect(saw_value);
+    // ...and the outer struct's field does not leak into the inner completion.
+    try std.testing.expect(!saw_inner);
+}
+
 const TestFixture = struct {
     allocator: Allocator,
     tmp_dir: std.testing.TmpDir,
