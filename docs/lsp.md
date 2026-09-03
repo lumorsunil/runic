@@ -19,7 +19,9 @@ Today it provides:
 - basic hover support
 - keyword and module-name completion
 - symbol-based completion from the current workspace
-- document symbols (outline) for top-level bindings and functions
+- document symbols (outline) for top-level bindings, functions, and structs —
+  nested: functions expose their parameters and structs expose their fields as
+  child symbols
 - document highlight (occurrences of the identifier under the cursor)
 
 There is also a placeholder `--tcp <port>` flag in the CLI surface, but that

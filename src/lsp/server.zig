@@ -922,31 +922,48 @@ pub const Server = struct {
             return;
         };
 
+        // Build the (possibly nested) outline in an arena so the tree of child
+        // slices is freed in one shot after serialization.
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+
         var doc_symbols = std.ArrayList(types.DocumentSymbol).empty;
-        defer doc_symbols.deinit(self.allocator);
 
         if (self.workspace.documents.get(params.textDocument.uri)) |ws_doc| {
             for (ws_doc.symbols.items) |sym| {
-                const kind: types.SymbolKind = switch (sym.kind) {
-                    .function => .function,
-                    .method => .method,
-                    .variable => .variable,
-                    .field => .field,
-                    .module => .module,
-                    .keyword => .keyword,
-                };
-
-                try doc_symbols.append(self.allocator, .{
-                    .name = sym.name,
-                    .kind = kind,
-                    .detail = sym.detail,
-                    .range = types.Range.fromSpan(sym.span),
-                    .selectionRange = types.Range.fromSpan(sym.span),
-                });
+                try doc_symbols.append(arena_allocator, try toDocumentSymbol(arena_allocator, sym));
             }
         }
 
         try self.sendJson(types.response(id, doc_symbols.items));
+    }
+
+    fn documentSymbolKind(kind: symbols.SymbolKind) types.SymbolKind {
+        return switch (kind) {
+            .function => .function,
+            .method => .method,
+            .variable => .variable,
+            .field => .field,
+            .module => .module,
+            .keyword => .keyword,
+            .@"struct" => .@"struct",
+        };
+    }
+
+    fn toDocumentSymbol(arena: Allocator, sym: symbols.Symbol) !types.DocumentSymbol {
+        const children = try arena.alloc(types.DocumentSymbol, sym.children.len);
+        for (sym.children, 0..) |child, i| {
+            children[i] = try toDocumentSymbol(arena, child);
+        }
+        return .{
+            .name = sym.name,
+            .kind = documentSymbolKind(sym.kind),
+            .detail = sym.detail,
+            .range = types.Range.fromSpan(sym.range_span orelse sym.span),
+            .selectionRange = types.Range.fromSpan(sym.span),
+            .children = if (children.len == 0) null else children,
+        };
     }
 
     fn handleRename(

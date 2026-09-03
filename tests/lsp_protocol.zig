@@ -150,6 +150,66 @@ test "lsp document symbols include top-level functions" {
     try std.testing.expectEqual(@as(?i64, 12), greet_kind);
 }
 
+test "lsp document symbols nest struct fields and function parameters" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\const Point = struct { x: Int, y: Int }
+        \\fn Void greet(name: String, times: Int) Void {
+        \\    echo "hi"
+        \\}
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeDocumentSymbolRequest(allocator, 2, uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const syms = parsed.value.object.get("result").?.array.items;
+
+    var checked_point = false;
+    var checked_greet = false;
+    for (syms) |s| {
+        const name = s.object.get("name").?.string;
+        const kind = s.object.get("kind").?.integer;
+        const children = if (s.object.get("children")) |c| (if (c == .array) c.array.items else &[_]std.json.Value{}) else &[_]std.json.Value{};
+
+        if (std.mem.eql(u8, name, "Point")) {
+            checked_point = true;
+            try std.testing.expectEqual(@as(i64, 23), kind); // SymbolKind.Struct
+            try std.testing.expectEqual(@as(usize, 2), children.len);
+            try std.testing.expectEqualStrings("x", children[0].object.get("name").?.string);
+            try std.testing.expectEqualStrings("y", children[1].object.get("name").?.string);
+            try std.testing.expectEqual(@as(i64, 8), children[0].object.get("kind").?.integer); // Field
+        }
+        if (std.mem.eql(u8, name, "greet")) {
+            checked_greet = true;
+            try std.testing.expectEqual(@as(i64, 12), kind); // Function
+            try std.testing.expectEqual(@as(usize, 2), children.len);
+            try std.testing.expectEqualStrings("name", children[0].object.get("name").?.string);
+            try std.testing.expectEqualStrings("times", children[1].object.get("name").?.string);
+        }
+    }
+
+    try std.testing.expect(checked_point);
+    try std.testing.expect(checked_greet);
+}
+
 test "lsp rename returns concrete same-file edits" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
