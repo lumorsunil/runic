@@ -143,29 +143,45 @@ const MemberContext = struct {
 };
 
 fn collectMemberMatches(context: CollectMatchesContext) !MatchList {
-    const member_ctx = extractMemberContext(context) orelse return .empty(context.allocator);
     const type_checker = context.type_checker orelse return .empty(context.allocator);
+    const member_ctx = (try extractMemberChain(context, context.allocator)) orelse return .empty(context.allocator);
+    defer context.allocator.free(member_ctx.chain);
+
+    const base_name = member_ctx.chain[0];
 
     var candidates = MatchList.init(context.allocator);
     errdefer candidates.deinit();
+
+    // Resolve the base object's type from the local scope, then the module scope.
+    var base_type: ?*const ast.TypeExpr = null;
     if (context.scope) |scope| {
-        if (scope.lookup(member_ctx.object_name)) |binding| {
-            if (binding.type_expr) |binding_type| {
-                try appendMembersForType(&candidates, context, type_checker, binding_type, member_ctx.object_name);
-            }
-        }
+        if (scope.lookup(base_name)) |binding| base_type = binding.type_expr;
     }
-    if (candidates.items.items.len == 0) {
+    if (base_type == null) {
         if (type_checker.modules.get(context.file)) |module_scope| {
-            if (module_scope.lookup(member_ctx.object_name)) |binding| {
-                if (binding.type_expr) |binding_type| {
-                    try appendMembersForType(&candidates, context, type_checker, binding_type, member_ctx.object_name);
-                }
-            }
+            if (module_scope.lookup(base_name)) |binding| base_type = binding.type_expr;
         }
     }
-    if (candidates.items.items.len == 0) {
-        try appendImportedModuleMembersFromText(&candidates, context, type_checker, member_ctx.object_name);
+
+    if (base_type) |bt| {
+        // Walk the intermediate segments (everything between the base and the
+        // member being typed) to reach the type whose members we complete.
+        var current: ?*const ast.TypeExpr = bt;
+        var i: usize = 1;
+        while (i < member_ctx.chain.len) : (i += 1) {
+            current = resolveMemberType(type_checker, context.scope, current.?, member_ctx.chain[i]);
+            if (current == null) break;
+        }
+        if (current) |final_type| {
+            const concrete = concreteType(type_checker, context.scope, final_type) orelse final_type;
+            try appendMembersForType(&candidates, context, type_checker, concrete, base_name);
+        }
+    }
+
+    // Fallback for a single-segment access whose base is an imported module not
+    // yet resolvable through a scope (parsed straight from the source text).
+    if (candidates.items.items.len == 0 and member_ctx.chain.len == 1) {
+        try appendImportedModuleMembersFromText(&candidates, context, type_checker, base_name);
     }
 
     const owned_symbols = try ownedSymbolsSlice(context.allocator, candidates.items.items);
@@ -176,8 +192,14 @@ fn collectMemberMatches(context: CollectMatchesContext) !MatchList {
     errdefer filtered.deinit();
     for (candidates.items.items) |candidate| {
         const symbol = candidate.symbol.getPtr().*;
-        if (!symbolMatches(symbol.name, member_ctx.prefix, mode)) continue;
-        try filtered.items.append(context.allocator, candidate);
+        if (symbolMatches(symbol.name, member_ctx.prefix, mode)) {
+            try filtered.items.append(context.allocator, candidate);
+        } else {
+            // Candidates dropped by the prefix filter own their symbols; free
+            // them rather than leaking, since only the retained ones are moved
+            // into `filtered`.
+            candidate.deinit(context.allocator);
+        }
     }
     candidates.items.clearRetainingCapacity();
     candidates.items.deinit(context.allocator);
@@ -400,6 +422,115 @@ fn ownedSymbolsSlice(allocator: Allocator, matches: []const Match) ![]symbols.Sy
         list[i] = match.symbol.getPtr().*;
     }
     return list;
+}
+
+const MemberChain = struct {
+    /// Object identifiers from the base binding outward, e.g. `p.inner.x` with
+    /// the cursor after `x` yields `.{ "p", "inner" }` — the segments whose type
+    /// must be walked to reach the members being completed.
+    chain: [][]const u8,
+    /// The partial member identifier being typed (may be empty).
+    prefix: []const u8,
+};
+
+/// Like `extractMemberContext`, but captures the full dotted object path so
+/// chained access (`a.b.c`) can be resolved segment by segment. Returns null
+/// when the cursor is not in a member-access position. Caller frees `chain`.
+fn extractMemberChain(context: CollectMatchesContext, allocator: Allocator) !?MemberChain {
+    const text = context.text_slice;
+    const line = context.line_index;
+    const character = context.char_index;
+    var offset: usize = 0;
+    var current_line: usize = 0;
+    while (offset < text.len and current_line < line) {
+        if (text[offset] == '\n') current_line += 1;
+        offset += 1;
+    }
+
+    var cursor = offset;
+    var consumed: usize = 0;
+    while (cursor < text.len and consumed < character) {
+        if (text[cursor] == '\n') break;
+        cursor += 1;
+        consumed += 1;
+    }
+
+    var member_start = cursor;
+    while (member_start > offset and runic.lexer.isIdentifierContinue(text[member_start - 1])) {
+        member_start -= 1;
+    }
+    if (member_start == offset or text[member_start - 1] != '.') return null;
+    const prefix = text[member_start..cursor];
+
+    var list = std.ArrayList([]const u8).empty;
+    errdefer list.deinit(allocator);
+
+    var seg_end = member_start - 1; // the '.' preceding the prefix
+    while (true) {
+        var seg_start = seg_end;
+        while (seg_start > offset and runic.lexer.isIdentifierContinue(text[seg_start - 1])) {
+            seg_start -= 1;
+        }
+        const seg = text[seg_start..seg_end];
+        if (seg.len == 0 or !runic.lexer.isIdentifierStart(text[seg_start])) {
+            list.deinit(allocator);
+            return null;
+        }
+        try list.insert(allocator, 0, seg);
+
+        if (seg_start > offset and text[seg_start - 1] == '.') {
+            seg_end = seg_start - 1;
+            continue;
+        }
+        break;
+    }
+
+    return .{ .chain = try list.toOwnedSlice(allocator), .prefix = prefix };
+}
+
+/// Peels a type down to its concrete shape: unwraps type aliases and resolves
+/// named-type identifiers (e.g. a struct field declared `inner: Inner`, stored
+/// as an unresolved identifier) to the type they name. Returns null when a name
+/// can't be resolved.
+fn concreteType(
+    type_checker: *runic.semantic.TypeChecker,
+    scope: ?*runic.semantic.Scope,
+    type_expr: *const ast.TypeExpr,
+) ?*const ast.TypeExpr {
+    var current: *const ast.TypeExpr = type_expr;
+    var guard: usize = 0;
+    while (guard < 8) : (guard += 1) {
+        switch (current.*) {
+            .alias => |alias_type| current = type_checker.resolveAliasType(&alias_type),
+            .identifier => {
+                const s = scope orelse return null;
+                current = type_checker.resolveTypeExpr(s, current) catch return null;
+            },
+            else => return current,
+        }
+    }
+    return current;
+}
+
+/// Resolves the type of `name` as a member of `type_expr` — a struct field, or a
+/// pub declaration of an imported module. Returns null when the type has no such
+/// traversable member. Used to walk chained member access one segment at a time.
+fn resolveMemberType(
+    type_checker: *runic.semantic.TypeChecker,
+    scope: ?*runic.semantic.Scope,
+    type_expr: *const ast.TypeExpr,
+    name: []const u8,
+) ?*const ast.TypeExpr {
+    const resolved = concreteType(type_checker, scope, type_expr) orelse return null;
+    return switch (resolved.*) {
+        .struct_type => |struct_type| struct_type.memberType(name),
+        .module => |module_type| blk: {
+            const module_scope = (type_checker.resolveModuleScopeForMemberCompletion(module_type) catch break :blk null) orelse break :blk null;
+            const binding = module_scope.lookup(name) orelse break :blk null;
+            break :blk binding.type_expr;
+        },
+        else => null,
+    };
 }
 
 fn extractMemberContext(context: CollectMatchesContext) ?MemberContext {

@@ -1029,7 +1029,7 @@ pub const TypeChecker = struct {
         );
     }
 
-    fn resolveTypeExpr(
+    pub fn resolveTypeExpr(
         self: *TypeChecker,
         scope: *Scope,
         type_expr: *const ast.TypeExpr,
