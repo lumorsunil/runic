@@ -11,6 +11,10 @@ const ProtocolResponse = struct {
 const ServerRunResult = struct {
     stdout: []const u8,
     stderr: []const u8,
+    /// Documents type-checked by the final recheck pass (open/client docs only).
+    recheck_count: usize = 0,
+    /// Total documents in the store after the run (open + transitively imported).
+    doc_count: usize = 0,
 
     fn deinit(self: ServerRunResult, allocator: Allocator) void {
         allocator.free(self.stdout);
@@ -331,6 +335,56 @@ test "lsp definition prefers the struct field over an unrelated same-named bindi
         \\echo "${p.x}"
         \\
     , 3, 10, 1, 23);
+}
+
+test "lsp per-edit recheck stays bounded to open documents, not imported modules" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const module_uri = try fixture.writeDocument("module.rn",
+        \\pub const version = "1"
+        \\
+    );
+    allocator.free(module_uri);
+    const main_uri = try fixture.writeDocument("main.rn",
+        \\const m = import "./module.rn"
+        \\echo "${m.version}"
+        \\
+    );
+    defer allocator.free(main_uri);
+
+    // Open ONLY main.rn; module.rn is pulled into the store transitively by the
+    // import, so it ends up in the document map without ever being opened.
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, main_uri,
+            \\const m = import "./module.rn"
+            \\echo "${m.version}"
+            \\
+        ),
+        try makeDidChangeWholeDocument(allocator, main_uri, 2,
+            \\const m = import "./module.rn"
+            \\echo "${m.version} a"
+            \\
+        ),
+        try makeDidChangeWholeDocument(allocator, main_uri, 3,
+            \\const m = import "./module.rn"
+            \\echo "${m.version} ab"
+            \\
+        ),
+    };
+    defer for (messages) |m| allocator.free(m);
+
+    const result = try runServerWithMessagesDetailed(allocator, &messages);
+    defer result.deinit(allocator);
+
+    // The imported module is present in the store...
+    try std.testing.expect(result.doc_count >= 2);
+    // ...but the per-edit recheck only covers the open document, so per-keystroke
+    // work does not grow with the number of modules pulled in over a session.
+    try std.testing.expectEqual(@as(usize, 1), result.recheck_count);
+    // And analysis stays quiet on stderr through the edits.
+    try std.testing.expectEqualStrings("", result.stderr);
 }
 
 test "lsp references search across opened documents" {
@@ -882,6 +936,9 @@ fn runServerWithMessagesDetailed(allocator: Allocator, messages: []const []const
     server.initInterface();
     try server.run();
 
+    const recheck_count = server.documents.recheck_count;
+    const doc_count = server.documents.map.count();
+
     // Positional readers pread from offset 0, regardless of where the server
     // left the shared OS file offset after writing.
     var output_reader = output_file.reader(io, &.{});
@@ -891,6 +948,8 @@ fn runServerWithMessagesDetailed(allocator: Allocator, messages: []const []const
     return .{
         .stdout = stdout,
         .stderr = stderr,
+        .recheck_count = recheck_count,
+        .doc_count = doc_count,
     };
 }
 

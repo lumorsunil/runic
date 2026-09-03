@@ -61,7 +61,13 @@ adding broad new feature surface.
 
 Current concerns:
 
-- occasional high CPU usage after extended sessions
+- occasional high CPU usage after extended sessions — **partly addressed:**
+  each edit re-type-checked *every* document in the store, which includes
+  modules pulled in transitively by imports and never removed, so per-keystroke
+  work grew without bound as a session touched more files. The per-edit recheck
+  is now limited to the open (client-managed) documents; imported modules are
+  still validated on demand when an importing open document is checked.
+  Regression-tested in `tests/lsp_protocol.zig`.
 - LSP degradation or failure after running for a while — **partly addressed:**
   the workspace type checker reused a single arena freed only at shutdown, so
   analysis memory grew per edit; it is now reset (and open documents re-checked)

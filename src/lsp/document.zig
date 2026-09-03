@@ -16,6 +16,11 @@ pub const LspDocumentStore = struct {
     document_store: DocumentStore = .{ .vtable = vtable },
     map: std.StringHashMap(*Document),
     workspace: *workspace_mod.Workspace,
+    /// Number of documents type-checked by the most recent `recheckAllTypes`
+    /// pass. Bounded to the set of client-managed (open) documents; exposed so
+    /// tests can assert per-edit work does not grow with the number of modules
+    /// pulled into the store transitively over a session.
+    recheck_count: usize = 0,
 
     pub fn init(
         io: std.Io,
@@ -258,9 +263,19 @@ pub const LspDocumentStore = struct {
     fn recheckAllTypes(self: *LspDocumentStore, workspace: *workspace_mod.Workspace) !void {
         workspace.type_checker.reset();
         var it = self.map.iterator();
+        var count: usize = 0;
         while (it.next()) |entry| {
-            try entry.value_ptr.*.reportTypeChecker(workspace);
+            const doc = entry.value_ptr.*;
+            // Only re-check documents the client has open. Transitively-imported
+            // modules (server-managed) are validated on demand when an importing
+            // open document is checked, and accumulate in the store across a
+            // session — re-checking all of them on every keystroke would make
+            // per-edit cost grow without bound as more modules are touched.
+            if (doc.manage_mode != .client) continue;
+            try doc.reportTypeChecker(workspace);
+            count += 1;
         }
+        self.recheck_count = count;
     }
 
     fn updateDocumentText(
