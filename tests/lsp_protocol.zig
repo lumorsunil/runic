@@ -412,6 +412,50 @@ test "lsp didChange and completion stay quiet on stderr" {
     try std.testing.expect(items.len > 0);
 }
 
+test "lsp incremental didChange applies a range edit to the right region" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const uri = try fixture.writeDocument("main.rn",
+        \\const foo = 1
+        \\
+    );
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri,
+            \\const foo = 1
+            \\
+        ),
+        // Replace just the identifier "foo" (line 0, chars 6..9) — not the
+        // whole document — proving incremental range edits patch the exact span.
+        try makeDidChangeIncremental(allocator, uri, 2, 0, 6, 0, 9, "renamed"),
+        try makeDocumentSymbolRequest(allocator, 2, uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const symbols_value = parsed.value.object.get("result").?;
+    try std.testing.expect(symbols_value.array.items.len >= 1);
+    const first = symbols_value.array.items[0].object;
+
+    // The symbol was renamed by the edit, and its declaration still starts at
+    // the same column — the surrounding text was left untouched.
+    try std.testing.expectEqualStrings("renamed", first.get("name").?.string);
+    const start = first.get("range").?.object.get("start").?.object;
+    try std.testing.expectEqual(@as(i64, 0), start.get("line").?.integer);
+    try std.testing.expectEqual(@as(i64, 6), start.get("character").?.integer);
+}
+
 test "lsp member completion prefers module members over keywords" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
@@ -789,6 +833,37 @@ fn makeDidChangeWholeDocument(
             },
             .contentChanges = &.{
                 .{ .text = text },
+            },
+        },
+    });
+}
+
+fn makeDidChangeIncremental(
+    allocator: Allocator,
+    uri: []const u8,
+    version: i64,
+    start_line: u32,
+    start_char: u32,
+    end_line: u32,
+    end_char: u32,
+    text: []const u8,
+) ![]u8 {
+    return toJsonAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .method = "textDocument/didChange",
+        .params = .{
+            .textDocument = .{
+                .uri = uri,
+                .version = version,
+            },
+            .contentChanges = &.{
+                .{
+                    .range = .{
+                        .start = .{ .line = start_line, .character = start_char },
+                        .end = .{ .line = end_line, .character = end_char },
+                    },
+                    .text = text,
+                },
             },
         },
     });
