@@ -363,7 +363,10 @@ fn appendMembersForType(
         .array => try appendOwnedMatch(matches, context.allocator, .field, "len", detail, .global),
         .struct_type => |struct_type| {
             for (struct_type.fields) |field| {
-                try appendOwnedMatch(matches, context.allocator, .field, field.name.name, detail, field.name.span);
+                // Detail shows the field's declared type rather than the object.
+                const field_detail = try std.fmt.allocPrint(context.allocator, "{f}", .{field.type_expr});
+                defer context.allocator.free(field_detail);
+                try appendOwnedMatch(matches, context.allocator, .field, field.name.name, field_detail, field.name.span);
             }
             for (struct_type.decls) |decl| {
                 const kind: symbols.SymbolKind = switch (decl.decl_source) {
