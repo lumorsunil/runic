@@ -714,6 +714,112 @@ test "lsp references can exclude declaration" {
     try std.testing.expectEqual(@as(i64, 5), start.get("character").?.integer);
 }
 
+test "lsp workspace symbol search finds symbols in unopened files" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const alpha_uri = try fixture.writeDocument("alpha.rn",
+        \\const alphaSymbol = 1
+        \\
+    );
+    defer allocator.free(alpha_uri);
+    const beta_uri = try fixture.writeDocument("beta.rn",
+        \\fn Void betaFn(name: String) Void {
+        \\    echo "hi"
+        \\}
+        \\
+    );
+    defer allocator.free(beta_uri);
+
+    const root_uri = try std.fmt.allocPrint(allocator, "file://{s}", .{fixture.root_path});
+    defer allocator.free(root_uri);
+
+    // Initialize with the fixture as the workspace root (indexes both files
+    // without either being opened), then search.
+    const messages = [_][]const u8{
+        try makeInitializeWithRoot(allocator, 1, root_uri),
+        try makeWorkspaceSymbolRequest(allocator, 2, "alpha"),
+        try makeWorkspaceSymbolRequest(allocator, 3, "betaFn"),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    // "alpha" → the const in alpha.rn.
+    {
+        const response = try findResponseById(allocator, output, 2);
+        defer allocator.free(response.body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        const results = parsed.value.object.get("result").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), results.len);
+        try std.testing.expectEqualStrings("alphaSymbol", results[0].object.get("name").?.string);
+        try std.testing.expectEqualStrings(alpha_uri, results[0].object.get("location").?.object.get("uri").?.string);
+    }
+
+    // "betaFn" → the function in beta.rn.
+    {
+        const response = try findResponseById(allocator, output, 3);
+        defer allocator.free(response.body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        const results = parsed.value.object.get("result").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), results.len);
+        try std.testing.expectEqualStrings("betaFn", results[0].object.get("name").?.string);
+        try std.testing.expectEqualStrings(beta_uri, results[0].object.get("location").?.object.get("uri").?.string);
+        try std.testing.expectEqual(@as(i64, 12), results[0].object.get("kind").?.integer); // Function
+    }
+}
+
+test "lsp go-to-definition resolves across an unopened workspace file" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const helper_uri = try fixture.writeDocument("helper.rn",
+        \\const sharedConst = 42
+        \\
+    );
+    defer allocator.free(helper_uri);
+    const main_uri = try fixture.writeDocument("main.rn",
+        \\echo "${sharedConst}"
+        \\
+    );
+    defer allocator.free(main_uri);
+
+    const root_uri = try std.fmt.allocPrint(allocator, "file://{s}", .{fixture.root_path});
+    defer allocator.free(root_uri);
+
+    // Index the workspace (loads helper.rn without opening it), open main.rn,
+    // then ask for the definition of `sharedConst` used in main.rn.
+    const messages = [_][]const u8{
+        try makeInitializeWithRoot(allocator, 1, root_uri),
+        try makeDidOpen(allocator, main_uri,
+            \\echo "${sharedConst}"
+            \\
+        ),
+        try makeDefinitionRequest(allocator, 2, main_uri, 0, 9),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const result = parsed.value.object.get("result").?.object;
+    // Resolves to the declaration in the unopened helper file.
+    try std.testing.expectEqualStrings(helper_uri, result.get("uri").?.string);
+    const start = result.get("range").?.object.get("start").?.object;
+    try std.testing.expectEqual(@as(i64, 0), start.get("line").?.integer);
+    try std.testing.expectEqual(@as(i64, 6), start.get("character").?.integer);
+}
+
 test "lsp document link points an import path at the module file" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
@@ -1663,6 +1769,24 @@ fn makeFormattingRequest(allocator: Allocator, id: i64, uri: []const u8) ![]u8 {
                 .insertSpaces = true,
             },
         },
+    });
+}
+
+fn makeInitializeWithRoot(allocator: Allocator, id: i64, root_uri: []const u8) ![]u8 {
+    return toJsonAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .id = id,
+        .method = "initialize",
+        .params = .{ .rootUri = root_uri },
+    });
+}
+
+fn makeWorkspaceSymbolRequest(allocator: Allocator, id: i64, query: []const u8) ![]u8 {
+    return toJsonAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .id = id,
+        .method = "workspace/symbol",
+        .params = .{ .query = query },
     });
 }
 
