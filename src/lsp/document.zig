@@ -289,8 +289,13 @@ pub const LspDocumentStore = struct {
                     }
                     return error.RangeNotFound;
                 };
-                const rangeLength = range_params.rangeLength orelse return error.RangeLengthNotDefined;
-                const endIndex = startIndex + rangeLength;
+                // `rangeLength` is deprecated in the LSP spec, so spec-compliant
+                // clients may omit it. Prefer the authoritative `range.end`, and
+                // only fall back to `rangeLength` when the end can't be resolved.
+                const endIndex = range.end.findIndex(text) orelse blk: {
+                    const rangeLength = range_params.rangeLength orelse return error.RangeLengthNotDefined;
+                    break :blk startIndex + rangeLength;
+                };
                 const first = text[0..startIndex];
                 const second = range_params.text;
                 const third = if (endIndex < text.len) text[endIndex..] else "";
