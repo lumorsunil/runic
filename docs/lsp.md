@@ -20,6 +20,7 @@ Today it provides:
 - keyword and module-name completion
 - symbol-based completion from the current workspace
 - document symbols (outline) for top-level bindings and functions
+- document highlight (occurrences of the identifier under the cursor)
 
 There is also a placeholder `--tcp <port>` flag in the CLI surface, but that
 transport is still reserved rather than being part of the supported workflow.
