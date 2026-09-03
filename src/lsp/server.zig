@@ -174,6 +174,10 @@ pub const Server = struct {
                 if (request.id) |id| try self.handleDocumentHighlight(id, params);
                 return true;
             },
+            .@"textDocument/documentLink" => |params| {
+                if (request.id) |id| try self.handleDocumentLink(id, params);
+                return true;
+            },
             .@"textDocument/documentSymbol" => |params| {
                 if (request.id) |id| try self.handleDocumentSymbols(id, params);
                 return true;
@@ -909,6 +913,62 @@ pub const Server = struct {
         try self.sendJson(types.response(id, highlights.items));
     }
 
+    fn handleDocumentLink(
+        self: *Server,
+        id: types.RequestId,
+        params: types.DocumentLinkParams,
+    ) !void {
+        const path = try self.resolveUriPath(params.textDocument.uri);
+        defer self.allocator.free(path);
+
+        const doc = self.documents.get(params.textDocument.uri) orelse {
+            try self.sendJson(types.response(id, std.json.Value{ .null = {} }));
+            return;
+        };
+
+        // The response holds owned target strings; build it in an arena so the
+        // whole set is freed in one shot after serialization.
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+
+        var links = std.ArrayList(types.DocumentLink).empty;
+
+        // Lex the document for `import "<path>"` and turn each module path into a
+        // link to the resolved file. Lexing (rather than the AST) means links
+        // still resolve when the rest of the document does not parse.
+        var lexer = try runic.lexer.Lexer.init(self.io, self.allocator, self.env_map, path, doc.text);
+        defer lexer.deinit();
+
+        while (true) {
+            const tok = lexer.next() catch break;
+            if (tok.tag == .eof) break;
+            if (tok.tag != .kw_import) continue;
+
+            var next = lexer.next() catch break;
+            if (next.tag == .l_paren) next = lexer.next() catch break;
+            if (next.tag != .string_start) continue;
+            const string_text = lexer.next() catch break;
+            if (string_text.tag != .string_text) continue;
+
+            const module_path = runic.document.resolveModulePath(self.io, self.allocator, path, string_text.lexeme) catch continue;
+            defer self.allocator.free(module_path);
+            // Skip the embedded `std` namespace (a `:std/...` virtual path with no
+            // file to open).
+            if (module_path.len > 0 and module_path[0] == ':') continue;
+
+            const target = self.documents.resolveUri(module_path) catch continue;
+            defer self.allocator.free(target);
+
+            try links.append(arena_allocator, .{
+                .range = types.Range.fromSpan(string_text.span),
+                .target = try arena_allocator.dupe(u8, target),
+            });
+        }
+
+        try self.sendJson(types.response(id, links.items));
+    }
+
     fn handleDocumentSymbols(
         self: *Server,
         id: types.RequestId,
@@ -1155,6 +1215,9 @@ pub const Server = struct {
                         .workDoneProgress = false,
                     },
                 } },
+                .documentLinkProvider = .{
+                    .resolveProvider = false,
+                },
                 .documentSymbolProvider = .{ .payload = .{
                     .documentSymbolOptions = .{
                         .workDoneProgress = false,
