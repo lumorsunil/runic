@@ -524,6 +524,67 @@ test "lsp member completion prefers module members over keywords" {
     try std.testing.expect(!saw_keyword_const);
 }
 
+test "lsp keyword completion emits snippets only when the client supports them" {
+    const allocator = std.testing.allocator;
+
+    // A helper: run a completion at a `co` prefix and return the `const`
+    // keyword item's insertTextFormat (null when absent) plus its insertText.
+    const Probe = struct {
+        fn run(alloc: Allocator, snippet_support: bool) !struct { format: ?i64, insert_text: ?[]u8 } {
+            var fixture = try TestFixture.init(alloc);
+            defer fixture.deinit();
+
+            const uri = try fixture.writeDocument("main.rn", "co\n");
+            defer alloc.free(uri);
+
+            const messages = [_][]const u8{
+                try makeInitialize(alloc, 1, snippet_support),
+                try makeDidOpen(alloc, uri, "co\n"),
+                try makeCompletionRequest(alloc, 2, uri, 0, 2),
+            };
+            defer for (messages) |message| alloc.free(message);
+
+            const output = try runServerWithMessages(alloc, &messages);
+            defer alloc.free(output);
+
+            const response = try findResponseById(alloc, output, 2);
+            defer alloc.free(response.body);
+
+            const parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.body, .{});
+            defer parsed.deinit();
+
+            const items = parsed.value.object.get("result").?.object.get("items").?.array.items;
+            for (items) |item| {
+                const label = item.object.get("label").?.string;
+                if (!std.mem.eql(u8, label, "const")) continue;
+                // Optional fields serialize as JSON `null` when unset, so treat
+                // a present-but-null value the same as an absent one.
+                const format_value = item.object.get("insertTextFormat");
+                const format: ?i64 = if (format_value != null and format_value.? != .null) format_value.?.integer else null;
+                const text_value = item.object.get("insertText");
+                const insert_text: ?[]u8 = if (text_value != null and text_value.? != .null) try alloc.dupe(u8, text_value.?.string) else null;
+                return .{ .format = format, .insert_text = insert_text };
+            }
+            return error.KeywordCompletionMissing;
+        }
+    };
+
+    // With snippet support the `const` keyword completes to a snippet
+    // (insertTextFormat = 2) carrying tab stops.
+    const supported = try Probe.run(allocator, true);
+    defer if (supported.insert_text) |t| allocator.free(t);
+    try std.testing.expectEqual(@as(?i64, 2), supported.format);
+    try std.testing.expect(supported.insert_text != null);
+    try std.testing.expect(std.mem.indexOf(u8, supported.insert_text.?, "${1:name}") != null);
+
+    // Without snippet support the completion inserts its label verbatim — no
+    // snippet format and no raw `${1:...}` tab stops leaking to the editor.
+    const unsupported = try Probe.run(allocator, false);
+    defer if (unsupported.insert_text) |t| allocator.free(t);
+    try std.testing.expectEqual(@as(?i64, null), unsupported.format);
+    try std.testing.expect(unsupported.insert_text == null);
+}
+
 test "lsp hover shows execution result type for bound command" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
@@ -833,6 +894,25 @@ fn makeDidChangeWholeDocument(
             },
             .contentChanges = &.{
                 .{ .text = text },
+            },
+        },
+    });
+}
+
+fn makeInitialize(allocator: Allocator, id: i64, snippet_support: bool) ![]u8 {
+    return toJsonAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .id = id,
+        .method = "initialize",
+        .params = .{
+            .capabilities = .{
+                .textDocument = .{
+                    .completion = .{
+                        .completionItem = .{
+                            .snippetSupport = snippet_support,
+                        },
+                    },
+                },
             },
         },
     });

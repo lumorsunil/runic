@@ -31,6 +31,9 @@ pub const Server = struct {
     initialized: bool = false,
     shutting_down: bool = false,
     log_enabled: bool = false,
+    /// Set from the client's `completionItem.snippetSupport` capability at
+    /// initialize time; gates whether completions emit snippet insert text.
+    snippet_support: bool = false,
 
     pub fn init(
         io: std.Io,
@@ -300,6 +303,10 @@ pub const Server = struct {
             const root = try std.Io.Dir.cwd().realPathFileAlloc(self.io, ".", self.allocator);
             defer self.allocator.free(root);
             try roots.append(self.allocator, try self.allocator.dupe(u8, root));
+        }
+
+        if (params.capabilities) |capabilities| {
+            self.snippet_support = capabilities.snippetSupport();
         }
 
         try self.workspace.resetRoots(roots.items);
@@ -1003,7 +1010,7 @@ pub const Server = struct {
     fn sendCompletionResult(self: *Server, id: types.RequestId, items: []const completion.Match) !void {
         var completionItems = try self.allocator.alloc(types.CompletionItem, items.len);
         defer self.allocator.free(completionItems);
-        for (items, 0..) |item, i| completionItems[i] = .fromSymbol(item.symbol.get());
+        for (items, 0..) |item, i| completionItems[i] = .fromSymbol(item.symbol.get(), self.snippet_support);
 
         const result = types.CompletionList{
             .isIncomplete = false,

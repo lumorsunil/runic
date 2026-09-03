@@ -126,6 +126,33 @@ pub const InitializeParams = struct {
     rootPath: ?[]const u8 = null,
     workspaceFolders: ?[]const WorkspaceFolder = null,
     workDoneToken: ?ProgressToken = null,
+    capabilities: ?ClientCapabilities = null,
+};
+
+/// A minimal slice of the client capabilities — only the fields the server
+/// actually reads. Everything else is dropped by `ignore_unknown_fields`.
+pub const ClientCapabilities = struct {
+    textDocument: ?TextDocumentClientCapabilities = null,
+
+    pub const TextDocumentClientCapabilities = struct {
+        completion: ?CompletionClientCapabilities = null,
+
+        pub const CompletionClientCapabilities = struct {
+            completionItem: ?CompletionItemClientCapabilities = null,
+
+            pub const CompletionItemClientCapabilities = struct {
+                snippetSupport: ?bool = null,
+            };
+        };
+    };
+
+    /// Whether the client advertised support for completion snippets.
+    pub fn snippetSupport(self: ClientCapabilities) bool {
+        const text_document = self.textDocument orelse return false;
+        const completion = text_document.completion orelse return false;
+        const completion_item = completion.completionItem orelse return false;
+        return completion_item.snippetSupport orelse false;
+    }
 };
 
 pub const WorkspaceFolder = struct {
@@ -1266,6 +1293,13 @@ pub const InsertTextFormat = enum(u32) {
     ///
     /// A snippet can define tab stops and placeholders with `$1`, `$2` and `${3:foo}`. `$0` defines the final tab stop, it defaults to the end of the snippet. Placeholders with equal identifiers are linked, that is typing in one will update others too.
     snippet = 2,
+
+    pub fn jsonStringify(
+        self: @This(),
+        stringify: *std.json.Stringify,
+    ) std.json.Stringify.Error!void {
+        try stringify.write(@intFromEnum(self));
+    }
 };
 
 /// How whitespace and indentation is handled during completion item insertion.
@@ -1374,11 +1408,16 @@ pub const CompletionItem = struct {
     /// A data entry field that is preserved on a completion item between a completion and a completion resolve request.
     data: ?std.json.Value = null,
 
-    pub fn fromSymbol(symbol: symbols.Symbol) CompletionItem {
+    /// `snippet_support` reflects the client's
+    /// `completionItem.snippetSupport` capability. Snippet insert text is only
+    /// emitted when the client supports it — otherwise the raw `${1:...}` tab
+    /// stops would be inserted literally.
+    pub fn fromSymbol(symbol: symbols.Symbol, snippet_support: bool) CompletionItem {
         const kind = std.meta.stringToEnum(CompletionItemKind, @tagName(symbol.kind));
 
         const detail = if (symbol.detail.len == 0) null else symbol.detail;
         const documentation = if (symbol.documentation.len == 0) null else symbol.documentation;
+        const use_snippet = snippet_support and symbol.snippet.len > 0;
 
         return .{
             .label = symbol.name,
@@ -1389,6 +1428,8 @@ pub const CompletionItem = struct {
                     .markupContent = .{ .kind = .markdown, .value = d },
                 },
             } else null,
+            .insertText = if (use_snippet) symbol.snippet else null,
+            .insertTextFormat = if (use_snippet) .snippet else null,
         };
     }
 };
