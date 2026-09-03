@@ -11,6 +11,7 @@ pub const SymbolKind = enum {
     variable,
     field,
     keyword,
+    @"struct",
 };
 
 pub const Symbol = struct {
@@ -21,7 +22,17 @@ pub const Symbol = struct {
     /// completion inserts its label verbatim rather than a snippet.
     snippet: []const u8 = &[_]u8{},
     kind: SymbolKind,
+    /// The symbol's selection span — the identifier itself. Used by
+    /// references/rename/definition and as the document-symbol selectionRange.
     span: ast.Span,
+    /// The full enclosing span (e.g. a whole struct or function declaration),
+    /// used as the document-symbol range so nested children fall inside it.
+    /// Falls back to `span` when null.
+    range_span: ?ast.Span = null,
+    /// Nested symbols (struct fields, function parameters). Only the outline
+    /// (documentSymbol) descends into these; the flat top-level list is what
+    /// completion and workspace search iterate.
+    children: []Symbol = &.{},
 
     pub fn deinit(self: *Symbol, allocator: Allocator) void {
         allocator.free(self.name);
@@ -31,6 +42,10 @@ pub const Symbol = struct {
         }
         if (self.snippet.len > 0) {
             allocator.free(self.snippet);
+        }
+        for (self.children) |*child| child.deinit(allocator);
+        if (self.children.len > 0) {
+            allocator.free(self.children);
         }
         self.* = undefined;
     }
@@ -53,18 +68,31 @@ pub fn collectSymbols(
             .expression => |expr_stmt| {
                 // A top-level named function declaration parses as an expression
                 // statement wrapping a `fn_decl`. Surface it as a symbol so it
-                // appears in the outline, workspace search, and completions.
+                // appears in the outline, workspace search, and completions, with
+                // its parameters nested as children.
                 switch (expr_stmt.expression.*) {
                     .fn_decl => |fn_decl| {
                         if (fn_decl.name) |name| {
-                            try appendSymbol(allocator, list, .function, name.name, detail, name.span);
+                            const children = try fnParamChildren(allocator, detail, fn_decl);
+                            errdefer freeChildren(allocator, children);
+                            try appendSymbolFull(allocator, list, .function, name.name, detail, name.span, fn_decl.span, children);
                         }
                     },
                     else => {},
                 }
             },
-            // TODO: implement?
-            .type_binding_decl => {},
+            // A type binding to a struct (`const Point = struct { … }`) surfaces
+            // as a Struct symbol with its fields and declarations as children.
+            .type_binding_decl => |type_binding_decl| {
+                switch (type_binding_decl.type_expr.*) {
+                    .struct_type => |struct_type| {
+                        const children = try structChildren(allocator, detail, struct_type);
+                        errdefer freeChildren(allocator, children);
+                        try appendSymbolFull(allocator, list, .@"struct", type_binding_decl.identifier.name, detail, type_binding_decl.identifier.span, type_binding_decl.span, children);
+                    },
+                    else => {},
+                }
+            },
             .binding_decl => |binding_decl| {
                 switch (binding_decl.pattern.*) {
                     .discard => {},
@@ -127,6 +155,110 @@ fn appendSymbol(
     };
     errdefer entry.deinit(allocator);
     try list.append(allocator, entry);
+}
+
+/// Appends a symbol carrying an enclosing `range_span` and nested `children`
+/// (which it takes ownership of).
+fn appendSymbolFull(
+    allocator: Allocator,
+    list: *std.ArrayList(Symbol),
+    kind: SymbolKind,
+    name: []const u8,
+    detail: []const u8,
+    span: ast.Span,
+    range_span: ast.Span,
+    children: []Symbol,
+) !void {
+    var entry = Symbol{
+        .name = try allocator.dupe(u8, name),
+        .detail = try allocator.dupe(u8, detail),
+        .documentation = try std.fmt.allocPrint(allocator, "`{s}`", .{@tagName(kind)}),
+        .kind = kind,
+        .span = span,
+        .range_span = range_span,
+        .children = children,
+    };
+    errdefer entry.deinit(allocator);
+    try list.append(allocator, entry);
+}
+
+fn freeChildren(allocator: Allocator, children: []Symbol) void {
+    for (children) |*child| child.deinit(allocator);
+    if (children.len > 0) allocator.free(children);
+}
+
+/// Builds child symbols for a struct type's fields and declarations.
+fn structChildren(
+    allocator: Allocator,
+    detail: []const u8,
+    struct_type: ast.TypeExpr.StructType,
+) ![]Symbol {
+    var children = std.ArrayList(Symbol).empty;
+    errdefer {
+        for (children.items) |*child| child.deinit(allocator);
+        children.deinit(allocator);
+    }
+
+    for (struct_type.fields) |field| {
+        try children.append(allocator, try leafSymbol(allocator, .field, field.name.name, detail, field.name.span, field.span));
+    }
+    for (struct_type.decls) |decl| {
+        const kind: SymbolKind = switch (decl.decl_source) {
+            .fn_decl => .method,
+            .binding_decl => .field,
+        };
+        try children.append(allocator, try leafSymbol(allocator, kind, decl.name.name, detail, decl.name.span, decl.span));
+    }
+
+    return children.toOwnedSlice(allocator);
+}
+
+/// Builds child symbols for a function's parameters.
+fn fnParamChildren(
+    allocator: Allocator,
+    detail: []const u8,
+    fn_decl: ast.FunctionDecl,
+) ![]Symbol {
+    var children = std.ArrayList(Symbol).empty;
+    errdefer {
+        for (children.items) |*child| child.deinit(allocator);
+        children.deinit(allocator);
+    }
+
+    const params = switch (fn_decl.params) {
+        ._non_variadic => |ps| ps,
+        ._variadic => |p| @as([]const *ast.Parameter, &.{p}),
+    };
+    for (params) |param| {
+        switch (param.pattern.*) {
+            .identifier => |identifier| {
+                try children.append(allocator, try leafSymbol(allocator, .variable, identifier.name, detail, identifier.span, param.span));
+            },
+            else => {},
+        }
+    }
+
+    return children.toOwnedSlice(allocator);
+}
+
+fn leafSymbol(
+    allocator: Allocator,
+    kind: SymbolKind,
+    name: []const u8,
+    detail: []const u8,
+    span: ast.Span,
+    range_span: ast.Span,
+) !Symbol {
+    var entry = Symbol{
+        .name = try allocator.dupe(u8, name),
+        .detail = try allocator.dupe(u8, detail),
+        .documentation = try std.fmt.allocPrint(allocator, "`{s}`", .{@tagName(kind)}),
+        .kind = kind,
+        .span = span,
+        .range_span = range_span,
+    };
+    errdefer entry.deinit(allocator);
+    return entry;
 }
 
 pub fn isIdentifierChar(ch: u8) bool {
