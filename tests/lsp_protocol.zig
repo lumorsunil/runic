@@ -1047,7 +1047,7 @@ test "lsp chained member completion resolves nested struct fields" {
         \\const Inner = struct { value: Int, label: String }
         \\const Outer = struct { inner: Inner }
         \\const o = Outer{ .inner = Inner{ .value = 1, .label = "x" } }
-        \\echo "${o.inner.v}"
+        \\echo "${o.inner.}"
         \\
     ;
     const uri = try fixture.writeDocument("main.rn", source);
@@ -1055,8 +1055,9 @@ test "lsp chained member completion resolves nested struct fields" {
 
     const messages = [_][]const u8{
         try makeDidOpen(allocator, uri, source),
-        // Cursor right after `v` in `o.inner.v` (inside interpolation) on line 3.
-        try makeCompletionRequest(allocator, 12, uri, 3, 17),
+        // Cursor right after the trailing dot in `o.inner.` on line 3 — a syntax
+        // error that requires scope recovery.
+        try makeCompletionRequest(allocator, 12, uri, 3, 16),
     };
     defer for (messages) |message| allocator.free(message);
 
@@ -1071,18 +1072,67 @@ test "lsp chained member completion resolves nested struct fields" {
 
     const items = parsed.value.object.get("result").?.object.get("items").?.array.items;
     var saw_value = false;
+    var saw_label = false;
     var saw_inner = false;
     for (items) |item| {
         const label = item.object.get("label").?.string;
         if (std.mem.eql(u8, label, "value")) saw_value = true;
+        if (std.mem.eql(u8, label, "label")) saw_label = true;
         if (std.mem.eql(u8, label, "inner")) saw_inner = true;
     }
 
-    // The chain resolved through `Inner`, so its `value` field completes (the
-    // `v` prefix filters out `label`)...
+    // The chain resolved through `Inner` even though the trailing dot makes the
+    // document unparseable — both of `Inner`'s fields complete...
     try std.testing.expect(saw_value);
+    try std.testing.expect(saw_label);
     // ...and the outer struct's field does not leak into the inner completion.
     try std.testing.expect(!saw_inner);
+}
+
+test "lsp single-level member completion recovers scope after a trailing dot" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\const Point = struct { x: Int, y: Int }
+        \\const p = Point{ .x = 1, .y = 2 }
+        \\echo "${p.}"
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        // Cursor right after the dot in `p.` on line 2.
+        try makeCompletionRequest(allocator, 12, uri, 2, 10),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const result = try runServerWithMessagesDetailed(allocator, &messages);
+    defer result.deinit(allocator);
+
+    const response = try findResponseById(allocator, result.stdout, 12);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const items = parsed.value.object.get("result").?.object.get("items").?.array.items;
+    var saw_x = false;
+    var saw_y = false;
+    for (items) |item| {
+        const label = item.object.get("label").?.string;
+        if (std.mem.eql(u8, label, "x")) saw_x = true;
+        if (std.mem.eql(u8, label, "y")) saw_y = true;
+    }
+
+    try std.testing.expect(saw_x);
+    try std.testing.expect(saw_y);
+    // The scratch recovery document was closed again, leaving only the real one.
+    try std.testing.expectEqual(@as(usize, 1), result.doc_count);
+    try std.testing.expectEqualStrings("", result.stderr);
 }
 
 const TestFixture = struct {
