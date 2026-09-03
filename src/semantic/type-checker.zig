@@ -149,6 +149,23 @@ pub const TypeChecker = struct {
         self.arena.deinit();
     }
 
+    /// Reclaims all analysis memory so a long-lived checker (the LSP reuses one
+    /// per workspace) does not grow without bound across re-checks. Frees the
+    /// child-allocated module keys, then resets the arena — which owns every
+    /// scope, `TypeExpr`, diagnostic, and the maps' backing — and clears the
+    /// now-dangling unmanaged maps/lists. After this the checker is empty, as if
+    /// freshly initialized; callers must re-`typeCheck` any documents they still
+    /// need scopes/diagnostics for.
+    pub fn reset(self: *TypeChecker) void {
+        for (self.modules.keys()) |key| {
+            self.arena.child_allocator.free(key);
+        }
+        _ = self.arena.reset(.free_all);
+        self.modules = .empty;
+        self.diagnostics = .empty;
+        self.generic_type_ctors = .empty;
+    }
+
     fn reportSpanError(
         self: *TypeChecker,
         span: ast.Span,

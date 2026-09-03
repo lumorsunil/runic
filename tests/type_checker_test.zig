@@ -131,3 +131,46 @@ test "assigning to a field of an immutable binding is rejected" {
         \\p.x = 9
     , "");
 }
+
+test "reset reclaims analysis memory across repeated re-checks" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var fds = FrontendDocumentStore.init(testIo(), allocator, &env);
+    defer fds.deinit();
+
+    const path = "<test>";
+    const doc = try fds.putDocument(path,
+        \\const a = 1
+        \\const b = a + 2
+        \\fn Int sq(n: Int) Int { yield n * n }
+        \\echo "${sq b}"
+    );
+    switch (doc.parser.parseScript(path)) {
+        .success => {},
+        .err => return error.TestSourceFailedToParse,
+    }
+
+    var tc = TypeChecker.init(testIo(), allocator, &fds.document_store, &env, false);
+    defer tc.deinit();
+
+    // Simulate an editing session: many re-checks with a reset between each,
+    // as the LSP now does. The arena must be reclaimed each round (bounded
+    // memory) rather than growing with the number of edits.
+    var peak: usize = 0;
+    for (0..25) |_| {
+        const result = try tc.typeCheck(path);
+        try std.testing.expect(result == .success);
+        const grown = tc.arena.queryCapacity();
+        peak = @max(peak, grown);
+
+        tc.reset();
+        // After reset the arena is fully reclaimed and the module cache empty.
+        try std.testing.expectEqual(@as(usize, 0), tc.arena.queryCapacity());
+        try std.testing.expectEqual(@as(usize, 0), tc.modules.count());
+    }
+
+    // One re-check's footprint stays modest; the loop above would have grown
+    // ~25x without the reset. Guard against runaway growth per check.
+    try std.testing.expect(peak < 1024 * 1024);
+}

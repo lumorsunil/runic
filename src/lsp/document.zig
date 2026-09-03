@@ -245,8 +245,22 @@ pub const LspDocumentStore = struct {
             &self.document_store,
             workspace.describePath(doc.path),
         );
-        try doc.reportTypeChecker(workspace);
+        // Re-type-check through a reset checker so analysis memory is reclaimed
+        // rather than accumulating in a never-freed arena across every edit.
+        try self.recheckAllTypes(workspace);
         return true;
+    }
+
+    /// Resets the (long-lived) workspace type checker to reclaim its arena, then
+    /// re-type-checks every open document so their scopes and diagnostics are
+    /// rebuilt. Called after an edit so memory stays bounded to one pass over the
+    /// open set instead of growing with the number of edits in a session.
+    fn recheckAllTypes(self: *LspDocumentStore, workspace: *workspace_mod.Workspace) !void {
+        workspace.type_checker.reset();
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            try entry.value_ptr.*.reportTypeChecker(workspace);
+        }
     }
 
     fn updateDocumentText(
