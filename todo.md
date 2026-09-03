@@ -119,7 +119,10 @@
   - [x] ranges
   - [x] arrays
   - [x] multiple sources
-- [ ] pipeline_or, pipeline_and
+- [x] pipeline_or, pipeline_and — `&&`/`||` sequence commands and pipelines
+      with bash-style short-circuit (verified: `echo x | grep z || fallback`,
+      `cmd | grep && next`). Covered by logical_short_circuit_regression and
+      nested_if_pipeline_logical_regression.
 - [x] recursive functions (add function def to closure?)
 - [x] exit/return statement
 - [ ] blocks as anonymous functions?
