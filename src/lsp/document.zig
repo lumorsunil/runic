@@ -324,13 +324,23 @@ pub const LspDocumentStore = struct {
         return text;
     }
 
-    pub fn close(self: *LspDocumentStore, uri: []const u8) void {
-        if (self.map.fetchRemove(uri)) |removed| {
-            self.allocator.free(@constCast(removed.key));
-            var document = removed.value;
-            document.deinit(self.allocator);
-            self.allocator.destroy(document);
-        }
+    pub fn close(
+        self: *LspDocumentStore,
+        uri: []const u8,
+        workspace: *workspace_mod.Workspace,
+    ) !void {
+        const removed = self.map.fetchRemove(uri) orelse return;
+        self.allocator.free(@constCast(removed.key));
+        var document = removed.value;
+        document.deinit(self.allocator);
+        self.allocator.destroy(document);
+
+        // Closing frees the document's AST, but the type checker's cached scopes
+        // still reference it — both the closed document's own scope and the
+        // scopes of any open document that imported it. Re-check the remaining
+        // open set (through a reset checker) so those dangling references are
+        // dropped and rebuilt from live sources before the next request.
+        try self.recheckAllTypes(workspace);
     }
 
     pub fn resolveUri(self: LspDocumentStore, path: []const u8) ![]const u8 {

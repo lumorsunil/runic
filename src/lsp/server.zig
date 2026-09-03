@@ -340,7 +340,7 @@ pub const Server = struct {
     }
 
     fn handleDidClose(self: *Server, params: types.DidCloseTextDocumentParams) !void {
-        self.documents.close(params.textDocument.uri);
+        try self.documents.close(params.textDocument.uri, self.workspace);
     }
 
     fn handleCompletion(
