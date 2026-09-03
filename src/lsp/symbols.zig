@@ -17,6 +17,9 @@ pub const Symbol = struct {
     name: []const u8,
     detail: []const u8,
     documentation: []const u8 = &[_]u8{},
+    /// LSP snippet insert text (tab stops like `${1:name}`). Empty means the
+    /// completion inserts its label verbatim rather than a snippet.
+    snippet: []const u8 = &[_]u8{},
     kind: SymbolKind,
     span: ast.Span,
 
@@ -25,6 +28,9 @@ pub const Symbol = struct {
         allocator.free(self.detail);
         if (self.documentation.len > 0) {
             allocator.free(self.documentation);
+        }
+        if (self.snippet.len > 0) {
+            allocator.free(self.snippet);
         }
         self.* = undefined;
     }

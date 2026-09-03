@@ -9,10 +9,16 @@ const max_source_bytes: usize = 4 * 1024 * 1024;
 
 const Allocator = std.mem.Allocator;
 
-fn makeKeyword(allocator: Allocator, name: []const u8, documentation: []const u8) !symbols.Symbol {
+fn makeKeyword(
+    allocator: Allocator,
+    name: []const u8,
+    documentation: []const u8,
+    snippet: []const u8,
+) !symbols.Symbol {
     return .{
         .detail = try allocator.dupe(u8, "keyword"),
         .documentation = try allocator.dupe(u8, documentation),
+        .snippet = if (snippet.len > 0) try allocator.dupe(u8, snippet) else &[_]u8{},
         .name = try allocator.dupe(u8, name),
         .kind = .keyword,
         .span = .global,
@@ -23,10 +29,10 @@ fn keywordSymbols(allocator: Allocator) ![]const symbols.Symbol {
     var list = std.ArrayList(symbols.Symbol).empty;
 
     try list.appendSlice(allocator, &.{
-        try makeKeyword(allocator, "import", "# import\nImport a runic module.\n\n```\nconst lib = import \"lib.rn\"\n```"),
-        try makeKeyword(allocator, "const", "Define a constant.\n\n```\nconst myConst = 5\n```"),
-        try makeKeyword(allocator, "var", "Define a variable.\n\n```\nvar myConst = 5\nmyConst = 3\n```"),
-        try makeKeyword(allocator, "fn", "Declare a function.\n\n```\nfn hello() Void {\n    echo \"hello\"\n}\n```"),
+        try makeKeyword(allocator, "import", "# import\nImport a runic module.\n\n```\nconst lib = import \"lib.rn\"\n```", "const ${1:name} = import \"${2:module.rn}\""),
+        try makeKeyword(allocator, "const", "Define a constant.\n\n```\nconst myConst = 5\n```", "const ${1:name} = ${2:value}"),
+        try makeKeyword(allocator, "var", "Define a variable.\n\n```\nvar myConst = 5\nmyConst = 3\n```", "var ${1:name} = ${2:value}"),
+        try makeKeyword(allocator, "fn", "Declare a function.\n\n```\nfn hello() Void {\n    echo \"hello\"\n}\n```", "fn ${1:name}(${2:params}) ${3:Void} {\n\t$0\n}"),
     });
 
     return try list.toOwnedSlice(allocator);

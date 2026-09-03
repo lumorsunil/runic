@@ -33,7 +33,11 @@ Near-term improvements:
 
 - member-access completions
 - richer completion metadata such as symbol kind and signature/detail text
-- snippets for common constructs like `const`, `var`, and `fn`
+- ~~snippets for common constructs like `const`, `var`, and `fn`~~ **done:**
+  the `import`/`const`/`var`/`fn` keyword completions now insert snippets with
+  tab stops (e.g. `const ${1:name} = ${2:value}`), gated on the client's
+  `completionItem.snippetSupport` capability so clients without snippet support
+  still get a plain insert
 - continued improvement of import/module-path completions
 
 ### 2. Navigation features
