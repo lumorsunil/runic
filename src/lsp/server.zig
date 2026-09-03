@@ -647,7 +647,19 @@ pub const Server = struct {
         var loc = params.position.toLocation(path);
         if (doc) |d| loc.offset = params.position.findIndex(d.text) orelse 0;
         const extracted_identifier = if (doc) |d| self.extractIdentifier(loc, d.text) else null;
+        const extracted_member = if (doc) |d| self.extractMember(loc, d.text) else null;
         const scope = self.workspace.type_checker.getScopeFromLoc(loc);
+
+        // Member access takes precedence: the cursor on `p.x` should resolve to
+        // `x`'s field declaration in the struct, not to an unrelated `x` binding
+        // that might happen to be in scope. Only jumps when the field/decl is
+        // actually found, otherwise falls through to identifier resolution.
+        if (scope) |s| if (extracted_member) |member| {
+            if (self.resolveMemberFieldSpan(s, member)) |field_span| {
+                try self.sendDefinitionSpan(id, field_span);
+                return;
+            }
+        };
 
         const binding: ?*runic.semantic.Scope.Binding = brk: {
             if (scope) |s| if (extracted_identifier) |i| {
@@ -657,13 +669,7 @@ pub const Server = struct {
         };
 
         if (binding) |b| {
-            const definition_uri = try self.documents.resolveUri(b.identifier.span.start.file);
-            defer self.allocator.free(definition_uri);
-            const result = types.Location{
-                .uri = definition_uri,
-                .range = types.Range.fromSpan(b.identifier.span),
-            };
-            try self.sendJson(types.response(id, result));
+            try self.sendDefinitionSpan(id, b.identifier.span);
             return;
         }
 
@@ -695,6 +701,51 @@ pub const Server = struct {
         }
 
         try self.sendJson(types.response(id, std.json.Value{ .null = {} }));
+    }
+
+    /// Sends a go-to-definition Location for `span`, resolving the target
+    /// document URI from the span's source file.
+    fn sendDefinitionSpan(self: *Server, id: types.RequestId, span: runic.ast.Span) !void {
+        const definition_uri = try self.documents.resolveUri(span.start.file);
+        defer self.allocator.free(definition_uri);
+        const result = types.Location{
+            .uri = definition_uri,
+            .range = types.Range.fromSpan(span),
+        };
+        try self.sendJson(types.response(id, result));
+    }
+
+    /// Resolves a member access (`object.member`) to the span of the member's
+    /// declaration in the object's struct type — a struct field's name, or a
+    /// struct decl (method/const member). Returns null when the object is not a
+    /// struct, has no such member, or has no known type (e.g. builtin members
+    /// like `.stdout` on an execution result, which have no source declaration).
+    fn resolveMemberFieldSpan(
+        self: *Server,
+        scope: *runic.semantic.Scope,
+        member: ExtractedMember,
+    ) ?runic.ast.Span {
+        const binding = scope.lookup(member.object_name) orelse return null;
+        const binding_type = binding.type_expr orelse return null;
+        const resolved = switch (binding_type.*) {
+            .alias => |alias_type| self.workspace.type_checker.resolveAliasType(&alias_type),
+            else => binding_type,
+        };
+        const struct_type = switch (resolved.*) {
+            .struct_type => |st| st,
+            else => return null,
+        };
+        for (struct_type.fields) |field| {
+            if (std.mem.eql(u8, field.name.name, member.member_name)) {
+                return field.name.span;
+            }
+        }
+        for (struct_type.decls) |decl| {
+            if (std.mem.eql(u8, decl.name.name, member.member_name)) {
+                return decl.name.span;
+            }
+        }
+        return null;
     }
 
     fn handleReferences(

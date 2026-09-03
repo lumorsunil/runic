@@ -32,7 +32,7 @@ fn keywordSymbols(allocator: Allocator) ![]const symbols.Symbol {
         try makeKeyword(allocator, "import", "# import\nImport a runic module.\n\n```\nconst lib = import \"lib.rn\"\n```", "const ${1:name} = import \"${2:module.rn}\""),
         try makeKeyword(allocator, "const", "Define a constant.\n\n```\nconst myConst = 5\n```", "const ${1:name} = ${2:value}"),
         try makeKeyword(allocator, "var", "Define a variable.\n\n```\nvar myConst = 5\nmyConst = 3\n```", "var ${1:name} = ${2:value}"),
-        try makeKeyword(allocator, "fn", "Declare a function.\n\n```\nfn hello() Void {\n    echo \"hello\"\n}\n```", "fn ${1:name}(${2:params}) ${3:Void} {\n\t$0\n}"),
+        try makeKeyword(allocator, "fn", "Declare a function.\n\n```\nfn Void hello(name: String) Void {\n    echo \"hello ${name}\"\n}\n```", "fn ${1:Void} ${2:name}(${3:params}) ${4:Void} {\n\t$0\n}"),
     });
 
     return try list.toOwnedSlice(allocator);

@@ -239,6 +239,100 @@ test "lsp definition resolves imported module member to module file" {
     try std.testing.expectEqual(@as(i64, 10), start.get("character").?.integer);
 }
 
+const DefResult = struct { found: bool, line: i64, character: i64 };
+
+fn singleFileDefinition(alloc: Allocator, source: []const u8, line: u32, char: u32) !DefResult {
+    var fixture = try TestFixture.init(alloc);
+    defer fixture.deinit();
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer alloc.free(uri);
+    const messages = [_][]const u8{
+        try makeDidOpen(alloc, uri, source),
+        try makeDefinitionRequest(alloc, 1, uri, line, char),
+    };
+    defer for (messages) |m| alloc.free(m);
+    const output = try runServerWithMessages(alloc, &messages);
+    defer alloc.free(output);
+    const response = try findResponseById(alloc, output, 1);
+    defer alloc.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.body, .{});
+    defer parsed.deinit();
+    const result = parsed.value.object.get("result").?;
+    if (result == .null) return .{ .found = false, .line = -1, .character = -1 };
+    const start = result.object.get("range").?.object.get("start").?.object;
+    return .{ .found = true, .line = start.get("line").?.integer, .character = start.get("character").?.integer };
+}
+
+fn expectDefinition(source: []const u8, line: u32, char: u32, exp_line: i64, exp_char: i64) !void {
+    const r = try singleFileDefinition(std.testing.allocator, source, line, char);
+    try std.testing.expect(r.found);
+    try std.testing.expectEqual(exp_line, r.line);
+    try std.testing.expectEqual(exp_char, r.character);
+}
+
+test "lsp definition resolves a local binding usage" {
+    try expectDefinition(
+        \\const foo = 1
+        \\echo foo
+        \\
+    , 1, 5, 0, 6);
+}
+
+test "lsp definition resolves a function parameter usage" {
+    try expectDefinition(
+        \\fn Void add(x: Int, y: Int) Int {
+        \\    yield x + y
+        \\}
+        \\
+    , 1, 10, 0, 12);
+}
+
+test "lsp definition resolves the nearest shadowing binding" {
+    // The inner `const x` (line 2) shadows the outer one (line 0); the usage in
+    // the function body must resolve to the inner declaration.
+    try expectDefinition(
+        \\const x = 1
+        \\fn Void f() Int {
+        \\    const x = 2
+        \\    yield x
+        \\}
+        \\
+    , 3, 10, 2, 10);
+}
+
+test "lsp definition resolves a function call to its declaration" {
+    try expectDefinition(
+        \\fn Void greet(name: String) Void {
+        \\    echo "hi ${name}"
+        \\}
+        \\greet "x"
+        \\
+    , 3, 2, 0, 8);
+}
+
+test "lsp definition resolves a struct field member access to the field declaration" {
+    // Cursor on `x` in `p.x` jumps to the `x` field in the struct definition,
+    // not to any unrelated `x` binding that might be in scope.
+    try expectDefinition(
+        \\const Point = struct { x: Int, y: Int }
+        \\const p = Point{ .x = 1, .y = 2 }
+        \\echo "${p.x}"
+        \\
+    , 2, 10, 0, 23);
+}
+
+test "lsp definition prefers the struct field over an unrelated same-named binding" {
+    // A top-level `const x` exists, but the cursor is on the member `p.x`, so
+    // member resolution must win over the plain identifier lookup.
+    try expectDefinition(
+        \\const x = 99
+        \\const Point = struct { x: Int, y: Int }
+        \\const p = Point{ .x = 1, .y = 2 }
+        \\echo "${p.x}"
+        \\
+    , 3, 10, 1, 23);
+}
+
 test "lsp references search across opened documents" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
