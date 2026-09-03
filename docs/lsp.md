@@ -72,7 +72,14 @@ Current concerns:
   the workspace type checker reused a single arena freed only at shutdown, so
   analysis memory grew per edit; it is now reset (and open documents re-checked)
   on each change, bounding memory to one pass over the open set.
-- continued memory/leak/crash hardening during restarts and document churn
+- continued memory/leak/crash hardening during restarts and document churn —
+  **in progress:** closing a document freed its AST but left the type checker's
+  cached scopes referencing it (both the closed document's own scope and the
+  scopes of any open document that imported it), so a request issued after a
+  close but before the next edit read freed memory. `close` now re-checks the
+  remaining open set so those references are dropped and rebuilt. Regression
+  tests in `tests/lsp_protocol.zig` cover close-then-request on an importer and
+  repeated open/change/close/reopen churn.
 
 ### 4. Better alignment with the language pipeline
 

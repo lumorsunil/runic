@@ -387,6 +387,132 @@ test "lsp per-edit recheck stays bounded to open documents, not imported modules
     try std.testing.expectEqualStrings("", result.stderr);
 }
 
+test "lsp survives request on an importer after its imported module is closed" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const module_uri = try fixture.writeDocument("module.rn",
+        \\pub const version = "0.0.1"
+        \\
+    );
+    defer allocator.free(module_uri);
+    const main_uri = try fixture.writeDocument("main.rn",
+        \\const m = import "./module.rn"
+        \\echo "${m.version}"
+        \\
+    );
+    defer allocator.free(main_uri);
+
+    // Open both, close the imported module, then — without any intervening edit
+    // that would re-heal caches — issue a definition request on the importer
+    // that reaches through the (now closed) module's type.
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, module_uri,
+            \\pub const version = "0.0.1"
+            \\
+        ),
+        try makeDidOpen(allocator, main_uri,
+            \\const m = import "./module.rn"
+            \\echo "${m.version}"
+            \\
+        ),
+        try makeDidClose(allocator, module_uri),
+        try makeDefinitionRequest(allocator, 5, main_uri, 1, 10),
+    };
+    defer for (messages) |m| allocator.free(m);
+
+    const result = try runServerWithMessagesDetailed(allocator, &messages);
+    defer result.deinit(allocator);
+
+    // No crash, no leak (checked by the testing allocator), quiet stderr.
+    try std.testing.expectEqualStrings("", result.stderr);
+
+    // The importer's caches were rebuilt on close (the module is re-read from
+    // disk), so member resolution still points at the module's real declaration
+    // rather than reading through the freed AST.
+    const response = try findResponseById(allocator, result.stdout, 5);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+    const def = parsed.value.object.get("result").?.object;
+    try std.testing.expectEqualStrings(module_uri, def.get("uri").?.string);
+    const start = def.get("range").?.object.get("start").?.object;
+    try std.testing.expectEqual(@as(i64, 0), start.get("line").?.integer);
+    try std.testing.expectEqual(@as(i64, 10), start.get("character").?.integer);
+}
+
+test "lsp survives repeated open/change/close/reopen churn" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const uri = try fixture.writeDocument("main.rn",
+        \\const foo = 1
+        \\echo foo
+        \\
+    );
+    defer allocator.free(uri);
+
+    var message_list = std.ArrayList([]const u8).empty;
+    defer {
+        for (message_list.items) |m| allocator.free(m);
+        message_list.deinit(allocator);
+    }
+
+    var round: i64 = 0;
+    while (round < 5) : (round += 1) {
+        try message_list.append(allocator, try makeDidOpen(allocator, uri,
+            \\const foo = 1
+            \\echo foo
+            \\
+        ));
+        try message_list.append(allocator, try makeDidChangeWholeDocument(allocator, uri, round * 2 + 2,
+            \\const foo = 2
+            \\echo foo
+            \\
+        ));
+        try message_list.append(allocator, try makeDidChangeIncremental(allocator, uri, round * 2 + 3, 0, 6, 0, 9, "renamed"));
+        try message_list.append(allocator, try makeCompletionRequest(allocator, 100 + round, uri, 1, 5));
+        try message_list.append(allocator, try makeDidClose(allocator, uri));
+    }
+
+    const result = try runServerWithMessagesDetailed(allocator, message_list.items);
+    defer result.deinit(allocator);
+
+    // The document was closed on the last round, so the store ends empty.
+    try std.testing.expectEqual(@as(usize, 0), result.doc_count);
+    try std.testing.expectEqualStrings("", result.stderr);
+}
+
+test "lsp tolerates didChange and didClose for never-opened documents" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const uri = try fixture.writeDocument("ghost.rn",
+        \\const foo = 1
+        \\
+    );
+    defer allocator.free(uri);
+
+    // Change and close a document the server never saw an open for.
+    const messages = [_][]const u8{
+        try makeDidChangeWholeDocument(allocator, uri, 2,
+            \\const foo = 2
+            \\
+        ),
+        try makeDidClose(allocator, uri),
+    };
+    defer for (messages) |m| allocator.free(m);
+
+    const result = try runServerWithMessagesDetailed(allocator, &messages);
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), result.doc_count);
+    try std.testing.expectEqualStrings("", result.stderr);
+}
+
 test "lsp references search across opened documents" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
@@ -1027,6 +1153,16 @@ fn makeDidOpen(allocator: Allocator, uri: []const u8, text: []const u8) ![]u8 {
                 .version = 1,
                 .text = text,
             },
+        },
+    });
+}
+
+fn makeDidClose(allocator: Allocator, uri: []const u8) ![]u8 {
+    return toJsonAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .method = "textDocument/didClose",
+        .params = .{
+            .textDocument = .{ .uri = uri },
         },
     });
 }
