@@ -2,10 +2,7 @@ const std = @import("std");
 const symbols = @import("symbols.zig");
 const diag = @import("diagnostics.zig");
 const runic = @import("runic");
-const parseFile = @import("parser.zig").parseFile;
 const LspDocumentStore = @import("document.zig").LspDocumentStore;
-
-const max_source_bytes: usize = 4 * 1024 * 1024;
 
 const Allocator = std.mem.Allocator;
 
@@ -61,8 +58,6 @@ pub const Workspace = struct {
     diagnostics: std.ArrayList(diag.Diagnostic) = .empty,
     documents: *LspDocumentStore,
     type_checker: runic.semantic.TypeChecker,
-
-    const self_dirs = [_][]const u8{ "src", "examples", "tests" };
 
     pub fn init(
         io: std.Io,
@@ -121,9 +116,20 @@ pub const Workspace = struct {
         self.clearIndex();
         try self.addKeywordsToIndex();
         self.clearDiagnostics();
-        // for (self.roots.items) |root| {
-        //     try self.scanRoot(root);
-        // }
+    }
+
+    /// Walks the workspace roots and loads every `.rn` file into the document
+    /// store so its symbols are available to workspace search and cross-file
+    /// navigation. Called only for roots the client explicitly provided (never
+    /// the current-directory fallback, which could be an arbitrarily large tree).
+    pub fn indexWorkspace(self: *Workspace) void {
+        for (self.roots.items) |root| {
+            // A scan failure (e.g. an unreadable directory) must not abort
+            // startup — the server still works with whatever was indexed.
+            self.scanRoot(root) catch |err| {
+                std.log.err("workspace scan failed for {s}: {}", .{ root, err });
+            };
+        }
     }
 
     pub fn symbolSlice(self: *Workspace) []const symbols.Symbol {
@@ -162,15 +168,23 @@ pub const Workspace = struct {
         self.diagnostics.clearRetainingCapacity();
     }
 
-    fn scanRoot(self: *Workspace, root: []const u8) !void {
-        for (self_dirs) |segment| {
-            const absolute = try std.fs.path.join(self.allocator, &.{ root, segment });
-            defer self.allocator.free(absolute);
-            try self.walkDir(absolute, segment);
+    /// Directory names skipped during the workspace scan — build/output caches
+    /// and dependency trees that contain no first-party source.
+    const skip_dirs = [_][]const u8{ "zig-cache", ".zig-cache", "zig-out", "node_modules", "target", ".git" };
+
+    fn shouldSkipDir(name: []const u8) bool {
+        if (name.len > 0 and name[0] == '.') return true;
+        for (skip_dirs) |skip| {
+            if (std.mem.eql(u8, name, skip)) return true;
         }
+        return false;
     }
 
-    fn walkDir(self: *Workspace, absolute_path: []const u8, rel_path: []const u8) !void {
+    fn scanRoot(self: *Workspace, root: []const u8) !void {
+        try self.walkDir(root);
+    }
+
+    fn walkDir(self: *Workspace, absolute_path: []const u8) !void {
         var dir = std.Io.Dir.openDirAbsolute(self.io, absolute_path, .{ .iterate = true }) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
@@ -179,42 +193,31 @@ pub const Workspace = struct {
 
         var it = dir.iterate();
         while (try it.next(self.io)) |entry| {
-            const child_abs = try std.fs.path.join(self.allocator, &.{ absolute_path, entry.name });
-            defer self.allocator.free(child_abs);
-            const rel_child = try joinRelative(self.allocator, rel_path, entry.name);
-            defer self.allocator.free(rel_child);
-
             switch (entry.kind) {
-                .directory => try self.walkDir(child_abs, rel_child),
-                .file => if (std.mem.endsWith(u8, entry.name, ".rn")) try self.indexFile(child_abs, rel_child),
+                .directory => {
+                    if (shouldSkipDir(entry.name)) continue;
+                    const child_abs = try std.fs.path.join(self.allocator, &.{ absolute_path, entry.name });
+                    defer self.allocator.free(child_abs);
+                    try self.walkDir(child_abs);
+                },
+                .file => {
+                    if (!std.mem.endsWith(u8, entry.name, ".rn")) continue;
+                    const child_abs = try std.fs.path.join(self.allocator, &.{ absolute_path, entry.name });
+                    defer self.allocator.free(child_abs);
+                    self.indexFile(child_abs);
+                },
                 else => {},
             }
         }
     }
 
-    fn indexFile(self: *Workspace, absolute_path: []const u8, detail: []const u8) !void {
-        const file = std.Io.Dir.openFileAbsolute(self.io, absolute_path, .{}) catch |err| switch (err) {
-            error.FileNotFound => return,
-            else => return err,
-        };
-        defer file.close(self.io);
-        var file_reader = file.reader(self.io, &.{});
-        const contents = file_reader.interface.allocRemaining(self.allocator, .limited(max_source_bytes)) catch |err| switch (err) {
-            error.StreamTooLong => return error.SourceTooLarge,
-            else => return err,
-        };
-        defer self.allocator.free(contents);
-        // var parser = runic.parser.Parser.init(self.allocator, contents);
-        var parser = runic.parser.Parser.init(self.allocator, self.documents.documentStore());
-        defer parser.deinit();
-        const script = try parseFile(self.allocator, &self.diagnostics, &parser, absolute_path) orelse return;
-        try symbols.collectSymbols(self.allocator, detail, script, &self.index);
+    /// Loads a workspace file into the document store as a server-managed
+    /// document so its symbols become available to navigation and workspace
+    /// search. Reuses the store's parse + symbol collection, whose spans
+    /// reference the document's long-lived path. Per-file failures are ignored.
+    fn indexFile(self: *Workspace, absolute_path: []const u8) void {
+        const uri = self.documents.resolveUri(absolute_path) catch return;
+        defer self.allocator.free(uri);
+        _ = self.documents.requestDocument(uri, absolute_path, .open_and_parse_only) catch return;
     }
 };
-
-fn joinRelative(allocator: Allocator, base: []const u8, name: []const u8) ![]u8 {
-    if (base.len == 0) {
-        return allocator.dupe(u8, name);
-    }
-    return std.fs.path.join(allocator, &.{ base, name });
-}

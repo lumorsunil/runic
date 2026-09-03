@@ -116,6 +116,7 @@ pub const ClientRequestPayload = union(enum) {
     @"textDocument/documentSymbol": DocumentSymbolParams,
     @"textDocument/rename": RenameParams,
     @"textDocument/formatting": DocumentFormattingParams,
+    @"workspace/symbol": WorkspaceSymbolParams,
     @"workspace/didChangeConfiguration": DidChangeConfigurationParams,
     @"workspace/didChangeWatchedFiles": DidChangeWatchedFilesParams,
     @"$/cancelRequest",
@@ -246,6 +247,19 @@ pub const DocumentLink = struct {
 
 pub const DocumentSymbolParams = struct {
     textDocument: TextDocumentIdentifier,
+};
+
+pub const WorkspaceSymbolParams = struct {
+    /// A query string to filter symbols by. An empty query matches everything.
+    query: []const u8,
+};
+
+/// A symbol reported by a workspace symbol search, with its location.
+pub const SymbolInformation = struct {
+    name: []const u8,
+    kind: SymbolKind,
+    location: Location,
+    containerName: ?[]const u8 = null,
 };
 
 pub const RenameParams = struct {

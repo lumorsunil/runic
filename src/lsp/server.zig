@@ -190,6 +190,10 @@ pub const Server = struct {
                 if (request.id) |id| try self.handleFormatting(id, params);
                 return true;
             },
+            .@"workspace/symbol" => |params| {
+                if (request.id) |id| try self.handleWorkspaceSymbol(id, params);
+                return true;
+            },
             .@"workspace/didChangeConfiguration", .@"workspace/didChangeWatchedFiles" => {
                 try self.log("ignoring optional workspace notification: {s}", .{request.method});
                 return true;
@@ -305,6 +309,10 @@ pub const Server = struct {
             }
         }
 
+        // A client-provided root is indexed; the current-directory fallback is
+        // not, since it could be an arbitrarily large tree unrelated to the
+        // edited project.
+        const has_explicit_root = roots.items.len > 0;
         if (roots.items.len == 0) {
             // `realPathFileAlloc` returns a sentinel-terminated `[:0]u8`; re-dupe it
             // into a plain slice so the workspace frees it with a matching size.
@@ -319,8 +327,9 @@ pub const Server = struct {
 
         try self.workspace.resetRoots(roots.items);
         try self.workspace.refresh();
+        if (has_explicit_root) self.workspace.indexWorkspace();
         self.initialized = true;
-        try self.log("workspace scan indexed {d} symbols", .{self.workspace.symbolCount()});
+        try self.log("workspace indexed {d} documents", .{self.documents.map.count()});
         try self.sendInitializeResult(id);
     }
 
@@ -969,6 +978,53 @@ pub const Server = struct {
         try self.sendJson(types.response(id, links.items));
     }
 
+    fn handleWorkspaceSymbol(
+        self: *Server,
+        id: types.RequestId,
+        params: types.WorkspaceSymbolParams,
+    ) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+
+        var results = std.ArrayList(types.SymbolInformation).empty;
+
+        // The document store holds every workspace file indexed at startup plus
+        // any open documents, so a single pass over it is the whole workspace.
+        var it = self.documents.map.iterator();
+        while (it.next()) |entry| {
+            const uri = entry.key_ptr.*;
+            for (entry.value_ptr.*.symbols.items) |sym| {
+                try appendWorkspaceSymbol(arena_allocator, &results, uri, sym, null, params.query);
+            }
+        }
+
+        try self.sendJson(types.response(id, results.items));
+    }
+
+    fn appendWorkspaceSymbol(
+        arena: Allocator,
+        results: *std.ArrayList(types.SymbolInformation),
+        uri: []const u8,
+        sym: symbols.Symbol,
+        container: ?[]const u8,
+        query: []const u8,
+    ) !void {
+        if (query.len == 0 or std.ascii.indexOfIgnoreCase(sym.name, query) != null) {
+            try results.append(arena, .{
+                .name = sym.name,
+                .kind = documentSymbolKind(sym.kind),
+                .location = .{ .uri = uri, .range = types.Range.fromSpan(sym.span) },
+                .containerName = container,
+            });
+        }
+        // Nested symbols (struct fields, function parameters) are searchable too,
+        // tagged with their enclosing symbol as the container.
+        for (sym.children) |child| {
+            try appendWorkspaceSymbol(arena, results, uri, child, sym.name, query);
+        }
+    }
+
     fn handleDocumentSymbols(
         self: *Server,
         id: types.RequestId,
@@ -1218,6 +1274,11 @@ pub const Server = struct {
                 .documentLinkProvider = .{
                     .resolveProvider = false,
                 },
+                .workspaceSymbolProvider = .{ .payload = .{
+                    .workspaceSymbolOptions = .{
+                        .workDoneProgress = false,
+                    },
+                } },
                 .documentSymbolProvider = .{ .payload = .{
                     .documentSymbolOptions = .{
                         .workDoneProgress = false,

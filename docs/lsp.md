@@ -24,6 +24,10 @@ Today it provides:
   child symbols
 - document highlight (occurrences of the identifier under the cursor)
 - document links (import paths link to the module file)
+- workspace symbol search across all indexed files
+- a workspace index: on initialize with a client-provided root, every `.rn`
+  file is loaded into the document store, making navigation work across files
+  that are not open
 
 There is also a placeholder `--tcp <port>` flag in the CLI surface, but that
 transport is still reserved rather than being part of the supported workflow.
@@ -65,7 +69,11 @@ Current planned work:
   declaration, and struct field/decl member access (`p.x` → the field
   declaration, which takes precedence over an unrelated same-named binding).
   Regression-tested in `tests/lsp_protocol.zig`.
-- more reliable identifier-to-symbol resolution
+- ~~more reliable identifier-to-symbol resolution~~ / workspace-wide
+  navigation — **done for definition:** the workspace is indexed on
+  initialize (client-provided roots only, never the cwd fallback), so
+  go-to-definition and references resolve to declarations in files that were
+  never opened; workspace/symbol search is served from the same index
 - ~~possibly document links where they clearly help navigation~~ **done:**
   `import "./x.rn"` paths are links to the module file (embedded `std`
   imports are skipped, having no file to open)
