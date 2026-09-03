@@ -170,6 +170,10 @@ pub const Server = struct {
                 if (request.id) |id| try self.handleReferences(id, params);
                 return true;
             },
+            .@"textDocument/documentHighlight" => |params| {
+                if (request.id) |id| try self.handleDocumentHighlight(id, params);
+                return true;
+            },
             .@"textDocument/documentSymbol" => |params| {
                 if (request.id) |id| try self.handleDocumentSymbols(id, params);
                 return true;
@@ -871,6 +875,40 @@ pub const Server = struct {
         try self.sendJson(types.response(id, locations.items));
     }
 
+    fn handleDocumentHighlight(
+        self: *Server,
+        id: types.RequestId,
+        params: types.DocumentHighlightParams,
+    ) !void {
+        const path = try self.resolveUriPath(params.textDocument.uri);
+        defer self.allocator.free(path);
+
+        const doc = self.documents.get(params.textDocument.uri);
+
+        var loc = params.position.toLocation(path);
+        if (doc) |d| loc.offset = params.position.findIndex(d.text) orelse 0;
+        const extracted_identifier = if (doc) |d| self.extractIdentifier(loc, d.text) else null;
+
+        if (extracted_identifier == null or doc == null) {
+            try self.sendJson(types.response(id, std.json.Value{ .null = {} }));
+            return;
+        }
+
+        // Highlight every occurrence of the identifier in the current document.
+        // findIdentifierRanges lexes the source, so occurrences inside strings
+        // and comments are excluded.
+        var ranges = try self.findIdentifierRanges(doc.?.text, extracted_identifier.?.name);
+        defer ranges.deinit(self.allocator);
+
+        var highlights = std.ArrayList(types.DocumentHighlight).empty;
+        defer highlights.deinit(self.allocator);
+        for (ranges.items) |range| {
+            try highlights.append(self.allocator, .{ .range = range, .kind = .text });
+        }
+
+        try self.sendJson(types.response(id, highlights.items));
+    }
+
     fn handleDocumentSymbols(
         self: *Server,
         id: types.RequestId,
@@ -1092,6 +1130,11 @@ pub const Server = struct {
                 } },
                 .referencesProvider = .{ .payload = .{
                     .referenceOptions = .{
+                        .workDoneProgress = false,
+                    },
+                } },
+                .documentHighlightProvider = .{ .payload = .{
+                    .documentHighlightOptions = .{
                         .workDoneProgress = false,
                     },
                 } },

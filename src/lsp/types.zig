@@ -111,6 +111,7 @@ pub const ClientRequestPayload = union(enum) {
     @"textDocument/hover": HoverParams,
     @"textDocument/definition": DefinitionParams,
     @"textDocument/references": ReferenceParams,
+    @"textDocument/documentHighlight": DocumentHighlightParams,
     @"textDocument/documentSymbol": DocumentSymbolParams,
     @"textDocument/rename": RenameParams,
     @"textDocument/formatting": DocumentFormattingParams,
@@ -205,6 +206,30 @@ pub const ReferenceParams = struct {
     textDocument: TextDocumentIdentifier,
     position: Position,
     context: ReferenceContext,
+};
+
+pub const DocumentHighlightParams = struct {
+    textDocument: TextDocumentIdentifier,
+    position: Position,
+};
+
+/// A document highlight kind — how an occurrence relates to the symbol.
+pub const DocumentHighlightKind = enum(u32) {
+    text = 1,
+    read = 2,
+    write = 3,
+
+    pub fn jsonStringify(
+        self: @This(),
+        stringify: *std.json.Stringify,
+    ) std.json.Stringify.Error!void {
+        try stringify.write(@intFromEnum(self));
+    }
+};
+
+pub const DocumentHighlight = struct {
+    range: Range,
+    kind: ?DocumentHighlightKind = null,
 };
 
 pub const DocumentSymbolParams = struct {

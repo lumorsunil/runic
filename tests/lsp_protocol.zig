@@ -654,6 +654,58 @@ test "lsp references can exclude declaration" {
     try std.testing.expectEqual(@as(i64, 5), start.get("character").?.integer);
 }
 
+test "lsp document highlight marks identifier occurrences, ignoring strings and comments" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\const foo = 1
+        \\echo "foo lives in a string"
+        \\# foo lives in a comment
+        \\const bar = foo
+        \\echo foo
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        // Cursor on `foo` in its declaration (line 0, char 6).
+        try makeDocumentHighlightRequest(allocator, 7, uri, 0, 6),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 7);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const highlights = parsed.value.object.get("result").?.array.items;
+    // Three code occurrences: the declaration (line 0), the use on line 3, and
+    // the use on line 4 — the string and comment mentions are excluded.
+    try std.testing.expectEqual(@as(usize, 3), highlights.len);
+    var saw_lines = [_]bool{ false, false, false, false, false };
+    for (highlights) |h| {
+        const start = h.object.get("range").?.object.get("start").?.object;
+        const line: usize = @intCast(start.get("line").?.integer);
+        try std.testing.expect(line < saw_lines.len);
+        saw_lines[line] = true;
+        // Highlight kind is DocumentHighlightKind.Text (1), serialized numeric.
+        try std.testing.expectEqual(@as(i64, 1), h.object.get("kind").?.integer);
+    }
+    try std.testing.expect(saw_lines[0]);
+    try std.testing.expect(saw_lines[3]);
+    try std.testing.expect(saw_lines[4]);
+    try std.testing.expect(!saw_lines[1]); // string
+    try std.testing.expect(!saw_lines[2]); // comment
+}
+
 test "lsp publishes diagnostics for invalid source" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
@@ -1493,6 +1545,24 @@ fn makeHoverRequest(
                 .line = line,
                 .character = character,
             },
+        },
+    });
+}
+
+fn makeDocumentHighlightRequest(
+    allocator: Allocator,
+    id: i64,
+    uri: []const u8,
+    line: u32,
+    character: u32,
+) ![]u8 {
+    return toJsonAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .id = id,
+        .method = "textDocument/documentHighlight",
+        .params = .{
+            .textDocument = .{ .uri = uri },
+            .position = .{ .line = line, .character = character },
         },
     });
 }
