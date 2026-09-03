@@ -23,6 +23,7 @@ Today it provides:
   nested: functions expose their parameters and structs expose their fields as
   child symbols
 - document highlight (occurrences of the identifier under the cursor)
+- document links (import paths link to the module file)
 
 There is also a placeholder `--tcp <port>` flag in the CLI surface, but that
 transport is still reserved rather than being part of the supported workflow.
@@ -65,7 +66,9 @@ Current planned work:
   declaration, which takes precedence over an unrelated same-named binding).
   Regression-tested in `tests/lsp_protocol.zig`.
 - more reliable identifier-to-symbol resolution
-- possibly document links where they clearly help navigation
+- ~~possibly document links where they clearly help navigation~~ **done:**
+  `import "./x.rn"` paths are links to the module file (embedded `std`
+  imports are skipped, having no file to open)
 
 ### 3. Stability and performance
 

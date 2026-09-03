@@ -714,6 +714,54 @@ test "lsp references can exclude declaration" {
     try std.testing.expectEqual(@as(i64, 5), start.get("character").?.integer);
 }
 
+test "lsp document link points an import path at the module file" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const module_uri = try fixture.writeDocument("module.rn",
+        \\pub const version = "1"
+        \\
+    );
+    defer allocator.free(module_uri);
+    const main_uri = try fixture.writeDocument("main.rn",
+        \\const m = import "./module.rn"
+        \\echo "${m.version}"
+        \\
+    );
+    defer allocator.free(main_uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, main_uri,
+            \\const m = import "./module.rn"
+            \\echo "${m.version}"
+            \\
+        ),
+        try makeDocumentLinkRequest(allocator, 7, main_uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 7);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const links = parsed.value.object.get("result").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), links.len);
+    const link = links[0].object;
+
+    // Target is the module's file:// URI.
+    try std.testing.expectEqualStrings(module_uri, link.get("target").?.string);
+    // Range covers the import path string on line 0 (after `const m = import "`).
+    const start = link.get("range").?.object.get("start").?.object;
+    try std.testing.expectEqual(@as(i64, 0), start.get("line").?.integer);
+    try std.testing.expect(start.get("character").?.integer > 0);
+}
+
 test "lsp document highlight marks identifier occurrences, ignoring strings and comments" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
@@ -1614,6 +1662,17 @@ fn makeFormattingRequest(allocator: Allocator, id: i64, uri: []const u8) ![]u8 {
                 .tabSize = 4,
                 .insertSpaces = true,
             },
+        },
+    });
+}
+
+fn makeDocumentLinkRequest(allocator: Allocator, id: i64, uri: []const u8) ![]u8 {
+    return toJsonAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .id = id,
+        .method = "textDocument/documentLink",
+        .params = .{
+            .textDocument = .{ .uri = uri },
         },
     });
 }

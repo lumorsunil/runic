@@ -112,6 +112,7 @@ pub const ClientRequestPayload = union(enum) {
     @"textDocument/definition": DefinitionParams,
     @"textDocument/references": ReferenceParams,
     @"textDocument/documentHighlight": DocumentHighlightParams,
+    @"textDocument/documentLink": DocumentLinkParams,
     @"textDocument/documentSymbol": DocumentSymbolParams,
     @"textDocument/rename": RenameParams,
     @"textDocument/formatting": DocumentFormattingParams,
@@ -230,6 +231,17 @@ pub const DocumentHighlightKind = enum(u32) {
 pub const DocumentHighlight = struct {
     range: Range,
     kind: ?DocumentHighlightKind = null,
+};
+
+pub const DocumentLinkParams = struct {
+    textDocument: TextDocumentIdentifier,
+};
+
+/// A link inside a document (e.g. an import path) pointing at a target URI.
+pub const DocumentLink = struct {
+    range: Range,
+    target: ?[]const u8 = null,
+    tooltip: ?[]const u8 = null,
 };
 
 pub const DocumentSymbolParams = struct {
