@@ -4,8 +4,9 @@ This document tracks the current future-facing plan for Runic.
 
 It is intentionally different from the historical bring-up notes that existed
 earlier in the project. The parser, type checker, IR compiler, script runner,
-and basic LSP all exist today, so the roadmap below focuses on the next major
-areas of work rather than on bootstrapping the interpreter from scratch.
+and a full-featured LSP all exist today, so the roadmap below focuses on the
+next major areas of work rather than on bootstrapping the interpreter from
+scratch.
 
 ## Current State
 
@@ -15,8 +16,10 @@ Runic already has:
 - script execution through the `runic` CLI
 - feature and diagnostics regression suites under `tests/`, plus in-source unit
   tests for the lexer, parser, type checker, IR compiler, and evaluator
-- a working `runic-lsp` binary with document management, diagnostics, hover,
-  and basic completion support
+- a `runic-lsp` binary with document management, diagnostics, hover,
+  completion (snippets, members, `$PATH`), go-to-definition, references and
+  rename (binding-aware, workspace-wide), document symbols/highlight/links,
+  workspace symbol search, folding ranges, inlay hints, and code actions
 - a command/process model with pipelines, execution-result values, redirects,
   imports, functions, closures, optionals, sum types, error sets/unions,
   `match`, and background execution
@@ -46,7 +49,8 @@ A cycle of feature work and engineering-health work:
   classification table (both replacing scattered per-site logic); and the unit
   test suite was resurrected and expanded — `zig build test` went from 13 tests
   (only the LSP protocol suite ran) to 70, after the runtime module's ~48
-  in-file tests were wired to run and brought back up to date.
+  in-file tests were wired to run and brought back up to date, and now stands
+  at 112 as the `runic-lsp` protocol suite grew alongside the LSP work below.
 
 A known constraint discovered this cycle: `compiler.zig` is large (~10k lines)
 but cannot be cleanly split in current Zig — `usingnamespace` was removed and
@@ -179,16 +183,23 @@ infrastructure.
 
 ### 5. LSP maturity
 
-The language server is no longer an MVP proposal; it exists and needs to be
-made more useful and more reliable.
+The language server saw a major build-out this cycle and now offers a broad,
+tested feature surface. Delivered:
 
-Current priorities are tracked in more detail in `docs/lsp.md`, but the broad
-goal is:
+- **Completion** — keyword snippets, member access (chained + trailing-dot
+  recovery), signature/type detail, `$PATH` executables, resolve-on-focus.
+- **Navigation** — go-to-definition, and binding-aware, workspace-wide
+  references and rename (including cross-file module members).
+- **Symbols & structure** — nested document outline, highlight, links,
+  workspace symbol search, folding ranges.
+- **Hints & actions** — inlay type and parameter hints, prepare-rename, an
+  add-type-annotation code action.
+- **Stability** — bounded per-edit analysis memory and re-check, and a
+  document-close use-after-free fix.
 
-- improve completion quality
-- add core navigation features
-- fix long-running stability/performance issues
-- keep diagnostics aligned with the parser/type checker used by the CLI
+Remaining work (tracked in `docs/lsp.md` and `todo.md`): more code actions
+(add-missing-import, remove-unused), call hierarchy, richer formatting, and
+semantic tokens. Diagnostics stay aligned with the CLI's parser/type checker.
 
 ### 6. Developer workflow and documentation
 

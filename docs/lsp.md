@@ -16,9 +16,15 @@ Today it provides:
 - document open/change/close handling
 - workspace awareness
 - diagnostics integration
-- basic hover support
-- keyword and module-name completion
-- symbol-based completion from the current workspace
+- hover with type information
+- completion — keywords (with `const`/`var`/`fn`/`import` snippets), workspace
+  symbols, member access (chained `a.b.c` and bare-trailing-dot recovery),
+  import module paths, and `$PATH` executables; items carry signature/type
+  detail and resolve documentation on focus
+- go-to-definition (locals, parameters, shadowing, functions, struct fields,
+  cross-file)
+- references and rename — binding-aware (not name-based) and workspace-wide,
+  including cross-file module members
 - document symbols (outline) for top-level bindings, functions, and structs —
   nested: functions expose their parameters and structs expose their fields as
   child symbols
@@ -30,9 +36,7 @@ Today it provides:
 - folding ranges (multi-line statements: functions, structs, control flow)
 - prepare-rename (validates the rename target and pre-fills the identifier)
 - code actions (quick fix: add an inferred type annotation to a binding)
-- completion item resolve (fills documentation from detail when focused)
 - workspace symbol search across all indexed files
-- workspace-wide rename (edits every indexed file that references the symbol)
 - a workspace index: on initialize with a client-provided root, every `.rn`
   file is loaded into the document store, making navigation work across files
   that are not open

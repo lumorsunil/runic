@@ -12,6 +12,8 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-04
+
 ### Added
 
 - **Exponent and bit shifts** — `**`, `<<`, `>>`. Integer operands stay `Int`
@@ -34,6 +36,26 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   sequence like `(...)`, not just a single expression.
 - **`&0 | cmd`** — a bare `&0` used as a pipeline stage forwards the function's
   stdin into the pipeline (distinct from reading `&0` as a value).
+- **Language server — major expansion.** `runic-lsp` gained a broad, tested
+  feature surface (see `docs/lsp.md`):
+  - _Completion:_ snippets for `const`/`var`/`fn`/`import` (gated on the
+    client's snippet capability); member access, including chained `a.b.c` and
+    recovery of a scope after a bare trailing dot (`obj.`); function-signature
+    and struct-field-type detail text; executables found on `$PATH`; symlinked
+    module paths; and `completionItem/resolve` filling documentation on focus.
+  - _Navigation:_ go-to-definition for locals, parameters, the nearest
+    shadowing binding, function calls, struct fields, and cross-file symbols;
+    references and rename that are **binding-aware** (scope/binding identity,
+    not name matching) and workspace-wide, including cross-file module members
+    (`m.foo`) even in files that were never opened.
+  - _Symbols & structure:_ a document outline nesting struct fields and
+    function parameters; document highlight; document links for import paths;
+    workspace symbol search; and folding ranges.
+  - _Hints & actions:_ inlay hints for inferred binding types and for call
+    parameter names (in nested positions and imported-module calls);
+    prepare-rename; and an "add type annotation" code action.
+  - _Workspace index:_ on initialize with a client-provided root, every `.rn`
+    file is indexed, which is what makes cross-file navigation and search work.
 
 ### Changed
 
@@ -50,6 +72,15 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   pointing at the source, instead of exiting silently.
 - **Missing executable** reports `command not found: '<name>'` with the call's
   source location, instead of a bare `error.FileNotFound`.
+- **LSP stability** — the workspace type checker's analysis memory is now reset
+  each edit (it previously grew unboundedly); the per-edit re-check is bounded
+  to the open documents rather than every module ever touched; and a
+  use-after-free when closing a document (stale cached scopes referencing the
+  freed AST) was fixed.
+- **LSP protocol encodings** — `SymbolKind`, `DiagnosticSeverity`,
+  `DiagnosticTag`, `TextDocumentSyncKind`, and `InsertTextFormat` now serialize
+  as their numeric codes; they were emitted as tag-name strings, which clients
+  reject.
 
 ### Internal
 
@@ -59,7 +90,9 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 - The unit-test suite was **resurrected and expanded**: `zig build test` went
   from 13 to 70 tests after the runtime module's in-file tests (lexer, parser,
   type checker, IR compiler, evaluator) were wired to run and brought up to
-  date, plus a new type-checker test harness.
+  date, plus a new type-checker test harness. It now stands at 112 tests, the
+  growth being an end-to-end `runic-lsp` protocol suite (49 tests) covering the
+  completion, navigation, symbol, hint, and action features above.
 
 ## [0.7.0] — 2026-08-31
 
