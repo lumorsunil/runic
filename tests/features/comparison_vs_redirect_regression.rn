@@ -1,7 +1,8 @@
 // `>` is overloaded by its left operand: a command (external executable, block,
 // or subshell) on the left makes it an output redirect; a value or in-scope
 // binding makes it the greater-than comparison. So these all compare, in any
-// context (condition, binding RHS, loop body). (`>>` and `>&` always redirect;
+// context (condition, binding RHS, loop body). (`>>` is likewise overloaded —
+// command-left appends, value-left is shift-right; `>&` always redirects;
 // `>=`/`<`/`<=` are always comparisons.)
 const a = 7
 const b = 3

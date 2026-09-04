@@ -1167,16 +1167,11 @@ pub const BinaryExpr = struct {
         const left_type = try self.left.resolveType(io, allocator, scope);
         const right_type = try self.right.resolveType(io, allocator, scope);
 
+        // Comparisons produce a Bool, not the operand type.
+        if (self.op.isComparison()) return &boolTypeExpr;
+
         return switch (self.op) {
-            // Comparisons and logical ops produce a Bool, not the operand type.
-            .equal,
-            .not_equal,
-            .greater,
-            .greater_equal,
-            .less,
-            .less_equal,
-            => &boolTypeExpr,
-            .assign, .add_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign => left_type,
+            .assign, .add_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign, .or_assign, .and_assign => left_type,
             .@"orelse" => blk: {
                 if (left_type) |lt| switch (lt.*) {
                     .optional => |optional| break :blk optional.child,
@@ -1247,11 +1242,13 @@ pub const BinaryExpr = struct {
                     else => break :blk null,
                 }
             },
-            // `xs[i]` yields the array's element type, not the array type.
+            // `xs[i]` yields the array's element type; `xs[a..b]` (a range index)
+            // is a slice and yields the whole array/string type.
             .array_access => blk: {
                 const lt = left_type orelse break :blk null;
                 var resolved = lt;
                 while (resolved.* == .alias) resolved = resolved.alias.type_expr;
+                if (self.right.* == .range) break :blk resolved;
                 break :blk switch (resolved.*) {
                     .array => |array| array.element,
                     else => null,
@@ -1268,6 +1265,8 @@ pub const BinaryOp = union(enum) {
     multiply,
     divide,
     remainder,
+    power,
+    shift_left,
     greater,
     fd_source_truncate_redirect: StreamRef,
     fd_source_append_redirect: StreamRef,
@@ -1295,9 +1294,73 @@ pub const BinaryOp = union(enum) {
     mul_assign,
     div_assign,
     rem_assign,
+    or_assign,
+    and_assign,
     /// Sequential execution: run left then right, result is right's result.
     /// Created by `parseBinding` when `;` follows a command expression initializer.
     sequence,
+
+    /// Broad classification of a binary operator, the single source of truth
+    /// for how each operator is grouped across the compiler and type checker.
+    /// The switch is exhaustive on purpose: a new `BinaryOp` variant must be
+    /// classified here, and every site that keys off a group (`isArithmetic`,
+    /// `isComparison`, …) picks it up automatically.
+    pub const Category = enum {
+        /// `+ - * / % ** <<` — numeric, mapped to an `AthOp`.
+        arithmetic,
+        /// `> >= < <= == !=` — yields a Bool (`>` doubles as a redirect).
+        comparison,
+        /// `&& ||`
+        logical,
+        /// `orelse`
+        coalesce,
+        /// `>>` — shift-right, overloaded with append-redirect (decided in IR).
+        shift_or_append,
+        /// plain `=`
+        assign,
+        /// `+= -= *= /= %= ||= &&=`
+        compound_assign,
+        /// `1>` / `2>>` / `>&` — always output redirects.
+        redirect,
+        /// `|`
+        pipe,
+        /// `.` member access
+        member,
+        /// `[]` element/slice access
+        index,
+        /// function application (space-form call)
+        apply,
+        /// `;` sequencing
+        sequence,
+    };
+
+    pub fn category(self: BinaryOp) Category {
+        return switch (self) {
+            .add, .subtract, .multiply, .divide, .remainder, .power, .shift_left => .arithmetic,
+            .greater, .greater_equal, .less, .less_equal, .not_equal, .equal => .comparison,
+            .logical_and, .logical_or => .logical,
+            .@"orelse" => .coalesce,
+            .append_redirect => .shift_or_append,
+            .assign => .assign,
+            .add_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign, .or_assign, .and_assign => .compound_assign,
+            .fd_source_truncate_redirect, .fd_source_append_redirect, .redirect_fd => .redirect,
+            .pipe => .pipe,
+            .member => .member,
+            .array_access => .index,
+            .apply => .apply,
+            .sequence => .sequence,
+        };
+    }
+
+    /// `+ - * / % ** <<` — numeric operators lowered through `AthOp`.
+    pub fn isArithmetic(self: BinaryOp) bool {
+        return self.category() == .arithmetic;
+    }
+
+    /// `> >= < <= == !=` — comparisons that yield a Bool.
+    pub fn isComparison(self: BinaryOp) bool {
+        return self.category() == .comparison;
+    }
 
     pub fn precedence(self: BinaryOp) usize {
         return switch (self) {
@@ -1306,6 +1369,10 @@ pub const BinaryOp = union(enum) {
             .multiply => 30,
             .divide => 30,
             .remainder => 30,
+            .power => 40,
+            // Shifts share the redirect/comparison tier; shift-right reuses
+            // `append_redirect` (also 15), so both shifts bind equally.
+            .shift_left => 15,
             .greater => 15,
             .fd_source_truncate_redirect => 15,
             .fd_source_append_redirect => 15,
@@ -1329,6 +1396,8 @@ pub const BinaryOp = union(enum) {
             .mul_assign => 0,
             .div_assign => 0,
             .rem_assign => 0,
+            .or_assign => 0,
+            .and_assign => 0,
             .sequence => 1,
         };
     }
@@ -1345,8 +1414,10 @@ pub const BinaryOp = union(enum) {
             .plus => .add,
             .minus => .subtract,
             .star => .multiply,
+            .star_star => .power,
             .slash => .divide,
             .percent => .remainder,
+            .shift_left => .shift_left,
             .fd_source_truncate_redirect => .{ .fd_source_truncate_redirect = streamFromToken(tok) },
             .fd_source_append_redirect => .{ .fd_source_append_redirect = streamFromToken(tok) },
             .greater => .greater,
@@ -1371,6 +1442,8 @@ pub const BinaryOp = union(enum) {
             .mul_assign => .mul_assign,
             .div_assign => .div_assign,
             .rem_assign => .rem_assign,
+            .or_assign => .or_assign,
+            .and_assign => .and_assign,
             else => null,
         };
     }
@@ -1384,7 +1457,7 @@ pub const BinaryOp = union(enum) {
 
     pub fn isAssignment(self: @This()) bool {
         return switch (self) {
-            .assign, .add_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign => true,
+            .assign, .add_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign, .or_assign, .and_assign => true,
             else => false,
         };
     }
@@ -1396,6 +1469,8 @@ pub const BinaryOp = union(enum) {
             .mul_assign => .multiply,
             .div_assign => .divide,
             .rem_assign => .remainder,
+            .or_assign => .logical_or,
+            .and_assign => .logical_and,
             else => @panic("shouldn't happen <|:)-|--<"),
         };
     }

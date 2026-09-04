@@ -16,6 +16,11 @@ pub const LspDocumentStore = struct {
     document_store: DocumentStore = .{ .vtable = vtable },
     map: std.StringHashMap(*Document),
     workspace: *workspace_mod.Workspace,
+    /// Number of documents type-checked by the most recent `recheckAllTypes`
+    /// pass. Bounded to the set of client-managed (open) documents; exposed so
+    /// tests can assert per-edit work does not grow with the number of modules
+    /// pulled into the store transitively over a session.
+    recheck_count: usize = 0,
 
     pub fn init(
         io: std.Io,
@@ -245,8 +250,32 @@ pub const LspDocumentStore = struct {
             &self.document_store,
             workspace.describePath(doc.path),
         );
-        try doc.reportTypeChecker(workspace);
+        // Re-type-check through a reset checker so analysis memory is reclaimed
+        // rather than accumulating in a never-freed arena across every edit.
+        try self.recheckAllTypes(workspace);
         return true;
+    }
+
+    /// Resets the (long-lived) workspace type checker to reclaim its arena, then
+    /// re-type-checks every open document so their scopes and diagnostics are
+    /// rebuilt. Called after an edit so memory stays bounded to one pass over the
+    /// open set instead of growing with the number of edits in a session.
+    fn recheckAllTypes(self: *LspDocumentStore, workspace: *workspace_mod.Workspace) !void {
+        workspace.type_checker.reset();
+        var it = self.map.iterator();
+        var count: usize = 0;
+        while (it.next()) |entry| {
+            const doc = entry.value_ptr.*;
+            // Only re-check documents the client has open. Transitively-imported
+            // modules (server-managed) are validated on demand when an importing
+            // open document is checked, and accumulate in the store across a
+            // session — re-checking all of them on every keystroke would make
+            // per-edit cost grow without bound as more modules are touched.
+            if (doc.manage_mode != .client) continue;
+            try doc.reportTypeChecker(workspace);
+            count += 1;
+        }
+        self.recheck_count = count;
     }
 
     fn updateDocumentText(
@@ -275,8 +304,13 @@ pub const LspDocumentStore = struct {
                     }
                     return error.RangeNotFound;
                 };
-                const rangeLength = range_params.rangeLength orelse return error.RangeLengthNotDefined;
-                const endIndex = startIndex + rangeLength;
+                // `rangeLength` is deprecated in the LSP spec, so spec-compliant
+                // clients may omit it. Prefer the authoritative `range.end`, and
+                // only fall back to `rangeLength` when the end can't be resolved.
+                const endIndex = range.end.findIndex(text) orelse blk: {
+                    const rangeLength = range_params.rangeLength orelse return error.RangeLengthNotDefined;
+                    break :blk startIndex + rangeLength;
+                };
                 const first = text[0..startIndex];
                 const second = range_params.text;
                 const third = if (endIndex < text.len) text[endIndex..] else "";
@@ -290,13 +324,23 @@ pub const LspDocumentStore = struct {
         return text;
     }
 
-    pub fn close(self: *LspDocumentStore, uri: []const u8) void {
-        if (self.map.fetchRemove(uri)) |removed| {
-            self.allocator.free(@constCast(removed.key));
-            var document = removed.value;
-            document.deinit(self.allocator);
-            self.allocator.destroy(document);
-        }
+    pub fn close(
+        self: *LspDocumentStore,
+        uri: []const u8,
+        workspace: *workspace_mod.Workspace,
+    ) !void {
+        const removed = self.map.fetchRemove(uri) orelse return;
+        self.allocator.free(@constCast(removed.key));
+        var document = removed.value;
+        document.deinit(self.allocator);
+        self.allocator.destroy(document);
+
+        // Closing frees the document's AST, but the type checker's cached scopes
+        // still reference it — both the closed document's own scope and the
+        // scopes of any open document that imported it. Re-check the remaining
+        // open set (through a reset checker) so those dangling references are
+        // dropped and rebuilt from live sources before the next request.
+        try self.recheckAllTypes(workspace);
     }
 
     pub fn resolveUri(self: LspDocumentStore, path: []const u8) ![]const u8 {

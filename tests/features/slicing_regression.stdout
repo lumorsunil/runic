@@ -1,0 +1,6 @@
+mid=20 30 len=2
+tail=2 head=2 whole=5
+clamp oob=3 inverted=0
+index still=50
+varsub=200 300 len=2
+s01=hello s6=world sall=hello world

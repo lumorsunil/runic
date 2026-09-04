@@ -311,6 +311,29 @@ pub const Lexer = struct {
     fn lexNumber(self: *Lexer) token.Token {
         const start = self.location();
         const start_index = self.index;
+
+        // Non-decimal integer literals: `0x…` (hex), `0o…` (octal), `0b…`
+        // (binary). The `0`-prefixed form is unambiguous with a bare `0`.
+        if (self.peekIs('0') and self.index + 1 < self.source.len) {
+            const radix: ?u8 = switch (self.source[self.index + 1]) {
+                'x', 'X' => 16,
+                'o', 'O' => 8,
+                'b', 'B' => 2,
+                else => null,
+            };
+            if (radix) |r| {
+                _ = self.advance(); // '0'
+                _ = self.advance(); // base marker
+                self.consumeRadixDigits(r);
+                const lexeme = self.source[start_index..self.index];
+                return .{
+                    .tag = .int_literal,
+                    .lexeme = lexeme,
+                    .span = .{ .start = start, .end = self.location() },
+                };
+            }
+        }
+
         var has_dot = false;
         var has_exponent = false;
 
@@ -350,12 +373,13 @@ pub const Lexer = struct {
             }
         }
 
-        if (self.peekIs('.')) {
-            if (!self.peekNextIs('.')) {
-                has_dot = true;
-                _ = self.advance(); // consume '.'
-                _ = self.consumeDigits(null);
-            }
+        // A `.` is the decimal point only when a digit follows it (`6.5`). A `.`
+        // followed by a letter is member access on an integer (`6.band`), and
+        // `..` is a range — both leave the `.` for the next token.
+        if (self.peekIs('.') and self.peekNextIsDigit()) {
+            has_dot = true;
+            _ = self.advance(); // consume '.'
+            _ = self.consumeDigits(null);
         }
 
         if (self.peekIs('e') or self.peekIs('E')) {
@@ -475,6 +499,9 @@ pub const Lexer = struct {
     fn lexStar(self: *Lexer) token.Token {
         const start = self.mark();
         _ = self.advance();
+        if (self.match('*')) {
+            return self.finish(.startAt(start), .star_star);
+        }
         if (self.match('=')) {
             return self.finish(.startAt(start), .mul_assign);
         }
@@ -538,6 +565,9 @@ pub const Lexer = struct {
     fn lexLess(self: *Lexer) token.Token {
         const start = self.mark();
         _ = self.advance();
+        if (self.match('<')) {
+            return self.finish(.startAt(start), .shift_left);
+        }
         if (self.match('=')) {
             return self.finish(.startAt(start), .less_equal);
         }
@@ -566,6 +596,9 @@ pub const Lexer = struct {
         const start = self.mark();
         _ = self.advance();
         if (self.match('|')) {
+            if (self.match('=')) {
+                return self.finish(.startAt(start), .or_assign);
+            }
             return self.finish(.startAt(start), .pipe_pipe);
         }
         return self.finish(.startAt(start), .pipe);
@@ -575,6 +608,9 @@ pub const Lexer = struct {
         const start = self.mark();
         _ = self.advance();
         if (self.match('&')) {
+            if (self.match('=')) {
+                return self.finish(.startAt(start), .and_assign);
+            }
             return self.finish(.startAt(start), .amp_amp);
         }
         // `&0`/`&1`/`&2` — a file-descriptor reference (stdin/stdout/stderr).
@@ -701,6 +737,25 @@ pub const Lexer = struct {
         const next_index = self.index + 1;
         if (next_index >= self.source.len) return false;
         return self.source[next_index] == needle;
+    }
+
+    fn consumeRadixDigits(self: *Lexer, radix: u8) void {
+        while (self.peek()) |ch| {
+            const valid = switch (radix) {
+                16 => (ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f') or (ch >= 'A' and ch <= 'F'),
+                8 => ch >= '0' and ch <= '7',
+                2 => ch == '0' or ch == '1',
+                else => ch >= '0' and ch <= '9',
+            };
+            if (!valid) break;
+            _ = self.advance();
+        }
+    }
+
+    fn peekNextIsDigit(self: *Lexer) bool {
+        const next_index = self.index + 1;
+        if (next_index >= self.source.len) return false;
+        return std.ascii.isDigit(self.source[next_index]);
     }
 
     fn match(self: *Lexer, expected: u8) bool {
@@ -908,8 +963,26 @@ fn endsWithNewline(source: []const u8) bool {
     return last == '\n' or last == '\r';
 }
 
+var lexer_test_threaded: std.Io.Threaded = undefined;
+var lexer_test_threaded_ready = false;
+
+fn testIo() std.Io {
+    if (!lexer_test_threaded_ready) {
+        lexer_test_threaded = .init(std.heap.page_allocator, .{});
+        lexer_test_threaded_ready = true;
+    }
+    return lexer_test_threaded.io();
+}
+
+var lexer_test_env: ?std.process.Environ.Map = null;
+
+fn testEnv() *std.process.Environ.Map {
+    if (lexer_test_env == null) lexer_test_env = std.process.Environ.Map.init(std.heap.page_allocator);
+    return &lexer_test_env.?;
+}
+
 test "lexer tokenizes declarations and synthesizes trailing newline" {
-    var lexer = try Lexer.init(std.testing.allocator, "main.rn", "const foo = 42");
+    var lexer = try Lexer.init(testIo(), std.testing.allocator, testEnv(), "main.rn", "const foo = 42");
     defer lexer.deinit();
 
     const expected_tags = [_]token.Tag{ .kw_const, .identifier, .assign, .int_literal, .newline, .eof };
@@ -931,7 +1004,7 @@ test "lexer tokenizes declarations and synthesizes trailing newline" {
 
 test "lexer balances nested braces inside string interpolation" {
     const source = "\"prefix ${foo {bar}} tail\"";
-    var lexer = try Lexer.init(std.testing.allocator, "interpolation.rn", source);
+    var lexer = try Lexer.init(testIo(), std.testing.allocator, testEnv(), "interpolation.rn", source);
     defer lexer.deinit();
 
     const expected = [_]struct { tag: token.Tag, lexeme: []const u8 }{
@@ -958,7 +1031,7 @@ test "lexer balances nested braces inside string interpolation" {
 
 test "lexer keeps array literal and indexing inside interpolation" {
     const source = "\"${.{1,2,3}[0]}\"";
-    var lexer = try Lexer.init(std.testing.allocator, "interpolation-array.rn", source);
+    var lexer = try Lexer.init(testIo(), std.testing.allocator, testEnv(), "interpolation-array.rn", source);
     defer lexer.deinit();
 
     const expected = [_]struct { tag: token.Tag, lexeme: []const u8 }{
@@ -989,7 +1062,7 @@ test "lexer keeps array literal and indexing inside interpolation" {
 }
 
 test "lexer restores succesfully" {
-    var lexer = try Stream.init(std.testing.allocator, "main.rn", "// comment\n\necho \"${a}\"");
+    var lexer = try Stream.init(testIo(), std.testing.allocator, testEnv(), "main.rn", "// comment\n\necho \"${a}\"");
     defer lexer.deinit();
 
     const expected_tags = [_]token.Tag{ .newline, .newline, .identifier, .string_start, .string_text, .string_interp_start, .identifier, .string_interp_end, .string_end };
@@ -1031,7 +1104,7 @@ test "lexer restores succesfully" {
 }
 
 test "lexer restores succesfully - peek" {
-    var lexer = try Stream.init(std.testing.allocator, "main.rn", "// comment\n\necho \"${a}\"");
+    var lexer = try Stream.init(testIo(), std.testing.allocator, testEnv(), "main.rn", "// comment\n\necho \"${a}\"");
     defer lexer.deinit();
 
     const expected_peeked_tags = [_]token.Tag{ .newline, .newline, .identifier };
@@ -1053,7 +1126,7 @@ test "lexer restores succesfully - peek" {
 }
 
 test "lexer restores succesfully - peek and next" {
-    var lexer = try Stream.init(std.testing.allocator, "main.rn", "// comment\n\necho \"${a}\"");
+    var lexer = try Stream.init(testIo(), std.testing.allocator, testEnv(), "main.rn", "// comment\n\necho \"${a}\"");
     defer lexer.deinit();
 
     const expected_peeked_tags = [_]token.Tag{ .newline, .identifier, .string_start, .string_text, .string_interp_start, .identifier };

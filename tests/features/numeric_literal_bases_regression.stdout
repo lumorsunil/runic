@@ -1,0 +1,7 @@
+hex=31 255 16
+oct=15 511
+bin=10 0
+dec=42 0 42
+mask=15
+flags=17
+float=0.5 1500

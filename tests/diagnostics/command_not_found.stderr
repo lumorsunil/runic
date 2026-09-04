@@ -1,0 +1,1 @@
+__RUNIC_PWD__/tests/diagnostics/command_not_found.rn:1:1: command not found: 'definitely_not_a_real_command'

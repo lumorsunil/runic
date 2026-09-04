@@ -4,8 +4,9 @@ This document tracks the current future-facing plan for Runic.
 
 It is intentionally different from the historical bring-up notes that existed
 earlier in the project. The parser, type checker, IR compiler, script runner,
-and basic LSP all exist today, so the roadmap below focuses on the next major
-areas of work rather than on bootstrapping the interpreter from scratch.
+and a full-featured LSP all exist today, so the roadmap below focuses on the
+next major areas of work rather than on bootstrapping the interpreter from
+scratch.
 
 ## Current State
 
@@ -13,14 +14,49 @@ Runic already has:
 
 - a lexer, parser, AST, semantic/type-checking pipeline, and IR compiler
 - script execution through the `runic` CLI
-- feature and diagnostics regression suites under `tests/`
-- a working `runic-lsp` binary with document management, diagnostics, hover,
-  and basic completion support
+- feature and diagnostics regression suites under `tests/`, plus in-source unit
+  tests for the lexer, parser, type checker, IR compiler, and evaluator
+- a `runic-lsp` binary with document management, diagnostics, hover,
+  completion (snippets, members, `$PATH`), go-to-definition, references and
+  rename (binding-aware, workspace-wide), document symbols/highlight/links,
+  workspace symbol search, folding ranges, inlay hints, and code actions
 - a command/process model with pipelines, execution-result values, redirects,
-  imports, functions, closures, optionals, matching, and background execution
+  imports, functions, closures, optionals, sum types, error sets/unions,
+  `match`, and background execution
+- an expression surface with the usual arithmetic plus `**`, bit shifts
+  `<<`/`>>`, bitwise Int methods (`.band`/`.bor`/`.bxor`/`.bnot`), compound
+  assignment (`+=` … `%=`, `||=`, `&&=`), array/string slicing, and hex/octal/
+  binary integer literals
+- a small standard library (`std.map`, `std.list`, `std.str`, …) and pipeline
+  builtins (`parseInt`/`parseFloat`/`parseBool`/`lines`)
 
 Runic is still experimental. Language design and implementation details are
 expected to keep moving while the core model stabilizes.
+
+## Recently Landed (2026-09)
+
+A cycle of feature work and engineering-health work:
+
+- **Language:** exponent `**` and bit shifts `<<`/`>>` (with `>>` overloaded
+  with append-redirect, resolved in the IR); bitwise ops as Int methods;
+  `||=`/`&&=`; array/string slicing; hex/octal/binary literals; `$(a; b)`
+  subshell statement sequences; a bare `&0` pipeline stage that forwards stdin;
+  `parseBool`; unary-prefix-after-binary parsing.
+- **Diagnostics:** top-level parser error recovery (report multiple errors per
+  parse); clear diagnostics for unterminated strings/block comments;
+  `command not found: '<name>'` instead of a bare `FileNotFound`.
+- **Engineering health:** a shared builtin registry and a single binary-operator
+  classification table (both replacing scattered per-site logic); and the unit
+  test suite was resurrected and expanded — `zig build test` went from 13 tests
+  (only the LSP protocol suite ran) to 70, after the runtime module's ~48
+  in-file tests were wired to run and brought back up to date, and now stands
+  at 112 as the `runic-lsp` protocol suite grew alongside the LSP work below.
+
+A known constraint discovered this cycle: `compiler.zig` is large (~10k lines)
+but cannot be cleanly split in current Zig — `usingnamespace` was removed and
+non-`pub` methods are not callable across files, so a struct's methods can't be
+spread across files. The mitigation is to keep the file from growing (the
+registry/table work helps) rather than to shatter it.
 
 ## Planning Principles
 
@@ -43,9 +79,14 @@ exist.
 
 Current focus areas:
 
-- parser error recovery and better diagnostics after the first parse failure
+- ~~parser error recovery and better diagnostics after the first parse
+  failure~~ — landed: top-level statement recovery reports multiple errors per
+  parse; unterminated string/block-comment diagnostics; and a missing
+  executable reports `command not found` instead of a bare `FileNotFound`.
+  Nested (in-construct) recovery is still future work.
 - remaining gaps in function behavior, especially stdin/stdout semantics and
-  piping through functions/blocks
+  piping through functions/blocks (a bare `&0` stage can now forward stdin into
+  a pipeline; first-class/anonymous blocks are still open — see Theme 3)
 - cleanup of execution-result behavior across more expression forms
 - better handling of background execution, pipes, and edge-case cleanup
 - reducing semantic mismatches between documented behavior and actual runtime
@@ -102,10 +143,17 @@ areas that are already partially designed or partially implemented.
 
 Likely near- to mid-term candidates:
 
-- richer pattern matching
+- ~~additional operators and assignment forms~~ — substantially done: `**`,
+  `<<`/`>>`, bitwise Int methods, `||=`/`&&=`, slicing, hex/octal/binary
+  literals. (Symbolic bitwise operators were deliberately *not* added — `&`/`|`/
+  `^` collide with background/fd, pipe, and the promise prefix, so bitwise ops
+  are methods instead.)
+- richer pattern matching (regex/glob patterns in `match`)
 - more complete type-expression support
-- additional operators and assignment forms
-- improved function references / partial application support
+- improved function references / partial application (`&add 5`) — needs a
+  design call on the `&` sigil first
+- first-class / anonymous blocks — bare `{ … }` is already an eager
+  expression-block, so a lambda form needs distinct syntax; a design decision
 - better user-defined struct/type support
 - support escaping whitespace in bareword executable/identifier syntax so
   commands or names containing spaces can be represented without immediately
@@ -135,16 +183,23 @@ infrastructure.
 
 ### 5. LSP maturity
 
-The language server is no longer an MVP proposal; it exists and needs to be
-made more useful and more reliable.
+The language server saw a major build-out this cycle and now offers a broad,
+tested feature surface. Delivered:
 
-Current priorities are tracked in more detail in `docs/lsp.md`, but the broad
-goal is:
+- **Completion** — keyword snippets, member access (chained + trailing-dot
+  recovery), signature/type detail, `$PATH` executables, resolve-on-focus.
+- **Navigation** — go-to-definition, and binding-aware, workspace-wide
+  references and rename (including cross-file module members).
+- **Symbols & structure** — nested document outline, highlight, links,
+  workspace symbol search, folding ranges.
+- **Hints & actions** — inlay type and parameter hints, prepare-rename, an
+  add-type-annotation code action.
+- **Stability** — bounded per-edit analysis memory and re-check, and a
+  document-close use-after-free fix.
 
-- improve completion quality
-- add core navigation features
-- fix long-running stability/performance issues
-- keep diagnostics aligned with the parser/type checker used by the CLI
+Remaining work (tracked in `docs/lsp.md` and `todo.md`): more code actions
+(add-missing-import, remove-unused), call hierarchy, richer formatting, and
+semantic tokens. Diagnostics stay aligned with the CLI's parser/type checker.
 
 ### 6. Developer workflow and documentation
 

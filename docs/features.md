@@ -34,6 +34,61 @@ const scores: []Int = .{ 90, 80 }
 
 **Result:** Each declaration advertises its type at the point of definition, catching mismatches such as assigning a string to `retries` before the script ever runs.
 
+### Numeric operators
+
+Runic has the usual arithmetic (`+`, `-`, `*`, `/`, `%`), plus exponent `**` and the bit shifts `<<` / `>>`.
+
+```rn
+const area = width ** 2      // exponent (2 ** 10 == 1024)
+const kib = size << 10       // shift-left  (multiply by 1024)
+const half = total >> 1      // shift-right (arithmetic, sign-extending)
+echo "${9 ** 0.5}"           // 3 — a fractional/negative exponent widens to Float
+```
+
+**Result:** `**` and the shifts keep integer operands `Int` — exponent saturates at the `Int` bounds on overflow, and shifting by 64 or more clears the value; a `Float` operand or a negative exponent widens `**` to `Float`. `**` binds tighter than `*`, and the shifts sit just below `+`/`-`; both shifts share one tier, so a run of same-tier operators is left-associative (`2 ** 3 ** 2` is `(2 ** 3) ** 2 == 64`, and `1024 >> 3 << 1 == 256`). Note `>>` is overloaded with append-redirect — see [*File descriptor redirects*](#file-descriptor-redirects) — but a value on the left always makes it the shift.
+
+**Bitwise** operations are `Int` methods (UFCS), like the `Float` math builtins — this keeps them clear of the `&`/`|`/`^` symbols, which are already the background/fd, pipe, and promise-prefix syntax:
+
+```rn
+const low = value.band 255          // bitwise AND   (a.band b)
+const set  = low.bor 16             // bitwise OR    (a.bor b)
+const tog  = set.bxor 4             // bitwise XOR   (a.bxor b)
+const inv  = tog.bnot               // bitwise NOT   (a.bnot; two's complement)
+```
+
+**Result:** each yields an `Int`; `band`/`bor`/`bxor` take one argument, `bnot` none. They compose (`(a.band mask).bor bit`) and pair naturally with the shifts. Method calls work on integer literals too — `6.band 3` — since `.` before a letter is member access, not a decimal point (`6.5` is still a float).
+
+Integer literals may be written in **hex** (`0x1f`), **octal** (`0o17`), or **binary** (`0b1010`) as well as decimal — handy for masks (`value.band 0x0f`). A leading zero does not imply octal: `042` is decimal `42`.
+
+### Slicing
+
+An array or string can be **sliced** with a range index — `x[a..b]` is the
+half-open sub-range (a new array/string), and either bound may be omitted:
+
+```rn
+const xs = .{ 10, 20, 30, 40, 50 }
+const mid  = xs[1..3]   // .{ 20, 30 }   (half-open: includes 1, excludes 3)
+const tail = xs[2..]    // .{ 30, 40, 50 }
+const head = xs[..2]    // .{ 10, 20 }
+const word = "hello world"[0..5]   // "hello"
+```
+
+**Result:** `x[a..b]` copies the elements/bytes in `[a, b)`; `x[a..]` runs to the
+end and `x[..b]` from the start (`x[..]` is a full copy). Bounds are clamped to
+`[0, len]`, so an out-of-range or inverted range yields an empty result rather
+than an error. Plain indexing `x[i]` is unchanged.
+
+### Compound assignment
+
+A `var` can be updated with a **compound assignment**, which applies an operator to its current value: `+=`, `-=`, `*=`, `/=`, `%=` for arithmetic, and `||=`, `&&=` for logical values (`x ||= y` is exactly `x = x || y`, with the same short-circuit behavior).
+
+```rn
+var total = 0
+total += 5              // total = total + 5  → 5
+var found = false
+found ||= (total > 3)   // found = found || (total > 3)  → true
+```
+
 ### Environment variables
 
 Environment variables are explicit. Use `$NAME` to read an environment entry as `?String`, and `$NAME = ...` to update the current subshell context so later child processes inherit the new value. Bare identifiers like `HOME` are normal Runic bindings and are distinct from `$HOME`.
@@ -622,7 +677,7 @@ echo "hello" 1>&2 2>"/dev/null"
 
 **Result:** `>` / `>>` redirect stdout (truncate / append), `2>...` redirects stderr, and `1>&2` duplicates stdout onto the current stderr target. Because redirects are applied left to right, `echo "hello" 1>&2 2>"/dev/null"` still writes `hello` to the original stderr stream instead of discarding it. Redirecting a *function call* or a *block*'s output to a file — `myFn > "file"`, `{ … } > "file"` — is also supported, including when the body runs external commands (their real stdout is drained to the file), and both `>` and `>>` apply.
 
-**`>` is overloaded.** Since `>` is also the greater-than operator, Runic resolves it by the left operand: a **command** (an external executable call, a function call, a block, or a subshell) makes `>` an output redirect, while a **value** makes it the comparison. So `echo "x" > "f"` and `myFn > "f"` redirect, but `n > 2` and `count > limit` compare. `>>` and `>&` are always redirects. To compare a function's return value instead of redirecting it, bind it first: `const r = myFn; if (r > 2) ...`.
+**`>` and `>>` are overloaded.** Since `>` is also the greater-than operator and `>>` the shift-right operator, Runic resolves each by its left operand: a **command** (an external executable call, a function call, a block, or a subshell) makes it an output redirect, while a **value** makes it the operator. So `echo "x" > "f"` / `echo "x" >> "f"` and `myFn > "f"` redirect (truncate / append), but `n > 2` compares and `bits >> 2` shifts. `>&` and the fd-prefixed forms (`1>`, `2>>`, …) are always redirects. To use a function's return value as an operand instead of redirecting it, bind it first: `const r = myFn; if (r > 2) ...`.
 
 ## Error-aware pipelines
 
@@ -827,6 +882,26 @@ fn Int consume_once() Int {
 echo "7" | parseInt | consume_once   // prints 7
 ```
 
+#### Forwarding stdin into a pipeline with `&0 |`
+
+Used as a **pipeline stage** rather than read as a value, a bare `&0` forwards
+the function's stdin straight into the pipeline — so you can hand it to an
+external command (or a further stage) without materializing it first:
+
+```rn
+fn String shout() String {
+    &0 | tr "a-z" "A-Z"
+}
+
+echo "hello" | shout   // prints HELLO
+```
+
+**Result:** `&0` pipes the function's stdin into `tr`, whose output becomes the
+function's output. It composes with more stages (`&0 | cat | wc "-c"`), streams
+line by line, and terminates cleanly on empty input. This is distinct from
+reading `&0` as a value (`const s = &0`, `yield &0`) above — the meaning is set
+by whether `&0` appears as a pipeline stage or in a value position.
+
 #### Consuming a live stream with `for (&0)`
 
 When the upstream stage `yield`s many values over its lifetime, the downstream
@@ -882,9 +957,12 @@ fn Int square() Int {
 `parseInt` maps per value, so it works on a single value (`echo "10" | parseInt`)
 or a framed stream (`… | lines | parseInt`). `parseFloat`
 (`fn String parseFloat() Float`) is the `Float` counterpart and behaves the same
-way. A custom stage that should process every value uses the `for (&0) |v| {
-... }` form — a stage that reads `&0` once (e.g. `const n = &0`) consumes only
-the first value.
+way, and `parseBool` (`fn String parseBool() Bool`) parses the text `true`/`false`
+(case-insensitive, whitespace-trimmed) into a `Bool`. Each is `ParseError!T`, so
+a bad parse is a value a surrounding `catch`/`try` handles (`echo "maybe" |
+parseBool catch false`). A custom stage that should process every value uses the
+`for (&0) |v| { ... }` form — a stage that reads `&0` once (e.g. `const n = &0`)
+consumes only the first value.
 
 ### Mixed executable and typed-function pipelines
 

@@ -116,6 +116,9 @@ pub const Instruction = struct {
         /// applies a Float math builtin (`x.sqrt`, `x.floor`, `x.pow y`, …) to the
         /// operand, with an optional argument, storing the Float result.
         float_op: FloatOp,
+        /// applies a bitwise Int builtin (`x.band y`, `x.bor y`, `x.bxor y`,
+        /// `x.bnot`) to the operand, storing the Int result.
+        int_op: IntOp,
         /// `arr.push value` — allocates a new array (`[len+1, …elements, value]`)
         /// and stores its base address in `result`.
         array_push: ArrayPush,
@@ -127,6 +130,9 @@ pub const Instruction = struct {
         /// Like `array_set` but writes the element in place (no copy), only
         /// emitted for a linear (uniquely-owned) array — see the compiler.
         array_set_inplace: ArraySet,
+        /// `arr[start..end]` — a new array of the half-open element range,
+        /// copied. Bounds are clamped to `[0, len]`.
+        array_slice: ArraySlice,
         /// constructs an error value (boxing the runtime payload, if any)
         make_err: MakeErr,
         /// sets result to a boolean: whether operand is an error value whose
@@ -202,6 +208,11 @@ pub const Instruction = struct {
         /// whitespace. stores the result in %r. invalid input is a runtime
         /// error. an existing Float (or EOF `.null`) passes through unchanged.
         parse_float,
+        /// parses the string in %r into a Bool value (`true`/`false`,
+        /// case-insensitive, whitespace-trimmed) and stores it in %r. invalid
+        /// input is a catchable `ParseError.Invalid`. an existing Bool
+        /// (`.exit_code`) or an EOF read (`.null`) passes through unchanged.
+        parse_bool,
         /// splits the string in %r by '\n' and enqueues each non-empty line as a
         /// separate value onto the given pipe's typed queue (framing a byte
         /// stream into per-line values). used by the `lines` builtin.
@@ -409,6 +420,20 @@ pub const Instruction = struct {
         }
     };
 
+    pub const IntOp = struct {
+        op: Op,
+        operand: ValueSource,
+        /// The second operand for `band`/`bor`/`bxor`; ignored by `bnot`.
+        arg0: ValueSource,
+        result: Location,
+
+        pub const Op = enum { band, bor, bxor, bnot };
+
+        pub fn format(self: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
+            try w.print("{f} = int.{t}({f}, {f})", .{ self.result, self.op, self.operand, self.arg0 });
+        }
+    };
+
     pub const ArrayPush = struct {
         array: ValueSource,
         value: ValueSource,
@@ -429,6 +454,17 @@ pub const Instruction = struct {
 
         pub fn format(self: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
             try w.print("{f} = set({f}, {f}, {f})", .{ self.result, self.array, self.index, self.value });
+        }
+    };
+
+    pub const ArraySlice = struct {
+        array: ValueSource,
+        start: ValueSource,
+        end: ValueSource,
+        result: Location,
+
+        pub fn format(self: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
+            try w.print("{f} = slice({f}, {f}, {f})", .{ self.result, self.array, self.start, self.end });
         }
     };
 
@@ -467,6 +503,9 @@ pub const Instruction = struct {
         mul,
         div,
         mod,
+        pow,
+        shl,
+        shr,
 
         pub fn from(binary_op: ast.BinaryOp) @This() {
             return switch (binary_op) {
@@ -475,6 +514,10 @@ pub const Instruction = struct {
                 .multiply => .mul,
                 .divide => .div,
                 .remainder => .mod,
+                .power => .pow,
+                .shift_left => .shl,
+                // `>>` reuses the append-redirect op; as arithmetic it is shr.
+                .append_redirect => .shr,
                 else => unreachable,
             };
         }
@@ -489,6 +532,9 @@ pub const Instruction = struct {
                 .mul => "*",
                 .div => "/",
                 .mod => "%",
+                .pow => "**",
+                .shl => "<<",
+                .shr => ">>",
             });
         }
     };

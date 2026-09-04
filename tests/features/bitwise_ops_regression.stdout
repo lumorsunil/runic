@@ -1,0 +1,7 @@
+band=8 bor=14 bxor=6 bnot=-13
+lit=2 7 -13
+flags=17 masked=17
+reassign=7
+bit-set
+float=6.5 sqrt=1.4142135623730951
+slice-len=2

@@ -1,0 +1,35 @@
+// Exponent `**`, shift-left `<<`, and shift-right `>>`. Shifts and integer
+// exponent stay Int (exponent saturates on overflow; a negative exponent or a
+// float operand widens to Float). `**` binds tighter than `*`; the shifts share
+// a tier, so a run of them is left-associative. Crucially, `>>` stays dual: a
+// *value* on the left is shift-right, a *command* on the left is an output
+// append-redirect (verified against a temp file below).
+const p = 2 ** 10
+echo "pow=${p} zero=${3 ** 0} sat=${2 ** 100}"
+echo "shl=${1 << 4} shr=${256 >> 2}"
+
+// Left-associative same-tier shifts: ((1024 >> 3) << 1) = 256.
+echo "mix=${1024 >> 3 << 1}"
+// `**` outranks `*`: 3 * 2 ** 3 = 3 * 8 = 24.
+echo "prec=${3 * 2 ** 3}"
+// Arithmetic (sign-extending) right shift of a negative value.
+const neg = 0 - 8
+echo "arith=${neg >> 1}"
+
+// Float exponent: fractional and negative exponents widen to Float. A unary
+// minus is accepted directly after a binary operator (no parens needed).
+echo "fpow=${9 ** 0.5} negexp=${2 ** -2}"
+echo "unary=${3 - -2} ${2 * -2} ${10 + -3}"
+
+// Reassignment with a shift on the same binding (in-place accumulation path).
+var n = 5
+n = n << 1
+n = n >> 1
+echo "reassign=${n}"
+
+// `>>` as append-redirect: a command on the left still appends to a file.
+const path = ".binops_append_tmp"
+echo "first" > "${path}"
+echo "second" >> "${path}"
+cat "${path}"
+rm "${path}"

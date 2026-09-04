@@ -1,0 +1,24 @@
+// parseBool (`fn String parseBool() ParseError!Bool`) maps each input value to
+// a Bool, parsing the text "true"/"false" (case-insensitive, whitespace
+// trimmed). A bad parse is a catchable ParseError. Booleans print as an exit
+// code (true→0, false→1), so the single-value lines read as 0/1 below.
+const t = echo "true" | parseBool
+const f = echo "false" | parseBool
+const ci = echo "  TRUE  " | parseBool
+echo "t=${t} f=${f} ci=${ci}"
+
+// A non-boolean is a catchable ParseError.Invalid.
+const bad = echo "maybe" | parseBool catch false
+echo "bad=${bad}"
+
+// Usable directly as a condition.
+if (echo "true" | parseBool) echo "cond-true" else echo "cond-false"
+
+// Composes with a framed `lines` stream, one value at a time.
+fn Bool showBools() String {
+    for (&0) |b| {
+        if (b) yield "T" else yield "F"
+    }
+}
+{ echo "true"; echo "false"; echo "TRUE" } | lines | parseBool | showBools
+echo ""

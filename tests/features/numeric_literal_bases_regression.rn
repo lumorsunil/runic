@@ -1,0 +1,15 @@
+// Integer literals in non-decimal bases: hex `0x`, octal `0o`, binary `0b`
+// (case-insensitive prefix). Bare and leading-zero decimals are unaffected
+// (`042` is decimal 42, not octal), and floats still parse.
+echo "hex=${0x1f} ${0xFF} ${0x10}"
+echo "oct=${0o17} ${0o777}"
+echo "bin=${0b1010} ${0b0}"
+echo "dec=${42} ${0} ${042}"
+
+// They pair with the bitwise Int methods (masks read naturally in hex).
+echo "mask=${255.band 0x0f}"
+const flags = 0x10.bor 1
+echo "flags=${flags}"
+
+// Floats and exponents are untouched by the base-prefix lexing.
+echo "float=${0.5} ${1.5e3}"

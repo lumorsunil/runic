@@ -20,7 +20,12 @@
   the same escaping model should apply to identifiers as well
 - [ ] support invoking dotted executable names such as `cmd.exe`, and decide
   how that syntax coexists with `.` member access
-- [ ] trying to call a command as an identifier that is not bound will result in unknown identifier error
+- [x] trying to call a command as an identifier that is not bound will result
+      in unknown identifier error — a missing executable now reports
+      `command not found: '<name>'` with the call's source location (a clean
+      `CommandNotFound`) instead of a bare `error.FileNotFound`. (A statically
+      unbound bare word can't be told from a valid external command, so this is
+      a runtime diagnostic, at both the sync and async spawn sites.)
 - [ ] all executables can be thought of as runic functions with the signature:
       `fn Stream(String) <exec-name>(...[]String) Stream(String)`
 
@@ -39,7 +44,8 @@
   replacing `@stdin`
   - [x] `&0` — reads the function's stdin as a typed value (String/Int)
   - [x] `yield &2 expr` — write to stderr
-  - [ ] `&0 | cat` — pipe stdin directly into a command
+  - [x] `&0 | cat` — a bare `&0` pipeline stage forwards the function's stdin
+    into the pipeline (distinct from reading `&0` as a value)
 - [x] `yield` keyword — explicit output (stdout by default, `yield &2` for stderr)
 - [ ] typed pipes
   - [x] type-check pipe boundary compatibility (exact match)
@@ -61,7 +67,8 @@
     downstream `for (&0)` / `parseInt` processes one line at a time
   - [x] `parseFloat` builtin (`fn String parseFloat() Float`); maps per value
     like `parseInt`, shares `compileParseMapStage`
-  - [ ] other parse builtins (e.g. `parseBool`)
+  - [x] `parseBool` builtin (`fn String parseBool() ParseError!Bool`); parses
+    "true"/"false" (case-insensitive), maps per value like parseInt/parseFloat
   - [ ] streaming `lines` (currently buffers all input before splitting) and
     other framers / custom delimiters
   - [x] in-process typed transport for scalars (Int/Float pass between stages
@@ -83,29 +90,39 @@
 - [x] (re-)assignment
 - [x] arithmetic
 - [x] assignment modifiers (+=, -=, \*=, /=, %=)
-- [ ] more assignment modifiers (||=, &&=)
-- [ ] more binary operators
-  - [ ] \*\* (exponentation)
-  - [ ] << (bit shift left)
-  - [ ] \>> (bit shift right)
-  - [ ] & (bitwise and)
-  - [ ] | (bitwise or)
-  - [ ] ^ (bitwise xor)
-- [ ] unary operators
-  - [ ] ~ (bitwise negation)
+- [x] more assignment modifiers (||=, &&=) — done; desugar to `x = x || y` /
+      `x = x && y`, alongside the existing `+=`/`-=`/`*=`/`/=`/`%=`
+- [x] more binary operators
+  - [x] \*\* (exponentation)
+  - [x] << (bit shift left)
+  - [x] \>> (bit shift right) — overloaded with append-redirect: a command on
+        the left appends, a value on the left shifts (resolved in the IR, like `>`)
+  - [x] bitwise and/or/xor/not — the `&`/`|`/`^` symbols collide with
+        background/fd, pipe, and the promise prefix, so these are Int methods
+        (UFCS) instead: `a.band b`, `a.bor b`, `a.bxor b`, `a.bnot` (mirrors the
+        Float math builtins). Also fixed the lexer so `N.method` on an int
+        literal is member access, not a `N.` float.
+- [x] unary operators
+  - [x] bitwise negation — `x.bnot` (method form, see above)
+- [x] numeric literal bases: hex `0x`, binary `0b`, octal `0o` — lexed in
+      `lexNumber` and parsed with base 0 (a leading zero is not octal; `042` is
+      decimal). Floats/exponents unaffected.
 - [x] boolean algebra
 - [x] comparisons (numeric)
 - [x] string concatenation
   - [ ] maybe ban?
 - [x] array literals
-- [ ] slicing
+- [x] slicing — `x[a..b]` array/string slices (open ends `x[a..]`/`x[..b]`), bounds clamped
 - [x] array element accessor
 - [x] if
 - [x] for loops
   - [x] ranges
   - [x] arrays
   - [x] multiple sources
-- [ ] pipeline_or, pipeline_and
+- [x] pipeline_or, pipeline_and — `&&`/`||` sequence commands and pipelines
+      with bash-style short-circuit (verified: `echo x | grep z || fallback`,
+      `cmd | grep && next`). Covered by logical_short_circuit_regression and
+      nested_if_pipeline_logical_regression.
 - [x] recursive functions (add function def to closure?)
 - [x] exit/return statement
 - [ ] blocks as anonymous functions?
@@ -162,30 +179,65 @@
 ## lsp
 
 - [x] completions for member access
-- [ ] add more information to completion results (symbol type, etc)
-- [ ] implement basic snippets (const/var/fn)
+  - [x] chained access (a.b.c) resolves each segment's type
+  - [x] trailing-dot scope recovery (complete after `obj.`)
+- [x] add more information to completion results (symbol type, etc)
+  - function signatures and struct-field types as completion detail
+- [x] implement basic snippets (const/var/fn)
+- [x] completions for executables found on $PATH
 - [x] hover
   - [x] basic hover implementation, identifier lookup
 - [x] go to definition
-- [ ] workspace-wide go to definition for symbols not present in currently tracked documents
+  - [x] struct field / decl member access resolves to the declaration
+- [x] workspace-wide go to definition for symbols not present in currently tracked documents
+  - via the workspace index (loads all .rn files under a client-provided root)
 - [x] completions for keywords
   - [x] bug: markdown syntax highlighting does not work for runic
 - [x] restart causes leaks and crashes
 - [x] completions for import module names
 - [x] document change does not reflect new symbols
 - [x] didChange support, document diagnostics
-- [ ] add protocol regressions for incremental `didChange` edits
+- [x] add protocol regressions for incremental `didChange` edits
 - [x] crashes (investigate that we do similar setup as run_script)
 - [x] type checker integration
   - [x] type checking imports
 - [x] references
-- [ ] workspace-wide references beyond currently tracked/open documents
+- [x] workspace-wide references beyond currently tracked/open documents
+  - references iterates the document store, which the workspace index populates
 - [x] rename
-- [ ] workspace-wide rename
-- [ ] improve semantic definition/rename/reference resolution for module members so it does not rely on conservative symbol fallbacks
+- [x] workspace-wide rename (lexical; edits every indexed file with the name)
+- [x] binding-aware references and rename (scope/binding identity, not name)
+- [x] binding-aware resolution for member access (`m.foo`): resolves to the
+      struct field or imported module `pub` declaration; references/rename link
+      the declaration and member accesses across open importers, excluding
+      unrelated same-named symbols
+- [x] member references in index-only (unopened) importer files — resolved by
+      type-checking such a file on demand during references/rename (read-only,
+      so it is reset by the next edit and does not grow memory)
 - [x] bug: takes 100% cpu after a while
 - [x] bug: stops working after a while, may be related to bug above
-- [ ] add support for document links?
+- [x] document symbols (outline), nested (struct fields, fn params)
+- [x] document highlight
+- [x] workspace symbol search
+- [x] add support for document links
+- [x] `.sym_link` entries in module-path completion (follows the link's target)
+- [ ] document symbols for destructuring patterns — BLOCKED: the parser does
+      not support tuple/record binding destructuring yet (parseBindingPattern
+      only accepts a single identifier or `_`); bash blocks / while statements
+      declare no top-level symbols, so nothing to add there
+- [x] inlay hints: inferred types after un-annotated bindings (`const x«: Int»`)
+- [x] inlay hints: parameter-name hints before call arguments (top-level and
+      binding-initializer calls to same-file functions)
+- [x] inlay parameter hints in deeper positions (pipelines, nested call
+      arguments, control-flow and function bodies, string interpolations)
+- [x] inlay parameter hints for imported-module functions (`m.f x`)
+- [x] folding ranges (multi-line statements: functions, structs, control flow)
+- [x] code action: add an inferred type annotation to an un-annotated binding
+- [ ] more code actions / quick fixes (add missing import, remove unused, etc.)
+- [x] prepare-rename (validates the target, pre-fills the identifier)
+- [x] completion-resolve: promotes a completion's detail to documentation on focus
+- [ ] call hierarchy
+- [ ] richer/robust formatting (current formatter is minimal)
 
 ## imports
 
@@ -214,10 +266,24 @@
   - long term goal: Runic should be able to drive its own contributor/test/tooling workflows instead of depending on shell wrappers
 - [ ] add first-class regression coverage for `scripts/run_ci.rn`
 - [ ] move Neovim tree-sitter/parser registration out of `editor/neovim/syntax/runic.vim` into a more appropriate plugin/setup file
+- [ ] resurrect the runtime module's unit tests. `zig build test` does not pull
+      test declarations from the runtime module's imported files (only the
+      `runic`-module-importing test files under `tests/` run), so the in-file
+      tests in frontend/lexer.zig, frontend/parser.zig, ir/evaluator.zig,
+      ir/compiler.zig, ir/context.zig, frontend/diagnostics.zig, mem/rc.zig,
+      mem/split.zig, and stream.zig have been dead and have bit-rotted against
+      later API changes (they no longer compile — `GeneralPurposeAllocator`
+      removed, `lexer.Stream.init` arity changed, `ArrayList.init` removed,
+      etc.). Bring each back up to date and wire it to run (e.g. a `tests/`
+      file per module importing `runic`, like tests/type_checker_test.zig).
 
 ## parser
 
-- [ ] parse error bail and continue
+- [x] parse error bail and continue — top-level statement recovery: a failed
+      statement records a diagnostic, resyncs at the next boundary (newline/`;`),
+      and continues, so multiple independent errors are reported at once
+      (recovery is top-level only; nested-construct errors fail their enclosing
+      statement)
   - when parsing fails entirely in a statement or expression, look for the next expression terminator and continue parsing from there, storing the error for later diagnostics
   - still produce a valid ast for the type checker to use
   - [x] in progress
@@ -437,9 +503,12 @@
 - [x] arrays will executable calls as elements cannot be accessed with element access operator
 - [x] pipelines are broken again
 - [x] escaped double quotes print as \"
-- [ ] `$(sleep 0.5; echo "after")` produces a parsing error
+- [x] `$(sleep 0.5; echo "after")` produces a parsing error — subshell bodies
+      now parse a statement sequence (`;`/newline-separated), like `(...)`
 - [x] syntax highlighting for match
-- [ ] `true "hello` is parsed as a call with `true` as the callee
+- [x] `true "hello` is parsed as a call with `true` as the callee — an
+      unterminated string now reports a clear lexer diagnostic instead of
+      exiting silently (thrown lexer errors are recorded as diagnostics)
 - [x] scripts/run_ci.rn fails with: `Type checker failed to run: error.UnsupportedStatement`
 - [x] scripts/run_ci.rn fails to detect Zig when repo-root paths are built from env-backed strings
 - [x] assigning a bound string or execution result into an env var does not populate the env var correctly

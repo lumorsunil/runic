@@ -10,6 +10,17 @@ const runic = @import("runic");
 
 const Allocator = std.mem.Allocator;
 
+/// Shared state threaded through the recursive parameter-hint walk.
+const CallHintCtx = struct {
+    arena: Allocator,
+    hints: *std.ArrayList(types.InlayHint),
+    fn_decls: *std.StringHashMap(runic.ast.FunctionDecl),
+    range: types.Range,
+    /// The document's module scope, used to resolve a `m.f` callee to the
+    /// imported module (null when the document is not type-checked).
+    scope: ?*runic.semantic.Scope,
+};
+
 const MAX_LINE = 16 * 1024;
 const MAX_FILE = 4 * 1024 * 1024;
 const MAX_OUT_CONTENT = 4 * 1024 * 1024;
@@ -31,6 +42,9 @@ pub const Server = struct {
     initialized: bool = false,
     shutting_down: bool = false,
     log_enabled: bool = false,
+    /// Set from the client's `completionItem.snippetSupport` capability at
+    /// initialize time; gates whether completions emit snippet insert text.
+    snippet_support: bool = false,
 
     pub fn init(
         io: std.Io,
@@ -153,6 +167,10 @@ pub const Server = struct {
                 }
                 return true;
             },
+            .@"completionItem/resolve" => |item| {
+                if (request.id) |id| try self.handleCompletionResolve(id, item);
+                return true;
+            },
             .@"textDocument/hover" => |params| {
                 if (request.id) |id| {
                     try self.handleHover(id, params);
@@ -167,6 +185,26 @@ pub const Server = struct {
                 if (request.id) |id| try self.handleReferences(id, params);
                 return true;
             },
+            .@"textDocument/documentHighlight" => |params| {
+                if (request.id) |id| try self.handleDocumentHighlight(id, params);
+                return true;
+            },
+            .@"textDocument/documentLink" => |params| {
+                if (request.id) |id| try self.handleDocumentLink(id, params);
+                return true;
+            },
+            .@"textDocument/inlayHint" => |params| {
+                if (request.id) |id| try self.handleInlayHint(id, params);
+                return true;
+            },
+            .@"textDocument/foldingRange" => |params| {
+                if (request.id) |id| try self.handleFoldingRange(id, params);
+                return true;
+            },
+            .@"textDocument/codeAction" => |params| {
+                if (request.id) |id| try self.handleCodeAction(id, params);
+                return true;
+            },
             .@"textDocument/documentSymbol" => |params| {
                 if (request.id) |id| try self.handleDocumentSymbols(id, params);
                 return true;
@@ -175,8 +213,16 @@ pub const Server = struct {
                 if (request.id) |id| try self.handleRename(id, params);
                 return true;
             },
+            .@"textDocument/prepareRename" => |params| {
+                if (request.id) |id| try self.handlePrepareRename(id, params);
+                return true;
+            },
             .@"textDocument/formatting" => |params| {
                 if (request.id) |id| try self.handleFormatting(id, params);
+                return true;
+            },
+            .@"workspace/symbol" => |params| {
+                if (request.id) |id| try self.handleWorkspaceSymbol(id, params);
                 return true;
             },
             .@"workspace/didChangeConfiguration", .@"workspace/didChangeWatchedFiles" => {
@@ -294,6 +340,10 @@ pub const Server = struct {
             }
         }
 
+        // A client-provided root is indexed; the current-directory fallback is
+        // not, since it could be an arbitrarily large tree unrelated to the
+        // edited project.
+        const has_explicit_root = roots.items.len > 0;
         if (roots.items.len == 0) {
             // `realPathFileAlloc` returns a sentinel-terminated `[:0]u8`; re-dupe it
             // into a plain slice so the workspace frees it with a matching size.
@@ -302,10 +352,15 @@ pub const Server = struct {
             try roots.append(self.allocator, try self.allocator.dupe(u8, root));
         }
 
+        if (params.capabilities) |capabilities| {
+            self.snippet_support = capabilities.snippetSupport();
+        }
+
         try self.workspace.resetRoots(roots.items);
         try self.workspace.refresh();
+        if (has_explicit_root) self.workspace.indexWorkspace();
         self.initialized = true;
-        try self.log("workspace scan indexed {d} symbols", .{self.workspace.symbolCount()});
+        try self.log("workspace indexed {d} documents", .{self.documents.map.count()});
         try self.sendInitializeResult(id);
     }
 
@@ -333,7 +388,7 @@ pub const Server = struct {
     }
 
     fn handleDidClose(self: *Server, params: types.DidCloseTextDocumentParams) !void {
-        self.documents.close(params.textDocument.uri);
+        try self.documents.close(params.textDocument.uri, self.workspace);
     }
 
     fn handleCompletion(
@@ -371,6 +426,21 @@ pub const Server = struct {
             scope = self.workspace.type_checker.modules.get(owned_path);
         }
 
+        // Trailing-dot recovery: a member access with an empty member (the cursor
+        // right after `.`) is a syntax error, so the document never type-checked
+        // and no scope is available. Re-check a repaired copy under a scratch
+        // document to recover a scope for the object being completed. The scratch
+        // document must stay open until after completion reads the scope (its
+        // bindings reference the scratch AST), then it is closed here.
+        var scratch_cleanup: ?[]const u8 = null;
+        defer if (scratch_cleanup) |scratch_uri| {
+            self.documents.close(scratch_uri, self.workspace) catch {};
+            self.allocator.free(scratch_uri);
+        };
+        if (scope == null and trailingMemberDot(text_slice, loc.offset)) {
+            scope = self.recoverTrailingDotScope(owned_path, text_slice, loc, &scratch_cleanup) catch null;
+        }
+
         const doc_symbols = if (doc) |d| d.symbols.items else &[_]symbols.Symbol{};
         const workspace_symbols = self.workspace.symbolSlice();
 
@@ -390,6 +460,87 @@ pub const Server = struct {
         defer matches.deinit();
 
         try self.sendCompletionResult(id, matches.items.items);
+    }
+
+    /// completionItem/resolve: the client asks for extra detail on a specific
+    /// item. We keep completion results lean and fill the documentation lazily
+    /// here — an item that carried only inline `detail` (a function signature,
+    /// a command path, a field type) gets that promoted to hover documentation
+    /// when the user focuses it. The item is echoed with all its other fields
+    /// intact.
+    fn handleCompletionResolve(self: *Server, id: types.RequestId, item: std.json.Value) !void {
+        const should_add = item == .object and
+            (if (item.object.get("documentation")) |d| d == .null else true) and
+            (if (item.object.get("detail")) |d| d == .string and d.string.len > 0 else false);
+
+        if (!should_add) {
+            try self.sendJson(types.response(id, item));
+            return;
+        }
+
+        // Build the enriched item in a scratch arena rather than mutating the
+        // request's parse arena (which a raw allocator must not free). Values are
+        // shallow-copied — their strings point into the request buffer, valid for
+        // the duration of this handler.
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+
+        var obj: std.json.ObjectMap = .empty;
+        var it = item.object.iterator();
+        while (it.next()) |entry| {
+            try obj.put(arena_allocator, entry.key_ptr.*, entry.value_ptr.*);
+        }
+        try obj.put(arena_allocator, "documentation", .{ .string = item.object.get("detail").?.string });
+
+        try self.sendJson(types.response(id, std.json.Value{ .object = obj }));
+    }
+
+    /// True when `offset` sits immediately after a `.` that follows an
+    /// identifier — i.e. the cursor is at an empty member access (`obj.`),
+    /// the case that fails to parse and needs scope recovery.
+    fn trailingMemberDot(text: []const u8, offset: usize) bool {
+        if (offset == 0 or offset > text.len) return false;
+        if (text[offset - 1] != '.') return false;
+        if (offset < 2) return false;
+        return runic.lexer.isIdentifierContinue(text[offset - 2]);
+    }
+
+    /// Recovers a scope for a completion whose document does not parse because
+    /// of a trailing member dot. Inserts a placeholder identifier so the member
+    /// access parses, type-checks the repaired text as a scratch document in the
+    /// same directory (keeping relative imports resolvable), and returns the
+    /// recovered scope. On success `*cleanup_out` receives the scratch document
+    /// URI, which the caller must close and free once it has finished using the
+    /// returned scope (its bindings reference the scratch document's AST).
+    fn recoverTrailingDotScope(
+        self: *Server,
+        real_path: []const u8,
+        text: []const u8,
+        loc: runic.token.Location,
+        cleanup_out: *?[]const u8,
+    ) !?*runic.semantic.Scope {
+        const placeholder = "__runic_lsp_completion__";
+        const repaired = try std.fmt.allocPrint(self.allocator, "{s}{s}{s}", .{
+            text[0..loc.offset],
+            placeholder,
+            text[loc.offset..],
+        });
+        defer self.allocator.free(repaired);
+
+        const dir = std.fs.path.dirname(real_path) orelse ".";
+        const scratch_path = try std.fs.path.join(self.allocator, &.{ dir, ".runic-lsp-completion.rn" });
+        defer self.allocator.free(scratch_path);
+
+        const scratch_uri = try self.documents.resolveUri(scratch_path);
+        errdefer self.allocator.free(scratch_uri);
+
+        try self.documents.openOrReplace(scratch_uri, scratch_path, repaired, 0, .parse_and_type_check);
+        cleanup_out.* = scratch_uri;
+
+        var scratch_loc = loc;
+        scratch_loc.file = scratch_path;
+        return self.workspace.type_checker.getScopeFromLoc(scratch_loc);
     }
 
     fn handleHover(
@@ -491,6 +642,65 @@ pub const Server = struct {
         }
 
         return ranges;
+    }
+
+    /// The declaration span of the binding that `name` resolves to at the given
+    /// position in `doc_path`, or null when it does not resolve to a binding —
+    /// e.g. a command name, an unbound identifier, or a document that was parsed
+    /// but not type-checked. Used to make references/rename binding-aware rather
+    /// than matching every same-named identifier.
+    /// The declaration span the identifier `name` at `position` resolves to:
+    /// for a member access `X.name`, the member's declaration (a struct field or
+    /// an imported module's `pub` binding); otherwise the binding it names.
+    /// Null when it does not resolve — a command, an unbound name, or a document
+    /// that was parsed but not type-checked.
+    fn declSpanAt(
+        self: *Server,
+        doc_path: []const u8,
+        doc_text: []const u8,
+        position: types.Position,
+        name: []const u8,
+    ) ?runic.ast.Span {
+        // toLocation converts the 0-indexed LSP position to the 1-indexed
+        // line/column the type checker's scopes use.
+        var loc = position.toLocation(doc_path);
+        loc.offset = position.findIndex(doc_text) orelse 0;
+
+        // Workspace files loaded by the index are parsed but not type-checked, so
+        // they have no scope until needed. Type-check on demand here (references
+        // and rename are read-only, so nothing resets it until the next edit),
+        // which lets member accesses in files that were never opened resolve.
+        if (!self.workspace.type_checker.modules.contains(doc_path)) {
+            _ = self.workspace.type_checker.typeCheck(doc_path) catch {};
+        }
+
+        if (self.extractMember(loc, doc_text)) |member| {
+            if (self.workspace.type_checker.getScopeFromLoc(loc)) |scope| {
+                if (self.resolveMemberFieldSpan(scope, member)) |span| return span;
+            }
+        }
+        if (self.workspace.type_checker.getScopeFromLoc(loc)) |scope| {
+            if (scope.lookup(name)) |binding| return binding.identifier.span;
+        }
+        return null;
+    }
+
+    /// Whether `range`'s start is exactly `decl`'s start position in `doc_path` —
+    /// i.e. this occurrence IS the declaration. Catches declaration sites that
+    /// do not themselves resolve to a scope binding (struct fields, a `pub`
+    /// binding in a module that was only parsed).
+    fn rangeIsDecl(doc_path: []const u8, range: types.Range, decl: runic.ast.Span) bool {
+        if (!std.mem.eql(u8, doc_path, decl.start.file)) return false;
+        const decl_range = types.Range.fromSpan(decl);
+        return range.start.line == decl_range.start.line and range.start.character == decl_range.start.character;
+    }
+
+    /// Two declaration spans identify the same binding when they begin at the
+    /// same position in the same file.
+    fn sameDecl(a: runic.ast.Span, b: runic.ast.Span) bool {
+        return a.start.line == b.start.line and
+            a.start.column == b.start.column and
+            std.mem.eql(u8, a.start.file, b.start.file);
     }
 
     fn extractIdentifier(
@@ -640,7 +850,19 @@ pub const Server = struct {
         var loc = params.position.toLocation(path);
         if (doc) |d| loc.offset = params.position.findIndex(d.text) orelse 0;
         const extracted_identifier = if (doc) |d| self.extractIdentifier(loc, d.text) else null;
+        const extracted_member = if (doc) |d| self.extractMember(loc, d.text) else null;
         const scope = self.workspace.type_checker.getScopeFromLoc(loc);
+
+        // Member access takes precedence: the cursor on `p.x` should resolve to
+        // `x`'s field declaration in the struct, not to an unrelated `x` binding
+        // that might happen to be in scope. Only jumps when the field/decl is
+        // actually found, otherwise falls through to identifier resolution.
+        if (scope) |s| if (extracted_member) |member| {
+            if (self.resolveMemberFieldSpan(s, member)) |field_span| {
+                try self.sendDefinitionSpan(id, field_span);
+                return;
+            }
+        };
 
         const binding: ?*runic.semantic.Scope.Binding = brk: {
             if (scope) |s| if (extracted_identifier) |i| {
@@ -650,13 +872,7 @@ pub const Server = struct {
         };
 
         if (binding) |b| {
-            const definition_uri = try self.documents.resolveUri(b.identifier.span.start.file);
-            defer self.allocator.free(definition_uri);
-            const result = types.Location{
-                .uri = definition_uri,
-                .range = types.Range.fromSpan(b.identifier.span),
-            };
-            try self.sendJson(types.response(id, result));
+            try self.sendDefinitionSpan(id, b.identifier.span);
             return;
         }
 
@@ -690,6 +906,59 @@ pub const Server = struct {
         try self.sendJson(types.response(id, std.json.Value{ .null = {} }));
     }
 
+    /// Sends a go-to-definition Location for `span`, resolving the target
+    /// document URI from the span's source file.
+    fn sendDefinitionSpan(self: *Server, id: types.RequestId, span: runic.ast.Span) !void {
+        const definition_uri = try self.documents.resolveUri(span.start.file);
+        defer self.allocator.free(definition_uri);
+        const result = types.Location{
+            .uri = definition_uri,
+            .range = types.Range.fromSpan(span),
+        };
+        try self.sendJson(types.response(id, result));
+    }
+
+    /// Resolves a member access (`object.member`) to the span of the member's
+    /// declaration in the object's struct type — a struct field's name, or a
+    /// struct decl (method/const member). Returns null when the object is not a
+    /// struct, has no such member, or has no known type (e.g. builtin members
+    /// like `.stdout` on an execution result, which have no source declaration).
+    fn resolveMemberFieldSpan(
+        self: *Server,
+        scope: *runic.semantic.Scope,
+        member: ExtractedMember,
+    ) ?runic.ast.Span {
+        const binding = scope.lookup(member.object_name) orelse return null;
+        const binding_type = binding.type_expr orelse return null;
+        const resolved = switch (binding_type.*) {
+            .alias => |alias_type| self.workspace.type_checker.resolveAliasType(&alias_type),
+            else => binding_type,
+        };
+        switch (resolved.*) {
+            .struct_type => |struct_type| {
+                for (struct_type.fields) |field| {
+                    if (std.mem.eql(u8, field.name.name, member.member_name)) {
+                        return field.name.span;
+                    }
+                }
+                for (struct_type.decls) |decl| {
+                    if (std.mem.eql(u8, decl.name.name, member.member_name)) {
+                        return decl.name.span;
+                    }
+                }
+                return null;
+            },
+            // A module member (`m.foo`) resolves to the `pub` declaration in the
+            // imported module file.
+            .module => |module_type| {
+                const module_scope = (self.workspace.type_checker.resolveModuleScopeForMemberCompletion(module_type) catch return null) orelse return null;
+                const member_binding = module_scope.lookup(member.member_name) orelse return null;
+                return member_binding.identifier.span;
+            },
+            else => return null,
+        }
+    }
+
     fn handleReferences(
         self: *Server,
         id: types.RequestId,
@@ -703,28 +972,22 @@ pub const Server = struct {
         var loc = params.position.toLocation(path);
         if (doc) |d| loc.offset = params.position.findIndex(d.text) orelse 0;
         const extracted_identifier = if (doc) |d| self.extractIdentifier(loc, d.text) else null;
-        const scope = self.workspace.type_checker.getScopeFromLoc(loc);
-
-        const binding: ?*runic.semantic.Scope.Binding = brk: {
-            if (scope) |s| if (extracted_identifier) |i| {
-                break :brk s.lookup(i.name);
-            };
-            break :brk null;
-        };
 
         var locations = std.ArrayList(types.Location).empty;
         defer locations.deinit(self.allocator);
 
-        const reference_name = if (binding) |b|
-            b.identifier.name
-        else if (extracted_identifier) |i|
-            i.name
-        else
-            null;
+        const reference_name = if (extracted_identifier) |i| i.name else null;
 
         if (reference_name) |name| {
-            const declaration_file = if (binding) |b| b.identifier.span.start.file else null;
-            const declaration_range = if (binding) |b| types.Range.fromSpan(b.identifier.span) else null;
+            // Resolve the symbol under the cursor to a declaration (a binding, or
+            // a struct field / imported module member for a member access). Keep
+            // only occurrences resolving to that same declaration — plus the
+            // declaration site itself. When it does not resolve (a command, an
+            // unbound name, an un-type-checked file) fall back to matching by
+            // name.
+            const target_decl: ?runic.ast.Span = if (doc) |d| self.declSpanAt(path, d.text, params.position, name) else null;
+            const declaration_file = if (target_decl) |td| td.start.file else null;
+            const declaration_range = if (target_decl) |td| types.Range.fromSpan(td) else null;
 
             var it = self.documents.map.iterator();
             while (it.next()) |entry| {
@@ -734,6 +997,12 @@ pub const Server = struct {
                 defer ranges.deinit(self.allocator);
 
                 for (ranges.items) |range| {
+                    if (target_decl) |td| {
+                        const occ = self.declSpanAt(ref_doc.path, ref_doc.text, range.start, name);
+                        const is_match = (occ != null and sameDecl(occ.?, td)) or rangeIsDecl(ref_doc.path, range, td);
+                        if (!is_match) continue;
+                    }
+
                     if (!params.context.includeDeclaration and declaration_range != null and declaration_file != null and
                         std.mem.eql(u8, ref_doc.path, declaration_file.?) and std.meta.eql(range, declaration_range.?))
                     {
@@ -751,6 +1020,487 @@ pub const Server = struct {
         try self.sendJson(types.response(id, locations.items));
     }
 
+    fn handleDocumentHighlight(
+        self: *Server,
+        id: types.RequestId,
+        params: types.DocumentHighlightParams,
+    ) !void {
+        const path = try self.resolveUriPath(params.textDocument.uri);
+        defer self.allocator.free(path);
+
+        const doc = self.documents.get(params.textDocument.uri);
+
+        var loc = params.position.toLocation(path);
+        if (doc) |d| loc.offset = params.position.findIndex(d.text) orelse 0;
+        const extracted_identifier = if (doc) |d| self.extractIdentifier(loc, d.text) else null;
+
+        if (extracted_identifier == null or doc == null) {
+            try self.sendJson(types.response(id, std.json.Value{ .null = {} }));
+            return;
+        }
+
+        // Highlight every occurrence of the identifier in the current document.
+        // findIdentifierRanges lexes the source, so occurrences inside strings
+        // and comments are excluded.
+        var ranges = try self.findIdentifierRanges(doc.?.text, extracted_identifier.?.name);
+        defer ranges.deinit(self.allocator);
+
+        var highlights = std.ArrayList(types.DocumentHighlight).empty;
+        defer highlights.deinit(self.allocator);
+        for (ranges.items) |range| {
+            try highlights.append(self.allocator, .{ .range = range, .kind = .text });
+        }
+
+        try self.sendJson(types.response(id, highlights.items));
+    }
+
+    fn handleDocumentLink(
+        self: *Server,
+        id: types.RequestId,
+        params: types.DocumentLinkParams,
+    ) !void {
+        const path = try self.resolveUriPath(params.textDocument.uri);
+        defer self.allocator.free(path);
+
+        const doc = self.documents.get(params.textDocument.uri) orelse {
+            try self.sendJson(types.response(id, std.json.Value{ .null = {} }));
+            return;
+        };
+
+        // The response holds owned target strings; build it in an arena so the
+        // whole set is freed in one shot after serialization.
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+
+        var links = std.ArrayList(types.DocumentLink).empty;
+
+        // Lex the document for `import "<path>"` and turn each module path into a
+        // link to the resolved file. Lexing (rather than the AST) means links
+        // still resolve when the rest of the document does not parse.
+        var lexer = try runic.lexer.Lexer.init(self.io, self.allocator, self.env_map, path, doc.text);
+        defer lexer.deinit();
+
+        while (true) {
+            const tok = lexer.next() catch break;
+            if (tok.tag == .eof) break;
+            if (tok.tag != .kw_import) continue;
+
+            var next = lexer.next() catch break;
+            if (next.tag == .l_paren) next = lexer.next() catch break;
+            if (next.tag != .string_start) continue;
+            const string_text = lexer.next() catch break;
+            if (string_text.tag != .string_text) continue;
+
+            const module_path = runic.document.resolveModulePath(self.io, self.allocator, path, string_text.lexeme) catch continue;
+            defer self.allocator.free(module_path);
+            // Skip the embedded `std` namespace (a `:std/...` virtual path with no
+            // file to open).
+            if (module_path.len > 0 and module_path[0] == ':') continue;
+
+            const target = self.documents.resolveUri(module_path) catch continue;
+            defer self.allocator.free(target);
+
+            try links.append(arena_allocator, .{
+                .range = types.Range.fromSpan(string_text.span),
+                .target = try arena_allocator.dupe(u8, target),
+            });
+        }
+
+        try self.sendJson(types.response(id, links.items));
+    }
+
+    fn positionInRange(pos: types.Position, range: types.Range) bool {
+        if (pos.line < range.start.line or (pos.line == range.start.line and pos.character < range.start.character)) return false;
+        if (pos.line > range.end.line or (pos.line == range.end.line and pos.character > range.end.character)) return false;
+        return true;
+    }
+
+    fn handleInlayHint(
+        self: *Server,
+        id: types.RequestId,
+        params: types.InlayHintParams,
+    ) !void {
+        const path = try self.resolveUriPath(params.textDocument.uri);
+        defer self.allocator.free(path);
+
+        const doc = self.documents.get(params.textDocument.uri) orelse {
+            try self.sendJson(types.response(id, std.json.Value{ .null = {} }));
+            return;
+        };
+        const script = doc.ast orelse {
+            try self.sendJson(types.response(id, &[_]types.InlayHint{}));
+            return;
+        };
+        const module_scope = self.workspace.type_checker.modules.get(path);
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+
+        var hints = std.ArrayList(types.InlayHint).empty;
+
+        // Show the inferred type after each top-level `const`/`var` that has no
+        // explicit annotation, e.g. `const x«: Int» = 5`.
+        for (script.statements) |stmt| {
+            const binding_decl = switch (stmt.*) {
+                .binding_decl => |b| b,
+                else => continue,
+            };
+            if (binding_decl.annotation != null) continue;
+            const identifier = switch (binding_decl.pattern.*) {
+                .identifier => |i| i,
+                else => continue,
+            };
+            const scope = module_scope orelse continue;
+            const binding = scope.lookup(identifier.name) orelse continue;
+            const type_expr = binding.type_expr orelse continue;
+
+            const pos = types.Range.fromSpan(identifier.span).end;
+            if (!positionInRange(pos, params.range)) continue;
+
+            const label = try std.fmt.allocPrint(arena_allocator, ": {f}", .{type_expr});
+            try hints.append(arena_allocator, .{
+                .position = pos,
+                .label = label,
+                .kind = .type,
+            });
+        }
+
+        // Parameter-name hints for calls: map each argument of a call to a
+        // top-level function's parameter name (`greet «name:» "x"`). Build a
+        // name -> declaration map first so a call to a function declared later
+        // is still annotated.
+        var fn_decls = std.StringHashMap(runic.ast.FunctionDecl).init(arena_allocator);
+        for (script.statements) |stmt| {
+            const expr_stmt = switch (stmt.*) {
+                .expression => |e| e,
+                else => continue,
+            };
+            switch (expr_stmt.expression.*) {
+                .fn_decl => |fn_decl| if (fn_decl.name) |n| try fn_decls.put(n.name, fn_decl),
+                else => {},
+            }
+        }
+        const ctx = CallHintCtx{
+            .arena = arena_allocator,
+            .hints = &hints,
+            .fn_decls = &fn_decls,
+            .range = params.range,
+            .scope = module_scope,
+        };
+        for (script.statements) |stmt| try self.walkStmtCalls(ctx, stmt);
+
+        try self.sendJson(types.response(id, hints.items));
+    }
+
+    /// Recursively visits statements looking for calls to annotate with
+    /// parameter-name hints — through binding initializers, control flow, and
+    /// nested blocks, not just top-level statements.
+    fn walkStmtCalls(self: *Server, ctx: CallHintCtx, stmt: *const runic.ast.Statement) (Allocator.Error)!void {
+        switch (stmt.*) {
+            .expression => |es| try self.walkExprCalls(ctx, es.expression),
+            .binding_decl => |bd| try self.walkExprCalls(ctx, bd.initializer),
+            .yield_stmt => |ys| try self.walkExprCalls(ctx, ys.value),
+            .exit_stmt => |xs| if (xs.value) |v| try self.walkExprCalls(ctx, v),
+            .while_stmt => |ws| {
+                try self.walkExprCalls(ctx, ws.condition);
+                for (ws.body.statements) |s| try self.walkStmtCalls(ctx, s);
+            },
+            .bash_block, .type_binding_decl => {},
+        }
+    }
+
+    /// Recursively visits an expression, emitting parameter hints at each call
+    /// and descending into pipelines, operands, call arguments, control-flow
+    /// bodies, function bodies, and string interpolations.
+    fn walkExprCalls(self: *Server, ctx: CallHintCtx, expr: *const runic.ast.Expression) (Allocator.Error)!void {
+        switch (expr.*) {
+            .call => |call| {
+                try self.appendCallParamHints(ctx, call);
+                try self.walkExprCalls(ctx, call.callee);
+                for (call.arguments) |arg| try self.walkExprCalls(ctx, arg);
+            },
+            .pipeline => |p| for (p.stages) |s| try self.walkExprCalls(ctx, s),
+            .binary => |b| {
+                try self.walkExprCalls(ctx, b.left);
+                try self.walkExprCalls(ctx, b.right);
+            },
+            .unary => |u| try self.walkExprCalls(ctx, u.operand),
+            .assignment => |a| try self.walkExprCalls(ctx, a.expr),
+            .block => |b| for (b.statements) |s| try self.walkStmtCalls(ctx, s),
+            .fn_decl => |fd| try self.walkExprCalls(ctx, fd.body),
+            .if_expr => |i| try self.walkIfExprCalls(ctx, &i),
+            .for_expr => |f| {
+                for (f.sources) |s| try self.walkExprCalls(ctx, s);
+                try self.walkExprCalls(ctx, f.body);
+            },
+            .match_expr => |m| {
+                try self.walkExprCalls(ctx, m.subject);
+                for (m.cases) |c| for (c.body.statements) |s| try self.walkStmtCalls(ctx, s);
+            },
+            .literal => |lit| switch (lit) {
+                .string => |s| for (s.segments) |seg| switch (seg) {
+                    .interpolation => |e| try self.walkExprCalls(ctx, e),
+                    else => {},
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
+
+    fn walkIfExprCalls(self: *Server, ctx: CallHintCtx, if_expr: *const runic.ast.IfExpr) (Allocator.Error)!void {
+        try self.walkExprCalls(ctx, if_expr.condition);
+        try self.walkExprCalls(ctx, if_expr.then_expr);
+        if (if_expr.else_branch) |else_branch| switch (else_branch) {
+            .expr => |e| try self.walkExprCalls(ctx, e),
+            .if_expr => |nested| try self.walkIfExprCalls(ctx, nested),
+            .condition => {},
+        };
+    }
+
+    fn appendCallParamHints(
+        self: *Server,
+        ctx: CallHintCtx,
+        call: runic.ast.CallExpr,
+    ) !void {
+        const arena = ctx.arena;
+        const hints = ctx.hints;
+        const range = ctx.range;
+
+        const params = self.resolveCallParams(ctx, call) orelse return;
+
+        for (call.arguments, 0..) |arg, i| {
+            if (i >= params.len) break;
+            const param_name = switch (params[i].pattern.*) {
+                .identifier => |identifier| identifier.name,
+                else => continue,
+            };
+            const pos = types.Range.fromSpan(arg.span()).start;
+            if (!positionInRange(pos, range)) continue;
+
+            const label = try std.fmt.allocPrint(arena, "{s}:", .{param_name});
+            try hints.append(arena, .{
+                .position = pos,
+                .label = label,
+                .kind = .parameter,
+                .paddingRight = true,
+            });
+        }
+    }
+
+    /// Resolves the parameter list for a call's callee: a same-file top-level
+    /// function (identifier callee), or an imported module's function
+    /// (`m.f` member callee, resolved through the module's AST). Returns null
+    /// for anything else or a variadic function.
+    fn resolveCallParams(self: *Server, ctx: CallHintCtx, call: runic.ast.CallExpr) ?[]const *runic.ast.Parameter {
+        switch (call.callee.*) {
+            .identifier => |identifier| {
+                const fn_decl = ctx.fn_decls.get(identifier.name) orelse return null;
+                return nonVariadicParams(fn_decl);
+            },
+            // Member access (`m.f`) is a binary expression with the `.member`
+            // operator: left is the object, right is the member name.
+            .binary => |binary| {
+                if (std.meta.activeTag(binary.op) != .member) return null;
+                const object_name = switch (binary.left.*) {
+                    .identifier => |i| i.name,
+                    else => return null,
+                };
+                const member_name = switch (binary.right.*) {
+                    .identifier => |i| i.name,
+                    else => return null,
+                };
+                const scope = ctx.scope orelse return null;
+                const binding = scope.lookup(object_name) orelse return null;
+                const binding_type = binding.type_expr orelse return null;
+                const resolved = switch (binding_type.*) {
+                    .alias => |alias_type| self.workspace.type_checker.resolveAliasType(&alias_type),
+                    else => binding_type,
+                };
+                const module_type = switch (resolved.*) {
+                    .module => |m| m,
+                    else => return null,
+                };
+                const script = (self.documents.document_store.getAst(module_type.path) catch return null) orelse return null;
+                const fn_decl = findTopLevelFn(script, member_name) orelse return null;
+                return nonVariadicParams(fn_decl);
+            },
+            else => return null,
+        }
+    }
+
+    fn nonVariadicParams(fn_decl: runic.ast.FunctionDecl) ?[]const *runic.ast.Parameter {
+        return switch (fn_decl.params) {
+            ._non_variadic => |ps| ps,
+            ._variadic => null,
+        };
+    }
+
+    fn findTopLevelFn(script: runic.ast.Script, name: []const u8) ?runic.ast.FunctionDecl {
+        for (script.statements) |stmt| switch (stmt.*) {
+            .expression => |es| switch (es.expression.*) {
+                .fn_decl => |fn_decl| if (fn_decl.name) |n| {
+                    if (std.mem.eql(u8, n.name, name)) return fn_decl;
+                },
+                else => {},
+            },
+            else => {},
+        };
+        return null;
+    }
+
+    fn handleFoldingRange(
+        self: *Server,
+        id: types.RequestId,
+        params: types.FoldingRangeParams,
+    ) !void {
+        const doc = self.documents.get(params.textDocument.uri) orelse {
+            try self.sendJson(types.response(id, std.json.Value{ .null = {} }));
+            return;
+        };
+        const script = doc.ast orelse {
+            try self.sendJson(types.response(id, &[_]types.FoldingRange{}));
+            return;
+        };
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+
+        var ranges = std.ArrayList(types.FoldingRange).empty;
+
+        // Fold every top-level statement that spans more than one line — that
+        // covers function bodies, struct definitions, and multi-line control
+        // flow without needing to enumerate each node kind.
+        for (script.statements) |stmt| {
+            const range = types.Range.fromSpan(stmt.span());
+            if (range.end.line > range.start.line) {
+                try ranges.append(arena.allocator(), .{
+                    .startLine = range.start.line,
+                    .endLine = range.end.line,
+                });
+            }
+        }
+
+        try self.sendJson(types.response(id, ranges.items));
+    }
+
+    fn handleCodeAction(
+        self: *Server,
+        id: types.RequestId,
+        params: types.CodeActionParams,
+    ) !void {
+        const path = try self.resolveUriPath(params.textDocument.uri);
+        defer self.allocator.free(path);
+
+        const doc = self.documents.get(params.textDocument.uri) orelse {
+            try self.sendJson(types.response(id, std.json.Value{ .null = {} }));
+            return;
+        };
+        const script = doc.ast orelse {
+            try self.sendJson(types.response(id, &[_]types.CodeAction{}));
+            return;
+        };
+        const module_scope = self.workspace.type_checker.modules.get(path);
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+
+        var actions = std.ArrayList(types.CodeAction).empty;
+
+        // Offer "add the inferred type" for un-annotated top-level bindings whose
+        // declaration line falls within the requested range.
+        for (script.statements) |stmt| {
+            const binding_decl = switch (stmt.*) {
+                .binding_decl => |b| b,
+                else => continue,
+            };
+            if (binding_decl.annotation != null) continue;
+            const identifier = switch (binding_decl.pattern.*) {
+                .identifier => |i| i,
+                else => continue,
+            };
+            const id_range = types.Range.fromSpan(identifier.span);
+            if (id_range.start.line < params.range.start.line or id_range.start.line > params.range.end.line) continue;
+
+            const scope = module_scope orelse continue;
+            const binding = scope.lookup(identifier.name) orelse continue;
+            const type_expr = binding.type_expr orelse continue;
+
+            const type_str = try std.fmt.allocPrint(arena_allocator, "{f}", .{type_expr});
+            const new_text = try std.fmt.allocPrint(arena_allocator, ": {s}", .{type_str});
+            const title = try std.fmt.allocPrint(arena_allocator, "Add type annotation: {s}", .{type_str});
+
+            const edits = try arena_allocator.alloc(types.TextEdit, 1);
+            edits[0] = .{
+                .range = .{ .start = id_range.end, .end = id_range.end },
+                .newText = new_text,
+            };
+            const changes = try arena_allocator.alloc(types.DocumentChangeOperation, 1);
+            changes[0] = .{ .textDocumentEdit = .{
+                .textDocument = .{ .uri = params.textDocument.uri, .version = null },
+                .edits = edits,
+            } };
+
+            try actions.append(arena_allocator, .{
+                .title = title,
+                .kind = "refactor.rewrite",
+                .edit = .{ .documentChanges = changes },
+            });
+        }
+
+        try self.sendJson(types.response(id, actions.items));
+    }
+
+    fn handleWorkspaceSymbol(
+        self: *Server,
+        id: types.RequestId,
+        params: types.WorkspaceSymbolParams,
+    ) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+
+        var results = std.ArrayList(types.SymbolInformation).empty;
+
+        // The document store holds every workspace file indexed at startup plus
+        // any open documents, so a single pass over it is the whole workspace.
+        var it = self.documents.map.iterator();
+        while (it.next()) |entry| {
+            const uri = entry.key_ptr.*;
+            for (entry.value_ptr.*.symbols.items) |sym| {
+                try appendWorkspaceSymbol(arena_allocator, &results, uri, sym, null, params.query);
+            }
+        }
+
+        try self.sendJson(types.response(id, results.items));
+    }
+
+    fn appendWorkspaceSymbol(
+        arena: Allocator,
+        results: *std.ArrayList(types.SymbolInformation),
+        uri: []const u8,
+        sym: symbols.Symbol,
+        container: ?[]const u8,
+        query: []const u8,
+    ) !void {
+        if (query.len == 0 or std.ascii.indexOfIgnoreCase(sym.name, query) != null) {
+            try results.append(arena, .{
+                .name = sym.name,
+                .kind = documentSymbolKind(sym.kind),
+                .location = .{ .uri = uri, .range = types.Range.fromSpan(sym.span) },
+                .containerName = container,
+            });
+        }
+        // Nested symbols (struct fields, function parameters) are searchable too,
+        // tagged with their enclosing symbol as the container.
+        for (sym.children) |child| {
+            try appendWorkspaceSymbol(arena, results, uri, child, sym.name, query);
+        }
+    }
+
     fn handleDocumentSymbols(
         self: *Server,
         id: types.RequestId,
@@ -764,31 +1514,48 @@ pub const Server = struct {
             return;
         };
 
+        // Build the (possibly nested) outline in an arena so the tree of child
+        // slices is freed in one shot after serialization.
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+
         var doc_symbols = std.ArrayList(types.DocumentSymbol).empty;
-        defer doc_symbols.deinit(self.allocator);
 
         if (self.workspace.documents.get(params.textDocument.uri)) |ws_doc| {
             for (ws_doc.symbols.items) |sym| {
-                const kind: types.SymbolKind = switch (sym.kind) {
-                    .function => .function,
-                    .method => .method,
-                    .variable => .variable,
-                    .field => .field,
-                    .module => .module,
-                    .keyword => .keyword,
-                };
-
-                try doc_symbols.append(self.allocator, .{
-                    .name = sym.name,
-                    .kind = kind,
-                    .detail = sym.detail,
-                    .range = types.Range.fromSpan(sym.span),
-                    .selectionRange = types.Range.fromSpan(sym.span),
-                });
+                try doc_symbols.append(arena_allocator, try toDocumentSymbol(arena_allocator, sym));
             }
         }
 
         try self.sendJson(types.response(id, doc_symbols.items));
+    }
+
+    fn documentSymbolKind(kind: symbols.SymbolKind) types.SymbolKind {
+        return switch (kind) {
+            .function => .function,
+            .method => .method,
+            .variable => .variable,
+            .field => .field,
+            .module => .module,
+            .keyword => .keyword,
+            .@"struct" => .@"struct",
+        };
+    }
+
+    fn toDocumentSymbol(arena: Allocator, sym: symbols.Symbol) !types.DocumentSymbol {
+        const children = try arena.alloc(types.DocumentSymbol, sym.children.len);
+        for (sym.children, 0..) |child, i| {
+            children[i] = try toDocumentSymbol(arena, child);
+        }
+        return .{
+            .name = sym.name,
+            .kind = documentSymbolKind(sym.kind),
+            .detail = sym.detail,
+            .range = types.Range.fromSpan(sym.range_span orelse sym.span),
+            .selectionRange = types.Range.fromSpan(sym.span),
+            .children = if (children.len == 0) null else children,
+        };
     }
 
     fn handleRename(
@@ -810,36 +1577,88 @@ pub const Server = struct {
             return;
         }
 
-        const text = if (doc) |d| d.text else {
+        if (doc == null) {
+            try self.sendJson(types.response(id, std.json.Value{ .null = {} }));
+            return;
+        }
+        const name = extracted_identifier.?.name;
+
+        // Resolve the symbol under the cursor to a binding. When it resolves,
+        // rename only occurrences that resolve to that same binding, so distinct
+        // same-named symbols in other scopes or files are left alone. When it
+        // does not resolve (a command, an unbound name, an un-type-checked file)
+        // fall back to a lexical rename by name across every indexed document.
+        // Either way findIdentifierRanges skips strings and comments, and editors
+        // preview the edit before applying it.
+        const target_decl: ?runic.ast.Span = self.declSpanAt(path, doc.?.text, params.position, name);
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+
+        var changes = std.ArrayList(types.DocumentChangeOperation).empty;
+
+        var it = self.documents.map.iterator();
+        while (it.next()) |entry| {
+            const doc_uri = entry.key_ptr.*;
+            const ref_doc = entry.value_ptr.*;
+            var ranges = try self.findIdentifierRanges(ref_doc.text, name);
+            defer ranges.deinit(self.allocator);
+            if (ranges.items.len == 0) continue;
+
+            var edits = std.ArrayList(types.TextEdit).empty;
+            for (ranges.items) |range| {
+                if (target_decl) |td| {
+                    const occ = self.declSpanAt(ref_doc.path, ref_doc.text, range.start, name);
+                    const is_match = (occ != null and sameDecl(occ.?, td)) or rangeIsDecl(ref_doc.path, range, td);
+                    if (!is_match) continue;
+                }
+                try edits.append(arena_allocator, .{ .range = range, .newText = params.newName });
+            }
+            if (edits.items.len == 0) continue;
+
+            try changes.append(arena_allocator, .{ .textDocumentEdit = .{
+                .textDocument = .{ .uri = doc_uri, .version = null },
+                .edits = edits.items,
+            } });
+        }
+
+        if (changes.items.len == 0) {
+            try self.sendJson(types.response(id, std.json.Value{ .null = {} }));
+            return;
+        }
+
+        const result = types.WorkspaceEdit{ .documentChanges = changes.items };
+        try self.sendJson(types.response(id, result));
+    }
+
+    fn handlePrepareRename(
+        self: *Server,
+        id: types.RequestId,
+        params: types.PrepareRenameParams,
+    ) !void {
+        const path = try self.resolveUriPath(params.textDocument.uri);
+        defer self.allocator.free(path);
+
+        const doc = self.documents.get(params.textDocument.uri) orelse {
             try self.sendJson(types.response(id, std.json.Value{ .null = {} }));
             return;
         };
 
-        var ranges = try self.findIdentifierRanges(text, extracted_identifier.?.name);
-        defer ranges.deinit(self.allocator);
+        var loc = params.position.toLocation(path);
+        loc.offset = params.position.findIndex(doc.text) orelse 0;
 
-        var edits = std.ArrayList(types.TextEdit).empty;
-        defer edits.deinit(self.allocator);
-
-        for (ranges.items) |range| {
-            try edits.append(self.allocator, .{
-                .range = range,
-                .newText = params.newName,
-            });
-        }
-
-        const result = types.WorkspaceEdit{
-            .documentChanges = &.{
-                .{
-                    .textDocumentEdit = .{
-                        .textDocument = .{ .uri = params.textDocument.uri, .version = null },
-                        .edits = edits.items,
-                    },
-                },
-            },
+        // Only an identifier is renameable; anywhere else returns null so the
+        // client blocks the rename instead of offering an invalid one.
+        const extracted = self.extractIdentifier(loc, doc.text) orelse {
+            try self.sendJson(types.response(id, std.json.Value{ .null = {} }));
+            return;
         };
 
-        try self.sendJson(types.response(id, result));
+        try self.sendJson(types.response(id, types.PrepareRenameResult{
+            .range = types.Range.fromSpan(extracted.span),
+            .placeholder = extracted.name,
+        }));
     }
 
     fn handleFormatting(
@@ -958,7 +1777,7 @@ pub const Server = struct {
                 } },
                 .completionProvider = .{
                     .triggerCharacters = &.{ ".", ":", "\"", "/" },
-                    .resolveProvider = false,
+                    .resolveProvider = true,
                 },
                 .hoverProvider = .{ .payload = .{
                     .hoverOptions = .{
@@ -975,6 +1794,32 @@ pub const Server = struct {
                         .workDoneProgress = false,
                     },
                 } },
+                .documentHighlightProvider = .{ .payload = .{
+                    .documentHighlightOptions = .{
+                        .workDoneProgress = false,
+                    },
+                } },
+                .documentLinkProvider = .{
+                    .resolveProvider = false,
+                },
+                .inlayHintProvider = .{ .payload = .{
+                    .inlayHintOptions = .{
+                        .resolveProvider = false,
+                    },
+                } },
+                .foldingRangeProvider = .{ .payload = .{
+                    .foldingRangeOptions = .{},
+                } },
+                .codeActionProvider = .{ .payload = .{
+                    .codeActionOptions = .{
+                        .codeActionKinds = &.{"refactor.rewrite"},
+                    },
+                } },
+                .workspaceSymbolProvider = .{ .payload = .{
+                    .workspaceSymbolOptions = .{
+                        .workDoneProgress = false,
+                    },
+                } },
                 .documentSymbolProvider = .{ .payload = .{
                     .documentSymbolOptions = .{
                         .workDoneProgress = false,
@@ -982,7 +1827,7 @@ pub const Server = struct {
                 } },
                 .renameProvider = .{ .payload = .{
                     .renameOptions = .{
-                        .prepareProvider = false,
+                        .prepareProvider = true,
                     },
                 } },
                 .documentFormattingProvider = .{ .payload = .{
@@ -1003,7 +1848,7 @@ pub const Server = struct {
     fn sendCompletionResult(self: *Server, id: types.RequestId, items: []const completion.Match) !void {
         var completionItems = try self.allocator.alloc(types.CompletionItem, items.len);
         defer self.allocator.free(completionItems);
-        for (items, 0..) |item, i| completionItems[i] = .fromSymbol(item.symbol.get());
+        for (items, 0..) |item, i| completionItems[i] = .fromSymbol(item.symbol.get(), self.snippet_support);
 
         const result = types.CompletionList{
             .isIncomplete = false,

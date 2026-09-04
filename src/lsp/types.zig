@@ -108,12 +108,20 @@ pub const ClientRequestPayload = union(enum) {
     @"textDocument/didChange": DidChangeTextDocumentParams,
     @"textDocument/didClose": DidCloseTextDocumentParams,
     @"textDocument/completion": CompletionParams,
+    @"completionItem/resolve": std.json.Value,
     @"textDocument/hover": HoverParams,
     @"textDocument/definition": DefinitionParams,
     @"textDocument/references": ReferenceParams,
+    @"textDocument/documentHighlight": DocumentHighlightParams,
+    @"textDocument/documentLink": DocumentLinkParams,
+    @"textDocument/inlayHint": InlayHintParams,
+    @"textDocument/foldingRange": FoldingRangeParams,
+    @"textDocument/codeAction": CodeActionParams,
     @"textDocument/documentSymbol": DocumentSymbolParams,
     @"textDocument/rename": RenameParams,
+    @"textDocument/prepareRename": PrepareRenameParams,
     @"textDocument/formatting": DocumentFormattingParams,
+    @"workspace/symbol": WorkspaceSymbolParams,
     @"workspace/didChangeConfiguration": DidChangeConfigurationParams,
     @"workspace/didChangeWatchedFiles": DidChangeWatchedFilesParams,
     @"$/cancelRequest",
@@ -126,6 +134,33 @@ pub const InitializeParams = struct {
     rootPath: ?[]const u8 = null,
     workspaceFolders: ?[]const WorkspaceFolder = null,
     workDoneToken: ?ProgressToken = null,
+    capabilities: ?ClientCapabilities = null,
+};
+
+/// A minimal slice of the client capabilities — only the fields the server
+/// actually reads. Everything else is dropped by `ignore_unknown_fields`.
+pub const ClientCapabilities = struct {
+    textDocument: ?TextDocumentClientCapabilities = null,
+
+    pub const TextDocumentClientCapabilities = struct {
+        completion: ?CompletionClientCapabilities = null,
+
+        pub const CompletionClientCapabilities = struct {
+            completionItem: ?CompletionItemClientCapabilities = null,
+
+            pub const CompletionItemClientCapabilities = struct {
+                snippetSupport: ?bool = null,
+            };
+        };
+    };
+
+    /// Whether the client advertised support for completion snippets.
+    pub fn snippetSupport(self: ClientCapabilities) bool {
+        const text_document = self.textDocument orelse return false;
+        const completion = text_document.completion orelse return false;
+        const completion_item = completion.completionItem orelse return false;
+        return completion_item.snippetSupport orelse false;
+    }
 };
 
 pub const WorkspaceFolder = struct {
@@ -180,8 +215,119 @@ pub const ReferenceParams = struct {
     context: ReferenceContext,
 };
 
+pub const DocumentHighlightParams = struct {
+    textDocument: TextDocumentIdentifier,
+    position: Position,
+};
+
+/// A document highlight kind — how an occurrence relates to the symbol.
+pub const DocumentHighlightKind = enum(u32) {
+    text = 1,
+    read = 2,
+    write = 3,
+
+    pub fn jsonStringify(
+        self: @This(),
+        stringify: *std.json.Stringify,
+    ) std.json.Stringify.Error!void {
+        try stringify.write(@intFromEnum(self));
+    }
+};
+
+pub const DocumentHighlight = struct {
+    range: Range,
+    kind: ?DocumentHighlightKind = null,
+};
+
+pub const DocumentLinkParams = struct {
+    textDocument: TextDocumentIdentifier,
+};
+
+pub const InlayHintParams = struct {
+    textDocument: TextDocumentIdentifier,
+    /// The visible document range hints are requested for.
+    range: Range,
+};
+
+pub const FoldingRangeParams = struct {
+    textDocument: TextDocumentIdentifier,
+};
+
+pub const CodeActionParams = struct {
+    textDocument: TextDocumentIdentifier,
+    /// The range the action is requested for (the selection or cursor line).
+    range: Range,
+    // `context` (diagnostics, requested kinds) is ignored for now.
+};
+
+/// A code action offered for a range — currently only edit-carrying quick fixes
+/// and refactors (no deferred command).
+pub const CodeAction = struct {
+    title: []const u8,
+    kind: ?CodeActionKind = null,
+    edit: ?WorkspaceEdit = null,
+};
+
+/// A collapsible region of a document, addressed by line (0-indexed).
+pub const FoldingRange = struct {
+    startLine: u32,
+    endLine: u32,
+    startCharacter: ?u32 = null,
+    endCharacter: ?u32 = null,
+    kind: ?[]const u8 = null,
+};
+
+pub const InlayHintKind = enum(u32) {
+    type = 1,
+    parameter = 2,
+
+    pub fn jsonStringify(self: @This(), stringify: *std.json.Stringify) std.json.Stringify.Error!void {
+        try stringify.write(@intFromEnum(self));
+    }
+};
+
+pub const InlayHint = struct {
+    position: Position,
+    label: []const u8,
+    kind: ?InlayHintKind = null,
+    paddingLeft: ?bool = null,
+    paddingRight: ?bool = null,
+};
+
+/// A link inside a document (e.g. an import path) pointing at a target URI.
+pub const DocumentLink = struct {
+    range: Range,
+    target: ?[]const u8 = null,
+    tooltip: ?[]const u8 = null,
+};
+
 pub const DocumentSymbolParams = struct {
     textDocument: TextDocumentIdentifier,
+};
+
+pub const WorkspaceSymbolParams = struct {
+    /// A query string to filter symbols by. An empty query matches everything.
+    query: []const u8,
+};
+
+/// A symbol reported by a workspace symbol search, with its location.
+pub const SymbolInformation = struct {
+    name: []const u8,
+    kind: SymbolKind,
+    location: Location,
+    containerName: ?[]const u8 = null,
+};
+
+pub const PrepareRenameParams = struct {
+    textDocument: TextDocumentIdentifier,
+    position: Position,
+};
+
+/// prepareRename result: the range of the identifier that would be renamed,
+/// plus the text to pre-fill in the rename box.
+pub const PrepareRenameResult = struct {
+    range: Range,
+    placeholder: []const u8,
 };
 
 pub const RenameParams = struct {
@@ -684,6 +830,13 @@ pub const TextDocumentSyncKind = enum(u32) {
     full = 1,
     /// Documents are synced by sending the full content on open. After that only incremental updates to the document are sent.
     incremental = 2,
+
+    pub fn jsonStringify(
+        self: @This(),
+        stringify: *std.json.Stringify,
+    ) std.json.Stringify.Error!void {
+        try stringify.write(@intFromEnum(self));
+    }
 };
 
 /// Options specific to a notebook plus its cells to be synced to the server.
@@ -1266,6 +1419,13 @@ pub const InsertTextFormat = enum(u32) {
     ///
     /// A snippet can define tab stops and placeholders with `$1`, `$2` and `${3:foo}`. `$0` defines the final tab stop, it defaults to the end of the snippet. Placeholders with equal identifiers are linked, that is typing in one will update others too.
     snippet = 2,
+
+    pub fn jsonStringify(
+        self: @This(),
+        stringify: *std.json.Stringify,
+    ) std.json.Stringify.Error!void {
+        try stringify.write(@intFromEnum(self));
+    }
 };
 
 /// How whitespace and indentation is handled during completion item insertion.
@@ -1374,11 +1534,16 @@ pub const CompletionItem = struct {
     /// A data entry field that is preserved on a completion item between a completion and a completion resolve request.
     data: ?std.json.Value = null,
 
-    pub fn fromSymbol(symbol: symbols.Symbol) CompletionItem {
+    /// `snippet_support` reflects the client's
+    /// `completionItem.snippetSupport` capability. Snippet insert text is only
+    /// emitted when the client supports it — otherwise the raw `${1:...}` tab
+    /// stops would be inserted literally.
+    pub fn fromSymbol(symbol: symbols.Symbol, snippet_support: bool) CompletionItem {
         const kind = std.meta.stringToEnum(CompletionItemKind, @tagName(symbol.kind));
 
         const detail = if (symbol.detail.len == 0) null else symbol.detail;
         const documentation = if (symbol.documentation.len == 0) null else symbol.documentation;
+        const use_snippet = snippet_support and symbol.snippet.len > 0;
 
         return .{
             .label = symbol.name,
@@ -1389,6 +1554,8 @@ pub const CompletionItem = struct {
                     .markupContent = .{ .kind = .markdown, .value = d },
                 },
             } else null,
+            .insertText = if (use_snippet) symbol.snippet else null,
+            .insertTextFormat = if (use_snippet) .snippet else null,
         };
     }
 };
@@ -1665,6 +1832,13 @@ pub const SymbolKind = enum(u32) {
     operator = 25,
     typeParameter = 26,
     keyword = 27,
+
+    pub fn jsonStringify(
+        self: @This(),
+        stringify: *std.json.Stringify,
+    ) std.json.Stringify.Error!void {
+        try stringify.write(@intFromEnum(self));
+    }
 };
 
 pub const DocumentSymbol = struct {
@@ -1685,6 +1859,13 @@ pub const DiagnosticSeverity = enum(u32) {
     information = 3,
     /// Reports a hint.
     hint = 4,
+
+    pub fn jsonStringify(
+        self: @This(),
+        stringify: *std.json.Stringify,
+    ) std.json.Stringify.Error!void {
+        try stringify.write(@intFromEnum(self));
+    }
 };
 
 /// Structure to capture a description for an error code.
@@ -1707,6 +1888,13 @@ pub const DiagnosticTag = enum(u32) {
     ///
     /// Clients are allowed to rendered diagnostics with this tag strike through.
     deprecated = 2,
+
+    pub fn jsonStringify(
+        self: @This(),
+        stringify: *std.json.Stringify,
+    ) std.json.Stringify.Error!void {
+        try stringify.write(@intFromEnum(self));
+    }
 };
 
 pub const ResponseError = struct {

@@ -1,0 +1,24 @@
+// Bitwise operations are Int methods (UFCS), like the Float math builtins:
+// `x.band y`, `x.bor y`, `x.bxor y` (two operands) and `x.bnot` (one). All
+// yield an Int. `~` two's-complement: bnot(n) == -(n) - 1.
+const a = 12
+const b = 10
+echo "band=${a.band b} bor=${a.bor b} bxor=${a.bxor b} bnot=${a.bnot}"
+
+// On integer literals directly (the `.` is member access, not a decimal point).
+echo "lit=${6.band 3} ${6.bor 1} ${12.bnot}"
+
+// Composes with itself and with the shift operators.
+const flags = (1 << 4).bor 1
+echo "flags=${flags} masked=${flags.band 31}"
+
+// Reassignment (in-place-style) and use in a condition.
+var f = 6
+f = f.bor 1
+echo "reassign=${f}"
+if ((6.band 2) == 2) echo "bit-set" else echo "bit-clear"
+
+// Floats and ranges are unaffected by the member-vs-decimal lexing.
+echo "float=${6.5} sqrt=${(2.0).sqrt}"
+const xs = .{ 10, 20, 30 }
+echo "slice-len=${(xs[0..2]).len}"

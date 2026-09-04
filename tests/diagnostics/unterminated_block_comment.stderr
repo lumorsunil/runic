@@ -1,0 +1,5 @@
+[error]: tests/diagnostics/unterminated_block_comment.rn:3:1: unterminated block comment (missing closing '*/')
+   1:echo "hi"
+   2:/* not closed
+   3:
+

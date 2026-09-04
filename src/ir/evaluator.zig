@@ -67,6 +67,7 @@ pub const Error =
         MissingSpawnedThreadContext,
         InvalidInt,
         InvalidFloat,
+        CommandNotFound,
     };
 
 pub const Result = union(enum) {
@@ -387,6 +388,29 @@ pub const IREvaluator = struct {
         return .{ .argv = argv, .owned = owned };
     }
 
+    /// Reports a missing executable the way bash does — the command name and
+    /// where it was invoked — with a precise message, then returns
+    /// `error.CommandNotFound`. The runner leaves that error un-decorated (it is
+    /// already reported here), so an unbound identifier used as a command no
+    /// longer surfaces as a bare `error.FileNotFound`.
+    fn reportCommandNotFound(self: *IREvaluator, thread: ir.context.IRThreadContext, name: []const u8) Error {
+        _ = self;
+        if (thread.currentInstruction()) |instr| {
+            if (instr.source) |source| {
+                const span = source.span();
+                std.log.err("{s}:{}:{}: command not found: '{s}'", .{
+                    span.start.file,
+                    span.start.line,
+                    span.start.column,
+                    name,
+                });
+                return error.CommandNotFound;
+            }
+        }
+        std.log.err("command not found: '{s}'", .{name});
+        return error.CommandNotFound;
+    }
+
     fn spawnSimpleExec(
         self: *IREvaluator,
         thread: ir.context.IRThreadContext,
@@ -420,14 +444,17 @@ pub const IREvaluator = struct {
         try flushInheritedChildOutput(stdout_pipe, stdout_behavior);
         try flushInheritedChildOutput(stderr_pipe, stderr_behavior);
 
-        const child = try std.process.spawn(io, .{
+        const child = std.process.spawn(io, .{
             .argv = argv_slice,
             .environ_map = &ctx.env,
             .cwd = if (ctx.cwd) |c| .{ .path = c } else .inherit,
             .stdin = stdin_behavior,
             .stdout = stdout_behavior,
             .stderr = stderr_behavior,
-        });
+        }) catch |err| switch (err) {
+            error.FileNotFound => return self.reportCommandNotFound(thread, argv_slice[0]),
+            else => return err,
+        };
 
         const child_ptr = try self.allocator.create(std.process.Child);
         child_ptr.* = child;
@@ -1176,6 +1203,31 @@ pub const IREvaluator = struct {
                 thread.private.result_register = .{ .float = parsed };
                 return .cont;
             },
+            .parse_bool => {
+                // A value that is already a Bool (represented as an exit code)
+                // or an EOF read (`.null`) passes through unchanged; otherwise
+                // parse the text "true"/"false" (case-insensitive, trimmed).
+                if (thread.private.result_register == .exit_code) return .cont;
+                if (thread.private.result_register == .null) return .cont;
+                var text_writer = std.Io.Writer.Allocating.init(self.allocator);
+                defer text_writer.deinit();
+                try self.materializeString(thread, thread.private.result_register, &text_writer.writer);
+                const trimmed = std.mem.trim(u8, text_writer.written(), " \t\r\n");
+                if (std.ascii.eqlIgnoreCase(trimmed, "true")) {
+                    thread.private.result_register = .fromBoolean(true);
+                } else if (std.ascii.eqlIgnoreCase(trimmed, "false")) {
+                    thread.private.result_register = .fromBoolean(false);
+                } else {
+                    // A bad parse is a catchable `ParseError.Invalid` value
+                    // (`parseBool: ParseError!Bool`), not a hard runtime abort.
+                    thread.private.result_register = .{ .err = .{
+                        .set = "ParseError",
+                        .variant = "Invalid",
+                        .payload = null,
+                    } };
+                }
+                return .cont;
+            },
             .emit_lines => |pipe_location| {
                 // `lines`: frame a byte stream into per-line values. Split the
                 // collected input in %r by '\n' and emit each non-empty line.
@@ -1483,6 +1535,30 @@ pub const IREvaluator = struct {
                 try self.setLocation(thread, as.result, new_base);
                 return .cont;
             },
+            .array_slice => |sl| {
+                const arr = try self.resolveValueSource(thread, sl.array);
+                const len: i64 = if (arr == .addr)
+                    thread.shared.heapGet(arr.addr).?.integer
+                else
+                    0;
+                const start_raw = (try self.resolveValueSource(thread, sl.start)).integer;
+                const end_raw = (try self.resolveValueSource(thread, sl.end)).integer;
+                // Clamp to [0, len]; an empty/inverted range yields an empty array.
+                const lo: i64 = @min(@max(start_raw, 0), len);
+                const hi: i64 = @min(@max(end_raw, lo), len);
+                const out_len: usize = @intCast(hi - lo);
+                const new_base = try thread.shared.alloc(self.allocator, out_len + 1);
+                const nb = new_base.addr;
+                thread.shared.heapGetPtr(nb).?.* = .{ .integer = @intCast(out_len) };
+                if (arr == .addr) {
+                    for (0..out_len) |i| {
+                        thread.shared.heapGetPtr(nb + 1 + i).?.* =
+                            thread.shared.heapGet(arr.addr + 1 + @as(usize, @intCast(lo)) + i).?;
+                    }
+                }
+                try self.setLocation(thread, sl.result, new_base);
+                return .cont;
+            },
             .array_set_inplace => |as| {
                 const arr = try self.resolveValueSource(thread, as.array);
                 const index = try self.resolveValueSource(thread, as.index);
@@ -1511,6 +1587,27 @@ pub const IREvaluator = struct {
                     },
                 };
                 try self.setLocation(thread, float_op.result, .{ .float = result });
+                return .cont;
+            },
+            .int_op => |int_op| {
+                const operand = try self.resolveValueSource(thread, int_op.operand);
+                if (operand != .integer) return Error.UnsupportedType;
+                const x = operand.integer;
+                const result: i64 = switch (int_op.op) {
+                    .bnot => ~x,
+                    .band, .bor, .bxor => blk: {
+                        const arg = try self.resolveValueSource(thread, int_op.arg0);
+                        if (arg != .integer) return Error.UnsupportedType;
+                        const y = arg.integer;
+                        break :blk switch (int_op.op) {
+                            .band => x & y,
+                            .bor => x | y,
+                            .bxor => x ^ y,
+                            .bnot => unreachable,
+                        };
+                    },
+                };
+                try self.setLocation(thread, int_op.result, .{ .integer = result });
                 return .cont;
             },
             .make_err => |make_err| {
@@ -1605,15 +1702,19 @@ pub const IREvaluator = struct {
                 try flushInheritedChildOutput(stdout_pipe, stdout_behavior);
                 try flushInheritedChildOutput(stderr_pipe, stderr_behavior);
 
-                const child = try self.allocator.create(std.process.Child);
-                child.* = try std.process.spawn(io, .{
+                const spawned = std.process.spawn(io, .{
                     .argv = argv_slice,
                     .environ_map = &ctx.env,
                     .cwd = if (ctx.cwd) |c| .{ .path = c } else .inherit,
                     .stdin = stdin_behavior,
                     .stdout = stdout_behavior,
                     .stderr = stderr_behavior,
-                });
+                }) catch |err| switch (err) {
+                    error.FileNotFound => return self.reportCommandNotFound(thread, argv_slice[0]),
+                    else => return err,
+                };
+                const child = try self.allocator.create(std.process.Child);
+                child.* = spawned;
                 thread.private.process = child;
 
                 // TODO: memory management
@@ -2168,6 +2269,42 @@ pub const IREvaluator = struct {
 
                 return .{ .float = @mod(float_left, float_right) };
             },
+            .pow => {
+                // Integer base with a non-negative integer exponent stays an
+                // integer (saturating on overflow, like +/-/*); anything else
+                // (float operand or negative exponent) widens to float.
+                if (left.isValueTag(.integer) and right.isValueTag(.integer) and right.value.integer >= 0) {
+                    const base = left.value.integer;
+                    const exp = right.value.integer;
+                    const result = std.math.powi(i64, base, exp) catch {
+                        const negative = base < 0 and @mod(exp, 2) == 1;
+                        return .{ .integer = if (negative) std.math.minInt(i64) else std.math.maxInt(i64) };
+                    };
+                    return .{ .integer = result };
+                }
+                const float_left: f64 = if (left.isValueTag(.integer)) @floatFromInt(left.value.integer) else if (left.isValueTag(.float)) left.value.float else return null;
+                const float_right: f64 = if (right.isValueTag(.integer)) @floatFromInt(right.value.integer) else if (right.isValueTag(.float)) right.value.float else return null;
+                return .{ .float = std.math.pow(f64, float_left, float_right) };
+            },
+            .shl, .shr => {
+                // Bit shifts are integer-only. A negative shift count flips the
+                // direction; a count of 64+ clears the value (an arithmetic
+                // right shift of a negative value settles at -1).
+                if (!left.isValueTag(.integer) or !right.isValueTag(.integer)) return null;
+                const value = left.value.integer;
+                var amount = right.value.integer;
+                var shift_left = op == .shl;
+                if (amount < 0) {
+                    shift_left = !shift_left;
+                    amount = -amount;
+                }
+                if (shift_left) {
+                    if (amount >= 64) return .{ .integer = 0 };
+                    return .{ .integer = value <<| @as(u6, @intCast(amount)) };
+                }
+                if (amount >= 64) return .{ .integer = if (value < 0) -1 else 0 };
+                return .{ .integer = value >> @as(u6, @intCast(amount)) };
+            },
         }
 
         return null;
@@ -2441,6 +2578,13 @@ fn testIo() std.Io {
     return test_threaded.io();
 }
 
+var test_env: ?std.process.Environ.Map = null;
+
+fn testEnvMap() *std.process.Environ.Map {
+    if (test_env == null) test_env = std.process.Environ.Map.init(std.heap.page_allocator);
+    return &test_env.?;
+}
+
 fn initTestEvaluator(
     allocator: Allocator,
 ) !struct {
@@ -2601,7 +2745,7 @@ test "evaluator materializeString reports missing pipe handle" {
         .tracer = &fixture.tracer,
     }, &fixture.context);
 
-    try fixture.context.addMainThread(null);
+    try fixture.context.addMainThread(testEnvMap());
     const thread = fixture.context.getCurrentThread().?;
     var writer = std.Io.Writer.Allocating.init(allocator);
     defer writer.deinit();
@@ -2630,7 +2774,7 @@ test "evaluator fast arithmetic path updates ref destination" {
         .tracer = &fixture.tracer,
     }, &fixture.context);
 
-    try fixture.context.addMainThread(null);
+    try fixture.context.addMainThread(testEnvMap());
     const thread = fixture.context.getCurrentThread().?;
     try thread.private.stack.appendSlice(allocator, &.{ .{ .integer = 4 }, .{ .integer = 7 } });
 
@@ -2648,7 +2792,7 @@ test "evaluator fast arithmetic path updates ref destination" {
         else => unreachable,
     }
 
-    try std.testing.expectEqual(@as(u64, 11), thread.private.stack.items[1].integer);
+    try std.testing.expectEqual(@as(i64, 11), thread.private.stack.items[1].integer);
 }
 
 test "evaluator fast arithmetic path updates closure destination" {
@@ -2669,7 +2813,7 @@ test "evaluator fast arithmetic path updates closure destination" {
         .tracer = &fixture.tracer,
     }, &fixture.context);
 
-    try fixture.context.addMainThread(null);
+    try fixture.context.addMainThread(testEnvMap());
     const thread = fixture.context.getCurrentThread().?;
     try thread.private.stack.resize(allocator, 4);
     @memset(thread.private.stack.items, .void);
@@ -2682,11 +2826,11 @@ test "evaluator fast arithmetic path updates closure destination" {
     thread.private.stack.items[3] = .fromAddr(closure_addr);
     fixture.context.shared.heapGetPtr(closure_addr).?.* = .{ .integer = 4 };
 
-    const closure_slot = ir.Location.initAbs(.closure, .{}).dereference();
+    const closure_slot = ir.Location.initAbs(.closure, .{});
 
     switch (try evaluator.runInstruction(thread, .init(null, .{ .ath = .{
         .op = .add,
-        .a = .fromLocation(closure_slot),
+        .a = .fromLocation(closure_slot.dereference()),
         .b = .fromValue(.{ .integer = 7 }),
         .result = closure_slot,
     } }))) {
@@ -2694,7 +2838,7 @@ test "evaluator fast arithmetic path updates closure destination" {
         else => unreachable,
     }
 
-    try std.testing.expectEqual(@as(u64, 11), fixture.context.shared.heapGet(closure_addr).?.integer);
+    try std.testing.expectEqual(@as(i64, 11), fixture.context.shared.heapGet(closure_addr).?.integer);
 }
 
 test "evaluator fast compare path updates register destination" {
@@ -2715,7 +2859,7 @@ test "evaluator fast compare path updates register destination" {
         .tracer = &fixture.tracer,
     }, &fixture.context);
 
-    try fixture.context.addMainThread(null);
+    try fixture.context.addMainThread(testEnvMap());
     const thread = fixture.context.getCurrentThread().?;
     thread.private.result_register = .{ .integer = 9 };
     thread.private.result_register_2 = .{ .integer = 3 };
@@ -2754,7 +2898,7 @@ test "evaluator fast compare path reads dereferenced refs" {
         .tracer = &fixture.tracer,
     }, &fixture.context);
 
-    try fixture.context.addMainThread(null);
+    try fixture.context.addMainThread(testEnvMap());
     const thread = fixture.context.getCurrentThread().?;
     try thread.private.stack.appendSlice(allocator, &.{ .{ .integer = 3 }, .{ .integer = 7 } });
 
@@ -2795,7 +2939,7 @@ test "evaluator fused range loop updates accumulator and exits loop" {
         .tracer = &fixture.tracer,
     }, &fixture.context);
 
-    try fixture.context.addMainThread(null);
+    try fixture.context.addMainThread(testEnvMap());
     const thread = fixture.context.getCurrentThreadPtr().?;
     try thread.private.stack.appendSlice(allocator, &.{
         .{ .integer = 0 },
@@ -2817,7 +2961,7 @@ test "evaluator fused range loop updates accumulator and exits loop" {
         .init(null, .{ .jmp = .{
             .cond = .fromLocation(.initRegister(.r2)),
             .jump_if = false,
-            .dest = .init(0, .{ .abs = 5 }),
+            .dest = .initAbs(0, 5),
         } }),
         .init(null, .{ .ath = .{
             .op = .add,
@@ -2834,13 +2978,13 @@ test "evaluator fused range loop updates accumulator and exits loop" {
         .init(null, .{ .jmp = .{
             .cond = null,
             .jump_if = false,
-            .dest = .init(0, .{ .abs = 0 }),
+            .dest = .initAbs(0, 0),
         } }),
     };
 
     try std.testing.expect(try evaluator.tryRunFastRangeLoop(thread, &instructions));
-    try std.testing.expectEqual(@as(u64, 10), thread.private.stack.items[0].integer);
-    try std.testing.expectEqual(@as(u64, 5), thread.private.stack.items[2].integer);
+    try std.testing.expectEqual(@as(i64, 10), thread.private.stack.items[0].integer);
+    try std.testing.expectEqual(@as(i64, 5), thread.private.stack.items[2].integer);
     try std.testing.expectEqual(@as(usize, 5), thread.getCurrentInstructionAddr().local_addr);
     try std.testing.expect(switch (thread.private.result_register_2) {
         .exit_code => |exit_code| !exit_code.toBoolean(),

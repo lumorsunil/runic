@@ -1,0 +1,4 @@
+[error]: tests/diagnostics/unterminated_string.rn:1:12: unterminated string literal (missing closing '"')
+   1:echo "hello
+   2:
+
