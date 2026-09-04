@@ -1360,6 +1360,47 @@ test "lsp member completion shows execution result members" {
     try std.testing.expect(first_kind == .integer);
 }
 
+test "lsp completion offers executables found on PATH" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    // A fake executable in a bin directory that PATH will point at.
+    try fixture.tmp_dir.dir.createDirPath(std.testing.io, "bin");
+    try fixture.tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "bin/myfakecmd", .data = "#!/bin/sh\n" });
+    const bin_dir = try std.fmt.allocPrint(allocator, "{s}/bin", .{fixture.root_path});
+    defer allocator.free(bin_dir);
+
+    const uri = try fixture.writeDocument("main.rn", "myfake\n");
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeInitialize(allocator, 1, false),
+        try makeDidOpen(allocator, uri, "myfake\n"),
+        try makeCompletionRequest(allocator, 2, uri, 0, 6),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const result = try runServerImpl(allocator, &messages, bin_dir);
+    defer result.deinit(allocator);
+
+    const response = try findResponseById(allocator, result.stdout, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const items = parsed.value.object.get("result").?.object.get("items").?.array.items;
+    var cmd_detail: ?[]const u8 = null;
+    for (items) |item| {
+        if (std.mem.eql(u8, item.object.get("label").?.string, "myfakecmd")) {
+            cmd_detail = if (item.object.get("detail")) |d| d.string else null;
+        }
+    }
+    try std.testing.expect(cmd_detail != null);
+    // Detail is the resolved path to the executable.
+    try std.testing.expect(std.mem.endsWith(u8, cmd_detail.?, "bin/myfakecmd"));
+}
+
 test "lsp completion shows a function's signature as detail" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
@@ -1579,6 +1620,10 @@ fn runServerWithMessages(allocator: Allocator, messages: []const []const u8) ![]
 }
 
 fn runServerWithMessagesDetailed(allocator: Allocator, messages: []const []const u8) !ServerRunResult {
+    return runServerImpl(allocator, messages, null);
+}
+
+fn runServerImpl(allocator: Allocator, messages: []const []const u8, path_env: ?[]const u8) !ServerRunResult {
     var fixture = try TestFixture.init(allocator);
     defer fixture.deinit();
 
@@ -1610,6 +1655,7 @@ fn runServerWithMessagesDetailed(allocator: Allocator, messages: []const []const
 
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
+    if (path_env) |p| try env_map.put("PATH", p);
 
     var server = try lsp.server.Server.init(io, allocator, &env_map, input_file, output_file, error_file);
     defer server.deinit();
