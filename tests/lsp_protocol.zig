@@ -311,6 +311,54 @@ test "lsp rename edits every indexed file that references the symbol" {
     try std.testing.expect(saw_main);
 }
 
+test "lsp rename is scoped to the binding, not every same-named identifier" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    // Two functions each have a local `x`. Renaming one must not touch the other.
+    const source =
+        \\fn Void a() Int {
+        \\    const x = 1
+        \\    yield x
+        \\}
+        \\fn Void b() Int {
+        \\    const x = 2
+        \\    yield x
+        \\}
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        // Cursor on `x` used in function a (line 2).
+        try makeRenameRequest(allocator, 2, uri, 2, 10, "renamed"),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const changes = parsed.value.object.get("result").?.object.get("documentChanges").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
+    const edits = changes[0].object.get("textDocumentEdit").?.object.get("edits").?.array.items;
+
+    // Only the two occurrences inside function a (lines 1 and 2) are renamed;
+    // function b's `x` on lines 5 and 6 is a different binding and left alone.
+    try std.testing.expectEqual(@as(usize, 2), edits.len);
+    for (edits) |edit| {
+        const line = edit.object.get("range").?.object.get("start").?.object.get("line").?.integer;
+        try std.testing.expect(line == 1 or line == 2);
+    }
+}
+
 test "lsp rename ignores strings and comments" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
@@ -728,6 +776,49 @@ test "lsp references search across opened documents" {
 
     try std.testing.expect(saw_module);
     try std.testing.expect(saw_main);
+}
+
+test "lsp references are scoped to the binding under the cursor" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\fn Void a() Int {
+        \\    const x = 1
+        \\    yield x
+        \\}
+        \\fn Void b() Int {
+        \\    const x = 2
+        \\    yield x
+        \\}
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        // References of `x` from within function a (line 2).
+        try makeReferencesRequest(allocator, 2, uri, 2, 10, true),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const results = parsed.value.object.get("result").?.array.items;
+    // Only function a's two occurrences of `x` (lines 1 and 2), not b's.
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    for (results) |ref| {
+        const line = ref.object.get("range").?.object.get("start").?.object.get("line").?.integer;
+        try std.testing.expect(line == 1 or line == 2);
+    }
 }
 
 test "lsp references can exclude declaration" {

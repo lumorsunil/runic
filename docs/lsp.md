@@ -73,6 +73,11 @@ Current planned work:
   declaration, and struct field/decl member access (`p.x` → the field
   declaration, which takes precedence over an unrelated same-named binding).
   Regression-tested in `tests/lsp_protocol.zig`.
+- semantic (binding-aware) references and rename: when the symbol under the
+  cursor resolves to a binding, only occurrences resolving to that *same*
+  binding are renamed/listed, so distinct same-named symbols in other scopes
+  or files are left alone; unresolvable symbols (commands, unbound names) fall
+  back to a lexical name match
 - ~~more reliable identifier-to-symbol resolution~~ / workspace-wide
   navigation — **done for definition:** the workspace is indexed on
   initialize (client-provided roots only, never the cwd fallback), so
