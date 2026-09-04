@@ -230,7 +230,7 @@
       binding-initializer calls to same-file functions)
 - [x] inlay parameter hints in deeper positions (pipelines, nested call
       arguments, control-flow and function bodies, string interpolations)
-- [ ] inlay parameter hints for imported-module functions (`m.f x`)
+- [x] inlay parameter hints for imported-module functions (`m.f x`)
 - [x] folding ranges (multi-line statements: functions, structs, control flow)
 - [ ] code actions / quick fixes (e.g. add missing import)
 - [x] prepare-rename (validates the target, pre-fills the identifier)

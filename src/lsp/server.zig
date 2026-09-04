@@ -16,6 +16,9 @@ const CallHintCtx = struct {
     hints: *std.ArrayList(types.InlayHint),
     fn_decls: *std.StringHashMap(runic.ast.FunctionDecl),
     range: types.Range,
+    /// The document's module scope, used to resolve a `m.f` callee to the
+    /// imported module (null when the document is not type-checked).
+    scope: ?*runic.semantic.Scope,
 };
 
 const MAX_LINE = 16 * 1024;
@@ -1142,6 +1145,7 @@ pub const Server = struct {
             .hints = &hints,
             .fn_decls = &fn_decls,
             .range = params.range,
+            .scope = module_scope,
         };
         for (script.statements) |stmt| try self.walkStmtCalls(ctx, stmt);
 
@@ -1215,25 +1219,15 @@ pub const Server = struct {
     }
 
     fn appendCallParamHints(
-        _: *Server,
+        self: *Server,
         ctx: CallHintCtx,
         call: runic.ast.CallExpr,
     ) !void {
         const arena = ctx.arena;
         const hints = ctx.hints;
-        const fn_decls = ctx.fn_decls;
         const range = ctx.range;
 
-        const callee_name = switch (call.callee.*) {
-            .identifier => |identifier| identifier.name,
-            else => return,
-        };
-        const fn_decl = fn_decls.get(callee_name) orelse return;
-        const params = switch (fn_decl.params) {
-            ._non_variadic => |ps| ps,
-            // A variadic parameter can't be mapped one-to-one to arguments.
-            ._variadic => return,
-        };
+        const params = self.resolveCallParams(ctx, call) orelse return;
 
         for (call.arguments, 0..) |arg, i| {
             if (i >= params.len) break;
@@ -1252,6 +1246,67 @@ pub const Server = struct {
                 .paddingRight = true,
             });
         }
+    }
+
+    /// Resolves the parameter list for a call's callee: a same-file top-level
+    /// function (identifier callee), or an imported module's function
+    /// (`m.f` member callee, resolved through the module's AST). Returns null
+    /// for anything else or a variadic function.
+    fn resolveCallParams(self: *Server, ctx: CallHintCtx, call: runic.ast.CallExpr) ?[]const *runic.ast.Parameter {
+        switch (call.callee.*) {
+            .identifier => |identifier| {
+                const fn_decl = ctx.fn_decls.get(identifier.name) orelse return null;
+                return nonVariadicParams(fn_decl);
+            },
+            // Member access (`m.f`) is a binary expression with the `.member`
+            // operator: left is the object, right is the member name.
+            .binary => |binary| {
+                if (std.meta.activeTag(binary.op) != .member) return null;
+                const object_name = switch (binary.left.*) {
+                    .identifier => |i| i.name,
+                    else => return null,
+                };
+                const member_name = switch (binary.right.*) {
+                    .identifier => |i| i.name,
+                    else => return null,
+                };
+                const scope = ctx.scope orelse return null;
+                const binding = scope.lookup(object_name) orelse return null;
+                const binding_type = binding.type_expr orelse return null;
+                const resolved = switch (binding_type.*) {
+                    .alias => |alias_type| self.workspace.type_checker.resolveAliasType(&alias_type),
+                    else => binding_type,
+                };
+                const module_type = switch (resolved.*) {
+                    .module => |m| m,
+                    else => return null,
+                };
+                const script = (self.documents.document_store.getAst(module_type.path) catch return null) orelse return null;
+                const fn_decl = findTopLevelFn(script, member_name) orelse return null;
+                return nonVariadicParams(fn_decl);
+            },
+            else => return null,
+        }
+    }
+
+    fn nonVariadicParams(fn_decl: runic.ast.FunctionDecl) ?[]const *runic.ast.Parameter {
+        return switch (fn_decl.params) {
+            ._non_variadic => |ps| ps,
+            ._variadic => null,
+        };
+    }
+
+    fn findTopLevelFn(script: runic.ast.Script, name: []const u8) ?runic.ast.FunctionDecl {
+        for (script.statements) |stmt| switch (stmt.*) {
+            .expression => |es| switch (es.expression.*) {
+                .fn_decl => |fn_decl| if (fn_decl.name) |n| {
+                    if (std.mem.eql(u8, n.name, name)) return fn_decl;
+                },
+                else => {},
+            },
+            else => {},
+        };
+        return null;
     }
 
     fn handleFoldingRange(

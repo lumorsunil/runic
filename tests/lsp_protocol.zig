@@ -1141,6 +1141,59 @@ test "lsp inlay hints label call arguments with parameter names" {
     try std.testing.expectEqual(@as(?i64, 3), times_line);
 }
 
+test "lsp inlay parameter hints resolve an imported module's function" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const module_uri = try fixture.writeDocument("mod.rn",
+        \\pub fn Void tag(label: String) String {
+        \\    yield "${label}"
+        \\}
+        \\
+    );
+    defer allocator.free(module_uri);
+    const main_uri = try fixture.writeDocument("main.rn",
+        \\const m = import "./mod.rn"
+        \\m.tag "hi"
+        \\
+    );
+    defer allocator.free(main_uri);
+
+    const root_uri = try std.fmt.allocPrint(allocator, "file://{s}", .{fixture.root_path});
+    defer allocator.free(root_uri);
+
+    const messages = [_][]const u8{
+        try makeInitializeWithRoot(allocator, 1, root_uri),
+        try makeDidOpen(allocator, main_uri,
+            \\const m = import "./mod.rn"
+            \\m.tag "hi"
+            \\
+        ),
+        try makeInlayHintRequest(allocator, 2, main_uri, 10),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const hints = parsed.value.object.get("result").?.array.items;
+    // `m.tag "hi"` — the argument is labelled with the module function's param.
+    var saw_label = false;
+    for (hints) |h| {
+        if (std.mem.eql(u8, h.object.get("label").?.string, "label:")) {
+            saw_label = true;
+            try std.testing.expectEqual(@as(i64, 1), h.object.get("position").?.object.get("line").?.integer);
+        }
+    }
+    try std.testing.expect(saw_label);
+}
+
 test "lsp inlay parameter hints reach calls inside a pipeline" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
