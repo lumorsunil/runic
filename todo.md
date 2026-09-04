@@ -216,7 +216,10 @@
 - [x] workspace symbol search
 - [x] add support for document links
 - [x] `.sym_link` entries in module-path completion (follows the link's target)
-- [ ] document symbols for bash blocks / while statements / destructuring patterns
+- [ ] document symbols for destructuring patterns — BLOCKED: the parser does
+      not support tuple/record binding destructuring yet (parseBindingPattern
+      only accepts a single identifier or `_`); bash blocks / while statements
+      declare no top-level symbols, so nothing to add there
 - [ ] inlay hints (parameter-name hints before space-form call arguments)
 - [ ] code actions / quick fixes (e.g. add missing import)
 - [ ] richer/robust formatting (current formatter is minimal)
