@@ -432,6 +432,9 @@ pub const Lexer = struct {
                     try self.pushContext(.interp());
                     return self.finish(.startAt(start), .string_text);
                 }
+                // A lone `$` not starting an interpolation is literal string
+                // text; consume it (otherwise the loop re-reads it forever).
+                _ = self.advance();
                 continue;
             }
             if (ch == '\n' or ch == '\r') break;
