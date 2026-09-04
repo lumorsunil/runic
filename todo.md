@@ -220,7 +220,9 @@
       not support tuple/record binding destructuring yet (parseBindingPattern
       only accepts a single identifier or `_`); bash blocks / while statements
       declare no top-level symbols, so nothing to add there
-- [ ] inlay hints (parameter-name hints before space-form call arguments)
+- [x] inlay hints: inferred types after un-annotated bindings (`const x«: Int»`)
+- [ ] inlay hints: parameter-name hints before space-form call arguments
+      (needs callee->FunctionDecl resolution and positional arg mapping)
 - [ ] code actions / quick fixes (e.g. add missing import)
 - [ ] richer/robust formatting (current formatter is minimal)
 

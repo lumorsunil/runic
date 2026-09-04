@@ -178,6 +178,10 @@ pub const Server = struct {
                 if (request.id) |id| try self.handleDocumentLink(id, params);
                 return true;
             },
+            .@"textDocument/inlayHint" => |params| {
+                if (request.id) |id| try self.handleInlayHint(id, params);
+                return true;
+            },
             .@"textDocument/documentSymbol" => |params| {
                 if (request.id) |id| try self.handleDocumentSymbols(id, params);
                 return true;
@@ -1016,6 +1020,66 @@ pub const Server = struct {
         try self.sendJson(types.response(id, links.items));
     }
 
+    fn positionInRange(pos: types.Position, range: types.Range) bool {
+        if (pos.line < range.start.line or (pos.line == range.start.line and pos.character < range.start.character)) return false;
+        if (pos.line > range.end.line or (pos.line == range.end.line and pos.character > range.end.character)) return false;
+        return true;
+    }
+
+    fn handleInlayHint(
+        self: *Server,
+        id: types.RequestId,
+        params: types.InlayHintParams,
+    ) !void {
+        const path = try self.resolveUriPath(params.textDocument.uri);
+        defer self.allocator.free(path);
+
+        const doc = self.documents.get(params.textDocument.uri) orelse {
+            try self.sendJson(types.response(id, std.json.Value{ .null = {} }));
+            return;
+        };
+        const script = doc.ast orelse {
+            try self.sendJson(types.response(id, &[_]types.InlayHint{}));
+            return;
+        };
+        const module_scope = self.workspace.type_checker.modules.get(path);
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+
+        var hints = std.ArrayList(types.InlayHint).empty;
+
+        // Show the inferred type after each top-level `const`/`var` that has no
+        // explicit annotation, e.g. `const x«: Int» = 5`.
+        for (script.statements) |stmt| {
+            const binding_decl = switch (stmt.*) {
+                .binding_decl => |b| b,
+                else => continue,
+            };
+            if (binding_decl.annotation != null) continue;
+            const identifier = switch (binding_decl.pattern.*) {
+                .identifier => |i| i,
+                else => continue,
+            };
+            const scope = module_scope orelse continue;
+            const binding = scope.lookup(identifier.name) orelse continue;
+            const type_expr = binding.type_expr orelse continue;
+
+            const pos = types.Range.fromSpan(identifier.span).end;
+            if (!positionInRange(pos, params.range)) continue;
+
+            const label = try std.fmt.allocPrint(arena_allocator, ": {f}", .{type_expr});
+            try hints.append(arena_allocator, .{
+                .position = pos,
+                .label = label,
+                .kind = .type,
+            });
+        }
+
+        try self.sendJson(types.response(id, hints.items));
+    }
+
     fn handleWorkspaceSymbol(
         self: *Server,
         id: types.RequestId,
@@ -1338,6 +1402,11 @@ pub const Server = struct {
                 .documentLinkProvider = .{
                     .resolveProvider = false,
                 },
+                .inlayHintProvider = .{ .payload = .{
+                    .inlayHintOptions = .{
+                        .resolveProvider = false,
+                    },
+                } },
                 .workspaceSymbolProvider = .{ .payload = .{
                     .workspaceSymbolOptions = .{
                         .workDoneProgress = false,
