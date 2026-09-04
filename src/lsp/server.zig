@@ -197,6 +197,10 @@ pub const Server = struct {
                 if (request.id) |id| try self.handleFoldingRange(id, params);
                 return true;
             },
+            .@"textDocument/codeAction" => |params| {
+                if (request.id) |id| try self.handleCodeAction(id, params);
+                return true;
+            },
             .@"textDocument/documentSymbol" => |params| {
                 if (request.id) |id| try self.handleDocumentSymbols(id, params);
                 return true;
@@ -1344,6 +1348,74 @@ pub const Server = struct {
         try self.sendJson(types.response(id, ranges.items));
     }
 
+    fn handleCodeAction(
+        self: *Server,
+        id: types.RequestId,
+        params: types.CodeActionParams,
+    ) !void {
+        const path = try self.resolveUriPath(params.textDocument.uri);
+        defer self.allocator.free(path);
+
+        const doc = self.documents.get(params.textDocument.uri) orelse {
+            try self.sendJson(types.response(id, std.json.Value{ .null = {} }));
+            return;
+        };
+        const script = doc.ast orelse {
+            try self.sendJson(types.response(id, &[_]types.CodeAction{}));
+            return;
+        };
+        const module_scope = self.workspace.type_checker.modules.get(path);
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+
+        var actions = std.ArrayList(types.CodeAction).empty;
+
+        // Offer "add the inferred type" for un-annotated top-level bindings whose
+        // declaration line falls within the requested range.
+        for (script.statements) |stmt| {
+            const binding_decl = switch (stmt.*) {
+                .binding_decl => |b| b,
+                else => continue,
+            };
+            if (binding_decl.annotation != null) continue;
+            const identifier = switch (binding_decl.pattern.*) {
+                .identifier => |i| i,
+                else => continue,
+            };
+            const id_range = types.Range.fromSpan(identifier.span);
+            if (id_range.start.line < params.range.start.line or id_range.start.line > params.range.end.line) continue;
+
+            const scope = module_scope orelse continue;
+            const binding = scope.lookup(identifier.name) orelse continue;
+            const type_expr = binding.type_expr orelse continue;
+
+            const type_str = try std.fmt.allocPrint(arena_allocator, "{f}", .{type_expr});
+            const new_text = try std.fmt.allocPrint(arena_allocator, ": {s}", .{type_str});
+            const title = try std.fmt.allocPrint(arena_allocator, "Add type annotation: {s}", .{type_str});
+
+            const edits = try arena_allocator.alloc(types.TextEdit, 1);
+            edits[0] = .{
+                .range = .{ .start = id_range.end, .end = id_range.end },
+                .newText = new_text,
+            };
+            const changes = try arena_allocator.alloc(types.DocumentChangeOperation, 1);
+            changes[0] = .{ .textDocumentEdit = .{
+                .textDocument = .{ .uri = params.textDocument.uri, .version = null },
+                .edits = edits,
+            } };
+
+            try actions.append(arena_allocator, .{
+                .title = title,
+                .kind = "refactor.rewrite",
+                .edit = .{ .documentChanges = changes },
+            });
+        }
+
+        try self.sendJson(types.response(id, actions.items));
+    }
+
     fn handleWorkspaceSymbol(
         self: *Server,
         id: types.RequestId,
@@ -1699,6 +1771,11 @@ pub const Server = struct {
                 } },
                 .foldingRangeProvider = .{ .payload = .{
                     .foldingRangeOptions = .{},
+                } },
+                .codeActionProvider = .{ .payload = .{
+                    .codeActionOptions = .{
+                        .codeActionKinds = &.{"refactor.rewrite"},
+                    },
                 } },
                 .workspaceSymbolProvider = .{ .payload = .{
                     .workspaceSymbolOptions = .{

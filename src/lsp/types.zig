@@ -115,6 +115,7 @@ pub const ClientRequestPayload = union(enum) {
     @"textDocument/documentLink": DocumentLinkParams,
     @"textDocument/inlayHint": InlayHintParams,
     @"textDocument/foldingRange": FoldingRangeParams,
+    @"textDocument/codeAction": CodeActionParams,
     @"textDocument/documentSymbol": DocumentSymbolParams,
     @"textDocument/rename": RenameParams,
     @"textDocument/prepareRename": PrepareRenameParams,
@@ -249,6 +250,21 @@ pub const InlayHintParams = struct {
 
 pub const FoldingRangeParams = struct {
     textDocument: TextDocumentIdentifier,
+};
+
+pub const CodeActionParams = struct {
+    textDocument: TextDocumentIdentifier,
+    /// The range the action is requested for (the selection or cursor line).
+    range: Range,
+    // `context` (diagnostics, requested kinds) is ignored for now.
+};
+
+/// A code action offered for a range — currently only edit-carrying quick fixes
+/// and refactors (no deferred command).
+pub const CodeAction = struct {
+    title: []const u8,
+    kind: ?CodeActionKind = null,
+    edit: ?WorkspaceEdit = null,
 };
 
 /// A collapsible region of a document, addressed by line (0-indexed).
