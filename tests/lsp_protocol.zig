@@ -1013,6 +1013,53 @@ test "lsp go-to-definition resolves across an unopened workspace file" {
     try std.testing.expectEqual(@as(i64, 6), start.get("character").?.integer);
 }
 
+test "lsp inlay hints label call arguments with parameter names" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\fn Void greet(name: String, times: Int) Void {
+        \\    echo "hi"
+        \\}
+        \\greet "x" 5
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeInlayHintRequest(allocator, 2, uri, 10),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const hints = parsed.value.object.get("result").?.array.items;
+    var name_line: ?i64 = null;
+    var times_line: ?i64 = null;
+    for (hints) |h| {
+        const label = h.object.get("label").?.string;
+        const line = h.object.get("position").?.object.get("line").?.integer;
+        const kind = h.object.get("kind").?.integer;
+        if (std.mem.eql(u8, label, "name:")) {
+            name_line = line;
+            try std.testing.expectEqual(@as(i64, 2), kind); // Parameter
+        }
+        if (std.mem.eql(u8, label, "times:")) times_line = line;
+    }
+    // Both parameter hints appear on the call line (line 3).
+    try std.testing.expectEqual(@as(?i64, 3), name_line);
+    try std.testing.expectEqual(@as(?i64, 3), times_line);
+}
+
 test "lsp folding ranges cover multi-line statements" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);

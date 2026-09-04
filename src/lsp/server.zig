@@ -1085,7 +1085,74 @@ pub const Server = struct {
             });
         }
 
+        // Parameter-name hints for calls: map each argument of a call to a
+        // top-level function's parameter name (`greet «name:» "x"`). Build a
+        // name -> declaration map first so a call to a function declared later
+        // is still annotated.
+        var fn_decls = std.StringHashMap(runic.ast.FunctionDecl).init(arena_allocator);
+        for (script.statements) |stmt| {
+            const expr_stmt = switch (stmt.*) {
+                .expression => |e| e,
+                else => continue,
+            };
+            switch (expr_stmt.expression.*) {
+                .fn_decl => |fn_decl| if (fn_decl.name) |n| try fn_decls.put(n.name, fn_decl),
+                else => {},
+            }
+        }
+        for (script.statements) |stmt| {
+            switch (stmt.*) {
+                .expression => |expr_stmt| switch (expr_stmt.expression.*) {
+                    .call => |call| try self.appendCallParamHints(arena_allocator, &hints, call, &fn_decls, params.range),
+                    else => {},
+                },
+                .binding_decl => |binding_decl| switch (binding_decl.initializer.*) {
+                    .call => |call| try self.appendCallParamHints(arena_allocator, &hints, call, &fn_decls, params.range),
+                    else => {},
+                },
+                else => {},
+            }
+        }
+
         try self.sendJson(types.response(id, hints.items));
+    }
+
+    fn appendCallParamHints(
+        _: *Server,
+        arena: Allocator,
+        hints: *std.ArrayList(types.InlayHint),
+        call: runic.ast.CallExpr,
+        fn_decls: *std.StringHashMap(runic.ast.FunctionDecl),
+        range: types.Range,
+    ) !void {
+        const callee_name = switch (call.callee.*) {
+            .identifier => |identifier| identifier.name,
+            else => return,
+        };
+        const fn_decl = fn_decls.get(callee_name) orelse return;
+        const params = switch (fn_decl.params) {
+            ._non_variadic => |ps| ps,
+            // A variadic parameter can't be mapped one-to-one to arguments.
+            ._variadic => return,
+        };
+
+        for (call.arguments, 0..) |arg, i| {
+            if (i >= params.len) break;
+            const param_name = switch (params[i].pattern.*) {
+                .identifier => |identifier| identifier.name,
+                else => continue,
+            };
+            const pos = types.Range.fromSpan(arg.span()).start;
+            if (!positionInRange(pos, range)) continue;
+
+            const label = try std.fmt.allocPrint(arena, "{s}:", .{param_name});
+            try hints.append(arena, .{
+                .position = pos,
+                .label = label,
+                .kind = .parameter,
+                .paddingRight = true,
+            });
+        }
     }
 
     fn handleFoldingRange(
