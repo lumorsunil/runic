@@ -311,6 +311,52 @@ test "lsp rename edits every indexed file that references the symbol" {
     try std.testing.expect(saw_main);
 }
 
+test "lsp prepare rename returns the identifier range, or null off an identifier" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\const foo = 1
+        \\echo foo
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makePrepareRenameRequest(allocator, 2, uri, 0, 6), // on `foo`
+        try makePrepareRenameRequest(allocator, 3, uri, 0, 10), // on `=`
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    // On the identifier: range covers `foo` and placeholder is its name.
+    {
+        const response = try findResponseById(allocator, output, 2);
+        defer allocator.free(response.body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        const result = parsed.value.object.get("result").?.object;
+        try std.testing.expectEqualStrings("foo", result.get("placeholder").?.string);
+        const start = result.get("range").?.object.get("start").?.object;
+        try std.testing.expectEqual(@as(i64, 0), start.get("line").?.integer);
+        try std.testing.expectEqual(@as(i64, 6), start.get("character").?.integer);
+    }
+
+    // Off any identifier (on `=`): null, so the client blocks the rename.
+    {
+        const response = try findResponseById(allocator, output, 3);
+        defer allocator.free(response.body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("result").? == .null);
+    }
+}
+
 test "lsp rename is scoped to the binding, not every same-named identifier" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
@@ -2138,6 +2184,18 @@ fn makeDocumentSymbolRequest(allocator: Allocator, id: i64, uri: []const u8) ![]
         .method = "textDocument/documentSymbol",
         .params = .{
             .textDocument = .{ .uri = uri },
+        },
+    });
+}
+
+fn makePrepareRenameRequest(allocator: Allocator, id: i64, uri: []const u8, line: u32, character: u32) ![]u8 {
+    return toJsonAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .id = id,
+        .method = "textDocument/prepareRename",
+        .params = .{
+            .textDocument = .{ .uri = uri },
+            .position = .{ .line = line, .character = character },
         },
     });
 }
