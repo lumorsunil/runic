@@ -221,8 +221,10 @@
       only accepts a single identifier or `_`); bash blocks / while statements
       declare no top-level symbols, so nothing to add there
 - [x] inlay hints: inferred types after un-annotated bindings (`const x«: Int»`)
-- [ ] inlay hints: parameter-name hints before space-form call arguments
-      (needs callee->FunctionDecl resolution and positional arg mapping)
+- [x] inlay hints: parameter-name hints before call arguments (top-level and
+      binding-initializer calls to same-file functions)
+- [ ] inlay parameter hints in deeper positions (pipelines, interpolations,
+      nested calls) and for imported-module functions
 - [x] folding ranges (multi-line statements: functions, structs, control flow)
 - [ ] code actions / quick fixes (e.g. add missing import)
 - [x] prepare-rename (validates the target, pre-fills the identifier)
