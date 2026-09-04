@@ -57,6 +57,7 @@ pub const Workspace = struct {
     index: std.ArrayList(symbols.Symbol) = .empty,
     diagnostics: std.ArrayList(diag.Diagnostic) = .empty,
     documents: *LspDocumentStore,
+    env_map: *std.process.Environ.Map,
     type_checker: runic.semantic.TypeChecker,
 
     pub fn init(
@@ -69,6 +70,7 @@ pub const Workspace = struct {
             .io = io,
             .allocator = allocator,
             .documents = documentStore,
+            .env_map = env_map,
             .type_checker = .init(
                 io,
                 allocator,
@@ -115,7 +117,53 @@ pub const Workspace = struct {
     pub fn refresh(self: *Workspace) !void {
         self.clearIndex();
         try self.addKeywordsToIndex();
+        self.addPathCommandsToIndex();
         self.clearDiagnostics();
+    }
+
+    /// Indexes the executables found on `$PATH` so they can be completed when
+    /// writing a command. Each becomes a symbol whose detail is the resolved
+    /// path. Names are de-duplicated in `$PATH` order (first directory wins,
+    /// matching shell lookup). Best-effort: unreadable directories are skipped.
+    fn addPathCommandsToIndex(self: *Workspace) void {
+        const path_var = self.env_map.get("PATH") orelse return;
+
+        // The seen-set keys live in an arena freed when the scan finishes; the
+        // index owns its own duplicated name/detail strings.
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        var seen = std.StringHashMap(void).init(arena.allocator());
+
+        var dirs = std.mem.splitScalar(u8, path_var, ':');
+        while (dirs.next()) |dir_path| {
+            if (dir_path.len == 0) continue;
+            var dir = std.Io.Dir.openDirAbsolute(self.io, dir_path, .{ .iterate = true }) catch continue;
+            defer dir.close(self.io);
+
+            var it = dir.iterate();
+            while (it.next(self.io) catch break) |entry| {
+                if (entry.kind == .directory) continue;
+                if (seen.contains(entry.name)) continue;
+
+                const full = std.fs.path.join(self.allocator, &.{ dir_path, entry.name }) catch continue;
+                defer self.allocator.free(full);
+
+                self.appendCommandSymbol(entry.name, full) catch continue;
+                const key = arena.allocator().dupe(u8, entry.name) catch continue;
+                seen.put(key, {}) catch {};
+            }
+        }
+    }
+
+    fn appendCommandSymbol(self: *Workspace, name: []const u8, path: []const u8) !void {
+        var entry = symbols.Symbol{
+            .name = try self.allocator.dupe(u8, name),
+            .detail = try self.allocator.dupe(u8, path),
+            .kind = .function,
+            .span = .global,
+        };
+        errdefer entry.deinit(self.allocator);
+        try self.index.append(self.allocator, entry);
     }
 
     /// Walks the workspace roots and loads every `.rn` file into the document

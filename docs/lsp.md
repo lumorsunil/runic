@@ -58,6 +58,9 @@ Near-term improvements:
   `completionItem.snippetSupport` capability so clients without snippet support
   still get a plain insert
 - continued improvement of import/module-path completions
+- executables on `$PATH` are indexed at initialize and offered as command
+  completions, with the resolved path as detail (argument-level completion
+  like a shell's `git <TAB>` is out of scope for now)
 
 ### 2. Navigation features
 
