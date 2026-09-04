@@ -616,27 +616,33 @@ fn collectModuleMatches(context: CollectMatchesContext) !MatchList {
     var matches = MatchList.init(context.allocator);
 
     while (try it.next(context.io)) |entry| {
-        switch (entry.kind) {
-            .file, .directory => {
-                if (entry.kind == .file and !std.mem.endsWith(u8, entry.name, ".rn")) continue;
-                if (symbolMatches(entry.name, basename_prefix, .fromPrefix(basename_prefix))) {
-                    const symbol = try context.allocator.create(symbols.Symbol);
-                    symbol.* = .{
-                        .name = try context.allocator.dupe(u8, entry.name),
-                        .kind = .module,
-                        .detail = try context.allocator.dupe(u8, entry.name),
-                        .documentation = &.{},
-                        .span = .global,
-                    };
-
-                    try matches.items.append(context.allocator, .{
-                        .symbol = .{ .owned = symbol },
-                        .source = .workspace,
-                    });
-                }
+        // Resolve symlinks to whatever they point at so a linked module file or
+        // directory is offered just like a real one.
+        const kind: std.Io.File.Kind = switch (entry.kind) {
+            .file, .directory => entry.kind,
+            .sym_link => blk: {
+                const stat = dir.statFile(context.io, entry.name, .{}) catch continue;
+                break :blk stat.kind;
             },
-            // TODO: support .sym_link
-            else => {},
+            else => continue,
+        };
+        if (kind != .file and kind != .directory) continue;
+        if (kind == .file and !std.mem.endsWith(u8, entry.name, ".rn")) continue;
+
+        if (symbolMatches(entry.name, basename_prefix, .fromPrefix(basename_prefix))) {
+            const symbol = try context.allocator.create(symbols.Symbol);
+            symbol.* = .{
+                .name = try context.allocator.dupe(u8, entry.name),
+                .kind = .module,
+                .detail = try context.allocator.dupe(u8, entry.name),
+                .documentation = &.{},
+                .span = .global,
+            };
+
+            try matches.items.append(context.allocator, .{
+                .symbol = .{ .owned = symbol },
+                .source = .workspace,
+            });
         }
     }
 

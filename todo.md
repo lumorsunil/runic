@@ -215,7 +215,7 @@
 - [x] document highlight
 - [x] workspace symbol search
 - [x] add support for document links
-- [ ] `.sym_link` entries in module-path completion (completion.zig)
+- [x] `.sym_link` entries in module-path completion (follows the link's target)
 - [ ] document symbols for bash blocks / while statements / destructuring patterns
 - [ ] inlay hints (parameter-name hints before space-form call arguments)
 - [ ] code actions / quick fixes (e.g. add missing import)
