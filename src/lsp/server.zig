@@ -613,6 +613,14 @@ pub const Server = struct {
         var loc = position.toLocation(doc_path);
         loc.offset = position.findIndex(doc_text) orelse 0;
 
+        // Workspace files loaded by the index are parsed but not type-checked, so
+        // they have no scope until needed. Type-check on demand here (references
+        // and rename are read-only, so nothing resets it until the next edit),
+        // which lets member accesses in files that were never opened resolve.
+        if (!self.workspace.type_checker.modules.contains(doc_path)) {
+            _ = self.workspace.type_checker.typeCheck(doc_path) catch {};
+        }
+
         if (self.extractMember(loc, doc_text)) |member| {
             if (self.workspace.type_checker.getScopeFromLoc(loc)) |scope| {
                 if (self.resolveMemberFieldSpan(scope, member)) |span| return span;

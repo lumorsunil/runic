@@ -82,8 +82,9 @@ Current planned work:
   field or an imported module's `pub` declaration — only occurrences resolving
   to that *same* declaration (plus the declaration site itself) are
   renamed/listed; distinct same-named symbols in other scopes/files are left
-  alone. Cross-file member accesses resolve for open importers; unresolvable
-  symbols (commands, unbound names) fall back to a lexical name match
+  alone. Cross-file member accesses resolve even in workspace files that were
+  never opened (type-checked on demand for the request); unresolvable symbols
+  (commands, unbound names) fall back to a lexical name match
 - ~~more reliable identifier-to-symbol resolution~~ / workspace-wide
   navigation — **done for definition:** the workspace is indexed on
   initialize (client-provided roots only, never the cwd fallback), so

@@ -381,6 +381,14 @@ test "lsp rename of a module member edits the module declaration and the access"
         \\
     );
     defer allocator.free(other_uri);
+    // A second importer of the module that is only indexed, never opened. Its
+    // `k.shared` access must still be renamed (resolved via on-demand checking).
+    const importer2_uri = try fixture.writeDocument("importer2.rn",
+        \\const k = import "./module.rn"
+        \\echo "${k.shared}"
+        \\
+    );
+    defer allocator.free(importer2_uri);
 
     const root_uri = try std.fmt.allocPrint(allocator, "file://{s}", .{fixture.root_path});
     defer allocator.free(root_uri);
@@ -409,6 +417,7 @@ test "lsp rename of a module member edits the module declaration and the access"
     var saw_module = false;
     var saw_main = false;
     var saw_other = false;
+    var saw_importer2 = false;
     for (changes) |change| {
         const tde = change.object.get("textDocumentEdit").?.object;
         const uri = tde.get("textDocument").?.object.get("uri").?.string;
@@ -418,10 +427,13 @@ test "lsp rename of a module member edits the module declaration and the access"
         if (std.mem.eql(u8, uri, module_uri)) saw_module = true;
         if (std.mem.eql(u8, uri, main_uri)) saw_main = true;
         if (std.mem.eql(u8, uri, other_uri)) saw_other = true;
+        if (std.mem.eql(u8, uri, importer2_uri)) saw_importer2 = true;
     }
-    // The `pub const shared` declaration and the `m.shared` access are both edited...
+    // The `pub const shared` declaration and the `m.shared` access are both edited,
+    // as is the `k.shared` access in the never-opened second importer...
     try std.testing.expect(saw_module);
     try std.testing.expect(saw_main);
+    try std.testing.expect(saw_importer2);
     // ...but the unrelated `shared` in other.rn is not.
     try std.testing.expect(!saw_other);
 }

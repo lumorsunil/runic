@@ -211,8 +211,9 @@
       struct field or imported module `pub` declaration; references/rename link
       the declaration and member accesses across open importers, excluding
       unrelated same-named symbols
-- [ ] member references in index-only (unopened) importer files (their member
-      accesses can't resolve a scope, so they fall outside the semantic match)
+- [x] member references in index-only (unopened) importer files — resolved by
+      type-checking such a file on demand during references/rename (read-only,
+      so it is reset by the next edit and does not grow memory)
 - [x] bug: takes 100% cpu after a while
 - [x] bug: stops working after a while, may be related to bug above
 - [x] document symbols (outline), nested (struct fields, fn params)
