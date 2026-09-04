@@ -10,6 +10,14 @@ const runic = @import("runic");
 
 const Allocator = std.mem.Allocator;
 
+/// Shared state threaded through the recursive parameter-hint walk.
+const CallHintCtx = struct {
+    arena: Allocator,
+    hints: *std.ArrayList(types.InlayHint),
+    fn_decls: *std.StringHashMap(runic.ast.FunctionDecl),
+    range: types.Range,
+};
+
 const MAX_LINE = 16 * 1024;
 const MAX_FILE = 4 * 1024 * 1024;
 const MAX_OUT_CONTENT = 4 * 1024 * 1024;
@@ -1129,31 +1137,93 @@ pub const Server = struct {
                 else => {},
             }
         }
-        for (script.statements) |stmt| {
-            switch (stmt.*) {
-                .expression => |expr_stmt| switch (expr_stmt.expression.*) {
-                    .call => |call| try self.appendCallParamHints(arena_allocator, &hints, call, &fn_decls, params.range),
-                    else => {},
-                },
-                .binding_decl => |binding_decl| switch (binding_decl.initializer.*) {
-                    .call => |call| try self.appendCallParamHints(arena_allocator, &hints, call, &fn_decls, params.range),
-                    else => {},
-                },
-                else => {},
-            }
-        }
+        const ctx = CallHintCtx{
+            .arena = arena_allocator,
+            .hints = &hints,
+            .fn_decls = &fn_decls,
+            .range = params.range,
+        };
+        for (script.statements) |stmt| try self.walkStmtCalls(ctx, stmt);
 
         try self.sendJson(types.response(id, hints.items));
     }
 
+    /// Recursively visits statements looking for calls to annotate with
+    /// parameter-name hints — through binding initializers, control flow, and
+    /// nested blocks, not just top-level statements.
+    fn walkStmtCalls(self: *Server, ctx: CallHintCtx, stmt: *const runic.ast.Statement) (Allocator.Error)!void {
+        switch (stmt.*) {
+            .expression => |es| try self.walkExprCalls(ctx, es.expression),
+            .binding_decl => |bd| try self.walkExprCalls(ctx, bd.initializer),
+            .yield_stmt => |ys| try self.walkExprCalls(ctx, ys.value),
+            .exit_stmt => |xs| if (xs.value) |v| try self.walkExprCalls(ctx, v),
+            .while_stmt => |ws| {
+                try self.walkExprCalls(ctx, ws.condition);
+                for (ws.body.statements) |s| try self.walkStmtCalls(ctx, s);
+            },
+            .bash_block, .type_binding_decl => {},
+        }
+    }
+
+    /// Recursively visits an expression, emitting parameter hints at each call
+    /// and descending into pipelines, operands, call arguments, control-flow
+    /// bodies, function bodies, and string interpolations.
+    fn walkExprCalls(self: *Server, ctx: CallHintCtx, expr: *const runic.ast.Expression) (Allocator.Error)!void {
+        switch (expr.*) {
+            .call => |call| {
+                try self.appendCallParamHints(ctx, call);
+                try self.walkExprCalls(ctx, call.callee);
+                for (call.arguments) |arg| try self.walkExprCalls(ctx, arg);
+            },
+            .pipeline => |p| for (p.stages) |s| try self.walkExprCalls(ctx, s),
+            .binary => |b| {
+                try self.walkExprCalls(ctx, b.left);
+                try self.walkExprCalls(ctx, b.right);
+            },
+            .unary => |u| try self.walkExprCalls(ctx, u.operand),
+            .assignment => |a| try self.walkExprCalls(ctx, a.expr),
+            .block => |b| for (b.statements) |s| try self.walkStmtCalls(ctx, s),
+            .fn_decl => |fd| try self.walkExprCalls(ctx, fd.body),
+            .if_expr => |i| try self.walkIfExprCalls(ctx, &i),
+            .for_expr => |f| {
+                for (f.sources) |s| try self.walkExprCalls(ctx, s);
+                try self.walkExprCalls(ctx, f.body);
+            },
+            .match_expr => |m| {
+                try self.walkExprCalls(ctx, m.subject);
+                for (m.cases) |c| for (c.body.statements) |s| try self.walkStmtCalls(ctx, s);
+            },
+            .literal => |lit| switch (lit) {
+                .string => |s| for (s.segments) |seg| switch (seg) {
+                    .interpolation => |e| try self.walkExprCalls(ctx, e),
+                    else => {},
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
+
+    fn walkIfExprCalls(self: *Server, ctx: CallHintCtx, if_expr: *const runic.ast.IfExpr) (Allocator.Error)!void {
+        try self.walkExprCalls(ctx, if_expr.condition);
+        try self.walkExprCalls(ctx, if_expr.then_expr);
+        if (if_expr.else_branch) |else_branch| switch (else_branch) {
+            .expr => |e| try self.walkExprCalls(ctx, e),
+            .if_expr => |nested| try self.walkIfExprCalls(ctx, nested),
+            .condition => {},
+        };
+    }
+
     fn appendCallParamHints(
         _: *Server,
-        arena: Allocator,
-        hints: *std.ArrayList(types.InlayHint),
+        ctx: CallHintCtx,
         call: runic.ast.CallExpr,
-        fn_decls: *std.StringHashMap(runic.ast.FunctionDecl),
-        range: types.Range,
     ) !void {
+        const arena = ctx.arena;
+        const hints = ctx.hints;
+        const fn_decls = ctx.fn_decls;
+        const range = ctx.range;
+
         const callee_name = switch (call.callee.*) {
             .identifier => |identifier| identifier.name,
             else => return,

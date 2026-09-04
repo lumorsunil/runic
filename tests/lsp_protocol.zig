@@ -1141,6 +1141,48 @@ test "lsp inlay hints label call arguments with parameter names" {
     try std.testing.expectEqual(@as(?i64, 3), times_line);
 }
 
+test "lsp inlay parameter hints reach calls inside a pipeline" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\fn String shout(prefix: String) String {
+        \\    echo "${prefix}"
+        \\}
+        \\echo "hi" | shout "x"
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeInlayHintRequest(allocator, 2, uri, 10),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const hints = parsed.value.object.get("result").?.array.items;
+    // The `shout "x"` call is the second stage of a pipeline (line 3); the old
+    // top-level-only walk would have missed it.
+    var saw_prefix = false;
+    for (hints) |h| {
+        if (std.mem.eql(u8, h.object.get("label").?.string, "prefix:")) {
+            saw_prefix = true;
+            try std.testing.expectEqual(@as(i64, 3), h.object.get("position").?.object.get("line").?.integer);
+        }
+    }
+    try std.testing.expect(saw_prefix);
+}
+
 test "lsp folding ranges cover multi-line statements" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
