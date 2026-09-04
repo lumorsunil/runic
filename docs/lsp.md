@@ -30,6 +30,7 @@ Today it provides:
 - folding ranges (multi-line statements: functions, structs, control flow)
 - prepare-rename (validates the rename target and pre-fills the identifier)
 - code actions (quick fix: add an inferred type annotation to a binding)
+- completion item resolve (fills documentation from detail when focused)
 - workspace symbol search across all indexed files
 - workspace-wide rename (edits every indexed file that references the symbol)
 - a workspace index: on initialize with a client-provided root, every `.rn`

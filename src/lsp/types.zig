@@ -108,6 +108,7 @@ pub const ClientRequestPayload = union(enum) {
     @"textDocument/didChange": DidChangeTextDocumentParams,
     @"textDocument/didClose": DidCloseTextDocumentParams,
     @"textDocument/completion": CompletionParams,
+    @"completionItem/resolve": std.json.Value,
     @"textDocument/hover": HoverParams,
     @"textDocument/definition": DefinitionParams,
     @"textDocument/references": ReferenceParams,

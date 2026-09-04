@@ -167,6 +167,10 @@ pub const Server = struct {
                 }
                 return true;
             },
+            .@"completionItem/resolve" => |item| {
+                if (request.id) |id| try self.handleCompletionResolve(id, item);
+                return true;
+            },
             .@"textDocument/hover" => |params| {
                 if (request.id) |id| {
                     try self.handleHover(id, params);
@@ -456,6 +460,40 @@ pub const Server = struct {
         defer matches.deinit();
 
         try self.sendCompletionResult(id, matches.items.items);
+    }
+
+    /// completionItem/resolve: the client asks for extra detail on a specific
+    /// item. We keep completion results lean and fill the documentation lazily
+    /// here — an item that carried only inline `detail` (a function signature,
+    /// a command path, a field type) gets that promoted to hover documentation
+    /// when the user focuses it. The item is echoed with all its other fields
+    /// intact.
+    fn handleCompletionResolve(self: *Server, id: types.RequestId, item: std.json.Value) !void {
+        const should_add = item == .object and
+            (if (item.object.get("documentation")) |d| d == .null else true) and
+            (if (item.object.get("detail")) |d| d == .string and d.string.len > 0 else false);
+
+        if (!should_add) {
+            try self.sendJson(types.response(id, item));
+            return;
+        }
+
+        // Build the enriched item in a scratch arena rather than mutating the
+        // request's parse arena (which a raw allocator must not free). Values are
+        // shallow-copied — their strings point into the request buffer, valid for
+        // the duration of this handler.
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+
+        var obj: std.json.ObjectMap = .empty;
+        var it = item.object.iterator();
+        while (it.next()) |entry| {
+            try obj.put(arena_allocator, entry.key_ptr.*, entry.value_ptr.*);
+        }
+        try obj.put(arena_allocator, "documentation", .{ .string = item.object.get("detail").?.string });
+
+        try self.sendJson(types.response(id, std.json.Value{ .object = obj }));
     }
 
     /// True when `offset` sits immediately after a `.` that follows an
@@ -1739,7 +1777,7 @@ pub const Server = struct {
                 } },
                 .completionProvider = .{
                     .triggerCharacters = &.{ ".", ":", "\"", "/" },
-                    .resolveProvider = false,
+                    .resolveProvider = true,
                 },
                 .hoverProvider = .{ .payload = .{
                     .hoverOptions = .{

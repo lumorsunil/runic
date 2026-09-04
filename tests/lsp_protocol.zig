@@ -1236,6 +1236,36 @@ test "lsp inlay parameter hints reach calls inside a pipeline" {
     try std.testing.expect(saw_prefix);
 }
 
+test "lsp completionItem/resolve promotes detail to documentation" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const uri = try fixture.writeDocument("main.rn", "echo\n");
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, "echo\n"),
+        try makeCompletionResolveRequest(allocator, 2, "greet", "(name: String) Void"),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const result = parsed.value.object.get("result").?.object;
+    // The item is echoed with its fields intact...
+    try std.testing.expectEqualStrings("greet", result.get("label").?.string);
+    try std.testing.expectEqualStrings("(name: String) Void", result.get("detail").?.string);
+    // ...and its detail is promoted to documentation.
+    try std.testing.expectEqualStrings("(name: String) Void", result.get("documentation").?.string);
+}
+
 test "lsp code action adds an inferred type annotation" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
@@ -2417,6 +2447,19 @@ fn makeInlayHintRequest(allocator: Allocator, id: i64, uri: []const u8, end_line
                 .start = .{ .line = 0, .character = 0 },
                 .end = .{ .line = end_line, .character = 0 },
             },
+        },
+    });
+}
+
+fn makeCompletionResolveRequest(allocator: Allocator, id: i64, label: []const u8, detail: []const u8) ![]u8 {
+    return toJsonAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .id = id,
+        .method = "completionItem/resolve",
+        .params = .{
+            .label = label,
+            .kind = 3,
+            .detail = detail,
         },
     });
 }
