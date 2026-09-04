@@ -25,6 +25,7 @@ Today it provides:
 - document highlight (occurrences of the identifier under the cursor)
 - document links (import paths link to the module file)
 - workspace symbol search across all indexed files
+- workspace-wide rename (edits every indexed file that references the symbol)
 - a workspace index: on initialize with a client-provided root, every `.rn`
   file is loaded into the document store, making navigation work across files
   that are not open

@@ -1101,35 +1101,47 @@ pub const Server = struct {
             return;
         }
 
-        const text = if (doc) |d| d.text else {
+        if (doc == null) {
             try self.sendJson(types.response(id, std.json.Value{ .null = {} }));
             return;
-        };
+        }
+        const name = extracted_identifier.?.name;
 
-        var ranges = try self.findIdentifierRanges(text, extracted_identifier.?.name);
-        defer ranges.deinit(self.allocator);
+        // Rename every occurrence of the identifier across all indexed documents
+        // (including workspace files that were never opened, whose text is loaded
+        // in the store). This is a lexical rename — findIdentifierRanges skips
+        // strings and comments but is name-based, so distinct same-named symbols
+        // in unrelated scopes are renamed together; editors preview the edit
+        // before applying it.
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
 
-        var edits = std.ArrayList(types.TextEdit).empty;
-        defer edits.deinit(self.allocator);
+        var changes = std.ArrayList(types.DocumentChangeOperation).empty;
 
-        for (ranges.items) |range| {
-            try edits.append(self.allocator, .{
-                .range = range,
-                .newText = params.newName,
-            });
+        var it = self.documents.map.iterator();
+        while (it.next()) |entry| {
+            const doc_uri = entry.key_ptr.*;
+            var ranges = try self.findIdentifierRanges(entry.value_ptr.*.text, name);
+            defer ranges.deinit(self.allocator);
+            if (ranges.items.len == 0) continue;
+
+            const edits = try arena_allocator.alloc(types.TextEdit, ranges.items.len);
+            for (ranges.items, 0..) |range, i| {
+                edits[i] = .{ .range = range, .newText = params.newName };
+            }
+            try changes.append(arena_allocator, .{ .textDocumentEdit = .{
+                .textDocument = .{ .uri = doc_uri, .version = null },
+                .edits = edits,
+            } });
         }
 
-        const result = types.WorkspaceEdit{
-            .documentChanges = &.{
-                .{
-                    .textDocumentEdit = .{
-                        .textDocument = .{ .uri = params.textDocument.uri, .version = null },
-                        .edits = edits.items,
-                    },
-                },
-            },
-        };
+        if (changes.items.len == 0) {
+            try self.sendJson(types.response(id, std.json.Value{ .null = {} }));
+            return;
+        }
 
+        const result = types.WorkspaceEdit{ .documentChanges = changes.items };
         try self.sendJson(types.response(id, result));
     }
 
