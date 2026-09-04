@@ -967,6 +967,42 @@ test "lsp go-to-definition resolves across an unopened workspace file" {
     try std.testing.expectEqual(@as(i64, 6), start.get("character").?.integer);
 }
 
+test "lsp folding ranges cover multi-line statements" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\fn Void greet(name: String) Void {
+        \\    echo "hi"
+        \\}
+        \\const x = 1
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeFoldingRangeRequest(allocator, 2, uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const ranges = parsed.value.object.get("result").?.array.items;
+    // The three-line function folds; the single-line `const x` does not.
+    try std.testing.expectEqual(@as(usize, 1), ranges.len);
+    try std.testing.expectEqual(@as(i64, 0), ranges[0].object.get("startLine").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), ranges[0].object.get("endLine").?.integer);
+}
+
 test "lsp inlay hints show inferred types for un-annotated bindings" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
@@ -2072,6 +2108,15 @@ fn makeInlayHintRequest(allocator: Allocator, id: i64, uri: []const u8, end_line
                 .end = .{ .line = end_line, .character = 0 },
             },
         },
+    });
+}
+
+fn makeFoldingRangeRequest(allocator: Allocator, id: i64, uri: []const u8) ![]u8 {
+    return toJsonAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .id = id,
+        .method = "textDocument/foldingRange",
+        .params = .{ .textDocument = .{ .uri = uri } },
     });
 }
 

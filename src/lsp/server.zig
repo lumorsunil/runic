@@ -182,6 +182,10 @@ pub const Server = struct {
                 if (request.id) |id| try self.handleInlayHint(id, params);
                 return true;
             },
+            .@"textDocument/foldingRange" => |params| {
+                if (request.id) |id| try self.handleFoldingRange(id, params);
+                return true;
+            },
             .@"textDocument/documentSymbol" => |params| {
                 if (request.id) |id| try self.handleDocumentSymbols(id, params);
                 return true;
@@ -1080,6 +1084,41 @@ pub const Server = struct {
         try self.sendJson(types.response(id, hints.items));
     }
 
+    fn handleFoldingRange(
+        self: *Server,
+        id: types.RequestId,
+        params: types.FoldingRangeParams,
+    ) !void {
+        const doc = self.documents.get(params.textDocument.uri) orelse {
+            try self.sendJson(types.response(id, std.json.Value{ .null = {} }));
+            return;
+        };
+        const script = doc.ast orelse {
+            try self.sendJson(types.response(id, &[_]types.FoldingRange{}));
+            return;
+        };
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+
+        var ranges = std.ArrayList(types.FoldingRange).empty;
+
+        // Fold every top-level statement that spans more than one line — that
+        // covers function bodies, struct definitions, and multi-line control
+        // flow without needing to enumerate each node kind.
+        for (script.statements) |stmt| {
+            const range = types.Range.fromSpan(stmt.span());
+            if (range.end.line > range.start.line) {
+                try ranges.append(arena.allocator(), .{
+                    .startLine = range.start.line,
+                    .endLine = range.end.line,
+                });
+            }
+        }
+
+        try self.sendJson(types.response(id, ranges.items));
+    }
+
     fn handleWorkspaceSymbol(
         self: *Server,
         id: types.RequestId,
@@ -1406,6 +1445,9 @@ pub const Server = struct {
                     .inlayHintOptions = .{
                         .resolveProvider = false,
                     },
+                } },
+                .foldingRangeProvider = .{ .payload = .{
+                    .foldingRangeOptions = .{},
                 } },
                 .workspaceSymbolProvider = .{ .payload = .{
                     .workspaceSymbolOptions = .{

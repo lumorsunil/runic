@@ -114,6 +114,7 @@ pub const ClientRequestPayload = union(enum) {
     @"textDocument/documentHighlight": DocumentHighlightParams,
     @"textDocument/documentLink": DocumentLinkParams,
     @"textDocument/inlayHint": InlayHintParams,
+    @"textDocument/foldingRange": FoldingRangeParams,
     @"textDocument/documentSymbol": DocumentSymbolParams,
     @"textDocument/rename": RenameParams,
     @"textDocument/formatting": DocumentFormattingParams,
@@ -243,6 +244,19 @@ pub const InlayHintParams = struct {
     textDocument: TextDocumentIdentifier,
     /// The visible document range hints are requested for.
     range: Range,
+};
+
+pub const FoldingRangeParams = struct {
+    textDocument: TextDocumentIdentifier,
+};
+
+/// A collapsible region of a document, addressed by line (0-indexed).
+pub const FoldingRange = struct {
+    startLine: u32,
+    endLine: u32,
+    startCharacter: ?u32 = null,
+    endCharacter: ?u32 = null,
+    kind: ?[]const u8 = null,
 };
 
 pub const InlayHintKind = enum(u32) {

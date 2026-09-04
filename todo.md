@@ -223,7 +223,9 @@
 - [x] inlay hints: inferred types after un-annotated bindings (`const x«: Int»`)
 - [ ] inlay hints: parameter-name hints before space-form call arguments
       (needs callee->FunctionDecl resolution and positional arg mapping)
+- [x] folding ranges (multi-line statements: functions, structs, control flow)
 - [ ] code actions / quick fixes (e.g. add missing import)
+- [ ] prepare-rename, call hierarchy, completion-resolve (lazy docs)
 - [ ] richer/robust formatting (current formatter is minimal)
 
 ## imports
