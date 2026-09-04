@@ -179,30 +179,46 @@
 ## lsp
 
 - [x] completions for member access
-- [ ] add more information to completion results (symbol type, etc)
-- [ ] implement basic snippets (const/var/fn)
+  - [x] chained access (a.b.c) resolves each segment's type
+  - [x] trailing-dot scope recovery (complete after `obj.`)
+- [x] add more information to completion results (symbol type, etc)
+  - function signatures and struct-field types as completion detail
+- [x] implement basic snippets (const/var/fn)
+- [x] completions for executables found on $PATH
 - [x] hover
   - [x] basic hover implementation, identifier lookup
 - [x] go to definition
-- [ ] workspace-wide go to definition for symbols not present in currently tracked documents
+  - [x] struct field / decl member access resolves to the declaration
+- [x] workspace-wide go to definition for symbols not present in currently tracked documents
+  - via the workspace index (loads all .rn files under a client-provided root)
 - [x] completions for keywords
   - [x] bug: markdown syntax highlighting does not work for runic
 - [x] restart causes leaks and crashes
 - [x] completions for import module names
 - [x] document change does not reflect new symbols
 - [x] didChange support, document diagnostics
-- [ ] add protocol regressions for incremental `didChange` edits
+- [x] add protocol regressions for incremental `didChange` edits
 - [x] crashes (investigate that we do similar setup as run_script)
 - [x] type checker integration
   - [x] type checking imports
 - [x] references
-- [ ] workspace-wide references beyond currently tracked/open documents
+- [x] workspace-wide references beyond currently tracked/open documents
+  - references iterates the document store, which the workspace index populates
 - [x] rename
-- [ ] workspace-wide rename
-- [ ] improve semantic definition/rename/reference resolution for module members so it does not rely on conservative symbol fallbacks
+- [x] workspace-wide rename (lexical; edits every indexed file with the name)
+- [ ] improve semantic definition/rename/reference resolution so it does not
+      rely on conservative name-based symbol fallbacks (bind-aware cross-file)
 - [x] bug: takes 100% cpu after a while
 - [x] bug: stops working after a while, may be related to bug above
-- [ ] add support for document links?
+- [x] document symbols (outline), nested (struct fields, fn params)
+- [x] document highlight
+- [x] workspace symbol search
+- [x] add support for document links
+- [ ] `.sym_link` entries in module-path completion (completion.zig)
+- [ ] document symbols for bash blocks / while statements / destructuring patterns
+- [ ] inlay hints (parameter-name hints before space-form call arguments)
+- [ ] code actions / quick fixes (e.g. add missing import)
+- [ ] richer/robust formatting (current formatter is minimal)
 
 ## imports
 
