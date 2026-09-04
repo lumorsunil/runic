@@ -579,6 +579,33 @@ pub const Server = struct {
         return ranges;
     }
 
+    /// The declaration span of the binding that `name` resolves to at the given
+    /// position in `doc_path`, or null when it does not resolve to a binding —
+    /// e.g. a command name, an unbound identifier, or a document that was parsed
+    /// but not type-checked. Used to make references/rename binding-aware rather
+    /// than matching every same-named identifier.
+    fn bindingDeclSpanAt(
+        self: *Server,
+        doc_path: []const u8,
+        position: types.Position,
+        name: []const u8,
+    ) ?runic.ast.Span {
+        // toLocation converts the 0-indexed LSP position to the 1-indexed
+        // line/column the type checker's scopes use.
+        const loc = position.toLocation(doc_path);
+        const scope = self.workspace.type_checker.getScopeFromLoc(loc) orelse return null;
+        const binding = scope.lookup(name) orelse return null;
+        return binding.identifier.span;
+    }
+
+    /// Two declaration spans identify the same binding when they begin at the
+    /// same position in the same file.
+    fn sameDecl(a: runic.ast.Span, b: runic.ast.Span) bool {
+        return a.start.line == b.start.line and
+            a.start.column == b.start.column and
+            std.mem.eql(u8, a.start.file, b.start.file);
+    }
+
     fn extractIdentifier(
         self: *@This(),
         loc: runic.token.Location,
@@ -862,6 +889,12 @@ pub const Server = struct {
         if (reference_name) |name| {
             const declaration_file = if (binding) |b| b.identifier.span.start.file else null;
             const declaration_range = if (binding) |b| types.Range.fromSpan(b.identifier.span) else null;
+            // When the symbol resolves to a binding, keep only occurrences that
+            // resolve to that same binding — so distinct same-named symbols in
+            // other scopes or files are excluded. When it does not resolve
+            // (a command, an unbound name, an un-type-checked file) fall back to
+            // matching by name.
+            const target_decl: ?runic.ast.Span = if (binding) |b| b.identifier.span else null;
 
             var it = self.documents.map.iterator();
             while (it.next()) |entry| {
@@ -871,6 +904,11 @@ pub const Server = struct {
                 defer ranges.deinit(self.allocator);
 
                 for (ranges.items) |range| {
+                    if (target_decl) |td| {
+                        const occ = self.bindingDeclSpanAt(ref_doc.path, range.start, name);
+                        if (occ == null or !sameDecl(occ.?, td)) continue;
+                    }
+
                     if (!params.context.includeDeclaration and declaration_range != null and declaration_file != null and
                         std.mem.eql(u8, ref_doc.path, declaration_file.?) and std.meta.eql(range, declaration_range.?))
                     {
@@ -1107,12 +1145,19 @@ pub const Server = struct {
         }
         const name = extracted_identifier.?.name;
 
-        // Rename every occurrence of the identifier across all indexed documents
-        // (including workspace files that were never opened, whose text is loaded
-        // in the store). This is a lexical rename — findIdentifierRanges skips
-        // strings and comments but is name-based, so distinct same-named symbols
-        // in unrelated scopes are renamed together; editors preview the edit
-        // before applying it.
+        // Resolve the symbol under the cursor to a binding. When it resolves,
+        // rename only occurrences that resolve to that same binding, so distinct
+        // same-named symbols in other scopes or files are left alone. When it
+        // does not resolve (a command, an unbound name, an un-type-checked file)
+        // fall back to a lexical rename by name across every indexed document.
+        // Either way findIdentifierRanges skips strings and comments, and editors
+        // preview the edit before applying it.
+        const target_decl: ?runic.ast.Span = brk: {
+            const scope = self.workspace.type_checker.getScopeFromLoc(loc) orelse break :brk null;
+            const binding = scope.lookup(name) orelse break :brk null;
+            break :brk binding.identifier.span;
+        };
+
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const arena_allocator = arena.allocator();
@@ -1122,17 +1167,24 @@ pub const Server = struct {
         var it = self.documents.map.iterator();
         while (it.next()) |entry| {
             const doc_uri = entry.key_ptr.*;
-            var ranges = try self.findIdentifierRanges(entry.value_ptr.*.text, name);
+            const ref_doc = entry.value_ptr.*;
+            var ranges = try self.findIdentifierRanges(ref_doc.text, name);
             defer ranges.deinit(self.allocator);
             if (ranges.items.len == 0) continue;
 
-            const edits = try arena_allocator.alloc(types.TextEdit, ranges.items.len);
-            for (ranges.items, 0..) |range, i| {
-                edits[i] = .{ .range = range, .newText = params.newName };
+            var edits = std.ArrayList(types.TextEdit).empty;
+            for (ranges.items) |range| {
+                if (target_decl) |td| {
+                    const occ = self.bindingDeclSpanAt(ref_doc.path, range.start, name);
+                    if (occ == null or !sameDecl(occ.?, td)) continue;
+                }
+                try edits.append(arena_allocator, .{ .range = range, .newText = params.newName });
             }
+            if (edits.items.len == 0) continue;
+
             try changes.append(arena_allocator, .{ .textDocumentEdit = .{
                 .textDocument = .{ .uri = doc_uri, .version = null },
-                .edits = edits,
+                .edits = edits.items,
             } });
         }
 

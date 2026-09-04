@@ -206,8 +206,9 @@
   - references iterates the document store, which the workspace index populates
 - [x] rename
 - [x] workspace-wide rename (lexical; edits every indexed file with the name)
-- [ ] improve semantic definition/rename/reference resolution so it does not
-      rely on conservative name-based symbol fallbacks (bind-aware cross-file)
+- [x] binding-aware references and rename (scope/binding identity, not name)
+- [ ] extend binding-aware resolution to cross-file module members (`m.foo`),
+      which still use member-based / name fallbacks
 - [x] bug: takes 100% cpu after a while
 - [x] bug: stops working after a while, may be related to bug above
 - [x] document symbols (outline), nested (struct fields, fn params)
