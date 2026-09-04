@@ -24,6 +24,7 @@ Today it provides:
   child symbols
 - document highlight (occurrences of the identifier under the cursor)
 - document links (import paths link to the module file)
+- inlay hints (inferred types shown after un-annotated bindings)
 - workspace symbol search across all indexed files
 - workspace-wide rename (edits every indexed file that references the symbol)
 - a workspace index: on initialize with a client-provided root, every `.rn`

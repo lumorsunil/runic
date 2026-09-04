@@ -113,6 +113,7 @@ pub const ClientRequestPayload = union(enum) {
     @"textDocument/references": ReferenceParams,
     @"textDocument/documentHighlight": DocumentHighlightParams,
     @"textDocument/documentLink": DocumentLinkParams,
+    @"textDocument/inlayHint": InlayHintParams,
     @"textDocument/documentSymbol": DocumentSymbolParams,
     @"textDocument/rename": RenameParams,
     @"textDocument/formatting": DocumentFormattingParams,
@@ -236,6 +237,29 @@ pub const DocumentHighlight = struct {
 
 pub const DocumentLinkParams = struct {
     textDocument: TextDocumentIdentifier,
+};
+
+pub const InlayHintParams = struct {
+    textDocument: TextDocumentIdentifier,
+    /// The visible document range hints are requested for.
+    range: Range,
+};
+
+pub const InlayHintKind = enum(u32) {
+    type = 1,
+    parameter = 2,
+
+    pub fn jsonStringify(self: @This(), stringify: *std.json.Stringify) std.json.Stringify.Error!void {
+        try stringify.write(@intFromEnum(self));
+    }
+};
+
+pub const InlayHint = struct {
+    position: Position,
+    label: []const u8,
+    kind: ?InlayHintKind = null,
+    paddingLeft: ?bool = null,
+    paddingRight: ?bool = null,
 };
 
 /// A link inside a document (e.g. an import path) pointing at a target URI.

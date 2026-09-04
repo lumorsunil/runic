@@ -967,6 +967,44 @@ test "lsp go-to-definition resolves across an unopened workspace file" {
     try std.testing.expectEqual(@as(i64, 6), start.get("character").?.integer);
 }
 
+test "lsp inlay hints show inferred types for un-annotated bindings" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\const x = 5
+        \\const y: Int = 3
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeInlayHintRequest(allocator, 2, uri, 10),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const hints = parsed.value.object.get("result").?.array.items;
+    // Only `x` (no annotation) gets a hint; `y` is already annotated.
+    try std.testing.expectEqual(@as(usize, 1), hints.len);
+    const hint = hints[0].object;
+    try std.testing.expectEqualStrings(": Int", hint.get("label").?.string);
+    try std.testing.expectEqual(@as(i64, 1), hint.get("kind").?.integer); // Type
+    const pos = hint.get("position").?.object;
+    try std.testing.expectEqual(@as(i64, 0), pos.get("line").?.integer);
+    try std.testing.expectEqual(@as(i64, 7), pos.get("character").?.integer);
+}
+
 test "lsp document link points an import path at the module file" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
@@ -2019,6 +2057,21 @@ fn makeWorkspaceSymbolRequest(allocator: Allocator, id: i64, query: []const u8) 
         .id = id,
         .method = "workspace/symbol",
         .params = .{ .query = query },
+    });
+}
+
+fn makeInlayHintRequest(allocator: Allocator, id: i64, uri: []const u8, end_line: u32) ![]u8 {
+    return toJsonAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .id = id,
+        .method = "textDocument/inlayHint",
+        .params = .{
+            .textDocument = .{ .uri = uri },
+            .range = .{
+                .start = .{ .line = 0, .character = 0 },
+                .end = .{ .line = end_line, .character = 0 },
+            },
+        },
     });
 }
 
