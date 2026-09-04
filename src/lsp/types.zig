@@ -117,6 +117,7 @@ pub const ClientRequestPayload = union(enum) {
     @"textDocument/foldingRange": FoldingRangeParams,
     @"textDocument/documentSymbol": DocumentSymbolParams,
     @"textDocument/rename": RenameParams,
+    @"textDocument/prepareRename": PrepareRenameParams,
     @"textDocument/formatting": DocumentFormattingParams,
     @"workspace/symbol": WorkspaceSymbolParams,
     @"workspace/didChangeConfiguration": DidChangeConfigurationParams,
@@ -298,6 +299,18 @@ pub const SymbolInformation = struct {
     kind: SymbolKind,
     location: Location,
     containerName: ?[]const u8 = null,
+};
+
+pub const PrepareRenameParams = struct {
+    textDocument: TextDocumentIdentifier,
+    position: Position,
+};
+
+/// prepareRename result: the range of the identifier that would be renamed,
+/// plus the text to pre-fill in the rename box.
+pub const PrepareRenameResult = struct {
+    range: Range,
+    placeholder: []const u8,
 };
 
 pub const RenameParams = struct {

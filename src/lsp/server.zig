@@ -194,6 +194,10 @@ pub const Server = struct {
                 if (request.id) |id| try self.handleRename(id, params);
                 return true;
             },
+            .@"textDocument/prepareRename" => |params| {
+                if (request.id) |id| try self.handlePrepareRename(id, params);
+                return true;
+            },
             .@"textDocument/formatting" => |params| {
                 if (request.id) |id| try self.handleFormatting(id, params);
                 return true;
@@ -1300,6 +1304,35 @@ pub const Server = struct {
         try self.sendJson(types.response(id, result));
     }
 
+    fn handlePrepareRename(
+        self: *Server,
+        id: types.RequestId,
+        params: types.PrepareRenameParams,
+    ) !void {
+        const path = try self.resolveUriPath(params.textDocument.uri);
+        defer self.allocator.free(path);
+
+        const doc = self.documents.get(params.textDocument.uri) orelse {
+            try self.sendJson(types.response(id, std.json.Value{ .null = {} }));
+            return;
+        };
+
+        var loc = params.position.toLocation(path);
+        loc.offset = params.position.findIndex(doc.text) orelse 0;
+
+        // Only an identifier is renameable; anywhere else returns null so the
+        // client blocks the rename instead of offering an invalid one.
+        const extracted = self.extractIdentifier(loc, doc.text) orelse {
+            try self.sendJson(types.response(id, std.json.Value{ .null = {} }));
+            return;
+        };
+
+        try self.sendJson(types.response(id, types.PrepareRenameResult{
+            .range = types.Range.fromSpan(extracted.span),
+            .placeholder = extracted.name,
+        }));
+    }
+
     fn handleFormatting(
         self: *Server,
         id: types.RequestId,
@@ -1461,7 +1494,7 @@ pub const Server = struct {
                 } },
                 .renameProvider = .{ .payload = .{
                     .renameOptions = .{
-                        .prepareProvider = false,
+                        .prepareProvider = true,
                     },
                 } },
                 .documentFormattingProvider = .{ .payload = .{

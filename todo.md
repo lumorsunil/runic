@@ -225,7 +225,8 @@
       (needs callee->FunctionDecl resolution and positional arg mapping)
 - [x] folding ranges (multi-line statements: functions, structs, control flow)
 - [ ] code actions / quick fixes (e.g. add missing import)
-- [ ] prepare-rename, call hierarchy, completion-resolve (lazy docs)
+- [x] prepare-rename (validates the target, pre-fills the identifier)
+- [ ] call hierarchy, completion-resolve (lazy docs)
 - [ ] richer/robust formatting (current formatter is minimal)
 
 ## imports
