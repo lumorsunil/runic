@@ -357,6 +357,75 @@ test "lsp prepare rename returns the identifier range, or null off an identifier
     }
 }
 
+test "lsp rename of a module member edits the module declaration and the access" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const module_uri = try fixture.writeDocument("module.rn",
+        \\pub const shared = 1
+        \\
+    );
+    defer allocator.free(module_uri);
+    const main_uri = try fixture.writeDocument("main.rn",
+        \\const m = import "./module.rn"
+        \\echo "${m.shared}"
+        \\
+    );
+    defer allocator.free(main_uri);
+    // An unrelated, identically-named binding in another file that must NOT be
+    // renamed — the lexical behaviour would have wrongly rewritten it.
+    const other_uri = try fixture.writeDocument("other.rn",
+        \\const shared = 99
+        \\echo "${shared}"
+        \\
+    );
+    defer allocator.free(other_uri);
+
+    const root_uri = try std.fmt.allocPrint(allocator, "file://{s}", .{fixture.root_path});
+    defer allocator.free(root_uri);
+
+    const messages = [_][]const u8{
+        try makeInitializeWithRoot(allocator, 1, root_uri),
+        try makeDidOpen(allocator, main_uri,
+            \\const m = import "./module.rn"
+            \\echo "${m.shared}"
+            \\
+        ),
+        // Rename `shared` from the `m.shared` member access (line 1).
+        try makeRenameRequest(allocator, 2, main_uri, 1, 12, "renamed"),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const changes = parsed.value.object.get("result").?.object.get("documentChanges").?.array.items;
+    var saw_module = false;
+    var saw_main = false;
+    var saw_other = false;
+    for (changes) |change| {
+        const tde = change.object.get("textDocumentEdit").?.object;
+        const uri = tde.get("textDocument").?.object.get("uri").?.string;
+        const edits = tde.get("edits").?.array.items;
+        try std.testing.expect(edits.len >= 1);
+        try std.testing.expectEqualStrings("renamed", edits[0].object.get("newText").?.string);
+        if (std.mem.eql(u8, uri, module_uri)) saw_module = true;
+        if (std.mem.eql(u8, uri, main_uri)) saw_main = true;
+        if (std.mem.eql(u8, uri, other_uri)) saw_other = true;
+    }
+    // The `pub const shared` declaration and the `m.shared` access are both edited...
+    try std.testing.expect(saw_module);
+    try std.testing.expect(saw_main);
+    // ...but the unrelated `shared` in other.rn is not.
+    try std.testing.expect(!saw_other);
+}
+
 test "lsp rename is scoped to the binding, not every same-named identifier" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);

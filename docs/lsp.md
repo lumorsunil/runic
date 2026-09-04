@@ -78,10 +78,12 @@ Current planned work:
   declaration, which takes precedence over an unrelated same-named binding).
   Regression-tested in `tests/lsp_protocol.zig`.
 - semantic (binding-aware) references and rename: when the symbol under the
-  cursor resolves to a binding, only occurrences resolving to that *same*
-  binding are renamed/listed, so distinct same-named symbols in other scopes
-  or files are left alone; unresolvable symbols (commands, unbound names) fall
-  back to a lexical name match
+  cursor resolves to a binding — or, for a member access `m.foo`, to a struct
+  field or an imported module's `pub` declaration — only occurrences resolving
+  to that *same* declaration (plus the declaration site itself) are
+  renamed/listed; distinct same-named symbols in other scopes/files are left
+  alone. Cross-file member accesses resolve for open importers; unresolvable
+  symbols (commands, unbound names) fall back to a lexical name match
 - ~~more reliable identifier-to-symbol resolution~~ / workspace-wide
   navigation — **done for definition:** the workspace is indexed on
   initialize (client-provided roots only, never the cwd fallback), so
