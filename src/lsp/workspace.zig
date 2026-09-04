@@ -59,6 +59,13 @@ pub const Workspace = struct {
     documents: *LspDocumentStore,
     env_map: *std.process.Environ.Map,
     type_checker: runic.semantic.TypeChecker,
+    /// Whether the workspace roots should be scanned into the index. Set only
+    /// for client-provided roots (never the current-directory fallback).
+    should_index: bool = false,
+    /// Whether the one-time workspace scan has run yet. The scan is lazy — it
+    /// happens on the first workspace-wide request, not at initialize — so a
+    /// slow or pathological file can never block startup.
+    indexed: bool = false,
 
     pub fn init(
         io: std.Io,
@@ -166,14 +173,25 @@ pub const Workspace = struct {
         try self.index.append(self.allocator, entry);
     }
 
+    /// Runs the one-time workspace scan if it is enabled and has not run yet.
+    /// Called lazily from workspace-wide requests (symbol search, references,
+    /// rename, cross-file definition) rather than at initialize, so the cost —
+    /// or a pathological file — only ever affects the first such request, never
+    /// startup or the per-file features (hover, completion, diagnostics).
+    pub fn ensureIndexed(self: *Workspace) void {
+        if (self.indexed or !self.should_index) return;
+        self.indexed = true;
+        self.indexWorkspace();
+    }
+
     /// Walks the workspace roots and loads every `.rn` file into the document
     /// store so its symbols are available to workspace search and cross-file
-    /// navigation. Called only for roots the client explicitly provided (never
-    /// the current-directory fallback, which could be an arbitrarily large tree).
-    pub fn indexWorkspace(self: *Workspace) void {
+    /// navigation. Scans only roots the client explicitly provided (never the
+    /// current-directory fallback, which could be an arbitrarily large tree).
+    fn indexWorkspace(self: *Workspace) void {
         for (self.roots.items) |root| {
-            // A scan failure (e.g. an unreadable directory) must not abort
-            // startup — the server still works with whatever was indexed.
+            // A scan failure (e.g. an unreadable directory) must not abort the
+            // request — the server still works with whatever was indexed.
             self.scanRoot(root) catch |err| {
                 std.log.err("workspace scan failed for {s}: {}", .{ root, err });
             };
