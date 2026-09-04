@@ -1236,6 +1236,47 @@ test "lsp inlay parameter hints reach calls inside a pipeline" {
     try std.testing.expect(saw_prefix);
 }
 
+test "lsp code action adds an inferred type annotation" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\const x = 5
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeCodeActionRequest(allocator, 2, uri, 0),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const actions = parsed.value.object.get("result").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), actions.len);
+    const action = actions[0].object;
+    try std.testing.expectEqualStrings("Add type annotation: Int", action.get("title").?.string);
+
+    const edits = action.get("edit").?.object.get("documentChanges").?.array
+        .items[0].object.get("textDocumentEdit").?.object.get("edits").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), edits.len);
+    try std.testing.expectEqualStrings(": Int", edits[0].object.get("newText").?.string);
+    // Inserted right after the identifier `x` (column 7 on line 0).
+    const start = edits[0].object.get("range").?.object.get("start").?.object;
+    try std.testing.expectEqual(@as(i64, 0), start.get("line").?.integer);
+    try std.testing.expectEqual(@as(i64, 7), start.get("character").?.integer);
+}
+
 test "lsp folding ranges cover multi-line statements" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
@@ -2376,6 +2417,22 @@ fn makeInlayHintRequest(allocator: Allocator, id: i64, uri: []const u8, end_line
                 .start = .{ .line = 0, .character = 0 },
                 .end = .{ .line = end_line, .character = 0 },
             },
+        },
+    });
+}
+
+fn makeCodeActionRequest(allocator: Allocator, id: i64, uri: []const u8, line: u32) ![]u8 {
+    return toJsonAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .id = id,
+        .method = "textDocument/codeAction",
+        .params = .{
+            .textDocument = .{ .uri = uri },
+            .range = .{
+                .start = .{ .line = line, .character = 0 },
+                .end = .{ .line = line, .character = 0 },
+            },
+            .context = .{ .diagnostics = .{} },
         },
     });
 }

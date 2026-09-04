@@ -232,7 +232,8 @@
       arguments, control-flow and function bodies, string interpolations)
 - [x] inlay parameter hints for imported-module functions (`m.f x`)
 - [x] folding ranges (multi-line statements: functions, structs, control flow)
-- [ ] code actions / quick fixes (e.g. add missing import)
+- [x] code action: add an inferred type annotation to an un-annotated binding
+- [ ] more code actions / quick fixes (add missing import, remove unused, etc.)
 - [x] prepare-rename (validates the target, pre-fills the identifier)
 - [ ] call hierarchy, completion-resolve (lazy docs)
 - [ ] richer/robust formatting (current formatter is minimal)
