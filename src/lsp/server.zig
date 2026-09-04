@@ -596,18 +596,42 @@ pub const Server = struct {
     /// e.g. a command name, an unbound identifier, or a document that was parsed
     /// but not type-checked. Used to make references/rename binding-aware rather
     /// than matching every same-named identifier.
-    fn bindingDeclSpanAt(
+    /// The declaration span the identifier `name` at `position` resolves to:
+    /// for a member access `X.name`, the member's declaration (a struct field or
+    /// an imported module's `pub` binding); otherwise the binding it names.
+    /// Null when it does not resolve — a command, an unbound name, or a document
+    /// that was parsed but not type-checked.
+    fn declSpanAt(
         self: *Server,
         doc_path: []const u8,
+        doc_text: []const u8,
         position: types.Position,
         name: []const u8,
     ) ?runic.ast.Span {
         // toLocation converts the 0-indexed LSP position to the 1-indexed
         // line/column the type checker's scopes use.
-        const loc = position.toLocation(doc_path);
-        const scope = self.workspace.type_checker.getScopeFromLoc(loc) orelse return null;
-        const binding = scope.lookup(name) orelse return null;
-        return binding.identifier.span;
+        var loc = position.toLocation(doc_path);
+        loc.offset = position.findIndex(doc_text) orelse 0;
+
+        if (self.extractMember(loc, doc_text)) |member| {
+            if (self.workspace.type_checker.getScopeFromLoc(loc)) |scope| {
+                if (self.resolveMemberFieldSpan(scope, member)) |span| return span;
+            }
+        }
+        if (self.workspace.type_checker.getScopeFromLoc(loc)) |scope| {
+            if (scope.lookup(name)) |binding| return binding.identifier.span;
+        }
+        return null;
+    }
+
+    /// Whether `range`'s start is exactly `decl`'s start position in `doc_path` —
+    /// i.e. this occurrence IS the declaration. Catches declaration sites that
+    /// do not themselves resolve to a scope binding (struct fields, a `pub`
+    /// binding in a module that was only parsed).
+    fn rangeIsDecl(doc_path: []const u8, range: types.Range, decl: runic.ast.Span) bool {
+        if (!std.mem.eql(u8, doc_path, decl.start.file)) return false;
+        const decl_range = types.Range.fromSpan(decl);
+        return range.start.line == decl_range.start.line and range.start.character == decl_range.start.character;
     }
 
     /// Two declaration spans identify the same binding when they begin at the
@@ -849,21 +873,29 @@ pub const Server = struct {
             .alias => |alias_type| self.workspace.type_checker.resolveAliasType(&alias_type),
             else => binding_type,
         };
-        const struct_type = switch (resolved.*) {
-            .struct_type => |st| st,
+        switch (resolved.*) {
+            .struct_type => |struct_type| {
+                for (struct_type.fields) |field| {
+                    if (std.mem.eql(u8, field.name.name, member.member_name)) {
+                        return field.name.span;
+                    }
+                }
+                for (struct_type.decls) |decl| {
+                    if (std.mem.eql(u8, decl.name.name, member.member_name)) {
+                        return decl.name.span;
+                    }
+                }
+                return null;
+            },
+            // A module member (`m.foo`) resolves to the `pub` declaration in the
+            // imported module file.
+            .module => |module_type| {
+                const module_scope = (self.workspace.type_checker.resolveModuleScopeForMemberCompletion(module_type) catch return null) orelse return null;
+                const member_binding = module_scope.lookup(member.member_name) orelse return null;
+                return member_binding.identifier.span;
+            },
             else => return null,
-        };
-        for (struct_type.fields) |field| {
-            if (std.mem.eql(u8, field.name.name, member.member_name)) {
-                return field.name.span;
-            }
         }
-        for (struct_type.decls) |decl| {
-            if (std.mem.eql(u8, decl.name.name, member.member_name)) {
-                return decl.name.span;
-            }
-        }
-        return null;
     }
 
     fn handleReferences(
@@ -879,34 +911,22 @@ pub const Server = struct {
         var loc = params.position.toLocation(path);
         if (doc) |d| loc.offset = params.position.findIndex(d.text) orelse 0;
         const extracted_identifier = if (doc) |d| self.extractIdentifier(loc, d.text) else null;
-        const scope = self.workspace.type_checker.getScopeFromLoc(loc);
-
-        const binding: ?*runic.semantic.Scope.Binding = brk: {
-            if (scope) |s| if (extracted_identifier) |i| {
-                break :brk s.lookup(i.name);
-            };
-            break :brk null;
-        };
 
         var locations = std.ArrayList(types.Location).empty;
         defer locations.deinit(self.allocator);
 
-        const reference_name = if (binding) |b|
-            b.identifier.name
-        else if (extracted_identifier) |i|
-            i.name
-        else
-            null;
+        const reference_name = if (extracted_identifier) |i| i.name else null;
 
         if (reference_name) |name| {
-            const declaration_file = if (binding) |b| b.identifier.span.start.file else null;
-            const declaration_range = if (binding) |b| types.Range.fromSpan(b.identifier.span) else null;
-            // When the symbol resolves to a binding, keep only occurrences that
-            // resolve to that same binding — so distinct same-named symbols in
-            // other scopes or files are excluded. When it does not resolve
-            // (a command, an unbound name, an un-type-checked file) fall back to
-            // matching by name.
-            const target_decl: ?runic.ast.Span = if (binding) |b| b.identifier.span else null;
+            // Resolve the symbol under the cursor to a declaration (a binding, or
+            // a struct field / imported module member for a member access). Keep
+            // only occurrences resolving to that same declaration — plus the
+            // declaration site itself. When it does not resolve (a command, an
+            // unbound name, an un-type-checked file) fall back to matching by
+            // name.
+            const target_decl: ?runic.ast.Span = if (doc) |d| self.declSpanAt(path, d.text, params.position, name) else null;
+            const declaration_file = if (target_decl) |td| td.start.file else null;
+            const declaration_range = if (target_decl) |td| types.Range.fromSpan(td) else null;
 
             var it = self.documents.map.iterator();
             while (it.next()) |entry| {
@@ -917,8 +937,9 @@ pub const Server = struct {
 
                 for (ranges.items) |range| {
                     if (target_decl) |td| {
-                        const occ = self.bindingDeclSpanAt(ref_doc.path, range.start, name);
-                        if (occ == null or !sameDecl(occ.?, td)) continue;
+                        const occ = self.declSpanAt(ref_doc.path, ref_doc.text, range.start, name);
+                        const is_match = (occ != null and sameDecl(occ.?, td)) or rangeIsDecl(ref_doc.path, range, td);
+                        if (!is_match) continue;
                     }
 
                     if (!params.context.includeDeclaration and declaration_range != null and declaration_file != null and
@@ -1326,11 +1347,7 @@ pub const Server = struct {
         // fall back to a lexical rename by name across every indexed document.
         // Either way findIdentifierRanges skips strings and comments, and editors
         // preview the edit before applying it.
-        const target_decl: ?runic.ast.Span = brk: {
-            const scope = self.workspace.type_checker.getScopeFromLoc(loc) orelse break :brk null;
-            const binding = scope.lookup(name) orelse break :brk null;
-            break :brk binding.identifier.span;
-        };
+        const target_decl: ?runic.ast.Span = self.declSpanAt(path, doc.?.text, params.position, name);
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
@@ -1349,8 +1366,9 @@ pub const Server = struct {
             var edits = std.ArrayList(types.TextEdit).empty;
             for (ranges.items) |range| {
                 if (target_decl) |td| {
-                    const occ = self.bindingDeclSpanAt(ref_doc.path, range.start, name);
-                    if (occ == null or !sameDecl(occ.?, td)) continue;
+                    const occ = self.declSpanAt(ref_doc.path, ref_doc.text, range.start, name);
+                    const is_match = (occ != null and sameDecl(occ.?, td)) or rangeIsDecl(ref_doc.path, range, td);
+                    if (!is_match) continue;
                 }
                 try edits.append(arena_allocator, .{ .range = range, .newText = params.newName });
             }

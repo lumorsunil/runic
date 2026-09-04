@@ -207,8 +207,12 @@
 - [x] rename
 - [x] workspace-wide rename (lexical; edits every indexed file with the name)
 - [x] binding-aware references and rename (scope/binding identity, not name)
-- [ ] extend binding-aware resolution to cross-file module members (`m.foo`),
-      which still use member-based / name fallbacks
+- [x] binding-aware resolution for member access (`m.foo`): resolves to the
+      struct field or imported module `pub` declaration; references/rename link
+      the declaration and member accesses across open importers, excluding
+      unrelated same-named symbols
+- [ ] member references in index-only (unopened) importer files (their member
+      accesses can't resolve a scope, so they fall outside the semantic match)
 - [x] bug: takes 100% cpu after a while
 - [x] bug: stops working after a while, may be related to bug above
 - [x] document symbols (outline), nested (struct fields, fn params)
