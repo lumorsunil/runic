@@ -1451,6 +1451,45 @@ test "lsp member completion shows execution result members" {
     try std.testing.expect(first_kind == .integer);
 }
 
+test "lsp module-path completion follows a symlinked module file" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const real_uri = try fixture.writeDocument("real.rn",
+        \\pub const value = 1
+        \\
+    );
+    allocator.free(real_uri);
+    // linked.rn -> real.rn (a symlink to a module file).
+    try fixture.tmp_dir.dir.symLink(std.testing.io, "real.rn", "linked.rn", .{});
+
+    const main_uri = try fixture.writeDocument("main.rn", "const m = import \"./l\"\n");
+    defer allocator.free(main_uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, main_uri, "const m = import \"./l\"\n"),
+        // Cursor after `./l` inside the import string on line 0.
+        try makeCompletionRequest(allocator, 2, main_uri, 0, 21),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const items = parsed.value.object.get("result").?.object.get("items").?.array.items;
+    var saw_linked = false;
+    for (items) |item| {
+        if (std.mem.eql(u8, item.object.get("label").?.string, "linked.rn")) saw_linked = true;
+    }
+    try std.testing.expect(saw_linked);
+}
+
 test "lsp completion offers executables found on PATH" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
