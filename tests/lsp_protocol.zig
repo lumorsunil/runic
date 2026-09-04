@@ -255,6 +255,62 @@ test "lsp rename returns concrete same-file edits" {
     }
 }
 
+test "lsp rename edits every indexed file that references the symbol" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const helper_uri = try fixture.writeDocument("helper.rn",
+        \\const shared = 1
+        \\
+    );
+    defer allocator.free(helper_uri);
+    const main_uri = try fixture.writeDocument("main.rn",
+        \\echo "${shared}"
+        \\
+    );
+    defer allocator.free(main_uri);
+
+    const root_uri = try std.fmt.allocPrint(allocator, "file://{s}", .{fixture.root_path});
+    defer allocator.free(root_uri);
+
+    const messages = [_][]const u8{
+        try makeInitializeWithRoot(allocator, 1, root_uri),
+        try makeDidOpen(allocator, main_uri,
+            \\echo "${shared}"
+            \\
+        ),
+        // Rename `shared` from its use in main.rn.
+        try makeRenameRequest(allocator, 2, main_uri, 0, 9, "renamed"),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const changes = parsed.value.object.get("result").?.object.get("documentChanges").?.array.items;
+    // Both the defining file and the referencing file are edited.
+    try std.testing.expectEqual(@as(usize, 2), changes.len);
+    var saw_helper = false;
+    var saw_main = false;
+    for (changes) |change| {
+        const tde = change.object.get("textDocumentEdit").?.object;
+        const uri = tde.get("textDocument").?.object.get("uri").?.string;
+        const edits = tde.get("edits").?.array.items;
+        try std.testing.expect(edits.len >= 1);
+        try std.testing.expectEqualStrings("renamed", edits[0].object.get("newText").?.string);
+        if (std.mem.eql(u8, uri, helper_uri)) saw_helper = true;
+        if (std.mem.eql(u8, uri, main_uri)) saw_main = true;
+    }
+    try std.testing.expect(saw_helper);
+    try std.testing.expect(saw_main);
+}
+
 test "lsp rename ignores strings and comments" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
