@@ -358,9 +358,11 @@ pub const Server = struct {
 
         try self.workspace.resetRoots(roots.items);
         try self.workspace.refresh();
-        if (has_explicit_root) self.workspace.indexWorkspace();
+        // The workspace scan is deferred to the first workspace-wide request
+        // (see Workspace.ensureIndexed); initialize must return promptly and
+        // never block on parsing every file under the root.
+        self.workspace.should_index = has_explicit_root;
         self.initialized = true;
-        try self.log("workspace indexed {d} documents", .{self.documents.map.count()});
         try self.sendInitializeResult(id);
     }
 
@@ -842,6 +844,7 @@ pub const Server = struct {
         id: types.RequestId,
         params: types.DefinitionParams,
     ) !void {
+        self.workspace.ensureIndexed();
         const path = try self.resolveUriPath(params.textDocument.uri);
         defer self.allocator.free(path);
 
@@ -964,6 +967,7 @@ pub const Server = struct {
         id: types.RequestId,
         params: types.ReferenceParams,
     ) !void {
+        self.workspace.ensureIndexed();
         const path = try self.resolveUriPath(params.textDocument.uri);
         defer self.allocator.free(path);
 
@@ -1459,6 +1463,7 @@ pub const Server = struct {
         id: types.RequestId,
         params: types.WorkspaceSymbolParams,
     ) !void {
+        self.workspace.ensureIndexed();
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const arena_allocator = arena.allocator();
@@ -1563,6 +1568,7 @@ pub const Server = struct {
         id: types.RequestId,
         params: types.RenameParams,
     ) !void {
+        self.workspace.ensureIndexed();
         const path = try self.resolveUriPath(params.textDocument.uri);
         defer self.allocator.free(path);
 

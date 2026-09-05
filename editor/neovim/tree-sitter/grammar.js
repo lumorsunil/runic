@@ -95,10 +95,10 @@ module.exports = grammar({
       // $.heredoc_fence
     ),
 
-    keyword_declaration: _ => choice('const', 'var', 'fn', 'pub'),
+    keyword_declaration: _ => choice('const', 'var', 'fn', 'pub', 'comptime'),
     keyword_type: _ => choice('error', 'enum', 'union', 'struct'),
     keyword_async: _ => choice('async', 'await'),
-    keyword_control: _ => choice('if', 'else', 'match', 'return', 'exit'),
+    keyword_control: _ => choice('if', 'else', 'match', 'exit', 'yield', 'is'),
     keyword_loop: _ => choice('for', 'while'),
     keyword_import: _ => 'import',
     keyword_interop: _ => 'bash',
@@ -110,6 +110,8 @@ module.exports = grammar({
 
     number_literal: _ => token(choice(
       seq(/0[xX]/, /[0-9a-fA-F_]+/),
+      seq(/0[oO]/, /[0-7_]+/),
+      seq(/0[bB]/, /[01_]+/),
       seq(
         /\d+(_\d+)*/,
         optional(seq('.', /\d+(_\d+)*/)),
@@ -278,7 +280,7 @@ module.exports = grammar({
       '>'
     )),
 
-    assignment_operator: _ => token(choice('+=', '-=', '*=', '/=', '%=', '=')),
+    assignment_operator: _ => token(choice('+=', '-=', '*=', '/=', '%=', '||=', '&&=', '=')),
 
     range_operator: _ => choice('..', '...'),
 

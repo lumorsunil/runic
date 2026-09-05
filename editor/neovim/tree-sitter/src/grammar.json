@@ -288,6 +288,10 @@
         {
           "type": "STRING",
           "value": "pub"
+        },
+        {
+          "type": "STRING",
+          "value": "comptime"
         }
       ]
     },
@@ -342,11 +346,15 @@
         },
         {
           "type": "STRING",
-          "value": "return"
+          "value": "exit"
         },
         {
           "type": "STRING",
-          "value": "exit"
+          "value": "yield"
+        },
+        {
+          "type": "STRING",
+          "value": "is"
         }
       ]
     },
@@ -424,6 +432,32 @@
               {
                 "type": "PATTERN",
                 "value": "[0-9a-fA-F_]+"
+              }
+            ]
+          },
+          {
+            "type": "SEQ",
+            "members": [
+              {
+                "type": "PATTERN",
+                "value": "0[oO]"
+              },
+              {
+                "type": "PATTERN",
+                "value": "[0-7_]+"
+              }
+            ]
+          },
+          {
+            "type": "SEQ",
+            "members": [
+              {
+                "type": "PATTERN",
+                "value": "0[bB]"
+              },
+              {
+                "type": "PATTERN",
+                "value": "[01_]+"
               }
             ]
           },
@@ -1169,6 +1203,14 @@
           {
             "type": "STRING",
             "value": "%="
+          },
+          {
+            "type": "STRING",
+            "value": "||="
+          },
+          {
+            "type": "STRING",
+            "value": "&&="
           },
           {
             "type": "STRING",

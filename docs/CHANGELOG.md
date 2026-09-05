@@ -72,6 +72,11 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   pointing at the source, instead of exiting silently.
 - **Missing executable** reports `command not found: '<name>'` with the call's
   source location, instead of a bare `error.FileNotFound`.
+- **Lexer infinite loop on a lone `$` in a string** — a `$` inside a string
+  that does not begin a `${…}` interpolation (e.g. `"$r"`, `"cost: $5"`) is now
+  literal text; it previously spun forever because the character was never
+  consumed. This hung both the CLI and the LSP (whose workspace scan parses
+  every file at startup).
 - **LSP stability** — the workspace type checker's analysis memory is now reset
   each edit (it previously grew unboundedly); the per-edit re-check is bounded
   to the open documents rather than every module ever touched; and a

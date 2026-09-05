@@ -1070,6 +1070,10 @@
     "named": true
   },
   {
+    "type": "comptime",
+    "named": false
+  },
+  {
     "type": "const",
     "named": false
   },
@@ -1122,6 +1126,10 @@
     "named": false
   },
   {
+    "type": "is",
+    "named": false
+  },
+  {
     "type": "keyword_import",
     "named": true
   },
@@ -1167,10 +1175,6 @@
     "named": false
   },
   {
-    "type": "return",
-    "named": false
-  },
-  {
     "type": "stage_separator",
     "named": true
   },
@@ -1208,6 +1212,10 @@
   },
   {
     "type": "while",
+    "named": false
+  },
+  {
+    "type": "yield",
     "named": false
   },
   {
