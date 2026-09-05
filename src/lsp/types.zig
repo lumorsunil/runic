@@ -522,6 +522,13 @@ pub const Position = struct {
         var i: u32 = 0;
 
         while (column != self.character or line != self.line) : (i += 1) {
+            // A position past end-of-file (a line beyond the document, or a
+            // character past the end of an existing line) does not resolve to
+            // an index. Without this guard `source[i]` reads out of bounds and
+            // crashes the server, because the early-out below only fires once
+            // BOTH line and column overshoot — which never happens for an
+            // over-long character on a valid line.
+            if (i >= source.len) return null;
             switch (source[i]) {
                 '\\' => {
                     if (i < source.len - 1) {
@@ -2149,4 +2156,16 @@ test "workspace edit documentChanges hold bare TextDocumentEdits" {
     try std.testing.expect(std.mem.indexOf(u8, s, "\"textDocumentEdit\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, s, "\"textDocument\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "\"edits\"") != null);
+}
+
+test "Position.findIndex returns null for out-of-bounds positions" {
+    const source = "const foo = 1\n";
+
+    // A character past the end of an existing line: the old guard never fired
+    // (line never overshoots), so `source[i]` ran off the end and crashed.
+    try std.testing.expectEqual(@as(?u32, null), (Position{ .line = 0, .character = 999 }).findIndex(source));
+    // A line past the end of the document.
+    try std.testing.expectEqual(@as(?u32, null), (Position{ .line = 50, .character = 0 }).findIndex(source));
+    // An in-bounds position still resolves to its byte offset (`foo` at col 6).
+    try std.testing.expectEqual(@as(?u32, 6), (Position{ .line = 0, .character = 6 }).findIndex(source));
 }
