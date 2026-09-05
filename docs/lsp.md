@@ -37,9 +37,12 @@ Today it provides:
 - prepare-rename (validates the rename target and pre-fills the identifier)
 - code actions (quick fix: add an inferred type annotation to a binding)
 - workspace symbol search across all indexed files
-- a workspace index: on initialize with a client-provided root, every `.rn`
-  file is loaded into the document store, making navigation work across files
-  that are not open
+- a workspace index: the first workspace-wide request (symbol search,
+  references, rename, cross-file definition) with a client-provided root loads
+  every `.rn` file into the document store, making navigation work across files
+  that are not open. The scan is lazy — it never runs at initialize — so a slow
+  or malformed file can only ever affect that first request, not startup or the
+  per-file features (hover, completion, diagnostics)
 
 There is also a placeholder `--tcp <port>` flag in the CLI surface, but that
 transport is still reserved rather than being part of the supported workflow.
@@ -93,10 +96,10 @@ Current planned work:
   never opened (type-checked on demand for the request); unresolvable symbols
   (commands, unbound names) fall back to a lexical name match
 - ~~more reliable identifier-to-symbol resolution~~ / workspace-wide
-  navigation — **done for definition:** the workspace is indexed on
-  initialize (client-provided roots only, never the cwd fallback), so
-  go-to-definition and references resolve to declarations in files that were
-  never opened; workspace/symbol search is served from the same index
+  navigation — **done:** the workspace is indexed lazily on the first
+  workspace-wide request (client-provided roots only, never the cwd fallback),
+  so go-to-definition, references, and rename resolve to declarations in files
+  that were never opened; workspace/symbol search is served from the same index
 - ~~possibly document links where they clearly help navigation~~ **done:**
   `import "./x.rn"` paths are links to the module file (embedded `std`
   imports are skipped, having no file to open)
@@ -127,6 +130,22 @@ Current concerns:
   remaining open set so those references are dropped and rebuilt. Regression
   tests in `tests/lsp_protocol.zig` cover close-then-request on an importer and
   repeated open/change/close/reopen churn.
+- request-level crash resilience — **addressed (0.8.1):** a position past
+  end-of-file (a line beyond the document, or a character past a line's end)
+  ran the position→offset scan off the buffer and crashed the server; such a
+  position now resolves to nothing. A malformed request body previously
+  propagated an error out of the main loop and ended the session; it is now
+  logged and dropped, and the session continues. Both are regression-tested,
+  alongside unknown-method (`-32601`) and duplicate-`initialize` (`-32600`)
+  handling and navigation requests against never-opened documents.
+- protocol wire-shape correctness — **addressed (0.8.1):** outgoing enums
+  serialize as their numeric codes and single-variant unions
+  (`documentChanges`, capability `Either`s) unwrap to bare objects rather than
+  tag-wrapped envelopes — a rename/code-action edit that clients rejected is
+  fixed, and the remaining latent cases (`InsertTextMode`, `CompletionItemTag`,
+  `ProgressToken`) are guarded. Responses use JSON-RPC result-XOR-error form.
+  Covered by unit tests in `src/lsp/types.zig` and wire-shape assertions in
+  `tests/lsp_protocol.zig`.
 
 ### 4. Better alignment with the language pipeline
 

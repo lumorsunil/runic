@@ -243,7 +243,7 @@ test "lsp rename returns concrete same-file edits" {
 
     const changes = parsed.value.object.get("result").?.object.get("documentChanges").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), changes.len);
-    const edits = changes[0].object.get("textDocumentEdit").?.object.get("edits").?.array.items;
+    const edits = changes[0].object.get("edits").?.array.items;
     try std.testing.expectEqual(@as(usize, 2), edits.len);
 
     for (edits) |edit| {
@@ -299,7 +299,7 @@ test "lsp rename edits every indexed file that references the symbol" {
     var saw_helper = false;
     var saw_main = false;
     for (changes) |change| {
-        const tde = change.object.get("textDocumentEdit").?.object;
+        const tde = change.object;
         const uri = tde.get("textDocument").?.object.get("uri").?.string;
         const edits = tde.get("edits").?.array.items;
         try std.testing.expect(edits.len >= 1);
@@ -342,9 +342,16 @@ test "lsp prepare rename returns the identifier range, or null off an identifier
         defer parsed.deinit();
         const result = parsed.value.object.get("result").?.object;
         try std.testing.expectEqualStrings("foo", result.get("placeholder").?.string);
-        const start = result.get("range").?.object.get("start").?.object;
+        const range = result.get("range").?.object;
+        const start = range.get("start").?.object;
         try std.testing.expectEqual(@as(i64, 0), start.get("line").?.integer);
         try std.testing.expectEqual(@as(i64, 6), start.get("character").?.integer);
+        // The range must END where `foo` ends (col 9), not one short or one
+        // long — a span-width off-by-one in the 1↔0-indexed conversion would
+        // rename only `fo`/`foo `.
+        const end = range.get("end").?.object;
+        try std.testing.expectEqual(@as(i64, 0), end.get("line").?.integer);
+        try std.testing.expectEqual(@as(i64, 9), end.get("character").?.integer);
     }
 
     // Off any identifier (on `=`): null, so the client blocks the rename.
@@ -419,7 +426,7 @@ test "lsp rename of a module member edits the module declaration and the access"
     var saw_other = false;
     var saw_importer2 = false;
     for (changes) |change| {
-        const tde = change.object.get("textDocumentEdit").?.object;
+        const tde = change.object;
         const uri = tde.get("textDocument").?.object.get("uri").?.string;
         const edits = tde.get("edits").?.array.items;
         try std.testing.expect(edits.len >= 1);
@@ -475,7 +482,7 @@ test "lsp rename is scoped to the binding, not every same-named identifier" {
 
     const changes = parsed.value.object.get("result").?.object.get("documentChanges").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), changes.len);
-    const edits = changes[0].object.get("textDocumentEdit").?.object.get("edits").?.array.items;
+    const edits = changes[0].object.get("edits").?.array.items;
 
     // Only the two occurrences inside function a (lines 1 and 2) are renamed;
     // function b's `x` on lines 5 and 6 is a different binding and left alone.
@@ -522,7 +529,7 @@ test "lsp rename ignores strings and comments" {
     defer parsed.deinit();
 
     const changes = parsed.value.object.get("result").?.object.get("documentChanges").?.array.items;
-    const edits = changes[0].object.get("textDocumentEdit").?.object.get("edits").?.array.items;
+    const edits = changes[0].object.get("edits").?.array.items;
     try std.testing.expectEqual(@as(usize, 2), edits.len);
     for (edits) |edit| {
         try std.testing.expectEqualStrings("bar", edit.object.get("newText").?.string);
@@ -1296,9 +1303,14 @@ test "lsp code action adds an inferred type annotation" {
     try std.testing.expectEqual(@as(usize, 1), actions.len);
     const action = actions[0].object;
     try std.testing.expectEqualStrings("Add type annotation: Int", action.get("title").?.string);
+    // CodeActionKind is a protocol string ("refactor.rewrite"), not a numeric
+    // enum code — assert it stays a string so the classification reaches clients.
+    if (action.get("kind")) |kind| {
+        try std.testing.expect(kind == .string);
+    }
 
     const edits = action.get("edit").?.object.get("documentChanges").?.array
-        .items[0].object.get("textDocumentEdit").?.object.get("edits").?.array.items;
+        .items[0].object.get("edits").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), edits.len);
     try std.testing.expectEqualStrings(": Int", edits[0].object.get("newText").?.string);
     // Inserted right after the identifier `x` (column 7 on line 0).
@@ -1767,7 +1779,12 @@ test "lsp hover shows execution result type for bound command" {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
     defer parsed.deinit();
 
-    const value = parsed.value.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    const contents = parsed.value.object.get("result").?.object.get("contents").?.object;
+    // MarkupContent.kind is a MarkupKind, which the protocol encodes as a STRING
+    // ("markdown"/"plaintext") — not a numeric code like the other kind enums.
+    const kind = contents.get("kind").?.string;
+    try std.testing.expect(std.mem.eql(u8, kind, "markdown") or std.mem.eql(u8, kind, "plaintext"));
+    const value = contents.get("value").?.string;
     try std.testing.expect(std.mem.indexOf(u8, value, "ExecutionResult") != null);
 }
 
@@ -2127,6 +2144,448 @@ test "lsp single-level member completion recovers scope after a trailing dot" {
     try std.testing.expectEqualStrings("", result.stderr);
 }
 
+test "lsp initialize advertises capabilities with the correct wire shape" {
+    const allocator = std.testing.allocator;
+    const messages = [_][]const u8{
+        try makeInitialize(allocator, 1, true),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 1);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    // Envelope: a success response carries jsonrpc "2.0" + result and MUST NOT
+    // carry a stray `error` field. sendJson serializes with
+    // emit_null_optional_fields = false so the JSON-RPC result-XOR-error shape
+    // holds; a regression to emit-nulls would put `"error": null` here.
+    try std.testing.expectEqualStrings("2.0", root.get("jsonrpc").?.string);
+    try std.testing.expect(root.get("result") != null);
+    try std.testing.expect(root.get("error") == null);
+
+    const caps = root.get("result").?.object.get("capabilities").?.object;
+
+    // textDocumentSync is an Either(options, kind): it must unwrap to the bare
+    // options object (never a `{"textDocumentSyncOptions": ...}` tag envelope),
+    // and its `change` must be the numeric TextDocumentSyncKind, not a tag name.
+    const sync = caps.get("textDocumentSync").?.object;
+    try std.testing.expect(sync.get("textDocumentSyncOptions") == null);
+    try std.testing.expectEqual(true, sync.get("openClose").?.bool);
+    try std.testing.expectEqual(@as(i64, 2), sync.get("change").?.integer); // incremental
+
+    // A bool-or-options Either capability likewise unwraps to its options object.
+    const rename = caps.get("renameProvider").?.object;
+    try std.testing.expect(rename.get("renameOptions") == null);
+    try std.testing.expectEqual(true, rename.get("prepareProvider").?.bool);
+
+    // completionProvider carries resolveProvider + trigger characters.
+    const completion_provider = caps.get("completionProvider").?.object;
+    try std.testing.expectEqual(true, completion_provider.get("resolveProvider").?.bool);
+    try std.testing.expect(completion_provider.get("triggerCharacters").?.array.items.len > 0);
+
+    // The rest of the advertised providers must be present.
+    const providers = [_][]const u8{
+        "definitionProvider",        "referencesProvider",
+        "hoverProvider",             "documentSymbolProvider",
+        "documentHighlightProvider", "documentLinkProvider",
+        "inlayHintProvider",         "foldingRangeProvider",
+        "codeActionProvider",        "workspaceSymbolProvider",
+    };
+    for (providers) |name| {
+        try std.testing.expect(caps.get(name) != null);
+    }
+}
+
+test "lsp success responses carry a result and omit the error field" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const uri = try fixture.writeDocument("main.rn",
+        \\const foo = 1
+        \\
+    );
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri,
+            \\const foo = 1
+            \\
+        ),
+        try makeDocumentSymbolRequest(allocator, 2, uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    // A normal (non-initialize) success response must also be result-XOR-error:
+    // the `result` is present and the `error` field is absent, not `null`.
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("2.0", root.get("jsonrpc").?.string);
+    try std.testing.expect(root.get("result") != null);
+    try std.testing.expect(root.get("error") == null);
+}
+
+// A single edit/location range, flattened for exact-coordinate assertions.
+const RangeSpan = struct {
+    line: i64,
+    start_char: i64,
+    end_line: i64,
+    end_char: i64,
+    new_text: []const u8,
+};
+
+fn spanOf(obj: std.json.ObjectMap, new_text_key: ?[]const u8) RangeSpan {
+    const range = obj.get("range").?.object;
+    const start = range.get("start").?.object;
+    const end = range.get("end").?.object;
+    return .{
+        .line = start.get("line").?.integer,
+        .start_char = start.get("character").?.integer,
+        .end_line = end.get("line").?.integer,
+        .end_char = end.get("character").?.integer,
+        .new_text = if (new_text_key) |k| obj.get(k).?.string else "",
+    };
+}
+
+test "lsp rename edits span exactly the identifier at precise coordinates" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    // `alpha` appears at (0,6)-(0,11) and (1,13)-(1,18): non-zero line and a
+    // non-zero column, so both the line and character conversions are exercised,
+    // and the 5-char span guards the range width.
+    const source =
+        \\const alpha = 1
+        \\const beta = alpha
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeRenameRequest(allocator, 2, uri, 0, 6, "renamed"),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const changes = parsed.value.object.get("result").?.object.get("documentChanges").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
+    const edits = changes[0].object.get("edits").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), edits.len);
+
+    var saw_decl = false;
+    var saw_use = false;
+    for (edits) |edit| {
+        const span = spanOf(edit.object, "newText");
+        try std.testing.expectEqualStrings("renamed", span.new_text);
+        // Every edit is single-line and spans exactly the 5 chars of `alpha`.
+        try std.testing.expectEqual(span.line, span.end_line);
+        try std.testing.expectEqual(span.start_char + 5, span.end_char);
+        if (span.line == 0 and span.start_char == 6) saw_decl = true;
+        if (span.line == 1 and span.start_char == 13) saw_use = true;
+    }
+    try std.testing.expect(saw_decl);
+    try std.testing.expect(saw_use);
+}
+
+test "lsp references report exact identifier ranges" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    // `count` at declaration (0,6)-(0,11) and use (1,8)-(1,13) — inside the
+    // interpolation `echo "${count}"`, where `${` occupies cols 6-7.
+    const source =
+        \\const count = 3
+        \\echo "${count}"
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeReferencesRequest(allocator, 2, uri, 0, 6, true),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const results = parsed.value.object.get("result").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+
+    var saw_decl = false;
+    var saw_use = false;
+    for (results) |item| {
+        try std.testing.expectEqualStrings(uri, item.object.get("uri").?.string);
+        const span = spanOf(item.object, null);
+        // Every occurrence is single-line and spans exactly `count` (5 chars).
+        try std.testing.expectEqual(span.line, span.end_line);
+        try std.testing.expectEqual(span.start_char + 5, span.end_char);
+        if (span.line == 0 and span.start_char == 6) saw_decl = true;
+        if (span.line == 1 and span.start_char == 8) saw_use = true;
+    }
+    try std.testing.expect(saw_decl);
+    try std.testing.expect(saw_use);
+}
+
+test "lsp survives out-of-bounds position requests" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const uri = try fixture.writeDocument("main.rn",
+        \\const foo = 1
+        \\
+    );
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri,
+            \\const foo = 1
+            \\
+        ),
+        // A line far past EOF and an over-long character — both used to run the
+        // position scan off the end of the buffer and crash the server.
+        try makeHoverRequest(allocator, 2, uri, 999, 999),
+        try makeDefinitionRequest(allocator, 3, uri, 0, 999),
+        // A valid request afterwards must still be answered — proof the server
+        // stayed alive through the out-of-bounds ones.
+        try makeDocumentSymbolRequest(allocator, 4, uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    // Each out-of-bounds request gets a well-formed response instead of taking
+    // the server down.
+    for ([_]i64{ 2, 3 }) |id| {
+        const response = try findResponseById(allocator, output, id);
+        defer allocator.free(response.body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("result") != null);
+    }
+
+    // The later valid request was still served.
+    const final = try findResponseById(allocator, output, 4);
+    defer allocator.free(final.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, final.body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("result").?.array.items.len >= 1);
+}
+
+test "lsp returns method-not-found for an unknown request method" {
+    const allocator = std.testing.allocator;
+    const request = try toJsonAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .id = 7,
+        .method = "textDocument/thisMethodDoesNotExist",
+        .params = .{},
+    });
+    const messages = [_][]const u8{request};
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 7);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    // Error response: `error` present with the JSON-RPC method-not-found code,
+    // and no `result` field (result-XOR-error).
+    const root = parsed.value.object;
+    try std.testing.expect(root.get("result") == null);
+    const err = root.get("error").?.object;
+    try std.testing.expectEqual(@as(i64, -32601), err.get("code").?.integer);
+}
+
+test "lsp rejects a second initialize with an already-initialized error" {
+    const allocator = std.testing.allocator;
+    const messages = [_][]const u8{
+        try makeInitialize(allocator, 1, true),
+        try makeInitialize(allocator, 2, true),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    // First initialize succeeds.
+    {
+        const response = try findResponseById(allocator, output, 1);
+        defer allocator.free(response.body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("result") != null);
+        try std.testing.expect(parsed.value.object.get("error") == null);
+    }
+    // The second is rejected as invalid (-32600), not silently re-run.
+    {
+        const response = try findResponseById(allocator, output, 2);
+        defer allocator.free(response.body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("result") == null);
+        const err = parsed.value.object.get("error").?.object;
+        try std.testing.expectEqual(@as(i64, -32600), err.get("code").?.integer);
+    }
+}
+
+test "lsp clears diagnostics once an invalid document is fixed" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const uri = try fixture.writeDocument("main.rn",
+        \\const foo =
+        \\
+    );
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        // Open with an incomplete binding (a parse error), then fix it.
+        try makeDidOpen(allocator, uri,
+            \\const foo =
+            \\
+        ),
+        try makeDidChangeWholeDocument(allocator, uri, 2,
+            \\const foo = 1
+            \\
+        ),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    // The first publish (on open) reports the error.
+    {
+        const first = try findMethodNotification(allocator, output, "textDocument/publishDiagnostics");
+        defer allocator.free(first);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, first, .{});
+        defer parsed.deinit();
+        const diagnostics = parsed.value.object.get("params").?.object.get("diagnostics").?.array.items;
+        try std.testing.expect(diagnostics.len > 0);
+    }
+
+    // After the fix, the server MUST republish an empty diagnostics array to
+    // clear the editor — not simply stop publishing, which would leave the stale
+    // error on screen.
+    {
+        const last = try findLastMethodNotification(allocator, output, "textDocument/publishDiagnostics");
+        defer allocator.free(last);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, last, .{});
+        defer parsed.deinit();
+        const params = parsed.value.object.get("params").?.object;
+        try std.testing.expectEqualStrings(uri, params.get("uri").?.string);
+        try std.testing.expectEqual(@as(usize, 0), params.get("diagnostics").?.array.items.len);
+    }
+}
+
+test "lsp survives a malformed request body" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const uri = try fixture.writeDocument("main.rn",
+        \\const foo = 1
+        \\
+    );
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        // A body that is framed correctly but is not valid JSON — it must be
+        // dropped, not end the session.
+        try allocator.dupe(u8, "{ this is : not valid json ]"),
+        // A valid session afterwards must still be served.
+        try makeDidOpen(allocator, uri,
+            \\const foo = 1
+            \\
+        ),
+        try makeDocumentSymbolRequest(allocator, 2, uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    // The request after the malformed one was answered → the server stayed up.
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("result") != null);
+}
+
+test "lsp handles navigation requests for a never-opened document" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    // The file exists on disk but is never sent via didOpen, so the server has
+    // no in-memory copy. Every position handler must degrade to a null/empty
+    // result rather than dereferencing the missing document.
+    const uri = try fixture.writeDocument("ghost.rn",
+        \\const foo = 1
+        \\echo foo
+        \\
+    );
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeHoverRequest(allocator, 1, uri, 1, 5),
+        try makeDefinitionRequest(allocator, 2, uri, 1, 5),
+        try makeReferencesRequest(allocator, 3, uri, 0, 6, true),
+        try makeRenameRequest(allocator, 4, uri, 0, 6, "bar"),
+        try makeDocumentSymbolRequest(allocator, 5, uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    // Every request gets a well-formed response (the `result` key is present),
+    // proving none of the handlers crashed on the missing document.
+    for ([_]i64{ 1, 2, 3, 4, 5 }) |id| {
+        const response = try findResponseById(allocator, output, id);
+        defer allocator.free(response.body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("result") != null);
+    }
+}
+
 const TestFixture = struct {
     allocator: Allocator,
     tmp_dir: std.testing.TmpDir,
@@ -2274,6 +2733,37 @@ fn findMethodNotification(allocator: Allocator, output: []const u8, wanted_metho
     }
 
     return error.ResponseNotFound;
+}
+
+/// Like findMethodNotification, but returns the LAST matching notification —
+/// used when a method is published more than once (e.g. diagnostics republished
+/// after an edit) and the test cares about the final state.
+fn findLastMethodNotification(allocator: Allocator, output: []const u8, wanted_method: []const u8) ![]u8 {
+    var offset: usize = 0;
+    var last: ?[]u8 = null;
+    errdefer if (last) |l| allocator.free(l);
+    while (offset < output.len) {
+        const header_end_rel = std.mem.indexOfPos(u8, output, offset, "\r\n\r\n") orelse break;
+        const header_block = output[offset..header_end_rel];
+        const content_length = parseContentLength(header_block) orelse break;
+        const body_start = header_end_rel + 4;
+        const body_end = body_start + content_length;
+        if (body_end > output.len) break;
+
+        const body = output[body_start..body_end];
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+        defer parsed.deinit();
+
+        const method = parsed.value.object.get("method");
+        if (method != null and method.? == .string and std.mem.eql(u8, method.?.string, wanted_method)) {
+            if (last) |l| allocator.free(l);
+            last = try allocator.dupe(u8, body);
+        }
+
+        offset = body_end;
+    }
+
+    return last orelse error.ResponseNotFound;
 }
 
 fn parseContentLength(headers: []const u8) ?usize {

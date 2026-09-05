@@ -1,0 +1,4 @@
+// A lone `$` in a string (not starting a `${...}` interpolation) is literal
+// text. This used to hang the lexer in an infinite loop.
+const label = "cost is $5, $r and a bare $ stay literal"
+echo "${label}"

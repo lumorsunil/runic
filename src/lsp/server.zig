@@ -119,7 +119,16 @@ pub const Server = struct {
     }
 
     fn handleEnvelope(self: *Server, envelopePayload: []u8) !bool {
-        const parsed: std.json.Parsed(types.ClientRequest) = try std.json.parseFromSlice(types.ClientRequest, self.allocator, envelopePayload, .{ .ignore_unknown_fields = true });
+        // A malformed body (invalid JSON, or JSON that isn't a well-formed
+        // request) must not end the session: drop it and keep serving. Erroring
+        // here would propagate out of run() and kill the server on a single bad
+        // message. We can't reliably recover an id from an unparseable body, so
+        // there is no response to send — dropping is the correct, resilient
+        // behavior.
+        const parsed: std.json.Parsed(types.ClientRequest) = std.json.parseFromSlice(types.ClientRequest, self.allocator, envelopePayload, .{ .ignore_unknown_fields = true }) catch |err| {
+            try self.log("dropping malformed request: {}", .{err});
+            return true;
+        };
         defer parsed.deinit();
 
         const request = parsed.value;
@@ -358,9 +367,11 @@ pub const Server = struct {
 
         try self.workspace.resetRoots(roots.items);
         try self.workspace.refresh();
-        if (has_explicit_root) self.workspace.indexWorkspace();
+        // The workspace scan is deferred to the first workspace-wide request
+        // (see Workspace.ensureIndexed); initialize must return promptly and
+        // never block on parsing every file under the root.
+        self.workspace.should_index = has_explicit_root;
         self.initialized = true;
-        try self.log("workspace indexed {d} documents", .{self.documents.map.count()});
         try self.sendInitializeResult(id);
     }
 
@@ -842,6 +853,7 @@ pub const Server = struct {
         id: types.RequestId,
         params: types.DefinitionParams,
     ) !void {
+        self.workspace.ensureIndexed();
         const path = try self.resolveUriPath(params.textDocument.uri);
         defer self.allocator.free(path);
 
@@ -964,6 +976,7 @@ pub const Server = struct {
         id: types.RequestId,
         params: types.ReferenceParams,
     ) !void {
+        self.workspace.ensureIndexed();
         const path = try self.resolveUriPath(params.textDocument.uri);
         defer self.allocator.free(path);
 
@@ -1459,6 +1472,7 @@ pub const Server = struct {
         id: types.RequestId,
         params: types.WorkspaceSymbolParams,
     ) !void {
+        self.workspace.ensureIndexed();
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const arena_allocator = arena.allocator();
@@ -1563,6 +1577,7 @@ pub const Server = struct {
         id: types.RequestId,
         params: types.RenameParams,
     ) !void {
+        self.workspace.ensureIndexed();
         const path = try self.resolveUriPath(params.textDocument.uri);
         defer self.allocator.free(path);
 
@@ -1919,11 +1934,18 @@ pub const Server = struct {
     }
 
     fn sendJson(self: *Server, json_body: anytype) !void {
-        try self.log("Sent JSON: {f}", .{std.json.fmt(json_body, .{ .emit_null_optional_fields = false })});
+        // The wire and the log MUST use the same options, or the JSON you
+        // inspect while debugging differs from what the client actually
+        // receives. `emit_null_optional_fields = false` also keeps responses on
+        // the JSON-RPC result-XOR-error shape (no stray `"error": null` beside a
+        // result). An explicit null result is passed as `std.json.Value.null`,
+        // whose optional wrapper is non-null, so it still serializes.
+        const options: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
+        try self.log("Sent JSON: {f}", .{std.json.fmt(json_body, options)});
 
         var buffer: [MAX_OUT_CONTENT]u8 = undefined;
         var writer = std.Io.Writer.fixed(&buffer);
-        try writer.print("{f}", .{std.json.fmt(json_body, .{})});
+        try writer.print("{f}", .{std.json.fmt(json_body, options)});
         const body = writer.buffered();
 
         try self.writer.print("Content-Length: {d}\r\n\r\n", .{body.len});
