@@ -1296,6 +1296,11 @@ test "lsp code action adds an inferred type annotation" {
     try std.testing.expectEqual(@as(usize, 1), actions.len);
     const action = actions[0].object;
     try std.testing.expectEqualStrings("Add type annotation: Int", action.get("title").?.string);
+    // CodeActionKind is a protocol string ("refactor.rewrite"), not a numeric
+    // enum code — assert it stays a string so the classification reaches clients.
+    if (action.get("kind")) |kind| {
+        try std.testing.expect(kind == .string);
+    }
 
     const edits = action.get("edit").?.object.get("documentChanges").?.array
         .items[0].object.get("edits").?.array.items;
@@ -1767,7 +1772,12 @@ test "lsp hover shows execution result type for bound command" {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
     defer parsed.deinit();
 
-    const value = parsed.value.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    const contents = parsed.value.object.get("result").?.object.get("contents").?.object;
+    // MarkupContent.kind is a MarkupKind, which the protocol encodes as a STRING
+    // ("markdown"/"plaintext") — not a numeric code like the other kind enums.
+    const kind = contents.get("kind").?.string;
+    try std.testing.expect(std.mem.eql(u8, kind, "markdown") or std.mem.eql(u8, kind, "plaintext"));
+    const value = contents.get("value").?.string;
     try std.testing.expect(std.mem.indexOf(u8, value, "ExecutionResult") != null);
 }
 
@@ -2125,6 +2135,99 @@ test "lsp single-level member completion recovers scope after a trailing dot" {
     // The scratch recovery document was closed again, leaving only the real one.
     try std.testing.expectEqual(@as(usize, 1), result.doc_count);
     try std.testing.expectEqualStrings("", result.stderr);
+}
+
+test "lsp initialize advertises capabilities with the correct wire shape" {
+    const allocator = std.testing.allocator;
+    const messages = [_][]const u8{
+        try makeInitialize(allocator, 1, true),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 1);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    // Envelope: a success response carries jsonrpc "2.0" + result and MUST NOT
+    // carry a stray `error` field. sendJson serializes with
+    // emit_null_optional_fields = false so the JSON-RPC result-XOR-error shape
+    // holds; a regression to emit-nulls would put `"error": null` here.
+    try std.testing.expectEqualStrings("2.0", root.get("jsonrpc").?.string);
+    try std.testing.expect(root.get("result") != null);
+    try std.testing.expect(root.get("error") == null);
+
+    const caps = root.get("result").?.object.get("capabilities").?.object;
+
+    // textDocumentSync is an Either(options, kind): it must unwrap to the bare
+    // options object (never a `{"textDocumentSyncOptions": ...}` tag envelope),
+    // and its `change` must be the numeric TextDocumentSyncKind, not a tag name.
+    const sync = caps.get("textDocumentSync").?.object;
+    try std.testing.expect(sync.get("textDocumentSyncOptions") == null);
+    try std.testing.expectEqual(true, sync.get("openClose").?.bool);
+    try std.testing.expectEqual(@as(i64, 2), sync.get("change").?.integer); // incremental
+
+    // A bool-or-options Either capability likewise unwraps to its options object.
+    const rename = caps.get("renameProvider").?.object;
+    try std.testing.expect(rename.get("renameOptions") == null);
+    try std.testing.expectEqual(true, rename.get("prepareProvider").?.bool);
+
+    // completionProvider carries resolveProvider + trigger characters.
+    const completion_provider = caps.get("completionProvider").?.object;
+    try std.testing.expectEqual(true, completion_provider.get("resolveProvider").?.bool);
+    try std.testing.expect(completion_provider.get("triggerCharacters").?.array.items.len > 0);
+
+    // The rest of the advertised providers must be present.
+    const providers = [_][]const u8{
+        "definitionProvider",        "referencesProvider",
+        "hoverProvider",             "documentSymbolProvider",
+        "documentHighlightProvider", "documentLinkProvider",
+        "inlayHintProvider",         "foldingRangeProvider",
+        "codeActionProvider",        "workspaceSymbolProvider",
+    };
+    for (providers) |name| {
+        try std.testing.expect(caps.get(name) != null);
+    }
+}
+
+test "lsp success responses carry a result and omit the error field" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const uri = try fixture.writeDocument("main.rn",
+        \\const foo = 1
+        \\
+    );
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri,
+            \\const foo = 1
+            \\
+        ),
+        try makeDocumentSymbolRequest(allocator, 2, uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    // A normal (non-initialize) success response must also be result-XOR-error:
+    // the `result` is present and the `error` field is absent, not `null`.
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("2.0", root.get("jsonrpc").?.string);
+    try std.testing.expect(root.get("result") != null);
+    try std.testing.expect(root.get("error") == null);
 }
 
 const TestFixture = struct {
