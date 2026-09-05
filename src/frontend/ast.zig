@@ -880,6 +880,7 @@ pub const Expression = union(enum) {
     catch_expr: CatchExpr,
     is_expr: IsExpr,
     import_expr: ImportExpr,
+    cimport_expr: CImportExpr,
     assignment: Assignment,
     executable: ExecutableExpr,
     builtin: BuiltinExpr,
@@ -1667,6 +1668,40 @@ pub const ImportExpr = struct {
         const type_expr = try allocator.create(TypeExpr);
         type_expr.* = .{ .module = .{ .path = module_path, .span = self.span } };
         return type_expr;
+    }
+};
+
+/// A single `extern fn name(params) ReturnType` declaration inside a `cimport`
+/// block. Unlike a `FunctionDecl` it has no body and no stdin/stdout stream
+/// types; its parameter and return types are C types (from `std.ffi`, written
+/// qualified like `c.Double`). Parameters reuse `Parameter` (name + type
+/// annotation); defaults are not allowed.
+pub const ExternFn = struct {
+    name: Identifier,
+    params: []const *Parameter,
+    return_type: *const TypeExpr,
+    span: Span,
+};
+
+/// `cimport "libname" { extern fn … }` — loads a C dynamic library and declares
+/// the functions called from it. Binds like a module value whose members are
+/// the declared externs. `library_name` is a soname (`"libm.so.6"`) resolved by
+/// the system loader or a relative/absolute path resolved against `importer`.
+pub const CImportExpr = struct {
+    importer: []const u8,
+    library_name: []const u8,
+    externs: []const ExternFn,
+    span: Span,
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.Io,
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*const TypeExpr {
+        // Giving the cimport value a module-like type (members = the externs)
+        // is a later phase; the frontend only parses the block.
+        return null;
     }
 };
 

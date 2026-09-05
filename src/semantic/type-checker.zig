@@ -1572,7 +1572,7 @@ pub const TypeChecker = struct {
             .struct_literal => |struct_literal| for (struct_literal.fields) |field| {
                 try self.validateFunctionBodyStdin(scope, field.value, enclosing_stdin);
             },
-            .fn_decl, .identifier, .env_var, .path, .literal, .pipeline_deprecated, .import_expr, .executable, .builtin, .fd => {},
+            .fn_decl, .identifier, .env_var, .path, .literal, .pipeline_deprecated, .import_expr, .cimport_expr, .executable, .builtin, .fd => {},
         }
     }
 

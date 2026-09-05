@@ -668,6 +668,7 @@ pub const Parser = struct {
             .kw_pub => self.parsePub(),
             .kw_fn => self.parseFn(null),
             .kw_import => self.parseImportExpression(),
+            .kw_cimport => self.parseCImportExpression(),
             .identifier => self.parseIdentifierExpression(),
             .kw_if => self.parseIfExpression(),
             .kw_for => self.parseForExpression(),
@@ -1897,6 +1898,74 @@ pub const Parser = struct {
             .call = call.call,
             .span = start.span.endAt(call.span()),
         } });
+    }
+
+    /// Parses `cimport "libname" { extern fn … }`. The library name is a plain
+    /// string literal (no interpolation); the block holds zero or more
+    /// `extern fn` declarations.
+    pub fn parseCImportExpression(self: *Self) Error!*ast.Expression {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const start = try self.expectTokenTag(.kw_cimport);
+
+        const next = try self.peekToken();
+        if (next.tag != .string_start) {
+            try self.reportParseError(
+                Error.UnexpectedToken,
+                next.span,
+                "expected the C library name as a string literal, actual: {s}",
+                .{next.lexeme},
+            );
+            return Error.UnexpectedToken;
+        }
+        const lib_literal = try self.parseStringLiteral();
+        const library_name = try self.stringLiteralToString(lib_literal);
+
+        _ = try self.expectTokenTag(.l_brace);
+
+        var externs = std.ArrayList(ast.ExternFn).empty;
+        defer externs.deinit(self.allocator);
+
+        while (true) {
+            self.skipNewlines();
+            if ((try self.peekToken()).tag == .r_brace) break;
+            try externs.append(self.allocator, try self.parseExternFn());
+        }
+
+        const close = try self.expectTokenTag(.r_brace);
+
+        return self.allocExpression(.{ .cimport_expr = .{
+            .importer = self.path,
+            .library_name = library_name,
+            .externs = try self.copyToArena(ast.ExternFn, externs.items),
+            .span = start.span.endAt(close.span),
+        } });
+    }
+
+    /// Parses one `extern fn name(name: c.Type, …) c.ReturnType` inside a
+    /// `cimport` block. No body, no stdin/stdout stream types; parameters reuse
+    /// `parseParam` (name + type annotation) and the return type is required.
+    fn parseExternFn(self: *Self) Error!ast.ExternFn {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const start = try self.expectTokenTag(.kw_extern);
+        _ = try self.expectTokenTag(.kw_fn);
+        const name = try self.expectTokenTag(.identifier);
+        _ = try self.expectTokenTag(.l_paren);
+        const params = try self.parseList(.comma, parseParam, .{
+            .terminators = .list(&.{.r_paren}),
+        });
+        _ = try self.expectTokenTag(.r_paren);
+        const return_type = try self.parseTypeExpr();
+
+        return .{
+            .name = .{ .name = name.lexeme, .span = name.span },
+            .params = params.payload,
+            .return_type = return_type,
+            .span = start.span.endAt(return_type.span()),
+        };
     }
 
     pub fn expectEnd(self: *Self) Error!void {
@@ -4172,6 +4241,92 @@ test "parser rejects interpolation in import module names" {
     const allocator = gpa.allocator();
 
     const src = "import \"foo${name}\"";
+    var tp: TestParser = undefined;
+    tp.init(allocator);
+    const parser = &tp.parser;
+    defer tp.deinit();
+
+    try std.testing.expectError(Error.StringInterpNotAllowed, parser.parseSource(src));
+}
+
+test "parser builds a cimport block with extern fn declarations" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const src =
+        \\const m = cimport "libm.so.6" {
+        \\    extern fn cos(x: c.Double) c.Double
+        \\    extern fn pow(base: c.Double, exp: c.Double) c.Double
+        \\}
+    ;
+    var tp: TestParser = undefined;
+    tp.init(allocator);
+    const parser = &tp.parser;
+    defer tp.deinit();
+
+    const script = try parser.parseSource(src);
+    try std.testing.expectEqual(@as(usize, 1), script.statements.len);
+    const initializer = script.statements[0].binding_decl.initializer;
+    try std.testing.expect(initializer.* == .cimport_expr);
+    const cimport = initializer.cimport_expr;
+
+    try std.testing.expectEqualStrings("libm.so.6", cimport.library_name);
+    try std.testing.expectEqual(@as(usize, 2), cimport.externs.len);
+
+    // First extern: cos(x: c.Double) c.Double.
+    const cos = cimport.externs[0];
+    try std.testing.expectEqualStrings("cos", cos.name.name);
+    try std.testing.expectEqual(@as(usize, 1), cos.params.len);
+
+    // The parameter type is the qualified path `c.Double` (a two-segment
+    // `.identifier` type — the qualified-annotation form the FFI surface needs).
+    const ptype = cos.params[0].type_annotation.?;
+    try std.testing.expect(ptype.* == .identifier);
+    const segs = ptype.identifier.path.segments;
+    try std.testing.expectEqual(@as(usize, 2), segs.len);
+    try std.testing.expectEqualStrings("c", segs[0].name);
+    try std.testing.expectEqualStrings("Double", segs[1].name);
+
+    // Return type is also `c.Double`.
+    try std.testing.expect(cos.return_type.* == .identifier);
+    const ret_segs = cos.return_type.identifier.path.segments;
+    try std.testing.expectEqual(@as(usize, 2), ret_segs.len);
+    try std.testing.expectEqualStrings("Double", ret_segs[1].name);
+
+    // Second extern: pow(base, exp) — two parameters.
+    const pow = cimport.externs[1];
+    try std.testing.expectEqualStrings("pow", pow.name.name);
+    try std.testing.expectEqual(@as(usize, 2), pow.params.len);
+}
+
+test "parser builds an empty cimport block" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const src =
+        \\const m = cimport "libfoo.so" {
+        \\}
+    ;
+    var tp: TestParser = undefined;
+    tp.init(allocator);
+    const parser = &tp.parser;
+    defer tp.deinit();
+
+    const script = try parser.parseSource(src);
+    const initializer = script.statements[0].binding_decl.initializer;
+    try std.testing.expect(initializer.* == .cimport_expr);
+    try std.testing.expectEqualStrings("libfoo.so", initializer.cimport_expr.library_name);
+    try std.testing.expectEqual(@as(usize, 0), initializer.cimport_expr.externs.len);
+}
+
+test "parser rejects interpolation in a cimport library name" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const src = "const m = cimport \"lib${x}.so\" { }";
     var tp: TestParser = undefined;
     tp.init(allocator);
     const parser = &tp.parser;

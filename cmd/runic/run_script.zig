@@ -297,7 +297,7 @@ const StatementExpressionIterator = struct {
     fn populateStackExpr(self: *StatementExpressionIterator, expr: *runic.ast.Expression) !void {
         const cursor = &self.cursor;
         switch (expr.*) {
-            .identifier, .env_var, .path, .literal, .map, .import_expr, .pipeline_deprecated, .builtin, .fd => {},
+            .identifier, .env_var, .path, .literal, .map, .import_expr, .cimport_expr, .pipeline_deprecated, .builtin, .fd => {},
             .array => |array| try cursor.appendExpressions(array.elements),
             .struct_literal => |struct_literal| for (struct_literal.fields) |field| try cursor.appendExpr(field.value),
             .range => |range| {
