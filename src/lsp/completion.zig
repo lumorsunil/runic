@@ -7,6 +7,14 @@ const ast = runic.ast;
 
 const Allocator = std.mem.Allocator;
 
+/// The C types exported by `std.ffi` (`c.Double`, …), offered when completing a
+/// member of the marker module. Kept in sync with `std/ffi.rn` and
+/// `src/ffi/ctype.zig`.
+const ffi_c_type_names = [_][]const u8{
+    "Int",   "UInt",  "Long",   "ULong", "Short", "UShort", "Char",
+    "SizeT", "Float", "Double", "Bool",  "Str",   "Ptr",    "Void",
+};
+
 pub const MatchList = struct {
     allocator: Allocator,
     items: std.ArrayList(Match),
@@ -347,6 +355,15 @@ fn appendMembersForType(
     switch (type_expr.*) {
         .alias => |alias_type| try appendMembersForType(matches, context, type_checker, type_checker.resolveAliasType(&alias_type), detail),
         .module => |module_type| {
+            // std.ffi is a compiler-recognized marker module with no members of
+            // its own; offer its C types (used in an extern fn signature). See
+            // future/c-ffi.md.
+            if (std.mem.eql(u8, module_type.path, ":std/ffi")) {
+                for (ffi_c_type_names) |name| {
+                    try appendOwnedMatch(matches, context.allocator, .@"struct", name, "C type", .global);
+                }
+                return;
+            }
             if (try type_checker.resolveModuleScopeForMemberCompletion(module_type)) |module_scope| {
                 var it = module_scope.bindings.iterator();
                 while (it.next()) |entry| {

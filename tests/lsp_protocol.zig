@@ -2680,6 +2680,80 @@ test "lsp import-path completion offers bundled std submodules" {
     try std.testing.expect(saw_ffi);
 }
 
+/// Runs a single trailing-dot member completion and reports whether each of
+/// `expected` appears among the offered labels.
+fn memberCompletionHas(
+    allocator: Allocator,
+    source: []const u8,
+    line: u32,
+    character: u32,
+    expected: []const []const u8,
+    found: []bool,
+) !void {
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeCompletionRequest(allocator, 2, uri, line, character),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const result = try runServerWithMessagesDetailed(allocator, &messages);
+    defer result.deinit(allocator);
+    const response = try findResponseById(allocator, result.stdout, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const items = parsed.value.object.get("result").?.object.get("items").?.array.items;
+    for (items) |item| {
+        const label = item.object.get("label").?.string;
+        for (expected, found) |want, *seen| {
+            if (std.mem.eql(u8, label, want)) seen.* = true;
+        }
+    }
+}
+
+test "lsp completion offers std submodules after a trailing dot" {
+    const source =
+        \\const std = import "std"
+        \\echo "${std.}"
+        \\
+    ;
+    var found = [_]bool{ false, false, false };
+    try memberCompletionHas(std.testing.allocator, source, 1, 12, &.{ "list", "str", "ffi" }, &found);
+    for (found) |f| try std.testing.expect(f);
+}
+
+test "lsp completion offers cimport externs after a trailing dot" {
+    const source =
+        \\const c = import "std/ffi.rn"
+        \\const m = cimport "libm.so.6" {
+        \\    extern fn pow(base: c.Double, exp: c.Double) c.Double
+        \\    extern fn cos(x: c.Double) c.Double
+        \\}
+        \\echo "${m.}"
+        \\
+    ;
+    var found = [_]bool{ false, false };
+    try memberCompletionHas(std.testing.allocator, source, 5, 10, &.{ "pow", "cos" }, &found);
+    for (found) |f| try std.testing.expect(f);
+}
+
+test "lsp completion offers std.ffi C types after a trailing dot" {
+    const source =
+        \\const c = import "std/ffi.rn"
+        \\echo "${c.}"
+        \\
+    ;
+    var found = [_]bool{ false, false, false };
+    try memberCompletionHas(std.testing.allocator, source, 1, 10, &.{ "Double", "Int", "Ptr" }, &found);
+    for (found) |f| try std.testing.expect(f);
+}
+
 const TestFixture = struct {
     allocator: Allocator,
     tmp_dir: std.testing.TmpDir,
