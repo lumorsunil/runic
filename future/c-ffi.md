@@ -338,6 +338,15 @@ area when no header is available.
 
 ## Phased plan
 
+**Status (2026-09): the MVP is implemented and works end-to-end** — a `cimport`
+block loads a C library via `std.DynLib`, resolves each `extern fn`, and a
+member call (`m.pow 2.0 10.0`) marshals through a statically-linked `libffi`
+and returns the value, in both bound and interpolated positions. Landed on the
+`cffi` branch across phases 0a/0b/1 below; scalar args/returns (int widths,
+float/double, bool, pointer) and `c.Str` *arguments* are supported. Remaining:
+`c.Str` *returns*, structs/varargs, the `cbind` generator, and the
+cross-compile vendoring — see below.
+
 0a. **Language prerequisite — mostly already present (re-verified 2026-09).**
    The critical path for `c.Double` is a *qualified type reference in annotation
    position*, and that already works end-to-end: a module exporting a type

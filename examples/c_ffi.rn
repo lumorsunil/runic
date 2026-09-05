@@ -1,0 +1,35 @@
+// Run with: zig build run -- examples/c_ffi.rn
+// Demonstrates calling C functions from a dynamic library. A `cimport` block
+// loads the library and declares the `extern fn`s to call; the C types come
+// from the `std.ffi` module, written qualified (`c.Double`). See
+// `future/c-ffi.md` for the design. (Linux/glibc: libm.so.6 / libc.so.6.)
+
+// The C types live in std.ffi and are referenced as `c.<Type>`.
+const c = import "std/ffi.rn"
+
+// libm — the C math library. Each `extern fn` names a symbol and its C
+// signature; the result binds like a module value, so `m.pow` is a member.
+const m = cimport "libm.so.6" {
+    extern fn pow(base: c.Double, exp: c.Double) c.Double
+    extern fn cos(x: c.Double) c.Double
+    extern fn sqrt(x: c.Double) c.Double
+}
+
+echo "pow(2, 10) = ${m.pow 2.0 10.0}"
+echo "cos(0)     = ${m.cos 0.0}"
+echo "sqrt(144)  = ${m.sqrt 144.0}"
+
+// A returned value is typed by its C return type, so it composes like any
+// Runic value (here, arithmetic on a Float result).
+const eight = m.pow 2.0 3.0
+echo "2^3 + 1    = ${eight + 1.0}"
+
+// libc — integer and string arguments. A `c.Str` argument is marshalled to a
+// null-terminated C string for the call.
+const libc = cimport "libc.so.6" {
+    extern fn abs(n: c.Int) c.Int
+    extern fn strlen(s: c.Str) c.ULong
+}
+
+echo "abs(-42)      = ${libc.abs (0 - 42)}"
+echo "strlen(hello) = ${libc.strlen "hello"}"
