@@ -30,6 +30,8 @@ fn keywordSymbols(allocator: Allocator) ![]const symbols.Symbol {
         try makeKeyword(allocator, "const", "Define a constant.\n\n```\nconst myConst = 5\n```", "const ${1:name} = ${2:value}"),
         try makeKeyword(allocator, "var", "Define a variable.\n\n```\nvar myConst = 5\nmyConst = 3\n```", "var ${1:name} = ${2:value}"),
         try makeKeyword(allocator, "fn", "Declare a function.\n\n```\nfn Void hello(name: String) Void {\n    echo \"hello ${name}\"\n}\n```", "fn ${1:Void} ${2:name}(${3:params}) ${4:Void} {\n\t$0\n}"),
+        try makeKeyword(allocator, "cimport", "# cimport\nLoad a C dynamic library and declare the functions to call from it. C types come from `std.ffi` (`c.Double`, `c.Int`, …).\n\n```\nconst c = import \"std/ffi.rn\"\nconst m = cimport \"libm.so.6\" {\n    extern fn pow(base: c.Double, exp: c.Double) c.Double\n}\n```", "const ${1:m} = cimport \"${2:libname.so}\" {\n\textern fn ${3:name}(${4:x}: c.${5:Double}) c.${6:Double}\n}"),
+        try makeKeyword(allocator, "extern", "# extern fn\nDeclare a C function inside a `cimport` block. Parameter and return types are `std.ffi` C types.\n\n```\nextern fn pow(base: c.Double, exp: c.Double) c.Double\n```", "extern fn ${1:name}(${2:x}: c.${3:Double}) c.${4:Double}"),
     });
 
     return try list.toOwnedSlice(allocator);

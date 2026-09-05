@@ -2586,6 +2586,36 @@ test "lsp handles navigation requests for a never-opened document" {
     }
 }
 
+test "lsp completion offers the cimport keyword" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const uri = try fixture.writeDocument("main.rn", "ci\n");
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeInitialize(allocator, 1, true),
+        try makeDidOpen(allocator, uri, "ci\n"),
+        try makeCompletionRequest(allocator, 2, uri, 0, 2),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const items = parsed.value.object.get("result").?.object.get("items").?.array.items;
+    var saw_cimport = false;
+    for (items) |item| {
+        if (std.mem.eql(u8, item.object.get("label").?.string, "cimport")) saw_cimport = true;
+    }
+    try std.testing.expect(saw_cimport);
+}
+
 const TestFixture = struct {
     allocator: Allocator,
     tmp_dir: std.testing.TmpDir,

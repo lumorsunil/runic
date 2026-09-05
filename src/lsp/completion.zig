@@ -301,6 +301,10 @@ fn appendPubModuleDeclsFromFile(
     env_map: *std.process.Environ.Map,
     module_path: []const u8,
 ) !void {
+    // Bundled std modules resolve to virtual ":std/…" paths with no file on
+    // disk; openFileAbsolute asserts on a non-absolute path, so skip them (a
+    // `.module`-typed base still completes via appendMembersForType).
+    if (!std.fs.path.isAbsolute(module_path)) return;
     const file = std.Io.Dir.openFileAbsolute(io, module_path, .{}) catch return;
     defer file.close(io);
     var buffer: [1024]u8 = undefined;
