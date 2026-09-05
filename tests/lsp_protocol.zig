@@ -342,9 +342,16 @@ test "lsp prepare rename returns the identifier range, or null off an identifier
         defer parsed.deinit();
         const result = parsed.value.object.get("result").?.object;
         try std.testing.expectEqualStrings("foo", result.get("placeholder").?.string);
-        const start = result.get("range").?.object.get("start").?.object;
+        const range = result.get("range").?.object;
+        const start = range.get("start").?.object;
         try std.testing.expectEqual(@as(i64, 0), start.get("line").?.integer);
         try std.testing.expectEqual(@as(i64, 6), start.get("character").?.integer);
+        // The range must END where `foo` ends (col 9), not one short or one
+        // long — a span-width off-by-one in the 1↔0-indexed conversion would
+        // rename only `fo`/`foo `.
+        const end = range.get("end").?.object;
+        try std.testing.expectEqual(@as(i64, 0), end.get("line").?.integer);
+        try std.testing.expectEqual(@as(i64, 9), end.get("character").?.integer);
     }
 
     // Off any identifier (on `=`): null, so the client blocks the rename.
@@ -2228,6 +2235,125 @@ test "lsp success responses carry a result and omit the error field" {
     try std.testing.expectEqualStrings("2.0", root.get("jsonrpc").?.string);
     try std.testing.expect(root.get("result") != null);
     try std.testing.expect(root.get("error") == null);
+}
+
+// A single edit/location range, flattened for exact-coordinate assertions.
+const RangeSpan = struct {
+    line: i64,
+    start_char: i64,
+    end_line: i64,
+    end_char: i64,
+    new_text: []const u8,
+};
+
+fn spanOf(obj: std.json.ObjectMap, new_text_key: ?[]const u8) RangeSpan {
+    const range = obj.get("range").?.object;
+    const start = range.get("start").?.object;
+    const end = range.get("end").?.object;
+    return .{
+        .line = start.get("line").?.integer,
+        .start_char = start.get("character").?.integer,
+        .end_line = end.get("line").?.integer,
+        .end_char = end.get("character").?.integer,
+        .new_text = if (new_text_key) |k| obj.get(k).?.string else "",
+    };
+}
+
+test "lsp rename edits span exactly the identifier at precise coordinates" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    // `alpha` appears at (0,6)-(0,11) and (1,13)-(1,18): non-zero line and a
+    // non-zero column, so both the line and character conversions are exercised,
+    // and the 5-char span guards the range width.
+    const source =
+        \\const alpha = 1
+        \\const beta = alpha
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeRenameRequest(allocator, 2, uri, 0, 6, "renamed"),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const changes = parsed.value.object.get("result").?.object.get("documentChanges").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
+    const edits = changes[0].object.get("edits").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), edits.len);
+
+    var saw_decl = false;
+    var saw_use = false;
+    for (edits) |edit| {
+        const span = spanOf(edit.object, "newText");
+        try std.testing.expectEqualStrings("renamed", span.new_text);
+        // Every edit is single-line and spans exactly the 5 chars of `alpha`.
+        try std.testing.expectEqual(span.line, span.end_line);
+        try std.testing.expectEqual(span.start_char + 5, span.end_char);
+        if (span.line == 0 and span.start_char == 6) saw_decl = true;
+        if (span.line == 1 and span.start_char == 13) saw_use = true;
+    }
+    try std.testing.expect(saw_decl);
+    try std.testing.expect(saw_use);
+}
+
+test "lsp references report exact identifier ranges" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    // `count` at declaration (0,6)-(0,11) and use (1,8)-(1,13) — inside the
+    // interpolation `echo "${count}"`, where `${` occupies cols 6-7.
+    const source =
+        \\const count = 3
+        \\echo "${count}"
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeReferencesRequest(allocator, 2, uri, 0, 6, true),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const results = parsed.value.object.get("result").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+
+    var saw_decl = false;
+    var saw_use = false;
+    for (results) |item| {
+        try std.testing.expectEqualStrings(uri, item.object.get("uri").?.string);
+        const span = spanOf(item.object, null);
+        // Every occurrence is single-line and spans exactly `count` (5 chars).
+        try std.testing.expectEqual(span.line, span.end_line);
+        try std.testing.expectEqual(span.start_char + 5, span.end_char);
+        if (span.line == 0 and span.start_char == 6) saw_decl = true;
+        if (span.line == 1 and span.start_char == 8) saw_use = true;
+    }
+    try std.testing.expect(saw_decl);
+    try std.testing.expect(saw_use);
 }
 
 const TestFixture = struct {
