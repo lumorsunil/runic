@@ -12,6 +12,52 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-09-05
+
+Bug fixes and stabilization after the 0.8.0 language-server build-out. The
+focus is LSP protocol correctness and resilience.
+
+### Fixed
+
+- **Rename / code-action edits crashed clients** — a `WorkspaceEdit`'s
+  `documentChanges` entries were serialized as `{"textDocumentEdit": {…}}`
+  instead of the bare `TextDocumentEdit` the protocol requires, so applying a
+  rename or the "add type annotation" quick fix failed in editors (Neovim
+  reported `attempt to index local 'text_document' (a nil value)`).
+- **More LSP protocol encodings** — `InsertTextMode` and `CompletionItemTag`
+  now serialize as their numeric codes, and `ProgressToken` as a bare scalar,
+  completing the numeric-code pass started in 0.8.0. Responses are now emitted
+  in JSON-RPC result-XOR-error form (no stray `"error": null` beside a result),
+  and the server's debug log now matches the exact bytes sent on the wire.
+- **Crash on an out-of-bounds position** — a hover/definition/rename/… request
+  at a line past end-of-file, or a character past the end of a line, ran the
+  position scan off the end of the buffer and crashed the server. Such a
+  position now resolves to nothing and the request returns an empty result.
+- **A malformed request killed the session** — an unparseable request body
+  propagated an error out of the main loop and terminated the server, dropping
+  every request after it. A malformed message is now logged and dropped, and
+  the session continues.
+
+### Changed
+
+- **Workspace indexing is lazy** — the full `.rn` workspace scan now runs on the
+  first workspace-wide request (symbol search, references, rename, cross-file
+  definition) for a client-provided root, never at `initialize`. A slow or
+  malformed file can no longer block startup or the per-file features (hover,
+  completion, diagnostics).
+- **Tree-sitter grammar refreshed** for the current syntax (`comptime`,
+  `yield`, `is`, hex/octal/binary integer literals, `||=`/`&&=`), and the
+  parser is generated at ABI 14 for editor compatibility (e.g. Neovim 0.10).
+
+### Internal
+
+- The LSP protocol test suite was expanded substantially: response wire-shape
+  assertions (numeric enum codes, unwrapped `documentChanges`, result-XOR-error
+  envelopes), exact 0↔1-indexed coordinate encoding for rename/references/
+  prepare-rename, robustness cases (out-of-bounds positions, unknown methods,
+  duplicate `initialize`, malformed bodies, never-opened documents), and the
+  diagnostics-clear-on-fix lifecycle. `zig build test` is now 126 tests.
+
 ## [0.8.0] - 2026-09-04
 
 ### Added

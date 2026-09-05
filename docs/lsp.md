@@ -130,6 +130,22 @@ Current concerns:
   remaining open set so those references are dropped and rebuilt. Regression
   tests in `tests/lsp_protocol.zig` cover close-then-request on an importer and
   repeated open/change/close/reopen churn.
+- request-level crash resilience — **addressed (0.8.1):** a position past
+  end-of-file (a line beyond the document, or a character past a line's end)
+  ran the position→offset scan off the buffer and crashed the server; such a
+  position now resolves to nothing. A malformed request body previously
+  propagated an error out of the main loop and ended the session; it is now
+  logged and dropped, and the session continues. Both are regression-tested,
+  alongside unknown-method (`-32601`) and duplicate-`initialize` (`-32600`)
+  handling and navigation requests against never-opened documents.
+- protocol wire-shape correctness — **addressed (0.8.1):** outgoing enums
+  serialize as their numeric codes and single-variant unions
+  (`documentChanges`, capability `Either`s) unwrap to bare objects rather than
+  tag-wrapped envelopes — a rename/code-action edit that clients rejected is
+  fixed, and the remaining latent cases (`InsertTextMode`, `CompletionItemTag`,
+  `ProgressToken`) are guarded. Responses use JSON-RPC result-XOR-error form.
+  Covered by unit tests in `src/lsp/types.zig` and wire-shape assertions in
+  `tests/lsp_protocol.zig`.
 
 ### 4. Better alignment with the language pipeline
 
