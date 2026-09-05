@@ -2356,6 +2356,112 @@ test "lsp references report exact identifier ranges" {
     try std.testing.expect(saw_use);
 }
 
+test "lsp survives out-of-bounds position requests" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const uri = try fixture.writeDocument("main.rn",
+        \\const foo = 1
+        \\
+    );
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri,
+            \\const foo = 1
+            \\
+        ),
+        // A line far past EOF and an over-long character — both used to run the
+        // position scan off the end of the buffer and crash the server.
+        try makeHoverRequest(allocator, 2, uri, 999, 999),
+        try makeDefinitionRequest(allocator, 3, uri, 0, 999),
+        // A valid request afterwards must still be answered — proof the server
+        // stayed alive through the out-of-bounds ones.
+        try makeDocumentSymbolRequest(allocator, 4, uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    // Each out-of-bounds request gets a well-formed response instead of taking
+    // the server down.
+    for ([_]i64{ 2, 3 }) |id| {
+        const response = try findResponseById(allocator, output, id);
+        defer allocator.free(response.body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("result") != null);
+    }
+
+    // The later valid request was still served.
+    const final = try findResponseById(allocator, output, 4);
+    defer allocator.free(final.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, final.body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("result").?.array.items.len >= 1);
+}
+
+test "lsp returns method-not-found for an unknown request method" {
+    const allocator = std.testing.allocator;
+    const request = try toJsonAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .id = 7,
+        .method = "textDocument/thisMethodDoesNotExist",
+        .params = .{},
+    });
+    const messages = [_][]const u8{request};
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 7);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    // Error response: `error` present with the JSON-RPC method-not-found code,
+    // and no `result` field (result-XOR-error).
+    const root = parsed.value.object;
+    try std.testing.expect(root.get("result") == null);
+    const err = root.get("error").?.object;
+    try std.testing.expectEqual(@as(i64, -32601), err.get("code").?.integer);
+}
+
+test "lsp rejects a second initialize with an already-initialized error" {
+    const allocator = std.testing.allocator;
+    const messages = [_][]const u8{
+        try makeInitialize(allocator, 1, true),
+        try makeInitialize(allocator, 2, true),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    // First initialize succeeds.
+    {
+        const response = try findResponseById(allocator, output, 1);
+        defer allocator.free(response.body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("result") != null);
+        try std.testing.expect(parsed.value.object.get("error") == null);
+    }
+    // The second is rejected as invalid (-32600), not silently re-run.
+    {
+        const response = try findResponseById(allocator, output, 2);
+        defer allocator.free(response.body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("result") == null);
+        const err = parsed.value.object.get("error").?.object;
+        try std.testing.expectEqual(@as(i64, -32600), err.get("code").?.integer);
+    }
+}
+
 const TestFixture = struct {
     allocator: Allocator,
     tmp_dir: std.testing.TmpDir,
