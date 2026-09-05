@@ -95,12 +95,12 @@ module.exports = grammar({
       // $.heredoc_fence
     ),
 
-    keyword_declaration: _ => choice('const', 'var', 'fn', 'pub', 'comptime'),
+    keyword_declaration: _ => choice('const', 'var', 'fn', 'pub', 'comptime', 'extern'),
     keyword_type: _ => choice('error', 'enum', 'union', 'struct'),
     keyword_async: _ => choice('async', 'await'),
     keyword_control: _ => choice('if', 'else', 'match', 'exit', 'yield', 'is'),
     keyword_loop: _ => choice('for', 'while'),
-    keyword_import: _ => 'import',
+    keyword_import: _ => choice('import', 'cimport'),
     keyword_interop: _ => 'bash',
     keyword_try: _ => choice('try', 'catch', 'orelse'),
     keyword_catch: _ => 'catch',
