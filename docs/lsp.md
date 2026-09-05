@@ -47,6 +47,20 @@ Today it provides:
 There is also a placeholder `--tcp <port>` flag in the CLI surface, but that
 transport is still reserved rather than being part of the supported workflow.
 
+### Editor integration gotchas
+
+Two client-side settings decide whether the server actually starts (see the
+Language server notes in `README.md`):
+
+- **Launch it by an absolute path** (or one on `$PATH`). `zig-out/bin/runic-lsp`
+  is relative to the repo root, so an editor that uses it verbatim only starts
+  the server when its working directory is the repo, and fails silently
+  elsewhere.
+- **Give the client a `root_dir` fallback.** A root search for a `.git` /
+  `build.zig.zon` marker finds nothing when a `.rn` file is outside a project,
+  and most clients then never attach — fall back to the file's directory (or
+  the cwd) so a lone `.rn` file still gets the server.
+
 ## Current Priorities
 
 ### 1. Better completions
