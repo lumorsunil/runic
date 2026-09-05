@@ -2513,6 +2513,79 @@ test "lsp clears diagnostics once an invalid document is fixed" {
     }
 }
 
+test "lsp survives a malformed request body" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const uri = try fixture.writeDocument("main.rn",
+        \\const foo = 1
+        \\
+    );
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        // A body that is framed correctly but is not valid JSON — it must be
+        // dropped, not end the session.
+        try allocator.dupe(u8, "{ this is : not valid json ]"),
+        // A valid session afterwards must still be served.
+        try makeDidOpen(allocator, uri,
+            \\const foo = 1
+            \\
+        ),
+        try makeDocumentSymbolRequest(allocator, 2, uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    // The request after the malformed one was answered → the server stayed up.
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("result") != null);
+}
+
+test "lsp handles navigation requests for a never-opened document" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    // The file exists on disk but is never sent via didOpen, so the server has
+    // no in-memory copy. Every position handler must degrade to a null/empty
+    // result rather than dereferencing the missing document.
+    const uri = try fixture.writeDocument("ghost.rn",
+        \\const foo = 1
+        \\echo foo
+        \\
+    );
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeHoverRequest(allocator, 1, uri, 1, 5),
+        try makeDefinitionRequest(allocator, 2, uri, 1, 5),
+        try makeReferencesRequest(allocator, 3, uri, 0, 6, true),
+        try makeRenameRequest(allocator, 4, uri, 0, 6, "bar"),
+        try makeDocumentSymbolRequest(allocator, 5, uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    // Every request gets a well-formed response (the `result` key is present),
+    // proving none of the handlers crashed on the missing document.
+    for ([_]i64{ 1, 2, 3, 4, 5 }) |id| {
+        const response = try findResponseById(allocator, output, id);
+        defer allocator.free(response.body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("result") != null);
+    }
+}
+
 const TestFixture = struct {
     allocator: Allocator,
     tmp_dir: std.testing.TmpDir,
