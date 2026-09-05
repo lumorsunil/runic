@@ -338,15 +338,20 @@ area when no header is available.
 
 ## Phased plan
 
-0a. **Language prerequisite — type-exporting modules + qualified type
-   references.** Currently `pub const X = struct {…}` does not parse and
-   `module.Type` does not parse in either annotation or expression position
-   (verified 2026-09; no `pub const … = struct` exists anywhere in `std/` or the
-   test modules). This phase makes a module able to export a type and a script
-   able to reference it qualified (`c.Double`, `s.Point`), with the type checker
-   resolving the qualified name to the module's exported type. It is a general
-   language feature, tested on its own (an ordinary `pub const Point = struct`
-   in a module, imported and used), independent of any C interop.
+0a. **Language prerequisite — mostly already present (re-verified 2026-09).**
+   The critical path for `c.Double` is a *qualified type reference in annotation
+   position*, and that already works end-to-end: a module exporting a type
+   (`const T = struct {…}` or an alias `const T = Int`; `TypeBindingDecl.is_pub`
+   defaults to `true`, so no `pub` is needed to export), referenced qualified in
+   a parameter/return annotation (`fn Void f(p: s.Point) …`, `n: s.MyInt`),
+   parses, type-checks, and runs. The parser builds a multi-segment
+   `.identifier` path and the type checker resolves it. What is *not* needed for
+   FFI and can stay out of scope: qualified *construction* (`s.Point{…}` in
+   expression position — member access currently rejects a type identifier) and
+   the cosmetic `pub const X = struct {…}` (only the `struct`-literal RHS after
+   `pub const` fails; the plain `const` form already exports). A separate
+   pre-existing bug — `expected type Int, actual: Int` when a module fn
+   constructs a struct from its own params — is noted but unrelated.
 0b. **Vendor + link `libffi`** — get `libffi` compiling from vendored source and
    statically linked into `runic` via `build.zig` for the primary dev target,
    with a trivial `ffi_call` smoke test. The load-bearing prerequisite for the
@@ -386,16 +391,21 @@ area when no header is available.
   escape hatch if the `libffi` build matrix becomes a burden; its own risk is
   that the GP/SSE class split only holds on SysV AMD64 / AArch64 and would need
   a per-ABI implementation.
-- **Module-exported types in annotation position — RESOLVED (verified
-  2026-09): not present, now planned as phase 0a.** `pub const X = struct {…}`
-  fails to parse (*expected value, actual: kw_struct*) and a qualified type
-  `module.Type` fails to parse (*expected identifier after member access*) in
-  both annotation and expression position; lowercase value members (`m.fn`) and
-  unqualified type annotations (`p: Point`) do work. So `std.ffi` needs this
-  built first — see phase 0a. The remaining sub-question: the C types are not
-  ordinary Runic types (they carry an ABI class), so once modules can export
-  types, decide whether `std.ffi`'s members are a new kind of builtin/opaque
-  type the FFI layer recognizes, or ordinary types tagged for marshalling.
+- **Module-exported types in annotation position — RESOLVED (re-verified
+  2026-09): already works.** A module type export (`const T = struct`/alias,
+  `is_pub` default `true`) referenced qualified in an annotation (`p: s.Point`,
+  `n: s.MyInt`) parses, type-checks, and runs end-to-end. Only *construction*
+  (`s.Point{…}`) and the `pub const X = struct` literal form remain unsupported,
+  and neither is on the FFI path. So `std.ffi` does *not* need new type-system
+  machinery for the `c.Double`-in-`extern-fn` surface.
+- **How `std.ffi` represents the C types — the real remaining type-surface
+  question.** A C type is not an ordinary Runic type (`c.Int` ≠ Runic `Int` in
+  width/ABI), so `std.ffi` cannot simply alias them. Options: (a) `std.ffi` is a
+  compiler-recognized module whose exported names (`Double`, `Int`, `Ptr`, …)
+  are opaque marker types the extern-block checker maps to ABI classes — the
+  qualified-annotation machinery that already works carries the *reference*, and
+  only the *meaning* of these specific names is special; or (b) add a dedicated
+  C-type type-expr kind that `std.ffi`'s bindings resolve to. Decide during MVP.
 - **`c.SizeT` / pointer-width types.** These resolve per target; `std.ffi` must
   expose them with the target's actual width rather than a fixed one.
 - **Threading/reentrancy** — Runic already runs pipeline stages on threads;
