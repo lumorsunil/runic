@@ -8,6 +8,7 @@ pub const parser = @import("frontend/parser.zig");
 pub const diagnostics = @import("frontend/diagnostics.zig");
 pub const document = @import("frontend/document_store.zig");
 pub const std_modules = @import("frontend/std_modules.zig");
+pub const cbind = @import("ffi/cbind.zig");
 pub const DocumentStore = @import("document_store.zig").DocumentStore;
 pub const ExitCode = @import("runtime/exit_code.zig").ExitCode;
 pub const rainbow = @import("rainbow.zig");
@@ -41,4 +42,5 @@ test {
     _ = @import("ir/compiler.zig");
     _ = @import("ffi/libffi.zig");
     _ = @import("ffi/ctype.zig");
+    _ = @import("ffi/cbind.zig");
 }

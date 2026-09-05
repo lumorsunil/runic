@@ -343,9 +343,11 @@ block loads a C library via `std.DynLib`, resolves each `extern fn`, and a
 member call (`m.pow 2.0 10.0`) marshals through a statically-linked `libffi`
 and returns the value, in both bound and interpolated positions. Landed on the
 `cffi` branch across phases 0a/0b/1 below; scalar args/returns (int widths,
-float/double, bool, pointer) and `c.Str` *arguments* are supported. Remaining:
-`c.Str` *returns*, structs/varargs, the `cbind` generator, and the
-cross-compile vendoring — see below.
+float/double, bool, pointer) and `c.Str` *arguments* are supported. The
+`runic cbind` generator (phase 3) is also implemented — it emits a `cimport`
+block plus the header's enum values / `#define` constants from a C header via
+`zig translate-c`. Remaining: `c.Str` *returns*, structs/varargs at the call
+boundary, and the cross-compile vendoring — see below.
 
 0a. **Language prerequisite — mostly already present (re-verified 2026-09).**
    The critical path for `c.Double` is a *qualified type reference in annotation
@@ -372,9 +374,16 @@ cross-compile vendoring — see below.
 2. **Ergonomics** — clean load/symbol errors as catchable Runic errors; a
    documented ownership contract; a smoke example (`examples/`) calling `libm`;
    the per-target `libffi` header/asm matrix filled in for the release targets.
-3. **`runic cbind` generator** — a dev-time command that emits a `.rn` binding
-   file from a C header (via `zig translate-c`), plus the `.dynsym`-only
-   fallback. Removes the hand-written `extern fn` tedium for large libraries.
+3. **`runic cbind` generator — DONE.** `runic cbind <header.h> --lib <lib.so>
+   [-o out.rn] [--name binding]` runs `zig translate-c` and emits a `std.ffi`
+   import, the header's enum values and integer/string `#define`s as `pub const`s,
+   and one `pub`-bound `cimport` block of `extern fn`s (C types mapped to `c.X`).
+   Compiler predefined macros are filtered out (via an empty-header baseline
+   translate-c), `char*`→`c.Str` / other pointers→`c.Ptr`, and struct-by-value
+   / variadic functions are skipped with a reported count. The transform lives
+   in `src/ffi/cbind.zig` (pure, unit-tested); the CLI glue is
+   `cmd/runic/cbind.zig`. Still open (phase 5): a `.dynsym`-only fallback when
+   no header is available, and a libclang backend.
 4. **Structs / varargs** — `libffi` already calls them; this phase is the
    marshalling side (struct-layout `ffi_type`s, Runic ↔ struct value mapping).
 5. **Later / maybe** — a libclang backend for `cbind`; the pure-Zig trampoline
