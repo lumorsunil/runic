@@ -3343,6 +3343,10 @@ pub const IRCompiler = struct {
             }
         }
 
+        // A nullary cimport extern accessed bare (`rl.CloseWindow`) is a C FFI
+        // call with no arguments — the same as `rl.CloseWindow()` would be.
+        if (try self.tryCompileNullaryCImportMember(source, object, member.member.name)) |result| return result;
+
         const object_type = object.typeExpr() orelse {
             try self.reportSourceError(
                 source,
@@ -7646,6 +7650,44 @@ pub const IRCompiler = struct {
                 break :blk ast.TypeExpr{ .array = .{ .element = byte, .span = .global } };
             },
         };
+    }
+
+    /// Emits a zero-argument `cimport_call` when `object` is a cimport value
+    /// (its type carries `cimport_externs`) and `member` names one of its
+    /// externs — the bare-member form `rl.CloseWindow`. Returns null otherwise.
+    fn tryCompileNullaryCImportMember(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        object: Result,
+        member: []const u8,
+    ) Error!?Result {
+        var object_type = object.typeExpr() orelse return null;
+        while (object_type == .alias) object_type = object_type.alias.type_expr.*;
+        if (object_type != .struct_type) return null;
+        const externs = object_type.struct_type.cimport_externs orelse return null;
+
+        var matched: ?ast.ExternFn = null;
+        for (externs) |candidate| {
+            if (std.mem.eql(u8, candidate.name.name, member)) {
+                matched = candidate;
+                break;
+            }
+        }
+        const extern_fn = matched orelse return null;
+
+        const lib_ref = try self.newRef(source, "cimport_lib");
+        try self.set(source, lib_ref, stableResultSource(object));
+
+        const result = try self.newRef(source, "cimport_result");
+        try self.addInstruction(.init(.from(source), .{ .cimport_call = .{
+            .library = ir.ValueSource.fromLocation(lib_ref.dereference()),
+            .symbol = extern_fn.name.name,
+            .args = &.{},
+            .result = result,
+        } }));
+
+        const ret_type = try self.cTypeRunicTypeExpr(cTypeOfAnnotation(extern_fn.return_type) orelse .void);
+        return (try Result.from(result.dereference())).typed(ret_type);
     }
 
     /// Compiles `m.extern args` where `m` is a cimport value and `extern` names a

@@ -15,6 +15,12 @@ echo "cos=${m.cos 0.0}"
 const libc = cimport "libc.so.6" {
     extern fn abs(n: c.Int) c.Int
     extern fn strlen(s: c.Str) c.ULong
+    extern fn getpid() c.Int
 }
 echo "abs=${libc.abs (0 - 5)}"
 echo "strlen=${libc.strlen "hello"}"
+
+// A nullary extern is called bare (no arguments), like a nullary Runic member.
+// getpid always returns a positive pid; the Bool renders as an exit code (0).
+const pid = libc.getpid
+echo "pid_positive=${pid > 0}"
