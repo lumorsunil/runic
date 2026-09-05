@@ -1925,11 +1925,18 @@ pub const Server = struct {
     }
 
     fn sendJson(self: *Server, json_body: anytype) !void {
-        try self.log("Sent JSON: {f}", .{std.json.fmt(json_body, .{ .emit_null_optional_fields = false })});
+        // The wire and the log MUST use the same options, or the JSON you
+        // inspect while debugging differs from what the client actually
+        // receives. `emit_null_optional_fields = false` also keeps responses on
+        // the JSON-RPC result-XOR-error shape (no stray `"error": null` beside a
+        // result). An explicit null result is passed as `std.json.Value.null`,
+        // whose optional wrapper is non-null, so it still serializes.
+        const options: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
+        try self.log("Sent JSON: {f}", .{std.json.fmt(json_body, options)});
 
         var buffer: [MAX_OUT_CONTENT]u8 = undefined;
         var writer = std.Io.Writer.fixed(&buffer);
-        try writer.print("{f}", .{std.json.fmt(json_body, .{})});
+        try writer.print("{f}", .{std.json.fmt(json_body, options)});
         const body = writer.buffered();
 
         try self.writer.print("Content-Length: {d}\r\n\r\n", .{body.len});

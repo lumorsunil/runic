@@ -407,6 +407,18 @@ pub const IntegerOrString = union(enum) {
             else => return error.UnexpectedToken,
         };
     }
+
+    /// Serialize as the bare scalar (`5` or `"tok"`), never the wrapped
+    /// `{"integer": 5}` a default tagged union would emit — an outbound
+    /// `ProgressToken` must be a raw integer or string.
+    pub fn jsonStringify(
+        self: @This(),
+        stringify: *std.json.Stringify,
+    ) std.json.Stringify.Error!void {
+        switch (self) {
+            inline else => |payload| try stringify.write(payload),
+        }
+    }
 };
 
 pub const TextDocumentItem = struct {
@@ -1439,6 +1451,14 @@ pub const InsertTextMode = enum(u32) {
     ///
     /// Consider a line like this: <2tabs><cursor><3tabs>foo. Accepting a multi line completion item is indented using 2 tabs and all following lines inserted will be indented using 2 tabs as well.
     adjustIndentation = 2,
+
+    /// LSP requires the numeric code, not the tag name. See `InsertTextFormat`.
+    pub fn jsonStringify(
+        self: @This(),
+        stringify: *std.json.Stringify,
+    ) std.json.Stringify.Error!void {
+        try stringify.write(@intFromEnum(self));
+    }
 };
 
 pub const CompletionItem = struct {
@@ -1613,6 +1633,14 @@ pub const CompletionItemKind = enum(u32) {
 pub const CompletionItemTag = enum(u32) {
     /// Render a completion as obsolete, usually using a strike-out.
     deprecated = 1,
+
+    /// LSP requires the numeric code, not the tag name. See `DiagnosticTag`.
+    pub fn jsonStringify(
+        self: @This(),
+        stringify: *std.json.Stringify,
+    ) std.json.Stringify.Error!void {
+        try stringify.write(@intFromEnum(self));
+    }
 };
 
 /// A `MarkupContent` literal represents a string value which content is interpreted base on its kind flag. Currently the protocol supports `plaintext` and `markdown` as markup kinds.
@@ -1704,6 +1732,20 @@ pub const TextDocumentEdit = struct {
 
 pub const DocumentChangeOperation = union(enum) {
     textDocumentEdit: TextDocumentEdit,
+
+    /// LSP's `documentChanges` array holds each operation object *directly*
+    /// (a bare `TextDocumentEdit`, etc.). Zig's default tagged-union encoding
+    /// would wrap the payload as `{"textDocumentEdit": {...}}`, which clients
+    /// reject (nvim: "attempt to index local 'text_document' (a nil value)").
+    /// Serialize only the active payload so the object is unwrapped.
+    pub fn jsonStringify(
+        self: @This(),
+        stringify: *std.json.Stringify,
+    ) std.json.Stringify.Error!void {
+        switch (self) {
+            inline else => |payload| try stringify.write(payload),
+        }
+    }
 };
 
 pub const WorkspaceEdit = struct {
@@ -2043,4 +2085,68 @@ test "client request parses textDocument/documentSymbol" {
     try std.testing.expect(parsed.value.payload != null);
     try std.testing.expectEqualStrings("textDocument/documentSymbol", parsed.value.method);
     try std.testing.expect(std.meta.activeTag(parsed.value.payload.?) == .@"textDocument/documentSymbol");
+}
+
+fn stringifyOwned(allocator: Allocator, value: anytype) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(value, .{ .emit_null_optional_fields = false })});
+}
+
+test "outbound enums serialize as numeric codes, not tag names" {
+    const allocator = std.testing.allocator;
+
+    // Each must emit its integer code. A default enum encoding would emit the
+    // tag name string, which clients reject (they expect the LSP number).
+    const cases = .{
+        .{ InsertTextMode.adjustIndentation, "2" },
+        .{ CompletionItemKind.function, "3" },
+        .{ SymbolKind.method, "6" },
+        .{ DiagnosticSeverity.warning, "2" },
+        .{ InlayHintKind.parameter, "2" },
+    };
+    inline for (cases) |case| {
+        const s = try stringifyOwned(allocator, case[0]);
+        defer allocator.free(s);
+        try std.testing.expectEqualStrings(case[1], s);
+    }
+
+    // CompletionItemTag lives in an array; the whole slice must be numeric.
+    const tags = [_]CompletionItemTag{.deprecated};
+    const tags_json = try stringifyOwned(allocator, @as([]const CompletionItemTag, &tags));
+    defer allocator.free(tags_json);
+    try std.testing.expectEqualStrings("[1]", tags_json);
+}
+
+test "IntegerOrString serializes as a bare scalar, not a wrapped union" {
+    const allocator = std.testing.allocator;
+
+    const as_int = try stringifyOwned(allocator, IntegerOrString{ .integer = 7 });
+    defer allocator.free(as_int);
+    try std.testing.expectEqualStrings("7", as_int);
+
+    const as_str = try stringifyOwned(allocator, IntegerOrString{ .string = "tok" });
+    defer allocator.free(as_str);
+    try std.testing.expectEqualStrings("\"tok\"", as_str);
+}
+
+test "workspace edit documentChanges hold bare TextDocumentEdits" {
+    const allocator = std.testing.allocator;
+
+    const edits = [_]TextEdit{.{
+        .range = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 3 } },
+        .newText = "bar",
+    }};
+    const ops = [_]DocumentChangeOperation{.{ .textDocumentEdit = .{
+        .textDocument = .{ .uri = "file:///x.rn", .version = null },
+        .edits = &edits,
+    } }};
+    const edit = WorkspaceEdit{ .documentChanges = &ops };
+
+    const s = try stringifyOwned(allocator, edit);
+    defer allocator.free(s);
+
+    // The tag-wrapped shape (`{"textDocumentEdit": ...}`) is what broke nvim's
+    // apply_workspace_edit; each element must be the TextDocumentEdit directly.
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"textDocumentEdit\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"textDocument\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"edits\"") != null);
 }

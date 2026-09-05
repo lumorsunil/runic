@@ -243,7 +243,7 @@ test "lsp rename returns concrete same-file edits" {
 
     const changes = parsed.value.object.get("result").?.object.get("documentChanges").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), changes.len);
-    const edits = changes[0].object.get("textDocumentEdit").?.object.get("edits").?.array.items;
+    const edits = changes[0].object.get("edits").?.array.items;
     try std.testing.expectEqual(@as(usize, 2), edits.len);
 
     for (edits) |edit| {
@@ -299,7 +299,7 @@ test "lsp rename edits every indexed file that references the symbol" {
     var saw_helper = false;
     var saw_main = false;
     for (changes) |change| {
-        const tde = change.object.get("textDocumentEdit").?.object;
+        const tde = change.object;
         const uri = tde.get("textDocument").?.object.get("uri").?.string;
         const edits = tde.get("edits").?.array.items;
         try std.testing.expect(edits.len >= 1);
@@ -419,7 +419,7 @@ test "lsp rename of a module member edits the module declaration and the access"
     var saw_other = false;
     var saw_importer2 = false;
     for (changes) |change| {
-        const tde = change.object.get("textDocumentEdit").?.object;
+        const tde = change.object;
         const uri = tde.get("textDocument").?.object.get("uri").?.string;
         const edits = tde.get("edits").?.array.items;
         try std.testing.expect(edits.len >= 1);
@@ -475,7 +475,7 @@ test "lsp rename is scoped to the binding, not every same-named identifier" {
 
     const changes = parsed.value.object.get("result").?.object.get("documentChanges").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), changes.len);
-    const edits = changes[0].object.get("textDocumentEdit").?.object.get("edits").?.array.items;
+    const edits = changes[0].object.get("edits").?.array.items;
 
     // Only the two occurrences inside function a (lines 1 and 2) are renamed;
     // function b's `x` on lines 5 and 6 is a different binding and left alone.
@@ -522,7 +522,7 @@ test "lsp rename ignores strings and comments" {
     defer parsed.deinit();
 
     const changes = parsed.value.object.get("result").?.object.get("documentChanges").?.array.items;
-    const edits = changes[0].object.get("textDocumentEdit").?.object.get("edits").?.array.items;
+    const edits = changes[0].object.get("edits").?.array.items;
     try std.testing.expectEqual(@as(usize, 2), edits.len);
     for (edits) |edit| {
         try std.testing.expectEqualStrings("bar", edit.object.get("newText").?.string);
@@ -1298,7 +1298,7 @@ test "lsp code action adds an inferred type annotation" {
     try std.testing.expectEqualStrings("Add type annotation: Int", action.get("title").?.string);
 
     const edits = action.get("edit").?.object.get("documentChanges").?.array
-        .items[0].object.get("textDocumentEdit").?.object.get("edits").?.array.items;
+        .items[0].object.get("edits").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), edits.len);
     try std.testing.expectEqualStrings(": Int", edits[0].object.get("newText").?.string);
     // Inserted right after the identifier `x` (column 7 on line 0).
