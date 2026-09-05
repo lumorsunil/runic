@@ -10,6 +10,7 @@ const Stream = @import("../stream.zig").Stream;
 const RCError = @import("../mem/rc.zig").RCError;
 const FrontendDocumentStore = @import("../frontend/document_store.zig").FrontendDocumentStore;
 const resolveModulePath = @import("../frontend/document_store.zig").resolveModulePath;
+const CType = @import("../ffi/ctype.zig").CType;
 const evaluateArithmetic = ir.evaluator.IREvaluator.evaluateArithmetic;
 const evaluateLogical = ir.evaluator.IREvaluator.evaluateLogical;
 const evaluateCompare = ir.evaluator.IREvaluator.evaluateCompare;
@@ -1978,6 +1979,7 @@ pub const IRCompiler = struct {
             } else self.compileBlock(expr, block),
             .fn_decl => |fn_decl| self.compileFnDecl(expr, fn_decl),
             .import_expr => |import_expr| self.compileImportExpr(expr, import_expr),
+            .cimport_expr => |cimport_expr| self.compileCImport(expr, cimport_expr),
             .binary => |binary| self.compileBinary(expr, binary),
             .unary => |unary| self.compileUnary(expr, unary),
             .array => |array| self.compileArray(expr, array),
@@ -7564,6 +7566,64 @@ pub const IRCompiler = struct {
         } };
 
         return .fromLocation(result_ref.dereference().typed(merged_type));
+    }
+
+    /// The C type an extern parameter/return annotation names (`c.Double` → the
+    /// last path segment `Double` → `CType.double`); null if it is not a
+    /// recognized C type (the type checker has already reported that).
+    fn cTypeOfAnnotation(annotation: ?*const ast.TypeExpr) ?CType {
+        const t = annotation orelse return null;
+        if (t.* == .identifier) {
+            const segments = t.identifier.path.segments;
+            if (segments.len > 0) return CType.fromName(segments[segments.len - 1].name);
+        }
+        return null;
+    }
+
+    /// Compiles a `cimport` block into a `cimport_open` instruction that, at
+    /// runtime, loads the library and resolves each declared extern's address.
+    /// The result value (a closeable handle) is typed as a cimport struct so a
+    /// later member call can be routed to a C FFI call.
+    fn compileCImport(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        cimport_expr: ast.CImportExpr,
+    ) Error!Result {
+        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        const externs = try self.allocator.alloc(ir.Instruction.CImportOpen.Extern, cimport_expr.externs.len);
+        for (cimport_expr.externs, externs) |ext, *dst| {
+            const params = try self.allocator.alloc(CType, ext.params.len);
+            for (ext.params, params) |param, *cparam| {
+                cparam.* = cTypeOfAnnotation(param.type_annotation) orelse {
+                    try self.reportSourceError(source, Error.UnsupportedExpression, .@"error", "extern fn \"{s}\" has an unresolved C parameter type", .{ext.name.name});
+                    return .fromValue(.void);
+                };
+            }
+            dst.* = .{
+                .symbol = ext.name.name,
+                .params = params,
+                .ret = cTypeOfAnnotation(ext.return_type) orelse .void,
+            };
+        }
+
+        const result = try self.newRef(source, "cimport");
+        try self.addInstruction(.init(.from(source), .{ .cimport_open = .{
+            .library_name = cimport_expr.library_name,
+            .importer = cimport_expr.importer,
+            .externs = externs,
+            .result = result,
+        } }));
+
+        // Tag the value's type so `resolveStaticType` recognizes a cimport (the
+        // externs are what routes a `m.fn x` member call to a C FFI call).
+        const cimport_type = ast.TypeExpr{ .struct_type = .{
+            .fields = &.{},
+            .decls = &.{},
+            .span = source.span(),
+            .cimport_externs = cimport_expr.externs,
+        } };
+        return (try Result.from(result.dereference())).typed(cimport_type);
     }
 
     /// Builds the `fn_ref_type` for a module pub-fn field, carrying the function's

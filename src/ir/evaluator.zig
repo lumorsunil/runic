@@ -9,6 +9,8 @@ const ExitCode = runic.ExitCode;
 const Stream = runic.stream.Stream;
 const Tracer = runic.trace.Tracer;
 const compiler = runic.ir.compiler;
+const CImportCloseable = @import("../ffi/cimport.zig").CImportCloseable;
+const ResolvedExtern = @import("../ffi/cimport.zig").ResolvedExtern;
 
 const FastUIntSource = union(enum) {
     ptr: *ir.Value,
@@ -68,6 +70,8 @@ pub const Error =
         InvalidInt,
         InvalidFloat,
         CommandNotFound,
+        CImportLoadFailed,
+        CImportSymbolNotFound,
     };
 
 pub const Result = union(enum) {
@@ -997,6 +1001,36 @@ pub const IREvaluator = struct {
 
         return switch (instruction.type) {
             .comment => return .skip,
+            .cimport_open => |op| {
+                var lib = std.DynLib.open(op.library_name) catch {
+                    std.log.err("could not load C library '{s}'", .{op.library_name});
+                    return Error.CImportLoadFailed;
+                };
+                errdefer lib.close();
+
+                const resolved = try self.allocator.alloc(ResolvedExtern, op.externs.len);
+                errdefer self.allocator.free(resolved);
+                for (op.externs, resolved) |ext, *dst| {
+                    const symbol_z = try self.allocator.dupeZ(u8, ext.symbol);
+                    defer self.allocator.free(symbol_z);
+                    const addr = lib.lookup(*anyopaque, symbol_z) orelse {
+                        std.log.err("C library '{s}' has no symbol '{s}'", .{ op.library_name, ext.symbol });
+                        return Error.CImportSymbolNotFound;
+                    };
+                    dst.* = .{ .symbol = ext.symbol, .addr = addr, .params = ext.params, .ret = ext.ret };
+                }
+
+                const cc = try self.allocator.create(CImportCloseable);
+                cc.* = .{
+                    .allocator = self.allocator,
+                    .lib = lib,
+                    .externs = resolved,
+                    .label = op.library_name,
+                };
+                const handle = try self.context.addCloseable(&cc.closeable);
+                try self.setLocation(thread, op.result, .{ .closeable = handle });
+                return .cont;
+            },
             .exit_with => |value| {
                 // A function/stage return (or body) value now only sets the exit
                 // code; it is never pushed to stdout. Output is explicit via

@@ -1,0 +1,9 @@
+// A cimport opens the C dynamic library and resolves every declared extern's
+// address at runtime. Calling them is a separate step; this asserts the load
+// and symbol resolution succeed (libm's `pow`/`cos` exist).
+const c = import "std/ffi.rn"
+const m = cimport "libm.so.6" {
+    extern fn pow(base: c.Double, exp: c.Double) c.Double
+    extern fn cos(x: c.Double) c.Double
+}
+echo "cimport opened"

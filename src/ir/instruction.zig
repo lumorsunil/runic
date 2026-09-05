@@ -6,6 +6,7 @@ const ExitCode = @import("../runtime/exit_code.zig").ExitCode;
 const Location = @import("location.zig").Location;
 const RegisterAbs = @import("location.zig").RegisterAbs;
 const InstructionAddr = @import("instruction-addr.zig").InstructionAddr;
+const CType = @import("../ffi/ctype.zig").CType;
 
 pub const ValueSource = union(enum) {
     location: Location,
@@ -87,6 +88,10 @@ pub const Instruction = struct {
     pub const Type = union(enum) {
         /// this instruction type is skipped, only used to add comments to the ir for debugging purposes
         comment: []const u8,
+        /// Opens a C dynamic library (`cimport "lib" { … }`), resolves each
+        /// declared extern's address, and stores the resulting handle value
+        /// (a closeable) into `result`. See `future/c-ffi.md`.
+        cimport_open: CImportOpen,
         /// forward program stdin, stdout and stderr, receives pointer to closure
         fwd_stdio,
         /// push a Value to the stack
@@ -337,6 +342,24 @@ pub const Instruction = struct {
     pub const UnaryOperation = struct {
         operand: Location,
         result: Location,
+    };
+
+    /// Opens a C dynamic library and resolves its declared externs. `result`
+    /// receives the runtime handle value. String/slice fields borrow the AST's
+    /// long-lived memory.
+    pub const CImportOpen = struct {
+        /// The library name as written (`"libm.so.6"` or a relative path).
+        library_name: []const u8,
+        /// The importing script's path, for resolving a relative library path.
+        importer: []const u8,
+        externs: []const Extern,
+        result: Location,
+
+        pub const Extern = struct {
+            symbol: []const u8,
+            params: []const CType,
+            ret: CType,
+        };
     };
 
     /// Constructs an error value. `payload` (if present) is resolved at runtime

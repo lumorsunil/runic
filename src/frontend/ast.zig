@@ -388,6 +388,13 @@ pub const TypeExpr = union(enum) {
         /// field spans `slotSize` slots.
         by_reference_fields: bool = false,
 
+        /// Non-null when this struct is the value type of a `cimport` block: its
+        /// declared externs, so the IR compiler can distinguish a cimport value
+        /// from an ordinary struct and route a member call (`m.pow x`) to a C
+        /// FFI call rather than the usual UFCS/command path. Null for every
+        /// ordinary struct.
+        cimport_externs: ?[]const ExternFn = null,
+
         pub const FieldLayout = struct {
             offset: usize,
             type_expr: TypeExpr,

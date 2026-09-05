@@ -3999,6 +3999,7 @@ pub const TypeChecker = struct {
             .fields = fields,
             .decls = &.{},
             .span = cimport.span,
+            .cimport_externs = cimport.externs,
         } });
     }
 
