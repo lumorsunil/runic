@@ -2462,6 +2462,57 @@ test "lsp rejects a second initialize with an already-initialized error" {
     }
 }
 
+test "lsp clears diagnostics once an invalid document is fixed" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const uri = try fixture.writeDocument("main.rn",
+        \\const foo =
+        \\
+    );
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        // Open with an incomplete binding (a parse error), then fix it.
+        try makeDidOpen(allocator, uri,
+            \\const foo =
+            \\
+        ),
+        try makeDidChangeWholeDocument(allocator, uri, 2,
+            \\const foo = 1
+            \\
+        ),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    // The first publish (on open) reports the error.
+    {
+        const first = try findMethodNotification(allocator, output, "textDocument/publishDiagnostics");
+        defer allocator.free(first);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, first, .{});
+        defer parsed.deinit();
+        const diagnostics = parsed.value.object.get("params").?.object.get("diagnostics").?.array.items;
+        try std.testing.expect(diagnostics.len > 0);
+    }
+
+    // After the fix, the server MUST republish an empty diagnostics array to
+    // clear the editor — not simply stop publishing, which would leave the stale
+    // error on screen.
+    {
+        const last = try findLastMethodNotification(allocator, output, "textDocument/publishDiagnostics");
+        defer allocator.free(last);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, last, .{});
+        defer parsed.deinit();
+        const params = parsed.value.object.get("params").?.object;
+        try std.testing.expectEqualStrings(uri, params.get("uri").?.string);
+        try std.testing.expectEqual(@as(usize, 0), params.get("diagnostics").?.array.items.len);
+    }
+}
+
 const TestFixture = struct {
     allocator: Allocator,
     tmp_dir: std.testing.TmpDir,
@@ -2609,6 +2660,37 @@ fn findMethodNotification(allocator: Allocator, output: []const u8, wanted_metho
     }
 
     return error.ResponseNotFound;
+}
+
+/// Like findMethodNotification, but returns the LAST matching notification —
+/// used when a method is published more than once (e.g. diagnostics republished
+/// after an edit) and the test cares about the final state.
+fn findLastMethodNotification(allocator: Allocator, output: []const u8, wanted_method: []const u8) ![]u8 {
+    var offset: usize = 0;
+    var last: ?[]u8 = null;
+    errdefer if (last) |l| allocator.free(l);
+    while (offset < output.len) {
+        const header_end_rel = std.mem.indexOfPos(u8, output, offset, "\r\n\r\n") orelse break;
+        const header_block = output[offset..header_end_rel];
+        const content_length = parseContentLength(header_block) orelse break;
+        const body_start = header_end_rel + 4;
+        const body_end = body_start + content_length;
+        if (body_end > output.len) break;
+
+        const body = output[body_start..body_end];
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+        defer parsed.deinit();
+
+        const method = parsed.value.object.get("method");
+        if (method != null and method.? == .string and std.mem.eql(u8, method.?.string, wanted_method)) {
+            if (last) |l| allocator.free(l);
+            last = try allocator.dupe(u8, body);
+        }
+
+        offset = body_end;
+    }
+
+    return last orelse error.ResponseNotFound;
 }
 
 fn parseContentLength(headers: []const u8) ?usize {
