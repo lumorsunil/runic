@@ -39,4 +39,5 @@ test {
     _ = @import("ir/evaluator.zig");
     _ = @import("ir/compiler.zig");
     _ = @import("ffi/libffi.zig");
+    _ = @import("ffi/ctype.zig");
 }
