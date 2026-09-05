@@ -119,7 +119,16 @@ pub const Server = struct {
     }
 
     fn handleEnvelope(self: *Server, envelopePayload: []u8) !bool {
-        const parsed: std.json.Parsed(types.ClientRequest) = try std.json.parseFromSlice(types.ClientRequest, self.allocator, envelopePayload, .{ .ignore_unknown_fields = true });
+        // A malformed body (invalid JSON, or JSON that isn't a well-formed
+        // request) must not end the session: drop it and keep serving. Erroring
+        // here would propagate out of run() and kill the server on a single bad
+        // message. We can't reliably recover an id from an unparseable body, so
+        // there is no response to send — dropping is the correct, resilient
+        // behavior.
+        const parsed: std.json.Parsed(types.ClientRequest) = std.json.parseFromSlice(types.ClientRequest, self.allocator, envelopePayload, .{ .ignore_unknown_fields = true }) catch |err| {
+            try self.log("dropping malformed request: {}", .{err});
+            return true;
+        };
         defer parsed.deinit();
 
         const request = parsed.value;
