@@ -605,19 +605,27 @@ fn isModuleFileChar(ch: u8) bool {
 }
 
 fn collectModuleMatches(context: CollectMatchesContext) !MatchList {
-    const script_dirname = std.fs.path.dirname(context.file) orelse return .empty(context.allocator);
     var module_path_prefix = extractPrefix(context, isModulePathChar);
     const basename_prefix = extractPrefix(context, isModuleFileChar);
     module_path_prefix = module_path_prefix[0 .. module_path_prefix.len - basename_prefix.len];
 
+    var matches = MatchList.init(context.allocator);
+
+    // The bundled standard library ("std", "std/list", …, "std/ffi") is embedded
+    // in the binary, not on disk, so a filesystem scan never finds it. Offer it
+    // by name from the embed table.
+    try appendBundledStdMatches(&matches, context, module_path_prefix, basename_prefix);
+
+    // Modules on disk, relative to the importing script. A missing directory
+    // (e.g. typing `import "std/…"` with no such folder next to the script) is
+    // not an error — the std matches above still stand.
+    const script_dirname = std.fs.path.dirname(context.file) orelse return matches;
     const dirname = try std.fs.path.join(context.allocator, &.{ script_dirname, module_path_prefix });
     defer context.allocator.free(dirname);
 
-    var dir = try std.Io.Dir.openDirAbsolute(context.io, dirname, .{ .iterate = true });
+    var dir = std.Io.Dir.openDirAbsolute(context.io, dirname, .{ .iterate = true }) catch return matches;
     defer dir.close(context.io);
     var it = dir.iterate();
-
-    var matches = MatchList.init(context.allocator);
 
     while (try it.next(context.io)) |entry| {
         // Resolve symlinks to whatever they point at so a linked module file or
@@ -651,6 +659,39 @@ fn collectModuleMatches(context: CollectMatchesContext) !MatchList {
     }
 
     return matches;
+}
+
+/// Offers the bundled std module specifiers that live under the namespace the
+/// user is currently typing: at the top level (`import "s…"`) the root `std`;
+/// inside `import "std/…"` its submodules (`list`, `str`, …, `ffi`). Names come
+/// from the embed table, so they stay in sync with the shipped std library.
+fn appendBundledStdMatches(
+    matches: *MatchList,
+    context: CollectMatchesContext,
+    path_prefix: []const u8,
+    basename_prefix: []const u8,
+) !void {
+    const namespace = std.mem.trimEnd(u8, path_prefix, "/");
+    inline for (runic.std_modules.modules) |module| {
+        // `module.path` is a virtual ":std" / ":std/list"; the import specifier
+        // drops the leading ':'.
+        const spec = module.path[1..];
+        const ns = std.fs.path.dirname(spec) orelse "";
+        const name = std.fs.path.basename(spec);
+        if (std.mem.eql(u8, ns, namespace) and
+            symbolMatches(name, basename_prefix, .fromPrefix(basename_prefix)))
+        {
+            const symbol = try context.allocator.create(symbols.Symbol);
+            symbol.* = .{
+                .name = try context.allocator.dupe(u8, name),
+                .kind = .module,
+                .detail = try context.allocator.dupe(u8, "std module"),
+                .documentation = &.{},
+                .span = .global,
+            };
+            try matches.items.append(context.allocator, .{ .symbol = .{ .owned = symbol }, .source = .workspace });
+        }
+    }
 }
 
 fn appendMatches(

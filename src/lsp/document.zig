@@ -459,7 +459,11 @@ const Document = struct {
     ) !void {
         workspace.type_checker.invalidateDocument(self.path);
         const result = workspace.type_checker.typeCheck(self.path) catch |err| switch (err) {
-            error.DocumentNotParsed => return,
+            // Both are expected during editing: the document isn't parsed yet,
+            // or an `import` references a module that can't be resolved (a
+            // half-typed path like `import "std/"`). Neither warrants an error
+            // log on every keystroke.
+            error.DocumentNotParsed, error.GetFailed => return,
             else => {
                 std.log.err("Type checker failed to run: {}", .{err});
                 return;

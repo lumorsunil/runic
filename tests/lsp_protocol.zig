@@ -2616,6 +2616,70 @@ test "lsp completion offers the cimport keyword" {
     try std.testing.expect(saw_cimport);
 }
 
+test "lsp import-path completion offers the bundled std root" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source = "const m = import \"st\"\n";
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeCompletionRequest(allocator, 2, uri, 0, 20), // after `st` in the import string
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const items = parsed.value.object.get("result").?.object.get("items").?.array.items;
+    var saw_std = false;
+    for (items) |item| {
+        if (std.mem.eql(u8, item.object.get("label").?.string, "std")) saw_std = true;
+    }
+    try std.testing.expect(saw_std);
+}
+
+test "lsp import-path completion offers bundled std submodules" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source = "const m = import \"std/\"\n";
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeCompletionRequest(allocator, 2, uri, 0, 22), // after `std/` in the import string
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const items = parsed.value.object.get("result").?.object.get("items").?.array.items;
+    var saw_list = false;
+    var saw_ffi = false;
+    for (items) |item| {
+        const label = item.object.get("label").?.string;
+        if (std.mem.eql(u8, label, "list")) saw_list = true;
+        if (std.mem.eql(u8, label, "ffi")) saw_ffi = true;
+    }
+    try std.testing.expect(saw_list);
+    try std.testing.expect(saw_ffi);
+}
+
 const TestFixture = struct {
     allocator: Allocator,
     tmp_dir: std.testing.TmpDir,
