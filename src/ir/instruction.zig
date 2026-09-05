@@ -92,6 +92,11 @@ pub const Instruction = struct {
         /// declared extern's address, and stores the resulting handle value
         /// (a closeable) into `result`. See `future/c-ffi.md`.
         cimport_open: CImportOpen,
+        /// Calls a declared extern of an open cimport library via libffi:
+        /// resolves `library` (the cimport handle value) to find `symbol`,
+        /// marshals `args` per the extern's C signature, and stores the
+        /// marshalled return value into `result`.
+        cimport_call: CImportCall,
         /// forward program stdin, stdout and stderr, receives pointer to closure
         fwd_stdio,
         /// push a Value to the stack
@@ -360,6 +365,15 @@ pub const Instruction = struct {
             params: []const CType,
             ret: CType,
         };
+    };
+
+    pub const CImportCall = struct {
+        /// The cimport value (resolves to a closeable handle at runtime).
+        library: ValueSource,
+        /// The extern's symbol name, looked up in the resolved cimport.
+        symbol: []const u8,
+        args: []const ValueSource,
+        result: Location,
     };
 
     /// Constructs an error value. `payload` (if present) is resolved at runtime

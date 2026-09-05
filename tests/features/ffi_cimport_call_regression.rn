@@ -1,0 +1,20 @@
+// End-to-end C FFI calls through libffi: double args/return (libm pow/cos),
+// int args/return (libc abs), and a string argument marshalled to a C string
+// (libc strlen). Covers both a bound result and a call inside interpolation.
+const c = import "std/ffi.rn"
+
+const m = cimport "libm.so.6" {
+    extern fn pow(base: c.Double, exp: c.Double) c.Double
+    extern fn cos(x: c.Double) c.Double
+}
+echo "pow=${m.pow 2.0 10.0}"
+const squared = m.pow 3.0 2.0
+echo "squared=${squared}"
+echo "cos=${m.cos 0.0}"
+
+const libc = cimport "libc.so.6" {
+    extern fn abs(n: c.Int) c.Int
+    extern fn strlen(s: c.Str) c.ULong
+}
+echo "abs=${libc.abs (0 - 5)}"
+echo "strlen=${libc.strlen "hello"}"

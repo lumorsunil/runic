@@ -4075,6 +4075,11 @@ pub const IRCompiler = struct {
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
+        // A C FFI call through a cimport member (`m.pow x y`) — dispatched to
+        // libffi. Handled on the main call path so its refs are framed like any
+        // other call (the speculative capture path miscounts a nested frame).
+        if (try self.tryCompileCImportCall(source, source)) |result| return result;
+
         if (call.callee.* == .block and call.redirects.len > 0) {
             return self.compileBlockCallWithRedirects(source, call.callee.*.block, call.redirects);
         }
@@ -7624,6 +7629,82 @@ pub const IRCompiler = struct {
             .cimport_externs = cimport_expr.externs,
         } };
         return (try Result.from(result.dereference())).typed(cimport_type);
+    }
+
+    /// The Runic type a C return type surfaces as (`c.Double` → `Float`), used
+    /// to type a cimport call's result so it composes downstream (arithmetic,
+    /// `.len`, …). Mirrors the type checker's `cTypeToRunic`.
+    fn cTypeRunicTypeExpr(self: *IRCompiler, ctype: CType) Error!ast.TypeExpr {
+        return switch (ctype) {
+            .int, .uint, .long, .ulong, .short, .ushort, .char, .size_t, .ptr => ast.TypeExpr.global(.integer),
+            .float, .double => ast.TypeExpr.global(.float),
+            .bool => ast.TypeExpr.global(.boolean),
+            .void => ast.TypeExpr.global(.void),
+            .str => blk: {
+                const byte = try self.allocator.create(ast.TypeExpr);
+                byte.* = ast.TypeExpr.global(.byte);
+                break :blk ast.TypeExpr{ .array = .{ .element = byte, .span = .global } };
+            },
+        };
+    }
+
+    /// Compiles `m.extern args` where `m` is a cimport value and `extern` names a
+    /// declared extern, into a `cimport_call` (a libffi dispatch). Returns null
+    /// when `expr` is not such a call, so other call paths still apply.
+    fn tryCompileCImportCall(
+        self: *IRCompiler,
+        source: anytype,
+        expr: *ast.Expression,
+    ) Error!?Result {
+        const call = switch (expr.*) {
+            .call => |c| c,
+            else => return null,
+        };
+        if (call.background or call.redirects.len != 0) return null;
+        const callee = call.callee;
+        if (callee.* != .binary or callee.binary.op != .member or callee.binary.right.* != .identifier) return null;
+
+        const object = callee.binary.left;
+        const member_name = callee.binary.right.identifier.name;
+
+        var object_type = self.resolveStaticType(object) orelse return null;
+        while (object_type == .alias) object_type = object_type.alias.type_expr.*;
+        if (object_type != .struct_type) return null;
+        const externs = object_type.struct_type.cimport_externs orelse return null;
+
+        var matched: ?ast.ExternFn = null;
+        for (externs) |candidate| {
+            if (std.mem.eql(u8, candidate.name.name, member_name)) {
+                matched = candidate;
+                break;
+            }
+        }
+        const extern_fn = matched orelse return null;
+
+        // Copy the cimport value and each argument into fresh local refs (like
+        // compileFloatOp): the call instruction then references local-frame
+        // slots, not a cross-frame location — which is what makes it work inside
+        // a nested frame such as a string interpolation.
+        const lib_ref = try self.newRef(source, "cimport_lib");
+        try self.set(source, lib_ref, stableResultSource(try self.compileExpression(object)));
+
+        const arg_sources = try self.allocator.alloc(ir.ValueSource, call.arguments.len);
+        for (call.arguments, arg_sources) |arg_expr, *dst| {
+            const arg_ref = try self.newRef(source, "cimport_arg");
+            try self.set(source, arg_ref, stableResultSource(try self.compileExpression(arg_expr)));
+            dst.* = ir.ValueSource.fromLocation(arg_ref.dereference());
+        }
+
+        const result = try self.newRef(source, "cimport_result");
+        try self.addInstruction(.init(.from(source), .{ .cimport_call = .{
+            .library = ir.ValueSource.fromLocation(lib_ref.dereference()),
+            .symbol = extern_fn.name.name,
+            .args = arg_sources,
+            .result = result,
+        } }));
+
+        const ret_type = try self.cTypeRunicTypeExpr(cTypeOfAnnotation(extern_fn.return_type) orelse .void);
+        return (try Result.from(result.dereference())).typed(ret_type);
     }
 
     /// Builds the `fn_ref_type` for a module pub-fn field, carrying the function's

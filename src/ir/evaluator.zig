@@ -11,6 +11,8 @@ const Tracer = runic.trace.Tracer;
 const compiler = runic.ir.compiler;
 const CImportCloseable = @import("../ffi/cimport.zig").CImportCloseable;
 const ResolvedExtern = @import("../ffi/cimport.zig").ResolvedExtern;
+const ffi = @import("../ffi/libffi.zig");
+const CType = @import("../ffi/ctype.zig").CType;
 
 const FastUIntSource = union(enum) {
     ptr: *ir.Value,
@@ -72,6 +74,7 @@ pub const Error =
         CommandNotFound,
         CImportLoadFailed,
         CImportSymbolNotFound,
+        CImportUnsupportedType,
     };
 
 pub const Result = union(enum) {
@@ -1028,7 +1031,79 @@ pub const IREvaluator = struct {
                     .label = op.library_name,
                 };
                 const handle = try self.context.addCloseable(&cc.closeable);
+                try self.context.addCImport(handle, cc);
                 try self.setLocation(thread, op.result, .{ .closeable = handle });
+                return .cont;
+            },
+            .cimport_call => |call| {
+                const lib_val = try self.resolveValueSource(thread, call.library);
+                const handle = switch (lib_val) {
+                    .closeable => |h| h,
+                    else => return Error.CImportLoadFailed,
+                };
+                const cc = self.context.getCImport(handle) orelse return Error.CImportLoadFailed;
+                const ext = cc.find(call.symbol) orelse return Error.CImportSymbolNotFound;
+                if (call.args.len != ext.params.len) return Error.CImportUnsupportedType;
+
+                // A slot holds one marshalled C argument (or the return); an
+                // extern union keeps it 8-byte aligned for any scalar width.
+                const Slot = extern union { i: i64, u: u64, f: f64, ff: f32, p: ?*anyopaque };
+
+                var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+                defer arena_state.deinit();
+                const a = arena_state.allocator();
+
+                const n = ext.params.len;
+                const storage = try a.alloc(Slot, n);
+                const avalues = try a.alloc(?*anyopaque, n);
+                const atypes = try a.alloc([*c]ffi.c.ffi_type, n);
+
+                for (ext.params, call.args, storage, avalues, atypes) |param, arg_src, *slot, *av, *at| {
+                    const v = try self.resolveValueSource(thread, arg_src);
+                    switch (param) {
+                        .int => @as(*i32, @ptrCast(slot)).* = @truncate(try ffiArgInt(v)),
+                        .uint => @as(*u32, @ptrCast(slot)).* = @truncate(@as(u64, @bitCast(try ffiArgInt(v)))),
+                        .long => @as(*i64, @ptrCast(slot)).* = try ffiArgInt(v),
+                        .ulong, .size_t => @as(*u64, @ptrCast(slot)).* = @bitCast(try ffiArgInt(v)),
+                        .short => @as(*i16, @ptrCast(slot)).* = @truncate(try ffiArgInt(v)),
+                        .ushort => @as(*u16, @ptrCast(slot)).* = @truncate(@as(u64, @bitCast(try ffiArgInt(v)))),
+                        .char => @as(*i8, @ptrCast(slot)).* = @truncate(try ffiArgInt(v)),
+                        .bool => @as(*u8, @ptrCast(slot)).* = if (ffiArgBool(v)) 1 else 0,
+                        .float => @as(*f32, @ptrCast(slot)).* = @floatCast(try ffiArgFloat(v)),
+                        .double => @as(*f64, @ptrCast(slot)).* = try ffiArgFloat(v),
+                        .ptr => @as(*usize, @ptrCast(slot)).* = try ffiArgPtr(v),
+                        .str => {
+                            var w = std.Io.Writer.Allocating.init(a);
+                            try self.materializeString(thread, v, &w.writer);
+                            const z = try a.dupeZ(u8, w.written());
+                            @as(*?[*:0]const u8, @ptrCast(slot)).* = z.ptr;
+                        },
+                        .void => return Error.CImportUnsupportedType,
+                    }
+                    av.* = @ptrCast(slot);
+                    at.* = ffiTypeFor(param);
+                }
+
+                var cif: ffi.c.ffi_cif = undefined;
+                if (ffi.c.ffi_prep_cif(&cif, ffi.c.FFI_DEFAULT_ABI, @intCast(n), ffiTypeFor(ext.ret), atypes.ptr) != ffi.c.FFI_OK)
+                    return Error.CImportLoadFailed;
+
+                var ret: Slot = .{ .u = 0 };
+                ffi.c.ffi_call(&cif, @ptrCast(ext.addr), &ret, avalues.ptr);
+
+                const result: ir.Value = switch (ext.ret) {
+                    .void => .void,
+                    .double => .{ .float = ret.f },
+                    .float => .{ .float = @floatCast(ret.ff) },
+                    .bool => .{ .exit_code = ExitCode.fromBoolean(ret.i != 0) },
+                    .ptr => .{ .addr = @intFromPtr(ret.p) },
+                    // A `c.Str` return (a borrowed `char*`) needs copying into a
+                    // Runic string — deferred; see future/c-ffi.md.
+                    .str => return Error.CImportUnsupportedType,
+                    // Integer widths are widened to `ffi_arg`; read the full word.
+                    else => .{ .integer = ret.i },
+                };
+                try self.setLocation(thread, call.result, result);
                 return .cont;
             },
             .exit_with => |value| {
@@ -3024,4 +3099,62 @@ test "evaluator fused range loop updates accumulator and exits loop" {
         .exit_code => |exit_code| !exit_code.toBoolean(),
         else => false,
     });
+}
+
+/// The libffi `ffi_type` for a C type. Uses the concrete-width globals
+/// (`ffi_type_sint32`, …) since the C-named aliases (`ffi_type_sint`, …) are
+/// header macros, not linkable symbols.
+fn ffiTypeFor(ctype: CType) [*c]ffi.c.ffi_type {
+    return switch (ctype) {
+        .int => &ffi.c.ffi_type_sint32,
+        .uint => &ffi.c.ffi_type_uint32,
+        .long => &ffi.c.ffi_type_sint64,
+        .ulong, .size_t => &ffi.c.ffi_type_uint64,
+        .short => &ffi.c.ffi_type_sint16,
+        .ushort => &ffi.c.ffi_type_uint16,
+        .char => &ffi.c.ffi_type_sint8,
+        .bool => &ffi.c.ffi_type_uint8,
+        .float => &ffi.c.ffi_type_float,
+        .double => &ffi.c.ffi_type_double,
+        .str, .ptr => &ffi.c.ffi_type_pointer,
+        .void => &ffi.c.ffi_type_void,
+    };
+}
+
+/// The i64 to marshal into an integer C argument (a Runic `Int`, or a `Bool`
+/// carried as an exit code).
+fn ffiArgInt(v: ir.Value) Error!i64 {
+    return switch (v) {
+        .integer => |x| x,
+        .exit_code => |ec| if (ec.toBoolean()) 1 else 0,
+        else => Error.CImportUnsupportedType,
+    };
+}
+
+/// The f64 to marshal into a floating C argument (a Runic `Float`, or an `Int`
+/// widened).
+fn ffiArgFloat(v: ir.Value) Error!f64 {
+    return switch (v) {
+        .float => |x| x,
+        .integer => |x| @floatFromInt(x),
+        else => Error.CImportUnsupportedType,
+    };
+}
+
+fn ffiArgBool(v: ir.Value) bool {
+    return switch (v) {
+        .exit_code => |ec| ec.toBoolean(),
+        .integer => |x| x != 0,
+        else => false,
+    };
+}
+
+/// The pointer-width value to marshal into a `c.Ptr` argument (an opaque
+/// handle carried as an `addr`, or a raw `Int`).
+fn ffiArgPtr(v: ir.Value) Error!usize {
+    return switch (v) {
+        .addr => |x| x,
+        .integer => |x| @bitCast(x),
+        else => Error.CImportUnsupportedType,
+    };
 }
