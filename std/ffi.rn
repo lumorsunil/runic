@@ -1,0 +1,44 @@
+// std.ffi — C foreign-function-interface types.
+//
+// These name the C ABI types used to declare `extern fn` signatures inside a
+// `cimport` block:
+//
+//   const c = import "std/ffi.rn"
+//   const m = cimport "libm.so.6" {
+//       extern fn pow(base: c.Double, exp: c.Double) c.Double
+//   }
+//   echo "${m.pow 2.0 10.0}"   // 1024
+//
+// They are markers, not ordinary Runic types. A C type carries an ABI class
+// (which register/stack slot it occupies) and a marshalling rule, neither of
+// which is expressible in Runic — and several C names (Int, Float, Bool, Void)
+// collide with Runic primitives. So this module declares no bindings: the
+// compiler recognizes a qualified reference to a member of `std.ffi`
+// (`c.Double`, `c.Int`, …) in an `extern fn` type position and resolves it to
+// the C type below. You never construct a value of one of these types; you
+// write them only in extern signatures.
+//
+// Integer types — passed in general-purpose registers, marshalled from/to the
+// Runic `Int` (i64); narrower widths are range-checked at the call:
+//   c.Int     C `int`             32-bit signed
+//   c.UInt    C `unsigned int`    32-bit unsigned
+//   c.Long    C `long`            64-bit signed
+//   c.ULong   C `unsigned long`   64-bit unsigned
+//   c.Short   C `short`           16-bit signed
+//   c.UShort  C `unsigned short`  16-bit unsigned
+//   c.Char    C `char`             8-bit
+//   c.SizeT   C `size_t`          pointer-width unsigned
+//
+// Floating-point types — passed in SSE/vector registers, marshalled from/to
+// the Runic `Float` (f64):
+//   c.Float   C `float`           32-bit
+//   c.Double  C `double`          64-bit
+//
+// Other scalar types:
+//   c.Bool    C `_Bool` / int 0|1     from/to Runic `Bool`
+//   c.Str     C `char*` (null-terminated) from/to Runic `String`
+//   c.Ptr     C `void*` / any pointer  an opaque handle (not dereferenceable)
+//   c.Void    C `void` return          maps to Runic `Void`
+//
+// See future/c-ffi.md for the full design.
+fn Void @() Void

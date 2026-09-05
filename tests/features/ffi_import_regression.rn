@@ -1,0 +1,9 @@
+// std.ffi is the bundled marker module for the C FFI type surface. Until the
+// type checker recognizes its C types (`c.Double`, `c.Int`, …), this asserts
+// only that the module resolves — both as a direct `import "std/ffi.rn"` and
+// as a re-export of the `std` root (`std.ffi`).
+const c = import "std/ffi.rn"
+echo "direct import ok"
+
+const std = import "std"
+echo "reexport ok"
