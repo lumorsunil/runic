@@ -1,0 +1,7 @@
+[error]: tests/diagnostics/ffi_unknown_ctype.rn:3:25: unknown C type `c.Nonsense`
+   1:const c = import "std/ffi.rn"
+   2:const m = cimport "libm.so.6" {
+   3:    extern fn pow(base: c.Nonsense) c.Double
+   4:}
+   5:
+

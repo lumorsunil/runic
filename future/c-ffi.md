@@ -398,14 +398,23 @@ area when no header is available.
   (`s.Point{…}`) and the `pub const X = struct` literal form remain unsupported,
   and neither is on the FFI path. So `std.ffi` does *not* need new type-system
   machinery for the `c.Double`-in-`extern-fn` surface.
-- **How `std.ffi` represents the C types — the real remaining type-surface
-  question.** A C type is not an ordinary Runic type (`c.Int` ≠ Runic `Int` in
-  width/ABI), so `std.ffi` cannot simply alias them. Options: (a) `std.ffi` is a
-  compiler-recognized module whose exported names (`Double`, `Int`, `Ptr`, …)
-  are opaque marker types the extern-block checker maps to ABI classes — the
-  qualified-annotation machinery that already works carries the *reference*, and
-  only the *meaning* of these specific names is special; or (b) add a dedicated
-  C-type type-expr kind that `std.ffi`'s bindings resolve to. Decide during MVP.
+- **How `std.ffi` represents the C types — RESOLVED (option a, virtualized).**
+  A C type is not an ordinary Runic type, and four names (`Int`/`Float`/`Bool`/
+  `Void`) collide with primitives and cannot be declared at all — so `std.ffi`
+  declares *nothing*: it is a documented marker module, and the type checker
+  recognizes a qualified `c.<Name>` in an `extern fn` type position, mapping the
+  name to the Runic type it marshals from/to (`c.Double`→`Float`, integer widths
+  →`Int`, `c.Str`→`String`, `c.Ptr`→`Int` as an opaque address for the MVP,
+  `c.Void`→`Void`). Unknown C types and an un-imported namespace are reported.
+  The original `c.X` names stay in the `ExternFn` AST for marshalling.
+- **`cimport` member-call resolution — deferred to the IR step.** A `cimport`
+  value is typed as a struct of its externs (function-typed fields), but a
+  member *call* `m.pow 2.0 10.0` currently resolves through Runic's permissive
+  UFCS/command path rather than strictly against those fields (module values get
+  special member-call handling that a struct type does not; and Runic checks no
+  argument types anywhere). Making `m.pow`'s return type flow — and rejecting an
+  unknown extern — needs dedicated cimport member handling, which is entangled
+  with the IR/eval stage and can only be verified end-to-end once calls run.
 - **`c.SizeT` / pointer-width types.** These resolve per target; `std.ffi` must
   expose them with the target's actual width rather than a fixed one.
 - **Threading/reentrancy** — Runic already runs pipeline stages on threads;

@@ -1797,6 +1797,7 @@ pub const TypeChecker = struct {
             .try_expr => |*try_expr| self.runTry(scope, try_expr),
             .is_expr => |*is_expr| self.runIs(scope, is_expr),
             .import_expr => |*import_expr| self.runImportExpr(scope, import_expr),
+            .cimport_expr => |*cimport_expr| self.runCImportExpr(scope, cimport_expr),
             .fn_decl => |*fn_decl| self.runFnDecl(scope, fn_decl),
             .call => |*call| self.runCall(scope, call),
             .comptime_expr => |*comptime_expr| self.runExpression(scope, comptime_expr.operand),
@@ -3862,6 +3863,145 @@ pub const TypeChecker = struct {
         }
     }
 
+    /// The Runic type a `std.ffi` C type marshals from/to, used only for
+    /// type-checking an `extern fn` and its calls. The C width/ABI distinction
+    /// (`c.Int` is 32-bit, Runic `Int` is 64-bit) is irrelevant here — it is
+    /// carried by the `ExternFn` AST and applied at marshalling — so several C
+    /// types collapse to the same Runic type. `c.Ptr` is an opaque handle,
+    /// treated as an `Int` (an address) for the MVP. Returns null for a name
+    /// that is not a known C type.
+    fn cTypeToRunic(self: *TypeChecker, name: []const u8) Error!?*const ast.TypeExpr {
+        const int_names = [_][]const u8{ "Int", "UInt", "Long", "ULong", "Short", "UShort", "Char", "SizeT", "Ptr" };
+        for (int_names) |n| {
+            if (std.mem.eql(u8, name, n)) return try self.allocTypeExpression(.global(.integer));
+        }
+        if (std.mem.eql(u8, name, "Float") or std.mem.eql(u8, name, "Double")) {
+            return try self.allocTypeExpression(.global(.float));
+        }
+        if (std.mem.eql(u8, name, "Bool")) return try self.allocTypeExpression(.global(.boolean));
+        if (std.mem.eql(u8, name, "Str")) return try self.allocStringType();
+        if (std.mem.eql(u8, name, "Void")) return try self.allocTypeExpression(.global(.void));
+        return null;
+    }
+
+    /// Resolves a C type written in an `extern fn` signature and reports a
+    /// diagnostic if it is malformed. It must be a qualified `ns.Name` where
+    /// `ns` is in scope (the imported `std.ffi` module) and `Name` is a known C
+    /// type. Returns the Runic type it checks as, or a `failed` type on error.
+    ///
+    /// NOTE: `ns` is only required to be *a* bound identifier, not verified to
+    /// be `std.ffi` specifically — a module-value binding does not currently
+    /// retain its source path. Tightening this is tracked in future/c-ffi.md.
+    fn resolveCType(self: *TypeChecker, scope: *Scope, type_expr: *const ast.TypeExpr) Error!*const ast.TypeExpr {
+        const failed = try self.allocTypeExpression(.{ .failed = .{ .span = type_expr.span() } });
+
+        if (type_expr.* != .identifier or type_expr.identifier.path.segments.len != 2) {
+            try self.reportSpanError(
+                type_expr.span(),
+                Error.UnsupportedExpression,
+                .@"error",
+                "an extern fn type must be a std.ffi C type like `c.Double`",
+                .{},
+            );
+            return failed;
+        }
+
+        const ns = type_expr.identifier.path.segments[0];
+        const cname = type_expr.identifier.path.segments[1].name;
+
+        if (scope.lookup(ns.name) == null) {
+            try self.reportSpanError(
+                ns.span,
+                Error.IdentifierNotFound,
+                .@"error",
+                "`{s}` is not in scope — `import \"std/ffi.rn\"` for the C types",
+                .{ns.name},
+            );
+            return failed;
+        }
+
+        return try self.cTypeToRunic(cname) orelse {
+            try self.reportSpanError(
+                type_expr.span(),
+                Error.UnsupportedExpression,
+                .@"error",
+                "unknown C type `{s}.{s}`",
+                .{ ns.name, cname },
+            );
+            return failed;
+        };
+    }
+
+    /// Type-checks a `cimport` block: every `extern fn` parameter and return
+    /// type must be a valid `std.ffi` C type. The value's own (module-like)
+    /// type is built separately in `buildCImportValueType`.
+    pub fn runCImportExpr(self: *TypeChecker, scope: *Scope, cimport: *ast.CImportExpr) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.logTypeCheckTrace(@src().fn_name, cimport.span);
+
+        for (cimport.externs) |extern_fn| {
+            for (extern_fn.params) |param| {
+                if (param.type_annotation) |ann| {
+                    _ = try self.resolveCType(scope, ann);
+                } else {
+                    try self.reportSpanError(
+                        extern_fn.name.span,
+                        Error.UnsupportedExpression,
+                        .@"error",
+                        "extern fn `{s}` parameter needs a C type, e.g. `x: c.Double`",
+                        .{extern_fn.name.name},
+                    );
+                }
+            }
+            _ = try self.resolveCType(scope, extern_fn.return_type);
+        }
+    }
+
+    /// The Runic type an extern parameter/return annotation checks as, extracted
+    /// by its last path segment (`c.Double` → the `Double` C type → `Float`).
+    /// Pure (no scope); `runCImportExpr` has already reported any bad type.
+    fn cTypeFromAnnotation(self: *TypeChecker, annotation: ?*const ast.TypeExpr) Error!?*const ast.TypeExpr {
+        const t = annotation orelse return null;
+        if (t.* == .identifier) {
+            const segments = t.identifier.path.segments;
+            if (segments.len > 0) {
+                return try self.cTypeToRunic(segments[segments.len - 1].name);
+            }
+        }
+        return null;
+    }
+
+    /// Builds the (module-like) type of a `cimport` value: a struct whose fields
+    /// are the declared externs, each typed as a function over the C types'
+    /// Runic equivalents. `m.pow` then resolves like any struct-field member and
+    /// `m.pow 2.0 10.0` type-checks like any call.
+    fn buildCImportValueType(self: *TypeChecker, cimport: ast.CImportExpr) Error!?*const ast.TypeExpr {
+        const fields = try self.arena.allocator().alloc(ast.TypeExpr.StructField, cimport.externs.len);
+        for (cimport.externs, 0..) |extern_fn, i| {
+            const params = try self.arena.allocator().alloc(?*const ast.TypeExpr, extern_fn.params.len);
+            for (extern_fn.params, 0..) |param, pi| {
+                params[pi] = try self.cTypeFromAnnotation(param.type_annotation);
+            }
+            const fn_type = try self.allocTypeExpression(.{ .function = .{
+                .params = .{ ._non_variadic = params },
+                .stdin_type = null,
+                .return_type = try self.cTypeFromAnnotation(extern_fn.return_type),
+                .span = extern_fn.span,
+            } });
+            fields[i] = .{
+                .name = extern_fn.name,
+                .type_expr = fn_type,
+                .span = extern_fn.span,
+            };
+        }
+
+        return self.allocTypeExpression(.{ .struct_type = .{
+            .fields = fields,
+            .decls = &.{},
+            .span = cimport.span,
+        } });
+    }
+
     fn isUnion(comptime T: type) bool {
         return switch (@typeInfo(T)) {
             .@"union" => true,
@@ -3954,6 +4094,13 @@ pub const TypeChecker = struct {
                 new_st.fields = new_fields;
                 return try self.allocTypeExpression(.{ .struct_type = new_st });
             }
+        }
+
+        // A cimport value is typed as a struct of its externs (see
+        // buildCImportValueType), so `m.pow 2.0 10.0` resolves and checks like
+        // any struct-member call. The AST's own resolveType returns null here.
+        if (T == *ast.Expression and expr.* == .cimport_expr) {
+            return self.buildCImportValueType(expr.cimport_expr);
         }
 
         const result = try expr.resolveType(self.io, self.arena.allocator(), scope);

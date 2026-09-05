@@ -1,0 +1,12 @@
+[error]: tests/diagnostics/ffi_namespace_not_imported.rn:2:25: `c` is not in scope — `import "std/ffi.rn"` for the C types
+   1:const m = cimport "libm.so.6" {
+   2:    extern fn pow(base: c.Double) c.Double
+   3:}
+   4:
+
+[error]: tests/diagnostics/ffi_namespace_not_imported.rn:2:35: `c` is not in scope — `import "std/ffi.rn"` for the C types
+   1:const m = cimport "libm.so.6" {
+   2:    extern fn pow(base: c.Double) c.Double
+   3:}
+   4:
+
