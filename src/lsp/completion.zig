@@ -45,7 +45,6 @@ fn OwnedOrNot(comptime T: type) type {
                         ptr.deinit(allocator);
                     }
                     allocator.destroy(ptr);
-                    ptr.* = undefined;
                 },
                 .notOwned => {},
             }
@@ -857,4 +856,19 @@ test "extractMemberContext finds member access before cursor" {
     const member_ctx = extractMemberContext(ctx).?;
     try std.testing.expectEqualStrings("m", member_ctx.object_name);
     try std.testing.expectEqualStrings("", member_ctx.prefix);
+}
+
+test "MatchList frees owned symbol matches cleanly" {
+    // Member completion produces owned matches (a fresh Symbol per match);
+    // deinit must free each exactly once with no use-after-free. Many entries
+    // increase the chance a freed slot is reused/unmapped, which is what turned
+    // a write-after-`destroy` into a segfault in the wild.
+    const allocator = std.testing.allocator;
+    var matches = MatchList.empty(allocator);
+    for (0..256) |i| {
+        var buf: [24]u8 = undefined;
+        const name = try std.fmt.bufPrint(&buf, "member{d}", .{i});
+        try appendOwnedMatch(&matches, allocator, .field, name, "some detail", .global);
+    }
+    matches.deinit();
 }

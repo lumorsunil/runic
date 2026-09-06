@@ -52,6 +52,11 @@ pass and return C structs by value, and generate bindings from a header.
 
 ### Fixed
 
+- **LSP crash on member completion** — completing a member (`m.<partial>`),
+  especially on a large imported module, could segfault the language server: an
+  owned completion match wrote to its heap slot *after* freeing it
+  (`ptr.* = undefined` following `destroy`), a use-after-free that crashed once
+  that page was reused or unmapped.
 - **Compound assignment to a struct field** — `a.x += 1` (and `a.x = a.x + 1`)
   crashed the type checker with `UnresolvedTypeLiteral` (or reported a spurious
   `expected type Int, actual: Int`). A field's declared type surfaces through
