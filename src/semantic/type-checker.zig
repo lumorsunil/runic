@@ -1306,6 +1306,30 @@ pub const TypeChecker = struct {
             }
         }
 
+        // A module-qualified type (`m.Vector3`): resolve the member through the
+        // module's scope so it becomes the actual type (a struct, …), not the
+        // module `m`. Types can't be `pub`, so visibility is not required.
+        if (identifier.path.segments.len == 2) {
+            if (scope.lookup(identifier.path.segments[0].name)) |mod_binding| {
+                if (mod_binding.type_expr) |mod_type_expr| {
+                    const mod_type = self.unaliasType(mod_type_expr);
+                    if (mod_type.* == .module) {
+                        if (try self.requestModuleScope(mod_type.module)) |module_scope| {
+                            if (module_scope.lookup(identifier.path.segments[1].name)) |member| {
+                                if (member.type_expr) |member_type| {
+                                    return try self.allocTypeExpression(.{ .alias = .{
+                                        .name = identifier.path.segments[1].name,
+                                        .span = identifier.span,
+                                        .type_expr = member_type,
+                                    } });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         const name = identifier.path.segments[0].name;
 
         const binding = scope.lookup(name) orelse {

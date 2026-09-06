@@ -55,6 +55,10 @@ pass and return C structs by value, and generate bindings from a header.
   rejects `pub const X = struct {…}`), so a module's struct type is reachable
   without a visibility marker; `m.Vector3` also resolves as a type and as a
   type-name reference in value position.
+- **Module-qualified type annotations** — a qualified type like `m.Vector3` used
+  as a field, parameter, or return type now resolves to the module's actual
+  type rather than to the module `m`, so a function `fn f(pos: m.Vector3) …`
+  type-checks and passes the value through correctly.
 
 ### Fixed
 
