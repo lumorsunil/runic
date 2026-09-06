@@ -1437,10 +1437,14 @@ pub const TypeChecker = struct {
 
         switch (fn_decl.params) {
             ._non_variadic => |params| for (params) |param| {
-                const param_type = try self.resolveExprType(
-                    fn_scope,
-                    param,
-                );
+                // Resolve the param's declared type (like the stdin/fn types
+                // above), so a primitive annotation such as `Int` — parsed as a
+                // bare identifier — becomes the resolved primitive rather than an
+                // unresolved `.identifier`. Otherwise every use of the param
+                // (a struct-literal field, an assignment, …) compares a resolved
+                // type against a raw `Int` and spuriously fails.
+                const raw = try self.resolveExprType(fn_scope, param);
+                const param_type = if (raw) |t| try self.resolveTypeExpr(fn_scope, t) else null;
                 try self.runBindingPattern(
                     fn_scope,
                     param.pattern,
@@ -1450,10 +1454,8 @@ pub const TypeChecker = struct {
                 );
             },
             ._variadic => |param| {
-                const param_type = try self.resolveExprType(
-                    fn_scope,
-                    param,
-                );
+                const raw = try self.resolveExprType(fn_scope, param);
+                const param_type = if (raw) |t| try self.resolveTypeExpr(fn_scope, t) else null;
                 try self.runBindingPattern(
                     fn_scope,
                     param.pattern,

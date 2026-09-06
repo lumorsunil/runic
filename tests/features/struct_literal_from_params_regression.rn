@@ -1,0 +1,18 @@
+// A function that builds a struct from its parameters: the param types (a bare
+// `Int` annotation) must resolve so the struct-literal field values type-check
+// against the declared field types, rather than comparing `Int` against `Int`.
+const Vector = struct { x: Int, y: Int }
+
+fn Void initVector(x: Int, y: Int) Vector {
+  yield Vector{ .x = x, .y = y }
+}
+
+const v = initVector 3 4
+echo "x=${v.x} y=${v.y}"
+
+// arithmetic on params into fields, too
+fn Void scaled(n: Int, factor: Int) Vector {
+  yield Vector{ .x = n * factor, .y = n + factor }
+}
+const s = scaled 5 2
+echo "sx=${s.x} sy=${s.y}"

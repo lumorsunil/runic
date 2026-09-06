@@ -52,6 +52,13 @@ pass and return C structs by value, and generate bindings from a header.
 
 ### Fixed
 
+- **Unresolved function-parameter types** — a function parameter's declared type
+  was stored unresolved, so a primitive annotation like `Int` (parsed as a bare
+  identifier) surfaced as an `.identifier` rather than the resolved primitive.
+  Using a parameter where its type is checked — a struct-literal field value
+  (`Vector{ .x = x }`), an assignment — spuriously failed with
+  `expected type Int, actual: Int`. Parameter types are now resolved at
+  declaration, like the stdin and function types already were.
 - **Injected globals leaked into module members** — a module value's type (and
   so member completion on an imported module, `m.<TAB>`) included the builtins
   and primitive types the type checker injects into every module scope
