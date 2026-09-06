@@ -406,6 +406,35 @@ emit a stub `cimport` block with every symbol name filled in and `// TODO:`
 types. Not callable as-is, but it saves typing the names and shows the surface
 area when no header is available.
 
+## Known limitation: direct access / wrappers need a closure-capture fix
+
+A generated binding is used through the raw cimport value —
+`rl.raylib.InitWindow 800 600 "…"` (import → cimport member → extern). Two nicer
+forms are **blocked by the same underlying bug** and are not generated:
+
+- **Aliases** — `pub const InitWindow = raylib.InitWindow` (bare access to a
+  multi-arg extern is treated as a nullary call, and there is no first-class
+  extern value to bind); and
+- **Wrapper functions** — `pub fn Void InitWindow(…) { raylib.InitWindow … }`.
+
+The root cause is in closure capture, not cbind. A cimport value is *typed* as a
+struct (so `m.pow x` dispatches like struct-member access) but its *runtime
+value* is a `.closeable` handle. When a function body references a top-level
+cimport const, the closure captures it **by slot reference** — the captured
+value is the address of the const's slot, not the handle. Struct *member access*
+resolves that extra indirection (so `p.x` on a captured struct works), but
+`cimport_call`'s library resolution does not, so the extern call gets a bogus
+library (`CImportLoadFailed` / a bad dereference). Verified: `const lib2 = lib`
+(top-level copy) works and captured scalars — even runtime-computed — work; only
+a captured cimport handle breaks. Wrapping the handle in a heap slot did not
+help: the capture still stored the slot reference rather than the value.
+
+Fixing this (capturing a cimport/closeable by value, or making `cimport_call`
+resolve the captured object the way struct member access does) would unblock both
+wrappers and the alias form. It is a contained change but in the closure /
+stack-vs-heap addressing model, so it wants a focused pass rather than a rushed
+one.
+
 ## Phased plan
 
 **Status (2026-09): the MVP is implemented and works end-to-end** — a `cimport`
