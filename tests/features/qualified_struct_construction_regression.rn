@@ -21,3 +21,8 @@ fn Void makeEntity(pos: m.Vector3) Entity {
 }
 const built = makeEntity m.Vector3{ .x = 4, .y = 5, .z = 6 }
 echo "built=${built.pos.x} ${built.pos.y} ${built.pos.z}"
+
+// A module's struct type referenced in value position: a bare statement is a
+// no-op, and interpolating it serializes to the type name (like `${Int}`).
+m.Vector3
+echo "typeref=${m.Vector3}"
