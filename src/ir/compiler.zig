@@ -11,6 +11,7 @@ const RCError = @import("../mem/rc.zig").RCError;
 const FrontendDocumentStore = @import("../frontend/document_store.zig").FrontendDocumentStore;
 const resolveModulePath = @import("../frontend/document_store.zig").resolveModulePath;
 const CType = @import("../ffi/ctype.zig").CType;
+const CSig = @import("../ffi/ctype.zig").CSig;
 const evaluateArithmetic = ir.evaluator.IREvaluator.evaluateArithmetic;
 const evaluateLogical = ir.evaluator.IREvaluator.evaluateLogical;
 const evaluateCompare = ir.evaluator.IREvaluator.evaluateCompare;
@@ -2623,6 +2624,12 @@ pub const IRCompiler = struct {
         expr: *ast.Expression,
     ) Error!Result {
         if (try self.tryCompileTypedValueCapture(source, expr)) |captured| return captured;
+
+        // A `cimport` extern call returning a by-value struct yields a heap
+        // value whose slots the stdio-capture path's pipe bookkeeping would
+        // clobber (a struct return is bound, never a command). Compile it
+        // directly, bypassing capture.
+        if (self.exprIsCImportStructCall(expr)) return try self.compileExpression(expr);
 
         const background_capture = isBackgroundExecutionExpression(expr);
         const expr_effects = self.analyzeExpressionEffects(expr);
@@ -7589,6 +7596,28 @@ pub const IRCompiler = struct {
         return null;
     }
 
+    /// The C signature type an extern parameter/return annotation names: a
+    /// scalar `c.X`, or a struct passed by value — a user struct all of whose
+    /// fields are scalar `c.X` or (recursively) such structs (e.g. raylib's
+    /// `Color`, `Vector2`, `Camera2D`). Null if the annotation resolves to
+    /// neither.
+    fn cSigOfAnnotation(self: *IRCompiler, annotation: ?*const ast.TypeExpr) Error!?CSig {
+        if (cTypeOfAnnotation(annotation)) |ct| return CSig{ .scalar = ct };
+        const t = annotation orelse return null;
+        if (t.* != .identifier) return null;
+        const segments = t.identifier.path.segments;
+        if (segments.len != 1) return null;
+        const name = segments[0].name;
+        const st = self.user_struct_types.get(name) orelse return null;
+        if (st.fields.len == 0) return null;
+        const fields = try self.allocator.alloc(CSig.Field, st.fields.len);
+        for (st.fields, fields) |f, *dst| {
+            const fsig = (try self.cSigOfAnnotation(f.type_expr)) orelse return null;
+            dst.* = .{ .name = f.name.name, .type = fsig };
+        }
+        return CSig{ .strct = .{ .name = name, .fields = fields } };
+    }
+
     /// Compiles a `cimport` block into a `cimport_open` instruction that, at
     /// runtime, loads the library and resolves each declared extern's address.
     /// The result value (a closeable handle) is typed as a cimport struct so a
@@ -7602,9 +7631,9 @@ pub const IRCompiler = struct {
 
         const externs = try self.allocator.alloc(ir.Instruction.CImportOpen.Extern, cimport_expr.externs.len);
         for (cimport_expr.externs, externs) |ext, *dst| {
-            const params = try self.allocator.alloc(CType, ext.params.len);
+            const params = try self.allocator.alloc(CSig, ext.params.len);
             for (ext.params, params) |param, *cparam| {
-                cparam.* = cTypeOfAnnotation(param.type_annotation) orelse {
+                cparam.* = (try self.cSigOfAnnotation(param.type_annotation)) orelse {
                     try self.reportSourceError(source, Error.UnsupportedExpression, .@"error", "extern fn \"{s}\" has an unresolved C parameter type", .{ext.name.name});
                     return .fromValue(.void);
                 };
@@ -7612,7 +7641,7 @@ pub const IRCompiler = struct {
             dst.* = .{
                 .symbol = ext.name.name,
                 .params = params,
-                .ret = cTypeOfAnnotation(ext.return_type) orelse .void,
+                .ret = (try self.cSigOfAnnotation(ext.return_type)) orelse .{ .scalar = .void },
             };
         }
 
@@ -7652,6 +7681,22 @@ pub const IRCompiler = struct {
         };
     }
 
+    /// The Runic type a cimport call's result is typed as: a scalar return
+    /// surfaces as its mapped primitive (`cTypeRunicTypeExpr`); a by-value
+    /// struct return surfaces as the user struct itself, so downstream field
+    /// access (`col.r`) composes.
+    fn cImportRetTypeExpr(self: *IRCompiler, annotation: ?*const ast.TypeExpr) Error!ast.TypeExpr {
+        if (cTypeOfAnnotation(annotation)) |ct| return self.cTypeRunicTypeExpr(ct);
+        if (annotation) |t| {
+            if (t.* == .identifier and t.identifier.path.segments.len == 1) {
+                if (self.user_struct_types.get(t.identifier.path.segments[0].name)) |st| {
+                    return ast.TypeExpr{ .struct_type = st };
+                }
+            }
+        }
+        return ast.TypeExpr.global(.void);
+    }
+
     /// Emits a zero-argument `cimport_call` when `object` is a cimport value
     /// (its type carries `cimport_externs`) and `member` names one of its
     /// externs — the bare-member form `rl.CloseWindow`. Returns null otherwise.
@@ -7686,8 +7731,41 @@ pub const IRCompiler = struct {
             .result = result,
         } }));
 
-        const ret_type = try self.cTypeRunicTypeExpr(cTypeOfAnnotation(extern_fn.return_type) orelse .void);
+        const ret_type = try self.cImportRetTypeExpr(extern_fn.return_type);
         return (try Result.from(result.dereference())).typed(ret_type);
+    }
+
+    /// Whether `expr` is a call to a declared `cimport` extern that returns a
+    /// by-value struct (`m.fn args` → `Color`). A static check (emits nothing)
+    /// mirroring `tryCompileCImportCall`. Only struct returns need to bypass the
+    /// stdio-capture path — their heap-backed result is clobbered by the capture
+    /// path's pipe bookkeeping; scalar returns survive it and keep their
+    /// existing behavior (which the interpolation stack contract relies on).
+    fn exprIsCImportStructCall(self: *IRCompiler, expr: *ast.Expression) bool {
+        const call = switch (expr.*) {
+            .call => |c| c,
+            else => return false,
+        };
+        if (call.background or call.redirects.len != 0) return false;
+        const callee = call.callee;
+        if (callee.* != .binary or callee.binary.op != .member or callee.binary.right.* != .identifier) return false;
+
+        var object_type = self.resolveStaticType(callee.binary.left) orelse return false;
+        while (object_type == .alias) object_type = object_type.alias.type_expr.*;
+        if (object_type != .struct_type) return false;
+        const externs = object_type.struct_type.cimport_externs orelse return false;
+
+        const member_name = callee.binary.right.identifier.name;
+        for (externs) |candidate| {
+            if (!std.mem.eql(u8, candidate.name.name, member_name)) continue;
+            // Only a struct return needs the bypass: no scalar C type, but a
+            // single identifier naming a user struct.
+            if (cTypeOfAnnotation(candidate.return_type) != null) return false;
+            const ret = candidate.return_type;
+            if (ret.* != .identifier or ret.identifier.path.segments.len != 1) return false;
+            return self.user_struct_types.contains(ret.identifier.path.segments[0].name);
+        }
+        return false;
     }
 
     /// Compiles `m.extern args` where `m` is a cimport value and `extern` names a
@@ -7745,7 +7823,7 @@ pub const IRCompiler = struct {
             .result = result,
         } }));
 
-        const ret_type = try self.cTypeRunicTypeExpr(cTypeOfAnnotation(extern_fn.return_type) orelse .void);
+        const ret_type = try self.cImportRetTypeExpr(extern_fn.return_type);
         return (try Result.from(result.dereference())).typed(ret_type);
     }
 

@@ -4,6 +4,7 @@ const builtins = @import("../builtins.zig");
 const rainbow = @import("../rainbow.zig");
 const DocumentStore = @import("../document_store.zig").DocumentStore;
 const token = @import("../frontend/token.zig");
+const CType = @import("../ffi/ctype.zig").CType;
 
 const Scope = @import("scope.zig").Scope;
 
@@ -1286,6 +1287,25 @@ pub const TypeChecker = struct {
         scope: *Scope,
         identifier: *const ast.TypeExpr.NamedType,
     ) Error!*const ast.TypeExpr {
+        // A `std.ffi` C type written qualified (`c.Char`, `c.Double`): resolve
+        // it to an alias whose NAME is the C type (recovered later for
+        // marshalling) and whose underlying type is the Runic type it checks
+        // as. This makes `c.X` usable anywhere a type is expected — struct
+        // fields, parameters, returns — not just an extern signature.
+        if (identifier.path.segments.len == 2 and
+            CType.fromName(identifier.path.segments[1].name) != null and
+            scope.lookup(identifier.path.segments[0].name) != null)
+        {
+            const cname = identifier.path.segments[1].name;
+            if (try self.cTypeToRunic(cname)) |runic| {
+                return try self.allocTypeExpression(.{ .alias = .{
+                    .name = cname,
+                    .span = identifier.span,
+                    .type_expr = runic,
+                } });
+            }
+        }
+
         const name = identifier.path.segments[0].name;
 
         const binding = scope.lookup(name) orelse {
@@ -2897,6 +2917,7 @@ pub const TypeChecker = struct {
 
         try self.runExpression(scope, binary.left);
         try self.runExpression(scope, binary.right);
+
         const maybe_left_type = try self.resolveExprType(scope, binary.left);
         const maybe_right_type = try self.resolveExprType(scope, binary.right);
 
@@ -2905,6 +2926,9 @@ pub const TypeChecker = struct {
 
         const left_type = maybe_left_type orelse return;
         const right_type = maybe_right_type orelse return;
+
+        //     break :brk .{ left_type, right_type };
+        // };
 
         // Member-specific operation enforcement: a *bare* (un-narrowed) sum is
         // never numeric, so it can't be used in arithmetic — narrow it first
@@ -3892,8 +3916,80 @@ pub const TypeChecker = struct {
     /// NOTE: `ns` is only required to be *a* bound identifier, not verified to
     /// be `std.ffi` specifically — a module-value binding does not currently
     /// retain its source path. Tightening this is tracked in future/c-ffi.md.
+    /// The scalar C type a struct-field annotation names (`c.Char` → `.char`),
+    /// or null if it is not a scalar `c.X` — the marker for a field that cannot
+    /// be marshalled in a by-value struct.
+    fn cTypeOfFieldAnnotation(type_expr: *const ast.TypeExpr) ?CType {
+        if (type_expr.* != .identifier) return null;
+        const segments = type_expr.identifier.path.segments;
+        if (segments.len == 0) return null;
+        return CType.fromName(segments[segments.len - 1].name);
+    }
+
+    /// Whether every field of a by-value struct is marshallable — a scalar `c.X`
+    /// or (recursively) another by-value struct. Reports the first field that is
+    /// not. `depth` guards against a pathological cyclic type.
+    fn cStructFieldsMarshallable(
+        self: *TypeChecker,
+        scope: *Scope,
+        struct_type: ast.TypeExpr.StructType,
+        struct_name: []const u8,
+        depth: usize,
+    ) Error!bool {
+        if (depth > 32) return false;
+        for (struct_type.fields) |field| {
+            if (cTypeOfFieldAnnotation(field.type_expr) != null) continue; // scalar
+            // A nested by-value struct: a single identifier naming a user struct.
+            if (field.type_expr.* == .identifier and
+                field.type_expr.identifier.path.segments.len == 1 and
+                scope.lookup(field.type_expr.identifier.path.segments[0].name) != null)
+            {
+                const resolved = try self.resolveTypeExpr(scope, field.type_expr);
+                const concrete = self.unaliasType(resolved);
+                if (concrete.* == .struct_type) {
+                    const nested_name = field.type_expr.identifier.path.segments[0].name;
+                    if (try self.cStructFieldsMarshallable(scope, concrete.struct_type, nested_name, depth + 1)) continue;
+                    return false; // the nested struct already reported
+                }
+            }
+            try self.reportSpanError(
+                field.type_expr.span(),
+                Error.UnsupportedExpression,
+                .@"error",
+                "field `{s}` of struct `{s}` must be a std.ffi C type (like `c.Char`) or a by-value struct",
+                .{ field.name.name, struct_name },
+            );
+            return false;
+        }
+        return true;
+    }
+
     fn resolveCType(self: *TypeChecker, scope: *Scope, type_expr: *const ast.TypeExpr) Error!*const ast.TypeExpr {
         const failed = try self.allocTypeExpression(.{ .failed = .{ .span = type_expr.span() } });
+
+        // A struct passed by value: a single identifier naming a user struct
+        // whose fields are all scalar `c.X` or (recursively) such structs (e.g.
+        // raylib's `Color`, `Vector2`, `Camera2D`). Checks as that struct.
+        if (type_expr.* == .identifier and
+            type_expr.identifier.path.segments.len == 1 and
+            scope.lookup(type_expr.identifier.path.segments[0].name) != null)
+        {
+            const resolved = try self.resolveTypeExpr(scope, type_expr);
+            const concrete = self.unaliasType(resolved);
+            if (concrete.* == .struct_type) {
+                const name = type_expr.identifier.path.segments[0].name;
+                if (try self.cStructFieldsMarshallable(scope, concrete.struct_type, name, 0)) return resolved;
+                return failed;
+            }
+            try self.reportSpanError(
+                type_expr.span(),
+                Error.UnsupportedExpression,
+                .@"error",
+                "an extern fn type must be a std.ffi C type like `c.Double` or a by-value struct",
+                .{},
+            );
+            return failed;
+        }
 
         if (type_expr.* != .identifier or type_expr.identifier.path.segments.len != 2) {
             try self.reportSpanError(

@@ -7,6 +7,7 @@ const Location = @import("location.zig").Location;
 const RegisterAbs = @import("location.zig").RegisterAbs;
 const InstructionAddr = @import("instruction-addr.zig").InstructionAddr;
 const CType = @import("../ffi/ctype.zig").CType;
+const CSig = @import("../ffi/ctype.zig").CSig;
 
 pub const ValueSource = union(enum) {
     location: Location,
@@ -362,8 +363,8 @@ pub const Instruction = struct {
 
         pub const Extern = struct {
             symbol: []const u8,
-            params: []const CType,
-            ret: CType,
+            params: []const CSig,
+            ret: CSig,
         };
     };
 

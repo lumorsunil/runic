@@ -1,0 +1,8 @@
+[error]: tests/diagnostics/ffi_struct_field_not_ctype.rn:2:38: field `name` of struct `Bad` must be a std.ffi C type (like `c.Char`) or a by-value struct
+   1:const c = import "std/ffi.rn"
+   2:const Bad = struct { x: c.Int, name: String }
+   3:const m = cimport "liba.so" {
+   4:    extern fn f(b: Bad) c.Int
+   5:}
+   6:
+

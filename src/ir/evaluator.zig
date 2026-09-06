@@ -13,6 +13,7 @@ const CImportCloseable = @import("../ffi/cimport.zig").CImportCloseable;
 const ResolvedExtern = @import("../ffi/cimport.zig").ResolvedExtern;
 const ffi = @import("../ffi/libffi.zig");
 const CType = @import("../ffi/ctype.zig").CType;
+const CSig = @import("../ffi/ctype.zig").CSig;
 
 const FastUIntSource = union(enum) {
     ptr: *ir.Value,
@@ -1045,8 +1046,8 @@ pub const IREvaluator = struct {
                 const ext = cc.find(call.symbol) orelse return Error.CImportSymbolNotFound;
                 if (call.args.len != ext.params.len) return Error.CImportUnsupportedType;
 
-                // A slot holds one marshalled C argument (or the return); an
-                // extern union keeps it 8-byte aligned for any scalar width.
+                // A slot holds the marshalled return; an extern union keeps it
+                // 8-byte aligned for any scalar width.
                 const Slot = extern union { i: i64, u: u64, f: f64, ff: f32, p: ?*anyopaque };
 
                 var arena_state = std.heap.ArenaAllocator.init(self.allocator);
@@ -1054,54 +1055,64 @@ pub const IREvaluator = struct {
                 const a = arena_state.allocator();
 
                 const n = ext.params.len;
-                const storage = try a.alloc(Slot, n);
                 const avalues = try a.alloc(?*anyopaque, n);
                 const atypes = try a.alloc([*c]ffi.c.ffi_type, n);
 
-                for (ext.params, call.args, storage, avalues, atypes) |param, arg_src, *slot, *av, *at| {
-                    const v = try self.resolveValueSource(thread, arg_src);
-                    switch (param) {
-                        .int => @as(*i32, @ptrCast(slot)).* = @truncate(try ffiArgInt(v)),
-                        .uint => @as(*u32, @ptrCast(slot)).* = @truncate(@as(u64, @bitCast(try ffiArgInt(v)))),
-                        .long => @as(*i64, @ptrCast(slot)).* = try ffiArgInt(v),
-                        .ulong, .size_t => @as(*u64, @ptrCast(slot)).* = @bitCast(try ffiArgInt(v)),
-                        .short => @as(*i16, @ptrCast(slot)).* = @truncate(try ffiArgInt(v)),
-                        .ushort => @as(*u16, @ptrCast(slot)).* = @truncate(@as(u64, @bitCast(try ffiArgInt(v)))),
-                        .char => @as(*i8, @ptrCast(slot)).* = @truncate(try ffiArgInt(v)),
-                        .bool => @as(*u8, @ptrCast(slot)).* = if (ffiArgBool(v)) 1 else 0,
-                        .float => @as(*f32, @ptrCast(slot)).* = @floatCast(try ffiArgFloat(v)),
-                        .double => @as(*f64, @ptrCast(slot)).* = try ffiArgFloat(v),
-                        .ptr => @as(*usize, @ptrCast(slot)).* = try ffiArgPtr(v),
-                        .str => {
-                            var w = std.Io.Writer.Allocating.init(a);
-                            try self.materializeString(thread, v, &w.writer);
-                            const z = try a.dupeZ(u8, w.written());
-                            @as(*?[*:0]const u8, @ptrCast(slot)).* = z.ptr;
-                        },
-                        .void => return Error.CImportUnsupportedType,
-                    }
-                    av.* = @ptrCast(slot);
-                    at.* = ffiTypeFor(param);
+                // Build each parameter's ffi_type first; a by-value struct needs
+                // a constructed FFI_TYPE_STRUCT whose layout libffi computes
+                // during ffi_prep_cif. A struct *return* is not yet supported.
+                for (ext.params, atypes) |param, *at| {
+                    at.* = switch (param) {
+                        .scalar => |ct| ffiTypeFor(ct),
+                        .strct => |s| try buildStructFfiType(a, s),
+                    };
                 }
+                const ret_type: [*c]ffi.c.ffi_type = switch (ext.ret) {
+                    .scalar => |ct| ffiTypeFor(ct),
+                    .strct => |s| try buildStructFfiType(a, s),
+                };
 
                 var cif: ffi.c.ffi_cif = undefined;
-                if (ffi.c.ffi_prep_cif(&cif, ffi.c.FFI_DEFAULT_ABI, @intCast(n), ffiTypeFor(ext.ret), atypes.ptr) != ffi.c.FFI_OK)
+                if (ffi.c.ffi_prep_cif(&cif, ffi.c.FFI_DEFAULT_ABI, @intCast(n), ret_type, atypes.ptr) != ffi.c.FFI_OK)
                     return Error.CImportLoadFailed;
 
+                // Layouts are known after prep — allocate each argument buffer
+                // (ffi_arg-aligned; libffi reads `type.size` bytes) and fill it.
+                for (ext.params, call.args, avalues, atypes) |param, arg_src, *av, at| {
+                    const v = try self.resolveValueSource(thread, arg_src);
+                    const size = @max(@as(usize, @intCast(at.*.size)), @sizeOf(ffi.c.ffi_arg));
+                    const buf = try a.alignedAlloc(u8, .of(ffi.c.ffi_arg), size);
+                    switch (param) {
+                        .scalar => |ct| try self.marshalCScalar(thread, a, ct, v, buf.ptr),
+                        .strct => |s| try self.marshalCStruct(thread, a, s, at, v, buf.ptr),
+                    }
+                    av.* = buf.ptr;
+                }
+
+                // A struct return lands in its own buffer (it can exceed a
+                // scalar slot); a scalar return uses the 8-byte slot, widened to
+                // `ffi_arg` for the integer widths.
                 var ret: Slot = .{ .u = 0 };
-                ffi.c.ffi_call(&cif, @ptrCast(ext.addr), &ret, avalues.ptr);
+                const ret_ptr: *anyopaque = switch (ext.ret) {
+                    .scalar => &ret,
+                    .strct => (try a.alignedAlloc(u8, .of(ffi.c.ffi_arg), @max(@as(usize, @intCast(ret_type.*.size)), @sizeOf(ffi.c.ffi_arg)))).ptr,
+                };
+                ffi.c.ffi_call(&cif, @ptrCast(ext.addr), ret_ptr, avalues.ptr);
 
                 const result: ir.Value = switch (ext.ret) {
-                    .void => .void,
-                    .double => .{ .float = ret.f },
-                    .float => .{ .float = @floatCast(ret.ff) },
-                    .bool => .{ .exit_code = ExitCode.fromBoolean(ret.i != 0) },
-                    .ptr => .{ .addr = @intFromPtr(ret.p) },
-                    // A `c.Str` return (a borrowed `char*`) needs copying into a
-                    // Runic string — deferred; see future/c-ffi.md.
-                    .str => return Error.CImportUnsupportedType,
-                    // Integer widths are widened to `ffi_arg`; read the full word.
-                    else => .{ .integer = ret.i },
+                    .strct => |s| try self.buildReturnedCStruct(thread, a, s, ret_type, @ptrCast(ret_ptr)),
+                    .scalar => |ct| switch (ct) {
+                        .void => .void,
+                        .double => .{ .float = ret.f },
+                        .float => .{ .float = @floatCast(ret.ff) },
+                        .bool => .{ .exit_code = ExitCode.fromBoolean(ret.i != 0) },
+                        .ptr => .{ .addr = @intFromPtr(ret.p) },
+                        // A `c.Str` return (a borrowed `char*`) needs copying into
+                        // a Runic string — deferred; see future/c-ffi.md.
+                        .str => return Error.CImportUnsupportedType,
+                        // Integer widths are widened to `ffi_arg`; read the word.
+                        else => .{ .integer = ret.i },
+                    },
                 };
                 try self.setLocation(thread, call.result, result);
                 return .cont;
@@ -2595,6 +2606,105 @@ pub const IREvaluator = struct {
         return .{ .zig_string = out };
     }
 
+    /// Marshals one Runic value into `ptr` as a scalar C type, sized/laid out
+    /// per `ct`. Used for both a scalar argument and a struct field.
+    fn marshalCScalar(
+        self: *IREvaluator,
+        thread: ir.context.IRThreadContext,
+        a: std.mem.Allocator,
+        ct: CType,
+        v: ir.Value,
+        ptr: [*]u8,
+    ) Error!void {
+        switch (ct) {
+            .int => @as(*i32, @ptrCast(@alignCast(ptr))).* = @truncate(try ffiArgInt(v)),
+            .uint => @as(*u32, @ptrCast(@alignCast(ptr))).* = @truncate(@as(u64, @bitCast(try ffiArgInt(v)))),
+            .long => @as(*i64, @ptrCast(@alignCast(ptr))).* = try ffiArgInt(v),
+            .ulong, .size_t => @as(*u64, @ptrCast(@alignCast(ptr))).* = @bitCast(try ffiArgInt(v)),
+            .short => @as(*i16, @ptrCast(@alignCast(ptr))).* = @truncate(try ffiArgInt(v)),
+            .ushort => @as(*u16, @ptrCast(@alignCast(ptr))).* = @truncate(@as(u64, @bitCast(try ffiArgInt(v)))),
+            .char => @as(*i8, @ptrCast(ptr)).* = @truncate(try ffiArgInt(v)),
+            .bool => @as(*u8, @ptrCast(ptr)).* = if (ffiArgBool(v)) 1 else 0,
+            .float => @as(*f32, @ptrCast(@alignCast(ptr))).* = @floatCast(try ffiArgFloat(v)),
+            .double => @as(*f64, @ptrCast(@alignCast(ptr))).* = try ffiArgFloat(v),
+            .ptr => @as(*usize, @ptrCast(@alignCast(ptr))).* = try ffiArgPtr(v),
+            .str => {
+                var w = std.Io.Writer.Allocating.init(a);
+                try self.materializeString(thread, v, &w.writer);
+                const z = try a.dupeZ(u8, w.written());
+                @as(*?[*:0]const u8, @ptrCast(@alignCast(ptr))).* = z.ptr;
+            },
+            .void => return Error.CImportUnsupportedType,
+        }
+    }
+
+    /// Marshals a Runic struct value into `ptr` as a by-value C struct, using
+    /// libffi's computed field offsets so each scalar field lands where the C
+    /// ABI expects it.
+    fn marshalCStruct(
+        self: *IREvaluator,
+        thread: ir.context.IRThreadContext,
+        a: std.mem.Allocator,
+        s: CSig.Struct,
+        struct_type: [*c]ffi.c.ffi_type,
+        v: ir.Value,
+        ptr: [*]u8,
+    ) Error!void {
+        const offsets = try a.alloc(usize, s.fields.len);
+        if (ffi.c.ffi_get_struct_offsets(ffi.c.FFI_DEFAULT_ABI, struct_type, offsets.ptr) != ffi.c.FFI_OK)
+            return Error.CImportUnsupportedType;
+
+        // A by-value struct is exactly one Runic slot per field (every field
+        // type is an identifier, `slotSize` 1): a scalar holds its value, a
+        // nested struct holds the sub-struct's address. The value is stored
+        // either inline as a `.strct` or, as a struct literal compiles to, as a
+        // base address whose fields occupy consecutive heap slots.
+        for (s.fields, offsets, 0..) |field, offset, i| {
+            const field_val = switch (v) {
+                .strct => |st| blk: {
+                    if (st.fields.len != s.fields.len) return Error.CImportUnsupportedType;
+                    break :blk st.fields[i];
+                },
+                .addr => |base| try self.heapValueAt(base + i),
+                else => return Error.CImportUnsupportedType,
+            };
+            switch (field.type) {
+                .scalar => |ct| try self.marshalCScalar(thread, a, ct, field_val, ptr + offset),
+                .strct => |ns| try self.marshalCStruct(thread, a, ns, struct_type.*.elements[i], field_val, ptr + offset),
+            }
+        }
+    }
+
+    /// Reconstructs a Runic struct value from a by-value C struct return: reads
+    /// each scalar field out of the return buffer at libffi's computed offset
+    /// and stores it in a fresh heap block, one slot per field — the same
+    /// representation a struct literal compiles to (a base `.addr`). The result
+    /// is typed as the struct by the compiler, so field access composes.
+    fn buildReturnedCStruct(
+        self: *IREvaluator,
+        thread: ir.context.IRThreadContext,
+        a: std.mem.Allocator,
+        s: CSig.Struct,
+        struct_type: [*c]ffi.c.ffi_type,
+        buf: [*]const u8,
+    ) Error!ir.Value {
+        const offsets = try a.alloc(usize, s.fields.len);
+        if (ffi.c.ffi_get_struct_offsets(ffi.c.FFI_DEFAULT_ABI, struct_type, offsets.ptr) != ffi.c.FFI_OK)
+            return Error.CImportUnsupportedType;
+
+        const base = try thread.shared.alloc(self.allocator, s.fields.len);
+        for (s.fields, offsets, 0..) |field, offset, i| {
+            const field_val: ir.Value = switch (field.type) {
+                .scalar => |ct| try readCScalar(ct, buf + offset),
+                // A nested struct is rebuilt in its own heap block; the parent
+                // slot holds its address (by-reference), like a struct literal.
+                .strct => |ns| try self.buildReturnedCStruct(thread, a, ns, struct_type.*.elements[i], buf + offset),
+            };
+            thread.shared.heapGetPtr(base.addr + i).?.* = field_val;
+        }
+        return base;
+    }
+
     fn materializeString(
         self: *IREvaluator,
         thread: ir.context.IRThreadContext,
@@ -3118,6 +3228,49 @@ fn ffiTypeFor(ctype: CType) [*c]ffi.c.ffi_type {
         .double => &ffi.c.ffi_type_double,
         .str, .ptr => &ffi.c.ffi_type_pointer,
         .void => &ffi.c.ffi_type_void,
+    };
+}
+
+/// The libffi type for a C signature element: a scalar's global `ffi_type`, or
+/// a constructed `FFI_TYPE_STRUCT` for a (possibly nested) by-value struct.
+fn ffiTypeForSig(a: std.mem.Allocator, sig: CSig) Error![*c]ffi.c.ffi_type {
+    return switch (sig) {
+        .scalar => |ct| ffiTypeFor(ct),
+        .strct => |s| try buildStructFfiType(a, s),
+    };
+}
+
+/// Builds a libffi `FFI_TYPE_STRUCT` type for a by-value struct: its field types
+/// in order (a nested struct becomes its own `FFI_TYPE_STRUCT`), null-
+/// terminated. Size/alignment are left zero for libffi to compute during
+/// `ffi_prep_cif`. Allocated in the call arena.
+fn buildStructFfiType(a: std.mem.Allocator, s: CSig.Struct) Error![*c]ffi.c.ffi_type {
+    const elems = try a.alloc([*c]ffi.c.ffi_type, s.fields.len + 1);
+    for (s.fields, elems[0..s.fields.len]) |field, *e| e.* = try ffiTypeForSig(a, field.type);
+    elems[s.fields.len] = null;
+    const t = try a.create(ffi.c.ffi_type);
+    t.* = .{ .size = 0, .alignment = 0, .type = ffi.c.FFI_TYPE_STRUCT, .elements = elems.ptr };
+    return t;
+}
+
+/// Reads one scalar C value out of memory as the Runic `Value` it surfaces as
+/// (mirrors the scalar return conversion). A `c.Str` field in a returned struct
+/// would need copying into a Runic string, so it is deferred like a `c.Str`
+/// return.
+fn readCScalar(ct: CType, ptr: [*]const u8) Error!ir.Value {
+    return switch (ct) {
+        .int => .{ .integer = @as(*const i32, @ptrCast(@alignCast(ptr))).* },
+        .uint => .{ .integer = @as(*const u32, @ptrCast(@alignCast(ptr))).* },
+        .long => .{ .integer = @as(*const i64, @ptrCast(@alignCast(ptr))).* },
+        .ulong, .size_t => .{ .integer = @bitCast(@as(*const u64, @ptrCast(@alignCast(ptr))).*) },
+        .short => .{ .integer = @as(*const i16, @ptrCast(@alignCast(ptr))).* },
+        .ushort => .{ .integer = @as(*const u16, @ptrCast(@alignCast(ptr))).* },
+        .char => .{ .integer = @as(*const i8, @ptrCast(ptr)).* },
+        .bool => .{ .exit_code = ExitCode.fromBoolean(@as(*const u8, @ptrCast(ptr)).* != 0) },
+        .float => .{ .float = @as(*const f32, @ptrCast(@alignCast(ptr))).* },
+        .double => .{ .float = @as(*const f64, @ptrCast(@alignCast(ptr))).* },
+        .ptr => .{ .addr = @as(*const usize, @ptrCast(@alignCast(ptr))).* },
+        .str, .void => Error.CImportUnsupportedType,
     };
 }
 

@@ -51,6 +51,25 @@ pub const CType = enum {
     }
 };
 
+/// A parameter or return type in a C signature: either a scalar C type, or a
+/// struct passed by value (its fields, in declaration order). A field is itself
+/// a `CSig`, so structs nest arbitrarily (`Camera2D { Vector2 offset; … }`).
+pub const CSig = union(enum) {
+    scalar: CType,
+    strct: Struct,
+
+    pub const Struct = struct {
+        /// The Runic struct type name (e.g. "Color") the fields came from.
+        name: []const u8,
+        fields: []const Field,
+    };
+
+    pub const Field = struct {
+        name: []const u8,
+        type: CSig,
+    };
+};
+
 test "CType.fromName maps std.ffi member names, rejects others" {
     try std.testing.expectEqual(CType.double, CType.fromName("Double").?);
     try std.testing.expectEqual(CType.int, CType.fromName("Int").?);

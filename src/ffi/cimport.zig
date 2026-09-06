@@ -4,6 +4,7 @@
 //! process resource (see `future/c-ffi.md`).
 const std = @import("std");
 const CType = @import("ctype.zig").CType;
+const CSig = @import("ctype.zig").CSig;
 const ExitCode = @import("../runtime/exit_code.zig").ExitCode;
 const Closeable = @import("../closeable.zig").Closeable;
 
@@ -13,8 +14,8 @@ const Closeable = @import("../closeable.zig").Closeable;
 pub const ResolvedExtern = struct {
     symbol: []const u8,
     addr: *anyopaque,
-    params: []const CType,
-    ret: CType,
+    params: []const CSig,
+    ret: CSig,
 };
 
 pub const CImportCloseable = struct {
