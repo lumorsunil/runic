@@ -1,0 +1,33 @@
+# A function/module call used as an *argument* to another call must be captured
+# to its produced value before being passed. Compiling such an argument plainly
+# forks the inner call and hands the callee the raw thread handle (and sends the
+# inner `yield` to stdout), so the parameter would be a thread, not the value.
+# Regression: `f (g x)` — nested calls across scalar, struct, String, and
+# module-member returns.
+fn Void @() Void
+
+# Scalar nested call: dbl (mk 5) == dbl 6 == 12.
+fn Void mk(x: Int) Int { yield x + 1 }
+fn Void dbl(n: Int) Int { yield n + n }
+const scalar = dbl (mk 5)
+echo "scalar=${scalar}"
+
+# Struct-returning nested call: useP (mkP 42).
+const P = struct { v: Int }
+fn Void mkP(x: Int) P { yield P{ .v = x } }
+fn Void useP(p: P) Int { yield p.v }
+const structv = useP (mkP 42)
+echo "struct=${structv}"
+
+# String-returning nested call: the inner yield must not leak to stdout.
+fn Void greet() String { yield "hi" }
+fn Void useS(s: String) String { yield "got:${s}" }
+const strv = useS (greet)
+echo "string=${strv}"
+
+# Module-member call as an argument, built into a struct field.
+const m = import "../support/imports/vector3_module.rn"
+const Entity = struct { pos: m.Vector3 }
+fn Void makeEntity(pos: m.Vector3) Entity { yield Entity{ .pos = pos } }
+const entity = makeEntity (m.makeVector 1 2 3)
+echo "entity=${entity.pos.x} ${entity.pos.y} ${entity.pos.z}"

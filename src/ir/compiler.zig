@@ -5852,7 +5852,36 @@ pub const IRCompiler = struct {
             }
         }
 
+        // Pre-capture arguments that are themselves calls/pipelines/blocks: such
+        // an expression forks a thread whose `yield` goes to the caller's stdout,
+        // and compiling it plainly hands the callee the raw thread handle instead
+        // of the produced value (`f (g x)`). Capture each to a value first — the
+        // same as a `const tmp = g x` binding — then pass the captured value.
+        // Done before the slot-set loop so the capture machinery's temporaries
+        // don't interleave with the closure-slot writes.
+        const captured_args = try self.allocator.alloc(?Result, arguments.len);
+        defer self.allocator.free(captured_args);
         for (arguments, 0..) |arg, i| {
+            if (self.argNeedsValueCapture(arg)) {
+                const captured = try self.compileExpressionWithCapture(source, arg);
+                const arg_ref = try self.newRef(source, "call_arg");
+                try self.set(source, arg_ref, stableResultSource(captured));
+                captured_args[i] = .fromLocation(arg_ref.dereference().typed(captured.typeExpr()));
+            } else {
+                captured_args[i] = null;
+            }
+        }
+
+        for (arguments, 0..) |arg, i| {
+            if (captured_args[i]) |captured| {
+                try self.set(source, .initRegister(.r), .from(closure_ref.dereference()));
+                try self.set(
+                    source,
+                    .initAdd(.{ .register = .r }, i, .{ .dereference = true }),
+                    captured.source,
+                );
+                continue;
+            }
             // Track whether compiling this argument pushed an owned temporary.
             // `consume` pops any stack-location result, but a bare binding
             // reference (e.g. a struct-valued `p` passed as an arg) is a
@@ -10036,6 +10065,59 @@ pub const IRCompiler = struct {
     fn fnRefParamCount(self: *IRCompiler, source: ir.ValueSource) ?usize {
         if (source != .value or source.value != .fn_ref) return null;
         return self.instruction_sets.items[source.value.fn_ref.fn_addr.instr_set].param_count;
+    }
+
+    /// Whether a call/pipeline/block used as a *function argument* forks a thread
+    /// (a function call, external command, pipeline, or block) whose produced
+    /// value must be captured before it can be passed. Compiling such an
+    /// expression plainly returns the thread handle and sends its `yield` to the
+    /// caller's stdout — so the callee would receive an unwaited thread instead
+    /// of the value. Builtins (`s.contains`, `arr.push`), type applications
+    /// (`Box(Int)`), and plain variable/function-value reads return values
+    /// directly and must NOT be routed through capture.
+    fn argNeedsValueCapture(self: *IRCompiler, arg: *ast.Expression) bool {
+        switch (arg.*) {
+            .pipeline => |p| return !p.background,
+            .block => |b| return !b.background,
+            .call => |call| {
+                if (call.background) return false;
+                switch (call.callee.*) {
+                    .identifier => |id| {
+                        // A type application (`Box(Int)`) serializes to a string
+                        // value — not a call to capture.
+                        if (call.arguments.len > 0 and self.isTypeName(id.name) and
+                            self.lookup(id.name, .{ .shallow = false }) == null) return false;
+                        if (call.arguments.len == 0) {
+                            const binding = self.lookup(id.name, .{ .shallow = false }) orelse
+                                return true; // unknown name → external command
+                            if (!binding.result.isFunctionRef()) return false; // variable read
+                            // A zero-arg reference to a paramful function is a
+                            // function *value*, not a call.
+                            if (self.fnRefParamCount(binding.result.source)) |pc| {
+                                if (pc > 0) return false;
+                            }
+                            return true; // nullary function call
+                        }
+                        return true; // function call / external command with args
+                    },
+                    .binary => |b| {
+                        // A member call that resolves to a string/int/float
+                        // builtin (or `push`/`with`) returns a value directly.
+                        if (b.op == .member and b.right.* == .identifier and
+                            !self.memberIsStructField(b.left, b.right.identifier.name))
+                        {
+                            const member = b.right.identifier.name;
+                            if (stringBuiltin(member) != null or floatBuiltin(member) != null or
+                                intBuiltin(member) != null) return false;
+                            if (std.mem.eql(u8, member, "push") or std.mem.eql(u8, member, "with")) return false;
+                        }
+                        return true;
+                    },
+                    else => return true,
+                }
+            },
+            else => return false,
+        }
     }
 
     fn callNeedsStdioCapture(self: *IRCompiler, call: ast.CallExpr) bool {

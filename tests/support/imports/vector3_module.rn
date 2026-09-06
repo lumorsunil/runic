@@ -1,3 +1,9 @@
 // A struct type exported (implicitly — struct types can't be `pub`) for a
 // module to construct via qualified `m.Vector3{ … }`.
 const Vector3 = struct { x: Int, y: Int, z: Int }
+
+// A pub constructor so an importer can build a Vector3 through a module-member
+// call — exercised as a nested call argument (`f (m.makeVector 1 2 3)`).
+pub fn Void makeVector(x: Int, y: Int, z: Int) Vector3 {
+  yield Vector3{ .x = x, .y = y, .z = z }
+}
