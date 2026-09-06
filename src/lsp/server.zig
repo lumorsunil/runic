@@ -808,6 +808,27 @@ pub const Server = struct {
         alloc_writer.writer.writeAll("```") catch {};
     }
 
+    /// Writes a `cimport` extern's C signature (`pow(base: c.Double, …) c.Double`)
+    /// to the hover buffer.
+    fn writeExternSignature(alloc_writer: *std.Io.Writer.Allocating, ext: runic.ast.ExternFn) void {
+        const w = &alloc_writer.writer;
+        w.print("{s}(", .{ext.name.name}) catch {};
+        for (ext.params, 0..) |param, i| {
+            if (i > 0) w.writeAll(", ") catch {};
+            const pname = switch (param.pattern.*) {
+                .identifier => |id| id.name,
+                else => "_",
+            };
+            w.print("{s}: ", .{pname}) catch {};
+            if (param.type_annotation) |t| {
+                w.print("{f}", .{t}) catch {};
+            } else {
+                w.writeAll("?") catch {};
+            }
+        }
+        w.print(") {f}", .{ext.return_type}) catch {};
+    }
+
     fn writeHoverMember(
         self: *Server,
         alloc_writer: *std.Io.Writer.Allocating,
@@ -818,6 +839,19 @@ pub const Server = struct {
             .alias => |alias_type| self.workspace.type_checker.resolveAliasType(&alias_type),
             else => binding_type,
         };
+
+        // A `cimport` member is a declared extern; show its C signature.
+        if (resolved_type.* == .struct_type) {
+            if (resolved_type.struct_type.cimport_externs) |externs| {
+                for (externs) |ext| {
+                    if (!std.mem.eql(u8, ext.name.name, member_name)) continue;
+                    alloc_writer.writer.writeAll("```\nextern fn ") catch {};
+                    writeExternSignature(alloc_writer, ext);
+                    alloc_writer.writer.writeAll("\n```") catch {};
+                    return;
+                }
+            }
+        }
 
         alloc_writer.writer.writeAll("```\n") catch {};
         alloc_writer.writer.print("const {s}: ", .{member_name}) catch {};
@@ -948,6 +982,14 @@ pub const Server = struct {
         };
         switch (resolved.*) {
             .struct_type => |struct_type| {
+                // A `cimport` member resolves to its `extern fn` declaration.
+                if (struct_type.cimport_externs) |externs| {
+                    for (externs) |ext| {
+                        if (std.mem.eql(u8, ext.name.name, member.member_name)) {
+                            return ext.name.span;
+                        }
+                    }
+                }
                 for (struct_type.fields) |field| {
                     if (std.mem.eql(u8, field.name.name, member.member_name)) {
                         return field.name.span;

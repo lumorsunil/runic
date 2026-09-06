@@ -383,6 +383,15 @@ fn appendMembersForType(
         .thread => try appendOwnedMatch(matches, context.allocator, .method, "wait", detail, .global),
         .array => try appendOwnedMatch(matches, context.allocator, .field, "len", detail, .global),
         .struct_type => |struct_type| {
+            // A `cimport` value's members are its declared externs (its `fields`
+            // are empty); offer each as a callable with its C signature.
+            if (struct_type.cimport_externs) |externs| {
+                for (externs) |ext| {
+                    const sig_detail = try formatExternSignature(context.allocator, ext);
+                    defer context.allocator.free(sig_detail);
+                    try appendOwnedMatch(matches, context.allocator, .function, ext.name.name, sig_detail, ext.name.span);
+                }
+            }
             for (struct_type.fields) |field| {
                 // Detail shows the field's declared type rather than the object.
                 const field_detail = try std.fmt.allocPrint(context.allocator, "{f}", .{field.type_expr});
@@ -399,6 +408,30 @@ fn appendMembersForType(
         },
         else => {},
     }
+}
+
+/// Formats a `cimport` extern's C signature for a completion detail, e.g.
+/// `pow(base: c.Double, exp: c.Double) c.Double`. Caller frees the result.
+fn formatExternSignature(allocator: Allocator, ext: ast.ExternFn) ![]u8 {
+    var out = std.Io.Writer.Allocating.init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+    try w.print("{s}(", .{ext.name.name});
+    for (ext.params, 0..) |param, i| {
+        if (i > 0) try w.writeAll(", ");
+        const pname = switch (param.pattern.*) {
+            .identifier => |id| id.name,
+            else => "_",
+        };
+        try w.print("{s}: ", .{pname});
+        if (param.type_annotation) |t| {
+            try w.print("{f}", .{t});
+        } else {
+            try w.writeAll("?");
+        }
+    }
+    try w.print(") {f}", .{ext.return_type});
+    return out.toOwnedSlice();
 }
 
 fn appendExecutionMembers(

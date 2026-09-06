@@ -105,9 +105,15 @@ pub fn collectSymbols(
                     },
                     .identifier => |identifier| {
                         const name = identifier.name;
-                        // const initializer = binding_decl.initializer.span().sliceFrom(contents);
-
-                        try appendSymbol(allocator, list, .variable, name, detail, identifier.span);
+                        // A `cimport` binding is module-like: surface it with its
+                        // declared externs nested as function children.
+                        if (binding_decl.initializer.* == .cimport_expr) {
+                            const children = try cimportChildren(allocator, detail, binding_decl.initializer.cimport_expr);
+                            errdefer freeChildren(allocator, children);
+                            try appendSymbolFull(allocator, list, .module, name, detail, identifier.span, binding_decl.span, children);
+                        } else {
+                            try appendSymbol(allocator, list, .variable, name, detail, identifier.span);
+                        }
                     },
                 }
             },
@@ -212,6 +218,25 @@ fn structChildren(
             .binding_decl => .field,
         };
         try children.append(allocator, try leafSymbol(allocator, kind, decl.name.name, detail, decl.name.span, decl.span));
+    }
+
+    return children.toOwnedSlice(allocator);
+}
+
+/// Builds child symbols for a `cimport` block's declared externs.
+fn cimportChildren(
+    allocator: Allocator,
+    detail: []const u8,
+    cimport: ast.CImportExpr,
+) ![]Symbol {
+    var children = std.ArrayList(Symbol).empty;
+    errdefer {
+        for (children.items) |*child| child.deinit(allocator);
+        children.deinit(allocator);
+    }
+
+    for (cimport.externs) |ext| {
+        try children.append(allocator, try leafSymbol(allocator, .function, ext.name.name, detail, ext.name.span, ext.span));
     }
 
     return children.toOwnedSlice(allocator);

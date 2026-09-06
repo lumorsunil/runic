@@ -210,6 +210,52 @@ test "lsp document symbols nest struct fields and function parameters" {
     try std.testing.expect(checked_greet);
 }
 
+test "lsp document symbols nest a cimport's externs" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\const c = import "std/ffi.rn"
+        \\const m = cimport "libm.so.6" {
+        \\    extern fn pow(base: c.Double, exp: c.Double) c.Double
+        \\    extern fn cos(x: c.Double) c.Double
+        \\}
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeDocumentSymbolRequest(allocator, 2, uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const syms = parsed.value.object.get("result").?.array.items;
+    var checked_m = false;
+    for (syms) |s| {
+        if (!std.mem.eql(u8, s.object.get("name").?.string, "m")) continue;
+        checked_m = true;
+        try std.testing.expectEqual(@as(i64, 2), s.object.get("kind").?.integer); // Module
+        const children = s.object.get("children").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), children.len);
+        try std.testing.expectEqualStrings("pow", children[0].object.get("name").?.string);
+        try std.testing.expectEqualStrings("cos", children[1].object.get("name").?.string);
+        try std.testing.expectEqual(@as(i64, 12), children[0].object.get("kind").?.integer); // Function
+    }
+    try std.testing.expect(checked_m);
+}
+
 test "lsp rename returns concrete same-file edits" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
@@ -665,6 +711,18 @@ test "lsp definition resolves a struct field member access to the field declarat
         \\echo "${p.x}"
         \\
     , 2, 10, 0, 23);
+}
+
+test "lsp definition resolves a cimport member to its extern declaration" {
+    // Cursor on `pow` in `m.pow` jumps to the `extern fn pow` declaration.
+    try expectDefinition(
+        \\const c = import "std/ffi.rn"
+        \\const m = cimport "libm.so.6" {
+        \\    extern fn pow(base: c.Double, exp: c.Double) c.Double
+        \\}
+        \\echo "${m.pow 2.0 10.0}"
+        \\
+    , 4, 11, 2, 14);
 }
 
 test "lsp definition prefers the struct field over an unrelated same-named binding" {
@@ -1824,6 +1882,42 @@ test "lsp hover shows execution result member type" {
     try std.testing.expect(std.mem.indexOf(u8, value, "Byte") != null);
 }
 
+test "lsp hover shows a cimport extern's C signature" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\const c = import "std/ffi.rn"
+        \\const m = cimport "libm.so.6" {
+        \\    extern fn pow(base: c.Double, exp: c.Double) c.Double
+        \\}
+        \\echo "${m.pow 2.0 10.0}"
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        // Cursor on `pow` in `m.pow` (line 4).
+        try makeHoverRequest(allocator, 13, uri, 4, 11),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 13);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const value = parsed.value.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, value, "extern fn pow(base: c.Double, exp: c.Double) c.Double") != null);
+}
+
 test "lsp member completion shows execution result members" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
@@ -1880,6 +1974,59 @@ test "lsp member completion shows execution result members" {
 
     const first_kind = items[0].object.get("kind").?;
     try std.testing.expect(first_kind == .integer);
+}
+
+test "lsp member completion lists a cimport's extern functions" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\const c = import "std/ffi.rn"
+        \\const m = cimport "libm.so.6" {
+        \\    extern fn pow(base: c.Double, exp: c.Double) c.Double
+        \\    extern fn cos(x: c.Double) c.Double
+        \\}
+        \\m.
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        // Cursor just after `m.` on line 5.
+        try makeCompletionRequest(allocator, 21, uri, 5, 2),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 21);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const items = parsed.value.object.get("result").?.object.get("items").?.array.items;
+    var saw_pow = false;
+    var saw_cos = false;
+    var pow_detail: ?[]const u8 = null;
+    for (items) |item| {
+        const label = item.object.get("label").?.string;
+        if (std.mem.eql(u8, label, "pow")) {
+            saw_pow = true;
+            if (item.object.get("detail")) |d| pow_detail = d.string;
+        }
+        if (std.mem.eql(u8, label, "cos")) saw_cos = true;
+    }
+
+    try std.testing.expect(saw_pow);
+    try std.testing.expect(saw_cos);
+    // The detail carries the extern's C signature.
+    try std.testing.expect(pow_detail != null);
+    try std.testing.expectEqualStrings("pow(base: c.Double, exp: c.Double) c.Double", pow_detail.?);
 }
 
 test "lsp module-path completion follows a symlinked module file" {
