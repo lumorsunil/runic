@@ -12,6 +12,44 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-06
+
+A C foreign-function interface: call C functions in a shared library directly,
+pass and return C structs by value, and generate bindings from a header.
+
+### Added
+
+- **C FFI via `cimport`** — a `cimport "libfoo.so" { extern fn … }` block loads
+  a shared library through `libffi` (linked into the interpreter) and declares
+  the C functions to call; the bound value is module-like, its members the
+  externs (`m.pow 2.0 10.0`). C types come from the `std/ffi.rn` marker module,
+  written qualified so they never clash with Runic's primitives: `c.Int`,
+  `c.UInt`, `c.Long`, `c.ULong`, `c.Short`, `c.UShort`, `c.Char`, `c.SizeT`,
+  `c.Float`, `c.Double`, `c.Bool`, `c.Str`, `c.Ptr`, and `c.Void`. Narrow
+  integers are range-mapped to `Int`, a `c.Str` argument is marshalled to a
+  null-terminated copy, and a `c.Ptr` is an opaque address. Always available,
+  no flag; the library is `dlclose`d at script exit. See `docs/features.md` and
+  `future/c-ffi.md`.
+- **C structs by value** — a C struct passed or returned by value is declared as
+  an ordinary Runic struct whose fields are all `c.X` types, or, recursively,
+  other such structs (nested structs like raylib's `Camera2D`). The evaluator
+  builds the struct's `libffi` type and marshals each field at the ABI's
+  computed offset, in both directions; a returned struct composes normally
+  (field access, passing it back).
+- **`runic cbind`** — generates a Runic binding from a C header
+  (`runic cbind <header.h> --lib <lib> --name <binding>`, via `zig translate-c`):
+  the `cimport` block with every callable `extern fn`, the by-value struct types
+  they use (emitted in dependency order, following typedef chains), enum values
+  and integer/string `#define`s as `const`s, and struct-valued `#define`s (such
+  as raylib's named colours) as struct-literal constants. Fixed C arrays inside
+  a struct become a struct of that many fields; function pointers become
+  `c.Ptr`. Only variadic functions are left out.
+- **LSP support for `cimport`** — member completion lists a cimport's externs
+  with their C signatures, hover shows an extern's signature, go-to-definition
+  jumps to the `extern fn` declaration, and the document outline shows a cimport
+  as a module with its externs nested. `c.` completes the `std.ffi` C types, and
+  the `cimport`/`extern` keywords complete with snippets.
+
 ## [0.8.1] - 2026-09-05
 
 Bug fixes and stabilization after the 0.8.0 language-server build-out. The

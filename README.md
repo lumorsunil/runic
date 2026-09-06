@@ -101,6 +101,10 @@ A working parser, type checker, and IR-based runtime are in place. The following
 - Runtime type tests with `is`, including narrowing inside `if (x is T) { … }`
 - **Generic collections** — `std.map`, a hashed key/value map (immutable and
   mutable APIs, insertion-order iteration)
+- **C interop (`cimport`)** — call C functions in a shared library through
+  `libffi`, with `std.ffi` C types (`c.Int`, `c.Double`, `c.Str`, …) and C
+  structs passed/returned by value (including nested structs). `runic cbind`
+  generates a binding from a C header.
 
 Runic aims to be familiar enough that a bash user can start using it immediately, yet principled enough to scale to large automation projects without the typical bash scripting pitfalls.
 

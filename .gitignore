@@ -2,6 +2,7 @@
 .zig-cache/
 zig-cache/
 zig-cache-global/
+zig-pkg
 zig-out/
 
 # Zig documentation AI helper

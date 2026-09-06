@@ -45,10 +45,8 @@ integration points, and a phased rollout, flagging the questions that remain.
 
 ## Non-goals (at least initially)
 
-- Passing/returning C structs *by value*, `union`s, or variadic functions.
-  `libffi` can *call* these, so the limit is the marshalling side (describing a
-  struct's layout as an `ffi_type` and mapping it to/from a Runic value), which
-  is deferred rather than blocked by the calling mechanism.
+- `union`s and variadic functions. Passing and returning C structs *by value*
+  is supported, including nested structs (see below).
 - C callbacks (passing a Runic function as a C function pointer).
 - Compile-time `@cImport` of headers. Runic is interpreted; there is no Zig
   compile step per script, so the C interface is described in the script, not
@@ -159,6 +157,41 @@ class. Integer widths narrower than `Int` are range-checked at the call, like
   (`open` → handle → `use handle` → `close handle`).
 - **Numbers/bools:** direct, with the narrower integer types (`c.Int`,
   `c.Short`, `c.Char`, `c.UInt`, …) range-checked against the Runic `Int` i64.
+- **Structs by value (in):** a C struct passed by value is declared as an
+  ordinary Runic struct whose fields are all scalar `c.X` types, e.g.
+
+  ```runic
+  const c = import "std/ffi"
+  const Color = struct { r: c.Char, g: c.Char, b: c.Char, a: c.Char }
+  const rl = cimport "libraylib.so" {
+      extern fn ColorToInt(color: Color) c.Int
+  }
+  const packed = rl.ColorToInt Color{ .r = 255, .g = 0, .b = 0, .a = 255 }
+  ```
+
+  At the call the evaluator builds an `FFI_TYPE_STRUCT` from the field C-types,
+  lets `libffi` compute the target-ABI field offsets
+  (`ffi_get_struct_offsets`), and copies each Runic field into the argument
+  buffer at its offset. The type checker admits such a struct in an `extern fn`
+  signature and reports a field that is not a scalar `c.X` or a by-value struct.
+- **Structs by value (out):** a struct *return* (`extern fn GetColor(hex:
+  c.UInt) Color`) works the same way in reverse — `libffi` writes the struct
+  into a return buffer, and the evaluator reads each field back at its computed
+  offset into a fresh heap-backed struct value (the representation a struct
+  literal compiles to), typed as the user struct so field access composes. A
+  struct-returning extern call bypasses the stdio-capture path (it is a direct
+  libffi dispatch, never a command), so its heap-backed result survives being
+  bound.
+- **Nested structs:** a field may itself be a by-value struct
+  (`Camera2D { Vector2 offset; Vector2 target; … }`). Every Runic struct field
+  is exactly one slot — a scalar holds its value, a nested struct holds the
+  sub-struct's address (by reference) — so the evaluator builds a nested
+  `FFI_TYPE_STRUCT`, and marshalling recurses: an argument field follows the
+  address to marshal the sub-struct into the parent's buffer at its offset, and
+  a return field rebuilds the sub-struct in its own heap block and stores its
+  address in the parent slot. Field offsets always come from
+  `ffi_get_struct_offsets`, so the target ABI's struct layout (padding,
+  alignment) is respected at every level.
 
 ### 4. Calling — statically linked libffi
 
@@ -323,11 +356,48 @@ crashes at the call:
 - **`char*` ambiguity** — string (`c.Str`) or mutable byte buffer (`c.Ptr`)?
   The header does not say. Heuristic: `const char* → c.Str`, `char* → c.Ptr`,
   with a hand override when wrong.
-- **struct-by-value / varargs** — not callable until the libffi phase, so they
-  are skipped with a commented stub and a count (`// skipped 34: struct-by-value / variadic`).
-- **function pointers** (callbacks) — deferred to the callback phase.
+- **struct-by-value** — a struct whose fields are all scalar C types or
+  (recursively) such structs *is* generated: its `extern struct` becomes a Runic
+  `const T = struct { … }` (a plain `const`, since the parser rejects
+  `pub const X = struct {…}`), and its struct-arg / struct-return functions are
+  kept. A nested struct field is emitted after the struct it references, in
+  dependency order (`Vector2` before `Camera2D`). Only structs reached from a
+  kept function are emitted. Because a generated struct is not `pub`, an importer
+  that must *construct* one to pass in has to declare a matching struct locally
+  (qualified construction `lib.Color{…}` is not yet supported); calling
+  struct-*returning* functions and passing their results back needs no local
+  declaration.
+- **typedef chains** — the generator follows a typedef to whatever it names:
+  `Texture2D → Texture → struct_Texture` (a struct), or `ModelAnimPose →
+  [*c]Transform` (an opaque `c.Ptr`). This is what keeps a struct with pointer
+  fields marshallable — the pointers become `c.Ptr` slots, preserved verbatim
+  through a by-value copy (the usual way one gets such a struct is a `Load*`
+  return, then passes it back).
+- **fixed array fields** — a `float params[4]` becomes a synthesized
+  `const Arr_4_f32 = struct { e0: c.Float, … e3: c.Float }` and the field is
+  typed as it. A C array and a struct of that many identical fields share one
+  layout, so the existing (nested) struct marshalling handles it unchanged —
+  the array's elements are reached as `params.e0 … params.e3`.
+- **varargs** — skipped (their ABI classification is not a fixed signature),
+  reported with a count. These are the only functions a full header leaves out.
+- **function pointers** (callbacks) — a callback typedef resolves to `c.Ptr`, so
+  a function *taking* one is generated (pass a raw address, or null); *creating*
+  a C callback from a Runic function is deferred to the callback phase.
 - **`enum`s** — map to their underlying integer type (`c.Int` unless the header
   widens them); the scalar C-type set already covers `size_t`/unsigned widths.
+- **compound-literal constants** — a `#define` whose value is a struct literal
+  (raylib's named colors, `CLITERAL(Color){ … }`) *is* emitted: translate-c
+  lowers it to `mem.zeroInit(CLITERAL(T), .{ … })`, which the generator pairs
+  with `T`'s field names into a `pub const NAME = T{ .field = value, … }`. Since
+  a struct-*literal* value (unlike a struct *type*) can be `pub`, an importer
+  uses it directly (`rl.RAYWHITE`) with no local declaration. Only all-integer
+  field lists over a known marshallable struct are converted; anything else is
+  left out.
+
+The C preprocessor runs as part of `zig translate-c` (Clang/Aro), so
+`#define`d enums, macro-expanded declarations, and conditional `#include`s are
+already resolved before the generator sees them — a separate preprocessor pass
+adds nothing.
 
 ### Symbol-only fallback
 
