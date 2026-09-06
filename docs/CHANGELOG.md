@@ -52,6 +52,11 @@ pass and return C structs by value, and generate bindings from a header.
 
 ### Fixed
 
+- **LSP crash on go-to-definition** — jumping to the definition of a member
+  whose declaration lives in an embedded module (a virtual path like `:std/str`
+  with no on-disk file), or in a file not resolvable from the server's working
+  directory, propagated a `FileNotFound` out of the request handler and crashed
+  the server. Such a request now returns an empty result.
 - **LSP crash on member completion** — completing a member (`m.<partial>`),
   especially on a large imported module, could segfault the language server: an
   owned completion match wrote to its heap slot *after* freeing it

@@ -953,9 +953,16 @@ pub const Server = struct {
     }
 
     /// Sends a go-to-definition Location for `span`, resolving the target
-    /// document URI from the span's source file.
+    /// document URI from the span's source file. When that file is not a
+    /// resolvable on-disk path — a virtual/embedded module (`:std/ffi`), an
+    /// empty span, or a relative path outside the server's working directory —
+    /// there is nothing navigable to return, so reply with an empty result
+    /// rather than letting the resolve error crash the server.
     fn sendDefinitionSpan(self: *Server, id: types.RequestId, span: runic.ast.Span) !void {
-        const definition_uri = try self.documents.resolveUri(span.start.file);
+        const definition_uri = self.documents.resolveUri(span.start.file) catch {
+            try self.sendJson(types.response(id, std.json.Value{ .null = {} }));
+            return;
+        };
         defer self.allocator.free(definition_uri);
         const result = types.Location{
             .uri = definition_uri,

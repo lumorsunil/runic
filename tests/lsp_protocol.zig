@@ -713,6 +713,22 @@ test "lsp definition resolves a struct field member access to the field declarat
     , 2, 10, 0, 23);
 }
 
+test "lsp definition on an embedded std-module member does not crash" {
+    // The member resolves into an embedded std module whose declaration span
+    // has a virtual file path with no on-disk location. Resolving that path to a
+    // URI fails; the server must reply with an empty result rather than letting
+    // the error crash it.
+    const allocator = std.testing.allocator;
+    const source =
+        \\const s = import "std/str.rn"
+        \\echo "${s.capitalize "x"}"
+        \\
+    ;
+    // Cursor on `capitalize` in `s.capitalize` (line 1). The request must return
+    // (found or not) without crashing the server.
+    _ = try singleFileDefinition(allocator, source, 1, 12);
+}
+
 test "lsp definition resolves a cimport member to its extern declaration" {
     // Cursor on `pow` in `m.pow` jumps to the `extern fn pow` declaration.
     try expectDefinition(
