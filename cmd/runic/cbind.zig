@@ -102,16 +102,16 @@ pub fn run(
         try writer.interface.writeAll(result.source);
         try writer.interface.flush();
         try stderr.print(
-            "wrote {s}: {d} extern fn, {d} const, {d} skipped\n",
-            .{ path, result.extern_count, result.constant_count, result.skipped_count },
+            "wrote {s}: {d} extern fn, {d} struct, {d} const, {d} skipped\n",
+            .{ path, result.extern_count, result.struct_count, result.constant_count, result.skipped_count },
         );
         try stderr.flush();
     } else {
         try stdout.writeAll(result.source);
         try stdout.flush();
         try stderr.print(
-            "// {d} extern fn, {d} const, {d} skipped\n",
-            .{ result.extern_count, result.constant_count, result.skipped_count },
+            "// {d} extern fn, {d} struct, {d} const, {d} skipped\n",
+            .{ result.extern_count, result.struct_count, result.constant_count, result.skipped_count },
         );
         try stderr.flush();
     }

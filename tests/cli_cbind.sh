@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Smoke test for `runic cbind`: generate a Runic C-FFI binding from a C header
 # and check the shape of the output (functions, enum values, #define constants,
-# and that struct-by-value / variadic functions are skipped).
+# by-value struct types and their functions, and that variadic functions are
+# skipped).
 
 set -euo pipefail
 
@@ -31,8 +32,10 @@ int foo_add(int a, int b);
 double foo_scale(double x);
 const char *foo_name(void *handle);
 void foo_free(void *handle);
-struct Big { int x; int y; };
-int foo_make(struct Big b);
+typedef struct { int x; int y; } Point;
+#define ORIGIN ((Point){ 0, 0 })
+Point foo_make(int x, int y);
+int foo_sum(Point p);
 int foo_printf(const char *fmt, ...);
 EOF
 
@@ -57,8 +60,16 @@ check '    extern fn foo_add(a: c.Int, b: c.Int) c.Int'
 check '    extern fn foo_scale(x: c.Double) c.Double'
 check '    extern fn foo_name(handle: c.Ptr) c.Str'
 check '    extern fn foo_free(handle: c.Ptr) c.Void'
-# struct-by-value (foo_make) and variadic (foo_printf) are skipped.
-check 'skipped 2 function'
+# A by-value struct type is emitted (a plain `const`, not `pub` — the parser
+# rejects `pub const X = struct {…}`), and its struct-arg / struct-return
+# functions are kept.
+check 'const Point = struct { x: c.Int, y: c.Int }'
+check '    extern fn foo_make(x: c.Int, y: c.Int) Point'
+check '    extern fn foo_sum(p: Point) c.Int'
+# A compound-literal #define becomes a pub struct-literal constant.
+check 'pub const ORIGIN = Point{ .x = 0, .y = 0 }'
+# Only the variadic function is skipped now.
+check 'skipped 1 function'
 
 # The enum's underlying type alias (Color) is not emitted as a constant.
 if grep -qE '(pub const Color|Color =)' <<<"$out"; then
