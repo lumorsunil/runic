@@ -50,6 +50,15 @@ pass and return C structs by value, and generate bindings from a header.
   as a module with its externs nested. `c.` completes the `std.ffi` C types, and
   the `cimport`/`extern` keywords complete with snippets.
 
+### Fixed
+
+- **Compound assignment to a struct field** — `a.x += 1` (and `a.x = a.x + 1`)
+  crashed the type checker with `UnresolvedTypeLiteral` (or reported a spurious
+  `expected type Int, actual: Int`). A field's declared type surfaces through
+  member access and arithmetic as a bare type name; the assignment check now
+  resolves it, so compound assignment to a struct field — including a nested
+  one (`b.inner.n += 1`) — type-checks. A genuine type mismatch is still caught.
+
 ## [0.8.1] - 2026-09-05
 
 Bug fixes and stabilization after the 0.8.0 language-server build-out. The

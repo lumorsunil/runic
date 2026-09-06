@@ -2992,45 +2992,55 @@ pub const TypeChecker = struct {
                 return;
             }
 
-            // For a plain `x = v` to an identifier binding, validate against the
-            // binding's *declared* type (not its current narrowed flow type — a
-            // `var x: Int || String` narrowed to `String` can still be reassigned
-            // an Int), then refine the flow type so reads after the assignment
-            // see the new (narrowed) type.
-            if (binary.op == .assign) {
-                if (referencedBindingName(binary.left)) |name| {
-                    if (scope.lookup(name)) |binding| {
-                        const declared = binding.declared_type orelse left_type;
-                        try self.validateTypeAssignment(declared, right_type, .{ .span = right_type.span() });
-                        if (self.unaliasType(declared).* == .sum) {
-                            binding.type_expr = self.flowTypeForSum(declared, right_type);
-                        }
-                        return;
-                    }
-                }
+            // An operand can surface as an unresolved type identifier: a struct
+            // field's declared type comes back through member access and
+            // arithmetic as the bare name `Int` rather than the resolved
+            // primitive (so `a.x += 1`, i.e. `a.x = a.x + 1`, would otherwise
+            // compare `Int` against `Int` and fail, or hit an UnresolvedTypeLiteral
+            // for a compound assignment). Resolve such a right side before
+            // validating. This covers `=` and every compound assignment.
+            const resolved_right = if (right_type.* == .identifier)
+                try self.resolveTypeExpr(scope, right_type)
+            else
+                right_type;
 
-                // Field assignment `p.x = v`: the target is a member access.
-                // Enforce that the root binding is mutable and validate `v`
-                // against the (resolved) field type.
-                if (binary.left.* == .binary and binary.left.binary.op == .member) {
-                    if (rootBindingName(binary.left)) |root| {
-                        if (scope.lookup(root)) |binding| if (!binding.is_mutable) {
-                            try self.reportSpanError(
-                                binary.left.span(),
-                                Error.TypeMismatch,
-                                .@"error",
-                                "cannot assign to a field of immutable '{s}'; declare it with var",
-                                .{root},
-                            );
-                        };
+            // For `x = v` / `x += v` to an identifier binding, validate against
+            // the binding's *declared* type (not its current narrowed flow type
+            // — a `var x: Int || String` narrowed to `String` can still be
+            // reassigned an Int), then, for a plain `=` to a sum, refine the flow
+            // type so reads after the assignment see the new (narrowed) type.
+            if (referencedBindingName(binary.left)) |name| {
+                if (scope.lookup(name)) |binding| {
+                    const declared = binding.declared_type orelse left_type;
+                    try self.validateTypeAssignment(declared, resolved_right, .{ .span = right_type.span() });
+                    if (binary.op == .assign and self.unaliasType(declared).* == .sum) {
+                        binding.type_expr = self.flowTypeForSum(declared, resolved_right);
                     }
-                    const field_type = try self.resolveTypeExpr(scope, left_type);
-                    try self.validateTypeAssignment(field_type, right_type, .{ .span = right_type.span() });
                     return;
                 }
             }
 
-            try self.validateTypeAssignment(left_type, right_type, .{ .span = right_type.span() });
+            // Field assignment `p.x = v` / `p.x += v`: the target is a member
+            // access. Enforce that the root binding is mutable and validate `v`
+            // against the (resolved) field type.
+            if (binary.left.* == .binary and binary.left.binary.op == .member) {
+                if (rootBindingName(binary.left)) |root| {
+                    if (scope.lookup(root)) |binding| if (!binding.is_mutable) {
+                        try self.reportSpanError(
+                            binary.left.span(),
+                            Error.TypeMismatch,
+                            .@"error",
+                            "cannot assign to a field of immutable '{s}'; declare it with var",
+                            .{root},
+                        );
+                    };
+                }
+                const field_type = try self.resolveTypeExpr(scope, left_type);
+                try self.validateTypeAssignment(field_type, resolved_right, .{ .span = right_type.span() });
+                return;
+            }
+
+            try self.validateTypeAssignment(left_type, resolved_right, .{ .span = right_type.span() });
         }
     }
 
