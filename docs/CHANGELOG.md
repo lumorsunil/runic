@@ -52,6 +52,12 @@ pass and return C structs by value, and generate bindings from a header.
 
 ### Fixed
 
+- **Injected globals leaked into module members** — a module value's type (and
+  so member completion on an imported module, `m.<TAB>`) included the builtins
+  and primitive types the type checker injects into every module scope
+  (`parseInt`, `parseFloat`, `Int`, …), because they are declared into the same
+  scope as the file's own exports. Such globals are now marked and excluded from
+  a module value's members.
 - **LSP crash on go-to-definition** — jumping to the definition of a member
   whose declaration lives in an embedded module (a virtual path like `:std/str`
   with no on-disk file), or in a file not resolvable from the server's working

@@ -1992,6 +1992,61 @@ test "lsp member completion shows execution result members" {
     try std.testing.expect(first_kind == .integer);
 }
 
+test "lsp member completion on an imported module excludes injected globals" {
+    // Completing `m.` must list the module's own pub exports, not the builtins
+    // and primitive types the type checker injects into every module scope
+    // (`parseInt`, `parseFloat`, `Int`, …).
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const module_uri = try fixture.writeDocument("module.rn",
+        \\pub const version = "0.0.1"
+        \\pub fn Void greet() Void { echo "hi" }
+        \\
+    );
+    defer allocator.free(module_uri);
+
+    const main_src =
+        \\const m = import "./module.rn"
+        \\echo m.
+        \\
+    ;
+    const main_uri = try fixture.writeDocument("main.rn", main_src);
+    defer allocator.free(main_uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, module_uri,
+            \\pub const version = "0.0.1"
+            \\pub fn Void greet() Void { echo "hi" }
+            \\
+        ),
+        try makeDidOpen(allocator, main_uri, main_src),
+        try makeCompletionRequest(allocator, 30, main_uri, 1, 7),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 30);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const items = parsed.value.object.get("result").?.object.get("items").?.array.items;
+    var saw_version = false;
+    for (items) |item| {
+        const label = item.object.get("label").?.string;
+        if (std.mem.eql(u8, label, "version")) saw_version = true;
+        // Injected globals must never appear as module members.
+        try std.testing.expect(!std.mem.eql(u8, label, "parseInt"));
+        try std.testing.expect(!std.mem.eql(u8, label, "parseFloat"));
+        try std.testing.expect(!std.mem.eql(u8, label, "Int"));
+    }
+    try std.testing.expect(saw_version);
+}
+
 test "lsp member completion lists a cimport's extern functions" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);

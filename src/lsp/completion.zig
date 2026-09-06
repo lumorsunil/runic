@@ -367,7 +367,9 @@ fn appendMembersForType(
                 var it = module_scope.bindings.iterator();
                 while (it.next()) |entry| {
                     const binding = entry.value_ptr.*;
-                    if (!binding.is_pub) continue;
+                    // Skip compiler-injected globals (builtins, primitive types):
+                    // they are in scope everywhere but are not module members.
+                    if (!binding.is_pub or binding.is_global) continue;
                     const binding_type = binding.type_expr orelse &ast.TypeExpr.executableType;
                     const kind: symbols.SymbolKind = switch (binding_type.*) {
                         .function, .fn_ref_type => .function,

@@ -470,7 +470,7 @@ pub const TypeChecker = struct {
         var public_count: usize = 0;
         var it_count = module_scope.bindings.iterator();
         while (it_count.next()) |entry| {
-            if (entry.value_ptr.is_pub) public_count += 1;
+            if (entry.value_ptr.is_pub and !entry.value_ptr.is_global) public_count += 1;
         }
 
         const fields = try self.arena.allocator().alloc(ast.TypeExpr.StructField, 3 + public_count);
@@ -494,7 +494,7 @@ pub const TypeChecker = struct {
         var it = module_scope.bindings.iterator();
         while (it.next()) |entry| {
             const binding = entry.value_ptr.*;
-            if (!binding.is_pub) continue;
+            if (!binding.is_pub or binding.is_global) continue;
             fields[i] = .{
                 .name = binding.identifier,
                 .type_expr = binding.type_expr orelse try self.allocTypeExpression(.global(.void)),
@@ -4961,10 +4961,12 @@ fn addGlobalScope(allocator: std.mem.Allocator, scope: *Scope) !*Scope {
 
     for (global_scope_definitions) |definition| {
         try global_scope.declare(allocator, definition.identifier, definition.type_expr, true, false);
+        global_scope.bindings.getPtr(definition.identifier.name).?.is_global = true;
     }
 
     for (global_value_definitions) |definition| {
         try global_scope.declare(allocator, definition.identifier, definition.type_expr, true, false);
+        global_scope.bindings.getPtr(definition.identifier.name).?.is_global = true;
     }
 
     return global_scope;
