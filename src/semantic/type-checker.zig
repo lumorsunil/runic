@@ -3200,10 +3200,12 @@ pub const TypeChecker = struct {
 
         const module_scope = try self.requestModuleScope(module) orelse return;
 
-        // Only pub declarations are accessible on a module; fall back to
-        // execution-result fields (exit_code, stdout, stderr, wait) for the rest.
+        // Only pub declarations are accessible on a module — except a type
+        // member (`m.Vector3`), which can't be declared `pub` (the parser
+        // rejects `pub const X = struct {…}`), so it is always reachable.
+        // Otherwise fall back to execution-result fields (exit_code, stdout, …).
         if (module_scope.lookup(identifier.name)) |binding| {
-            if (binding.is_pub) return;
+            if (binding.is_pub or binding.is_type) return;
         }
 
         try self.runExecutionMemberAccess(undefined, identifier);
@@ -3616,6 +3618,49 @@ pub const TypeChecker = struct {
         try self.logTypeCheckTrace(@src().fn_name, struct_literal.span);
 
         for (struct_literal.fields) |field| try self.runExpression(scope, field.value);
+
+        // Qualified construction `m.Vector3{ … }`: the struct type lives in the
+        // module `m`. Struct types can't be `pub` (the parser rejects
+        // `pub const X = struct {…}`), so it is looked up in the module's scope
+        // regardless of visibility.
+        if (struct_literal.object) |object| {
+            try self.runExpression(scope, object);
+            const object_type = self.unaliasType((try self.resolveExprType(scope, object)) orelse return);
+            if (object_type.* != .module) {
+                try self.reportSpanError(
+                    object.span(),
+                    Error.UnsupportedExpression,
+                    .@"error",
+                    "qualified struct construction requires a module value",
+                    .{},
+                );
+                return;
+            }
+            const module_scope = (try self.requestModuleScope(object_type.module)) orelse return;
+            const member = module_scope.lookup(struct_literal.name.name) orelse {
+                try self.reportSpanError(
+                    struct_literal.name.span,
+                    Error.IdentifierNotFound,
+                    .@"error",
+                    "module has no type '{s}'",
+                    .{struct_literal.name.name},
+                );
+                return;
+            };
+            const st = self.unaliasType(member.type_expr orelse return);
+            if (st.* == .struct_type) {
+                try self.runStructValueLiteral(scope, st.struct_type, struct_literal);
+            } else {
+                try self.reportSpanError(
+                    struct_literal.name.span,
+                    Error.UnsupportedExpression,
+                    .@"error",
+                    "'{s}' is not a struct type",
+                    .{struct_literal.name.name},
+                );
+            }
+            return;
+        }
 
         // A generic constructor (`Box{ … }` for `const Box(T) = struct { … }`):
         // validate against the body struct with its type parameters permissive.

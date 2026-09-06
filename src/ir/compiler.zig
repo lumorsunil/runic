@@ -3479,6 +3479,15 @@ pub const IRCompiler = struct {
                 // function named `method` is in scope (field access wins, which
                 // is why this is only reached after fieldLayout fails).
                 if (try self.tryUfcsRewrite(source, member.object, member.member.name, &.{}, &.{})) |r| return r;
+                // A module's struct type accessed as a member (`m.Vector3`) in
+                // value position — a type reference, serialized to its name like
+                // a bare type identifier (`${Int}` → "Int"). Registered from the
+                // imported module's declarations.
+                if (self.user_struct_types.contains(member.member.name)) {
+                    if (try self.typeIdentifierString(member.member.name)) |type_name| {
+                        return .fromValue(type_name);
+                    }
+                }
                 try self.reportSourceError(
                     source,
                     Error.NotImplemented,

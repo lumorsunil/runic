@@ -1286,6 +1286,10 @@ pub const Parser = struct {
     // f a b c ==> (((f a) b) c) ==> (f a b c)
 
     fn flattenBinaryExpression(self: *Self, binary: ast.Expression) Error!ast.Expression {
+        // `initBinaryExpression` may fold a `.member` into a non-binary node —
+        // a qualified struct literal (`m.Vector3{ … }`). Nothing to flatten.
+        if (binary != .binary) return binary;
+
         const left = binary.binary.left;
         const right = binary.binary.right;
 
@@ -1617,6 +1621,19 @@ pub const Parser = struct {
         right: *ast.Expression,
         span: ast.Span,
     ) Error!ast.Expression {
+        // Qualified struct construction: `m.Vector3{ … }` parses as a `.member`
+        // whose right side is a struct literal (the `{` binds to `Vector3`).
+        // Reinterpret it as constructing the module-qualified type `m.Vector3`,
+        // carrying the object (`m`, or a chain like `a.b`) as the qualifier.
+        if (op == .member and right.* == .struct_literal and right.struct_literal.object == null) {
+            return .{ .struct_literal = .{
+                .name = right.struct_literal.name,
+                .fields = right.struct_literal.fields,
+                .span = span,
+                .object = left,
+            } };
+        }
+
         if (op == .member and right.* != .identifier) {
             try self.reportParseError(
                 Error.UnexpectedToken,

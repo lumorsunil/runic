@@ -832,6 +832,9 @@ pub const StructLiteral = struct {
     name: Identifier,
     fields: []const FieldInit,
     span: Span,
+    /// The module the struct type comes from, for qualified construction
+    /// (`m.Vector3{ … }`). Null for a plain local `Vector3{ … }`.
+    object: ?*Expression = null,
 
     pub const FieldInit = struct {
         name: Identifier,

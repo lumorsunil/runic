@@ -49,6 +49,12 @@ pass and return C structs by value, and generate bindings from a header.
   jumps to the `extern fn` declaration, and the document outline shows a cimport
   as a module with its externs nested. `c.` completes the `std.ffi` C types, and
   the `cimport`/`extern` keywords complete with snippets.
+- **Qualified struct construction** — a struct type from an imported module can
+  be constructed directly with `m.Vector3{ .x = 0, … }`, including nested inside
+  another struct literal. Struct types can't be declared `pub` (the parser
+  rejects `pub const X = struct {…}`), so a module's struct type is reachable
+  without a visibility marker; `m.Vector3` also resolves as a type and as a
+  type-name reference in value position.
 
 ### Fixed
 

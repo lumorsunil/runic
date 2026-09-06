@@ -1,0 +1,3 @@
+// A struct type exported (implicitly — struct types can't be `pub`) for a
+// module to construct via qualified `m.Vector3{ … }`.
+const Vector3 = struct { x: Int, y: Int, z: Int }
