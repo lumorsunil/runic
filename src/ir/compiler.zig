@@ -3013,7 +3013,14 @@ pub const IRCompiler = struct {
                             ft.* = vt;
                             concrete_fields[i].type_expr = ft;
                         }
-                        break :blk try self.compileExpression(lit_field.value);
+                        // A call/pipeline field value (`{ .pos = mk x y }`)
+                        // forks a thread; capture it to its produced value first
+                        // (same as an argument or binding), else the field would
+                        // hold a raw thread handle.
+                        break :blk if (self.argNeedsValueCapture(lit_field.value))
+                            try self.compileExpressionWithCapture(source, lit_field.value)
+                        else
+                            try self.compileExpression(lit_field.value);
                     }
                 }
                 break :blk .fromValue(.void);
@@ -6830,6 +6837,17 @@ pub const IRCompiler = struct {
         // upstream's output kind decides the boundary; an executable upstream
         // still forces the byte path via its own output kind.
         if (callee.* == .block) return .exact_typed;
+        // A param-stage (`producer | consume` where `consume(x: T)` takes the
+        // upstream value in its single parameter) binds by parameter, not stdin.
+        // Classify by that parameter's type so a struct/scalar param gets typed
+        // transport even though the function's declared stdin is Void.
+        if (self.pipelineParamStageParamType(stage)) |pt| {
+            return switch (pt) {
+                .void => .void_boundary,
+                .execution => .byte_stream,
+                else => .exact_typed,
+            };
+        }
         const binding = switch (callee.*) {
             .identifier => |id| self.lookup(id.name, .{ .shallow = false }),
             else => null,
@@ -7144,7 +7162,24 @@ pub const IRCompiler = struct {
             if (builtin.kind == .framer) return true;
         }
         const out_type = self.stageStdoutType(upstream) orelse return false;
-        return typeExprIsNamed(out_type, "Int") or typeExprIsNamed(out_type, "Float") or typeExprIsNamed(out_type, "Bool");
+        return typeExprIsNamed(out_type, "Int") or typeExprIsNamed(out_type, "Float") or
+            typeExprIsNamed(out_type, "Bool") or self.typeExprIsStruct(out_type);
+    }
+
+    /// Whether a type is a struct value (a user struct by name, or a resolved
+    /// struct type). Such a value must transport between pipeline stages by
+    /// value (typed queue), not byte-serialized — serializing a struct's heap
+    /// layout misreads it as a length-prefixed sequence and recurses.
+    fn typeExprIsStruct(self: *IRCompiler, t: ast.TypeExpr) bool {
+        return switch (t) {
+            .struct_type => true,
+            .identifier => |named| blk: {
+                const segments = named.path.segments;
+                if (segments.len == 0) break :blk false;
+                break :blk self.user_struct_types.contains(segments[segments.len - 1].name);
+            },
+            else => false,
+        };
     }
 
     /// Pipeline↔param coercion: a stage that is a zero-arg reference to a
@@ -7152,6 +7187,35 @@ pub const IRCompiler = struct {
     /// Collects stdin into a value, binds it to the parameter, and calls the
     /// function (whose output flows to the stage's stdout). Returns null when the
     /// stage isn't such a reference (fall back to normal stage compilation).
+    /// The single-parameter type of a pipeline param-stage: a stage that is a
+    /// zero-arg reference to a one-parameter function, which receives the
+    /// upstream value in that parameter (`producer | consume` binds the upstream
+    /// value to `consume`'s parameter). Returns null when the stage isn't such a
+    /// reference — including a declared parameter with no type annotation.
+    fn pipelineParamStageParamType(self: *IRCompiler, stage_expr: *ast.Expression) ?ast.TypeExpr {
+        const callee: *ast.Expression = switch (stage_expr.*) {
+            .call => |call| if (call.arguments.len == 0 and call.redirects.len == 0) call.callee else return null,
+            .identifier => stage_expr,
+            else => return null,
+        };
+        if (callee.* != .identifier) return null;
+        const binding = self.lookup(callee.identifier.name, .{ .shallow = false }) orelse return null;
+        if (!binding.result.isFunctionRef()) return null;
+        const fn_ref = binding.result.source.value;
+        if (self.instruction_sets.items[fn_ref.fn_ref.fn_addr.instr_set].param_count != 1) return null;
+        const fn_type = switch (binding.type_expr orelse return null) {
+            .function => |f| f,
+            else => return null,
+        };
+        switch (fn_type.params) {
+            ._non_variadic => |ps| if (ps.len == 1) {
+                if (ps[0]) |pt| return pt.*;
+            },
+            ._variadic => {},
+        }
+        return null;
+    }
+
     fn tryCompilePipelineParamStage(self: *IRCompiler, source: *ast.Expression, stage_expr: *ast.Expression) Error!?Result {
         const callee: *ast.Expression = switch (stage_expr.*) {
             .call => |call| if (call.arguments.len == 0 and call.redirects.len == 0) call.callee else return null,
@@ -7165,17 +7229,10 @@ pub const IRCompiler = struct {
         if (self.instruction_sets.items[fn_ref.fn_ref.fn_addr.instr_set].param_count != 1) return null;
 
         // The single parameter's type. `collect_stdin` (== `&0`) dequeues the
-        // upstream value typed when the boundary is typed (Int/Float/…) and as a
-        // String byte blob otherwise, matching the parameter type either way.
-        const param_type: ast.TypeExpr = blk: {
-            if (binding.type_expr) |t| if (t == .function) switch (t.function.params) {
-                ._non_variadic => |ps| if (ps.len == 1) {
-                    if (ps[0]) |pt| break :blk pt.*;
-                },
-                ._variadic => {},
-            };
-            break :blk string_type;
-        };
+        // upstream value typed when the boundary is typed (Int/Float/struct/…)
+        // and as a String byte blob otherwise, matching the parameter type either
+        // way.
+        const param_type: ast.TypeExpr = self.pipelineParamStageParamType(stage_expr) orelse string_type;
 
         // Collect the upstream value and bind it to the single parameter.
         try self.addInstruction(.init(.from(source), .collect_stdin));

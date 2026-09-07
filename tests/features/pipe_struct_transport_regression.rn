@@ -1,0 +1,26 @@
+# A struct value passed between pipeline stages must transport by value (typed
+# queue), not byte-serialized. Serializing a struct's heap layout misread it as
+# a length-prefixed sequence: a flat struct errored with MissingHeapValue and a
+# nested struct recursed infinitely (stack-overflow segfault). Regression:
+# `producer | consume(x: Struct)` for flat, nested, and module-struct fields.
+fn Void @() Void
+
+# Flat struct through a param-stage consumer.
+const P = struct { v: Int }
+fn Void makeP() P { yield P{ .v = 7 } }
+fn Void showP(p: P) Void { echo "flat=${p.v}" }
+makeP | showP
+
+# Nested struct (a struct field that is itself a struct).
+const Inner = struct { a: Int }
+const Outer = struct { inner: Inner }
+fn Void makeOuter() Outer { yield Outer{ .inner = Inner{ .a = 9 } } }
+fn Void showOuter(o: Outer) Void { echo "nested=${o.inner.a}" }
+makeOuter | showOuter
+
+# A struct whose field type comes from an imported module.
+const m = import "../support/imports/vector3_module.rn"
+const Entity = struct { pos: m.Vector3 }
+fn Void makeEntity() Entity { yield Entity{ .pos = m.makeVector 1 2 3 } }
+fn Void showEntity(e: Entity) Void { echo "entity=${e.pos.x} ${e.pos.y} ${e.pos.z}" }
+makeEntity | showEntity
