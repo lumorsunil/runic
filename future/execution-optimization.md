@@ -289,6 +289,45 @@ scheduler each round (now syscall-free, but still blocking `singleThreadFastPath
 and forcing a round-trip per iteration) and (b) the append-only heap never
 reclaiming per-iteration slots — both belong to fix direction 2 below.
 
+**Fix direction 2 (part a) — DONE.** Widened `counted_loop` to cover `ref`-body
+loops (any `const`/computed binding). A `counted_loop` runs the whole loop in one
+`runInstruction` call via `runAtomicInstructionSet`, never yielding to the
+scheduler — so the stdio threads never run mid-loop (killing both remaining
+costs). Previously `instructionSetIsCountedLoopSafe` excluded `.ref`/`.pop`/`.push`,
+so a `const x = …` binding forced the general jmp loop. Two changes in
+`src/ir/compiler.zig`:
+1. Add `.ref`, `.pop`, `.push` to the counted-loop-safe whitelist.
+2. **Frame alignment** (the subtle part): `addInstructionSet` gives the body its
+   own compile frame based at 4 (a fresh activation reserves slots 0–3 for
+   stdin/stdout/stderr/closure), but `runCountedLoop` runs the body in the
+   *outer* runtime frame. So a body-local ref was numbered at slot 4 while the
+   `.ref` instruction appends at the real outer stack top — the ref aliased the
+   loop's limit slot and corrupted the loop (a `const x=i+1; total+=x` loop
+   returned 1 instead of the sum). Fix: set the body frame's `rel_stack_counter`
+   to `frame_before_body` so body-local refs are numbered from the outer top and
+   line up with where `.ref` actually pushes them. Captured refs (`for_counter`)
+   already carry outer addresses; `simple_exec` uses absolute slots 0–2; the
+   language has no `break`, and any `if`/branch body emits `jmp` (not whitelisted)
+   so conditional bodies still fall back correctly.
+
+Effect (`const x = i + 1; total = total + x`, ReleaseFast, `</dev/null`):
+
+| N | before fix 2 | after fix 2 |
+|---|---|---|
+| 200 000 | 1.9 s / 1.7 GB | 0.04 s / 5 MB |
+| 1 000 000 | ~25 s / ~14 GB (orig) | 0.23 s / 5 MB |
+
+Now at the `counted_loop` ceiling — flat memory, ~linear-fast time. Full suite
+green (unit + 173 smoke + 57 diagnostics + 9 examples + FFI + strict-mode).
+
+**Fix direction 2 (part b) — still open.** Sync `call`/`ret` inside a counted-loop
+body: a sync `call` returns `.cont_no_instr_counter_inc` (it jumps to another
+instruction set and returns via `ret`), which `runAtomicInstructionSet` rejects
+(`ContNoInstrCounterIncInAtomic`). Making a fork-free call run inside the inline
+loop needs `runAtomicInstructionSet`/`runCountedLoop` to drive `call`/`ret` (a
+mini instruction-pointer loop over the body rather than a flat `for`). This is
+where increments (a–c)'s sync convention finally pays off on `call_heavy`.
+
 ## (superseded) earlier framing: "jmp-fallback loop leaks ~20 KB/iter"
 
 The reason `call_heavy` (and any compute-in-loop) is slow is **not** the call

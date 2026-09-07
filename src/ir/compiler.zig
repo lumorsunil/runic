@@ -10240,6 +10240,16 @@ pub const IRCompiler = struct {
         self.current_instruction_set = body_set;
         defer self.current_instruction_set = prev_set;
 
+        // A counted_loop runs its body in the *caller's* (outer) runtime frame — it
+        // does not push a new activation. So body-local refs must be numbered from
+        // the outer frame's top, not from a fresh activation base (which addInstructionSet
+        // reserves at 4 for stdin/stdout/stderr/closure). Otherwise a body-local ref
+        // (e.g. `const x = ...`) would be addressed at slot 4 while the `.ref` instruction
+        // appends at the real outer stack top, corrupting whatever occupies slot 4
+        // (the loop's limit/counter). Aligning the body frame to frame_before_body makes
+        // a body ref's compile-time rel_stack_addr match where `.ref` actually pushes it.
+        self.currentFrame().rel_stack_counter = frame_before_body;
+
         try self.scopes.push(self.allocator, .lexical);
         defer self.scopes.pop();
 
@@ -10345,7 +10355,7 @@ pub const IRCompiler = struct {
     fn instructionSetIsCountedLoopSafe(self: *IRCompiler, instr_set: usize) bool {
         for (self.instruction_sets.items[instr_set].instructions.items) |instr| {
             switch (instr.type) {
-                .comment, .set, .ath, .cmp, .neg, .is_err, .make_err, .match_err, .err_payload, .get_env, .set_env, .simple_exec => {},
+                .comment, .set, .ath, .cmp, .neg, .is_err, .make_err, .match_err, .err_payload, .get_env, .set_env, .simple_exec, .ref, .pop, .push => {},
                 else => return false,
             }
         }
