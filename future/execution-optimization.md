@@ -254,6 +254,41 @@ Why loops split:
 Both are tractable and well-scoped now that the cause is known. Only after this
 does `call_heavy` show the sync-call win.
 
+**Fix direction 1 — DONE.** The stdin stream-forward thread busy-polled because
+`ReaderWriterStream.forward` re-`stream()`s every connected source each round,
+and the stdin source stayed connected after EOF: the stdin stream ran with
+`disconnect_source = false`, so the EndOfStream branch's `disconnectSources` was
+a no-op and the *closed* source lingered in the list, re-polled forever
+(`poll(0)`+`read(0)`=EOF each scheduler round). Fix: flip stdin's
+`disconnect_source` to `true` (in `cmd/runic/run_script.zig`) so the closed
+source is removed via the existing, well-tested EndOfStream→`disconnectSources`
+path. Removal is safe because `propagate_eof_on_source_close` already closes and
+disconnects the *destination* on the first EOF — so re-polling the stale source
+could never deliver data anywhere; it was pure busy-poll.
+
+A first attempt skipped any `isClosed()` source directly in the shared `forward`
+loop; that hung command substitution (`const arr = .{ echo "one" }`): a command
+source is closed by the child *exiting* **before** its pipe is drained, and
+`forward` re-streaming it is exactly what drains the buffered bytes and yields
+the terminal `.closed` that unblocks the consumer. `isClosed()` is therefore not
+equivalent to "fully drained", so the fix must stay in stdin's config, not touch
+shared `forward`.
+
+Effect (ref-body loop `const x = i + 1; total = total + x`, N=200 000,
+ReleaseFast, `</dev/null`):
+
+| | time | peak RSS | syscalls |
+|---|---|---|---|
+| before | 5.0 s | 3.8 GB | ~8/iter `poll`+`read` (linear in N) |
+| after  | 1.9 s | 1.7 GB | flat: 66 `poll`, 18 `read` total |
+| ceiling (`counted_loop`, no `ref`) | 0.01 s | 4.9 MB | — |
+
+~2.8× faster, ~2.6× less memory; the syscall storm is gone entirely. The
+remaining gap to the ceiling is (a) the three stdio threads still *spin* in the
+scheduler each round (now syscall-free, but still blocking `singleThreadFastPath`
+and forcing a round-trip per iteration) and (b) the append-only heap never
+reclaiming per-iteration slots — both belong to fix direction 2 below.
+
 ## (superseded) earlier framing: "jmp-fallback loop leaks ~20 KB/iter"
 
 The reason `call_heavy` (and any compute-in-loop) is slow is **not** the call
