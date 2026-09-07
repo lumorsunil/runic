@@ -788,7 +788,7 @@ pub const Server = struct {
     }
 
     fn writeHoverBinding(
-        _: *Server,
+        self: *Server,
         alloc_writer: *std.Io.Writer.Allocating,
         binding: *const runic.semantic.Scope.Binding,
     ) void {
@@ -803,6 +803,25 @@ pub const Server = struct {
             alloc_writer.writer.writeAll(" = ") catch {};
         } else {
             alloc_writer.writer.writeAll(": ") catch {};
+        }
+        // A `cimport` value is a struct of every declared extern; printing it in
+        // full would dump hundreds of fields. Show a concise `cimport` summary
+        // (the extern count) instead — e.g. `const rlf: cimport { 615 externs }`.
+        if (binding.type_expr) |t| {
+            const resolved = switch (t.*) {
+                .alias => |alias_type| self.workspace.type_checker.resolveAliasType(&alias_type),
+                else => t,
+            };
+            if (resolved.* == .struct_type) {
+                if (resolved.struct_type.cimport_externs) |externs| {
+                    alloc_writer.writer.print("cimport {{ {d} extern{s} }}\n", .{
+                        externs.len,
+                        if (externs.len == 1) "" else "s",
+                    }) catch {};
+                    alloc_writer.writer.writeAll("```") catch {};
+                    return;
+                }
+            }
         }
         alloc_writer.writer.print("{?f}\n", .{binding.type_expr}) catch {};
         alloc_writer.writer.writeAll("```") catch {};

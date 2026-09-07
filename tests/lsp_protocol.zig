@@ -1934,6 +1934,56 @@ test "lsp hover shows a cimport extern's C signature" {
     try std.testing.expect(std.mem.indexOf(u8, value, "extern fn pow(base: c.Double, exp: c.Double) c.Double") != null);
 }
 
+test "lsp hover types an alias to a module's cimport value" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const bindings_uri = try fixture.writeDocument("bindings.rn",
+        \\const c = import "std/ffi.rn"
+        \\const raylib = cimport "libraylib.so" {
+        \\    extern fn InitWindow(width: c.Int, height: c.Int) c.Int
+        \\}
+        \\
+    );
+    defer allocator.free(bindings_uri);
+
+    const main_source =
+        \\const rl = import "./bindings.rn"
+        \\const rlf = rl.raylib
+        \\echo "${rlf.InitWindow 800 600}"
+        \\
+    ;
+    const main_uri = try fixture.writeDocument("main.rn", main_source);
+    defer allocator.free(main_uri);
+
+    const root_uri = try std.fmt.allocPrint(allocator, "file://{s}", .{fixture.root_path});
+    defer allocator.free(root_uri);
+
+    const messages = [_][]const u8{
+        try makeInitializeWithRoot(allocator, 1, root_uri),
+        try makeDidOpen(allocator, main_uri, main_source),
+        // Cursor on `rlf` in its `const rlf = rl.raylib` declaration (line 1).
+        try makeHoverRequest(allocator, 20, main_uri, 1, 6),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 20);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    // The alias must be typed (previously null): its type is the cimport value,
+    // shown concisely as a `cimport` summary rather than the full extern struct.
+    const value = parsed.value.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, value, "cimport") != null);
+    try std.testing.expect(std.mem.indexOf(u8, value, "1 extern") != null);
+}
+
 test "lsp member completion shows execution result members" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);

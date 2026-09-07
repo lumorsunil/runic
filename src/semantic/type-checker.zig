@@ -4281,6 +4281,40 @@ pub const TypeChecker = struct {
             return self.buildCImportValueType(expr.cimport_expr);
         }
 
+        // A member access on an imported module value (`m.member`). The AST's
+        // own `MemberExpr.resolveType` can't see the module's scope, so it
+        // returns null for a `.module` object. Resolve the member's type here
+        // from the module scope — including non-`pub` bindings, so an alias to a
+        // `cimport` constant (`const rlf = rl.raylib`) is typed as that cimport
+        // value (a struct of its externs) rather than null.
+        if (T == *ast.Expression) {
+            const member_access: ?struct { object: *ast.Expression, name: []const u8 } = switch (expr.*) {
+                .member => |*m| .{ .object = m.object, .name = m.member.name },
+                .binary => |*b| if (b.op == .member and b.right.* == .identifier)
+                    .{ .object = b.left, .name = b.right.identifier.name }
+                else
+                    null,
+                else => null,
+            };
+            if (member_access) |ma| {
+                if (try self.resolveExprType(scope, ma.object)) |obj_raw| {
+                    const obj_type = self.unaliasType(obj_raw);
+                    if (obj_type.* == .module) {
+                        if (try self.requestModuleScope(obj_type.module)) |module_scope| {
+                            if (module_scope.lookup(ma.name)) |member_binding| {
+                                // A type member (`m.Vector3`) is a type reference,
+                                // not a value — leave it to the existing path so
+                                // `${m.Vector3}` still serializes to the type name.
+                                if (!member_binding.is_type) {
+                                    if (member_binding.type_expr) |t| return t;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         const result = try expr.resolveType(self.io, self.arena.allocator(), scope);
 
         if (T == *ast.ImportExpr) {
