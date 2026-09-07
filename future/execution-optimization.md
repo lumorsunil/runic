@@ -136,6 +136,50 @@ sync calls never touch them.
 - Added `tests/benchmarks/call_heavy.{rn,sh}` — the call-in-loop benchmark that
   was missing (only compute/command/mixed existed), so this stays measured.
 
+## Phase 2 design: the sync call/return convention (agreed, next to build)
+
+The classifier landed (`src/semantic/effects.zig`). Wiring it into a fork-free
+lowering requires a VM change, because of how the VM actually models calls:
+
+**VM reality (why calls fork today).** A thread models exactly *one* function
+activation. Its stack begins with `[stdin, stdout, stderr, closure]` at slots
+0–3 (set once at `fork`); `.closure` addressing is hardcoded to `stack[3]`, so a
+function's arguments/captures are read from there. `.sf`/`.sc` provide only
+*block* frames within that one activation (`pushFrame`/`popFrame` save `.sf`).
+A result is produced by `yield`ing to the activation's stdout stream, collected
+by the caller through a pipe. There is no intra-thread call stack — so the only
+way to give a callee its own args + result channel is to `fork` a new thread.
+That is the cost the sync path must avoid.
+
+**The convention to add.**
+1. New IR instructions `call target` and `ret`, plus a per-thread
+   return-address stack in `IRPrivateContext` (each entry saves the return
+   `instruction_counter`, `.sf`, and `.sc`). `call` pushes a return entry and
+   jumps to `target`; `ret` pops it and restores. Recursion works for free.
+2. A compiled **sync entry** instruction set per sync function: parameters are
+   passed on the caller's stack as a new frame (not the heap `.closure`), read
+   frame-relative via `.sf`; the single tail `yield expr` becomes `set %r = expr`
+   then `ret`; block frames still work via `.sf`. No heap `alloc`, no pipe, no
+   thread — so args are reclaimed on `ret`, which also fixes the append-only-heap
+   growth for sync calls.
+3. Call site: in `compileFunctionCall` (and the arg/struct-field/typed-value
+   capture fast paths), when the callee `isSync` *and* has no closure captures
+   *and* the arity matches, push args to a frame, emit `call sync_entry`, and
+   take the result from `%r` — bypassing fork + closure + pipe + wait + dequeue
+   entirely.
+
+**v1 restrictions (widen later):** only sync functions with **no closure
+captures** (pure leaves + params) take the sync path; capturing functions stay
+on the fork path (this also neatly excludes the closure-capture-of-closeable FFI
+blocker). Only a single tail `yield` to fd 1 — refine the classifier to treat a
+`yield` to fd 2 (stderr) as threaded, since sync mode has no stderr stream.
+
+**Validation targets:** `tests/benchmarks/call_heavy.rn` should collapse toward
+inline speed and flat memory; `tests/features/recursive_regression.rn` must stay
+correct; full CI green. Build it in tested increments: (a) `call`/`ret` + return
+stack in isolation, (b) sync-entry emission for a nullary leaf, (c) params, (d)
+recursion, (e) wire the capture fast paths.
+
 ## Open design questions (for when Phase 2 starts)
 
 - Sync call/ret convention vs inline-only for the first milestone (recursion
