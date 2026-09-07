@@ -353,9 +353,32 @@ Effect (`const x = inc i; total += x`, `fn inc(n) { yield n+1 }`, ReleaseFast):
 `call_heavy` finally shows the sync-call win — fork-free calls, flat memory. Full
 suite green (unit + 173 smoke + 57 diagnostics + 9 examples + FFI + strict-mode).
 
-Remaining: (d) recursion (recursive sync fns — the driven loop already nests
-call/ret, but the classifier must be allowed to sync-lower them), (e) capture
-fast paths + widen `syncReturnAllowed`.
+**Increment (d) — recursion, DONE for value-capture call sites.** A recursive
+sync function now lowers to fork-free `call`/`ret` and recurses correctly (fib,
+factorial, countdown), including inside a counted_loop. The classifier already
+seeds candidates optimistically sync so self/mutual recursion converges, and
+`syncBodyLowerable` already allows `if`/`match`/`block`; the missing piece was a
+compile-ordering bug: `compileFnDecl` registered `sync_entries[fn] = entry` only
+*after* `compileSyncEntry` compiled the body, so a self-call inside the body
+looked up its own entry, found nothing, and fell back to fork (returning an
+uncaptured thread handle → blank/wrong result, and deep fork-recursion then
+failed outright). Fix: register the mapping inside `compileSyncEntry` right after
+reserving the entry set, before compiling the body. `fib 10` in a binding →
+55; `fib` summed over a loop → correct; all fork-free.
+
+Measured: fib is now O(calls) with flat memory instead of forking a thread per
+recursive call.
+
+Still open on recursion: a call in **yield-value / statement / command-argument**
+position (`yield (countdown n)`, `echo (fib n)`) does not route through
+`tryCompileSyncCall` (only value-capture positions — bindings, arithmetic
+operands, struct fields — do), so those still fork. Widening the bare-call path
+to prefer a sync `call` when the callee has an entry is the next step; it also
+subsumes part of the remaining call_heavy-shaped surface.
+
+Remaining: (d-cont) route yield-value/statement/command-arg calls through sync
+lowering; (e) capture fast paths + widen `syncReturnAllowed`
+(error-union/optional/sum/promise returns and capture-bearing fns still fork).
 
 ## (superseded) earlier framing: "jmp-fallback loop leaks ~20 KB/iter"
 

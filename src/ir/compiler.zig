@@ -8174,8 +8174,13 @@ pub const IRCompiler = struct {
         self.currentFrame().rel_stack_counter = params.len;
     }
 
-    fn compileSyncEntry(self: *IRCompiler, source: *ast.Expression, fn_decl: ast.FunctionDecl) Error!usize {
+    fn compileSyncEntry(self: *IRCompiler, source: *ast.Expression, fn_decl: ast.FunctionDecl, forked_set: usize) Error!usize {
         const entry_set = try self.addInstructionSetNoPushFrame();
+        // Register the mapping BEFORE compiling the body so a self-recursive sync
+        // call inside the body resolves to this same entry (via `tryCompileSyncCall`,
+        // which looks up `sync_entries.get(forked_set)`). Without this, the recursive
+        // call falls back to the fork path and returns an uncaptured thread handle.
+        try self.sync_entries.put(self.allocator, forked_set, entry_set);
         const orig = self.current_instruction_set;
         self.current_instruction_set = entry_set;
         try self.scopes.push(self.allocator, .closure);
@@ -8442,8 +8447,7 @@ pub const IRCompiler = struct {
                     self.syncBodyLowerable(fn_decl.body) and
                     self.instruction_sets.items[instr_set].closure_captures.len == 0)
                 {
-                    const sync_set = try self.compileSyncEntry(source, fn_decl);
-                    try self.sync_entries.put(self.allocator, instr_set, sync_set);
+                    _ = try self.compileSyncEntry(source, fn_decl, instr_set);
                 }
             }
         }
