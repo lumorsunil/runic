@@ -170,6 +170,10 @@ pub const Tag = enum {
     // Module/interop keywords
     /// Module import keyword.
     kw_import,
+    /// C dynamic-library import keyword (`cimport "lib" { extern fn … }`).
+    kw_cimport,
+    /// C extern function declaration keyword, used inside a `cimport` block.
+    kw_extern,
 
     // Error-handling keywords
     kw_try,
@@ -267,6 +271,8 @@ pub const Tag = enum {
             .kw_yield => "yield",
             .kw_comptime => "comptime",
             .kw_import => "import",
+            .kw_cimport => "cimport",
+            .kw_extern => "extern",
             .kw_try => "try",
             .kw_catch => "catch",
             .kw_is => "is",
@@ -311,6 +317,8 @@ const keyword_map = std.StaticStringMap(Tag).initComptime(.{
     .{ "yield", .kw_yield },
     .{ "comptime", .kw_comptime },
     .{ "import", .kw_import },
+    .{ "cimport", .kw_cimport },
+    .{ "extern", .kw_extern },
     .{ "try", .kw_try },
     .{ "catch", .kw_catch },
     .{ "is", .kw_is },

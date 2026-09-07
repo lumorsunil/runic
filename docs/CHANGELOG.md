@@ -12,6 +12,86 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-06
+
+A C foreign-function interface: call C functions in a shared library directly,
+pass and return C structs by value, and generate bindings from a header.
+
+### Added
+
+- **C FFI via `cimport`** — a `cimport "libfoo.so" { extern fn … }` block loads
+  a shared library through `libffi` (linked into the interpreter) and declares
+  the C functions to call; the bound value is module-like, its members the
+  externs (`m.pow 2.0 10.0`). C types come from the `std/ffi.rn` marker module,
+  written qualified so they never clash with Runic's primitives: `c.Int`,
+  `c.UInt`, `c.Long`, `c.ULong`, `c.Short`, `c.UShort`, `c.Char`, `c.SizeT`,
+  `c.Float`, `c.Double`, `c.Bool`, `c.Str`, `c.Ptr`, and `c.Void`. Narrow
+  integers are range-mapped to `Int`, a `c.Str` argument is marshalled to a
+  null-terminated copy, and a `c.Ptr` is an opaque address. Always available,
+  no flag; the library is `dlclose`d at script exit. See `docs/features.md` and
+  `future/c-ffi.md`.
+- **C structs by value** — a C struct passed or returned by value is declared as
+  an ordinary Runic struct whose fields are all `c.X` types, or, recursively,
+  other such structs (nested structs like raylib's `Camera2D`). The evaluator
+  builds the struct's `libffi` type and marshals each field at the ABI's
+  computed offset, in both directions; a returned struct composes normally
+  (field access, passing it back).
+- **`runic cbind`** — generates a Runic binding from a C header
+  (`runic cbind <header.h> --lib <lib> --name <binding>`, via `zig translate-c`):
+  the `cimport` block with every callable `extern fn`, the by-value struct types
+  they use (emitted in dependency order, following typedef chains), enum values
+  and integer/string `#define`s as `const`s, and struct-valued `#define`s (such
+  as raylib's named colours) as struct-literal constants. Fixed C arrays inside
+  a struct become a struct of that many fields; function pointers become
+  `c.Ptr`. Only variadic functions are left out.
+- **LSP support for `cimport`** — member completion lists a cimport's externs
+  with their C signatures, hover shows an extern's signature, go-to-definition
+  jumps to the `extern fn` declaration, and the document outline shows a cimport
+  as a module with its externs nested. `c.` completes the `std.ffi` C types, and
+  the `cimport`/`extern` keywords complete with snippets.
+- **Qualified struct construction** — a struct type from an imported module can
+  be constructed directly with `m.Vector3{ .x = 0, … }`, including nested inside
+  another struct literal. Struct types can't be declared `pub` (the parser
+  rejects `pub const X = struct {…}`), so a module's struct type is reachable
+  without a visibility marker; `m.Vector3` also resolves as a type and as a
+  type-name reference in value position.
+- **Module-qualified type annotations** — a qualified type like `m.Vector3` used
+  as a field, parameter, or return type now resolves to the module's actual
+  type rather than to the module `m`, so a function `fn f(pos: m.Vector3) …`
+  type-checks and passes the value through correctly.
+
+### Fixed
+
+- **Unresolved function-parameter types** — a function parameter's declared type
+  was stored unresolved, so a primitive annotation like `Int` (parsed as a bare
+  identifier) surfaced as an `.identifier` rather than the resolved primitive.
+  Using a parameter where its type is checked — a struct-literal field value
+  (`Vector{ .x = x }`), an assignment — spuriously failed with
+  `expected type Int, actual: Int`. Parameter types are now resolved at
+  declaration, like the stdin and function types already were.
+- **Injected globals leaked into module members** — a module value's type (and
+  so member completion on an imported module, `m.<TAB>`) included the builtins
+  and primitive types the type checker injects into every module scope
+  (`parseInt`, `parseFloat`, `Int`, …), because they are declared into the same
+  scope as the file's own exports. Such globals are now marked and excluded from
+  a module value's members.
+- **LSP crash on go-to-definition** — jumping to the definition of a member
+  whose declaration lives in an embedded module (a virtual path like `:std/str`
+  with no on-disk file), or in a file not resolvable from the server's working
+  directory, propagated a `FileNotFound` out of the request handler and crashed
+  the server. Such a request now returns an empty result.
+- **LSP crash on member completion** — completing a member (`m.<partial>`),
+  especially on a large imported module, could segfault the language server: an
+  owned completion match wrote to its heap slot *after* freeing it
+  (`ptr.* = undefined` following `destroy`), a use-after-free that crashed once
+  that page was reused or unmapped.
+- **Compound assignment to a struct field** — `a.x += 1` (and `a.x = a.x + 1`)
+  crashed the type checker with `UnresolvedTypeLiteral` (or reported a spurious
+  `expected type Int, actual: Int`). A field's declared type surfaces through
+  member access and arithmetic as a bare type name; the assignment check now
+  resolves it, so compound assignment to a struct field — including a nested
+  one (`b.inner.n += 1`) — type-checks. A genuine type mismatch is still caught.
+
 ## [0.8.1] - 2026-09-05
 
 Bug fixes and stabilization after the 0.8.0 language-server build-out. The

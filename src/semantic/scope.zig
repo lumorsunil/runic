@@ -94,5 +94,10 @@ pub const Scope = struct {
         declared_type: ?*const ast.TypeExpr = null,
         is_pub: bool,
         is_mutable: bool,
+        /// True for a compiler-injected global (a builtin like `parseInt` or a
+        /// primitive type like `Int`), declared into every module's top scope.
+        /// These are in scope everywhere but are not members of a module value,
+        /// so module-member type-building and completion skip them.
+        is_global: bool = false,
     };
 };

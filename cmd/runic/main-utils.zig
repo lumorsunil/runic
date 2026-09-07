@@ -798,6 +798,7 @@ pub fn printUsage(writer: *std.Io.Writer) !void {
         \\Runic CLI
         \\Usage:
         \\  runic [options] path/to/script.rn [-- <script args>...]
+        \\  runic cbind <header.h> --lib <libname.so> [-o out.rn] [--name binding]
         \\
         \\Options:
         \\  --help, -h           Display this help text.

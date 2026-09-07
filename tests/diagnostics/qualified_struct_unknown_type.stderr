@@ -1,0 +1,5 @@
+[error]: tests/diagnostics/qualified_struct_unknown_type.rn:2:13: module has no type 'Nope'
+   1:const m = import "../support/imports/vector3_module.rn"
+   2:const v = m.Nope{ .x = 1 }
+   3:
+

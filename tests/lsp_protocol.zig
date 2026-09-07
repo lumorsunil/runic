@@ -210,6 +210,52 @@ test "lsp document symbols nest struct fields and function parameters" {
     try std.testing.expect(checked_greet);
 }
 
+test "lsp document symbols nest a cimport's externs" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\const c = import "std/ffi.rn"
+        \\const m = cimport "libm.so.6" {
+        \\    extern fn pow(base: c.Double, exp: c.Double) c.Double
+        \\    extern fn cos(x: c.Double) c.Double
+        \\}
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeDocumentSymbolRequest(allocator, 2, uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const syms = parsed.value.object.get("result").?.array.items;
+    var checked_m = false;
+    for (syms) |s| {
+        if (!std.mem.eql(u8, s.object.get("name").?.string, "m")) continue;
+        checked_m = true;
+        try std.testing.expectEqual(@as(i64, 2), s.object.get("kind").?.integer); // Module
+        const children = s.object.get("children").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), children.len);
+        try std.testing.expectEqualStrings("pow", children[0].object.get("name").?.string);
+        try std.testing.expectEqualStrings("cos", children[1].object.get("name").?.string);
+        try std.testing.expectEqual(@as(i64, 12), children[0].object.get("kind").?.integer); // Function
+    }
+    try std.testing.expect(checked_m);
+}
+
 test "lsp rename returns concrete same-file edits" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
@@ -665,6 +711,34 @@ test "lsp definition resolves a struct field member access to the field declarat
         \\echo "${p.x}"
         \\
     , 2, 10, 0, 23);
+}
+
+test "lsp definition on an embedded std-module member does not crash" {
+    // The member resolves into an embedded std module whose declaration span
+    // has a virtual file path with no on-disk location. Resolving that path to a
+    // URI fails; the server must reply with an empty result rather than letting
+    // the error crash it.
+    const allocator = std.testing.allocator;
+    const source =
+        \\const s = import "std/str.rn"
+        \\echo "${s.capitalize "x"}"
+        \\
+    ;
+    // Cursor on `capitalize` in `s.capitalize` (line 1). The request must return
+    // (found or not) without crashing the server.
+    _ = try singleFileDefinition(allocator, source, 1, 12);
+}
+
+test "lsp definition resolves a cimport member to its extern declaration" {
+    // Cursor on `pow` in `m.pow` jumps to the `extern fn pow` declaration.
+    try expectDefinition(
+        \\const c = import "std/ffi.rn"
+        \\const m = cimport "libm.so.6" {
+        \\    extern fn pow(base: c.Double, exp: c.Double) c.Double
+        \\}
+        \\echo "${m.pow 2.0 10.0}"
+        \\
+    , 4, 11, 2, 14);
 }
 
 test "lsp definition prefers the struct field over an unrelated same-named binding" {
@@ -1824,6 +1898,92 @@ test "lsp hover shows execution result member type" {
     try std.testing.expect(std.mem.indexOf(u8, value, "Byte") != null);
 }
 
+test "lsp hover shows a cimport extern's C signature" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\const c = import "std/ffi.rn"
+        \\const m = cimport "libm.so.6" {
+        \\    extern fn pow(base: c.Double, exp: c.Double) c.Double
+        \\}
+        \\echo "${m.pow 2.0 10.0}"
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        // Cursor on `pow` in `m.pow` (line 4).
+        try makeHoverRequest(allocator, 13, uri, 4, 11),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 13);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const value = parsed.value.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, value, "extern fn pow(base: c.Double, exp: c.Double) c.Double") != null);
+}
+
+test "lsp hover types an alias to a module's cimport value" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const bindings_uri = try fixture.writeDocument("bindings.rn",
+        \\const c = import "std/ffi.rn"
+        \\const raylib = cimport "libraylib.so" {
+        \\    extern fn InitWindow(width: c.Int, height: c.Int) c.Int
+        \\}
+        \\
+    );
+    defer allocator.free(bindings_uri);
+
+    const main_source =
+        \\const rl = import "./bindings.rn"
+        \\const rlf = rl.raylib
+        \\echo "${rlf.InitWindow 800 600}"
+        \\
+    ;
+    const main_uri = try fixture.writeDocument("main.rn", main_source);
+    defer allocator.free(main_uri);
+
+    const root_uri = try std.fmt.allocPrint(allocator, "file://{s}", .{fixture.root_path});
+    defer allocator.free(root_uri);
+
+    const messages = [_][]const u8{
+        try makeInitializeWithRoot(allocator, 1, root_uri),
+        try makeDidOpen(allocator, main_uri, main_source),
+        // Cursor on `rlf` in its `const rlf = rl.raylib` declaration (line 1).
+        try makeHoverRequest(allocator, 20, main_uri, 1, 6),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 20);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    // The alias must be typed (previously null): its type is the cimport value,
+    // shown concisely as a `cimport` summary rather than the full extern struct.
+    const value = parsed.value.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, value, "cimport") != null);
+    try std.testing.expect(std.mem.indexOf(u8, value, "1 extern") != null);
+}
+
 test "lsp member completion shows execution result members" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
@@ -1880,6 +2040,114 @@ test "lsp member completion shows execution result members" {
 
     const first_kind = items[0].object.get("kind").?;
     try std.testing.expect(first_kind == .integer);
+}
+
+test "lsp member completion on an imported module excludes injected globals" {
+    // Completing `m.` must list the module's own pub exports, not the builtins
+    // and primitive types the type checker injects into every module scope
+    // (`parseInt`, `parseFloat`, `Int`, …).
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const module_uri = try fixture.writeDocument("module.rn",
+        \\pub const version = "0.0.1"
+        \\pub fn Void greet() Void { echo "hi" }
+        \\
+    );
+    defer allocator.free(module_uri);
+
+    const main_src =
+        \\const m = import "./module.rn"
+        \\echo m.
+        \\
+    ;
+    const main_uri = try fixture.writeDocument("main.rn", main_src);
+    defer allocator.free(main_uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, module_uri,
+            \\pub const version = "0.0.1"
+            \\pub fn Void greet() Void { echo "hi" }
+            \\
+        ),
+        try makeDidOpen(allocator, main_uri, main_src),
+        try makeCompletionRequest(allocator, 30, main_uri, 1, 7),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 30);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const items = parsed.value.object.get("result").?.object.get("items").?.array.items;
+    var saw_version = false;
+    for (items) |item| {
+        const label = item.object.get("label").?.string;
+        if (std.mem.eql(u8, label, "version")) saw_version = true;
+        // Injected globals must never appear as module members.
+        try std.testing.expect(!std.mem.eql(u8, label, "parseInt"));
+        try std.testing.expect(!std.mem.eql(u8, label, "parseFloat"));
+        try std.testing.expect(!std.mem.eql(u8, label, "Int"));
+    }
+    try std.testing.expect(saw_version);
+}
+
+test "lsp member completion lists a cimport's extern functions" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\const c = import "std/ffi.rn"
+        \\const m = cimport "libm.so.6" {
+        \\    extern fn pow(base: c.Double, exp: c.Double) c.Double
+        \\    extern fn cos(x: c.Double) c.Double
+        \\}
+        \\m.
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        // Cursor just after `m.` on line 5.
+        try makeCompletionRequest(allocator, 21, uri, 5, 2),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 21);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const items = parsed.value.object.get("result").?.object.get("items").?.array.items;
+    var saw_pow = false;
+    var saw_cos = false;
+    var pow_detail: ?[]const u8 = null;
+    for (items) |item| {
+        const label = item.object.get("label").?.string;
+        if (std.mem.eql(u8, label, "pow")) {
+            saw_pow = true;
+            if (item.object.get("detail")) |d| pow_detail = d.string;
+        }
+        if (std.mem.eql(u8, label, "cos")) saw_cos = true;
+    }
+
+    try std.testing.expect(saw_pow);
+    try std.testing.expect(saw_cos);
+    // The detail carries the extern's C signature.
+    try std.testing.expect(pow_detail != null);
+    try std.testing.expectEqualStrings("pow(base: c.Double, exp: c.Double) c.Double", pow_detail.?);
 }
 
 test "lsp module-path completion follows a symlinked module file" {
@@ -2584,6 +2852,174 @@ test "lsp handles navigation requests for a never-opened document" {
         defer parsed.deinit();
         try std.testing.expect(parsed.value.object.get("result") != null);
     }
+}
+
+test "lsp completion offers the cimport keyword" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const uri = try fixture.writeDocument("main.rn", "ci\n");
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeInitialize(allocator, 1, true),
+        try makeDidOpen(allocator, uri, "ci\n"),
+        try makeCompletionRequest(allocator, 2, uri, 0, 2),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const items = parsed.value.object.get("result").?.object.get("items").?.array.items;
+    var saw_cimport = false;
+    for (items) |item| {
+        if (std.mem.eql(u8, item.object.get("label").?.string, "cimport")) saw_cimport = true;
+    }
+    try std.testing.expect(saw_cimport);
+}
+
+test "lsp import-path completion offers the bundled std root" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source = "const m = import \"st\"\n";
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeCompletionRequest(allocator, 2, uri, 0, 20), // after `st` in the import string
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const items = parsed.value.object.get("result").?.object.get("items").?.array.items;
+    var saw_std = false;
+    for (items) |item| {
+        if (std.mem.eql(u8, item.object.get("label").?.string, "std")) saw_std = true;
+    }
+    try std.testing.expect(saw_std);
+}
+
+test "lsp import-path completion offers bundled std submodules" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source = "const m = import \"std/\"\n";
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeCompletionRequest(allocator, 2, uri, 0, 22), // after `std/` in the import string
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const items = parsed.value.object.get("result").?.object.get("items").?.array.items;
+    var saw_list = false;
+    var saw_ffi = false;
+    for (items) |item| {
+        const label = item.object.get("label").?.string;
+        if (std.mem.eql(u8, label, "list")) saw_list = true;
+        if (std.mem.eql(u8, label, "ffi")) saw_ffi = true;
+    }
+    try std.testing.expect(saw_list);
+    try std.testing.expect(saw_ffi);
+}
+
+/// Runs a single trailing-dot member completion and reports whether each of
+/// `expected` appears among the offered labels.
+fn memberCompletionHas(
+    allocator: Allocator,
+    source: []const u8,
+    line: u32,
+    character: u32,
+    expected: []const []const u8,
+    found: []bool,
+) !void {
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeCompletionRequest(allocator, 2, uri, line, character),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const result = try runServerWithMessagesDetailed(allocator, &messages);
+    defer result.deinit(allocator);
+    const response = try findResponseById(allocator, result.stdout, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const items = parsed.value.object.get("result").?.object.get("items").?.array.items;
+    for (items) |item| {
+        const label = item.object.get("label").?.string;
+        for (expected, found) |want, *seen| {
+            if (std.mem.eql(u8, label, want)) seen.* = true;
+        }
+    }
+}
+
+test "lsp completion offers std submodules after a trailing dot" {
+    const source =
+        \\const std = import "std"
+        \\echo "${std.}"
+        \\
+    ;
+    var found = [_]bool{ false, false, false };
+    try memberCompletionHas(std.testing.allocator, source, 1, 12, &.{ "list", "str", "ffi" }, &found);
+    for (found) |f| try std.testing.expect(f);
+}
+
+test "lsp completion offers cimport externs after a trailing dot" {
+    const source =
+        \\const c = import "std/ffi.rn"
+        \\const m = cimport "libm.so.6" {
+        \\    extern fn pow(base: c.Double, exp: c.Double) c.Double
+        \\    extern fn cos(x: c.Double) c.Double
+        \\}
+        \\echo "${m.}"
+        \\
+    ;
+    var found = [_]bool{ false, false };
+    try memberCompletionHas(std.testing.allocator, source, 5, 10, &.{ "pow", "cos" }, &found);
+    for (found) |f| try std.testing.expect(f);
+}
+
+test "lsp completion offers std.ffi C types after a trailing dot" {
+    const source =
+        \\const c = import "std/ffi.rn"
+        \\echo "${c.}"
+        \\
+    ;
+    var found = [_]bool{ false, false, false };
+    try memberCompletionHas(std.testing.allocator, source, 1, 10, &.{ "Double", "Int", "Ptr" }, &found);
+    for (found) |f| try std.testing.expect(f);
 }
 
 const TestFixture = struct {

@@ -59,6 +59,20 @@ pub const LspDocumentStore = struct {
         path: []const u8,
     ) DocumentStore.Error!*Document {
         const self: *@This() = @fieldParentPtr("document_store", doc_store);
+
+        // Bundled std modules resolve to virtual ":std/…" paths whose source is
+        // embedded in the binary, not on disk. Serve them from the embed table
+        // (cached under the virtual path) instead of a filesystem lookup — the
+        // frontend document store does the same. Without this, resolving an
+        // `import "std"` (or std/…) during LSP type-checking fails, so a `std.`
+        // member completion sees no submodules.
+        if (runic.std_modules.source(path)) |embedded| {
+            if (self.get(path)) |document| return document;
+            const document = self.createAndStoreDocument(path, path, embedded, 0, .server) catch return DocumentStore.Error.GetFailed;
+            self.processDocument(document, .open_and_parse_only) catch return DocumentStore.Error.GetFailed;
+            return document;
+        }
+
         const uri = self.resolveUri(path) catch return DocumentStore.Error.GetFailed;
         defer self.allocator.free(uri);
         return self.requestDocument(
@@ -459,7 +473,11 @@ const Document = struct {
     ) !void {
         workspace.type_checker.invalidateDocument(self.path);
         const result = workspace.type_checker.typeCheck(self.path) catch |err| switch (err) {
-            error.DocumentNotParsed => return,
+            // Both are expected during editing: the document isn't parsed yet,
+            // or an `import` references a module that can't be resolved (a
+            // half-typed path like `import "std/"`). Neither warrants an error
+            // log on every keystroke.
+            error.DocumentNotParsed, error.GetFailed => return,
             else => {
                 std.log.err("Type checker failed to run: {}", .{err});
                 return;

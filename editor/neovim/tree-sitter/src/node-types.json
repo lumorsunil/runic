@@ -741,6 +741,11 @@
     "fields": {}
   },
   {
+    "type": "keyword_import",
+    "named": true,
+    "fields": {}
+  },
+  {
     "type": "keyword_loop",
     "named": true,
     "fields": {}
@@ -1062,6 +1067,10 @@
     "named": false
   },
   {
+    "type": "cimport",
+    "named": false
+  },
+  {
     "type": "command_head",
     "named": true
   },
@@ -1102,6 +1111,10 @@
     "named": false
   },
   {
+    "type": "extern",
+    "named": false
+  },
+  {
     "type": "false",
     "named": false
   },
@@ -1122,16 +1135,16 @@
     "named": false
   },
   {
+    "type": "import",
+    "named": false
+  },
+  {
     "type": "inspect",
     "named": false
   },
   {
     "type": "is",
     "named": false
-  },
-  {
-    "type": "keyword_import",
-    "named": true
   },
   {
     "type": "keyword_interop",

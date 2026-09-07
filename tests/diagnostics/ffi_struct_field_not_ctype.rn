@@ -1,0 +1,5 @@
+const c = import "std/ffi.rn"
+const Bad = struct { x: c.Int, name: String }
+const m = cimport "liba.so" {
+    extern fn f(b: Bad) c.Int
+}

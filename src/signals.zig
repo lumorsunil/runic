@@ -4,7 +4,10 @@ var signals = Signals{};
 
 const sig_action = std.posix.Sigaction{
     .handler = .{ .handler = handler },
-    .mask = std.posix.sigemptyset(),
+    // An empty signal mask is all-zeros. `std.posix.sigemptyset()` is not
+    // comptime-evaluable once libc is linked (it becomes an extern call), and
+    // this is a comptime `const`, so zero the set directly instead.
+    .mask = std.mem.zeroes(std.posix.sigset_t),
     .flags = 0,
 };
 

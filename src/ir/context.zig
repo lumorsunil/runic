@@ -12,6 +12,7 @@ const ReaderWriterStream = @import("../stream.zig").ReaderWriterStream;
 const Closeable = @import("../closeable.zig").Closeable;
 const Ref = @import("ref.zig").Ref;
 const FileSink = @import("../process.zig").FileSink;
+const CImportCloseable = @import("../ffi/cimport.zig").CImportCloseable;
 
 pub const page_size = 1024 * 4;
 pub const stack_start: usize = std.math.maxInt(usize) - 1024 * 1024 * 10;
@@ -79,6 +80,10 @@ pub const IRProgramContext = struct {
     /// the queue above instead; an empty closed queue is EOF.)
     consumed_pipes: std.AutoArrayHashMapUnmanaged(PipeHandle, void) = .empty,
     closeables: std.AutoArrayHashMapUnmanaged(CloseableHandle, *Closeable(ExitCode)) = .empty,
+    /// Open `cimport` libraries, keyed by the same handle used for their
+    /// closeable (which handles dlclose at exit). This typed side table lets a
+    /// C FFI call recover the resolved externs from the closeable handle.
+    cimports: std.AutoArrayHashMapUnmanaged(CloseableHandle, *CImportCloseable) = .empty,
     closeable_handle_counter: usize = 0,
     file_sinks: std.ArrayList(*FileSink) = .empty,
 
@@ -122,6 +127,13 @@ pub const IRProgramContext = struct {
             if (!closeable.isClosed()) _ = closeable.close();
         }
         self.closeables.deinit(self.allocator);
+
+        // The closeables above already dlclose'd each cimport library and freed
+        // its externs; destroy the owning structs (this table's values).
+        for (self.cimports.values()) |cimport| {
+            self.allocator.destroy(cimport);
+        }
+        self.cimports.deinit(self.allocator);
 
         for (self.file_sinks.items) |file_sink| {
             if (!file_sink.closeable.isClosed()) _ = file_sink.closeable.close();
@@ -367,6 +379,16 @@ pub const IRProgramContext = struct {
 
     pub fn getCloseable(self: *@This(), handle: CloseableHandle) Error!*Closeable(ExitCode) {
         return self.closeables.get(handle) orelse Error.MissingCloseableHandle;
+    }
+
+    /// Registers an open cimport library under its closeable handle for typed
+    /// retrieval by a C FFI call.
+    pub fn addCImport(self: *@This(), handle: CloseableHandle, cimport: *CImportCloseable) !void {
+        try self.cimports.put(self.allocator, handle, cimport);
+    }
+
+    pub fn getCImport(self: *@This(), handle: CloseableHandle) ?*CImportCloseable {
+        return self.cimports.get(handle);
     }
 
     pub fn addFileSink(self: *@This(), file_sink: *FileSink) !void {

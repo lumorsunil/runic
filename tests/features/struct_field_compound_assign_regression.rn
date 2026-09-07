@@ -1,0 +1,22 @@
+// Compound assignment (and self-referential assignment) to a struct field: the
+// field's declared type surfaces through member access / arithmetic as a bare
+// type name, which must resolve rather than fail to type-check.
+const Counter = struct { n: Int, step: Int }
+
+var c = Counter{ .n = 0, .step = 5 }
+
+c.n = c.n + 1
+c.n += 10
+c.n -= 2
+c.n *= 3
+echo "n=${c.n}"
+
+// a field driving another field
+c.step += c.n
+echo "step=${c.step}"
+
+// nested struct field compound assignment
+const Box = struct { inner: Counter }
+var b = Box{ .inner = Counter{ .n = 100, .step = 1 } }
+b.inner.n += 23
+echo "inner=${b.inner.n}"

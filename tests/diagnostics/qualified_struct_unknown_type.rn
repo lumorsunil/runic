@@ -1,0 +1,2 @@
+const m = import "../support/imports/vector3_module.rn"
+const v = m.Nope{ .x = 1 }

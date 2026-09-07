@@ -1,0 +1,28 @@
+// Qualified struct construction of a type from an imported module:
+// `m.Vector3{ … }`. The type is resolved through the module (types can't be
+// `pub`, so visibility is not required); the compiler constructs it by name.
+const m = import "../support/imports/vector3_module.rn"
+
+// A module struct type used as a struct field type.
+const Entity = struct { pos: m.Vector3 }
+
+// Qualified construction, nested inside another struct literal.
+const entity = Entity{ .pos = m.Vector3{ .x = 0, .y = 1, .z = 2 } }
+echo "x=${entity.pos.x} y=${entity.pos.y} z=${entity.pos.z}"
+
+// Direct qualified construction.
+const v = m.Vector3{ .x = 10, .y = 20, .z = 30 }
+echo "v=${v.x} ${v.y} ${v.z}"
+
+// A module-qualified type as a function parameter (and return): the annotation
+// must resolve to the module's struct type, not to the module value itself.
+fn Void makeEntity(pos: m.Vector3) Entity {
+  yield Entity{ .pos = pos }
+}
+const built = makeEntity m.Vector3{ .x = 4, .y = 5, .z = 6 }
+echo "built=${built.pos.x} ${built.pos.y} ${built.pos.z}"
+
+// A module's struct type referenced in value position: a bare statement is a
+// no-op, and interpolating it serializes to the type name (like `${Int}`).
+m.Vector3
+echo "typeref=${m.Vector3}"

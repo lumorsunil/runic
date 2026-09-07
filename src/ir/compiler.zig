@@ -10,6 +10,8 @@ const Stream = @import("../stream.zig").Stream;
 const RCError = @import("../mem/rc.zig").RCError;
 const FrontendDocumentStore = @import("../frontend/document_store.zig").FrontendDocumentStore;
 const resolveModulePath = @import("../frontend/document_store.zig").resolveModulePath;
+const CType = @import("../ffi/ctype.zig").CType;
+const CSig = @import("../ffi/ctype.zig").CSig;
 const evaluateArithmetic = ir.evaluator.IREvaluator.evaluateArithmetic;
 const evaluateLogical = ir.evaluator.IREvaluator.evaluateLogical;
 const evaluateCompare = ir.evaluator.IREvaluator.evaluateCompare;
@@ -1978,6 +1980,7 @@ pub const IRCompiler = struct {
             } else self.compileBlock(expr, block),
             .fn_decl => |fn_decl| self.compileFnDecl(expr, fn_decl),
             .import_expr => |import_expr| self.compileImportExpr(expr, import_expr),
+            .cimport_expr => |cimport_expr| self.compileCImport(expr, cimport_expr),
             .binary => |binary| self.compileBinary(expr, binary),
             .unary => |unary| self.compileUnary(expr, unary),
             .array => |array| self.compileArray(expr, array),
@@ -2622,6 +2625,12 @@ pub const IRCompiler = struct {
     ) Error!Result {
         if (try self.tryCompileTypedValueCapture(source, expr)) |captured| return captured;
 
+        // A `cimport` extern call returning a by-value struct yields a heap
+        // value whose slots the stdio-capture path's pipe bookkeeping would
+        // clobber (a struct return is bound, never a command). Compile it
+        // directly, bypassing capture.
+        if (self.exprIsCImportStructCall(expr)) return try self.compileExpression(expr);
+
         const background_capture = isBackgroundExecutionExpression(expr);
         const expr_effects = self.analyzeExpressionEffects(expr);
         if (expr_effects.needs_stdio_capture or background_capture) {
@@ -3004,7 +3013,14 @@ pub const IRCompiler = struct {
                             ft.* = vt;
                             concrete_fields[i].type_expr = ft;
                         }
-                        break :blk try self.compileExpression(lit_field.value);
+                        // A call/pipeline field value (`{ .pos = mk x y }`)
+                        // forks a thread; capture it to its produced value first
+                        // (same as an argument or binding), else the field would
+                        // hold a raw thread handle.
+                        break :blk if (self.argNeedsValueCapture(lit_field.value))
+                            try self.compileExpressionWithCapture(source, lit_field.value)
+                        else
+                            try self.compileExpression(lit_field.value);
                     }
                 }
                 break :blk .fromValue(.void);
@@ -3341,6 +3357,10 @@ pub const IRCompiler = struct {
             }
         }
 
+        // A nullary cimport extern accessed bare (`rl.CloseWindow`) is a C FFI
+        // call with no arguments — the same as `rl.CloseWindow()` would be.
+        if (try self.tryCompileNullaryCImportMember(source, object, member.member.name)) |result| return result;
+
         const object_type = object.typeExpr() orelse {
             try self.reportSourceError(
                 source,
@@ -3466,6 +3486,15 @@ pub const IRCompiler = struct {
                 // function named `method` is in scope (field access wins, which
                 // is why this is only reached after fieldLayout fails).
                 if (try self.tryUfcsRewrite(source, member.object, member.member.name, &.{}, &.{})) |r| return r;
+                // A module's struct type accessed as a member (`m.Vector3`) in
+                // value position — a type reference, serialized to its name like
+                // a bare type identifier (`${Int}` → "Int"). Registered from the
+                // imported module's declarations.
+                if (self.user_struct_types.contains(member.member.name)) {
+                    if (try self.typeIdentifierString(member.member.name)) |type_name| {
+                        return .fromValue(type_name);
+                    }
+                }
                 try self.reportSourceError(
                     source,
                     Error.NotImplemented,
@@ -4072,6 +4101,11 @@ pub const IRCompiler = struct {
         call: ast.CallExpr,
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        // A C FFI call through a cimport member (`m.pow x y`) — dispatched to
+        // libffi. Handled on the main call path so its refs are framed like any
+        // other call (the speculative capture path miscounts a nested frame).
+        if (try self.tryCompileCImportCall(source, source)) |result| return result;
 
         if (call.callee.* == .block and call.redirects.len > 0) {
             return self.compileBlockCallWithRedirects(source, call.callee.*.block, call.redirects);
@@ -5825,7 +5859,36 @@ pub const IRCompiler = struct {
             }
         }
 
+        // Pre-capture arguments that are themselves calls/pipelines/blocks: such
+        // an expression forks a thread whose `yield` goes to the caller's stdout,
+        // and compiling it plainly hands the callee the raw thread handle instead
+        // of the produced value (`f (g x)`). Capture each to a value first — the
+        // same as a `const tmp = g x` binding — then pass the captured value.
+        // Done before the slot-set loop so the capture machinery's temporaries
+        // don't interleave with the closure-slot writes.
+        const captured_args = try self.allocator.alloc(?Result, arguments.len);
+        defer self.allocator.free(captured_args);
         for (arguments, 0..) |arg, i| {
+            if (self.argNeedsValueCapture(arg)) {
+                const captured = try self.compileExpressionWithCapture(source, arg);
+                const arg_ref = try self.newRef(source, "call_arg");
+                try self.set(source, arg_ref, stableResultSource(captured));
+                captured_args[i] = .fromLocation(arg_ref.dereference().typed(captured.typeExpr()));
+            } else {
+                captured_args[i] = null;
+            }
+        }
+
+        for (arguments, 0..) |arg, i| {
+            if (captured_args[i]) |captured| {
+                try self.set(source, .initRegister(.r), .from(closure_ref.dereference()));
+                try self.set(
+                    source,
+                    .initAdd(.{ .register = .r }, i, .{ .dereference = true }),
+                    captured.source,
+                );
+                continue;
+            }
             // Track whether compiling this argument pushed an owned temporary.
             // `consume` pops any stack-location result, but a bare binding
             // reference (e.g. a struct-valued `p` passed as an arg) is a
@@ -6774,6 +6837,17 @@ pub const IRCompiler = struct {
         // upstream's output kind decides the boundary; an executable upstream
         // still forces the byte path via its own output kind.
         if (callee.* == .block) return .exact_typed;
+        // A param-stage (`producer | consume` where `consume(x: T)` takes the
+        // upstream value in its single parameter) binds by parameter, not stdin.
+        // Classify by that parameter's type so a struct/scalar param gets typed
+        // transport even though the function's declared stdin is Void.
+        if (self.pipelineParamStageParamType(stage)) |pt| {
+            return switch (pt) {
+                .void => .void_boundary,
+                .execution => .byte_stream,
+                else => .exact_typed,
+            };
+        }
         const binding = switch (callee.*) {
             .identifier => |id| self.lookup(id.name, .{ .shallow = false }),
             else => null,
@@ -7088,7 +7162,24 @@ pub const IRCompiler = struct {
             if (builtin.kind == .framer) return true;
         }
         const out_type = self.stageStdoutType(upstream) orelse return false;
-        return typeExprIsNamed(out_type, "Int") or typeExprIsNamed(out_type, "Float") or typeExprIsNamed(out_type, "Bool");
+        return typeExprIsNamed(out_type, "Int") or typeExprIsNamed(out_type, "Float") or
+            typeExprIsNamed(out_type, "Bool") or self.typeExprIsStruct(out_type);
+    }
+
+    /// Whether a type is a struct value (a user struct by name, or a resolved
+    /// struct type). Such a value must transport between pipeline stages by
+    /// value (typed queue), not byte-serialized — serializing a struct's heap
+    /// layout misreads it as a length-prefixed sequence and recurses.
+    fn typeExprIsStruct(self: *IRCompiler, t: ast.TypeExpr) bool {
+        return switch (t) {
+            .struct_type => true,
+            .identifier => |named| blk: {
+                const segments = named.path.segments;
+                if (segments.len == 0) break :blk false;
+                break :blk self.user_struct_types.contains(segments[segments.len - 1].name);
+            },
+            else => false,
+        };
     }
 
     /// Pipeline↔param coercion: a stage that is a zero-arg reference to a
@@ -7096,6 +7187,35 @@ pub const IRCompiler = struct {
     /// Collects stdin into a value, binds it to the parameter, and calls the
     /// function (whose output flows to the stage's stdout). Returns null when the
     /// stage isn't such a reference (fall back to normal stage compilation).
+    /// The single-parameter type of a pipeline param-stage: a stage that is a
+    /// zero-arg reference to a one-parameter function, which receives the
+    /// upstream value in that parameter (`producer | consume` binds the upstream
+    /// value to `consume`'s parameter). Returns null when the stage isn't such a
+    /// reference — including a declared parameter with no type annotation.
+    fn pipelineParamStageParamType(self: *IRCompiler, stage_expr: *ast.Expression) ?ast.TypeExpr {
+        const callee: *ast.Expression = switch (stage_expr.*) {
+            .call => |call| if (call.arguments.len == 0 and call.redirects.len == 0) call.callee else return null,
+            .identifier => stage_expr,
+            else => return null,
+        };
+        if (callee.* != .identifier) return null;
+        const binding = self.lookup(callee.identifier.name, .{ .shallow = false }) orelse return null;
+        if (!binding.result.isFunctionRef()) return null;
+        const fn_ref = binding.result.source.value;
+        if (self.instruction_sets.items[fn_ref.fn_ref.fn_addr.instr_set].param_count != 1) return null;
+        const fn_type = switch (binding.type_expr orelse return null) {
+            .function => |f| f,
+            else => return null,
+        };
+        switch (fn_type.params) {
+            ._non_variadic => |ps| if (ps.len == 1) {
+                if (ps[0]) |pt| return pt.*;
+            },
+            ._variadic => {},
+        }
+        return null;
+    }
+
     fn tryCompilePipelineParamStage(self: *IRCompiler, source: *ast.Expression, stage_expr: *ast.Expression) Error!?Result {
         const callee: *ast.Expression = switch (stage_expr.*) {
             .call => |call| if (call.arguments.len == 0 and call.redirects.len == 0) call.callee else return null,
@@ -7109,17 +7229,10 @@ pub const IRCompiler = struct {
         if (self.instruction_sets.items[fn_ref.fn_ref.fn_addr.instr_set].param_count != 1) return null;
 
         // The single parameter's type. `collect_stdin` (== `&0`) dequeues the
-        // upstream value typed when the boundary is typed (Int/Float/…) and as a
-        // String byte blob otherwise, matching the parameter type either way.
-        const param_type: ast.TypeExpr = blk: {
-            if (binding.type_expr) |t| if (t == .function) switch (t.function.params) {
-                ._non_variadic => |ps| if (ps.len == 1) {
-                    if (ps[0]) |pt| break :blk pt.*;
-                },
-                ._variadic => {},
-            };
-            break :blk string_type;
-        };
+        // upstream value typed when the boundary is typed (Int/Float/struct/…)
+        // and as a String byte blob otherwise, matching the parameter type either
+        // way.
+        const param_type: ast.TypeExpr = self.pipelineParamStageParamType(stage_expr) orelse string_type;
 
         // Collect the upstream value and bind it to the single parameter.
         try self.addInstruction(.init(.from(source), .collect_stdin));
@@ -7564,6 +7677,249 @@ pub const IRCompiler = struct {
         } };
 
         return .fromLocation(result_ref.dereference().typed(merged_type));
+    }
+
+    /// The C type an extern parameter/return annotation names (`c.Double` → the
+    /// last path segment `Double` → `CType.double`); null if it is not a
+    /// recognized C type (the type checker has already reported that).
+    fn cTypeOfAnnotation(annotation: ?*const ast.TypeExpr) ?CType {
+        const t = annotation orelse return null;
+        if (t.* == .identifier) {
+            const segments = t.identifier.path.segments;
+            if (segments.len > 0) return CType.fromName(segments[segments.len - 1].name);
+        }
+        return null;
+    }
+
+    /// The C signature type an extern parameter/return annotation names: a
+    /// scalar `c.X`, or a struct passed by value — a user struct all of whose
+    /// fields are scalar `c.X` or (recursively) such structs (e.g. raylib's
+    /// `Color`, `Vector2`, `Camera2D`). Null if the annotation resolves to
+    /// neither.
+    fn cSigOfAnnotation(self: *IRCompiler, annotation: ?*const ast.TypeExpr) Error!?CSig {
+        if (cTypeOfAnnotation(annotation)) |ct| return CSig{ .scalar = ct };
+        const t = annotation orelse return null;
+        if (t.* != .identifier) return null;
+        const segments = t.identifier.path.segments;
+        if (segments.len != 1) return null;
+        const name = segments[0].name;
+        const st = self.user_struct_types.get(name) orelse return null;
+        if (st.fields.len == 0) return null;
+        const fields = try self.allocator.alloc(CSig.Field, st.fields.len);
+        for (st.fields, fields) |f, *dst| {
+            const fsig = (try self.cSigOfAnnotation(f.type_expr)) orelse return null;
+            dst.* = .{ .name = f.name.name, .type = fsig };
+        }
+        return CSig{ .strct = .{ .name = name, .fields = fields } };
+    }
+
+    /// Compiles a `cimport` block into a `cimport_open` instruction that, at
+    /// runtime, loads the library and resolves each declared extern's address.
+    /// The result value (a closeable handle) is typed as a cimport struct so a
+    /// later member call can be routed to a C FFI call.
+    fn compileCImport(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        cimport_expr: ast.CImportExpr,
+    ) Error!Result {
+        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        const externs = try self.allocator.alloc(ir.Instruction.CImportOpen.Extern, cimport_expr.externs.len);
+        for (cimport_expr.externs, externs) |ext, *dst| {
+            const params = try self.allocator.alloc(CSig, ext.params.len);
+            for (ext.params, params) |param, *cparam| {
+                cparam.* = (try self.cSigOfAnnotation(param.type_annotation)) orelse {
+                    try self.reportSourceError(source, Error.UnsupportedExpression, .@"error", "extern fn \"{s}\" has an unresolved C parameter type", .{ext.name.name});
+                    return .fromValue(.void);
+                };
+            }
+            dst.* = .{
+                .symbol = ext.name.name,
+                .params = params,
+                .ret = (try self.cSigOfAnnotation(ext.return_type)) orelse .{ .scalar = .void },
+            };
+        }
+
+        const result = try self.newRef(source, "cimport");
+        try self.addInstruction(.init(.from(source), .{ .cimport_open = .{
+            .library_name = cimport_expr.library_name,
+            .importer = cimport_expr.importer,
+            .externs = externs,
+            .result = result,
+        } }));
+
+        // Tag the value's type so `resolveStaticType` recognizes a cimport (the
+        // externs are what routes a `m.fn x` member call to a C FFI call).
+        const cimport_type = ast.TypeExpr{ .struct_type = .{
+            .fields = &.{},
+            .decls = &.{},
+            .span = source.span(),
+            .cimport_externs = cimport_expr.externs,
+        } };
+        return (try Result.from(result.dereference())).typed(cimport_type);
+    }
+
+    /// The Runic type a C return type surfaces as (`c.Double` → `Float`), used
+    /// to type a cimport call's result so it composes downstream (arithmetic,
+    /// `.len`, …). Mirrors the type checker's `cTypeToRunic`.
+    fn cTypeRunicTypeExpr(self: *IRCompiler, ctype: CType) Error!ast.TypeExpr {
+        return switch (ctype) {
+            .int, .uint, .long, .ulong, .short, .ushort, .char, .size_t, .ptr => ast.TypeExpr.global(.integer),
+            .float, .double => ast.TypeExpr.global(.float),
+            .bool => ast.TypeExpr.global(.boolean),
+            .void => ast.TypeExpr.global(.void),
+            .str => blk: {
+                const byte = try self.allocator.create(ast.TypeExpr);
+                byte.* = ast.TypeExpr.global(.byte);
+                break :blk ast.TypeExpr{ .array = .{ .element = byte, .span = .global } };
+            },
+        };
+    }
+
+    /// The Runic type a cimport call's result is typed as: a scalar return
+    /// surfaces as its mapped primitive (`cTypeRunicTypeExpr`); a by-value
+    /// struct return surfaces as the user struct itself, so downstream field
+    /// access (`col.r`) composes.
+    fn cImportRetTypeExpr(self: *IRCompiler, annotation: ?*const ast.TypeExpr) Error!ast.TypeExpr {
+        if (cTypeOfAnnotation(annotation)) |ct| return self.cTypeRunicTypeExpr(ct);
+        if (annotation) |t| {
+            if (t.* == .identifier and t.identifier.path.segments.len == 1) {
+                if (self.user_struct_types.get(t.identifier.path.segments[0].name)) |st| {
+                    return ast.TypeExpr{ .struct_type = st };
+                }
+            }
+        }
+        return ast.TypeExpr.global(.void);
+    }
+
+    /// Emits a zero-argument `cimport_call` when `object` is a cimport value
+    /// (its type carries `cimport_externs`) and `member` names one of its
+    /// externs — the bare-member form `rl.CloseWindow`. Returns null otherwise.
+    fn tryCompileNullaryCImportMember(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        object: Result,
+        member: []const u8,
+    ) Error!?Result {
+        var object_type = object.typeExpr() orelse return null;
+        while (object_type == .alias) object_type = object_type.alias.type_expr.*;
+        if (object_type != .struct_type) return null;
+        const externs = object_type.struct_type.cimport_externs orelse return null;
+
+        var matched: ?ast.ExternFn = null;
+        for (externs) |candidate| {
+            if (std.mem.eql(u8, candidate.name.name, member)) {
+                matched = candidate;
+                break;
+            }
+        }
+        const extern_fn = matched orelse return null;
+
+        const lib_ref = try self.newRef(source, "cimport_lib");
+        try self.set(source, lib_ref, stableResultSource(object));
+
+        const result = try self.newRef(source, "cimport_result");
+        try self.addInstruction(.init(.from(source), .{ .cimport_call = .{
+            .library = ir.ValueSource.fromLocation(lib_ref.dereference()),
+            .symbol = extern_fn.name.name,
+            .args = &.{},
+            .result = result,
+        } }));
+
+        const ret_type = try self.cImportRetTypeExpr(extern_fn.return_type);
+        return (try Result.from(result.dereference())).typed(ret_type);
+    }
+
+    /// Whether `expr` is a call to a declared `cimport` extern that returns a
+    /// by-value struct (`m.fn args` → `Color`). A static check (emits nothing)
+    /// mirroring `tryCompileCImportCall`. Only struct returns need to bypass the
+    /// stdio-capture path — their heap-backed result is clobbered by the capture
+    /// path's pipe bookkeeping; scalar returns survive it and keep their
+    /// existing behavior (which the interpolation stack contract relies on).
+    fn exprIsCImportStructCall(self: *IRCompiler, expr: *ast.Expression) bool {
+        const call = switch (expr.*) {
+            .call => |c| c,
+            else => return false,
+        };
+        if (call.background or call.redirects.len != 0) return false;
+        const callee = call.callee;
+        if (callee.* != .binary or callee.binary.op != .member or callee.binary.right.* != .identifier) return false;
+
+        var object_type = self.resolveStaticType(callee.binary.left) orelse return false;
+        while (object_type == .alias) object_type = object_type.alias.type_expr.*;
+        if (object_type != .struct_type) return false;
+        const externs = object_type.struct_type.cimport_externs orelse return false;
+
+        const member_name = callee.binary.right.identifier.name;
+        for (externs) |candidate| {
+            if (!std.mem.eql(u8, candidate.name.name, member_name)) continue;
+            // Only a struct return needs the bypass: no scalar C type, but a
+            // single identifier naming a user struct.
+            if (cTypeOfAnnotation(candidate.return_type) != null) return false;
+            const ret = candidate.return_type;
+            if (ret.* != .identifier or ret.identifier.path.segments.len != 1) return false;
+            return self.user_struct_types.contains(ret.identifier.path.segments[0].name);
+        }
+        return false;
+    }
+
+    /// Compiles `m.extern args` where `m` is a cimport value and `extern` names a
+    /// declared extern, into a `cimport_call` (a libffi dispatch). Returns null
+    /// when `expr` is not such a call, so other call paths still apply.
+    fn tryCompileCImportCall(
+        self: *IRCompiler,
+        source: anytype,
+        expr: *ast.Expression,
+    ) Error!?Result {
+        const call = switch (expr.*) {
+            .call => |c| c,
+            else => return null,
+        };
+        if (call.background or call.redirects.len != 0) return null;
+        const callee = call.callee;
+        if (callee.* != .binary or callee.binary.op != .member or callee.binary.right.* != .identifier) return null;
+
+        const object = callee.binary.left;
+        const member_name = callee.binary.right.identifier.name;
+
+        var object_type = self.resolveStaticType(object) orelse return null;
+        while (object_type == .alias) object_type = object_type.alias.type_expr.*;
+        if (object_type != .struct_type) return null;
+        const externs = object_type.struct_type.cimport_externs orelse return null;
+
+        var matched: ?ast.ExternFn = null;
+        for (externs) |candidate| {
+            if (std.mem.eql(u8, candidate.name.name, member_name)) {
+                matched = candidate;
+                break;
+            }
+        }
+        const extern_fn = matched orelse return null;
+
+        // Copy the cimport value and each argument into fresh local refs (like
+        // compileFloatOp): the call instruction then references local-frame
+        // slots, not a cross-frame location — which is what makes it work inside
+        // a nested frame such as a string interpolation.
+        const lib_ref = try self.newRef(source, "cimport_lib");
+        try self.set(source, lib_ref, stableResultSource(try self.compileExpression(object)));
+
+        const arg_sources = try self.allocator.alloc(ir.ValueSource, call.arguments.len);
+        for (call.arguments, arg_sources) |arg_expr, *dst| {
+            const arg_ref = try self.newRef(source, "cimport_arg");
+            try self.set(source, arg_ref, stableResultSource(try self.compileExpression(arg_expr)));
+            dst.* = ir.ValueSource.fromLocation(arg_ref.dereference());
+        }
+
+        const result = try self.newRef(source, "cimport_result");
+        try self.addInstruction(.init(.from(source), .{ .cimport_call = .{
+            .library = ir.ValueSource.fromLocation(lib_ref.dereference()),
+            .symbol = extern_fn.name.name,
+            .args = arg_sources,
+            .result = result,
+        } }));
+
+        const ret_type = try self.cImportRetTypeExpr(extern_fn.return_type);
+        return (try Result.from(result.dereference())).typed(ret_type);
     }
 
     /// Builds the `fn_ref_type` for a module pub-fn field, carrying the function's
@@ -9766,6 +10122,59 @@ pub const IRCompiler = struct {
     fn fnRefParamCount(self: *IRCompiler, source: ir.ValueSource) ?usize {
         if (source != .value or source.value != .fn_ref) return null;
         return self.instruction_sets.items[source.value.fn_ref.fn_addr.instr_set].param_count;
+    }
+
+    /// Whether a call/pipeline/block used as a *function argument* forks a thread
+    /// (a function call, external command, pipeline, or block) whose produced
+    /// value must be captured before it can be passed. Compiling such an
+    /// expression plainly returns the thread handle and sends its `yield` to the
+    /// caller's stdout — so the callee would receive an unwaited thread instead
+    /// of the value. Builtins (`s.contains`, `arr.push`), type applications
+    /// (`Box(Int)`), and plain variable/function-value reads return values
+    /// directly and must NOT be routed through capture.
+    fn argNeedsValueCapture(self: *IRCompiler, arg: *ast.Expression) bool {
+        switch (arg.*) {
+            .pipeline => |p| return !p.background,
+            .block => |b| return !b.background,
+            .call => |call| {
+                if (call.background) return false;
+                switch (call.callee.*) {
+                    .identifier => |id| {
+                        // A type application (`Box(Int)`) serializes to a string
+                        // value — not a call to capture.
+                        if (call.arguments.len > 0 and self.isTypeName(id.name) and
+                            self.lookup(id.name, .{ .shallow = false }) == null) return false;
+                        if (call.arguments.len == 0) {
+                            const binding = self.lookup(id.name, .{ .shallow = false }) orelse
+                                return true; // unknown name → external command
+                            if (!binding.result.isFunctionRef()) return false; // variable read
+                            // A zero-arg reference to a paramful function is a
+                            // function *value*, not a call.
+                            if (self.fnRefParamCount(binding.result.source)) |pc| {
+                                if (pc > 0) return false;
+                            }
+                            return true; // nullary function call
+                        }
+                        return true; // function call / external command with args
+                    },
+                    .binary => |b| {
+                        // A member call that resolves to a string/int/float
+                        // builtin (or `push`/`with`) returns a value directly.
+                        if (b.op == .member and b.right.* == .identifier and
+                            !self.memberIsStructField(b.left, b.right.identifier.name))
+                        {
+                            const member = b.right.identifier.name;
+                            if (stringBuiltin(member) != null or floatBuiltin(member) != null or
+                                intBuiltin(member) != null) return false;
+                            if (std.mem.eql(u8, member, "push") or std.mem.eql(u8, member, "with")) return false;
+                        }
+                        return true;
+                    },
+                    else => return true,
+                }
+            },
+            else => return false,
+        }
     }
 
     fn callNeedsStdioCapture(self: *IRCompiler, call: ast.CallExpr) bool {

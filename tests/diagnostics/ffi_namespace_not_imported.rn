@@ -1,0 +1,3 @@
+const m = cimport "libm.so.6" {
+    extern fn pow(base: c.Double) c.Double
+}

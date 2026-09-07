@@ -292,6 +292,10 @@
         {
           "type": "STRING",
           "value": "comptime"
+        },
+        {
+          "type": "STRING",
+          "value": "extern"
         }
       ]
     },
@@ -372,8 +376,17 @@
       ]
     },
     "keyword_import": {
-      "type": "STRING",
-      "value": "import"
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "import"
+        },
+        {
+          "type": "STRING",
+          "value": "cimport"
+        }
+      ]
     },
     "keyword_interop": {
       "type": "STRING",

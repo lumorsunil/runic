@@ -101,6 +101,10 @@ A working parser, type checker, and IR-based runtime are in place. The following
 - Runtime type tests with `is`, including narrowing inside `if (x is T) { … }`
 - **Generic collections** — `std.map`, a hashed key/value map (immutable and
   mutable APIs, insertion-order iteration)
+- **C interop (`cimport`)** — call C functions in a shared library through
+  `libffi`, with `std.ffi` C types (`c.Int`, `c.Double`, `c.Str`, …) and C
+  structs passed/returned by value (including nested structs). `runic cbind`
+  generates a binding from a C header.
 
 Runic aims to be familiar enough that a bash user can start using it immediately, yet principled enough to scale to large automation projects without the typical bash scripting pitfalls.
 
@@ -159,6 +163,8 @@ Override the binary path with `RUNIC_BIN=/path/to/runic bash scripts/bench.sh` i
 ### Language server
 
 - Build with `zig build runic-lsp` to produce `zig-out/bin/runic-lsp`. Editors should launch it with the default `--stdio` transport.
+- **Register it with an absolute path (or one on `$PATH`).** The `zig-out/bin/runic-lsp` path above is relative to the repo root — if an editor uses it verbatim as the launch command, the server only starts when the editor's working directory *is* the repo, and silently fails to start anywhere else. Point your editor at the fully-resolved path (e.g. `/abs/path/to/runic/zig-out/bin/runic-lsp`).
+- **Give the client a `root_dir` fallback.** Most LSP clients only attach once they resolve a project root, and a root search for a marker like `.git`/`build.zig.zon` finds nothing when a `.rn` file lives outside a project — so the server never starts. Fall back to the file's own directory (or the cwd) when no marker is found, so a lone `.rn` file still gets the server.
 - Set `RUNIC_LSP_LOG=1` when debugging conversations; logs go to stderr so protocol responses on stdout remain untouched.
 - A placeholder `--tcp <port>` flag exists for upcoming transport introspection. Until then, prefer stdio and invoke `zig-out/bin/runic-lsp --stdio` directly when iterating locally.
 

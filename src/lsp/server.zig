@@ -788,7 +788,7 @@ pub const Server = struct {
     }
 
     fn writeHoverBinding(
-        _: *Server,
+        self: *Server,
         alloc_writer: *std.Io.Writer.Allocating,
         binding: *const runic.semantic.Scope.Binding,
     ) void {
@@ -804,8 +804,48 @@ pub const Server = struct {
         } else {
             alloc_writer.writer.writeAll(": ") catch {};
         }
+        // A `cimport` value is a struct of every declared extern; printing it in
+        // full would dump hundreds of fields. Show a concise `cimport` summary
+        // (the extern count) instead — e.g. `const rlf: cimport { 615 externs }`.
+        if (binding.type_expr) |t| {
+            const resolved = switch (t.*) {
+                .alias => |alias_type| self.workspace.type_checker.resolveAliasType(&alias_type),
+                else => t,
+            };
+            if (resolved.* == .struct_type) {
+                if (resolved.struct_type.cimport_externs) |externs| {
+                    alloc_writer.writer.print("cimport {{ {d} extern{s} }}\n", .{
+                        externs.len,
+                        if (externs.len == 1) "" else "s",
+                    }) catch {};
+                    alloc_writer.writer.writeAll("```") catch {};
+                    return;
+                }
+            }
+        }
         alloc_writer.writer.print("{?f}\n", .{binding.type_expr}) catch {};
         alloc_writer.writer.writeAll("```") catch {};
+    }
+
+    /// Writes a `cimport` extern's C signature (`pow(base: c.Double, …) c.Double`)
+    /// to the hover buffer.
+    fn writeExternSignature(alloc_writer: *std.Io.Writer.Allocating, ext: runic.ast.ExternFn) void {
+        const w = &alloc_writer.writer;
+        w.print("{s}(", .{ext.name.name}) catch {};
+        for (ext.params, 0..) |param, i| {
+            if (i > 0) w.writeAll(", ") catch {};
+            const pname = switch (param.pattern.*) {
+                .identifier => |id| id.name,
+                else => "_",
+            };
+            w.print("{s}: ", .{pname}) catch {};
+            if (param.type_annotation) |t| {
+                w.print("{f}", .{t}) catch {};
+            } else {
+                w.writeAll("?") catch {};
+            }
+        }
+        w.print(") {f}", .{ext.return_type}) catch {};
     }
 
     fn writeHoverMember(
@@ -818,6 +858,19 @@ pub const Server = struct {
             .alias => |alias_type| self.workspace.type_checker.resolveAliasType(&alias_type),
             else => binding_type,
         };
+
+        // A `cimport` member is a declared extern; show its C signature.
+        if (resolved_type.* == .struct_type) {
+            if (resolved_type.struct_type.cimport_externs) |externs| {
+                for (externs) |ext| {
+                    if (!std.mem.eql(u8, ext.name.name, member_name)) continue;
+                    alloc_writer.writer.writeAll("```\nextern fn ") catch {};
+                    writeExternSignature(alloc_writer, ext);
+                    alloc_writer.writer.writeAll("\n```") catch {};
+                    return;
+                }
+            }
+        }
 
         alloc_writer.writer.writeAll("```\n") catch {};
         alloc_writer.writer.print("const {s}: ", .{member_name}) catch {};
@@ -919,9 +972,16 @@ pub const Server = struct {
     }
 
     /// Sends a go-to-definition Location for `span`, resolving the target
-    /// document URI from the span's source file.
+    /// document URI from the span's source file. When that file is not a
+    /// resolvable on-disk path — a virtual/embedded module (`:std/ffi`), an
+    /// empty span, or a relative path outside the server's working directory —
+    /// there is nothing navigable to return, so reply with an empty result
+    /// rather than letting the resolve error crash the server.
     fn sendDefinitionSpan(self: *Server, id: types.RequestId, span: runic.ast.Span) !void {
-        const definition_uri = try self.documents.resolveUri(span.start.file);
+        const definition_uri = self.documents.resolveUri(span.start.file) catch {
+            try self.sendJson(types.response(id, std.json.Value{ .null = {} }));
+            return;
+        };
         defer self.allocator.free(definition_uri);
         const result = types.Location{
             .uri = definition_uri,
@@ -948,6 +1008,14 @@ pub const Server = struct {
         };
         switch (resolved.*) {
             .struct_type => |struct_type| {
+                // A `cimport` member resolves to its `extern fn` declaration.
+                if (struct_type.cimport_externs) |externs| {
+                    for (externs) |ext| {
+                        if (std.mem.eql(u8, ext.name.name, member.member_name)) {
+                            return ext.name.span;
+                        }
+                    }
+                }
                 for (struct_type.fields) |field| {
                     if (std.mem.eql(u8, field.name.name, member.member_name)) {
                         return field.name.span;

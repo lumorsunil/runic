@@ -7,6 +7,14 @@ const ast = runic.ast;
 
 const Allocator = std.mem.Allocator;
 
+/// The C types exported by `std.ffi` (`c.Double`, …), offered when completing a
+/// member of the marker module. Kept in sync with `std/ffi.rn` and
+/// `src/ffi/ctype.zig`.
+const ffi_c_type_names = [_][]const u8{
+    "Int",   "UInt",  "Long",   "ULong", "Short", "UShort", "Char",
+    "SizeT", "Float", "Double", "Bool",  "Str",   "Ptr",    "Void",
+};
+
 pub const MatchList = struct {
     allocator: Allocator,
     items: std.ArrayList(Match),
@@ -37,7 +45,6 @@ fn OwnedOrNot(comptime T: type) type {
                         ptr.deinit(allocator);
                     }
                     allocator.destroy(ptr);
-                    ptr.* = undefined;
                 },
                 .notOwned => {},
             }
@@ -301,6 +308,10 @@ fn appendPubModuleDeclsFromFile(
     env_map: *std.process.Environ.Map,
     module_path: []const u8,
 ) !void {
+    // Bundled std modules resolve to virtual ":std/…" paths with no file on
+    // disk; openFileAbsolute asserts on a non-absolute path, so skip them (a
+    // `.module`-typed base still completes via appendMembersForType).
+    if (!std.fs.path.isAbsolute(module_path)) return;
     const file = std.Io.Dir.openFileAbsolute(io, module_path, .{}) catch return;
     defer file.close(io);
     var buffer: [1024]u8 = undefined;
@@ -343,11 +354,22 @@ fn appendMembersForType(
     switch (type_expr.*) {
         .alias => |alias_type| try appendMembersForType(matches, context, type_checker, type_checker.resolveAliasType(&alias_type), detail),
         .module => |module_type| {
+            // std.ffi is a compiler-recognized marker module with no members of
+            // its own; offer its C types (used in an extern fn signature). See
+            // future/c-ffi.md.
+            if (std.mem.eql(u8, module_type.path, ":std/ffi")) {
+                for (ffi_c_type_names) |name| {
+                    try appendOwnedMatch(matches, context.allocator, .@"struct", name, "C type", .global);
+                }
+                return;
+            }
             if (try type_checker.resolveModuleScopeForMemberCompletion(module_type)) |module_scope| {
                 var it = module_scope.bindings.iterator();
                 while (it.next()) |entry| {
                     const binding = entry.value_ptr.*;
-                    if (!binding.is_pub) continue;
+                    // Skip compiler-injected globals (builtins, primitive types):
+                    // they are in scope everywhere but are not module members.
+                    if (!binding.is_pub or binding.is_global) continue;
                     const binding_type = binding.type_expr orelse &ast.TypeExpr.executableType;
                     const kind: symbols.SymbolKind = switch (binding_type.*) {
                         .function, .fn_ref_type => .function,
@@ -362,6 +384,15 @@ fn appendMembersForType(
         .thread => try appendOwnedMatch(matches, context.allocator, .method, "wait", detail, .global),
         .array => try appendOwnedMatch(matches, context.allocator, .field, "len", detail, .global),
         .struct_type => |struct_type| {
+            // A `cimport` value's members are its declared externs (its `fields`
+            // are empty); offer each as a callable with its C signature.
+            if (struct_type.cimport_externs) |externs| {
+                for (externs) |ext| {
+                    const sig_detail = try formatExternSignature(context.allocator, ext);
+                    defer context.allocator.free(sig_detail);
+                    try appendOwnedMatch(matches, context.allocator, .function, ext.name.name, sig_detail, ext.name.span);
+                }
+            }
             for (struct_type.fields) |field| {
                 // Detail shows the field's declared type rather than the object.
                 const field_detail = try std.fmt.allocPrint(context.allocator, "{f}", .{field.type_expr});
@@ -378,6 +409,30 @@ fn appendMembersForType(
         },
         else => {},
     }
+}
+
+/// Formats a `cimport` extern's C signature for a completion detail, e.g.
+/// `pow(base: c.Double, exp: c.Double) c.Double`. Caller frees the result.
+fn formatExternSignature(allocator: Allocator, ext: ast.ExternFn) ![]u8 {
+    var out = std.Io.Writer.Allocating.init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+    try w.print("{s}(", .{ext.name.name});
+    for (ext.params, 0..) |param, i| {
+        if (i > 0) try w.writeAll(", ");
+        const pname = switch (param.pattern.*) {
+            .identifier => |id| id.name,
+            else => "_",
+        };
+        try w.print("{s}: ", .{pname});
+        if (param.type_annotation) |t| {
+            try w.print("{f}", .{t});
+        } else {
+            try w.writeAll("?");
+        }
+    }
+    try w.print(") {f}", .{ext.return_type});
+    return out.toOwnedSlice();
 }
 
 fn appendExecutionMembers(
@@ -601,19 +656,27 @@ fn isModuleFileChar(ch: u8) bool {
 }
 
 fn collectModuleMatches(context: CollectMatchesContext) !MatchList {
-    const script_dirname = std.fs.path.dirname(context.file) orelse return .empty(context.allocator);
     var module_path_prefix = extractPrefix(context, isModulePathChar);
     const basename_prefix = extractPrefix(context, isModuleFileChar);
     module_path_prefix = module_path_prefix[0 .. module_path_prefix.len - basename_prefix.len];
 
+    var matches = MatchList.init(context.allocator);
+
+    // The bundled standard library ("std", "std/list", …, "std/ffi") is embedded
+    // in the binary, not on disk, so a filesystem scan never finds it. Offer it
+    // by name from the embed table.
+    try appendBundledStdMatches(&matches, context, module_path_prefix, basename_prefix);
+
+    // Modules on disk, relative to the importing script. A missing directory
+    // (e.g. typing `import "std/…"` with no such folder next to the script) is
+    // not an error — the std matches above still stand.
+    const script_dirname = std.fs.path.dirname(context.file) orelse return matches;
     const dirname = try std.fs.path.join(context.allocator, &.{ script_dirname, module_path_prefix });
     defer context.allocator.free(dirname);
 
-    var dir = try std.Io.Dir.openDirAbsolute(context.io, dirname, .{ .iterate = true });
+    var dir = std.Io.Dir.openDirAbsolute(context.io, dirname, .{ .iterate = true }) catch return matches;
     defer dir.close(context.io);
     var it = dir.iterate();
-
-    var matches = MatchList.init(context.allocator);
 
     while (try it.next(context.io)) |entry| {
         // Resolve symlinks to whatever they point at so a linked module file or
@@ -647,6 +710,39 @@ fn collectModuleMatches(context: CollectMatchesContext) !MatchList {
     }
 
     return matches;
+}
+
+/// Offers the bundled std module specifiers that live under the namespace the
+/// user is currently typing: at the top level (`import "s…"`) the root `std`;
+/// inside `import "std/…"` its submodules (`list`, `str`, …, `ffi`). Names come
+/// from the embed table, so they stay in sync with the shipped std library.
+fn appendBundledStdMatches(
+    matches: *MatchList,
+    context: CollectMatchesContext,
+    path_prefix: []const u8,
+    basename_prefix: []const u8,
+) !void {
+    const namespace = std.mem.trimEnd(u8, path_prefix, "/");
+    inline for (runic.std_modules.modules) |module| {
+        // `module.path` is a virtual ":std" / ":std/list"; the import specifier
+        // drops the leading ':'.
+        const spec = module.path[1..];
+        const ns = std.fs.path.dirname(spec) orelse "";
+        const name = std.fs.path.basename(spec);
+        if (std.mem.eql(u8, ns, namespace) and
+            symbolMatches(name, basename_prefix, .fromPrefix(basename_prefix)))
+        {
+            const symbol = try context.allocator.create(symbols.Symbol);
+            symbol.* = .{
+                .name = try context.allocator.dupe(u8, name),
+                .kind = .module,
+                .detail = try context.allocator.dupe(u8, "std module"),
+                .documentation = &.{},
+                .span = .global,
+            };
+            try matches.items.append(context.allocator, .{ .symbol = .{ .owned = symbol }, .source = .workspace });
+        }
+    }
 }
 
 fn appendMatches(
@@ -762,4 +858,19 @@ test "extractMemberContext finds member access before cursor" {
     const member_ctx = extractMemberContext(ctx).?;
     try std.testing.expectEqualStrings("m", member_ctx.object_name);
     try std.testing.expectEqualStrings("", member_ctx.prefix);
+}
+
+test "MatchList frees owned symbol matches cleanly" {
+    // Member completion produces owned matches (a fresh Symbol per match);
+    // deinit must free each exactly once with no use-after-free. Many entries
+    // increase the chance a freed slot is reused/unmapped, which is what turned
+    // a write-after-`destroy` into a segfault in the wild.
+    const allocator = std.testing.allocator;
+    var matches = MatchList.empty(allocator);
+    for (0..256) |i| {
+        var buf: [24]u8 = undefined;
+        const name = try std.fmt.bufPrint(&buf, "member{d}", .{i});
+        try appendOwnedMatch(&matches, allocator, .field, name, "some detail", .global);
+    }
+    matches.deinit();
 }

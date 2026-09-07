@@ -4,6 +4,7 @@ const builtins = @import("../builtins.zig");
 const rainbow = @import("../rainbow.zig");
 const DocumentStore = @import("../document_store.zig").DocumentStore;
 const token = @import("../frontend/token.zig");
+const CType = @import("../ffi/ctype.zig").CType;
 
 const Scope = @import("scope.zig").Scope;
 
@@ -469,7 +470,7 @@ pub const TypeChecker = struct {
         var public_count: usize = 0;
         var it_count = module_scope.bindings.iterator();
         while (it_count.next()) |entry| {
-            if (entry.value_ptr.is_pub) public_count += 1;
+            if (entry.value_ptr.is_pub and !entry.value_ptr.is_global) public_count += 1;
         }
 
         const fields = try self.arena.allocator().alloc(ast.TypeExpr.StructField, 3 + public_count);
@@ -493,7 +494,7 @@ pub const TypeChecker = struct {
         var it = module_scope.bindings.iterator();
         while (it.next()) |entry| {
             const binding = entry.value_ptr.*;
-            if (!binding.is_pub) continue;
+            if (!binding.is_pub or binding.is_global) continue;
             fields[i] = .{
                 .name = binding.identifier,
                 .type_expr = binding.type_expr orelse try self.allocTypeExpression(.global(.void)),
@@ -1286,6 +1287,49 @@ pub const TypeChecker = struct {
         scope: *Scope,
         identifier: *const ast.TypeExpr.NamedType,
     ) Error!*const ast.TypeExpr {
+        // A `std.ffi` C type written qualified (`c.Char`, `c.Double`): resolve
+        // it to an alias whose NAME is the C type (recovered later for
+        // marshalling) and whose underlying type is the Runic type it checks
+        // as. This makes `c.X` usable anywhere a type is expected — struct
+        // fields, parameters, returns — not just an extern signature.
+        if (identifier.path.segments.len == 2 and
+            CType.fromName(identifier.path.segments[1].name) != null and
+            scope.lookup(identifier.path.segments[0].name) != null)
+        {
+            const cname = identifier.path.segments[1].name;
+            if (try self.cTypeToRunic(cname)) |runic| {
+                return try self.allocTypeExpression(.{ .alias = .{
+                    .name = cname,
+                    .span = identifier.span,
+                    .type_expr = runic,
+                } });
+            }
+        }
+
+        // A module-qualified type (`m.Vector3`): resolve the member through the
+        // module's scope so it becomes the actual type (a struct, …), not the
+        // module `m`. Types can't be `pub`, so visibility is not required.
+        if (identifier.path.segments.len == 2) {
+            if (scope.lookup(identifier.path.segments[0].name)) |mod_binding| {
+                if (mod_binding.type_expr) |mod_type_expr| {
+                    const mod_type = self.unaliasType(mod_type_expr);
+                    if (mod_type.* == .module) {
+                        if (try self.requestModuleScope(mod_type.module)) |module_scope| {
+                            if (module_scope.lookup(identifier.path.segments[1].name)) |member| {
+                                if (member.type_expr) |member_type| {
+                                    return try self.allocTypeExpression(.{ .alias = .{
+                                        .name = identifier.path.segments[1].name,
+                                        .span = identifier.span,
+                                        .type_expr = member_type,
+                                    } });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         const name = identifier.path.segments[0].name;
 
         const binding = scope.lookup(name) orelse {
@@ -1417,10 +1461,14 @@ pub const TypeChecker = struct {
 
         switch (fn_decl.params) {
             ._non_variadic => |params| for (params) |param| {
-                const param_type = try self.resolveExprType(
-                    fn_scope,
-                    param,
-                );
+                // Resolve the param's declared type (like the stdin/fn types
+                // above), so a primitive annotation such as `Int` — parsed as a
+                // bare identifier — becomes the resolved primitive rather than an
+                // unresolved `.identifier`. Otherwise every use of the param
+                // (a struct-literal field, an assignment, …) compares a resolved
+                // type against a raw `Int` and spuriously fails.
+                const raw = try self.resolveExprType(fn_scope, param);
+                const param_type = if (raw) |t| try self.resolveTypeExpr(fn_scope, t) else null;
                 try self.runBindingPattern(
                     fn_scope,
                     param.pattern,
@@ -1430,10 +1478,8 @@ pub const TypeChecker = struct {
                 );
             },
             ._variadic => |param| {
-                const param_type = try self.resolveExprType(
-                    fn_scope,
-                    param,
-                );
+                const raw = try self.resolveExprType(fn_scope, param);
+                const param_type = if (raw) |t| try self.resolveTypeExpr(fn_scope, t) else null;
                 try self.runBindingPattern(
                     fn_scope,
                     param.pattern,
@@ -1572,7 +1618,7 @@ pub const TypeChecker = struct {
             .struct_literal => |struct_literal| for (struct_literal.fields) |field| {
                 try self.validateFunctionBodyStdin(scope, field.value, enclosing_stdin);
             },
-            .fn_decl, .identifier, .env_var, .path, .literal, .pipeline_deprecated, .import_expr, .executable, .builtin, .fd => {},
+            .fn_decl, .identifier, .env_var, .path, .literal, .pipeline_deprecated, .import_expr, .cimport_expr, .executable, .builtin, .fd => {},
         }
     }
 
@@ -1797,6 +1843,7 @@ pub const TypeChecker = struct {
             .try_expr => |*try_expr| self.runTry(scope, try_expr),
             .is_expr => |*is_expr| self.runIs(scope, is_expr),
             .import_expr => |*import_expr| self.runImportExpr(scope, import_expr),
+            .cimport_expr => |*cimport_expr| self.runCImportExpr(scope, cimport_expr),
             .fn_decl => |*fn_decl| self.runFnDecl(scope, fn_decl),
             .call => |*call| self.runCall(scope, call),
             .comptime_expr => |*comptime_expr| self.runExpression(scope, comptime_expr.operand),
@@ -2896,6 +2943,7 @@ pub const TypeChecker = struct {
 
         try self.runExpression(scope, binary.left);
         try self.runExpression(scope, binary.right);
+
         const maybe_left_type = try self.resolveExprType(scope, binary.left);
         const maybe_right_type = try self.resolveExprType(scope, binary.right);
 
@@ -2904,6 +2952,9 @@ pub const TypeChecker = struct {
 
         const left_type = maybe_left_type orelse return;
         const right_type = maybe_right_type orelse return;
+
+        //     break :brk .{ left_type, right_type };
+        // };
 
         // Member-specific operation enforcement: a *bare* (un-narrowed) sum is
         // never numeric, so it can't be used in arithmetic — narrow it first
@@ -2967,45 +3018,55 @@ pub const TypeChecker = struct {
                 return;
             }
 
-            // For a plain `x = v` to an identifier binding, validate against the
-            // binding's *declared* type (not its current narrowed flow type — a
-            // `var x: Int || String` narrowed to `String` can still be reassigned
-            // an Int), then refine the flow type so reads after the assignment
-            // see the new (narrowed) type.
-            if (binary.op == .assign) {
-                if (referencedBindingName(binary.left)) |name| {
-                    if (scope.lookup(name)) |binding| {
-                        const declared = binding.declared_type orelse left_type;
-                        try self.validateTypeAssignment(declared, right_type, .{ .span = right_type.span() });
-                        if (self.unaliasType(declared).* == .sum) {
-                            binding.type_expr = self.flowTypeForSum(declared, right_type);
-                        }
-                        return;
-                    }
-                }
+            // An operand can surface as an unresolved type identifier: a struct
+            // field's declared type comes back through member access and
+            // arithmetic as the bare name `Int` rather than the resolved
+            // primitive (so `a.x += 1`, i.e. `a.x = a.x + 1`, would otherwise
+            // compare `Int` against `Int` and fail, or hit an UnresolvedTypeLiteral
+            // for a compound assignment). Resolve such a right side before
+            // validating. This covers `=` and every compound assignment.
+            const resolved_right = if (right_type.* == .identifier)
+                try self.resolveTypeExpr(scope, right_type)
+            else
+                right_type;
 
-                // Field assignment `p.x = v`: the target is a member access.
-                // Enforce that the root binding is mutable and validate `v`
-                // against the (resolved) field type.
-                if (binary.left.* == .binary and binary.left.binary.op == .member) {
-                    if (rootBindingName(binary.left)) |root| {
-                        if (scope.lookup(root)) |binding| if (!binding.is_mutable) {
-                            try self.reportSpanError(
-                                binary.left.span(),
-                                Error.TypeMismatch,
-                                .@"error",
-                                "cannot assign to a field of immutable '{s}'; declare it with var",
-                                .{root},
-                            );
-                        };
+            // For `x = v` / `x += v` to an identifier binding, validate against
+            // the binding's *declared* type (not its current narrowed flow type
+            // — a `var x: Int || String` narrowed to `String` can still be
+            // reassigned an Int), then, for a plain `=` to a sum, refine the flow
+            // type so reads after the assignment see the new (narrowed) type.
+            if (referencedBindingName(binary.left)) |name| {
+                if (scope.lookup(name)) |binding| {
+                    const declared = binding.declared_type orelse left_type;
+                    try self.validateTypeAssignment(declared, resolved_right, .{ .span = right_type.span() });
+                    if (binary.op == .assign and self.unaliasType(declared).* == .sum) {
+                        binding.type_expr = self.flowTypeForSum(declared, resolved_right);
                     }
-                    const field_type = try self.resolveTypeExpr(scope, left_type);
-                    try self.validateTypeAssignment(field_type, right_type, .{ .span = right_type.span() });
                     return;
                 }
             }
 
-            try self.validateTypeAssignment(left_type, right_type, .{ .span = right_type.span() });
+            // Field assignment `p.x = v` / `p.x += v`: the target is a member
+            // access. Enforce that the root binding is mutable and validate `v`
+            // against the (resolved) field type.
+            if (binary.left.* == .binary and binary.left.binary.op == .member) {
+                if (rootBindingName(binary.left)) |root| {
+                    if (scope.lookup(root)) |binding| if (!binding.is_mutable) {
+                        try self.reportSpanError(
+                            binary.left.span(),
+                            Error.TypeMismatch,
+                            .@"error",
+                            "cannot assign to a field of immutable '{s}'; declare it with var",
+                            .{root},
+                        );
+                    };
+                }
+                const field_type = try self.resolveTypeExpr(scope, left_type);
+                try self.validateTypeAssignment(field_type, resolved_right, .{ .span = right_type.span() });
+                return;
+            }
+
+            try self.validateTypeAssignment(left_type, resolved_right, .{ .span = right_type.span() });
         }
     }
 
@@ -3163,10 +3224,12 @@ pub const TypeChecker = struct {
 
         const module_scope = try self.requestModuleScope(module) orelse return;
 
-        // Only pub declarations are accessible on a module; fall back to
-        // execution-result fields (exit_code, stdout, stderr, wait) for the rest.
+        // Only pub declarations are accessible on a module — except a type
+        // member (`m.Vector3`), which can't be declared `pub` (the parser
+        // rejects `pub const X = struct {…}`), so it is always reachable.
+        // Otherwise fall back to execution-result fields (exit_code, stdout, …).
         if (module_scope.lookup(identifier.name)) |binding| {
-            if (binding.is_pub) return;
+            if (binding.is_pub or binding.is_type) return;
         }
 
         try self.runExecutionMemberAccess(undefined, identifier);
@@ -3580,6 +3643,49 @@ pub const TypeChecker = struct {
 
         for (struct_literal.fields) |field| try self.runExpression(scope, field.value);
 
+        // Qualified construction `m.Vector3{ … }`: the struct type lives in the
+        // module `m`. Struct types can't be `pub` (the parser rejects
+        // `pub const X = struct {…}`), so it is looked up in the module's scope
+        // regardless of visibility.
+        if (struct_literal.object) |object| {
+            try self.runExpression(scope, object);
+            const object_type = self.unaliasType((try self.resolveExprType(scope, object)) orelse return);
+            if (object_type.* != .module) {
+                try self.reportSpanError(
+                    object.span(),
+                    Error.UnsupportedExpression,
+                    .@"error",
+                    "qualified struct construction requires a module value",
+                    .{},
+                );
+                return;
+            }
+            const module_scope = (try self.requestModuleScope(object_type.module)) orelse return;
+            const member = module_scope.lookup(struct_literal.name.name) orelse {
+                try self.reportSpanError(
+                    struct_literal.name.span,
+                    Error.IdentifierNotFound,
+                    .@"error",
+                    "module has no type '{s}'",
+                    .{struct_literal.name.name},
+                );
+                return;
+            };
+            const st = self.unaliasType(member.type_expr orelse return);
+            if (st.* == .struct_type) {
+                try self.runStructValueLiteral(scope, st.struct_type, struct_literal);
+            } else {
+                try self.reportSpanError(
+                    struct_literal.name.span,
+                    Error.UnsupportedExpression,
+                    .@"error",
+                    "'{s}' is not a struct type",
+                    .{struct_literal.name.name},
+                );
+            }
+            return;
+        }
+
         // A generic constructor (`Box{ … }` for `const Box(T) = struct { … }`):
         // validate against the body struct with its type parameters permissive.
         if (self.generic_type_ctors.get(struct_literal.name.name)) |ctor| {
@@ -3862,6 +3968,218 @@ pub const TypeChecker = struct {
         }
     }
 
+    /// The Runic type a `std.ffi` C type marshals from/to, used only for
+    /// type-checking an `extern fn` and its calls. The C width/ABI distinction
+    /// (`c.Int` is 32-bit, Runic `Int` is 64-bit) is irrelevant here — it is
+    /// carried by the `ExternFn` AST and applied at marshalling — so several C
+    /// types collapse to the same Runic type. `c.Ptr` is an opaque handle,
+    /// treated as an `Int` (an address) for the MVP. Returns null for a name
+    /// that is not a known C type.
+    fn cTypeToRunic(self: *TypeChecker, name: []const u8) Error!?*const ast.TypeExpr {
+        const int_names = [_][]const u8{ "Int", "UInt", "Long", "ULong", "Short", "UShort", "Char", "SizeT", "Ptr" };
+        for (int_names) |n| {
+            if (std.mem.eql(u8, name, n)) return try self.allocTypeExpression(.global(.integer));
+        }
+        if (std.mem.eql(u8, name, "Float") or std.mem.eql(u8, name, "Double")) {
+            return try self.allocTypeExpression(.global(.float));
+        }
+        if (std.mem.eql(u8, name, "Bool")) return try self.allocTypeExpression(.global(.boolean));
+        if (std.mem.eql(u8, name, "Str")) return try self.allocStringType();
+        if (std.mem.eql(u8, name, "Void")) return try self.allocTypeExpression(.global(.void));
+        return null;
+    }
+
+    /// Resolves a C type written in an `extern fn` signature and reports a
+    /// diagnostic if it is malformed. It must be a qualified `ns.Name` where
+    /// `ns` is in scope (the imported `std.ffi` module) and `Name` is a known C
+    /// type. Returns the Runic type it checks as, or a `failed` type on error.
+    ///
+    /// NOTE: `ns` is only required to be *a* bound identifier, not verified to
+    /// be `std.ffi` specifically — a module-value binding does not currently
+    /// retain its source path. Tightening this is tracked in future/c-ffi.md.
+    /// The scalar C type a struct-field annotation names (`c.Char` → `.char`),
+    /// or null if it is not a scalar `c.X` — the marker for a field that cannot
+    /// be marshalled in a by-value struct.
+    fn cTypeOfFieldAnnotation(type_expr: *const ast.TypeExpr) ?CType {
+        if (type_expr.* != .identifier) return null;
+        const segments = type_expr.identifier.path.segments;
+        if (segments.len == 0) return null;
+        return CType.fromName(segments[segments.len - 1].name);
+    }
+
+    /// Whether every field of a by-value struct is marshallable — a scalar `c.X`
+    /// or (recursively) another by-value struct. Reports the first field that is
+    /// not. `depth` guards against a pathological cyclic type.
+    fn cStructFieldsMarshallable(
+        self: *TypeChecker,
+        scope: *Scope,
+        struct_type: ast.TypeExpr.StructType,
+        struct_name: []const u8,
+        depth: usize,
+    ) Error!bool {
+        if (depth > 32) return false;
+        for (struct_type.fields) |field| {
+            if (cTypeOfFieldAnnotation(field.type_expr) != null) continue; // scalar
+            // A nested by-value struct: a single identifier naming a user struct.
+            if (field.type_expr.* == .identifier and
+                field.type_expr.identifier.path.segments.len == 1 and
+                scope.lookup(field.type_expr.identifier.path.segments[0].name) != null)
+            {
+                const resolved = try self.resolveTypeExpr(scope, field.type_expr);
+                const concrete = self.unaliasType(resolved);
+                if (concrete.* == .struct_type) {
+                    const nested_name = field.type_expr.identifier.path.segments[0].name;
+                    if (try self.cStructFieldsMarshallable(scope, concrete.struct_type, nested_name, depth + 1)) continue;
+                    return false; // the nested struct already reported
+                }
+            }
+            try self.reportSpanError(
+                field.type_expr.span(),
+                Error.UnsupportedExpression,
+                .@"error",
+                "field `{s}` of struct `{s}` must be a std.ffi C type (like `c.Char`) or a by-value struct",
+                .{ field.name.name, struct_name },
+            );
+            return false;
+        }
+        return true;
+    }
+
+    fn resolveCType(self: *TypeChecker, scope: *Scope, type_expr: *const ast.TypeExpr) Error!*const ast.TypeExpr {
+        const failed = try self.allocTypeExpression(.{ .failed = .{ .span = type_expr.span() } });
+
+        // A struct passed by value: a single identifier naming a user struct
+        // whose fields are all scalar `c.X` or (recursively) such structs (e.g.
+        // raylib's `Color`, `Vector2`, `Camera2D`). Checks as that struct.
+        if (type_expr.* == .identifier and
+            type_expr.identifier.path.segments.len == 1 and
+            scope.lookup(type_expr.identifier.path.segments[0].name) != null)
+        {
+            const resolved = try self.resolveTypeExpr(scope, type_expr);
+            const concrete = self.unaliasType(resolved);
+            if (concrete.* == .struct_type) {
+                const name = type_expr.identifier.path.segments[0].name;
+                if (try self.cStructFieldsMarshallable(scope, concrete.struct_type, name, 0)) return resolved;
+                return failed;
+            }
+            try self.reportSpanError(
+                type_expr.span(),
+                Error.UnsupportedExpression,
+                .@"error",
+                "an extern fn type must be a std.ffi C type like `c.Double` or a by-value struct",
+                .{},
+            );
+            return failed;
+        }
+
+        if (type_expr.* != .identifier or type_expr.identifier.path.segments.len != 2) {
+            try self.reportSpanError(
+                type_expr.span(),
+                Error.UnsupportedExpression,
+                .@"error",
+                "an extern fn type must be a std.ffi C type like `c.Double`",
+                .{},
+            );
+            return failed;
+        }
+
+        const ns = type_expr.identifier.path.segments[0];
+        const cname = type_expr.identifier.path.segments[1].name;
+
+        if (scope.lookup(ns.name) == null) {
+            try self.reportSpanError(
+                ns.span,
+                Error.IdentifierNotFound,
+                .@"error",
+                "`{s}` is not in scope — `import \"std/ffi.rn\"` for the C types",
+                .{ns.name},
+            );
+            return failed;
+        }
+
+        return try self.cTypeToRunic(cname) orelse {
+            try self.reportSpanError(
+                type_expr.span(),
+                Error.UnsupportedExpression,
+                .@"error",
+                "unknown C type `{s}.{s}`",
+                .{ ns.name, cname },
+            );
+            return failed;
+        };
+    }
+
+    /// Type-checks a `cimport` block: every `extern fn` parameter and return
+    /// type must be a valid `std.ffi` C type. The value's own (module-like)
+    /// type is built separately in `buildCImportValueType`.
+    pub fn runCImportExpr(self: *TypeChecker, scope: *Scope, cimport: *ast.CImportExpr) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+        try self.logTypeCheckTrace(@src().fn_name, cimport.span);
+
+        for (cimport.externs) |extern_fn| {
+            for (extern_fn.params) |param| {
+                if (param.type_annotation) |ann| {
+                    _ = try self.resolveCType(scope, ann);
+                } else {
+                    try self.reportSpanError(
+                        extern_fn.name.span,
+                        Error.UnsupportedExpression,
+                        .@"error",
+                        "extern fn `{s}` parameter needs a C type, e.g. `x: c.Double`",
+                        .{extern_fn.name.name},
+                    );
+                }
+            }
+            _ = try self.resolveCType(scope, extern_fn.return_type);
+        }
+    }
+
+    /// The Runic type an extern parameter/return annotation checks as, extracted
+    /// by its last path segment (`c.Double` → the `Double` C type → `Float`).
+    /// Pure (no scope); `runCImportExpr` has already reported any bad type.
+    fn cTypeFromAnnotation(self: *TypeChecker, annotation: ?*const ast.TypeExpr) Error!?*const ast.TypeExpr {
+        const t = annotation orelse return null;
+        if (t.* == .identifier) {
+            const segments = t.identifier.path.segments;
+            if (segments.len > 0) {
+                return try self.cTypeToRunic(segments[segments.len - 1].name);
+            }
+        }
+        return null;
+    }
+
+    /// Builds the (module-like) type of a `cimport` value: a struct whose fields
+    /// are the declared externs, each typed as a function over the C types'
+    /// Runic equivalents. `m.pow` then resolves like any struct-field member and
+    /// `m.pow 2.0 10.0` type-checks like any call.
+    fn buildCImportValueType(self: *TypeChecker, cimport: ast.CImportExpr) Error!?*const ast.TypeExpr {
+        const fields = try self.arena.allocator().alloc(ast.TypeExpr.StructField, cimport.externs.len);
+        for (cimport.externs, 0..) |extern_fn, i| {
+            const params = try self.arena.allocator().alloc(?*const ast.TypeExpr, extern_fn.params.len);
+            for (extern_fn.params, 0..) |param, pi| {
+                params[pi] = try self.cTypeFromAnnotation(param.type_annotation);
+            }
+            const fn_type = try self.allocTypeExpression(.{ .function = .{
+                .params = .{ ._non_variadic = params },
+                .stdin_type = null,
+                .return_type = try self.cTypeFromAnnotation(extern_fn.return_type),
+                .span = extern_fn.span,
+            } });
+            fields[i] = .{
+                .name = extern_fn.name,
+                .type_expr = fn_type,
+                .span = extern_fn.span,
+            };
+        }
+
+        return self.allocTypeExpression(.{ .struct_type = .{
+            .fields = fields,
+            .decls = &.{},
+            .span = cimport.span,
+            .cimport_externs = cimport.externs,
+        } });
+    }
+
     fn isUnion(comptime T: type) bool {
         return switch (@typeInfo(T)) {
             .@"union" => true,
@@ -3953,6 +4271,47 @@ pub const TypeChecker = struct {
                 var new_st = body.struct_type;
                 new_st.fields = new_fields;
                 return try self.allocTypeExpression(.{ .struct_type = new_st });
+            }
+        }
+
+        // A cimport value is typed as a struct of its externs (see
+        // buildCImportValueType), so `m.pow 2.0 10.0` resolves and checks like
+        // any struct-member call. The AST's own resolveType returns null here.
+        if (T == *ast.Expression and expr.* == .cimport_expr) {
+            return self.buildCImportValueType(expr.cimport_expr);
+        }
+
+        // A member access on an imported module value (`m.member`). The AST's
+        // own `MemberExpr.resolveType` can't see the module's scope, so it
+        // returns null for a `.module` object. Resolve the member's type here
+        // from the module scope — including non-`pub` bindings, so an alias to a
+        // `cimport` constant (`const rlf = rl.raylib`) is typed as that cimport
+        // value (a struct of its externs) rather than null.
+        if (T == *ast.Expression) {
+            const member_access: ?struct { object: *ast.Expression, name: []const u8 } = switch (expr.*) {
+                .member => |*m| .{ .object = m.object, .name = m.member.name },
+                .binary => |*b| if (b.op == .member and b.right.* == .identifier)
+                    .{ .object = b.left, .name = b.right.identifier.name }
+                else
+                    null,
+                else => null,
+            };
+            if (member_access) |ma| {
+                if (try self.resolveExprType(scope, ma.object)) |obj_raw| {
+                    const obj_type = self.unaliasType(obj_raw);
+                    if (obj_type.* == .module) {
+                        if (try self.requestModuleScope(obj_type.module)) |module_scope| {
+                            if (module_scope.lookup(ma.name)) |member_binding| {
+                                // A type member (`m.Vector3`) is a type reference,
+                                // not a value — leave it to the existing path so
+                                // `${m.Vector3}` still serializes to the type name.
+                                if (!member_binding.is_type) {
+                                    if (member_binding.type_expr) |t| return t;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -4707,10 +5066,12 @@ fn addGlobalScope(allocator: std.mem.Allocator, scope: *Scope) !*Scope {
 
     for (global_scope_definitions) |definition| {
         try global_scope.declare(allocator, definition.identifier, definition.type_expr, true, false);
+        global_scope.bindings.getPtr(definition.identifier.name).?.is_global = true;
     }
 
     for (global_value_definitions) |definition| {
         try global_scope.declare(allocator, definition.identifier, definition.type_expr, true, false);
+        global_scope.bindings.getPtr(definition.identifier.name).?.is_global = true;
     }
 
     return global_scope;

@@ -1162,3 +1162,61 @@ echo "${lib.add 3 5}"
 ```
 
 **Result:** `lib.rn` will become a struct type with a function `add` declared on it. `main.rn` is importing `lib.rn` and binding it to the identifier `lib`. `lib` is of the type `struct { fn add(x: Float, y: Float) }`.
+
+## C interop with `cimport`
+
+Runic calls C functions in a shared library directly, through `libffi` (linked
+into the interpreter). A `cimport` block names the library and declares the
+functions to call; the value it binds is module-like, its members the declared
+externs.
+
+```rn
+const c = import "std/ffi.rn"
+
+const m = cimport "libm.so.6" {
+    extern fn pow(base: c.Double, exp: c.Double) c.Double
+    extern fn cos(x: c.Double) c.Double
+}
+
+echo "${m.pow 2.0 10.0}"   # 1024
+```
+
+**C types** come from the `std/ffi.rn` marker module, written qualified so they
+never clash with Runic's own primitives: `c.Int`, `c.UInt`, `c.Long`, `c.ULong`,
+`c.Short`, `c.UShort`, `c.Char`, `c.SizeT`, `c.Float`, `c.Double`, `c.Bool`,
+`c.Str` (a C string, `char*`), `c.Ptr` (an opaque pointer), and `c.Void`. A
+narrow integer is range-mapped to Runic's `Int`; a `c.Str` argument is
+marshalled to a null-terminated copy for the call; a `c.Ptr` is an opaque
+address, passable back into other externs but not dereferenceable from Runic.
+
+**Structs by value.** A C struct passed or returned by value is declared as an
+ordinary Runic struct whose fields are all `c.X` types (or, recursively, other
+such structs — structs nest):
+
+```rn
+const Color = struct { r: c.Char, g: c.Char, b: c.Char, a: c.Char }
+
+const rl = cimport "libraylib.so" {
+    extern fn ColorToInt(color: Color) c.Int    # struct argument
+    extern fn GetColor(hex: c.UInt) Color        # struct return
+}
+
+const col = rl.GetColor 0xFF0000FF
+echo "${col.r}"                    # field access on a returned struct
+echo "${rl.ColorToInt col}"        # pass it back
+```
+
+The evaluator builds the C struct's layout from the field types and marshals
+each field at the ABI's computed offset, in both directions.
+
+**Generating bindings.** `runic cbind <header.h> --lib <libname> --name <binding>`
+generates a binding file from a C header (via `zig translate-c`): the `cimport`
+block with every callable `extern fn`, the by-value struct types they use, enum
+values and integer/string `#define`s as `const`s, and struct-valued `#define`s
+(such as raylib's named colours) as struct-literal constants. Function pointers
+become `c.Ptr`; only variadic functions are left out. See `future/c-ffi.md` for
+the full design.
+
+**Unsafe by nature.** The FFI trusts your declarations: a signature that does not
+match the C function is undefined behaviour, exactly as in C. It is always
+available (no flag), and the library is `dlclose`d at script exit.

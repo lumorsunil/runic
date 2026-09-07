@@ -15,6 +15,15 @@ pub fn build(b: *std.Build) void {
     });
     runtime.addImport("runic", runtime);
 
+    // The C FFI feature calls C functions through libffi (see
+    // `future/c-ffi.md`). It is linked statically — preferring `libffi.a` — so
+    // the shared library is not a runtime dependency. `@cImport("ffi.h")` in
+    // `src/ffi/libffi.zig` finds the header via libc's default include paths.
+    // (Cross-compilation to targets without a system libffi will need a
+    // vendored build; tracked in the design doc.)
+    runtime.link_libc = true;
+    runtime.linkSystemLibrary("ffi", .{ .preferred_link_mode = .static });
+
     // Embed the bundled standard-library sources (repo-root `std/`) so
     // `src/frontend/std_modules.zig` can `@embedFile` them by these names. Keep
     // this list in sync with the `modules` table in `std_modules.zig`.
@@ -28,6 +37,7 @@ pub fn build(b: *std.Build) void {
         "std/env.rn",
         "std/testing.rn",
         "std/map.rn",
+        "std/ffi.rn",
     };
     for (std_module_files) |rel| {
         runtime.addAnonymousImport(rel, .{ .root_source_file = b.path(rel) });
