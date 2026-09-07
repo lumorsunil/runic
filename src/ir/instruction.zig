@@ -232,6 +232,17 @@ pub const Instruction = struct {
         /// or `.null` when the queue is empty. used to read a single structured
         /// value (e.g. an error union) captured from an in-process function.
         pipe_dequeue: Location,
+        /// Synchronous call: pushes a return frame (the address after this
+        /// instruction, plus the current `.sf`/`.sc`) onto the thread's call
+        /// stack, then jumps to `dest` — running the callee in the *same* thread
+        /// (no fork). Used to lower a call to a `sync` function. See
+        /// `future/execution-optimization.md`.
+        call: InstructionAddr,
+        /// Returns from a synchronous `call`: pops the top return frame, resizes
+        /// the stack back to the caller's `.sc` (reclaiming the callee's frame),
+        /// restores `.sf`, and resumes at the saved return address. `%r` (the
+        /// return value) is left untouched.
+        ret,
 
         pub fn push_(value: ValueSource) @This() {
             return .{ .push = value };
@@ -277,7 +288,7 @@ pub const Instruction = struct {
 
         pub fn format(self: @This(), w: *std.Io.Writer) !void {
             switch (self) {
-                inline .push, .exit, .process_exit, .exit_with, .jmp, .fork, .set, .pipe_fwd, .pipe_file, .pipe_write, .wait, .stream, .pipe, .pipe_opt, .ath, .log, .cmp, .resolve_exit_code, .cd, .get_env, .set_env, .emit_lines, .pipe_dequeue => |t| try w.print("{t} {f}", .{ self, t }),
+                inline .push, .exit, .process_exit, .exit_with, .jmp, .fork, .set, .pipe_fwd, .pipe_file, .pipe_write, .wait, .stream, .pipe, .pipe_opt, .ath, .log, .cmp, .resolve_exit_code, .cd, .get_env, .set_env, .emit_lines, .pipe_dequeue, .call => |t| try w.print("{t} {f}", .{ self, t }),
                 inline .ref, .comment, .get_module_cache, .set_module_cache => |t| try w.print("{t} {s}", .{ self, t }),
                 inline .alloc => |t| try w.print("{t} {}", .{ self, t }),
                 else => try w.print("{t}", .{self}),

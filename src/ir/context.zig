@@ -53,6 +53,15 @@ pub const Error = error{
     MissingMainThreadExitCode,
     MissingPipeHandle,
     MissingCloseableHandle,
+    /// A `ret` executed with no matching synchronous `call` on the call stack.
+    MissingCallFrame,
+};
+
+/// A saved caller activation for a synchronous `call` — restored by `ret`.
+pub const CallFrame = struct {
+    return_addr: ResolvedInstructionAddr,
+    stack_frame: usize,
+    stack_len: usize,
 };
 
 pub const IRProgramContext = struct {
@@ -98,6 +107,7 @@ pub const IRProgramContext = struct {
     pub fn deinit(self: *@This()) void {
         for (self.threads.items) |thread| {
             thread.private.stack.deinit(self.allocator);
+            thread.private.call_stack.deinit(self.allocator);
             thread.private.subshell_context_stack.deinit(self.allocator);
             self.allocator.destroy(thread.private);
         }
@@ -105,6 +115,7 @@ pub const IRProgramContext = struct {
 
         for (self.pipe_threads.items) |thread| {
             thread.private.stack.deinit(self.allocator);
+            thread.private.call_stack.deinit(self.allocator);
             thread.private.subshell_context_stack.deinit(self.allocator);
             self.allocator.destroy(thread.private);
         }
@@ -564,6 +575,9 @@ pub const IRSharedContext = struct {
 pub const IRPrivateContext = struct {
     instruction_counter: ResolvedInstructionAddr = .init(0, 0),
     stack: std.ArrayList(Value) = .empty,
+    /// Return frames for synchronous `call`/`ret` (see `CallFrame`). Empty on a
+    /// normal forked activation; grows only across nested sync calls.
+    call_stack: std.ArrayListUnmanaged(CallFrame) = .empty,
     stack_frame: usize = 0,
     result_register: Value = .void,
     result_register_2: Value = .void,

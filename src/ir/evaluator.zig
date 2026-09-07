@@ -2116,6 +2116,28 @@ pub const IREvaluator = struct {
 
                 return .cont;
             },
+            .call => |dest| {
+                const target = try self.resolveAddr(thread, dest);
+                // Resume at the instruction after this `call`.
+                var return_addr = thread.getCurrentInstructionAddr();
+                return_addr.local_addr += 1;
+                try thread.private.call_stack.append(self.allocator, .{
+                    .return_addr = return_addr,
+                    .stack_frame = thread.private.stack_frame,
+                    .stack_len = thread.private.stack.items.len,
+                });
+                thread.setInstructionCounter(target);
+                return .cont_no_instr_counter_inc;
+            },
+            .ret => {
+                const frame = thread.private.call_stack.pop() orelse return Error.MissingCallFrame;
+                // Reclaim the callee's stack frame, restore the caller's, and
+                // resume. `%r` (the return value) is deliberately left as-is.
+                try thread.private.stack.resize(self.allocator, frame.stack_len);
+                thread.private.stack_frame = frame.stack_frame;
+                thread.setInstructionCounter(frame.return_addr);
+                return .cont_no_instr_counter_inc;
+            },
             .wait => |wait| {
                 const waitee = try self.resolveLocation(thread, wait.waitee);
 
@@ -3058,6 +3080,105 @@ test "evaluator fast arithmetic path updates closure destination" {
     }
 
     try std.testing.expectEqual(@as(i64, 11), fixture.context.shared.heapGet(closure_addr).?.integer);
+}
+
+test "evaluator sync call/ret saves and restores the caller activation" {
+    const allocator = std.testing.allocator;
+    var fixture = try initTestEvaluator(allocator);
+    defer fixture.context.deinit();
+    defer fixture.stdin_stream.deinitParent();
+    defer fixture.stdout_stream.deinitParent();
+    defer fixture.stderr_stream.deinitParent();
+    defer fixture.tracer.deinit();
+
+    var evaluator = IREvaluator.init(allocator, .{
+        .io = testIo(),
+        .verbose = false,
+        .stdin = fixture.stdin_stream,
+        .stdout = fixture.stdout_stream,
+        .stderr = fixture.stderr_stream,
+        .tracer = &fixture.tracer,
+    }, &fixture.context);
+
+    try fixture.context.addMainThread(testEnvMap());
+    const thread = fixture.context.getCurrentThread().?;
+
+    // Caller activation: a 4-slot stack, frame at 0, executing at (0, 5).
+    try thread.private.stack.resize(allocator, 4);
+    @memset(thread.private.stack.items, .void);
+    thread.private.stack_frame = 0;
+    thread.setInstructionCounter(.init(0, 5));
+
+    // call → jumps to (1, 0), pushing a return frame for (0, 6).
+    switch (try evaluator.runInstruction(thread, .init(null, .{ .call = ir.InstructionAddr.initAbs(1, 0) }))) {
+        .cont_no_instr_counter_inc => {},
+        else => unreachable,
+    }
+    try std.testing.expectEqual(ir.ResolvedInstructionAddr.init(1, 0), thread.getCurrentInstructionAddr());
+    try std.testing.expectEqual(@as(usize, 1), thread.private.call_stack.items.len);
+    try std.testing.expectEqual(ir.ResolvedInstructionAddr.init(0, 6), thread.private.call_stack.items[0].return_addr);
+
+    // Callee runs on the same stack: pushes its own frame and computes a result.
+    try thread.private.stack.appendSlice(allocator, &.{ .{ .integer = 1 }, .{ .integer = 2 } });
+    thread.private.stack_frame = 4;
+    thread.private.result_register = .{ .integer = 42 };
+
+    // ret → reclaims the callee frame, restores caller sf, resumes at (0, 6),
+    // and leaves %r (the return value) intact.
+    switch (try evaluator.runInstruction(thread, .init(null, .ret))) {
+        .cont_no_instr_counter_inc => {},
+        else => unreachable,
+    }
+    try std.testing.expectEqual(ir.ResolvedInstructionAddr.init(0, 6), thread.getCurrentInstructionAddr());
+    try std.testing.expectEqual(@as(usize, 4), thread.private.stack.items.len);
+    try std.testing.expectEqual(@as(usize, 0), thread.private.stack_frame);
+    try std.testing.expectEqual(@as(i64, 42), thread.private.result_register.integer);
+    try std.testing.expectEqual(@as(usize, 0), thread.private.call_stack.items.len);
+
+    // A `ret` with no matching `call` is an error, not a crash.
+    try std.testing.expectError(ir.context.Error.MissingCallFrame, evaluator.runInstruction(thread, .init(null, .ret)));
+}
+
+test "evaluator sync call/ret nests for recursion" {
+    const allocator = std.testing.allocator;
+    var fixture = try initTestEvaluator(allocator);
+    defer fixture.context.deinit();
+    defer fixture.stdin_stream.deinitParent();
+    defer fixture.stdout_stream.deinitParent();
+    defer fixture.stderr_stream.deinitParent();
+    defer fixture.tracer.deinit();
+
+    var evaluator = IREvaluator.init(allocator, .{
+        .io = testIo(),
+        .verbose = false,
+        .stdin = fixture.stdin_stream,
+        .stdout = fixture.stdout_stream,
+        .stderr = fixture.stderr_stream,
+        .tracer = &fixture.tracer,
+    }, &fixture.context);
+
+    try fixture.context.addMainThread(testEnvMap());
+    const thread = fixture.context.getCurrentThread().?;
+    try thread.private.stack.resize(allocator, 4);
+    @memset(thread.private.stack.items, .void);
+
+    // Three nested calls, each from a distinct return site.
+    thread.setInstructionCounter(.init(0, 10));
+    _ = try evaluator.runInstruction(thread, .init(null, .{ .call = ir.InstructionAddr.initAbs(1, 0) }));
+    thread.setInstructionCounter(.init(1, 20));
+    _ = try evaluator.runInstruction(thread, .init(null, .{ .call = ir.InstructionAddr.initAbs(1, 0) }));
+    thread.setInstructionCounter(.init(1, 30));
+    _ = try evaluator.runInstruction(thread, .init(null, .{ .call = ir.InstructionAddr.initAbs(1, 0) }));
+    try std.testing.expectEqual(@as(usize, 3), thread.private.call_stack.items.len);
+
+    // Returns unwind in LIFO order.
+    _ = try evaluator.runInstruction(thread, .init(null, .ret));
+    try std.testing.expectEqual(ir.ResolvedInstructionAddr.init(1, 31), thread.getCurrentInstructionAddr());
+    _ = try evaluator.runInstruction(thread, .init(null, .ret));
+    try std.testing.expectEqual(ir.ResolvedInstructionAddr.init(1, 21), thread.getCurrentInstructionAddr());
+    _ = try evaluator.runInstruction(thread, .init(null, .ret));
+    try std.testing.expectEqual(ir.ResolvedInstructionAddr.init(0, 11), thread.getCurrentInstructionAddr());
+    try std.testing.expectEqual(@as(usize, 0), thread.private.call_stack.items.len);
 }
 
 test "evaluator fast compare path updates register destination" {
