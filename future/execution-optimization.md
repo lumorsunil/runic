@@ -122,17 +122,22 @@ sync calls never touch them.
   the list; `removeThreadsSlatedToBeRemoved` `swapRemove`d a finished thread
   **without freeing its private context** — so every reaped forked call (one per
   function call) leaked its private context and stacks. Fixing this
-  (`freeThreadPrivate` on removal) took the captured-call benchmark at N=8000
-  from **15 s / 686 MB to 0.01 s / 2.3 MB**. Also fixed a latent bug there: the
-  pipe-thread branch called `orderedRemove` on the wrong list (`threads` instead
-  of `pipe_threads`).
-- **Root cause part 2 (structural, not fixed):** the shared `heap` is
-  append-only (`alloc` bumps `current_heap_addr`, never reclaims). Each call
-  allocates closure + result slots that are never freed, so very large call
-  counts still blow up (N=1,000,000 captured calls → ~15 GB). This is the
-  lifetime problem the Phase 2 fork-free path avoids by not allocating a closure
-  per call at all; a general fix would need heap reclamation / a different
-  ownership model (see [[result-model-rethink]]).
+  (`freeThreadPrivate` on removal) cut the captured-call benchmark at N=8000
+  from **15 s / 686 MB to ~0.9 s / 660 MB** — a real fix (it stopped the
+  per-reap leak of thread stacks). Also fixed a latent bug there: the pipe-thread
+  branch called `orderedRemove` on the wrong list (`threads` instead of
+  `pipe_threads`). (An earlier note claimed this reached 0.01 s / 2.3 MB; that
+  was a mis-measurement against a cleared scratchpad file — the real post-fix
+  figure is ~660 MB, because part 2 below still dominates a call-in-loop.)
+- **Root cause part 2 (structural, not fixed) — the real remaining cost:** a
+  loop runs its body as a **forked closure per iteration**, and the shared `heap`
+  is **append-only** (`alloc` bumps `current_heap_addr`, never reclaims). So a
+  call — or even a plain `const x = <computed>` — inside a loop still allocates
+  per iteration and never frees (N=1,000,000 → ~15 GB). The Phase 2 sync call is
+  fork-free and helps *non-loop* code greatly, but inside a loop the forked
+  loop-body + append-only heap dominate both the sync and fork paths. **Making a
+  loop run a sync body inline (no per-iteration fork) + heap reclamation is the
+  next big win** (Phase 1 / loop work); see [[result-model-rethink]].
 - Added `tests/benchmarks/call_heavy.{rn,sh}` — the call-in-loop benchmark that
   was missing (only compute/command/mixed existed), so this stays measured.
 
@@ -194,8 +199,20 @@ correct; full CI green. Build it in tested increments:
   optional / sum / execution returns need the typed-transport + try/catch/match
   machinery the sync return path doesn't replicate, so they stay on the fork
   path (`syncReturnAllowed`).
-- [ ] (c) params passed on the stack frame (read frame-relative, not `.closure`).
-  This is what will actually speed up `call_heavy` (its `inc(n)` is paramful).
+- [x] **(c) params on the stack frame** — done. `call` carries an `args` count;
+  the frame base is `stacklen - args` (params are slots `0..N-1`, reclaimed by
+  `ret`). The call site evaluates args into stable refs, pushes their values
+  contiguously, then `call`s; `declareSyncParams` binds each param to its
+  dereferenced frame slot. Eligibility tightened via `syncBodyLowerable` (a
+  whitelist of body constructs — loops/pipelines/streams/try-catch/nested-fns
+  fall back to fork), plus generic-`|T|` params/returns excluded (they
+  monomorphize via the fork path). Correct for nested/branch/two-arg cases.
+  **Did NOT speed up `call_heavy`:** the real bottleneck is the per-iteration
+  forked loop body + append-only heap (Phase 0 part 2), not the call convention.
+- [ ] **(next, higher priority than d/e) loops run sync bodies inline.** Teach
+  the loop to detect a sync body (via the effect analysis) and run it without
+  forking a closure per iteration; pair with heap reclamation. This is what
+  unlocks the `call_heavy` win.
 - [ ] (d) recursion end-to-end (`recursive_regression`).
 - [ ] (e) wire the arg / struct-field / typed-value capture fast paths; widen
   `syncReturnAllowed` (error unions/optionals) once the sync return path carries
