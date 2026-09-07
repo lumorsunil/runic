@@ -183,18 +183,23 @@ correct; full CI green. Build it in tested increments:
   sc}`; `ret` resizes the stack back to reclaim the callee frame. Unit-tested via
   `runInstruction` (save/restore, reclamation, LIFO recursion, empty-stack
   error). No emission yet.
-- [ ] **(b) sync-entry emission for a nullary leaf.** The compiler-side work,
-  and the harder part. A normal instruction set reserves slots 0–3 for
-  stdin/stdout/stderr/closure (`addInstructionSet` does `rel_stack_counter +=
-  4`) and a `yield` writes to `threadStdout()` (== `stack[1]`). A **sync entry**
-  must NOT reserve those (it runs on the caller's stack, entered by `call` which
-  pushes no I/O slots), and its single tail `yield expr` must compile to `set
-  %r = expr` then `ret` — not a stdout write. So this is a genuine second
-  lowering mode for a function body, not a reuse of the existing one. Gate the
-  call site on `effects.isSync` + no captures + arity match.
+- [x] **(b) sync-entry emission for a nullary leaf** — done. `compileSyncEntry`
+  emits a fork-free entry (no I/O/closure slots; a `set .sf = .sc` prologue bases
+  its frame on the caller's stack top; `yield expr` → `set %r`/`ret` via a new
+  sync branch in `compileYield`). `tryCompileSyncCall`, hooked at the top of
+  `compileExpressionWithCapture`, emits `call <sync entry>` for a nullary sync
+  callee and pads to `capture_temp_ref_count` to keep the capture path's stack
+  contract. Gated on `effects.isSync` + nullary + capture-free +
+  `syncReturnAllowed`. **v1 return-type restriction discovered:** error-union /
+  optional / sum / execution returns need the typed-transport + try/catch/match
+  machinery the sync return path doesn't replicate, so they stay on the fork
+  path (`syncReturnAllowed`).
 - [ ] (c) params passed on the stack frame (read frame-relative, not `.closure`).
+  This is what will actually speed up `call_heavy` (its `inc(n)` is paramful).
 - [ ] (d) recursion end-to-end (`recursive_regression`).
-- [ ] (e) wire the arg / struct-field / typed-value capture fast paths.
+- [ ] (e) wire the arg / struct-field / typed-value capture fast paths; widen
+  `syncReturnAllowed` (error unions/optionals) once the sync return path carries
+  the discriminant.
 
 ## Open design questions (for when Phase 2 starts)
 
