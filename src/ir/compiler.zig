@@ -12,6 +12,7 @@ const FrontendDocumentStore = @import("../frontend/document_store.zig").Frontend
 const resolveModulePath = @import("../frontend/document_store.zig").resolveModulePath;
 const CType = @import("../ffi/ctype.zig").CType;
 const CSig = @import("../ffi/ctype.zig").CSig;
+const Effects = @import("../semantic/effects.zig");
 const evaluateArithmetic = ir.evaluator.IREvaluator.evaluateArithmetic;
 const evaluateLogical = ir.evaluator.IREvaluator.evaluateLogical;
 const evaluateCompare = ir.evaluator.IREvaluator.evaluateCompare;
@@ -617,6 +618,17 @@ pub const IRCompiler = struct {
     /// specialization body (its callee resolves to the generic set) is
     /// redirected to the specialization so it recurses at the same concrete type.
     active_specializations: std.ArrayListUnmanaged(struct { generic: usize, spec: usize }) = .empty,
+
+    /// Synchrony analysis (see `semantic/effects.zig`), computed once at the top
+    /// of `compile`. Drives the fork-free lowering of `sync` function calls.
+    effects: ?Effects.Analysis = null,
+    /// While true, `yield expr` compiles to `set %r = expr` + `ret` (the sync
+    /// call/return convention) instead of a write to the thread's stdout stream.
+    sync_mode: bool = false,
+    /// Maps a function's normal (forked) instruction set to its `sync` entry set,
+    /// when one was compiled (a capture-free sync function). A call site to such
+    /// a function emits `call <sync entry>` instead of a fork.
+    sync_entries: std.AutoHashMapUnmanaged(usize, usize) = .empty,
 
     /// Concrete types bound by `|T|` captures in binding positions (`const x:
     /// []|T| = …` → `T` = the element type). A later `: T` resolves through here.
@@ -1256,6 +1268,11 @@ pub const IRCompiler = struct {
     }
 
     pub fn compile(self: *IRCompiler) Error!CompilationResult {
+        // Classify every function's synchrony up front so call sites can lower a
+        // sync call without a fork. Conservative: any function not proven sync
+        // (or defined outside this script) stays on the fork path.
+        self.effects = try Effects.analyze(self.allocator, self.script);
+
         try self.registerErrorSets();
 
         self.current_instruction_set = try self.addInstructionSetNoPushFrame();
@@ -1679,6 +1696,17 @@ pub const IRCompiler = struct {
         y: ast.YieldStmt,
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        // In a `sync` entry the value is returned in `%r` and control returns to
+        // the caller via `ret` — there is no stdout stream to yield to. The
+        // classifier only marks a function sync when every `yield` is to fd 1, so
+        // this branch handles all of a sync function's yields.
+        if (self.sync_mode and y.fd == 1) {
+            const value = try self.compileExpression(y.value);
+            try self.set(source, .initRegister(.r), stableResultSource(value));
+            try self.addInstruction(.init(.from(source), .ret));
+            return .fromValue(.void);
+        }
 
         const target = switch (y.fd) {
             1 => self.threadStdout(),
@@ -2618,11 +2646,54 @@ pub const IRCompiler = struct {
         }
     }
 
+    /// Fork-free lowering of a call to a `sync` function (v1: nullary,
+    /// capture-free). Emits `call <sync entry>` and takes the result from `%r`,
+    /// bypassing the fork + closure + pipe + wait + dequeue path entirely.
+    /// Returns null when the call isn't such a sync call (fall back to the
+    /// normal paths).
+    fn tryCompileSyncCall(self: *IRCompiler, source: anytype, expr: *ast.Expression) Error!?Result {
+        if (self.effects == null) return null;
+        const call = switch (expr.*) {
+            .call => |c| c,
+            else => return null,
+        };
+        if (call.background or call.redirects.len != 0 or call.arguments.len != 0) return null;
+        if (call.callee.* != .identifier) return null;
+        const name = call.callee.identifier.name;
+        if (!self.effects.?.isSync(name)) return null;
+
+        const binding = self.lookup(name, .{ .shallow = false }) orelse return null;
+        if (!binding.result.isFunctionRef()) return null;
+        const forked_set = binding.result.source.value.fn_ref.fn_addr.instr_set;
+        // A nullary function only — a paramful function referenced with no args
+        // is a function *value*, not a call.
+        if (self.instruction_sets.items[forked_set].param_count != 0) return null;
+        const sync_set = self.sync_entries.get(forked_set) orelse return null;
+
+        const return_type: ?ast.TypeExpr = if (binding.type_expr) |t|
+            if (t == .function) (if (t.function.return_type) |rt| rt.* else null) else null
+        else
+            null;
+
+        const stack_before = self.currentFrame().rel_stack_counter;
+        try self.addInstruction(.init(.from(source), .{ .call = ir.InstructionAddr.initAbs(sync_set, 0) }));
+        // Honor the capture path's stack contract: leave exactly
+        // `capture_temp_ref_count` temporary refs on top (callers in a
+        // stdio-capture context pop that many). The `call`/`ret` pair is
+        // net-zero on the stack and the result lives in %r, which `.ref`/`.pop`
+        // never touch — so padding here is safe.
+        while (self.currentFrame().rel_stack_counter -| stack_before < capture_temp_ref_count) {
+            _ = try self.newRef(source, "sync_call_pad");
+        }
+        return try .from(ir.Location.initRegister(.r).typed(return_type));
+    }
+
     fn compileExpressionWithCapture(
         self: *IRCompiler,
         source: anytype,
         expr: *ast.Expression,
     ) Error!Result {
+        if (try self.tryCompileSyncCall(source, expr)) |r| return r;
         if (try self.tryCompileTypedValueCapture(source, expr)) |captured| return captured;
 
         // A `cimport` extern call returning a by-value struct yields a heap
@@ -7949,6 +8020,54 @@ pub const IRCompiler = struct {
         };
     }
 
+    /// Compiles a fork-free `sync` entry for a capture-free, nullary sync
+    /// function (v1 scope). Unlike the forked body, it reserves no
+    /// stdin/stdout/stderr/closure slots (it runs on the caller's stack, entered
+    /// by `call`), establishes its frame at the caller's stack top, and returns
+    /// its value in `%r` via `ret` (see `compileYield`'s sync branch). Returns
+    /// the new instruction set's index.
+    /// Whether a return type is eligible for v1 fork-free sync lowering. Values
+    /// carrying an error/optional discriminant (or an execution result) need the
+    /// typed-transport + try/catch/match machinery that the sync return path
+    /// does not yet replicate, so they stay on the fork path for now.
+    fn syncReturnAllowed(return_type: ?*const ast.TypeExpr) bool {
+        const t = return_type orelse return true; // Void
+        return switch (t.*) {
+            .error_union, .optional, .promise, .error_set, .err, .sum, .type_merge, .execution, .failed => false,
+            else => true,
+        };
+    }
+
+    fn compileSyncEntry(self: *IRCompiler, source: *ast.Expression, fn_decl: ast.FunctionDecl) Error!usize {
+        const entry_set = try self.addInstructionSetNoPushFrame();
+        const orig = self.current_instruction_set;
+        self.current_instruction_set = entry_set;
+        try self.scopes.push(self.allocator, .closure);
+        // Frame base starts at 0 (no I/O/closure slots), unlike addInstructionSet.
+        try self.pushFrameNoInstructions();
+
+        const saved_sync = self.sync_mode;
+        self.sync_mode = true;
+        defer self.sync_mode = saved_sync;
+
+        // Prologue: this activation's locals live above the caller's stack top.
+        try self.set(source, .initRegister(.sf), .fromLocation(.initRegister(.sc)));
+
+        if (fn_decl.body.* == .block) {
+            for (fn_decl.body.block.statements) |stmt| _ = try self.compileStatement(stmt);
+        } else {
+            const r = try self.compileExpression(fn_decl.body);
+            try self.set(source, .initRegister(.r), stableResultSource(r));
+        }
+
+        // Fall-off return: a path that produced no value (or a Void function).
+        try self.addInstruction(.init(.from(source), .ret));
+
+        self.current_instruction_set = orig;
+        self.scopes.pop();
+        return entry_set;
+    }
+
     fn compileFnDecl(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -8170,6 +8289,23 @@ pub const IRCompiler = struct {
                     if (self.lookup(name.name, .{ .shallow = true })) |binding| {
                         binding.is_pub = true;
                     }
+                }
+            }
+        }
+
+        // Emit a fork-free `sync` entry for a capture-free nullary sync function
+        // (v1 scope), so a call site can invoke it via `call`/`ret`. The forked
+        // set stays for pipeline/async uses.
+        if (!self.specializing) {
+            if (fn_decl.name) |name| {
+                if (self.effects != null and
+                    self.effects.?.isSync(name.name) and
+                    fn_decl.params._non_variadic.len == 0 and
+                    syncReturnAllowed(fn_decl.return_type) and
+                    self.instruction_sets.items[instr_set].closure_captures.len == 0)
+                {
+                    const sync_set = try self.compileSyncEntry(source, fn_decl);
+                    try self.sync_entries.put(self.allocator, instr_set, sync_set);
                 }
             }
         }

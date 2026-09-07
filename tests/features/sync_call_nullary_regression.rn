@@ -1,0 +1,39 @@
+# A call to a `sync` function (one that runs to completion producing a single
+# value, with no pipeline/command/stream/yield-in-loop) is lowered fork-free via
+# the call/ret convention: it runs in the caller's thread, returning its value
+# in a register. This covers the v1 scope — nullary, capture-free sync functions
+# — across value positions. See future/execution-optimization.md.
+fn Void @() Void
+
+# Simple nullary sync call, bound.
+fn Void answer() Int { yield 42 }
+const a = answer
+echo "a=${a}"
+
+# Locals + arithmetic inside the sync entry (frame set up on the caller's stack).
+fn Void compute() Int {
+  const x = 10
+  const y = 20
+  yield x + y
+}
+echo "compute=${compute}"
+
+# A sync call nested inside another sync function's body (call/ret nesting).
+fn Void base() Int { yield 5 }
+fn Void plusOne() Int { yield (base) + 1 }
+echo "plusOne=${plusOne}"
+
+# A sync call as a binary operand at top level.
+const w = (base) + 100
+echo "w=${w}"
+
+# Branch yields: only one path runs, so it is a single-value sync function.
+fn Void pick() Int {
+  const flag = true
+  if (flag) { yield 1 } else { yield 2 }
+}
+echo "pick=${pick}"
+
+# A String-returning sync function.
+fn Void greet() String { yield "hello" }
+echo "greet=${greet}"
