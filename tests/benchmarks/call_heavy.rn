@@ -1,0 +1,7 @@
+fn Void inc(n: Int) Int { yield n + 1 }
+var total = 0
+for (0..20000) |i| {
+    const x = inc i
+    total = total + x
+}
+echo total

@@ -114,6 +114,28 @@ sync calls never touch them.
   Phase 2 synchrony classification is the prerequisite — the sync subset is
   exactly what compiles cleanly to native.
 
+## Phase 0 findings (done)
+
+- **Root cause of the call-in-loop blow-up, part 1 (fixed):** `spawnThread`
+  heap-allocates each thread's `IRPrivateContext` (holding its `stack` and
+  `subshell_context_stack`). `deinit` frees those, but only for threads still in
+  the list; `removeThreadsSlatedToBeRemoved` `swapRemove`d a finished thread
+  **without freeing its private context** — so every reaped forked call (one per
+  function call) leaked its private context and stacks. Fixing this
+  (`freeThreadPrivate` on removal) took the captured-call benchmark at N=8000
+  from **15 s / 686 MB to 0.01 s / 2.3 MB**. Also fixed a latent bug there: the
+  pipe-thread branch called `orderedRemove` on the wrong list (`threads` instead
+  of `pipe_threads`).
+- **Root cause part 2 (structural, not fixed):** the shared `heap` is
+  append-only (`alloc` bumps `current_heap_addr`, never reclaims). Each call
+  allocates closure + result slots that are never freed, so very large call
+  counts still blow up (N=1,000,000 captured calls → ~15 GB). This is the
+  lifetime problem the Phase 2 fork-free path avoids by not allocating a closure
+  per call at all; a general fix would need heap reclamation / a different
+  ownership model (see [[result-model-rethink]]).
+- Added `tests/benchmarks/call_heavy.{rn,sh}` — the call-in-loop benchmark that
+  was missing (only compute/command/mixed existed), so this stays measured.
+
 ## Open design questions (for when Phase 2 starts)
 
 - Sync call/ret convention vs inline-only for the first milestone (recursion

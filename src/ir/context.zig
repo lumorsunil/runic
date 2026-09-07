@@ -307,11 +307,23 @@ pub const IRProgramContext = struct {
         }
     }
 
+    /// Frees a removed thread's owned private context (its stacks and the
+    /// heap-allocated `IRPrivateContext` itself). `spawnThread` allocates one per
+    /// thread; without this, every reaped thread — e.g. the child forked for each
+    /// function call — leaks its private context and stacks. `deinit` only frees
+    /// threads still in the list, so removal must free its own.
+    fn freeThreadPrivate(self: *@This(), thread: IRThreadContext) void {
+        thread.private.stack.deinit(self.allocator);
+        thread.private.subshell_context_stack.deinit(self.allocator);
+        self.allocator.destroy(thread.private);
+    }
+
     fn removeThreadsSlatedToBeRemoved(self: *@This()) void {
         defer self.threads_to_remove.clearRetainingCapacity();
         for (self.threads_to_remove.keys()) |id| {
             for (self.threads.items, 0..) |item, i| {
                 if (item.id == id) {
+                    self.freeThreadPrivate(item);
                     _ = self.threads.swapRemove(i);
                     break;
                 }
@@ -322,7 +334,8 @@ pub const IRProgramContext = struct {
         for (self.pipe_threads_to_remove.keys()) |id| {
             for (self.pipe_threads.items, 0..) |item, i| {
                 if (item.id == id) {
-                    _ = self.threads.orderedRemove(i);
+                    self.freeThreadPrivate(item);
+                    _ = self.pipe_threads.swapRemove(i);
                     break;
                 }
             }
