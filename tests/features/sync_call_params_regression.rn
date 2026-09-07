@@ -1,0 +1,42 @@
+# Parameterized sync calls lower fork-free (call/ret): arguments are pushed on
+# the caller's stack and read as the callee's frame slots. Also checks that
+# functions the v1 sync path can't handle — generic, error-union return, or a
+# loop in the body — fall back to the fork path and still produce correct
+# results. See future/execution-optimization.md.
+fn Void @() Void
+
+# One parameter, arithmetic on it.
+fn Void inc(n: Int) Int { yield n + 1 }
+echo "inc=${inc 41}"
+
+# Two parameters, order matters.
+fn Void sub(a: Int, b: Int) Int { yield a - b }
+echo "sub=${sub 50 8}"
+
+# Nested paramful sync calls (call/ret nesting).
+fn Void dbl(n: Int) Int { yield n + n }
+echo "nested=${dbl (inc 5)}"
+
+# A parameter passed straight through and via a branch.
+fn Void pick(a: Int, b: Int, first: Bool) Int {
+  if (first) { yield a } else { yield b }
+}
+echo "pickA=${pick 7 9 true} pickB=${pick 7 9 false}"
+
+# Fork-path fallbacks (must still be correct):
+# - a loop in the body,
+fn Void sumTo(n: Int) Int {
+  var total = 0
+  for (0..n) |i| { total = total + i }
+  yield total
+}
+echo "sumTo=${sumTo 5}"
+
+# - a generic parameter (monomorphized via the fork path),
+fn Void identity(x: |T|) T { yield x }
+echo "gen=${identity 42}"
+
+# - an error-union return.
+const E = error { Bad }
+fn Void checked(n: Int) E!Int { if (n < 0) { yield E.Bad } else { yield n } }
+echo "ok=${checked 7 catch 0} err=${checked (0 - 1) catch 99}"

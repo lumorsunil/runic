@@ -2657,7 +2657,7 @@ pub const IRCompiler = struct {
             .call => |c| c,
             else => return null,
         };
-        if (call.background or call.redirects.len != 0 or call.arguments.len != 0) return null;
+        if (call.background or call.redirects.len != 0) return null;
         if (call.callee.* != .identifier) return null;
         const name = call.callee.identifier.name;
         if (!self.effects.?.isSync(name)) return null;
@@ -2665,9 +2665,9 @@ pub const IRCompiler = struct {
         const binding = self.lookup(name, .{ .shallow = false }) orelse return null;
         if (!binding.result.isFunctionRef()) return null;
         const forked_set = binding.result.source.value.fn_ref.fn_addr.instr_set;
-        // A nullary function only — a paramful function referenced with no args
-        // is a function *value*, not a call.
-        if (self.instruction_sets.items[forked_set].param_count != 0) return null;
+        // The arity must match — a paramful function referenced with no args is a
+        // function *value*, and a mismatch is not a plain call.
+        if (self.instruction_sets.items[forked_set].param_count != call.arguments.len) return null;
         const sync_set = self.sync_entries.get(forked_set) orelse return null;
 
         const return_type: ?ast.TypeExpr = if (binding.type_expr) |t|
@@ -2676,12 +2676,35 @@ pub const IRCompiler = struct {
             null;
 
         const stack_before = self.currentFrame().rel_stack_counter;
-        try self.addInstruction(.init(.from(source), .{ .call = ir.InstructionAddr.initAbs(sync_set, 0) }));
-        // Honor the capture path's stack contract: leave exactly
-        // `capture_temp_ref_count` temporary refs on top (callers in a
-        // stdio-capture context pop that many). The `call`/`ret` pair is
-        // net-zero on the stack and the result lives in %r, which `.ref`/`.pop`
-        // never touch — so padding here is safe.
+
+        // Evaluate the arguments into stable refs first (their compilation may
+        // push its own temporaries), then push the values contiguously so they
+        // become the callee's frame slots 0..N-1.
+        const arg_refs = try self.allocator.alloc(ir.Location, call.arguments.len);
+        defer self.allocator.free(arg_refs);
+        for (call.arguments, 0..) |arg, i| {
+            const r = try self.compileExpressionWithCapture(source, arg);
+            const ref = try self.newRef(source, "sync_arg");
+            try self.set(source, ref, stableResultSource(r));
+            arg_refs[i] = ref;
+        }
+        // Raw pushes (untracked by the ref counter): `call` records the frame
+        // base below them and `ret` truncates them away, so they must not count
+        // toward the caller's frame — the counter is reconciled after the call.
+        for (arg_refs) |ref| {
+            try self.addInstruction(.init(.from(source), .push_(.fromLocation(ref.dereference()))));
+        }
+        try self.addInstruction(.init(.from(source), .{ .call = .{
+            .dest = ir.InstructionAddr.initAbs(sync_set, 0),
+            .args = call.arguments.len,
+        } }));
+
+        // The raw-pushed args and the callee frame are reclaimed by `ret`, so the
+        // net stack growth here is the arg-eval temporaries (tracked refs, which
+        // stay live until the enclosing frame is torn down). Pad up to the
+        // capture path's contract of `capture_temp_ref_count` refs — never pop:
+        // `pop` writes the popped value into `%r`, which would clobber the return
+        // value, whereas `.ref` pushes leave `%r` intact.
         while (self.currentFrame().rel_stack_counter -| stack_before < capture_temp_ref_count) {
             _ = try self.newRef(source, "sync_call_pad");
         }
@@ -8026,16 +8049,129 @@ pub const IRCompiler = struct {
     /// by `call`), establishes its frame at the caller's stack top, and returns
     /// its value in `%r` via `ret` (see `compileYield`'s sync branch). Returns
     /// the new instruction set's index.
+    /// Whether a function body is built only from constructs the sync entry can
+    /// compile. The sync entry runs on the caller's stack (no `.closure` slot,
+    /// no thread I/O), so anything that forks, uses a closure, streams, or drives
+    /// the error/optional machinery must stay on the fork path. This is a
+    /// whitelist: only known-safe nodes pass, so a new construct defaults to the
+    /// fork path rather than silently miscompiling. Loops (`for`/`while`) are the
+    /// main exclusion for v1 — they lower to a forked closure body.
+    fn syncBodyLowerable(self: *IRCompiler, expr: *const ast.Expression) bool {
+        return switch (expr.*) {
+            .literal, .identifier, .env_var, .path => true,
+            .binary => |b| self.syncBodyLowerable(b.left) and self.syncBodyLowerable(b.right),
+            .unary => |u| self.syncBodyLowerable(u.operand),
+            .member => |m| self.syncBodyLowerable(m.object),
+            .index => |i| self.syncBodyLowerable(i.target) and self.syncBodyLowerable(i.index),
+            .call => |c| blk: {
+                if (!self.syncBodyLowerable(c.callee)) break :blk false;
+                for (c.arguments) |a| if (!self.syncBodyLowerable(a)) break :blk false;
+                break :blk true;
+            },
+            .range => |r| self.syncBodyLowerable(r.start) and (r.end == null or self.syncBodyLowerable(r.end.?)),
+            .array => |a| blk: {
+                for (a.elements) |el| if (!self.syncBodyLowerable(el)) break :blk false;
+                break :blk true;
+            },
+            .struct_literal => |sl| blk: {
+                if (sl.object) |o| if (!self.syncBodyLowerable(o)) break :blk false;
+                for (sl.fields) |f| if (!self.syncBodyLowerable(f.value)) break :blk false;
+                break :blk true;
+            },
+            .if_expr => |i| blk: {
+                if (!self.syncBodyLowerable(i.condition) or !self.syncBodyLowerable(i.then_expr)) break :blk false;
+                if (i.else_branch) |eb| switch (eb) {
+                    .expr => |x| if (!self.syncBodyLowerable(x)) break :blk false,
+                    .if_expr => |nested| if (!self.syncBodyLowerable(@ptrCast(nested))) break :blk false,
+                    .condition => {},
+                };
+                break :blk true;
+            },
+            .match_expr => |m| blk: {
+                if (!self.syncBodyLowerable(m.subject)) break :blk false;
+                for (m.cases) |case| for (case.body.statements) |s| if (!self.syncStmtLowerable(s)) break :blk false;
+                break :blk true;
+            },
+            .block => |b| blk: {
+                if (b.background) break :blk false;
+                for (b.statements) |s| if (!self.syncStmtLowerable(s)) break :blk false;
+                break :blk true;
+            },
+            .comptime_expr => |c| self.syncBodyLowerable(c.operand),
+            .assignment => |a| self.syncBodyLowerable(a.expr),
+            .is_expr => |i| self.syncBodyLowerable(i.subject),
+            // Everything else (loops, pipelines, subshells, fd/stream, exec,
+            // import/cimport, try/catch, nested fn decls, map) → fork path.
+            else => false,
+        };
+    }
+
+    fn syncStmtLowerable(self: *IRCompiler, stmt: *const ast.Statement) bool {
+        return switch (stmt.*) {
+            .binding_decl => |d| self.syncBodyLowerable(d.initializer),
+            .expression => |e| self.syncBodyLowerable(e.expression),
+            .yield_stmt => |y| y.fd == 1 and self.syncBodyLowerable(y.value),
+            .exit_stmt => |e| if (e.value) |v| self.syncBodyLowerable(v) else true,
+            .type_binding_decl => true,
+            // while_stmt, bash_block → fork path.
+            else => false,
+        };
+    }
+
+    /// Whether a function's parameters are eligible for v1 sync lowering: a fixed
+    /// (non-variadic) list of plain identifier parameters, none generic. A
+    /// generic parameter (`x: |T|`) is monomorphized per call type through the
+    /// fork path (`maybeSpecialize`); the sync call bypasses that, so a generic
+    /// function must stay on the fork path.
+    fn syncParamsSupported(params: ast.FunctionDecl.Parameters) bool {
+        return switch (params) {
+            ._variadic => false,
+            ._non_variadic => |ps| blk: {
+                for (ps) |p| {
+                    if (p.pattern.* != .identifier) break :blk false;
+                    if (p.type_annotation) |ta| if (hasTypeCapture(ta.*)) break :blk false;
+                }
+                break :blk true;
+            },
+        };
+    }
+
     /// Whether a return type is eligible for v1 fork-free sync lowering. Values
     /// carrying an error/optional discriminant (or an execution result) need the
     /// typed-transport + try/catch/match machinery that the sync return path
     /// does not yet replicate, so they stay on the fork path for now.
     fn syncReturnAllowed(return_type: ?*const ast.TypeExpr) bool {
         const t = return_type orelse return true; // Void
+        // A generic return (`|T|`, `T`) is monomorphized via the fork path.
+        if (t.* == .type_var or hasTypeCapture(t.*)) return false;
         return switch (t.*) {
             .error_union, .optional, .promise, .error_set, .err, .sum, .type_merge, .execution, .failed => false,
             else => true,
         };
+    }
+
+    /// Declares a sync entry's parameters as frame slots `0..N-1` (the caller
+    /// pushed the argument values there before `call`), and advances the frame's
+    /// ref counter past them so locals follow. Emits no `ref` pushes — the values
+    /// are already on the stack.
+    fn declareSyncParams(self: *IRCompiler, source: *ast.Expression, fn_decl: ast.FunctionDecl) Error!void {
+        const params = fn_decl.params._non_variadic;
+        for (params, 0..) |param, i| {
+            switch (param.pattern.*) {
+                .identifier => |identifier| {
+                    const ptype: ?ast.TypeExpr = if (param.type_annotation) |ta| self.normalizeStringTypes(ta.*) else null;
+                    // A value expression yields a dereferenced ref location (so
+                    // reading the parameter gives its value, not its slot addr).
+                    const loc = ir.Location.initAbs(.{ .ref = .{ .name = identifier.name, .rel_stack_addr = i } }, .{}).dereference().typed(ptype);
+                    try self.scopes.declare(self.allocator, identifier.name, .fromLocation(loc), ptype, param.is_mutable, .normal);
+                },
+                .discard => {},
+                .tuple, .record => {
+                    try self.reportSourceError(source, Error.UnsupportedBindingPattern, .@"error", "sync parameter destructuring is not yet supported", .{});
+                },
+            }
+        }
+        self.currentFrame().rel_stack_counter = params.len;
     }
 
     fn compileSyncEntry(self: *IRCompiler, source: *ast.Expression, fn_decl: ast.FunctionDecl) Error!usize {
@@ -8050,8 +8186,9 @@ pub const IRCompiler = struct {
         self.sync_mode = true;
         defer self.sync_mode = saved_sync;
 
-        // Prologue: this activation's locals live above the caller's stack top.
-        try self.set(source, .initRegister(.sf), .fromLocation(.initRegister(.sc)));
+        // `.sf` is set by the `call` instruction to the frame base (the first
+        // argument slot); parameters occupy frame slots 0..N-1 and locals follow.
+        try self.declareSyncParams(source, fn_decl);
 
         if (fn_decl.body.* == .block) {
             for (fn_decl.body.block.statements) |stmt| _ = try self.compileStatement(stmt);
@@ -8300,8 +8437,9 @@ pub const IRCompiler = struct {
             if (fn_decl.name) |name| {
                 if (self.effects != null and
                     self.effects.?.isSync(name.name) and
-                    fn_decl.params._non_variadic.len == 0 and
+                    syncParamsSupported(fn_decl.params) and
                     syncReturnAllowed(fn_decl.return_type) and
+                    self.syncBodyLowerable(fn_decl.body) and
                     self.instruction_sets.items[instr_set].closure_captures.len == 0)
                 {
                     const sync_set = try self.compileSyncEntry(source, fn_decl);

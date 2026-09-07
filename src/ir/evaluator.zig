@@ -2116,16 +2116,20 @@ pub const IREvaluator = struct {
 
                 return .cont;
             },
-            .call => |dest| {
-                const target = try self.resolveAddr(thread, dest);
+            .call => |c| {
+                const target = try self.resolveAddr(thread, c.dest);
+                // The caller pushed `args` values; the callee's frame begins at
+                // them, so its parameters are frame slots 0..args-1.
+                const base = thread.private.stack.items.len - c.args;
                 // Resume at the instruction after this `call`.
                 var return_addr = thread.getCurrentInstructionAddr();
                 return_addr.local_addr += 1;
                 try thread.private.call_stack.append(self.allocator, .{
                     .return_addr = return_addr,
                     .stack_frame = thread.private.stack_frame,
-                    .stack_len = thread.private.stack.items.len,
+                    .stack_len = base,
                 });
+                thread.private.stack_frame = base;
                 thread.setInstructionCounter(target);
                 return .cont_no_instr_counter_inc;
             },
@@ -3109,18 +3113,20 @@ test "evaluator sync call/ret saves and restores the caller activation" {
     thread.private.stack_frame = 0;
     thread.setInstructionCounter(.init(0, 5));
 
-    // call → jumps to (1, 0), pushing a return frame for (0, 6).
-    switch (try evaluator.runInstruction(thread, .init(null, .{ .call = ir.InstructionAddr.initAbs(1, 0) }))) {
+    // call (no args) → jumps to (1, 0), pushing a return frame for (0, 6) and
+    // setting the frame base to the current top (4).
+    switch (try evaluator.runInstruction(thread, .init(null, .{ .call = .{ .dest = ir.InstructionAddr.initAbs(1, 0) } }))) {
         .cont_no_instr_counter_inc => {},
         else => unreachable,
     }
     try std.testing.expectEqual(ir.ResolvedInstructionAddr.init(1, 0), thread.getCurrentInstructionAddr());
     try std.testing.expectEqual(@as(usize, 1), thread.private.call_stack.items.len);
     try std.testing.expectEqual(ir.ResolvedInstructionAddr.init(0, 6), thread.private.call_stack.items[0].return_addr);
+    try std.testing.expectEqual(@as(usize, 4), thread.private.stack_frame);
+    try std.testing.expectEqual(@as(usize, 4), thread.private.call_stack.items[0].stack_len);
 
     // Callee runs on the same stack: pushes its own frame and computes a result.
     try thread.private.stack.appendSlice(allocator, &.{ .{ .integer = 1 }, .{ .integer = 2 } });
-    thread.private.stack_frame = 4;
     thread.private.result_register = .{ .integer = 42 };
 
     // ret → reclaims the callee frame, restores caller sf, resumes at (0, 6),
@@ -3164,11 +3170,11 @@ test "evaluator sync call/ret nests for recursion" {
 
     // Three nested calls, each from a distinct return site.
     thread.setInstructionCounter(.init(0, 10));
-    _ = try evaluator.runInstruction(thread, .init(null, .{ .call = ir.InstructionAddr.initAbs(1, 0) }));
+    _ = try evaluator.runInstruction(thread, .init(null, .{ .call = .{ .dest = ir.InstructionAddr.initAbs(1, 0) } }));
     thread.setInstructionCounter(.init(1, 20));
-    _ = try evaluator.runInstruction(thread, .init(null, .{ .call = ir.InstructionAddr.initAbs(1, 0) }));
+    _ = try evaluator.runInstruction(thread, .init(null, .{ .call = .{ .dest = ir.InstructionAddr.initAbs(1, 0) } }));
     thread.setInstructionCounter(.init(1, 30));
-    _ = try evaluator.runInstruction(thread, .init(null, .{ .call = ir.InstructionAddr.initAbs(1, 0) }));
+    _ = try evaluator.runInstruction(thread, .init(null, .{ .call = .{ .dest = ir.InstructionAddr.initAbs(1, 0) } }));
     try std.testing.expectEqual(@as(usize, 3), thread.private.call_stack.items.len);
 
     // Returns unwind in LIFO order.

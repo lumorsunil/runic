@@ -232,12 +232,15 @@ pub const Instruction = struct {
         /// or `.null` when the queue is empty. used to read a single structured
         /// value (e.g. an error union) captured from an in-process function.
         pipe_dequeue: Location,
-        /// Synchronous call: pushes a return frame (the address after this
-        /// instruction, plus the current `.sf`/`.sc`) onto the thread's call
-        /// stack, then jumps to `dest` — running the callee in the *same* thread
-        /// (no fork). Used to lower a call to a `sync` function. See
-        /// `future/execution-optimization.md`.
-        call: InstructionAddr,
+        /// Synchronous call: the caller has pushed `args` argument values on top
+        /// of the stack. Records the frame base (`stack length - args`) plus the
+        /// return address and caller `.sf` on the thread's call stack, sets `.sf`
+        /// to that base (so the callee reads its parameters as frame slots
+        /// `0..args-1`), and jumps to `dest` — running the callee in the *same*
+        /// thread (no fork). `ret` truncates back to the base, reclaiming the
+        /// arguments and the callee's locals. Used to lower a call to a `sync`
+        /// function. See `future/execution-optimization.md`.
+        call: Call,
         /// Returns from a synchronous `call`: pops the top return frame, resizes
         /// the stack back to the caller's `.sc` (reclaiming the callee's frame),
         /// restores `.sf`, and resumes at the saved return address. `%r` (the
@@ -796,6 +799,19 @@ pub const Instruction = struct {
             writer: *std.Io.Writer,
         ) std.Io.Writer.Error!void {
             try writer.print("{f}", .{self.waitee});
+        }
+    };
+
+    pub const Call = struct {
+        dest: InstructionAddr,
+        /// Number of argument values the caller pushed on top of the stack.
+        args: usize = 0,
+
+        pub fn format(
+            self: @This(),
+            writer: *std.Io.Writer,
+        ) std.Io.Writer.Error!void {
+            try writer.print("{f} args={d}", .{ self.dest, self.args });
         }
     };
 
