@@ -369,16 +369,26 @@ reserving the entry set, before compiling the body. `fib 10` in a binding →
 Measured: fib is now O(calls) with flat memory instead of forking a thread per
 recursive call.
 
-Still open on recursion: a call in **yield-value / statement / command-argument**
-position (`yield (countdown n)`, `echo (fib n)`) does not route through
-`tryCompileSyncCall` (only value-capture positions — bindings, arithmetic
-operands, struct fields — do), so those still fork. Widening the bare-call path
-to prefer a sync `call` when the callee has an entry is the next step; it also
-subsumes part of the remaining call_heavy-shaped surface.
+**Bare-call positions — DONE.** A sync call now lowers to `call`/`ret` in the two
+value-consuming bare positions too, via `tryCompileSyncCall` hooks:
+- **yield-value** (`yield (f n)`) — both the sync-mode branch (a nested sync call
+  inside an entry, e.g. bare-`yield` recursion like `yield (countdown (n-1))`) and
+  the normal branch (a forked body yielding a sync call's value to its stream).
+- **command-argument** (`echo (f n)`) — the arg resolves to its entry and its
+  value is materialized like any other argument.
 
-Remaining: (d-cont) route yield-value/statement/command-arg calls through sync
-lowering; (e) capture fast paths + widen `syncReturnAllowed`
-(error-union/optional/sum/promise returns and capture-bearing fns still fork).
+**Statement position is deliberately left on the fork/output path.** A bare
+statement call (`classify`) sends its `yield` to stdout — that is the value's
+destination in statement position — so sync-lowering it (value → discarded `%r`)
+would swallow the output. Confirmed by `if_bare_body_regression`. So the broad
+`compileCall` hook was reverted in favor of the two value-position hooks above.
+Covered by `tests/features/sync_call_bare_positions_regression.rn`.
+
+Remaining: (e) capture fast paths + widen `syncReturnAllowed`
+(error-union/optional/sum/promise returns and capture-bearing fns still fork);
+member/indirect calls stay conservatively threaded; and the append-only-heap
+reclaim (deep recursion through the general `step()` path still accumulates
+per-call slots — the counted_loop path is already flat).
 
 ## (superseded) earlier framing: "jmp-fallback loop leaks ~20 KB/iter"
 

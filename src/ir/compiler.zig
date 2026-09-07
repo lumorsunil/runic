@@ -1702,7 +1702,9 @@ pub const IRCompiler = struct {
         // classifier only marks a function sync when every `yield` is to fd 1, so
         // this branch handles all of a sync function's yields.
         if (self.sync_mode and y.fd == 1) {
-            const value = try self.compileExpression(y.value);
+            // A yielded fork-free sync call (`yield (f n)`) resolves to its
+            // `call`/`ret` entry rather than forking; its value lands in `%r`.
+            const value = (try self.tryCompileSyncCall(y.value, y.value)) orelse try self.compileExpression(y.value);
             try self.set(source, .initRegister(.r), stableResultSource(value));
             try self.addInstruction(.init(.from(source), .ret));
             return .fromValue(.void);
@@ -1726,7 +1728,10 @@ pub const IRCompiler = struct {
         // the frame counter across compilation distinguishes owned temporaries
         // from borrowed references regardless of where they sit in the frame.
         const stack_before_value = self.currentFrame().rel_stack_counter;
-        const value = try self.compileResultSaveR(source, try self.compileExpression(y.value));
+        // A yielded fork-free sync call resolves to its entry (fork-free); its
+        // value (`%r`) is then written to the stdout/stderr stream like any yield.
+        const raw_value = (try self.tryCompileSyncCall(y.value, y.value)) orelse try self.compileExpression(y.value);
+        const value = try self.compileResultSaveR(source, raw_value);
         try self.pipeWrite(source, target, value.source);
         const pushed = self.currentFrame().rel_stack_counter -| stack_before_value;
         for (0..pushed) |_| _ = try self.pop(source);
@@ -4984,7 +4989,10 @@ pub const IRCompiler = struct {
         var it = std.mem.reverseIterator(arguments);
         var arg_i: usize = 0;
         while (it.next()) |arg_expr| : (arg_i += 1) {
-            var arg = try self.compileExpression(arg_expr);
+            // A command argument that is a fork-free sync call (`echo (f n)`)
+            // resolves to its `call`/`ret` entry; its value (`%r`) is then
+            // materialized as the argument like any other value.
+            var arg = (try self.tryCompileSyncCall(arg_expr, arg_expr)) orelse try self.compileExpression(arg_expr);
             if (arg.isType(execution_result_struct_type)) {
                 const arg_ref = try self.newRef(source, "exec_result_arg");
                 try self.set(source, arg_ref, arg.source);
