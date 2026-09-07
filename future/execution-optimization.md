@@ -207,16 +207,51 @@ correct; full CI green. Build it in tested increments:
   whitelist of body constructs — loops/pipelines/streams/try-catch/nested-fns
   fall back to fork), plus generic-`|T|` params/returns excluded (they
   monomorphize via the fork path). Correct for nested/branch/two-arg cases.
-  **Did NOT speed up `call_heavy`:** the real bottleneck is the per-iteration
-  forked loop body + append-only heap (Phase 0 part 2), not the call convention.
-- [ ] **(next, higher priority than d/e) loops run sync bodies inline.** Teach
-  the loop to detect a sync body (via the effect analysis) and run it without
-  forking a closure per iteration; pair with heap reclamation. This is what
-  unlocks the `call_heavy` win.
+  **Did NOT speed up `call_heavy`** — see the critical finding below.
+- [ ] **(next, higher priority than d/e) the jmp-fallback loop transient-alloc
+  leak — the real blocker.** See "Critical finding" below.
 - [ ] (d) recursion end-to-end (`recursive_regression`).
 - [ ] (e) wire the arg / struct-field / typed-value capture fast paths; widen
   `syncReturnAllowed` (error unions/optionals) once the sync return path carries
   the discriminant.
+
+## Critical finding: the jmp-fallback loop leaks ~20 KB/iter (the real blocker)
+
+The reason `call_heavy` (and any compute-in-loop) is slow is **not** the call
+convention and **not** a forked loop body. Measured cleanly (ReleaseFast):
+
+| loop body (single-range `for (0..N)`) | 1M time | 1M peak RSS |
+|---|---|---|
+| `total = total + i` (no `ref`) | 0.09 s | 5 MB |
+| `const x = i + 1; total = total + x` | ~25 s | ~14 GB |
+
+Scaling of the `const` case is strictly linear: ~20 KB and ~0.4 ms **per
+iteration**. Yet at teardown the process state is tiny (`heap.len=8`), so the
+memory is **transient** — allocated and freed each iteration, but the allocator
+retains the pages, so peak RSS (and time) grow linearly.
+
+Root of the split:
+- `total += i` compiles to a `counted_loop` (a tight native runtime loop,
+  `tryRunFastRangeLoop`) because its body is `instructionSetIsCountedLoopSafe`
+  (only `set`/`ath`/`cmp`/… — **no `ref`**).
+- **Any** `const`/computed binding needs a `ref`, which disqualifies
+  `counted_loop`, so the loop falls back to the general jmp loop that runs the
+  body through `runInstruction` per instruction (the loop body IS inline — there
+  is no per-iteration fork; the earlier "forked body" framing was wrong).
+- Somewhere on that per-instruction path a ~20 KB transient allocation happens
+  each iteration. **Not yet root-caused** — it is not an `alloc` in the IR
+  (the compiled loop body is just `ref`/`ath`/`ath`/`pop`), so it is inside the
+  runtime execution of those ops or the step loop. Next step: instrument the
+  allocator (a counting wrapper) to find the ~20 KB/iter call site; candidates
+  ruled out so far — the stack ArrayList (append+pop reuses capacity), the
+  append-only heap (teardown `heap.len=8`), and per-instruction logging
+  (compiled out / verbose-gated in ReleaseFast).
+
+Fixing this is the highest-impact next task (it makes *all* compute-in-loops
+fast, and only then does the sync call show its win in `call_heavy`). Options:
+(a) find and remove the per-iteration transient allocation on the jmp loop path;
+(b) widen `counted_loop` to accept `ref`/`call` bodies (run them in the tight
+loop); (c) both.
 
 ## Open design questions (for when Phase 2 starts)
 
