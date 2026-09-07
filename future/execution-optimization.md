@@ -320,13 +320,42 @@ Effect (`const x = i + 1; total = total + x`, ReleaseFast, `</dev/null`):
 Now at the `counted_loop` ceiling — flat memory, ~linear-fast time. Full suite
 green (unit + 173 smoke + 57 diagnostics + 9 examples + FFI + strict-mode).
 
-**Fix direction 2 (part b) — still open.** Sync `call`/`ret` inside a counted-loop
-body: a sync `call` returns `.cont_no_instr_counter_inc` (it jumps to another
-instruction set and returns via `ret`), which `runAtomicInstructionSet` rejects
-(`ContNoInstrCounterIncInAtomic`). Making a fork-free call run inside the inline
-loop needs `runAtomicInstructionSet`/`runCountedLoop` to drive `call`/`ret` (a
-mini instruction-pointer loop over the body rather than a flat `for`). This is
-where increments (a–c)'s sync convention finally pays off on `call_heavy`.
+**Fix direction 2 (part b) — DONE.** Sync `call`/`ret` now runs fork-free inside
+a counted_loop. A sync `call` returns `.cont_no_instr_counter_inc` (it jumps to
+its entry set and returns via `ret`), which the flat `runAtomicInstructionSet`
+rejects. Replaced it (for counted loops) with `runCountedLoopBody`, a mini
+instruction-pointer loop: set the counter to the body set, run the instruction
+at the counter, and on `.cont`/`.skip` advance it, on `.cont_no_instr_counter_inc`
+follow whatever the instruction set it to (so `call`→entry and `ret`→caller both
+work). The iteration ends when control falls off the end of the body set (a
+trailing `ret` lands there too). Added `.call` to the counted-loop-safe
+whitelist; the sync classifier guarantees the whole callee tree is sync
+(ref/set/ath/call/ret, no yields), so nothing in the detour can block. The
+counted_loop's own address is saved and restored around the loop (the body
+runner clobbers the counter).
+
+One real bug surfaced and was fixed: `counter_ptr` (the loop variable) is a
+pointer into the value-stack ArrayList, and a call body grows the stack (args +
+padding + locals, ~12 slots) past its capacity, reallocating the backing and
+invalidating the pointer — so the post-body `counter_ptr.* += 1` wrote to freed
+memory, the counter lost its first increment, and the loop ran one extra
+iteration (a constant +1 in every sum). Fix: re-resolve the counter pointer
+after the body. This also hardened part a (a ref body that pushes past capacity
+had the same latent bug).
+
+Effect (`const x = inc i; total += x`, `fn inc(n) { yield n+1 }`, ReleaseFast):
+
+| N | before | after |
+|---|---|---|
+| 20 000 | 0.67 s / 566 MB | 0.01 s / 5 MB |
+| 1 000 000 | (unusable) | 0.87 s / 5 MB (flat) |
+
+`call_heavy` finally shows the sync-call win — fork-free calls, flat memory. Full
+suite green (unit + 173 smoke + 57 diagnostics + 9 examples + FFI + strict-mode).
+
+Remaining: (d) recursion (recursive sync fns — the driven loop already nests
+call/ret, but the classifier must be allowed to sync-lower them), (e) capture
+fast paths + widen `syncReturnAllowed`.
 
 ## (superseded) earlier framing: "jmp-fallback loop leaks ~20 KB/iter"
 

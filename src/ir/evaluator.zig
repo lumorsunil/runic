@@ -328,23 +328,71 @@ pub const IREvaluator = struct {
         thread: ir.context.IRThreadContext,
         counted_loop: ir.Instruction.CountedLoop,
     ) Error!Result {
+        // The body runner drives the thread's instruction counter (so it can
+        // follow a sync `call` into its entry set and back via `ret`). Save the
+        // counted_loop's own address and restore it afterwards so the caller's
+        // `step()` increments past the counted_loop as usual.
+        const resume_addr = thread.getCurrentInstructionAddr();
+
         while (true) {
             const counter_ptr = self.resolveFastUIntPointer(thread, counted_loop.counter.dereference()) orelse return Error.UnsupportedInstruction;
             if (counter_ptr.* != .integer) return Error.UnsupportedInstruction;
 
             const limit = self.resolveFastUIntSource(thread, counted_loop.limit) orelse return Error.UnsupportedInstruction;
-            if (counter_ptr.integer >= limit.get()) break;
+            const current = counter_ptr.integer;
+            if (current >= limit.get()) break;
 
-            switch (try self.runAtomicInstructionSet(thread, counted_loop.body_instr_set)) {
+            switch (try self.runCountedLoopBody(thread, counted_loop.body_instr_set)) {
                 .cont, .skip => {},
                 .cont_no_instr_counter_inc => return Error.ContNoInstrCounterIncInAtomic,
                 .exit => |exit_code| return .{ .exit = exit_code },
                 .process_exit => |exit_code| return .{ .process_exit = exit_code },
             }
-            counter_ptr.* = .{ .integer = counter_ptr.integer +| 1 };
+
+            // The body may have grown the value stack (pushing call args, locals,
+            // padding), reallocating its backing and invalidating `counter_ptr`.
+            // Re-resolve before writing the incremented counter.
+            const counter_ptr_after = self.resolveFastUIntPointer(thread, counted_loop.counter.dereference()) orelse return Error.UnsupportedInstruction;
+            counter_ptr_after.* = .{ .integer = current +| 1 };
         }
 
+        thread.setInstructionCounter(resume_addr);
         return .cont;
+    }
+
+    /// Runs one counted_loop iteration by executing `body_instr_set` while
+    /// following the thread's instruction counter. Unlike `runAtomicInstructionSet`
+    /// (a flat pass over a set's instructions), this lets a fork-free sync `call`
+    /// in the body jump to its entry set and return via `ret` — the counter walks
+    /// the detour and the iteration completes when control falls off the end of the
+    /// body set. All body instructions must be counted-loop-safe (see
+    /// `instructionSetIsCountedLoopSafe`), so none of them yield to the scheduler.
+    fn runCountedLoopBody(
+        self: *IREvaluator,
+        thread: ir.context.IRThreadContext,
+        body_instr_set: usize,
+    ) Error!Result {
+        const all = self.context.instructions();
+        thread.setInstructionCounter(.init(body_instr_set, 0));
+
+        while (true) {
+            const addr = thread.getCurrentInstructionAddr();
+            // The iteration is done when control returns to the body set past its
+            // last instruction (a trailing `ret` from a call lands here too).
+            if (addr.instr_set == body_instr_set and addr.local_addr >= all[body_instr_set].len) {
+                return .cont;
+            }
+
+            const instr = all[addr.instr_set][addr.local_addr];
+            switch (try self.runInstruction(thread, instr)) {
+                .cont, .skip => thread.incInstructionCounter(),
+                // `call`/`ret` (and any other counter-setting op) already moved the
+                // counter; keep following it.
+                .cont_no_instr_counter_inc => {},
+                .exit => |exit_code| return .{ .exit = exit_code },
+                .process_exit => |exit_code| return .{ .process_exit = exit_code },
+            }
+        }
     }
 
     fn materializeExecArgv(

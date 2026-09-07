@@ -10355,7 +10355,7 @@ pub const IRCompiler = struct {
     fn instructionSetIsCountedLoopSafe(self: *IRCompiler, instr_set: usize) bool {
         for (self.instruction_sets.items[instr_set].instructions.items) |instr| {
             switch (instr.type) {
-                .comment, .set, .ath, .cmp, .neg, .is_err, .make_err, .match_err, .err_payload, .get_env, .set_env, .simple_exec, .ref, .pop, .push => {},
+                .comment, .set, .ath, .cmp, .neg, .is_err, .make_err, .match_err, .err_payload, .get_env, .set_env, .simple_exec, .ref, .pop, .push, .call => {},
                 else => return false,
             }
         }
