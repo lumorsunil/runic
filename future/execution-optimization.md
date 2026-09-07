@@ -384,11 +384,27 @@ would swallow the output. Confirmed by `if_bare_body_regression`. So the broad
 `compileCall` hook was reverted in favor of the two value-position hooks above.
 Covered by `tests/features/sync_call_bare_positions_regression.rn`.
 
-Remaining: (e) capture fast paths + widen `syncReturnAllowed`
-(error-union/optional/sum/promise returns and capture-bearing fns still fork);
-member/indirect calls stay conservatively threaded; and the append-only-heap
-reclaim (deep recursion through the general `step()` path still accumulates
-per-call slots — the counted_loop path is already flat).
+**Increment (e), part 1 — optional returns, DONE.** `syncReturnAllowed` now
+permits `?T`: an optional value rides back in `%r` with its null/present
+discriminant intact, and its consumers (`if` capture, `orelse`, direct
+interpolation, typed-pipe coercion) read it directly — no typed-transport needed.
+Verified fork-free: a value-position `maybe n` call drops from 2 forks to 0 (only
+the fixed stdio threads remain). Covered by
+`sync_call_optional_return_regression.rn`; full suite green (174 smoke). Error
+discriminants (error-union/error-set/sum/promise/execution) still fork — they
+need the try/catch/match machinery the sync return path doesn't replicate yet.
+
+Note: an optional call in a *loop* (`const v = maybe i orelse 0`) does not yet go
+flat — the `orelse` makes the body non-counted-loop-safe (branches → general jmp
+loop) and the orelse-operand call position is a separate routing gap; both are
+independent of the return-type gate.
+
+Remaining: (e) the rest — error-union/sum/promise returns (needs typed transport +
+try/catch/match on the sync path); capture-bearing (closure) fns (the entry
+requires `closure_captures.len == 0`); member/indirect calls stay conservatively
+threaded; and the append-only-heap reclaim (deep recursion / forked-call-in-loop
+through the general `step()` path still accumulates per-call slots — the
+counted_loop path is already flat; this is the biggest remaining memory win).
 
 ## (superseded) earlier framing: "jmp-fallback loop leaks ~20 KB/iter"
 

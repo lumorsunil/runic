@@ -8144,16 +8144,19 @@ pub const IRCompiler = struct {
         };
     }
 
-    /// Whether a return type is eligible for v1 fork-free sync lowering. Values
-    /// carrying an error/optional discriminant (or an execution result) need the
-    /// typed-transport + try/catch/match machinery that the sync return path
-    /// does not yet replicate, so they stay on the fork path for now.
+    /// Whether a return type is eligible for v1 fork-free sync lowering. An
+    /// optional (`?T`) rides back in `%r` with its discriminant intact and its
+    /// consumers (`if` capture, `orelse`, interpolation) read it directly, so it
+    /// is allowed. Values carrying an *error* discriminant or needing typed
+    /// transport (error-union, error-set, sum, promise, execution, …) still need
+    /// the try/catch/match machinery the sync return path does not yet replicate,
+    /// so they stay on the fork path for now.
     fn syncReturnAllowed(return_type: ?*const ast.TypeExpr) bool {
         const t = return_type orelse return true; // Void
         // A generic return (`|T|`, `T`) is monomorphized via the fork path.
         if (t.* == .type_var or hasTypeCapture(t.*)) return false;
         return switch (t.*) {
-            .error_union, .optional, .promise, .error_set, .err, .sum, .type_merge, .execution, .failed => false,
+            .error_union, .promise, .error_set, .err, .sum, .type_merge, .execution, .failed => false,
             else => true,
         };
     }
