@@ -40,6 +40,7 @@ test {
     _ = @import("ir/context.zig");
     _ = @import("ir/evaluator.zig");
     _ = @import("ir/compiler.zig");
+    _ = @import("semantic/effects.zig");
     _ = @import("ffi/libffi.zig");
     _ = @import("ffi/ctype.zig");
     _ = @import("ffi/cbind.zig");
