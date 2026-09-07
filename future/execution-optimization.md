@@ -215,7 +215,46 @@ correct; full CI green. Build it in tested increments:
   `syncReturnAllowed` (error unions/optionals) once the sync return path carries
   the discriminant.
 
-## Critical finding: the jmp-fallback loop leaks ~20 KB/iter (the real blocker)
+## ROOT CAUSE FOUND: per-iteration stdin polling by the stdio stream threads
+
+**It is not a memory leak — it is syscalls.** `strace -c` shows `poll` and
+`read` scaling linearly (~8 each per loop iteration; N=3000→24k, N=6000→48k),
+while `mmap`/`munmap` stay flat. `strace -k` pins the call:
+`runInstruction → ReaderWriterStream.forward → PipeReader.stream → read(0,…,1)=0`
+— i.e. **the stdin stream-forwarding thread busy-polls stdin (a `read(0)` that
+returns EOF, then re-runs) once per scheduler round.**
+
+Why loops split:
+- Every program forks three background stdio threads (`fork <1:0>/<2:0>/<3:0>`
+  → sets `stream [S0]/[S1]/[S2]`). The stdin one forwards stdin and never
+  completes — its `forward` returns `.not_done`, so it re-polls forever, keeping
+  ≥4 threads live (so `singleThreadFastPathEligible`, which needs exactly one
+  thread, is never true here).
+- `total += i` matches `tryRunFastRangeLoop`, which runs **all** iterations in
+  one native loop **without yielding to the scheduler** — so the stdin thread
+  barely runs → ~no syscalls → flat and fast.
+- Any body needing a `ref` (any `const`/computed binding) drops to the general
+  jmp loop, which **yields to the round-robin scheduler every iteration**;
+  between iterations the scheduler runs the stdin thread, which does a
+  `read(0)`+`poll` each round → ~8 syscalls/iter → the ~0.4 ms/iter slowdown.
+  The "~20 KB/iter, freed at end" was transient io buffers for those reads, not
+  a leak (teardown state is tiny; nothing scales through the interpreter
+  allocator, the Value stacks stay cap=8, and context tables stay small).
+
+**Fix directions (next task):**
+1. Don't busy-poll stdin: when stdin is at EOF / not readable, the stream-forward
+   thread should block or complete instead of re-running every scheduler round
+   (`.not_done` → spin). This alone likely removes the per-round syscall.
+2. Run a single-thread-safe loop body inline without a scheduler round-trip per
+   iteration (widen the `counted_loop`/fast path to bodies containing
+   `ref`/`ath`/`set`/sync-`call`, not just the one-ath shape) — so compute loops
+   don't yield to the stdio threads at all. This is also exactly where the sync
+   `call`/`ret` pays off (a fork-free call can run in that inline loop).
+
+Both are tractable and well-scoped now that the cause is known. Only after this
+does `call_heavy` show the sync-call win.
+
+## (superseded) earlier framing: "jmp-fallback loop leaks ~20 KB/iter"
 
 The reason `call_heavy` (and any compute-in-loop) is slow is **not** the call
 convention and **not** a forked loop body. Measured cleanly (ReleaseFast):
