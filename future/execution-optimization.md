@@ -602,11 +602,40 @@ Start with P1 (bounded, biggest single win, reuses RC). P2 is the follow-up.
    non-escaping stage temporaries — never a pipe whose handle was bound/returned.
 
 De-risk order: do (1) first (pipes on a freeing allocator; still freed only at
-`deinit`) — pure refactor, suite stays green, no reclaim yet. Then (2) (emit
-`pipe_free` for the exec/fork stage temporaries) — fork-in-loop RSS should go
-flat; run under the debug allocator to catch a double-free or a freed-but-live
-pipe. Only stage-plumbing pipes are targeted first; other pipe creators
-(pipelines, subshells, redirects) are added once the pattern is proven.
+`deinit`) — pure refactor, suite stays green, no reclaim yet. **(1) is DONE
+(commit bac0981).**
+
+**Sub-step (2) as first specced — a fixed-point `pipe_free` — is UNSAFE. Do not
+ship it.** Investigating it revealed why: the exec/fork result struct stores the
+stdout/stderr/merged **pipe handles** in its `.stdout`/`.stderr`/`.merged` fields
+(compiler ~line 2888), and `materializeString` reads a `.pipe` value's buffer
+*lazily* (evaluator ~line 2828). The same handles are also how output **streams**
+onward (`bash … | grep`). So a stage's pipes must live as long as the result
+*value* that references them — which is first-class: it can be bound
+(`const m = bash …; echo m.stdout`), stored in a struct, or returned. Freeing at
+stage teardown would be a use-after-free; eager-materializing the buffers to
+strings at stage end would break streaming. Pipe lifetime = the lifetime of the
+`.pipe` **values** that reference the handle. There is no fixed IR point.
+
+**Correct sub-step (2): refcount the pipe handle by its value references.** Keep
+a per-handle count in the context. Retain when a `.pipe` value is stored into a
+slot (`set`/`push`/heap-write/closure-write), release when a slot holding a
+`.pipe` is overwritten or dropped (`pop`, `ret` stack truncation, rebind); at 0,
+remove the handle from `pipes`/`typed_pipe_queues`/`consumed_pipes` and
+`deinitParent` the stream. Pipes never reference pipes, so **no cycles** — RC is
+complete here. The retain/release goes at the handful of central value-move sites
+(each cheap-guarded by `value == .pipe`), so it does not touch integer-only hot
+loops. Sub-step (1)'s freeing allocator is exactly what makes the count-0 free
+reclaim. This is more like the Tier-2 discipline than a bounded op — but scoped
+to `.pipe` values only, and cycle-free.
+
+Implication for the plan: **pipes are not an independent "resource" tier** — they
+are referenced by first-class values, so their reclaim is value-lifetime-driven,
+same as the value tier. The hybrid's clean "RC resources vs scratch values" split
+does not hold for pipes (you cannot escape-copy a live stream). Refcounting
+`.pipe` values is the right mechanism; other pointer resources with no
+value-reference (a subshell context, a file sink tied to a redirect) may still
+suit a simpler owned-lifetime free.
 
 ### Measurement of loop heap/stack growth (decides whether P2 is worth it)
 
