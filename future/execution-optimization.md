@@ -474,6 +474,108 @@ try/catch/match on the sync path); capture-bearing (closure) fns (the entry
 requires `closure_captures.len == 0`); member/indirect calls stay conservatively
 threaded.
 
+## Runtime freeing-allocator rework — design notes (grounded in two probes)
+
+**Current architecture.** `runIR` makes one `ArenaAllocator` (over the process
+GPA) and uses it for *both* compile and runtime. Compile builds `IRSharedContext`
+(instructions/data/labels/struct_types) — these must outlive the run. At runtime
+the evaluator (via `runner.allocator`) and the context (`context.allocator`) share
+that *same* arena and allocate threads, per-fork pipes/`ReaderWriterStream`s,
+closures, the value heap, and the bookkeeping maps. The arena never frees, so all
+of it lives to program end. `context.deinit` already contains correct, complete
+teardown for every resource type — but every `.deinit(self.allocator)` in it is a
+no-op because `self.allocator` is the arena; `arena.deinit()` does the real work
+in one shot.
+
+**Probe 1 (switch only `context.allocator` to the GPA):** immediate "Invalid
+free" in `freeThreadPrivate`. Cause: the evaluator allocates a forked thread's
+stack via `runner.allocator` (still the arena) while the context frees it via the
+GPA. ⇒ the evaluator and context MUST share one runtime allocator.
+
+**Probe 2 (switch both `runner.allocator` and `context.allocator` to the GPA):**
+programs run correctly and there are **no invalid frees** — but the GPA reports
+**leaks**: e.g. `materializeExecArgv` argv strings and `.zig_string` interpolation
+dupes (`allocator.dupe(u8, …)`) are allocated and never freed. ⇒ the runtime is
+written *leak-and-forget*; the arena is its safety net. A freeing switch is not a
+one-liner: every such site needs a real lifetime.
+
+**Options (each its own scoped effort):**
+1. **Two arenas — persistent + resettable scratch (recommended).** Keep
+   leak-and-forget. Persistent arena: main-thread-durable state (its stack,
+   bindings, `shared`, the value heap, module cache). Scratch arena: per-fork
+   transient (forked thread stacks/privates, per-fork pipes/streams/closures,
+   transient dupes). Reset the scratch arena at a *quiescent point* — only the
+   main thread live, `threads_to_remove` empty, no pipe threads — where every
+   completed fork's machinery is provably dead. The audit is coarse (classify by
+   allocation *site/purpose*, not per-object lifetime), plus one contained rule:
+   a value that crosses the fork→main boundary (dequeued from a pipe / captured)
+   must be copied into the persistent arena so it survives a reset. Bulk reclaim,
+   no per-free correctness risk; wrong classification shows up as a dangling-read
+   crash under the debug allocator (caught by tests), or as persistent growth.
+2. **Full freeing rework.** One runtime allocator (freeing), plug every leak,
+   free each reaped stage's pipes/closeables/map-entries incrementally. Most
+   thorough (also fixes real leaks, enables long-running scripts) but the largest,
+   riskiest audit — runtime values (`.zig_string`, slices) flow between threads
+   and into bindings, so lifetimes are entangled.
+3. **Targeted: pipes/streams only.** The measured bulk (~10 KB/iter) is per-fork
+   `ReaderWriterStream`s. Give *pipes* a freeing allocator and `deinitParent` them
+   when a stage's pipe is consumed/closed (machinery exists), leaving values on
+   the arena. Narrowest; reclaims most of the fork-in-loop cost without touching
+   value lifetimes — but needs a safe per-pipe "done" signal during the run.
+4. **Reduce forks instead (orthogonal).** The sync-lowering call-path rework
+   removes the fork — and thus the allocation — for the common compute cases; it
+   does nothing for genuinely concurrent work (commands, real pipelines).
+
+Recommendation: option 1 (two arenas) is the best effort/risk/reward — it reclaims
+the bulk without a per-object free audit. Option 3 is a good smaller first step if
+we want a bounded win before committing to the classification work.
+
+### CHOSEN (2026-09-08): hybrid — RC-reclaim resources + scratch-arena values
+
+Runic already has `RC(T)` (`src/mem/rc.zig`), and the stream types (pipes are
+`ReaderWriterStream`) already carry an `RC(...).Ref`. Two reasons RC doesn't
+reclaim today: the RC box is arena-allocated (its `deinit` free is a no-op), and
+the `pipes` map holds a ref for the whole program so the count never hits 0.
+
+Allocator layout for the runtime:
+- **compile arena** — `shared` (instructions/data/labels/struct_types). Unchanged;
+  persists to program end.
+- **persistent** (freeing) — main-thread-durable state and any value that escapes
+  the fork→main boundary; also backs the RC boxes for resources.
+- **scratch arena** — per-fork/-iteration transients: forked thread stacks/privates,
+  the transient part of the value heap, `.zig_string`/argv dupes. Reset in bulk at
+  a *quiescent point* (only the main thread live, `threads_to_remove` empty, no
+  pipe threads). Because these are bulk-reset, their leak-and-forget style needs
+  **no** per-object free audit.
+- **resources** (pipes/streams/closeables/cimports/subshell contexts/file sinks) —
+  RC boxes allocated from `persistent`; each owner releases its ref when done, and
+  the count reaching 0 frees the box. This is Tier 1.
+
+The one cross-cutting rule: a value that crosses **fork→main** (dequeued from a
+typed pipe, or a captured binding result) is copied into `persistent` so it
+survives a scratch reset. The value heap is therefore split by address range into
+a persistent region and a scratch region; a scratch reset truncates only the
+scratch region.
+
+**Phasing (each phase shippable + suite-green before the next):**
+- **P0 — allocator seam.** Thread ONE `runtime_allocator` through the evaluator
+  (`runner.allocator`) and context (`context.allocator`); keep compile on the arena.
+  (Probe 2 showed this runs correctly but leaks — the leaks are exactly the values
+  P2 moves to the scratch arena, so P0 lands with the runtime allocator = the
+  compile arena still, i.e. a no-op refactor that just introduces the seam/param.)
+- **P1 — Tier 1 RC resources.** Allocate resource RC boxes from a freeing allocator
+  and release refs at the right points (thread reap releases its pipe refs; a pipe
+  leaves the `pipes` map when disconnected from all ends). Needs a focused pass on
+  pipe ref *ownership* (who holds strong refs vs the registry). Reclaims the
+  measured ~10 KB/iter bulk. De-risk: fork-in-loop RSS should go flat; run under the
+  debug allocator for double-free/leak.
+- **P2 — scratch value heap.** Split the heap into persistent/scratch address
+  ranges; route transient value allocs to scratch; add the fork→main copy-out;
+  reset scratch at quiescent points. De-risk: dangling reads surface under the debug
+  allocator + the feature/smoke suite.
+
+Start with P1 (bounded, biggest single win, reuses RC). P2 is the follow-up.
+
 ## (superseded) earlier framing: "jmp-fallback loop leaks ~20 KB/iter"
 
 The reason `call_heavy` (and any compute-in-loop) is slow is **not** the call
