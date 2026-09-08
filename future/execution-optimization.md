@@ -450,14 +450,29 @@ has no production consumer (only live echo reads traces), so gating `trace()` on
 view traces). fib(22): 1.25 s / 1.12 GB → **0.33 s / 5.2 MB**; fib(28) now flat at
 5 MB; the orelse fork-in-loop that used to run out of memory now completes.
 
+**Fork-in-loop memory — investigated; NOT a heap-reclaim job (measured).** After
+the tracer fix, the residual growth in a forking loop (`maybe i orelse 0`,
+N=5000) breaks down as: heap ≈3 slots/iter, `thread_exit_codes` ≈3/iter, `pipes`
+≈3/iter — all small — but the **runtime arena ≈10 KB/iter** (54 MB at N=5000).
+The dominant cost is that each forked stage allocates a `ReaderWriterStream` +
+buffers from the context allocator, and **the whole runtime runs on a
+never-freeing `ArenaAllocator`** (`runIR`), so per-fork pipes/streams/closures
+accumulate for the life of the program. Reclaiming just the reaped thread's
+closure heap slots would recover ~1 % of this; the maps and pipe buffers are in
+the arena and cannot be freed piecemeal.
+
+So the real fix is architectural, not a bounded reclaim: either (a) give the
+**runtime** a freeing allocator (or a resettable scratch arena for transient
+per-fork resources) and free a reaped stage's pipes/streams/closure/map-entries,
+or (b) make fewer things fork — the systematic sync-lowering call-path rework
+above eliminates the fork (and thus the allocation) entirely for the common
+compute cases. Treat (a) as its own project (the runtime currently relies on the
+arena never freeing, so it needs a full free-correctness audit).
+
 Remaining: (e) the rest — error-union/sum/promise returns (needs typed transport +
 try/catch/match on the sync path); capture-bearing (closure) fns (the entry
 requires `closure_captures.len == 0`); member/indirect calls stay conservatively
-threaded. And the genuine **append-only heap** growth (now unmasked by the tracer
-fix): a forked call in a loop accumulates ~12 heap slots/iteration for its closure
-(the heap has no free path). This is real but far smaller than the tracer was, and
-many fork-in-loop cases are already avoided by sync lowering / counted loops;
-reclaiming a reaped thread's closure slots is the next memory step.
+threaded.
 
 ## (superseded) earlier framing: "jmp-fallback loop leaks ~20 KB/iter"
 
