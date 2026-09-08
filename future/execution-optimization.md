@@ -438,12 +438,26 @@ inherits it — which requires resolving the statement-position dual semantics f
 own focused project: give `compileCall` the sync hook, and have `compileStatement`
 route a statement-position sync call's `%r` to stdout to preserve output.
 
+**Runtime memory — the real driver was the tracer, DONE (big win).** The
+"append-only heap" framing for deep-recursion memory was **wrong** (measured: fib
+recursion leaves the heap at ~9 items and the runtime arena at ~1.3 MB). The
+gigabytes were the **Tracer**: `Tracer.trace` unconditionally allocates a
+`BasicTrace` + an `allocPrint`ed message and appends to `full_log` (never freed),
+and `ReaderWriterStream.forward` calls it on every stream-thread `forward` — once
+per scheduler round, i.e. per instruction in the general `step()` path. `full_log`
+has no production consumer (only live echo reads traces), so gating `trace()` on
+`echo_to_stdout` makes it a no-op when tracing is off (the debugger flips it on to
+view traces). fib(22): 1.25 s / 1.12 GB → **0.33 s / 5.2 MB**; fib(28) now flat at
+5 MB; the orelse fork-in-loop that used to run out of memory now completes.
+
 Remaining: (e) the rest — error-union/sum/promise returns (needs typed transport +
 try/catch/match on the sync path); capture-bearing (closure) fns (the entry
 requires `closure_captures.len == 0`); member/indirect calls stay conservatively
-threaded; and the append-only-heap reclaim (deep recursion / forked-call-in-loop
-through the general `step()` path still accumulates per-call slots — the
-counted_loop path is already flat; this is the biggest remaining memory win).
+threaded. And the genuine **append-only heap** growth (now unmasked by the tracer
+fix): a forked call in a loop accumulates ~12 heap slots/iteration for its closure
+(the heap has no free path). This is real but far smaller than the tracer was, and
+many fork-in-loop cases are already avoided by sync lowering / counted loops;
+reclaiming a reaped thread's closure slots is the next memory step.
 
 ## (superseded) earlier framing: "jmp-fallback loop leaks ~20 KB/iter"
 

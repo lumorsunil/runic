@@ -209,6 +209,12 @@ pub const Tracer = struct {
         comptime fmt: []const u8,
         args: anytype,
     ) void {
+        // Building a trace allocates (a BasicTrace + the formatted message) and
+        // appends to `full_log`, which is never freed. On a hot path — e.g. the
+        // stdio stream threads call this on every `forward`, once per scheduler
+        // round — that churns gigabytes over a long run. The log is only ever
+        // consumed by live echo, so when echo is off there is nothing to build.
+        if (!self.config.echo_to_stdout) return;
         const new_trace = self.initTraceBasic(severity, tags, span, fmt, args) catch return;
         self.traceCustom(new_trace);
     }
