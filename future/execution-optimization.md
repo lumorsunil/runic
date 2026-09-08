@@ -576,6 +576,48 @@ scratch region.
 
 Start with P1 (bounded, biggest single win, reuses RC). P2 is the follow-up.
 
+### Measurement of loop heap/stack growth (decides whether P2 is worth it)
+
+The "reset at program quiescence (only main thread)" trigger was **wrong**: the
+three stdio stream threads live for the whole program, so that point is never
+reached, and it wouldn't help a single long loop/recursion anyway. Before
+building P2, measured heap+arena growth across representative loop shapes
+(per-iteration deltas from N=1000→5000, or 5000→50000):
+
+| loop shape | heap/iter | arena/iter | class |
+|---|---|---|---|
+| pure int `t+=i` (counted) | 0 | 0 | already flat |
+| ref body `const x=i+1; t+=x` (counted) | 0 | 0 | already flat |
+| sync call `const x=inc i; t+=x` (counted) | 0 | 0 | already flat |
+| transient string `const s="x${i}"; t+=s.len` | ~3 slots | ~940 B | **garbage** |
+| transient array `const a=.{i,i,i}; t+=a.len` | ~4 slots | ~270 B | **garbage** |
+| array build `a = a.push i` | quadratic | quadratic + **forks** | pathology |
+
+Conclusions:
+- Compute in a counted_loop (int / ref / sync-call) is **already flat** — the
+  biggest and most common case is done. Deep-recursion *stack* is inherent live
+  data (bound it with tail-call frame reuse or a depth limit, not reclaim).
+- **Garbage** = a transient value built and dropped inside a loop (string/array
+  not kept). Real but moderate (~hundreds of B + a few slots/iter; ~GB only at
+  N≥1e6). Reclaimable.
+- `a.push` in a loop is a separate pathology: it **forks** (pipes grow ~3/iter)
+  and copies the whole array each time (quadratic). Its win is in-place linear
+  arrays + a non-forking push, not the allocator rework.
+
+**Trigger fix for P2 (if built):** not program quiescence — a **high-water-mark**
+scratch heap checkpointed at loop-iteration / call-frame boundaries (the
+counted_loop is the natural driver: it already runs a net-neutral body per
+iteration). Restore the mark at iteration end; a value that escaped this iteration
+(bound to an outer var, accumulated, returned) is copied to persistent first.
+
+**Reprioritization from the data:** P1 (RC resources / pipes) is confirmed
+highest-value — pipes dominate every fork case (fork-in-loop AND `a.push`). The
+value tier (P2) is real but moderate and can be **deferred**; when built, use the
+checkpoint trigger above (full value-refcounting would also work and needs no
+checkpoint, but costs per-boxed-value retain/release and leaks cycles — not
+justified by the moderate garbage measured). A separate, high-value item surfaced:
+**in-place non-forking `array.push`** (quadratic+forking today).
+
 ## (superseded) earlier framing: "jmp-fallback loop leaks ~20 KB/iter"
 
 The reason `call_heavy` (and any compute-in-loop) is slow is **not** the call
