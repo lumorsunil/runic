@@ -105,6 +105,12 @@ pub const IREvaluator = struct {
         stdout_is_tty: bool = false,
         stderr_is_tty: bool = false,
         tracer: *Tracer,
+        /// Allocator for runtime-created pipes (`ReaderWriterStream` RC boxes and
+        /// their buffers). Distinct from `self.allocator` (the compile+runtime
+        /// arena) so a pipe's `deinitParent` actually reclaims — the groundwork
+        /// for freeing per-stage pipes during the run (P1). Falls back to
+        /// `self.allocator` when null (tests, debugger), preserving old behavior.
+        pipe_allocator: ?Allocator = null,
     };
 
     pub fn init(
@@ -2026,7 +2032,7 @@ pub const IREvaluator = struct {
                 return .cont;
             },
             .pipe => |instr_pipe| {
-                const pipe = try Stream(u8).initReaderWriter(self.allocator, "pipe", .{}, self.config.tracer);
+                const pipe = try Stream(u8).initReaderWriter(self.config.pipe_allocator orelse self.allocator, "pipe", .{}, self.config.tracer);
                 const pipe_handle = try self.context.addPipe(pipe);
 
                 try self.setLocation(thread, instr_pipe.result, .{ .pipe = pipe_handle });

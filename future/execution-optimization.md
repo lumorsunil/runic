@@ -576,6 +576,38 @@ scratch region.
 
 Start with P1 (bounded, biggest single win, reuses RC). P2 is the follow-up.
 
+### P1 investigation — pipe ownership (what the RC actually does today)
+
+- `initReaderWriter` creates the `ReaderWriterStream` in an `RC` box with
+  **refcount 1** (the self-ref stored in `.ref`), allocated from the context
+  allocator (the arena). `addPipe` stores a **raw `*ReaderWriterStream`** in the
+  `pipes` map keyed by handle — it does not take a counted ref.
+- `connectSource`/`connectDestination` do **not** bump the count. Nothing does.
+  So the count is always 1: RC is a single-owner box here, not multi-owner
+  refcounting. Pipe *handles* are plain `usize`s inside `Value{.pipe=h}`, copied
+  freely, so there is no general liveness tracking to hang a refcount on.
+- `deinitParent` drops the ref (→ free), but is only called in `context.deinit`,
+  and the arena makes that free a no-op. So pipes live to program end.
+
+⇒ P1 is two concrete pieces, not "flip RC on":
+1. **Freeing allocator for pipe boxes.** Allocate the `RC(ReaderWriterStream)`
+   box (and its buffers) from a freeing allocator so `deinitParent` actually
+   reclaims. (This is the P0 seam, scoped to pipes.)
+2. **A `pipe_free` op + compiler-emitted teardown.** The compiler creates the
+   per-stage plumbing pipes (stdout/stderr/merged for an exec/fork) as internal
+   temporaries and already pops their stack refs at stage end — it *knows* those
+   handles don't escape. Emit a `pipe_free h` there; at runtime it removes the
+   handle from `pipes` (+ `typed_pipe_queues`/`consumed_pipes`) and `deinitParent`s
+   the stream. Safety rests on the compiler only freeing pipes it created as
+   non-escaping stage temporaries — never a pipe whose handle was bound/returned.
+
+De-risk order: do (1) first (pipes on a freeing allocator; still freed only at
+`deinit`) — pure refactor, suite stays green, no reclaim yet. Then (2) (emit
+`pipe_free` for the exec/fork stage temporaries) — fork-in-loop RSS should go
+flat; run under the debug allocator to catch a double-free or a freed-but-live
+pipe. Only stage-plumbing pipes are targeted first; other pipe creators
+(pipelines, subshells, redirects) are added once the pattern is proven.
+
 ### Measurement of loop heap/stack growth (decides whether P2 is worth it)
 
 The "reset at program quiescence (only main thread)" trigger was **wrong**: the
