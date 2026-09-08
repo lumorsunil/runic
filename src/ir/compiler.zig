@@ -10367,10 +10367,18 @@ pub const IRCompiler = struct {
         return .fromValue(.void);
     }
 
+    /// Whether a loop body can run as a `counted_loop`. The body runner
+    /// (`runCountedLoopBody`) follows the thread's instruction pointer, so any op
+    /// here is safe as long as it never yields to the scheduler and its control
+    /// flow stays inside the body: `jmp` is allowed because a lowerable body's
+    /// only jumps are its own internal branches (if/else, match, a nested while) —
+    /// their targets are labels within this set — and `call` because a sync entry
+    /// is fork-free and returns via `ret`. Anything that forks, waits, streams, or
+    /// spawns (fork/exec/pipeline/wait/…) is absent and disqualifies the body.
     fn instructionSetIsCountedLoopSafe(self: *IRCompiler, instr_set: usize) bool {
         for (self.instruction_sets.items[instr_set].instructions.items) |instr| {
             switch (instr.type) {
-                .comment, .set, .ath, .cmp, .neg, .is_err, .make_err, .match_err, .err_payload, .get_env, .set_env, .simple_exec, .ref, .pop, .push, .call => {},
+                .comment, .set, .ath, .cmp, .neg, .is_err, .make_err, .match_err, .err_payload, .get_env, .set_env, .simple_exec, .ref, .pop, .push, .call, .jmp => {},
                 else => return false,
             }
         }

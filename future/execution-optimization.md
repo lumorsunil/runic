@@ -394,10 +394,28 @@ the fixed stdio threads remain). Covered by
 discriminants (error-union/error-set/sum/promise/execution) still fork — they
 need the try/catch/match machinery the sync return path doesn't replicate yet.
 
-Note: an optional call in a *loop* (`const v = maybe i orelse 0`) does not yet go
-flat — the `orelse` makes the body non-counted-loop-safe (branches → general jmp
-loop) and the orelse-operand call position is a separate routing gap; both are
-independent of the return-type gate.
+**Counted loops with control flow — DONE (big win).** `instructionSetIsCountedLoopSafe`
+now also allows `jmp`, so a for-loop body containing `if`/`else`/`else if`/`match`
+or a nested `while` compiles to a `counted_loop` instead of dropping to the
+general jmp loop. Safe because `runCountedLoopBody` follows the instruction
+pointer: a lowerable body's only jumps are its own internal branch targets (labels
+within the body set), so the runner walks them and still terminates by falling off
+the end; anything that forks/waits/streams is absent (not whitelisted) and keeps
+the body on the fork path. Combines with sync `call`/`ret` (a call inside an
+`if`-branch inside the loop is fine).
+
+Effect (if/else body, `total += (i>N ? 2 : 1)`, N=2 000 000, ReleaseFast): the
+general jmp loop took **41 min / 15 GB** (per-iteration scheduler round-trips
+through the general `step()` path accumulate); the counted_loop runs in **1.1 s /
+5 MB**. Covered by `counted_loop_control_flow_regression.rn` (if/else, else-if,
+match, while-in-for, value-position if, asymmetric branch temps, a sync call in a
+branch). Full suite green (175 smoke).
+
+Note: an optional call in a *loop* (`const v = maybe i orelse 0`) still does not
+go flat — the `orelse`-operand call position is a routing gap (the `maybe` call
+forks there, and a `fork` in the body disqualifies the counted_loop). This is
+independent of the return-type and jmp gates; routing orelse/operand call sites
+through `tryCompileSyncCall` is the remaining piece.
 
 Remaining: (e) the rest — error-union/sum/promise returns (needs typed transport +
 try/catch/match on the sync path); capture-bearing (closure) fns (the entry
