@@ -412,10 +412,31 @@ match, while-in-for, value-position if, asymmetric branch temps, a sync call in 
 branch). Full suite green (175 smoke).
 
 Note: an optional call in a *loop* (`const v = maybe i orelse 0`) still does not
-go flat — the `orelse`-operand call position is a routing gap (the `maybe` call
-forks there, and a `fork` in the body disqualifies the counted_loop). This is
-independent of the return-type and jmp gates; routing orelse/operand call sites
-through `tryCompileSyncCall` is the remaining piece.
+go flat. Root cause (investigated): a compound expression that merely *contains* a
+call (`maybe i orelse 0`) reports `needs_stdio_capture = true` and
+`compileExpressionWithCapture` forks the whole expression to capture a pipe — even
+though the only call is a *sync* one that produces no stdio. A `fork` in the body
+then disqualifies the counted_loop.
+
+**Attempted and reverted (whack-a-mole — do not retry piecemeal).** Making
+`callNeedsStdioCapture` return false for a call that has a sync entry does stop
+the compound force-fork (optloop went to 0.0 s / 5 MB), but `needs_stdio_capture`
+is *also* the flag every value context uses to choose between the sync-lowering
+capture path (`compileExpressionWithCapture`, which runs `tryCompileSyncCall`) and
+the plain `compileExpression` (no hook). Flipping it to false diverts sync-call
+operands into the plain path, where they fork with the wrong type — regressing
+arithmetic operands, `orelse` operands, and `${…}` interpolation
+(`call_in_arithmetic_regression`, `array_element_typing_regression`). Patching each
+value context (`compileArithmeticOperand`, `compileStableExpressionIntoRef`, …) to
+re-add a sync check is unbounded — there are many such contexts.
+
+The correct fix is systematic, not incremental: sync-lower a call in **one** place
+(the call path itself, `compileCall`/`compileExpression`), so every value context
+inherits it — which requires resolving the statement-position dual semantics first
+(a bare statement call's `yield` is stdout output, not a discarded `%r`; a naive
+`compileCall` hook swallows it — see `if_bare_body_regression`). Treat this as its
+own focused project: give `compileCall` the sync hook, and have `compileStatement`
+route a statement-position sync call's `%r` to stdout to preserve output.
 
 Remaining: (e) the rest — error-union/sum/promise returns (needs typed transport +
 try/catch/match on the sync path); capture-bearing (closure) fns (the entry
