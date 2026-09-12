@@ -47,6 +47,38 @@ Expected `right|7`; occasionally empty.
   true=0). So this is **not** a `keep_open` timing bug; the transient EOF reaches
   the consumer's OS stdin through the per-statement subprocess fd lifecycle.
 
+## Fix attempt (2026-09-12) — stopped; it is below the ReaderWriterStream layer
+
+Tried to fix it; could not safely, and here is why, so the next attempt starts ahead:
+
+- **It is consumer-side and a genuine no-match.** `… | grep -m 1 right|7 || echo
+  NOMATCH` prints `NOMATCH` on the flaky runs (10/300) — grep exits non-zero, i.e.
+  it read a stream that did **not** contain `right|7`. So the consumer receives a
+  *truncated* stream (transient EOF after line 1), while `cat` on the same producer
+  gets both lines 300/300.
+- **Not an inter-statement window-duration issue.** Inserting `bash -c "sleep 0.1"`
+  between the two echoes does **not** make it fail deterministically (9/10 still
+  correct) — `grep` blocks correctly through a slow gap. The transient EOF is a
+  momentary glitch at a specific instant, not "the gap is long enough to read EOF".
+- **The ReaderWriterStream model says it should NOT EOF.** The inter-stage pipe is
+  `keep_open=true` for the whole block (set false only at stage end, after both
+  echoes — `keep_open 0` in dumps is *true*). With `keep_open=true`, `forward` with
+  zero sources returns `.no_source` and does not close the destination, so the
+  consumer's stdin write-end (held by runic as the pipe's destination) should stay
+  open across the echoes. Each echo is spawned `.pipe` (a fresh OS pipe that runic
+  reads and forwards), so an echo exiting does not close the consumer's stdin fd.
+- **It is a Heisenbug.** Under `strace -f` the flake does not reproduce in 60 runs
+  (tracing perturbs the timing). So it is a tight race that instrumentation hides —
+  consistent with it living **below** the ReaderWriterStream layer, in the OS-fd /
+  `std.process.spawn` juggling (dup2/close) as the block's sequential subprocesses
+  are created, racing the consumer's read — not in the stream/keep_open logic.
+
+Because it hides under tracing and the stream-level logic is provably correct, a
+fix must target the OS-fd lifecycle, and any candidate can only be validated
+statistically (≥1000 untraced runs before/after). I did not ship a speculative
+change to the fd/spawn path — unverifiable root cause + high risk of shifting the
+race or hanging. Left for a dedicated concurrency pass.
+
 ## Fix direction (deferred — deep, risky)
 
 Keep the downstream consumer's stdin from signaling EOF across a multi-statement
