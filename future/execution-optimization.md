@@ -674,9 +674,18 @@ Conclusions:
 - **Garbage** = a transient value built and dropped inside a loop (string/array
   not kept). Real but moderate (~hundreds of B + a few slots/iter; ~GB only at
   N≥1e6). Reclaimable.
-- `a.push` in a loop is a separate pathology: it **forks** (pipes grow ~3/iter)
-  and copies the whole array each time (quadratic). Its win is in-place linear
-  arrays + a non-forking push, not the allocator rework.
+- `a.push` in a loop *was* a separate pathology (forked ~3 pipes/iter + copied the
+  whole array each push → O(n²)). **FIXED** (commit below): the in-place
+  linear-buffer path (`array_push_inplace`, amortized O(1), no fork) already
+  existed but never fired at the **top level** (the script body was never analyzed
+  by `analyzeLinearBuffers`) and `linScanExpr` bailed on a `for` loop whose source
+  is a **range** (`0..N`) — so the analysis returned empty and every push copied.
+  Two fixes: run `analyzeLinearBuffers` on the script statements, and handle
+  `.range` in the scan. A top-level `var a = .{ }; for (0..1e6) { a = a.push i }`
+  now runs in ~4.5 s / 136 MB (a live 1M-element array) instead of being
+  effectively unrunnable. (Separate pre-existing bug, unrelated: building an array
+  and returning `a.len` from inside a **function** yields empty output — noted for
+  later.)
 
 **Trigger fix for P2 (if built):** not program quiescence — a **high-water-mark**
 scratch heap checkpointed at loop-iteration / call-frame boundaries (the

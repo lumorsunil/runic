@@ -1,0 +1,36 @@
+# A top-level `var xs = .{ }` grown with `xs = xs.push e` in a loop must use the
+# in-place linear-buffer path (amortized O(1) grow), same as inside a function —
+# previously the top-level script body was never analyzed for linear buffers, and
+# the analysis also bailed on a `for` loop whose source is a range, so the build
+# was O(n²) (rebuild-copy each push). Correctness across a range loop, an array
+# loop, indexing, and `.with` in-place replacement is checked here. See
+# future/execution-optimization.md.
+fn Void @() Void
+
+# Range-source loop: build 0..9, sum and spot-check elements.
+var a = .{ }
+for (0..10) |i| {
+  a = a.push (i * i)
+}
+echo "len=${a.len} first=${a[0]} last=${a[9]}"
+var sum = 0
+for (a) |v| {
+  sum = sum + v
+}
+echo "sum=${sum}"
+
+# Array-source loop feeding another linear buffer.
+const words = .{ "a", "b", "c" }
+var joined = .{ }
+for (words) |w| {
+  joined = joined.push w
+}
+echo "joined=${joined[0]}${joined[1]}${joined[2]} n=${joined.len}"
+
+# In-place `.with` element replacement on a linear buffer.
+var b = .{ }
+for (0..5) |i| {
+  b = b.push i
+}
+b = b.with 2 99
+echo "with=${b[0]}${b[1]}${b[2]}${b[3]}${b[4]}"

@@ -1340,6 +1340,17 @@ pub const IRCompiler = struct {
             }
         }
 
+        // Identify the script body's linear-buffer vars (`var xs = .{ }` grown in
+        // place via `xs = xs.push e`), same as a function body — otherwise a
+        // top-level array-building loop rebuilds+forks each iteration (O(n²)).
+        // A nested function's analysis saves/restores this, so it doesn't leak.
+        const prev_linear = self.linear_buffers;
+        self.linear_buffers = self.analyzeLinearBuffers(self.script.statements);
+        defer {
+            self.linear_buffers.deinit(self.allocator);
+            self.linear_buffers = prev_linear;
+        }
+
         for (self.script.statements) |stmt| {
             _ = try self.compileStatement(stmt);
         }
@@ -8798,6 +8809,10 @@ pub const IRCompiler = struct {
                 },
             },
             .if_expr => |ife| linScanIf(scan, ife),
+            .range => |r| {
+                linScanExpr(scan, r.start);
+                if (r.end) |end| linScanExpr(scan, end);
+            },
             .for_expr => |f| {
                 for (f.sources) |src| linReadBase(scan, src);
                 linScanExpr(scan, f.body);
