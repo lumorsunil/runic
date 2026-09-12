@@ -5002,8 +5002,17 @@ pub const IRCompiler = struct {
         while (it.next()) |arg_expr| : (arg_i += 1) {
             // A command argument that is a fork-free sync call (`echo (f n)`)
             // resolves to its `call`/`ret` entry; its value (`%r`) is then
-            // materialized as the argument like any other value.
-            var arg = (try self.tryCompileSyncCall(arg_expr, arg_expr)) orelse try self.compileExpression(arg_expr);
+            // materialized as the argument like any other value. A forking value
+            // expression (`echo (build)` where `build` is a function/pipeline/block)
+            // must be *captured* — waited on and read into a value — the same as a
+            // binding (`const r = build`); compiling it plainly hands the command
+            // the raw thread handle, which materializes to nothing (and races the
+            // still-running producer). Sync calls and plain literals fall through.
+            var arg = (try self.tryCompileSyncCall(arg_expr, arg_expr)) orelse
+                if (self.argNeedsValueCapture(arg_expr))
+                    try self.compileExpressionWithCapture(source, arg_expr)
+                else
+                    try self.compileExpression(arg_expr);
             if (arg.isType(execution_result_struct_type)) {
                 const arg_ref = try self.newRef(source, "exec_result_arg");
                 try self.set(source, arg_ref, arg.source);

@@ -683,9 +683,13 @@ Conclusions:
   Two fixes: run `analyzeLinearBuffers` on the script statements, and handle
   `.range` in the scan. A top-level `var a = .{ }; for (0..1e6) { a = a.push i }`
   now runs in ~4.5 s / 136 MB (a live 1M-element array) instead of being
-  effectively unrunnable. (Separate pre-existing bug, unrelated: building an array
-  and returning `a.len` from inside a **function** yields empty output — noted for
-  later.)
+  effectively unrunnable. (A separate, pre-existing bug found while measuring this
+  — `echo (build)` where `build` is a forking value-returning function yielded
+  empty output — turned out to be the **command-argument capture path** handing
+  the command a raw thread handle (materializes to "") and racing the still-running
+  producer; only the slower array-loop producer exposed it. Fixed by capturing
+  forking command args via `compileExpressionWithCapture`, like a binding does —
+  see `command_arg_forking_value_regression.rn`.)
 
 **Trigger fix for P2 (if built):** not program quiescence — a **high-water-mark**
 scratch heap checkpointed at loop-iteration / call-frame boundaries (the

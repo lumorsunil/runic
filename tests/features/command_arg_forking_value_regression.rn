@@ -1,0 +1,36 @@
+# A forking value expression passed as a command argument (`echo (build)`) must be
+# captured — waited on and read into a value — not handed to the command as the
+# raw thread handle. A function whose body forks (e.g. it contains a loop) is a
+# slower producer, so passing its thread handle raced the still-running fork and
+# echoed nothing (materializing a `.thread` gives ""). Now command args are
+# value-captured like a binding (`const r = build`). See
+# future/execution-optimization.md.
+fn Void @() Void
+
+# A forked (loop-bodied) value-returning function as a bare command arg.
+fn Void buildLen() Int {
+  var a = .{ }
+  for (0..5) |i| {
+    a = a.push (i * 2)
+  }
+  yield a.len
+}
+echo (buildLen)
+
+# Its result also composes with a literal arg and with the array contents.
+fn Void sumTo() Int {
+  var a = .{ }
+  for (0..4) |i| {
+    a = a.push i
+  }
+  var s = 0
+  for (a) |v| {
+    s = s + v
+  }
+  yield s
+}
+echo "sum is" (sumTo)
+
+# A plain (non-forking) function arg still works (regression guard).
+fn Void inc(n: Int) Int { yield n + 1 }
+echo (inc 41)
