@@ -637,6 +637,19 @@ does not hold for pipes (you cannot escape-copy a live stream). Refcounting
 value-reference (a subshell context, a file sink tied to a redirect) may still
 suit a simpler owned-lifetime free.
 
+**DECISION (2026-09-08): pipe reclaim PAUSED.** Sub-step (1) stays (commit
+bac0981 — pipes on a freeing allocator, the correct foundation for either a later
+RC or a simple owned free). Sub-step (2) is **not** pursued now: the dominant
+runtime-memory cost was already removed (the tracer fix, commit 8bf8ff0), and the
+remaining fork-in-loop cases are increasingly avoided by sync lowering / counted
+loops. Value-lifetime refcounting of `.pipe` values (and, if unified, of all
+boxed values) is the correct next mechanism but is a pervasive change touching the
+central value-move sites — it deserves to be scoped as its own deliberate project
+rather than bolted on here. Revisit when a real workload shows fork-in-loop memory
+is the bottleneck. Higher-leverage bounded items to pick up first: the systematic
+sync-lowering call-path rework (removes forks at the source) and in-place
+non-forking `array.push` (quadratic + forking today).
+
 ### Measurement of loop heap/stack growth (decides whether P2 is worth it)
 
 The "reset at program quiescence (only main thread)" trigger was **wrong**: the
