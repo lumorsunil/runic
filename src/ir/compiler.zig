@@ -2734,28 +2734,39 @@ pub const IRCompiler = struct {
         }
     }
 
-    /// Fork-free lowering of a call to a `sync` function (v1: nullary,
-    /// capture-free). Emits `call <sync entry>` and takes the result from `%r`,
-    /// bypassing the fork + closure + pipe + wait + dequeue path entirely.
-    /// Returns null when the call isn't such a sync call (fall back to the
-    /// normal paths).
+    /// Fork-free lowering of a call to a `sync` function (capture-free). Emits
+    /// `call <sync entry>` and takes the result from `%r`, bypassing the fork +
+    /// closure + pipe + wait + dequeue path entirely. Handles both a plain
+    /// `f args` call and a UFCS method call `recv.method args` — for the latter
+    /// the receiver is prepended as the first argument (frame slot 0 = `self`),
+    /// exactly as the fork path does. Returns null when the call isn't such a sync
+    /// call (fall back to the normal paths).
     fn tryCompileSyncCall(self: *IRCompiler, source: anytype, expr: *ast.Expression) Error!?Result {
         if (self.effects == null) return null;
-        const call = switch (expr.*) {
-            .call => |c| c,
+        // Reject background/redirected calls up front (a bare `.binary` member —
+        // nullary UFCS `p.magSq` — has neither).
+        switch (expr.*) {
+            .call => |c| if (c.background or c.redirects.len != 0) return null,
+            .binary => {},
             else => return null,
-        };
-        if (call.background or call.redirects.len != 0) return null;
-        if (call.callee.* != .identifier) return null;
-        const name = call.callee.identifier.name;
+        }
+        // Resolve the callee — a bare identifier or a UFCS `recv.method` (receiver
+        // prepended to `arguments`), the same resolution the typed-value capture
+        // path uses. A field access (`p.x`) resolves to a non-function name and
+        // bails at the `isSync`/`isFunctionRef` checks below.
+        const info = (try self.capturableCallInfo(expr)) orelse return null;
+        if (info.redirects.len != 0) return null;
+        const name = info.method_name;
         if (!self.effects.?.isSync(name)) return null;
 
         const binding = self.lookup(name, .{ .shallow = false }) orelse return null;
         if (!binding.result.isFunctionRef()) return null;
         const forked_set = binding.result.source.value.fn_ref.fn_addr.instr_set;
         // The arity must match — a paramful function referenced with no args is a
-        // function *value*, and a mismatch is not a plain call.
-        if (self.instruction_sets.items[forked_set].param_count != call.arguments.len) return null;
+        // function *value*, and a mismatch is not a plain call. For UFCS the
+        // receiver is included in `info.arguments`, so this compares against the
+        // full param count (`self` + explicit params).
+        if (self.instruction_sets.items[forked_set].param_count != info.arguments.len) return null;
         const sync_set = self.sync_entries.get(forked_set) orelse return null;
 
         const return_type: ?ast.TypeExpr = if (binding.type_expr) |t|
@@ -2768,9 +2779,9 @@ pub const IRCompiler = struct {
         // Evaluate the arguments into stable refs first (their compilation may
         // push its own temporaries), then push the values contiguously so they
         // become the callee's frame slots 0..N-1.
-        const arg_refs = try self.allocator.alloc(ir.Location, call.arguments.len);
+        const arg_refs = try self.allocator.alloc(ir.Location, info.arguments.len);
         defer self.allocator.free(arg_refs);
-        for (call.arguments, 0..) |arg, i| {
+        for (info.arguments, 0..) |arg, i| {
             const r = try self.compileExpressionWithCapture(source, arg);
             const ref = try self.newRef(source, "sync_arg");
             try self.set(source, ref, stableResultSource(r));
@@ -2784,7 +2795,7 @@ pub const IRCompiler = struct {
         }
         try self.addInstruction(.init(.from(source), .{ .call = .{
             .dest = ir.InstructionAddr.initAbs(sync_set, 0),
-            .args = call.arguments.len,
+            .args = info.arguments.len,
         } }));
 
         // The raw-pushed args and the callee frame are reclaimed by `ret`, so the
