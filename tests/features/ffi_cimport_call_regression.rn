@@ -24,3 +24,10 @@ echo "strlen=${libc.strlen "hello"}"
 // getpid always returns a positive pid; the Bool renders as an exit code (0).
 const pid = libc.getpid
 echo "pid_positive=${pid > 0}"
+
+// An extern argument that is itself a Runic function call must be value-captured
+// (its yielded result), not forked — a bare call would hand the marshaller a
+// thread/exec-result handle instead of the returned value. (The by-value-struct
+// form, `DrawRectangleRec (entityRec e) …`, needs the same capture.)
+fn Void neg(n: Int) Int { yield 0 - n }
+echo "abs_call_arg=${libc.abs (neg 7)}"

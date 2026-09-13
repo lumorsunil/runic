@@ -4,3 +4,4 @@ cos=1
 abs=5
 strlen=5
 pid_positive=0
+abs_call_arg=7

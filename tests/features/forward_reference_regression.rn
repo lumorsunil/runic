@@ -23,3 +23,19 @@ fn Void run() Void { nums | showit }
 fn Void nums() Int { yield 1; yield 2; yield 3 }
 fn Void showit(n: Int) Void { echo "n=${n}" }
 run
+
+# A forward-referenced consumer that CAPTURES a global. `drive` forks `tally` (a
+# pipe consumer) and `tallyLoop` (a for-loop consumer) before either is declared;
+# both read the global `base`. The fork site must compile the callee's body first
+# so its closure captures (`base`) are known — otherwise the consumer runs with
+# an uninitialized closure slot and dereferences garbage at runtime (was a
+# `Could not dereference address 0x…` crash for a struct-valued global).
+const P = struct { x: Int, y: Int }
+var base = P{ .x = 100, .y = 200 }
+var pts = .{ P{ .x = 1, .y = 2 }, P{ .x = 3, .y = 4 } }
+fn Void drive() Void { pts | tally }
+fn Void tally(p: P) Void { echo "base=${base.x},${base.y} p=${p.x},${p.y}" }
+drive
+fn Void driveLoop() Void { for (pts) |p| tallyLoop p }
+fn Void tallyLoop(p: P) Void { echo "sum=${base.x + p.x}" }
+driveLoop

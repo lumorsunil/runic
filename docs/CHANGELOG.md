@@ -12,6 +12,23 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Forward-referenced consumer closures.** A top-level function used as a
+  pipeline or `for`-loop consumer *before* its own declaration
+  (`fn run() { items | handle }` with `handle` declared later) now captures its
+  closed-over globals correctly. The fork site previously read the callee's
+  closure captures before the callee's body was compiled, so the consumer ran
+  with an uninitialized closure slot and dereferenced garbage at runtime
+  (`Could not dereference address 0x…`, most visibly for a struct-valued
+  global). The callee's body is now compiled on demand before its captures are
+  read.
+- **Function-call arguments to C externs.** Passing a Runic function call
+  straight to a `cimport` extern — including a function that returns a by-value
+  struct, e.g. `DrawRectangleRec (entityRec e) e.color` — now value-captures the
+  returned value instead of forking the call and handing the FFI marshaller a
+  thread handle (which failed with `CImportUnsupportedType`).
+
 ## [0.10.0] - 2026-09-13
 
 Compute-heavy, in-process Runic is now dramatically faster. A synchrony (effect)

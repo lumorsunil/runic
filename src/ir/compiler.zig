@@ -637,6 +637,19 @@ pub const IRCompiler = struct {
     /// the set the forward call sites already point at.
     hoisted_fn_sets: std.AutoHashMapUnmanaged(*const ast.Expression, usize) = .empty,
 
+    /// Reverse of `hoisted_fn_sets`: a hoisted function's instruction set → its
+    /// `fn …` expression, so a call/fork site can compile the callee's body
+    /// on demand (see `ensureFnBodyCompiled`) when it is forward-referenced.
+    hoisted_set_sources: std.AutoHashMapUnmanaged(usize, *ast.Expression) = .empty,
+    /// Hoisted function sets whose body has already been compiled — so the main
+    /// statement loop skips re-compiling one that was pulled forward on demand,
+    /// and an on-demand request is a no-op once satisfied.
+    compiled_fn_sets: std.AutoHashMapUnmanaged(usize, void) = .empty,
+    /// Hoisted function sets whose body is mid-compilation — guards against
+    /// infinite recursion when two forward-referenced functions fork each other
+    /// (a cycle falls back to whatever captures are known so far).
+    compiling_fn_sets: std.AutoHashMapUnmanaged(usize, void) = .empty,
+
     /// Concrete types bound by `|T|` captures in binding positions (`const x:
     /// []|T| = …` → `T` = the element type). A later `: T` resolves through here.
     type_captures: std.StringHashMapUnmanaged(ast.TypeExpr) = .empty,
@@ -6051,6 +6064,13 @@ pub const IRCompiler = struct {
             }
         }
 
+        // A forward-referenced callee's body may not be compiled yet; its
+        // `closure_captures`/`closure_slot_count` (read just below to build the
+        // callee's closure) are only finalized by `compileFnDecl`. Compile it
+        // now so this fork copies the globals the callee captures — otherwise
+        // the callee dereferences an uninitialized closure slot at runtime.
+        if (!is_self_recursive) try self.ensureFnBodyCompiled(fn_addr.instr_set);
+
         const self_closure_depth = if (is_self_recursive) blk: {
             const frame = try self.scopes.getFrame(0);
             break :blk if (frame.scope_type == .closure) @as(usize, 0) else try self.nearestClosureDepth();
@@ -8212,7 +8232,17 @@ pub const IRCompiler = struct {
         const arg_sources = try self.allocator.alloc(ir.ValueSource, call.arguments.len);
         for (call.arguments, arg_sources) |arg_expr, *dst| {
             const arg_ref = try self.newRef(source, "cimport_arg");
-            try self.set(source, arg_ref, stableResultSource(try self.compileExpression(arg_expr)));
+            // A call/pipeline argument (e.g. a Runic function returning a
+            // by-value struct passed straight to the extern, `DrawRectangleRec
+            // (entityRec e) …`) must be value-captured, not compiled plainly —
+            // a bare call forks and yields a thread/exec-result handle, whereas
+            // the struct marshaller needs the yielded struct's base address.
+            // A struct literal or scalar arg already compiles to the right shape.
+            const compiled = if (self.argNeedsValueCapture(arg_expr))
+                try self.compileExpressionWithCapture(source, arg_expr)
+            else
+                try self.compileExpression(arg_expr);
+            try self.set(source, arg_ref, stableResultSource(compiled));
             dst.* = ir.ValueSource.fromLocation(arg_ref.dereference());
         }
 
@@ -8488,6 +8518,7 @@ pub const IRCompiler = struct {
                 if (self.lookup(name.name, .{ .shallow = true })) |binding| binding.is_pub = true;
             }
             try self.hoisted_fn_sets.put(self.allocator, expr, instr_set);
+            try self.hoisted_set_sources.put(self.allocator, instr_set, expr);
 
             // Pre-register the sync entry too, so *mutual* sync recursion resolves
             // to a fork-free `call` (a top-level sync fn has no closure captures,
@@ -8505,6 +8536,24 @@ pub const IRCompiler = struct {
         }
     }
 
+    /// Compile a hoisted (top-level) function's body *now*, if it hasn't been
+    /// compiled yet, so a call/fork site that is about to read the callee's
+    /// `closure_captures`/`closure_slot_count` sees the finished values. Without
+    /// this, a forward reference (`updatePhysics` forking `handleCollision`,
+    /// which is declared later) reads an empty capture set and forks a closure
+    /// missing the globals the callee needs — the callee then dereferences
+    /// garbage at runtime. A no-op for a non-hoisted set, one already compiled,
+    /// or one mid-compilation (a fork cycle keeps the pre-hoist behavior).
+    fn ensureFnBodyCompiled(self: *IRCompiler, instr_set: usize) Error!void {
+        if (self.specializing) return;
+        if (self.compiled_fn_sets.contains(instr_set)) return;
+        if (self.compiling_fn_sets.contains(instr_set)) return;
+        const source = self.hoisted_set_sources.get(instr_set) orelse return;
+        try self.compiling_fn_sets.put(self.allocator, instr_set, {});
+        defer _ = self.compiling_fn_sets.remove(instr_set);
+        _ = try self.compileFnDecl(source, source.fn_decl);
+    }
+
     fn compileFnDecl(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -8515,6 +8564,15 @@ pub const IRCompiler = struct {
         // Reuse the instruction set pre-allocated by the top-level hoist pass, so
         // the body lands in the set that forward call sites already reference.
         const instr_set = self.hoisted_fn_sets.get(source) orelse try self.addInstructionSet();
+        // Idempotent: a hoisted body may be pulled forward on demand by a fork
+        // site (`ensureFnBodyCompiled`) before the main statement loop reaches
+        // its declaration — don't compile it twice.
+        if (self.compiled_fn_sets.contains(instr_set)) {
+            return .from(ir.Value{ .fn_ref = .{ .fn_addr = ir.InstructionAddr.initAbs(instr_set, 0) } });
+        }
+        if (self.hoisted_set_sources.contains(instr_set)) {
+            try self.compiled_fn_sets.put(self.allocator, instr_set, {});
+        }
         const fn_ref = ir.Value{
             .fn_ref = .{ .fn_addr = ir.InstructionAddr.initAbs(instr_set, 0) },
         };
@@ -8708,8 +8766,13 @@ pub const IRCompiler = struct {
         self.scopes.pop();
         // A specialization is called directly by instruction set; it must not
         // re-declare the (already-declared) function name in the enclosing scope.
+        // A hoisted function is likewise already declared at top level by the
+        // hoist pass — re-declaring is redundant, and when its body was pulled
+        // forward on demand (`ensureFnBodyCompiled`) the enclosing scope is the
+        // *caller's* frame, so a re-declare would leak the name into it.
+        const already_hoist_declared = self.hoisted_set_sources.contains(instr_set);
         if (fn_decl.name) |name| {
-            if (!self.specializing) {
+            if (!self.specializing and !already_hoist_declared) {
                 const fn_type = ast.TypeExpr{ .function = .{
                     .params = .nonVariadic(&.{}),
                     .stdin_type = fn_decl.stdin_type,
