@@ -895,6 +895,33 @@ pub const Server = struct {
                     alloc_writer.writer.print("{f}\n", .{member_type}) catch {};
                 }
             },
+            // A member of an imported module (`rl.raylib`): resolve it through the
+            // module's scope and show its type — a `cimport` value as the same
+            // concise summary `writeHoverBinding` uses, so `rl.raylib` types the
+            // same as the `const rlf = rl.raylib` alias.
+            .module => |module_type| {
+                if (self.workspace.type_checker.resolveModuleScopeForMemberCompletion(module_type) catch null) |module_scope| {
+                    if (module_scope.lookup(member_name)) |member| {
+                        if (member.type_expr) |member_type| {
+                            const resolved_member = switch (member_type.*) {
+                                .alias => |alias_type| self.workspace.type_checker.resolveAliasType(&alias_type),
+                                else => member_type,
+                            };
+                            if (resolved_member.* == .struct_type) {
+                                if (resolved_member.struct_type.cimport_externs) |externs| {
+                                    alloc_writer.writer.print("cimport {{ {d} extern{s} }}\n", .{
+                                        externs.len,
+                                        if (externs.len == 1) "" else "s",
+                                    }) catch {};
+                                    alloc_writer.writer.writeAll("```") catch {};
+                                    return;
+                                }
+                            }
+                            alloc_writer.writer.print("{f}\n", .{member_type}) catch {};
+                        }
+                    }
+                }
+            },
             else => {},
         }
 

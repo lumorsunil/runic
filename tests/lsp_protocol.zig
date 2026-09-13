@@ -1984,6 +1984,57 @@ test "lsp hover types an alias to a module's cimport value" {
     try std.testing.expect(std.mem.indexOf(u8, value, "1 extern") != null);
 }
 
+test "lsp hover types a module's cimport-value member" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const bindings_uri = try fixture.writeDocument("bindings.rn",
+        \\const c = import "std/ffi.rn"
+        \\const raylib = cimport "libraylib.so" {
+        \\    extern fn InitWindow(width: c.Int, height: c.Int) c.Int
+        \\}
+        \\
+    );
+    defer allocator.free(bindings_uri);
+
+    const main_source =
+        \\const rl = import "./bindings.rn"
+        \\const rlf = rl.raylib
+        \\echo "${rlf.InitWindow 800 600}"
+        \\
+    ;
+    const main_uri = try fixture.writeDocument("main.rn", main_source);
+    defer allocator.free(main_uri);
+
+    const root_uri = try std.fmt.allocPrint(allocator, "file://{s}", .{fixture.root_path});
+    defer allocator.free(root_uri);
+
+    const messages = [_][]const u8{
+        try makeInitializeWithRoot(allocator, 1, root_uri),
+        try makeDidOpen(allocator, main_uri, main_source),
+        // Cursor on `raylib` in `rl.raylib` (line 1, col 17) — the module member,
+        // not the `rlf` alias. Previously this member hover showed no type.
+        try makeHoverRequest(allocator, 21, main_uri, 1, 17),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 21);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    // The module member `rl.raylib` types as the cimport value, shown as the
+    // same concise `cimport` summary as its `rlf` alias.
+    const value = parsed.value.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, value, "cimport") != null);
+    try std.testing.expect(std.mem.indexOf(u8, value, "1 extern") != null);
+}
+
 test "lsp member completion shows execution result members" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
