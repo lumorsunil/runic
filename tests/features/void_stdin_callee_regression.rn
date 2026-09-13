@@ -1,0 +1,17 @@
+# A function whose declared stdin type is non-Void (`report` reads `Int` stdin)
+# may call a function that reads no stdin (`dbl` declares an explicit `Void`
+# stdin) — a Void-stdin callee consumes nothing from the inherited stream, so it
+# imposes no constraint on the caller's stdin. Previously `validateCallStdin`
+# exempted only an *absent* stdin type, not an explicit `Void`, so the call was
+# wrongly rejected ("function stdin type mismatch: enclosing stdin is Int,
+# callee stdin expects Void").
+fn Void @() Void
+
+fn Void dbl(n: Int) Int { yield n * 2 }
+
+fn Int report() Void {
+  const d = dbl 21
+  echo "dbl=${d}"
+}
+
+report

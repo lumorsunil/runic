@@ -1708,6 +1708,11 @@ pub const TypeChecker = struct {
         if (callee_type.* != .function) return;
         if (self.isExecutableFunctionType(callee_type.function)) return;
         const callee_stdin = try self.resolvePipeType(scope, callee_type.function.stdin_type) orelse return;
+        // A callee that reads no stdin (declared `Void`, like an absent stdin
+        // type) imposes no constraint on the enclosing function's stdin — it does
+        // not consume the inherited stream. Only a callee that actually reads
+        // stdin must match the enclosing stdin type.
+        if (self.unaliasType(callee_stdin).* == .void) return;
         if (self.pipeTypesEqual(enclosing_stdin, callee_stdin)) return;
 
         try self.reportSpanError(
