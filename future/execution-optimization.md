@@ -743,6 +743,27 @@ fast, and only then does the sync call show its win in `call_heavy`). Options:
 (b) widen `counted_loop` to accept `ref`/`call` bodies (run them in the tight
 loop); (c) both.
 
+## Operand-capture correctness (found during the call-path investigation)
+
+Sync lowering + stdio capture is hooked ad-hoc, so operand positions that call
+bare `compileExpression` fork a producing operand and read a thread handle
+instead of its value. Surveyed positions: arithmetic, interpolation, array
+elements, index, if-condition, and command args (fixed b785dc4) all capture
+correctly; **comparison** and **logical `&&`/`||`** did not.
+
+- **Comparison — FIXED (commit 7b0eb88).** `compileComparisonBinary` now routes
+  operands through `compileArithmeticOperand` like arithmetic does. Was a real
+  wrong-answer bug: `const c = a < b` (a=3,b=5) yielded false. Guard:
+  `tests/features/call_in_comparison_regression.rn`.
+- **Logical `&&`/`||` with forking operands — DEFERRED.** Not the same easy swap:
+  when an operand needs stdio capture, routing goes to
+  `compileLogicalBinary(.value)` (compiler.zig ~9445), which *deliberately*
+  forks operands directly into the outer capture pipe (nested captures would
+  leave the outer pipe empty — documented there). So `yes && yes` concatenates
+  both bools into the capture → `"00"`. Fixing it means capturing each operand
+  as its own value within the capture-fork model — the monadic/capture crux of
+  the systematic call-path rework, not an isolated change. Left for that rework.
+
 ## Open design questions (for when Phase 2 starts)
 
 - Sync call/ret convention vs inline-only for the first milestone (recursion
