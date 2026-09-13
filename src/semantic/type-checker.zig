@@ -395,7 +395,7 @@ pub const TypeChecker = struct {
             .statements = script.statements,
             .span = script.span,
         };
-        try self.runBlock(global_scope, &root_block);
+        try self.runTopLevelBlock(global_scope, &root_block);
 
         return scope;
     }
@@ -516,6 +516,52 @@ pub const TypeChecker = struct {
 
         for (block.statements) |statement| {
             try self.runStatement(scope, statement);
+        }
+    }
+
+    /// The function declaration a statement is, if it is a bare `fn …` expression
+    /// statement; null otherwise.
+    fn fnDeclStatement(statement: *ast.Statement) ?*ast.FunctionDecl {
+        if (statement.* != .expression) return null;
+        if (statement.expression.expression.* != .fn_decl) return null;
+        return &statement.expression.expression.fn_decl;
+    }
+
+    /// Checks the top-level script block with forward references resolved: two
+    /// interleaved passes over the statements. Pass 1 walks in source order —
+    /// a non-function statement is checked normally, and a named function
+    /// declaration only has its *signature* declared (its body deferred). Because
+    /// signatures are declared in source order alongside the consts/types/imports
+    /// they reference, a signature still sees its dependencies — while every
+    /// function body (pass 2) sees every top-level function's signature, so it can
+    /// call functions declared later (mutual recursion, forward references). Pass 2
+    /// walks in source order too, checking only the deferred function bodies.
+    /// Scoped to the top level: nested-block functions keep declare-before-use, so
+    /// the type checker never accepts a forward reference the IR compiler (which
+    /// hoists only top-level functions) would fail to compile.
+    fn runTopLevelBlock(self: *TypeChecker, scope: *Scope, block: *ast.Block) Error!void {
+        // Pass 1 (source order): bindings/type declarations are checked normally,
+        // and a function only has its *signature* declared. Declarations come
+        // before the signatures that reference them, so a signature still resolves
+        // its dependency types.
+        for (block.statements) |statement| {
+            if (fnDeclStatement(statement)) |fn_decl| {
+                try self.declareFunctionSignature(scope, fn_decl);
+            } else if (statement.* == .binding_decl or statement.* == .type_binding_decl) {
+                try self.runStatement(scope, statement);
+            }
+        }
+        // Pass 2 (source order): function bodies and the imperative statements
+        // (calls, `match`, loops, `yield`). Deferring these past pass 1 means a
+        // body — or a consumer like `match f` — sees every function's signature
+        // (forward references, mutual recursion) *and* its walked body (so an
+        // inferred `!T` error set is finalized before a `match`/`catch` reads it).
+        for (block.statements) |statement| {
+            if (fnDeclStatement(statement) != null) {
+                try self.runStatement(scope, statement);
+            } else if (statement.* != .binding_decl and statement.* != .type_binding_decl) {
+                try self.runStatement(scope, statement);
+            }
         }
     }
 
@@ -1438,49 +1484,82 @@ pub const TypeChecker = struct {
         }
     }
 
+    /// Declares a function signature's implicit generic type variables in
+    /// `fn_scope`. An uppercase type name in the signature that isn't a declared
+    /// type is a type variable, scoped to this function (e.g. `T`/`U` in
+    /// `fn map(xs: []T, f: fn(T) U) []U`). Declaring them first lets the signature
+    /// resolve (no "type T not declared") and — resolved *in the function scope* —
+    /// bakes them into the stored function type as `.type_var`, so a call site
+    /// never re-resolves a raw `T`/`U`.
+    fn declareSignatureTypeVars(
+        self: *TypeChecker,
+        scope: *Scope,
+        fn_scope: *Scope,
+        fn_decl: *ast.FunctionDecl,
+    ) Error!void {
+        var type_vars: std.StringHashMapUnmanaged(void) = .empty;
+        defer type_vars.deinit(self.arena.allocator());
+        if (fn_decl.stdin_type) |st| try self.collectTypeVars(scope, st, &type_vars);
+        switch (fn_decl.params) {
+            ._non_variadic => |params| for (params) |param| {
+                if (param.type_annotation) |ta| try self.collectTypeVars(scope, ta, &type_vars);
+            },
+            ._variadic => |param| if (param.type_annotation) |ta| try self.collectTypeVars(scope, ta, &type_vars),
+        }
+        if (fn_decl.return_type) |rt| try self.collectTypeVars(scope, rt, &type_vars);
+        var it = type_vars.keyIterator();
+        while (it.next()) |name| {
+            const marker = try self.allocTypeExpression(.{ .type_var = .{ .name = name.*, .span = fn_decl.span } });
+            try fn_scope.declare(self.arena.allocator(), .{ .name = name.*, .span = fn_decl.span }, marker, false, false);
+        }
+    }
+
+    /// Declares a named function's resolved `.function` signature type in `scope`,
+    /// so a forward reference or mutual recursion resolves to the function rather
+    /// than an unknown external command. Called by `runBlock` as a hoist pre-pass
+    /// before any statement body is checked. Idempotent: a no-op when the name is
+    /// already declared in this scope (a re-run, or a later `runFnDecl`). Builds a
+    /// throwaway function scope only to bake in any signature type variables; the
+    /// body is checked later by `runFnDecl` in its own scope.
+    fn declareFunctionSignature(self: *TypeChecker, scope: *Scope, fn_decl: *ast.FunctionDecl) Error!void {
+        const identifier = fn_decl.name orelse return;
+        if (scope.bindings.contains(identifier.name)) return;
+        // A *detached* scope (parented to `scope` for lookups, but not added to
+        // its children) — the body is checked later by `runFnDecl` in its own
+        // real child scope, so registering one here would leave an empty duplicate
+        // in the scope tree and mislead LSP scope-location lookups.
+        const fn_scope = try self.arena.allocator().create(Scope);
+        fn_scope.* = .initWithParent(scope, fn_decl.span);
+        try self.declareSignatureTypeVars(scope, fn_scope, fn_decl);
+        const raw_fn_type = try self.resolveExprType(fn_scope, fn_decl);
+        const resolved_fn_type = if (raw_fn_type) |t| try self.resolveTypeExpr(fn_scope, t) else null;
+        try scope.declare(self.arena.allocator(), identifier, resolved_fn_type, fn_decl.is_pub, false);
+    }
+
     fn runFnDecl(self: *TypeChecker, scope: *Scope, fn_decl: *ast.FunctionDecl) Error!void {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, fn_decl.span);
 
         const fn_scope = try scope.addChild(self.arena.allocator(), fn_decl.span);
-
-        // Implicit generics: an uppercase type name in the signature that isn't a
-        // declared type is a type variable, scoped to this function (e.g. `T`/`U`
-        // in `fn map(xs: []T, f: fn(T) U) []U`). Declare them in the function
-        // scope first, so the signature resolves (no "type T not declared") and —
-        // resolved *in the function scope* — the type variables are baked into the
-        // stored function type as `.type_var`, so a call site never re-resolves a
-        // raw `T`/`U`.
-        {
-            var type_vars: std.StringHashMapUnmanaged(void) = .empty;
-            defer type_vars.deinit(self.arena.allocator());
-            if (fn_decl.stdin_type) |st| try self.collectTypeVars(scope, st, &type_vars);
-            switch (fn_decl.params) {
-                ._non_variadic => |params| for (params) |param| {
-                    if (param.type_annotation) |ta| try self.collectTypeVars(scope, ta, &type_vars);
-                },
-                ._variadic => |param| if (param.type_annotation) |ta| try self.collectTypeVars(scope, ta, &type_vars),
-            }
-            if (fn_decl.return_type) |rt| try self.collectTypeVars(scope, rt, &type_vars);
-            var it = type_vars.keyIterator();
-            while (it.next()) |name| {
-                const marker = try self.allocTypeExpression(.{ .type_var = .{ .name = name.*, .span = fn_decl.span } });
-                try fn_scope.declare(self.arena.allocator(), .{ .name = name.*, .span = fn_decl.span }, marker, false, false);
-            }
-        }
+        try self.declareSignatureTypeVars(scope, fn_scope, fn_decl);
 
         if (fn_decl.name) |identifier| {
-            // Resolve the function's type in the function scope so type variables
+            // The signature is normally already declared by `runBlock`'s hoist
+            // pre-pass (so forward references and mutual recursion resolve); only
+            // declare it here when it wasn't (e.g. a `fn` reached outside a block
+            // pre-pass). Resolve the type in the function scope so type variables
             // are baked in, then expose the binding in the outer scope.
-            const raw_fn_type = try self.resolveExprType(fn_scope, fn_decl);
-            const resolved_fn_type = if (raw_fn_type) |t| try self.resolveTypeExpr(fn_scope, t) else null;
-            try scope.declare(
-                self.arena.allocator(),
-                identifier,
-                resolved_fn_type,
-                fn_decl.is_pub,
-                false,
-            );
+            if (!scope.bindings.contains(identifier.name)) {
+                const raw_fn_type = try self.resolveExprType(fn_scope, fn_decl);
+                const resolved_fn_type = if (raw_fn_type) |t| try self.resolveTypeExpr(fn_scope, t) else null;
+                try scope.declare(
+                    self.arena.allocator(),
+                    identifier,
+                    resolved_fn_type,
+                    fn_decl.is_pub,
+                    false,
+                );
+            }
         }
 
         if (fn_decl.stdin_type) |stdin_type| {

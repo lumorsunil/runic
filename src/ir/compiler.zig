@@ -630,6 +630,13 @@ pub const IRCompiler = struct {
     /// a function emits `call <sync entry>` instead of a fork.
     sync_entries: std.AutoHashMapUnmanaged(usize, usize) = .empty,
 
+    /// Instruction set pre-allocated for a top-level function declaration by the
+    /// hoist pre-pass (keyed by the `fn …` expression), so a forward reference or
+    /// mutual recursion resolves to the function's `fn_ref`. `compileFnDecl`
+    /// reuses this set rather than allocating a fresh one, so the body lands in
+    /// the set the forward call sites already point at.
+    hoisted_fn_sets: std.AutoHashMapUnmanaged(*const ast.Expression, usize) = .empty,
+
     /// Concrete types bound by `|T|` captures in binding positions (`const x:
     /// []|T| = …` → `T` = the element type). A later `: T` resolves through here.
     type_captures: std.StringHashMapUnmanaged(ast.TypeExpr) = .empty,
@@ -1350,6 +1357,13 @@ pub const IRCompiler = struct {
             self.linear_buffers.deinit(self.allocator);
             self.linear_buffers = prev_linear;
         }
+
+        // Hoist top-level function bindings so a forward reference or mutual
+        // recursion resolves to the function's `fn_ref` (with a pre-allocated
+        // instruction set that `compileFnDecl` fills in) rather than compiling to
+        // an unknown external command. Mirrors the type checker's top-level
+        // signature hoist.
+        try self.hoistTopLevelFnDecls(self.script.statements);
 
         for (self.script.statements) |stmt| {
             _ = try self.compileStatement(stmt);
@@ -8315,7 +8329,9 @@ pub const IRCompiler = struct {
     }
 
     fn compileSyncEntry(self: *IRCompiler, source: *ast.Expression, fn_decl: ast.FunctionDecl, forked_set: usize) Error!usize {
-        const entry_set = try self.addInstructionSetNoPushFrame();
+        // Reuse the entry set pre-registered by the top-level hoist pass (so
+        // mutual sync recursion already resolved to it); otherwise allocate one.
+        const entry_set = self.sync_entries.get(forked_set) orelse try self.addInstructionSetNoPushFrame();
         // Register the mapping BEFORE compiling the body so a self-recursive sync
         // call inside the body resolves to this same entry (via `tryCompileSyncCall`,
         // which looks up `sync_entries.get(forked_set)`). Without this, the recursive
@@ -8350,6 +8366,79 @@ pub const IRCompiler = struct {
         return entry_set;
     }
 
+    /// Pre-declares each top-level named function's binding (`fn_ref` over a
+    /// freshly allocated, still-empty instruction set) before the statements are
+    /// compiled, so a forward reference or mutual recursion resolves to the
+    /// function instead of compiling to an unknown external command.
+    /// `compileFnDecl` reuses the pre-allocated set (via `hoisted_fn_sets`) so the
+    /// body lands where the forward call sites point. Idempotent: skips a name
+    /// already in scope. Skipped while specializing a generic.
+    /// Whether a function's signature carries a `|T|` type capture (in a param,
+    /// stdin, or return type) — i.e. it is generic and monomorphized per call.
+    fn fnDeclIsGeneric(fn_decl: ast.FunctionDecl) bool {
+        switch (fn_decl.params) {
+            ._non_variadic => |ps| for (ps) |p| {
+                if (p.type_annotation) |ta| if (hasTypeCapture(ta.*)) return true;
+            },
+            ._variadic => |p| if (p.type_annotation) |ta| if (hasTypeCapture(ta.*)) return true,
+        }
+        if (fn_decl.return_type) |rt| if (hasTypeCapture(rt.*)) return true;
+        if (fn_decl.stdin_type) |st| if (hasTypeCapture(st.*)) return true;
+        return false;
+    }
+
+    fn hoistTopLevelFnDecls(self: *IRCompiler, statements: []const *ast.Statement) Error!void {
+        if (self.specializing) return;
+        for (statements) |stmt| {
+            if (stmt.* != .expression) continue;
+            const expr = stmt.expression.expression;
+            if (expr.* != .fn_decl) continue;
+            const name = expr.fn_decl.name orelse continue;
+            if (self.lookup(name.name, .{ .shallow = true }) != null) continue;
+            // A generic function (`|T|` captures) is monomorphized per call site,
+            // not called through one shared binding — leave it on that path.
+            if (fnDeclIsGeneric(expr.fn_decl)) continue;
+
+            const instr_set = try self.addInstructionSet();
+            // A forward call site is compiled before the body, so the callee's
+            // arity must already be known here. A top-level function captures no
+            // closure variables, so its frame is exactly its parameters — set the
+            // param count now (the body re-sets the same value in `compileFnDecl`).
+            const param_count = switch (expr.fn_decl.params) {
+                ._non_variadic => |ps| ps.len,
+                ._variadic => continue, // variadic top-level fn: leave on the normal path
+            };
+            self.instruction_sets.items[instr_set].param_count = param_count;
+            self.instruction_sets.items[instr_set].closure_slot_count = param_count;
+            const fn_ref = ir.Value{ .fn_ref = .{ .fn_addr = ir.InstructionAddr.initAbs(instr_set, 0) } };
+            const fn_type = ast.TypeExpr{ .function = .{
+                .params = .nonVariadic(&.{}),
+                .stdin_type = expr.fn_decl.stdin_type,
+                .return_type = expr.fn_decl.return_type,
+                .span = expr.fn_decl.span,
+            } };
+            try self.scopes.declare(self.allocator, name.name, try .from(fn_ref), fn_type, false, .normal);
+            if (expr.fn_decl.is_pub) {
+                if (self.lookup(name.name, .{ .shallow = true })) |binding| binding.is_pub = true;
+            }
+            try self.hoisted_fn_sets.put(self.allocator, expr, instr_set);
+
+            // Pre-register the sync entry too, so *mutual* sync recursion resolves
+            // to a fork-free `call` (a top-level sync fn has no closure captures,
+            // so it matches `compileFnDecl`'s emission gate). `compileSyncEntry`
+            // reuses this pre-allocated entry set when it fills the body in.
+            if (self.effects != null and
+                self.effects.?.isSync(name.name) and
+                syncParamsSupported(expr.fn_decl.params) and
+                syncReturnAllowed(expr.fn_decl.return_type) and
+                self.syncBodyLowerable(expr.fn_decl.body))
+            {
+                const entry_set = try self.addInstructionSetNoPushFrame();
+                try self.sync_entries.put(self.allocator, instr_set, entry_set);
+            }
+        }
+    }
+
     fn compileFnDecl(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -8357,7 +8446,9 @@ pub const IRCompiler = struct {
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
-        const instr_set = try self.addInstructionSet();
+        // Reuse the instruction set pre-allocated by the top-level hoist pass, so
+        // the body lands in the set that forward call sites already reference.
+        const instr_set = self.hoisted_fn_sets.get(source) orelse try self.addInstructionSet();
         const fn_ref = ir.Value{
             .fn_ref = .{ .fn_addr = ir.InstructionAddr.initAbs(instr_set, 0) },
         };

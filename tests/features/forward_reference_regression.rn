@@ -1,0 +1,25 @@
+# Top-level functions may be referenced before their declaration (forward
+# references) and may recurse mutually. The type checker hoists top-level
+# function signatures (a two-pass over the script), and the IR compiler
+# pre-allocates each top-level function's instruction set (and sync entry), so a
+# forward call resolves to the function — not an unknown external command — at
+# both type-check and run time. Scoped to the top level; nested-block functions
+# keep declare-before-use.
+fn Void @() Void
+
+# A function used before it is declared.
+echo "inc=${addOne 41}"
+fn Void addOne(n: Int) Int { yield n + 1 }
+
+# Mutual recursion: each references the other, declared after it.
+fn Void isEven(n: Int) Bool { if (n == 0) { yield true } else { yield isOdd (n - 1) } }
+fn Void isOdd(n: Int) Bool { if (n == 0) { yield false } else { yield isEven (n - 1) } }
+echo "even10=${isEven 10}"
+echo "odd7=${isOdd 7}"
+
+# A forward reference inside a function body, including a pipeline whose stages
+# (a generator and a consumer) are both declared later.
+fn Void run() Void { nums | showit }
+fn Void nums() Int { yield 1; yield 2; yield 3 }
+fn Void showit(n: Int) Void { echo "n=${n}" }
+run
