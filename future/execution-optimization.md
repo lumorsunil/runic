@@ -228,12 +228,30 @@ correct; full CI green. Build it in tested increments:
   atomically would deadlock. Result: `fib 25` 27.6 s → **0.24 s**, `fib 30` 34.3 s
   → **3.6 s** (commit c854999). `call_heavy` and compute-loops were already fast
   via `counted_loop`; this extends the same atomic execution to recursion.
-- [ ] (e) wire the arg / struct-field / typed-value capture fast paths; widen
-  `syncReturnAllowed` (error unions/optionals) once the sync return path carries
-  the discriminant. (Note: a sync entry with a struct param currently still emits
-  a capture/fork for the param access — hence the `runSyncCallAtomic` bail — so a
-  struct-param sync fn does not yet get the atomic fast path; wiring the
-  struct-field capture fast path here would let it, too, run fork-free.)
+- [x] (e) UFCS / struct-param sync calls — DONE (the previous note was wrong: the
+  fork wasn't a struct-field capture inside the entry — `magSq`'s entry is
+  fork-free — it was the *call site*). `tryCompileSyncCall` required a bare
+  identifier callee, so a UFCS method call `recv.method` (member callee) never
+  sync-lowered and always forked. A struct-param sync fn is invoked that way
+  (`p.magSq`), so it forked every call: 606 MB / 9.9 s at N=200000. Fix (commit
+  ad69645): resolve the callee via `capturableCallInfo` (handles identifier *and*
+  UFCS, prepending the receiver as frame slot 0 = `self`); arity checked against
+  the full arg list; a field access (`p.x`) resolves to a non-fn name and bails.
+  Result: 0.41 s / 5 MB (24x/120x), fork-free and atomic. Also fixed a correctness
+  bug (a self-recursive UFCS method returned empty on the fork path). Test
+  sync_call_ufcs_regression.rn. THEN (commit 172b966) the effects classifier:
+  `callThreaded` blanket-threaded every member callee, so a fn wrapping a with-args
+  UFCS sync call (`fn wrap(p) Int { yield p.scaledSum 2 }`) was threaded and forked
+  (8.4 s / 713 MB). Since UFCS dispatches by method *name* to a free function,
+  inherit that fn's effect for a `recv.method` callee (fields/builtins/module fns
+  stay conservatively threaded — only a known-fn name is demoted, dup names already
+  forced threaded → sound). wrap-with-args: 0.37 s / 5 MB. (A *nullary* UFCS `p.m`
+  parses as a member node, not a call, so it was already non-threading.)
+- [ ] (e-remaining) widen `syncReturnAllowed` for error unions once the sync return
+  path carries the error discriminant (optionals already done, f51950f). A nullary
+  UFCS call to a *threaded* fn is still classified sync (parses as a member node,
+  bypassing `callThreaded`) — harmless today (its entry's fork makes
+  `runSyncCallAtomic` bail to normal scheduling), but a latent looseness.
 
 ## ROOT CAUSE FOUND: per-iteration stdin polling by the stdio stream threads
 
