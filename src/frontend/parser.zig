@@ -1039,7 +1039,15 @@ pub const Parser = struct {
                             // `Name(arg, …)` — a generic type application in value
                             // position (e.g. `${Pair(Int, String)}`), for an
                             // uppercase (type) name. Lowercase calls stay space-form.
-                            if (id.isTypeIdentifier() and ahead[1].tag == .l_paren) {
+                            // NOT after a member access: `recv.Method (arg)` is a
+                            // method call whose argument happens to be parenthesized
+                            // (common for FFI externs like `rlf.CheckCollisionRecs
+                            // (rec)`), so the uppercase name is a plain member, not a
+                            // type application.
+                            const after_member = components.items.len > 0 and
+                                components.items[components.items.len - 1] == .op and
+                                components.items[components.items.len - 1].op.payload == .member;
+                            if (!after_member and id.isTypeIdentifier() and ahead[1].tag == .l_paren) {
                                 _ = try self.nextToken(); // consume the identifier
                                 const app = try self.parseValueTypeApplication(id);
                                 // `Name(args){ … }` — explicit-type-arg struct

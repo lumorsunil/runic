@@ -1,0 +1,20 @@
+# A method/member call whose name starts uppercase and whose argument is
+# parenthesized (`recv.Method (arg)`) is a call, not a generic type application.
+# An uppercase name followed by `(` is a type application (`Box(Int)`) only when
+# it is NOT the right-hand side of a member access — so `recv.Upper (x)` no longer
+# needs the `(recv.Upper) (x)` parenthesization workaround. (Common for FFI
+# externs, whose C names are PascalCase.)
+fn Void @() Void
+
+const Box = struct { lo: Int, hi: Int }
+
+# Uppercase-named method, parenthesized args (single and multiple).
+fn Void Between(self: Box, n: Int) Bool { yield n >= self.lo }
+fn Void Sum(self: Box) Int { yield self.lo + self.hi }
+const b = Box{ .lo = 3, .hi = 10 }
+
+echo "between=${b.Between (1 + 1)}"
+echo "sum=${b.Sum}"
+
+# A type name used as a value (not after a member) still serializes as before.
+echo "type=${Box}"
