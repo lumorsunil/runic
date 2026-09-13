@@ -48,6 +48,10 @@ pub const CompilationResult = union(enum) {
 
 pub const IRRunner = struct {
     allocator: Allocator,
+    /// A freeing allocator (not the compile+runtime arena) used for resources
+    /// that should be reclaimed during the run — currently runtime pipes (P1).
+    /// Defaults to `allocator`; `runIR` overrides it to the process allocator.
+    free_allocator: Allocator,
     document_store: *DocumentStore,
     script: *ast.Script,
     config: IRConfig,
@@ -60,6 +64,7 @@ pub const IRRunner = struct {
     ) @This() {
         return .{
             .allocator = allocator,
+            .free_allocator = allocator,
             .document_store = document_store,
             .script = script,
             .config = config,
@@ -100,6 +105,7 @@ pub const IRRunner = struct {
                 .stdout_is_tty = self.config.stdout_is_tty,
                 .stderr_is_tty = self.config.stderr_is_tty,
                 .tracer = self.config.tracer,
+                .pipe_allocator = self.free_allocator,
             },
             context,
         );
@@ -178,6 +184,9 @@ pub fn runIR(
     var arena = std.heap.ArenaAllocator.init(allocator);
     const arena_allocator = arena.allocator();
     var runner = IRRunner.init(arena_allocator, document_store, script, config);
+    // Pipes are created from the process (freeing) allocator, not the arena, so
+    // their teardown reclaims. Compile and the rest of the runtime stay on `arena`.
+    runner.free_allocator = allocator;
     const result = try runner.compile();
 
     if (result == .err) return .err_(arena, result.err.diagnostics());

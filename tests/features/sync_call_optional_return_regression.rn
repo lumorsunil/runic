@@ -1,0 +1,24 @@
+# An optional (`?T`) return lowers to the fork-free sync `call`/`ret` path: the
+# optional value (with its null/present discriminant) rides back in `%r`, and the
+# usual optional consumers — `if` capture, `orelse`, direct interpolation — all
+# read it correctly. Non-optional discriminant carriers (error-union, sum,
+# promise, …) still fork. See future/execution-optimization.md.
+fn Void @() Void
+
+fn Void maybe(n: Int) ?Int { if (n > 0) { yield n } else { yield null } }
+
+# Direct binding + interpolation (present and null).
+const a = maybe 5
+const b = maybe 0
+echo "a=${a} b=${b}"
+
+# `if` capture on the returned optional.
+if (maybe 7) |v| { echo "some ${v}" } else { echo "none" }
+if (maybe 0) |v| { echo "some ${v}" } else { echo "none" }
+
+# `orelse` default.
+echo "x=${maybe 9 orelse 42} y=${maybe 0 orelse 42}"
+
+# Nested: a sync call feeding another sync call's argument, through an optional.
+fn Void inc(n: Int) Int { yield n + 1 }
+echo "nested=${maybe (inc 2) orelse 0}"

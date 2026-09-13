@@ -113,7 +113,13 @@ pub fn runScript(
 
     const stdin_stream = try Stream(u8).initReaderWriter(allocator, "<<<stdin_pipe>>>", .{
         .close_source = false,
-        .disconnect_source = false,
+        // Disconnect the stdin source once it reaches EOF. Otherwise the closed
+        // source is retained and re-streamed every scheduler round, re-issuing a
+        // poll()/read() on stdin each time — a busy-poll that dominates the cost of
+        // compute loops. Removal is safe here: propagate_eof_on_source_close already
+        // closes and disconnects the destination on the first EOF, so re-polling the
+        // stale source can never deliver data anywhere.
+        .disconnect_source = true,
         .close_destination = true,
         .disconnect_destination = true,
         .keep_open = true,

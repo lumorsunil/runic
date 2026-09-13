@@ -105,6 +105,12 @@ pub const IREvaluator = struct {
         stdout_is_tty: bool = false,
         stderr_is_tty: bool = false,
         tracer: *Tracer,
+        /// Allocator for runtime-created pipes (`ReaderWriterStream` RC boxes and
+        /// their buffers). Distinct from `self.allocator` (the compile+runtime
+        /// arena) so a pipe's `deinitParent` actually reclaims — the groundwork
+        /// for freeing per-stage pipes during the run (P1). Falls back to
+        /// `self.allocator` when null (tests, debugger), preserving old behavior.
+        pipe_allocator: ?Allocator = null,
     };
 
     pub fn init(
@@ -147,7 +153,12 @@ pub const IREvaluator = struct {
             return try self.advanceThreadCounter();
         };
 
-        const result = try self.runInstruction(thread.*, instruction);
+        // A sync `call` runs its whole fork-free subtree atomically (no
+        // scheduler round-trip per instruction) — see `runSyncCallAtomic`.
+        const result = if (instruction.type == .call)
+            try self.runSyncCallAtomic(thread.*)
+        else
+            try self.runInstruction(thread.*, instruction);
 
         switch (result) {
             .exit => |exit_code| try self.context.closeThread(thread.id, exit_code),
@@ -328,23 +339,132 @@ pub const IREvaluator = struct {
         thread: ir.context.IRThreadContext,
         counted_loop: ir.Instruction.CountedLoop,
     ) Error!Result {
+        // The body runner drives the thread's instruction counter (so it can
+        // follow a sync `call` into its entry set and back via `ret`). Save the
+        // counted_loop's own address and restore it afterwards so the caller's
+        // `step()` increments past the counted_loop as usual.
+        const resume_addr = thread.getCurrentInstructionAddr();
+
         while (true) {
             const counter_ptr = self.resolveFastUIntPointer(thread, counted_loop.counter.dereference()) orelse return Error.UnsupportedInstruction;
             if (counter_ptr.* != .integer) return Error.UnsupportedInstruction;
 
             const limit = self.resolveFastUIntSource(thread, counted_loop.limit) orelse return Error.UnsupportedInstruction;
-            if (counter_ptr.integer >= limit.get()) break;
+            const current = counter_ptr.integer;
+            if (current >= limit.get()) break;
 
-            switch (try self.runAtomicInstructionSet(thread, counted_loop.body_instr_set)) {
+            switch (try self.runCountedLoopBody(thread, counted_loop.body_instr_set)) {
                 .cont, .skip => {},
                 .cont_no_instr_counter_inc => return Error.ContNoInstrCounterIncInAtomic,
                 .exit => |exit_code| return .{ .exit = exit_code },
                 .process_exit => |exit_code| return .{ .process_exit = exit_code },
             }
-            counter_ptr.* = .{ .integer = counter_ptr.integer +| 1 };
+
+            // The body may have grown the value stack (pushing call args, locals,
+            // padding), reallocating its backing and invalidating `counter_ptr`.
+            // Re-resolve before writing the incremented counter.
+            const counter_ptr_after = self.resolveFastUIntPointer(thread, counted_loop.counter.dereference()) orelse return Error.UnsupportedInstruction;
+            counter_ptr_after.* = .{ .integer = current +| 1 };
         }
 
+        thread.setInstructionCounter(resume_addr);
         return .cont;
+    }
+
+    /// Runs one counted_loop iteration by executing `body_instr_set` while
+    /// following the thread's instruction counter. Unlike `runAtomicInstructionSet`
+    /// (a flat pass over a set's instructions), this lets a fork-free sync `call`
+    /// in the body jump to its entry set and return via `ret` — the counter walks
+    /// the detour and the iteration completes when control falls off the end of the
+    /// body set. All body instructions must be counted-loop-safe (see
+    /// `instructionSetIsCountedLoopSafe`), so none of them yield to the scheduler.
+    fn runCountedLoopBody(
+        self: *IREvaluator,
+        thread: ir.context.IRThreadContext,
+        body_instr_set: usize,
+    ) Error!Result {
+        const all = self.context.instructions();
+        thread.setInstructionCounter(.init(body_instr_set, 0));
+
+        while (true) {
+            const addr = thread.getCurrentInstructionAddr();
+            // The iteration is done when control returns to the body set past its
+            // last instruction (a trailing `ret` from a call lands here too).
+            if (addr.instr_set == body_instr_set and addr.local_addr >= all[body_instr_set].len) {
+                return .cont;
+            }
+
+            const instr = all[addr.instr_set][addr.local_addr];
+            switch (try self.runInstruction(thread, instr)) {
+                .cont, .skip => thread.incInstructionCounter(),
+                // `call`/`ret` (and any other counter-setting op) already moved the
+                // counter; keep following it.
+                .cont_no_instr_counter_inc => {},
+                .exit => |exit_code| return .{ .exit = exit_code },
+                .process_exit => |exit_code| return .{ .process_exit = exit_code },
+            }
+        }
+    }
+
+    /// Runs a sync `call` atomically as far as it can: drives the thread's
+    /// instruction counter through the callee (following nested sync
+    /// `call`/`ret`/`jmp`) until it unwinds back to the caller, without yielding
+    /// to the scheduler between instructions. The current instruction must be the
+    /// `.call`. This is safe while every instruction is scheduler-free (arithmetic,
+    /// refs, control flow, nested sync calls) — such code produces no output,
+    /// forks nothing, and never blocks, so no other thread needs to interleave
+    /// (the same reason `counted_loop` runs atomically). It stops and hands back
+    /// to the scheduler at the first instruction that isn't (see the loop body).
+    /// Without this, the general multi-thread `step()` round-robins the (idle)
+    /// stdio stream threads after *every* instruction of a recursive sync call,
+    /// costing ~100 µs/call (e.g. `fib` — millions of scheduler round-trips).
+    ///
+    /// Returns `.cont_no_instr_counter_inc` on normal completion — the final
+    /// `ret` already positioned the counter at the instruction after the `call` —
+    /// or an `exit`/`process_exit` raised inside the subtree.
+    fn runSyncCallAtomic(self: *IREvaluator, thread: ir.context.IRThreadContext) Error!Result {
+        const all = self.context.instructions();
+        // Depth before the `.call`; the subtree is done when a matching `ret`
+        // unwinds the call stack back to (or below) this depth.
+        const depth_before = thread.private.call_stack.items.len;
+        while (true) {
+            const addr = thread.getCurrentInstructionAddr();
+            const instr = all[addr.instr_set][addr.local_addr];
+            // Only fast-forward while every instruction is safe to run without the
+            // scheduler. A `sync` entry can still contain a capture (`pipe`/`fork`/
+            // `wait`/`pipe_dequeue`) for a sub-operand that itself needs one — e.g.
+            // a struct-param body — and a `fork`+`wait` run atomically would
+            // deadlock (the forked thread never gets scheduled). On the first
+            // non-safe instruction, hand control back to the normal round-robin
+            // `step()` loop *at* that instruction (the call frame is on the stack,
+            // so scheduling resumes the call correctly).
+            if (!instructionIsAtomicSafe(instr.type)) return .cont_no_instr_counter_inc;
+            switch (try self.runInstruction(thread, instr)) {
+                .cont, .skip => thread.incInstructionCounter(),
+                // `call`/`ret`/`jmp` already moved the counter; keep following it.
+                .cont_no_instr_counter_inc => {},
+                .exit => |exit_code| return .{ .exit = exit_code },
+                .process_exit => |exit_code| return .{ .process_exit = exit_code },
+            }
+            if (thread.private.call_stack.items.len <= depth_before) {
+                // The initial `.call` pushed one frame (depth_before + 1); the
+                // matching `ret` popped back to depth_before, so control is now at
+                // the instruction after the original `call`.
+                return .cont_no_instr_counter_inc;
+            }
+        }
+    }
+
+    /// Whether an instruction can run without a scheduler round-trip — no fork,
+    /// no wait, no pipe/stream I/O, no blocking. Mirrors the compiler's
+    /// `instructionSetIsCountedLoopSafe` whitelist (which gates the same atomic
+    /// execution for loop bodies) plus `.ret`, since a sync `call` walks into an
+    /// entry set that returns. Keep the two lists in sync.
+    fn instructionIsAtomicSafe(t: ir.Instruction.Type) bool {
+        return switch (t) {
+            .comment, .set, .ath, .cmp, .neg, .is_err, .make_err, .match_err, .err_payload, .get_env, .set_env, .simple_exec, .ref, .pop, .push, .call, .jmp, .ret => true,
+            else => false,
+        };
     }
 
     fn materializeExecArgv(
@@ -1978,7 +2098,7 @@ pub const IREvaluator = struct {
                 return .cont;
             },
             .pipe => |instr_pipe| {
-                const pipe = try Stream(u8).initReaderWriter(self.allocator, "pipe", .{}, self.config.tracer);
+                const pipe = try Stream(u8).initReaderWriter(self.config.pipe_allocator orelse self.allocator, "pipe", .{}, self.config.tracer);
                 const pipe_handle = try self.context.addPipe(pipe);
 
                 try self.setLocation(thread, instr_pipe.result, .{ .pipe = pipe_handle });
@@ -2115,6 +2235,32 @@ pub const IREvaluator = struct {
                 );
 
                 return .cont;
+            },
+            .call => |c| {
+                const target = try self.resolveAddr(thread, c.dest);
+                // The caller pushed `args` values; the callee's frame begins at
+                // them, so its parameters are frame slots 0..args-1.
+                const base = thread.private.stack.items.len - c.args;
+                // Resume at the instruction after this `call`.
+                var return_addr = thread.getCurrentInstructionAddr();
+                return_addr.local_addr += 1;
+                try thread.private.call_stack.append(self.allocator, .{
+                    .return_addr = return_addr,
+                    .stack_frame = thread.private.stack_frame,
+                    .stack_len = base,
+                });
+                thread.private.stack_frame = base;
+                thread.setInstructionCounter(target);
+                return .cont_no_instr_counter_inc;
+            },
+            .ret => {
+                const frame = thread.private.call_stack.pop() orelse return Error.MissingCallFrame;
+                // Reclaim the callee's stack frame, restore the caller's, and
+                // resume. `%r` (the return value) is deliberately left as-is.
+                try thread.private.stack.resize(self.allocator, frame.stack_len);
+                thread.private.stack_frame = frame.stack_frame;
+                thread.setInstructionCounter(frame.return_addr);
+                return .cont_no_instr_counter_inc;
             },
             .wait => |wait| {
                 const waitee = try self.resolveLocation(thread, wait.waitee);
@@ -3058,6 +3204,107 @@ test "evaluator fast arithmetic path updates closure destination" {
     }
 
     try std.testing.expectEqual(@as(i64, 11), fixture.context.shared.heapGet(closure_addr).?.integer);
+}
+
+test "evaluator sync call/ret saves and restores the caller activation" {
+    const allocator = std.testing.allocator;
+    var fixture = try initTestEvaluator(allocator);
+    defer fixture.context.deinit();
+    defer fixture.stdin_stream.deinitParent();
+    defer fixture.stdout_stream.deinitParent();
+    defer fixture.stderr_stream.deinitParent();
+    defer fixture.tracer.deinit();
+
+    var evaluator = IREvaluator.init(allocator, .{
+        .io = testIo(),
+        .verbose = false,
+        .stdin = fixture.stdin_stream,
+        .stdout = fixture.stdout_stream,
+        .stderr = fixture.stderr_stream,
+        .tracer = &fixture.tracer,
+    }, &fixture.context);
+
+    try fixture.context.addMainThread(testEnvMap());
+    const thread = fixture.context.getCurrentThread().?;
+
+    // Caller activation: a 4-slot stack, frame at 0, executing at (0, 5).
+    try thread.private.stack.resize(allocator, 4);
+    @memset(thread.private.stack.items, .void);
+    thread.private.stack_frame = 0;
+    thread.setInstructionCounter(.init(0, 5));
+
+    // call (no args) → jumps to (1, 0), pushing a return frame for (0, 6) and
+    // setting the frame base to the current top (4).
+    switch (try evaluator.runInstruction(thread, .init(null, .{ .call = .{ .dest = ir.InstructionAddr.initAbs(1, 0) } }))) {
+        .cont_no_instr_counter_inc => {},
+        else => unreachable,
+    }
+    try std.testing.expectEqual(ir.ResolvedInstructionAddr.init(1, 0), thread.getCurrentInstructionAddr());
+    try std.testing.expectEqual(@as(usize, 1), thread.private.call_stack.items.len);
+    try std.testing.expectEqual(ir.ResolvedInstructionAddr.init(0, 6), thread.private.call_stack.items[0].return_addr);
+    try std.testing.expectEqual(@as(usize, 4), thread.private.stack_frame);
+    try std.testing.expectEqual(@as(usize, 4), thread.private.call_stack.items[0].stack_len);
+
+    // Callee runs on the same stack: pushes its own frame and computes a result.
+    try thread.private.stack.appendSlice(allocator, &.{ .{ .integer = 1 }, .{ .integer = 2 } });
+    thread.private.result_register = .{ .integer = 42 };
+
+    // ret → reclaims the callee frame, restores caller sf, resumes at (0, 6),
+    // and leaves %r (the return value) intact.
+    switch (try evaluator.runInstruction(thread, .init(null, .ret))) {
+        .cont_no_instr_counter_inc => {},
+        else => unreachable,
+    }
+    try std.testing.expectEqual(ir.ResolvedInstructionAddr.init(0, 6), thread.getCurrentInstructionAddr());
+    try std.testing.expectEqual(@as(usize, 4), thread.private.stack.items.len);
+    try std.testing.expectEqual(@as(usize, 0), thread.private.stack_frame);
+    try std.testing.expectEqual(@as(i64, 42), thread.private.result_register.integer);
+    try std.testing.expectEqual(@as(usize, 0), thread.private.call_stack.items.len);
+
+    // A `ret` with no matching `call` is an error, not a crash.
+    try std.testing.expectError(ir.context.Error.MissingCallFrame, evaluator.runInstruction(thread, .init(null, .ret)));
+}
+
+test "evaluator sync call/ret nests for recursion" {
+    const allocator = std.testing.allocator;
+    var fixture = try initTestEvaluator(allocator);
+    defer fixture.context.deinit();
+    defer fixture.stdin_stream.deinitParent();
+    defer fixture.stdout_stream.deinitParent();
+    defer fixture.stderr_stream.deinitParent();
+    defer fixture.tracer.deinit();
+
+    var evaluator = IREvaluator.init(allocator, .{
+        .io = testIo(),
+        .verbose = false,
+        .stdin = fixture.stdin_stream,
+        .stdout = fixture.stdout_stream,
+        .stderr = fixture.stderr_stream,
+        .tracer = &fixture.tracer,
+    }, &fixture.context);
+
+    try fixture.context.addMainThread(testEnvMap());
+    const thread = fixture.context.getCurrentThread().?;
+    try thread.private.stack.resize(allocator, 4);
+    @memset(thread.private.stack.items, .void);
+
+    // Three nested calls, each from a distinct return site.
+    thread.setInstructionCounter(.init(0, 10));
+    _ = try evaluator.runInstruction(thread, .init(null, .{ .call = .{ .dest = ir.InstructionAddr.initAbs(1, 0) } }));
+    thread.setInstructionCounter(.init(1, 20));
+    _ = try evaluator.runInstruction(thread, .init(null, .{ .call = .{ .dest = ir.InstructionAddr.initAbs(1, 0) } }));
+    thread.setInstructionCounter(.init(1, 30));
+    _ = try evaluator.runInstruction(thread, .init(null, .{ .call = .{ .dest = ir.InstructionAddr.initAbs(1, 0) } }));
+    try std.testing.expectEqual(@as(usize, 3), thread.private.call_stack.items.len);
+
+    // Returns unwind in LIFO order.
+    _ = try evaluator.runInstruction(thread, .init(null, .ret));
+    try std.testing.expectEqual(ir.ResolvedInstructionAddr.init(1, 31), thread.getCurrentInstructionAddr());
+    _ = try evaluator.runInstruction(thread, .init(null, .ret));
+    try std.testing.expectEqual(ir.ResolvedInstructionAddr.init(1, 21), thread.getCurrentInstructionAddr());
+    _ = try evaluator.runInstruction(thread, .init(null, .ret));
+    try std.testing.expectEqual(ir.ResolvedInstructionAddr.init(0, 11), thread.getCurrentInstructionAddr());
+    try std.testing.expectEqual(@as(usize, 0), thread.private.call_stack.items.len);
 }
 
 test "evaluator fast compare path updates register destination" {

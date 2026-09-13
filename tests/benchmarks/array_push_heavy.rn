@@ -1,0 +1,5 @@
+var xs = .{ }
+for (0..50000) |i| {
+    xs = xs.push i
+}
+echo "${xs.len}"

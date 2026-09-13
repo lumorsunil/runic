@@ -1,0 +1,44 @@
+# A Bool-yielding function call used as a `&&`/`||` operand must be captured by
+# value, not forked into the surrounding capture pipe. Previously such operands
+# were run directly inside the outer capture fork, so each one's yielded bool was
+# written to the same pipe and concatenated: `const a = yes && yes` captured
+# "00" instead of the boolean AND. Bool-valued operands now lower like the
+# non-capture value path (capture each as a value, combine with `.log`). Command
+# operands keep the exit-code pipe path. Bool prints as an exit code: true=0.
+# See future/execution-optimization.md.
+fn Void @() Void
+
+fn Void yes() Bool { yield true }
+fn Void no() Bool { yield false }
+
+# Two bool-call operands, both operators.
+echo "yy=${yes && yes}"
+echo "yn=${yes && no}"
+echo "ny=${no || yes}"
+echo "nn=${no || no}"
+
+# Bound to a const, then read.
+const a = yes && no
+echo "a=${a}"
+
+# Mixed with a plain bound bool (only one operand forks).
+const flag = true
+echo "m=${yes && flag}"
+echo "m2=${flag && no}"
+
+# Nested logical of bool calls (left operand is itself a logical expression).
+echo "n=${yes && yes && no}"
+echo "p=${no || no || yes}"
+
+# Used directly as an `if` condition.
+if (yes && no) echo "if1: yes" else echo "if1: no"
+if (no || yes) echo "if2: yes" else echo "if2: no"
+
+# A command producer as an operand must still flow its output to the capture
+# (exit-code pipe path), not the value path.
+const out = (echo "hi") && (echo "bye")
+echo "out=[${out}]"
+
+# Command-based logical as a statement keeps exit-code short-circuit.
+echo "L" && echo "R"
+echo "S" || echo "T"

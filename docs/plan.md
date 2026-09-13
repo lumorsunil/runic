@@ -51,6 +51,16 @@ A cycle of feature work and engineering-health work:
   (only the LSP protocol suite ran) to 70, after the runtime module's ~48
   in-file tests were wired to run and brought back up to date, and now stands
   at 112 as the `runic-lsp` protocol suite grew alongside the LSP work below.
+- **Performance (0.10.0):** a synchrony (effect) analysis lowers
+  concurrency-free code to a fork-free "sync" call/return path — fork-free
+  function calls (nullary, parameterized, UFCS/struct-param, in yield/arg
+  positions), atomic execution of counted loops (incl. `const` bodies and
+  control flow) and recursion, and `?T`/`E!T` returns on that path — plus
+  in-place `xs = xs.push e` array growth and runtime memory/latency fixes.
+  Compute-heavy in-process scripts now run at flat memory and near the
+  interpreter's ceiling; the plain interpreter is still the zero-startup
+  default, and native compilation stays deferred. A `bench_guard` CI stage
+  protects these fast paths. Full history: `future/execution-optimization.md`.
 
 A known constraint discovered this cycle: `compiler.zig` is large (~10k lines)
 but cannot be cleanly split in current Zig — `usingnamespace` was removed and

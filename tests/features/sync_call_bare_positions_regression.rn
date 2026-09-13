@@ -1,0 +1,27 @@
+# Fork-free sync calls now lower in bare-call positions too — not just
+# value-capture sites (bindings, arithmetic operands). Covered here: a call as a
+# command argument, a call as a yielded value (including bare-yield recursion),
+# and — the deliberate exception — a bare statement call, whose yield still goes
+# to stdout (must NOT be swallowed by sync lowering). See
+# future/execution-optimization.md ("route yield-value/command-arg calls").
+fn Void @() Void
+
+fn Void inc(n: Int) Int { yield n + 1 }
+
+# Command-argument position: the call's value is materialized as the argument.
+echo (inc 5)
+
+# Yield-value position: a bare call as the yielded value, including recursion
+# through a bare `yield (f ...)` (previously forked and produced nothing).
+fn Void countdown(n: Int) Int {
+  if (n < 1) { yield 100 } else { yield (countdown (n - 1)) }
+}
+echo "cd=${countdown 4}"
+
+fn Void relay(n: Int) Int { yield (inc n) }
+echo "relay=${relay 9}"
+
+# Statement position: a bare call's yield goes to stdout (kept on the output
+# path, not sync-lowered to a discarded %r).
+fn Void greet() String { yield "hi" }
+greet

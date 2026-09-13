@@ -1,0 +1,39 @@
+# A UFCS method call (`recv.method args`) to a `sync` function is lowered
+# fork-free via the sync `call`/`ret` convention, with the receiver prepended as
+# the first argument (frame slot 0 = `self`) — exactly as the fork path passes
+# it. Previously `tryCompileSyncCall` required a bare-identifier callee, so a
+# UFCS method callee (a member expression) always fell to the fork path: a
+# struct-param sync fn called in a loop forked every call (600 MB / 10 s at
+# N=200000 vs 5 MB / 0.4 s now). See future/execution-optimization.md.
+fn Void @() Void
+
+const Point = struct { x: Int, y: Int }
+
+# Nullary UFCS method (receiver is the only arg).
+fn Void magSq(self: Point) Int { yield self.x * self.x + self.y * self.y }
+const p: Point = Point{ .x = 3, .y = 4 }
+echo "magSq=${p.magSq}"
+
+# UFCS method with an explicit argument after the receiver.
+fn Void scaledSum(self: Point, k: Int) Int { yield (self.x + self.y) * k }
+echo "scaled=${p.scaledSum 10}"
+
+# A plain struct-field access is not a method call — it must still read the
+# field, not be mis-lowered as a sync call.
+echo "field=${p.x}"
+
+# UFCS result composes in arithmetic and (via a binding) comparison.
+echo "arith=${p.magSq + 1}"
+const gt = p.magSq > 20
+echo "cmp=${gt}"
+
+# Self-recursive UFCS method: the receiver rides the sync frame each level.
+fn Void countDown(self: Point) Int {
+  if (self.x == 0) { yield self.y } else {
+    const cx = self.x
+    const cy = self.y
+    yield countDown Point{ .x = cx - 1, .y = cy + cx }
+  }
+}
+const start: Point = Point{ .x = 4, .y = 0 }
+echo "countDown=${start.countDown}"

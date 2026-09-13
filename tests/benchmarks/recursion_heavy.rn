@@ -1,0 +1,4 @@
+fn Void fib(n: Int) Int {
+  if (n < 2) { yield n } else { yield (fib (n - 1)) + (fib (n - 2)) }
+}
+echo "${fib 25}"

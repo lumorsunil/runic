@@ -1,0 +1,11 @@
+catch-ok=6
+catch-err=99
+str-ok=val5
+str-err=caught
+infer-ok=fine
+infer-err=c
+chain-ok=11
+chain-err=0
+match=bad
+rec-ok=55
+rec-err=-1

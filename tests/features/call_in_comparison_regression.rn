@@ -1,0 +1,37 @@
+# A function call (or UFCS method call) used directly as a comparison operand
+# must capture the function's yielded value, not leave a fork/thread handle.
+# Previously `compileComparisonBinary` compiled operands with plain
+# `compileExpression` (unlike arithmetic, which uses `compileArithmeticOperand`),
+# so a call operand forked and the comparison saw the thread handle instead of
+# the value — `const c = a < b` for a=3, b=5 wrongly yielded false. See
+# future/execution-optimization.md.
+fn Void @() Void
+
+fn Void three() Int { yield 3 }
+fn Void five() Int { yield 5 }
+
+# Two call operands. Only `<`/`<=`/`==`/`!=` are exercised with call operands:
+# a `>` whose left is a call/identifier parses as a redirect (a separate parser
+# ambiguity), so it is out of scope here. Bool prints as an exit code: true=0.
+echo "3<5=${three < five}"
+echo "5<3=${five < three}"
+echo "3<=3=${three <= three}"
+echo "3==3=${three == three}"
+echo "3!=5=${three != five}"
+
+# A call compared against a literal (only one operand forks).
+echo "3<4=${three < 4}"
+
+# Bound to a const, then used as an `if` condition.
+const lt = three < five
+echo "lt=${lt}"
+if (three < five) echo "if: 3<5 true" else echo "if: 3<5 false"
+if (five < three) echo "if: 5<3 true" else echo "if: 5<3 false"
+
+# UFCS method calls as comparison operands (receiver is a struct), twice in one
+# expression so each must be stabilized into its own ref.
+const Point = struct { x: Int, y: Int }
+fn Void magSq(self: Point) Int { yield self.x * self.x + self.y * self.y }
+const p: Point = Point{ .x = 3, .y = 4 }
+const q: Point = Point{ .x = 1, .y = 2 }
+if (q.magSq < p.magSq) echo "magSq: q<p" else echo "magSq: q>=p"

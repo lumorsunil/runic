@@ -1,0 +1,65 @@
+# A for-loop body containing control flow (if/else, else-if chains, match, a
+# nested while) now compiles to a fork-free counted_loop: the loop's body runner
+# follows the instruction pointer, so internal `jmp`s (branch targets inside the
+# body set) are walked like any other instruction. Previously such a body dropped
+# to the general jmp loop, which yielded to the scheduler every iteration and was
+# pathologically slow. Correctness across branch shapes is checked here; the win
+# is that these now run flat. See future/execution-optimization.md.
+fn Void @() Void
+
+# if / else.
+var a = 0
+for (0..10) |i| {
+  if (i > 4) { a = a + i } else { a = a + 1 }
+}
+echo "a=${a}"
+
+# else-if chain.
+var b = 0
+for (0..6) |i| {
+  if (i == 0) { b = b + 100 } else if (i == 1) { b = b + 10 } else { b = b + i }
+}
+echo "b=${b}"
+
+# match.
+var c = 0
+for (0..5) |i| {
+  match (i) {
+    0 => { c = c + 100 }
+    1 => { c = c + 10 }
+    _ => { c = c + i }
+  }
+}
+echo "c=${c}"
+
+# while nested in the for-body (a backward jmp the body runner also follows).
+var d = 0
+for (0..4) |i| {
+  var j = 0
+  while (j < i) {
+    d = d + 1
+    j = j + 1
+  }
+}
+echo "d=${d}"
+
+# value-position if, and asymmetric branch temporaries.
+var e = 0
+for (0..5) |i| {
+  const x = if (i > 2) { i * 10 } else { i }
+  e = e + x
+}
+echo "e=${e}"
+
+# a fork-free sync call inside a conditional inside the loop.
+fn Void inc(n: Int) Int { yield n + 1 }
+var f = 0
+for (0..6) |i| {
+  if (i > 2) {
+    const y = inc i
+    f = f + y
+  } else {
+    f = f + 0
+  }
+}
+echo "f=${f}"
