@@ -153,7 +153,12 @@ pub const IREvaluator = struct {
             return try self.advanceThreadCounter();
         };
 
-        const result = try self.runInstruction(thread.*, instruction);
+        // A sync `call` runs its whole fork-free subtree atomically (no
+        // scheduler round-trip per instruction) — see `runSyncCallAtomic`.
+        const result = if (instruction.type == .call)
+            try self.runSyncCallAtomic(thread.*)
+        else
+            try self.runInstruction(thread.*, instruction);
 
         switch (result) {
             .exit => |exit_code| try self.context.closeThread(thread.id, exit_code),
@@ -399,6 +404,67 @@ pub const IREvaluator = struct {
                 .process_exit => |exit_code| return .{ .process_exit = exit_code },
             }
         }
+    }
+
+    /// Runs a sync `call` atomically as far as it can: drives the thread's
+    /// instruction counter through the callee (following nested sync
+    /// `call`/`ret`/`jmp`) until it unwinds back to the caller, without yielding
+    /// to the scheduler between instructions. The current instruction must be the
+    /// `.call`. This is safe while every instruction is scheduler-free (arithmetic,
+    /// refs, control flow, nested sync calls) — such code produces no output,
+    /// forks nothing, and never blocks, so no other thread needs to interleave
+    /// (the same reason `counted_loop` runs atomically). It stops and hands back
+    /// to the scheduler at the first instruction that isn't (see the loop body).
+    /// Without this, the general multi-thread `step()` round-robins the (idle)
+    /// stdio stream threads after *every* instruction of a recursive sync call,
+    /// costing ~100 µs/call (e.g. `fib` — millions of scheduler round-trips).
+    ///
+    /// Returns `.cont_no_instr_counter_inc` on normal completion — the final
+    /// `ret` already positioned the counter at the instruction after the `call` —
+    /// or an `exit`/`process_exit` raised inside the subtree.
+    fn runSyncCallAtomic(self: *IREvaluator, thread: ir.context.IRThreadContext) Error!Result {
+        const all = self.context.instructions();
+        // Depth before the `.call`; the subtree is done when a matching `ret`
+        // unwinds the call stack back to (or below) this depth.
+        const depth_before = thread.private.call_stack.items.len;
+        while (true) {
+            const addr = thread.getCurrentInstructionAddr();
+            const instr = all[addr.instr_set][addr.local_addr];
+            // Only fast-forward while every instruction is safe to run without the
+            // scheduler. A `sync` entry can still contain a capture (`pipe`/`fork`/
+            // `wait`/`pipe_dequeue`) for a sub-operand that itself needs one — e.g.
+            // a struct-param body — and a `fork`+`wait` run atomically would
+            // deadlock (the forked thread never gets scheduled). On the first
+            // non-safe instruction, hand control back to the normal round-robin
+            // `step()` loop *at* that instruction (the call frame is on the stack,
+            // so scheduling resumes the call correctly).
+            if (!instructionIsAtomicSafe(instr.type)) return .cont_no_instr_counter_inc;
+            switch (try self.runInstruction(thread, instr)) {
+                .cont, .skip => thread.incInstructionCounter(),
+                // `call`/`ret`/`jmp` already moved the counter; keep following it.
+                .cont_no_instr_counter_inc => {},
+                .exit => |exit_code| return .{ .exit = exit_code },
+                .process_exit => |exit_code| return .{ .process_exit = exit_code },
+            }
+            if (thread.private.call_stack.items.len <= depth_before) {
+                // The initial `.call` pushed one frame (depth_before + 1); the
+                // matching `ret` popped back to depth_before, so control is now at
+                // the instruction after the original `call`.
+                return .cont_no_instr_counter_inc;
+            }
+        }
+    }
+
+    /// Whether an instruction can run without a scheduler round-trip — no fork,
+    /// no wait, no pipe/stream I/O, no blocking. Mirrors the compiler's
+    /// `instructionSetIsCountedLoopSafe` whitelist (which gates the same atomic
+    /// execution for loop bodies) plus `.ret`, since a sync `call` walks into an
+    /// entry set that returns. Keep the two lists in sync.
+    fn instructionIsAtomicSafe(t: ir.Instruction.Type) bool {
+        return switch (t) {
+            .comment, .set, .ath, .cmp, .neg, .is_err, .make_err, .match_err, .err_payload, .get_env, .set_env, .simple_exec, .ref, .pop, .push, .call, .jmp, .ret => true,
+            else => false,
+        };
     }
 
     fn materializeExecArgv(
