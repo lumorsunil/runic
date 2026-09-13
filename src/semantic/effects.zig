@@ -303,8 +303,20 @@ fn callThreaded(w: *const Walk, call: ast.CallExpr) bool {
             if (w.value_names.contains(id.name)) return call.arguments.len > 0;
             return true;
         },
-        // Member calls (UFCS / module fn / string-int-float builtin / C-FFI) and
-        // indirect calls are conservatively threaded for now.
+        // A UFCS method call `recv.method` dispatches by the *name* `method` to a
+        // free function (there is no per-type method table), so — exactly like the
+        // IR compiler's `tryCompileSyncCall` — a call to a known *sync* user
+        // function is itself sync. Anything else (a field access `p.x`, a builtin
+        // method like `.len`/`.map`, a module fn, C-FFI) is left conservatively
+        // threaded: only demote when the name resolves to a known threaded fn, or
+        // stay sync only when it resolves to a known sync fn.
+        .binary => |b| blk: {
+            if (b.op == .member and b.right.* == .identifier) {
+                if (w.analysis.fns.get(b.right.identifier.name)) |effect| break :blk effect == .threaded;
+            }
+            break :blk true;
+        },
+        // Other indirect callees are conservatively threaded for now.
         else => true,
     };
 }
@@ -515,6 +527,22 @@ test "mutual recursion of pure functions stays sync" {
     , &.{
         .{ "isEven", .sync },
         .{ "isOdd", .sync },
+    });
+}
+
+test "a UFCS call (with args) to a sync function is sync; to a threaded one is threaded" {
+    // A UFCS call *with arguments* parses as a call with a member callee, so it
+    // reaches `callThreaded` and inherits the method's effect by name.
+    try expectEffects(
+        \\fn Void scale(self: Int, k: Int) Int { yield self * k }
+        \\fn Void usesSync(p: Int) Int { yield p.scale 2 }
+        \\fn Void shout(self: Int, k: Int) Void { echo "hi" }
+        \\fn Void usesThreaded(p: Int) Void { p.shout 2 }
+    , &.{
+        .{ "scale", .sync },
+        .{ "usesSync", .sync },
+        .{ "shout", .threaded },
+        .{ "usesThreaded", .threaded },
     });
 }
 
