@@ -1,7 +1,8 @@
-[error]: tests/diagnostics/function_stdin_mismatch.rn:2:30: function stdin type mismatch: enclosing stdin is String, callee stdin expects Void
-   1:fn Void hello() String echo "hello"
-   2:fn String greetings() String hello
-   3:
-   4:greetings
-   5:
+[error]: tests/diagnostics/function_stdin_mismatch.rn:5:30: function stdin type mismatch: enclosing stdin is String, callee stdin expects Int
+   3:# enclosing stdin stream. (A Void-stdin callee reads nothing and is exempt.)
+   4:fn Int consume() Int { yield 5 }
+   5:fn String greetings() String [41m[30mconsume[0m
+   6:
+   7:greetings
+   8:
 

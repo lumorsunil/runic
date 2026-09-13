@@ -1,4 +1,7 @@
-fn Void hello() String echo "hello"
-fn String greetings() String hello
+# A function that reads stdin as one type must not be called from a function
+# whose stdin is a different (non-Void) type — the callee inherits and reads the
+# enclosing stdin stream. (A Void-stdin callee reads nothing and is exempt.)
+fn Int consume() Int { yield 5 }
+fn String greetings() String consume
 
 greetings
