@@ -1,6 +1,13 @@
 # Execution optimization: interpreter wins, then a fork-free "sync" path
 
-Status: **planning** (agreed direction, not started). Owner: Lumor.
+Status: **shipped in 0.10.0** (2026-09-13). The fork-free sync path landed —
+fork-free calls (nullary/parameterized/UFCS), atomic counted loops (incl. `const`
+bodies + control flow) and recursion, and `?T`/`E!T` sync returns, plus in-place
+array growth and runtime memory/latency fixes; a `bench_guard` CI stage protects
+the fast paths. Native codegen remains deferred. Remaining follow-ups are noted
+inline (error sets/sums/promises/executions on the sync path; a nullary-UFCS
+classification looseness; the pre-existing `is`-on-error-union crash). This doc
+is the full design + findings log for that work. Owner: Lumor.
 
 ## Goal
 

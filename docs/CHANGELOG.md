@@ -12,6 +12,81 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-13
+
+Compute-heavy, in-process Runic is now dramatically faster. A synchrony (effect)
+analysis identifies code that needs no concurrency and lowers it to a fork-free
+"sync" execution path, so function calls, recursion, and tight loops run at flat
+memory and near-interpreter-ceiling speed — while the plain interpreter stays
+the zero-startup default and every script keeps its existing behavior. Several
+latent correctness bugs surfaced and were fixed along the way, and a benchmark
+regression guard now protects the fast paths. Native compilation remains
+deferred.
+
+All performance changes are transparent: output and semantics are unchanged; the
+same program simply runs faster and with flat memory where it used to fork.
+
+### Performance
+
+- **Fork-free `sync` calls.** A new synchrony analysis (`src/semantic/effects.zig`)
+  classifies each function as `sync` (pure compute, a single yield, no pipeline /
+  command / generator / indirect call) or `threaded`. A `sync` call is lowered to
+  a direct `call`/`ret` convention with a per-thread return stack instead of
+  forking a green thread plus a pipe and a wait — eliminating the dominant
+  per-call time and memory cost. Covers nullary and parameterized calls, calls in
+  `yield`-value and command-argument positions, and **UFCS method calls**
+  (`p.method args`), so a struct-parameter method no longer forks per call.
+- **Atomic loops and recursion.** A counted loop (`for (0..n)`) runs its whole body
+  in one native loop without yielding to the scheduler — now including `const`/
+  computed-binding bodies and bodies with control flow (`if`/`else`/`match`), and
+  following a `sync` call into its body and back. A recursive `sync` call runs its
+  entire subtree atomically the same way, so recursion (e.g. `fib`) is fork-free
+  *and* no longer pays a per-instruction scheduler round-trip.
+- **Optional and error-union returns on the sync path.** A `sync` function
+  returning `?T`, `E!T`, or an inferred `!T` stays fork-free: the value rides back
+  in place with its discriminant intact, and `catch`, `try` propagation, `orelse`,
+  and `match` read it directly.
+- **In-place array growth.** A linear buffer grown with `xs = xs.push e` now grows
+  in place (amortized O(1)) instead of copying the whole array each push
+  (quadratic), at top level as well as inside functions.
+- **Runtime memory and latency fixes.** Runtime pipes are created from a freeing
+  allocator; the stdin stream-forwarding thread no longer busy-polls after EOF (it
+  had dominated the syscall cost of compute loops); and the execution tracer no
+  longer allocates on every stream forward when tracing is off.
+
+Representative measurements (ReleaseFast): a scalar/struct function call in a
+200k-iteration loop drops from ~0.6–9.9 s and 540–610 MB to ~0.3–0.4 s and ~5 MB;
+recursive `fib 25` drops from ~27 s to ~0.24 s; a `const`-body loop at 4M
+iterations runs in ~0.9 s at flat ~5 MB.
+
+### Added
+
+- **Benchmark regression guard.** `scripts/bench_guard.py` (new `bench_guard` CI
+  stage) runs the `tests/benchmarks/` scripts against a ReleaseFast build and
+  fails if an optimized fast path regresses — measuring peak RSS per process and
+  wall time against deliberately loose, order-of-magnitude budgets, and checking
+  output so a "fast but wrong" regression also fails. See `CLAUDE.md`.
+
+### Fixed
+
+- **Function-call operands were not captured in comparisons.** `a < b` where `a`
+  and `b` are function calls compared raw thread handles instead of the yielded
+  values, giving the wrong answer (`const c = a < b` for `a=3, b=5` returned
+  false); comparison operands are now captured like arithmetic operands.
+- **Function-call operands were not captured in logical `&&` / `||`.** Two
+  Bool-returning calls (`yes && yes`) concatenated their outputs into the capture
+  pipe instead of combining their boolean values; Bool-valued operands now lower
+  through the value path.
+- **A forking value expression passed as a command argument** (`echo (build)`
+  where `build` forks) raced the producer and echoed nothing; such arguments are
+  now value-captured.
+- **A self-recursive UFCS method returned empty output** on the fork path; it now
+  lowers fork-free and returns correctly.
+- Compound assignment to a struct field; two LSP crashes (a use-after-free freeing
+  completion matches, and a crash on go-to-definition of a virtual/embedded span);
+  and type-checker fixes for function-parameter and module-qualified type
+  resolution.
+
 ## [0.9.0] - 2026-09-06
 
 A C foreign-function interface: call C functions in a shared library directly,
