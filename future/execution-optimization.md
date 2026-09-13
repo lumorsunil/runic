@@ -247,11 +247,24 @@ correct; full CI green. Build it in tested increments:
   stay conservatively threaded — only a known-fn name is demoted, dup names already
   forced threaded → sound). wrap-with-args: 0.37 s / 5 MB. (A *nullary* UFCS `p.m`
   parses as a member node, not a call, so it was already non-threading.)
-- [ ] (e-remaining) widen `syncReturnAllowed` for error unions once the sync return
-  path carries the error discriminant (optionals already done, f51950f). A nullary
-  UFCS call to a *threaded* fn is still classified sync (parses as a member node,
-  bypassing `callThreaded`) — harmless today (its entry's fork makes
-  `runSyncCallAtomic` bail to normal scheduling), but a latent looseness.
+- [x] (e) error-union returns — DONE (commit 7248837). `syncReturnAllowed` excluded
+  `.error_union`, so an `E!T`/inferred-`!T` sync fn always forked (540 MB / 6.9 s at
+  N=200000). Turned out no new machinery was needed: an error-union runtime value
+  already carries its ok/error discriminant (like an optional, already allowed), so
+  the sync yield sets it into %r and `ret`s, and `catch`/`try`-propagation/`match`
+  read it directly; its `make_err`/`is_err`/`match_err`/`err_payload` ops are already
+  atomic-safe (so it runs through `runSyncCallAtomic`). Dropped `.error_union` from
+  the exclusion. -> 0.31 s / 5 MB; identical output on both paths. Test
+  sync_call_error_union_regression.rn (Int/String payload, inferred `!T`, `try`
+  propagation, `match`, recursion). Still excluded (need real transport): error
+  sets/single errors/sums/promises/executions.
+- [ ] (e-remaining, minor) two latent looseness items, both harmless today:
+  (1) a *nullary* UFCS call to a *threaded* fn is still classified sync (parses as a
+  member node, bypassing `callThreaded`) — its entry's fork makes `runSyncCallAtomic`
+  bail to normal scheduling. (2) SEPARATE PRE-EXISTING CRASH (not from this work):
+  `is` on an error-union (`r is E.Bad`) is an unsupported type-check error, and that
+  error path GP-faults in `parser.deinit`/`arena.deinit` (repro on baseline too) —
+  worth a dedicated fix.
 
 ## ROOT CAUSE FOUND: per-iteration stdin polling by the stdio stream threads
 
