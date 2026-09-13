@@ -1,0 +1,8 @@
+// A module whose struct's field types refer to the module's OWN import
+// (`c = import "std/ffi.rn"`). An importer must be able to construct the struct
+// and read its fields without needing `c` in its own scope.
+const c = import "std/ffi.rn"
+
+const Rect = struct { x: c.Int, y: c.Int, w: c.Int, h: c.Int }
+
+pub const ORIGIN = Rect{ .x = 0, .y = 0, .w = 0, .h = 0 }

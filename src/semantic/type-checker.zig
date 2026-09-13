@@ -1317,11 +1317,19 @@ pub const TypeChecker = struct {
                         if (try self.requestModuleScope(mod_type.module)) |module_scope| {
                             if (module_scope.lookup(identifier.path.segments[1].name)) |member| {
                                 if (member.type_expr) |member_type| {
-                                    return try self.allocTypeExpression(.{ .alias = .{
-                                        .name = identifier.path.segments[1].name,
-                                        .span = identifier.span,
-                                        .type_expr = member_type,
-                                    } });
+                                    return try self.allocTypeExpression(.{
+                                        .alias = .{
+                                            .name = identifier.path.segments[1].name,
+                                            .span = identifier.span,
+                                            // Resolve the member's struct fields in the
+                                            // *module's* scope, where its own imports
+                                            // (`c = import "std/ffi"`) are bound — so a
+                                            // later field access or construction in the
+                                            // importer's scope doesn't re-resolve a
+                                            // `c.Float` field type where `c` is unknown.
+                                            .type_expr = try self.resolveModuleMemberFields(module_scope, member_type),
+                                        },
+                                    });
                                 }
                             }
                         }
@@ -1364,6 +1372,33 @@ pub const TypeChecker = struct {
                 .type_expr = type_expr,
             },
         });
+    }
+
+    /// When a module-qualified type (`m.Rectangle`) resolves to a struct, resolve
+    /// its field types in the *module's* scope. A field type such as `c.Float`
+    /// refers to the module's own `const c = import "std/ffi"`, which is not in
+    /// the importer's scope — so without this, a later field access
+    /// (`rect.width`) or construction (`m.Rectangle{ … }`) would try to resolve
+    /// `c.Float` where `c` is undeclared ("type c not declared"). Resolves one
+    /// level (each field to an alias); a nested struct field stays a bare alias,
+    /// which is resolved the same way when it is itself referenced qualified.
+    /// Non-struct members are returned unchanged.
+    fn resolveModuleMemberFields(
+        self: *TypeChecker,
+        module_scope: *Scope,
+        member_type: *const ast.TypeExpr,
+    ) Error!*const ast.TypeExpr {
+        const unaliased = self.unaliasType(member_type);
+        if (unaliased.* != .struct_type) return member_type;
+        const st = unaliased.struct_type;
+        const new_fields = try self.arena.allocator().alloc(ast.TypeExpr.StructField, st.fields.len);
+        for (st.fields, new_fields) |field, *dst| {
+            dst.* = field;
+            dst.type_expr = try self.resolveTypeExpr(module_scope, field.type_expr);
+        }
+        var new_st = st;
+        new_st.fields = new_fields;
+        return try self.allocTypeExpression(.{ .struct_type = new_st });
     }
 
     fn runBindingPattern(
@@ -3671,7 +3706,11 @@ pub const TypeChecker = struct {
                 );
                 return;
             };
-            const st = self.unaliasType(member.type_expr orelse return);
+            // Resolve the struct's field types in the module's scope so a field
+            // type such as `c.Float` (referring to the module's own `import`) is
+            // validated where `c` is bound, not in the importer's scope.
+            const member_type = member.type_expr orelse return;
+            const st = self.unaliasType(try self.resolveModuleMemberFields(module_scope, member_type));
             if (st.* == .struct_type) {
                 try self.runStructValueLiteral(scope, st.struct_type, struct_literal);
             } else {

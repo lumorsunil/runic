@@ -1,0 +1,21 @@
+// Regression: a struct type from an imported module whose fields are typed via
+// the module's own import (`c.Int` from `std/ffi`) must be constructible and
+// field-accessible in the importer, and usable as a parameter/return type —
+// without the importer needing `c` in scope. Previously the field types were
+// re-resolved in the importer's scope, giving "type c not declared".
+const m = import "../support/imports/ffi_struct_module.rn"
+
+// Construct + read a field.
+const r = m.Rect{ .x = 1, .y = 2, .w = 30, .h = 40 }
+echo "w=${r.w}"
+
+// A function returning the module struct, constructing it in the body.
+fn Void shift(dx: Int) m.Rect {
+  yield m.Rect{ .x = dx, .y = 0, .w = 30, .h = 40 }
+}
+const s = shift 7
+echo "shifted.x=${s.x}"
+
+// A function taking the module struct as a parameter and reading a field.
+fn Void area(rect: m.Rect) Int { yield rect.w * rect.h }
+echo "area=${area r}"
