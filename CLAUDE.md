@@ -21,7 +21,7 @@ zig build test
 # Build the language server
 zig build runic-lsp
 
-# Full CI pipeline (formatter → linter → unit tests → CLI smoke tests)
+# Full CI pipeline (formatter → linter → unit tests → CLI smoke tests → benchmark guard)
 zig build run -- scripts/run_ci.rn
 
 # Individual CI stages
@@ -29,9 +29,27 @@ zig build run -- scripts/run_ci.rn
 ./scripts/stages/linter.sh      # zig fmt --check (fails on violations)
 ./scripts/stages/unit_tests.sh  # zig build test
 ./scripts/stages/cli_smoke.sh   # bash tests/cli_*.sh
+
+# Performance-regression guard (builds ReleaseFast, checks the optimized fast paths)
+RUNIC_BIN=zig-out/bin/runic python3 scripts/bench_guard.py   # after: zig build -Doptimize=ReleaseFast
 ```
 
 Formatting is both formatter and linter: `zig fmt --check src cmd tests` must pass cleanly.
+
+### Performance-regression guard
+
+`scripts/bench_guard.py` runs the benchmarks in `tests/benchmarks/` and fails if a
+fast path regresses. Each benchmark isolates one optimization (counted loops, fork-free
+sync calls, recursion, UFCS/struct-param calls, error-union returns, in-place array
+growth) whose failure mode is an **order-of-magnitude** blow-up — a fork per call
+(hundreds of MB), a scheduler round-trip per instruction (10-100x time), or an O(n²)
+array copy. The peak-RSS and wall-time budgets are deliberately loose tripwires (10-100x
+margin over the ~5-13 MB / sub-second fast path), so they catch real regressions without
+flaking on machine speed or timing noise. It runs in ReleaseFast only (the optimizations
+don't exist in debug builds). **If a new feature legitimately makes a benchmark heavier,
+raise that entry's budget in `bench_guard.py` in the same change** rather than letting
+the guard rot. (`scripts/bench.sh` is a separate manual runic-vs-bash timing comparison,
+not a pass/fail guard.)
 
 ## Architecture
 

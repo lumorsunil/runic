@@ -1,0 +1,5 @@
+var total = 0
+for (0..2000000) |i| {
+    total = total + i
+}
+echo "${total}"

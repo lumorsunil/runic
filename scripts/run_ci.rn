@@ -28,7 +28,7 @@ fn Void run_stage(stage_name: String) String {
   bash script_path
 }
 
-echo "Runic CI pipeline (formatter → linter → unit tests → CLI regression tests)"
+echo "Runic CI pipeline (formatter → linter → unit tests → CLI regression tests → benchmark guard)"
 echo "Detected toolchain: ${language}"
 
 mkdir "-p" "./scripts/stages"
@@ -37,3 +37,4 @@ run_stage "formatter"
 run_stage "linter"
 run_stage "unit_tests"
 run_stage "cli_smoke"
+run_stage "bench_guard"

@@ -1,0 +1,6 @@
+var total = 0
+for (0..1000000) |i| {
+    const x = i + 1
+    total = total + x
+}
+echo "${total}"

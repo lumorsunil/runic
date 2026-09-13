@@ -1,0 +1,9 @@
+const Point = struct { x: Int, y: Int }
+fn Void magSq(self: Point) Int { yield self.x * self.x + self.y * self.y }
+const p: Point = Point{ .x = 3, .y = 4 }
+var total = 0
+for (0..200000) |i| {
+    const m = p.magSq
+    total = total + m
+}
+echo "${total}"

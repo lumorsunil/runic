@@ -1,0 +1,8 @@
+const E = error { Bad }
+fn Void checked(n: Int) E!Int { if (n < 0) { yield E.Bad } else { yield n + 1 } }
+var total = 0
+for (0..200000) |i| {
+    const v = checked i catch 0
+    total = total + v
+}
+echo "${total}"
