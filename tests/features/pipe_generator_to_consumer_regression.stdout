@@ -1,0 +1,7 @@
+show 10
+show 20
+show 30
+draw 1,1
+draw 2,2
+show 42
+done

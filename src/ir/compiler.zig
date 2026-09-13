@@ -7439,10 +7439,14 @@ pub const IRCompiler = struct {
         // way.
         const param_type: ast.TypeExpr = self.pipelineParamStageParamType(stage_expr) orelse string_type;
 
-        // Collect the upstream value and bind it to the single parameter.
-        try self.addInstruction(.init(.from(source), .collect_stdin));
+        // Loop over the upstream stream: read each value, bind it to the single
+        // parameter, and call the function once per value — so a generator that
+        // yields many values (`producer | consume`) invokes the consumer for each,
+        // not just the first. `collect_stdin` returns `.null` at EOF (empty and
+        // closed), which ends the loop. A single-value or byte-blob upstream
+        // yields exactly one value, so the consumer is still called once.
         const input_ref = try self.newRef(source, "pipe_param_input");
-        try self.set(source, input_ref, .fromLocation(.initRegister(.r)));
+        const is_eof_ref = try self.newRef(source, "pipe_param_eof");
 
         const input_name = "\x00pipe_param_input";
         try self.scopes.declare(
@@ -7456,7 +7460,29 @@ pub const IRCompiler = struct {
         const arg_expr = try self.allocator.create(ast.Expression);
         arg_expr.* = .{ .identifier = .{ .name = input_name, .span = source.span() } };
 
-        return try self.compileFunctionCall(source, fn_ref, &.{arg_expr}, &.{}, null);
+        const after_label = try self.newLabel("pipe_param_after", .unknown);
+        const loop_label = try self.newLabel("pipe_param_loop", .abs);
+
+        // Net stack growth per iteration (the consumer call's temporaries) is
+        // popped below so the loop doesn't grow the stack unboundedly.
+        const stack_before = self.currentFrame().rel_stack_counter;
+
+        try self.addInstruction(.init(.from(source), .collect_stdin));
+        try self.set(source, input_ref, .fromLocation(.initRegister(.r)));
+        try self.cmp(source, .equal, .from(input_ref.dereference()), .fromValue(.null), is_eof_ref);
+        try self.jmp(source, try .from(is_eof_ref.dereference()), true, after_label);
+
+        const call_result = try self.compileFunctionCall(source, fn_ref, &.{arg_expr}, &.{}, null);
+        // Wait for this call before reading the next value so the consumer's
+        // output is ordered (call 1's output precedes call 2's).
+        if (isWaitable(call_result)) |loc| try self.wait(source, loc);
+        const pushed = self.currentFrame().rel_stack_counter -| stack_before;
+        for (0..pushed) |_| _ = try self.pop(source);
+
+        try self.jmp(source, null, true, loop_label);
+        try self.setLabel(after_label.local_addr.label, .abs);
+
+        return .fromValue(.void);
     }
 
     /// A bare `&0` used as a pipeline stage forwards its stdin straight through

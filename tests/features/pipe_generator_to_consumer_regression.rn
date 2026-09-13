@@ -1,0 +1,29 @@
+# Piping a generator function (multiple `yield`s) into a single-parameter
+# consumer function must invoke the consumer once PER yielded value, not just
+# for the first. Previously the param-coercion stage did a single `collect_stdin`
+# + call, so `producer | consume` dropped every value after the first. Now the
+# stage loops over the upstream stream until EOF. A single-value (or byte-blob)
+# upstream still yields exactly one value, so the consumer is called once.
+fn Void @() Void
+
+# Int generator -> consumer: all three values.
+fn Void show(n: Int) Void { echo "show ${n}" }
+fn Void nums() Int { yield 10; yield 20; yield 30 }
+nums | show
+
+# Struct generator -> consumer (the reported raylib shape).
+const V = struct { x: Int, y: Int }
+fn Void draw(v: V) Void { echo "draw ${v.x},${v.y}" }
+var a = V{ .x = 1, .y = 1 }
+var b = V{ .x = 2, .y = 2 }
+fn Void verts() V { yield a; yield b }
+verts | draw
+
+# A single-value producer still calls the consumer exactly once.
+fn Void one() Int { yield 42 }
+one | show
+
+# An empty generator calls the consumer zero times.
+fn Void none() Int { if (false) { yield 0 } }
+none | show
+echo "done"
