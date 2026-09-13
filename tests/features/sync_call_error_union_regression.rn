@@ -1,0 +1,53 @@
+# A `sync` function returning an error union (`E!T` or inferred `!T`) is lowered
+# fork-free via the sync `call`/`ret` convention: the error-union value — its
+# error/ok discriminant intact — rides back in `%r`, and consumers (`catch`,
+# `try` propagation, `match`) read it directly, exactly as an optional return
+# does. Previously `syncReturnAllowed` excluded error unions, so such functions
+# always forked (an error-union sync fn in a loop cost 540 MB / 6.9 s at
+# N=200000 vs 5 MB / 0.3 s now). See future/execution-optimization.md.
+fn Void @() Void
+
+const E = error { Bad, Worse }
+
+# Int payload, ok and error paths, consumed by `catch`.
+fn Void okVal(n: Int) E!Int { yield n + 1 }
+fn Void errVal(n: Int) E!Int { yield E.Bad }
+echo "catch-ok=${okVal 5 catch 99}"
+echo "catch-err=${errVal 5 catch 99}"
+
+# String payload.
+fn Void okStr(n: Int) E!String { yield "val${n}" }
+fn Void errStr() E!String { yield E.Worse }
+echo "str-ok=${okStr 5 catch "caught"}"
+echo "str-err=${errStr catch "caught"}"
+
+# Inferred error set (`!T`).
+fn Void inferOk() !String { yield "fine" }
+fn Void inferErr() !String { yield E.Bad }
+echo "infer-ok=${inferOk catch "c"}"
+echo "infer-err=${inferErr catch "c"}"
+
+# `try` propagates the error out of an enclosing sync fn (early `ret` with the
+# error in %r); the ok path unwraps and continues.
+fn Void step(n: Int) E!Int { if (n == 0) { yield E.Bad } else { yield n * 2 } }
+fn Void chain(n: Int) E!Int { const v = try step n; yield v + 1 }
+echo "chain-ok=${chain 5 catch 0}"
+echo "chain-err=${chain 0 catch 0}"
+
+# `match` over the propagated error.
+match inferErr {
+  E.Bad => echo "match=bad"
+  E.Worse => echo "match=worse"
+}
+
+# Recursion returning an error union, error propagated through many sync frames.
+fn Void sumDown(n: Int) E!Int {
+  if (n > 100) { yield E.Worse } else {
+    if (n == 0) { yield 0 } else {
+      const rest = try sumDown (n - 1)
+      yield n + rest
+    }
+  }
+}
+echo "rec-ok=${sumDown 10 catch 0-1}"
+echo "rec-err=${sumDown 200 catch 0-1}"

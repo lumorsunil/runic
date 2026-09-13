@@ -8259,7 +8259,7 @@ pub const IRCompiler = struct {
         // A generic return (`|T|`, `T`) is monomorphized via the fork path.
         if (t.* == .type_var or hasTypeCapture(t.*)) return false;
         return switch (t.*) {
-            .error_union, .promise, .error_set, .err, .sum, .type_merge, .execution, .failed => false,
+            .promise, .error_set, .err, .sum, .type_merge, .execution, .failed => false,
             else => true,
         };
     }
