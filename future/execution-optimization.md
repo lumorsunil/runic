@@ -208,12 +208,32 @@ correct; full CI green. Build it in tested increments:
   fall back to fork), plus generic-`|T|` params/returns excluded (they
   monomorphize via the fork path). Correct for nested/branch/two-arg cases.
   **Did NOT speed up `call_heavy`** — see the critical finding below.
-- [ ] **(next, higher priority than d/e) the jmp-fallback loop transient-alloc
-  leak — the real blocker.** See "Critical finding" below.
-- [ ] (d) recursion end-to-end (`recursive_regression`).
+- [x] **the jmp-fallback loop transient-alloc leak** — DONE (fix directions 1 &
+  2 below). A `const`/computed loop body is now flat and fast: `const x=i+1;
+  total+=x` runs 4M iterations in 0.87 s at 4.8 MB (was projected 14 GB).
+- [x] **(d) recursion end-to-end** — DONE, and it was the last big win. Recursion
+  was already fork-free and correct (only 1 OS `clone`; `recursion_value_regression`
+  green) but ~11x slower per call than `call_heavy`'s sync calls: `fib 25` 27.6 s,
+  `fib 30` 34.3 s. Root cause: a recursive sync call round-trips the round-robin
+  scheduler after *every* instruction (the stdout/stderr stream-forward threads
+  are always live, so `step()` never hits the single-thread fast path and services
+  those idle threads per instruction — ~100 µs/call; without `</dev/null` it also
+  triggered a stdin poll storm, but that was only ~10% of the cost). Fix: a sync
+  `.call` in `step()` runs its whole subtree via `runSyncCallAtomic` (evaluator),
+  driving the instruction counter through `call`/`ret`/`jmp` without yielding —
+  the same technique `runCountedLoopBody` uses for loops. It fast-forwards only
+  while instructions are scheduler-free (`instructionIsAtomicSafe`) and bails to
+  normal scheduling at the first `pipe`/`fork`/`wait` — a sync entry can still
+  contain a capture (a struct-param body like `magSq`), and running its `fork`+`wait`
+  atomically would deadlock. Result: `fib 25` 27.6 s → **0.24 s**, `fib 30` 34.3 s
+  → **3.6 s** (commit c854999). `call_heavy` and compute-loops were already fast
+  via `counted_loop`; this extends the same atomic execution to recursion.
 - [ ] (e) wire the arg / struct-field / typed-value capture fast paths; widen
   `syncReturnAllowed` (error unions/optionals) once the sync return path carries
-  the discriminant.
+  the discriminant. (Note: a sync entry with a struct param currently still emits
+  a capture/fork for the param access — hence the `runSyncCallAtomic` bail — so a
+  struct-param sync fn does not yet get the atomic fast path; wiring the
+  struct-field capture fast path here would let it, too, run fork-free.)
 
 ## ROOT CAUSE FOUND: per-iteration stdin polling by the stdio stream threads
 
