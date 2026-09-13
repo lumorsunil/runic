@@ -12,6 +12,8 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-09-14
+
 ### Fixed
 
 - **Forward-referenced consumer closures.** A top-level function used as a
