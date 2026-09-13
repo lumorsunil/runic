@@ -2526,6 +2526,78 @@ pub const IRCompiler = struct {
         return try self.emitTypedValueCapture(source, expr, fn_ref_value, info.arguments, info.redirects, return_type_ptr);
     }
 
+    /// Whether `expr` evaluates to a `Bool` *value* (delivered through a
+    /// register), rather than to command output written to a capture pipe. Used
+    /// to route logical operators onto the value (`.log`) path: it is sound only
+    /// when every leaf is a value, never a command producer. Covers bool
+    /// literals/bindings, comparisons, logical `!`/`&&`/`||` (recursively), and
+    /// Bool-yielding calls. Conservative: anything else → false (keep the pipe
+    /// path). Comparisons and logical sub-expressions always yield a value here
+    /// because their own operands are captured.
+    fn exprIsBoolValued(self: *IRCompiler, expr: *ast.Expression) Error!bool {
+        switch (expr.*) {
+            .literal => |lit| return lit == .bool,
+            .unary => |u| return u.op == .logical_not and try self.exprIsBoolValued(u.operand),
+            .binary => |b| {
+                if (b.op.isComparison()) return true;
+                if (b.op == .logical_and or b.op == .logical_or)
+                    return (try self.exprIsBoolValued(b.left)) and (try self.exprIsBoolValued(b.right));
+                // else: a UFCS member call (`recv.method`) — fall through to the
+                // call-based Bool check below.
+            },
+            else => {},
+        }
+        if (!self.analyzeExpressionEffects(expr).needs_stdio_capture)
+            return self.exprIsStaticBool(expr);
+        return try self.operandYieldsBoolValue(expr);
+    }
+
+    /// Whether a non-capturing operand is statically a `Bool` (a bool literal or
+    /// a binding/field of Bool type). Conservative: unknown → false.
+    fn exprIsStaticBool(self: *IRCompiler, expr: *ast.Expression) bool {
+        if (expr.* == .literal and expr.literal == .bool) return true;
+        const t = self.resolveStaticType(expr) orelse return false;
+        return typeExprIsBool(&t);
+    }
+
+    /// Whether a type is `Bool` (either the primitive tag or the named type).
+    fn typeExprIsBool(t: *const ast.TypeExpr) bool {
+        return switch (t.*) {
+            .boolean => true,
+            .identifier => |named| std.mem.eql(u8, named.path.segments[named.path.segments.len - 1].name, "Bool"),
+            else => false,
+        };
+    }
+
+    /// Pure predicate mirroring `tryCompileTypedValueCapture`'s success
+    /// conditions (emits nothing) restricted to a `Bool` return: whether `expr`
+    /// is a call whose value is captured as a `Bool` rather than as command
+    /// output. Such an operand must be captured by value, not forked into a
+    /// surrounding capture pipe. Used to route logical operators whose operands
+    /// need capture onto the value (`.log`) path — which requires Bool operands
+    /// (an Int/exit-code left is unsupported there, matching plain-var logical).
+    fn operandYieldsBoolValue(self: *IRCompiler, expr: *ast.Expression) Error!bool {
+        if (try self.moduleMemberFnRef(expr)) |mm| {
+            return self.isTypedCaptureReturn(mm.return_type) and typeExprIsBool(mm.return_type);
+        }
+        const info = (try self.capturableCallInfo(expr)) orelse return false;
+        if (info.redirects.len != 0) return false;
+        const binding = self.lookup(info.method_name, .{ .shallow = false }) orelse return false;
+        if (!binding.result.isFunctionRef()) return false;
+        const fn_type = binding.type_expr orelse return false;
+        if (fn_type != .function) return false;
+        const return_type_ptr = fn_type.function.return_type orelse return false;
+        if (!typeExprIsBool(return_type_ptr)) return false;
+        const fn_ref_value = binding.result.source.value;
+        if (info.arguments.len == 0 and
+            self.instruction_sets.items[fn_ref_value.fn_ref.fn_addr.instr_set].param_count > 0)
+        {
+            return false;
+        }
+        if (self.instruction_sets.items[fn_ref_value.fn_ref.fn_addr.instr_set].pub_exports.len != 0) return false;
+        return true;
+    }
+
     /// Emits an in-process typed value capture of a function call: fork with a
     /// `typed` stdout pipe, wait, then dequeue the single yielded value into %r
     /// typed as `return_type_ptr`. Shared by the local-binding and module-member
@@ -9442,12 +9514,46 @@ pub const IRCompiler = struct {
                 const left_expr_effects = self.analyzeExpressionEffects(binary.left);
                 const right_expr_effects = self.analyzeExpressionEffects(binary.right);
 
+                // Bool-valued operands (a call yielding a Bool, a comparison, a
+                // nested `&&`/`||`/`!`, e.g. `yes && no`) must be captured *by
+                // value* — not forked into the surrounding capture pipe like a
+                // command. The pipe path below would send each operand's yielded
+                // value to the outer pipe and concatenate them (`yes && yes` →
+                // "00"). When both operands are Bool-valued, lower exactly like
+                // the non-capture value path: capture each operand as a value and
+                // combine with `.log`. The result is a value that flows back
+                // through %r, so the outer capture pipe is legitimately empty. A
+                // command operand keeps the exit-code pipe path.
+                if (binary.op != .sequence and
+                    (left_expr_effects.needs_stdio_capture or right_expr_effects.needs_stdio_capture) and
+                    try self.exprIsBoolValued(binary.left) and
+                    try self.exprIsBoolValued(binary.right))
+                {
+                    const left = try self.compileArithmeticOperand(source, binary.left);
+                    if (evaluateLogical(.from(binary.op), left.source)) |comptime_result| {
+                        return switch (comptime_result) {
+                            .left => left,
+                            .right => try self.compileArithmeticOperand(source, binary.right),
+                        };
+                    }
+                    const right = try self.compileArithmeticOperand(source, binary.right);
+                    const ref = try self.newRef(source, "logical_result");
+                    try self.addInstruction(.init(.from(source), .{ .log = .{
+                        .op = .from(binary.op),
+                        .a = left.source,
+                        .b = right.source,
+                        .result = ref,
+                    } }));
+                    return .from(ref.dereference());
+                }
+
                 if (left_expr_effects.needs_stdio_capture or right_expr_effects.needs_stdio_capture) {
                     // Compile sub-expressions directly — we are already inside a capture fork
                     // (set up by compileExpressionWithCapture → compileWithContext) where the
                     // current thread's stdout/stderr ARE the outer capture pipes. Creating
                     // nested captures here would intercept the output into inner pipes and
-                    // leave the outer pipes empty.
+                    // leave the outer pipes empty. (Reached only when at least one operand is
+                    // a command producer; pure typed-value operands took the value path above.)
                     const result_ref = try self.newRef(source, "logical_result");
                     const left = try self.compileExpression(binary.left);
 
