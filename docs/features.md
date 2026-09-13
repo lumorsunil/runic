@@ -773,6 +773,26 @@ produce | passthrough
 on stdin and forwards it. The type checker validates that these types align
 before the script runs.
 
+**Mutable parameters.** Parameters are immutable (`const`) by default, like
+bindings. Prefix one with `var` to reassign it or mutate its fields inside the
+body — no `var copy = param` shim needed:
+
+```rn
+const Point = struct { x: Int, y: Int }
+fn Void shiftRight(var p: Point) Void {
+    p.x += 1        // ok: `p` is a `var` parameter
+}
+```
+
+Mutating a plain (`const`) parameter is a compile-time error (`cannot assign to a
+field of immutable 'p'; declare it with var`). An explicit `const` marker is
+accepted and is the default.
+
+**Forward references.** Top-level functions may be called before they are
+declared, and top-level functions may recurse mutually — the declaration order
+of top-level functions does not matter. (Functions declared inside another
+function's body still follow declare-before-use.)
+
 ### Standard streams: `&0`, `&1`, `&2`
 
 The three standard streams are referenced with file-descriptor syntax: `&0`

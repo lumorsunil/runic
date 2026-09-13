@@ -1,0 +1,5 @@
+# A parameter is immutable (const) by default; mutating its field requires
+# marking it `var`.
+const V = struct { x: Int, y: Int }
+fn Void bump(e: V) Void { e.x += 1 }
+bump V{ .x = 1, .y = 2 }

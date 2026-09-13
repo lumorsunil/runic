@@ -1,0 +1,7 @@
+[error]: tests/diagnostics/const_param_field_mutation.rn:4:27: cannot assign to a field of immutable 'e'; declare it with var
+   2:# marking it `var`.
+   3:const V = struct { x: Int, y: Int }
+   4:fn Void bump(e: V) Void { [41m[30me.x[0m += 1 }
+   5:bump V{ .x = 1, .y = 2 }
+   6:
+

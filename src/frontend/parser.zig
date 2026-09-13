@@ -3410,6 +3410,19 @@ pub const Parser = struct {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
+        // A leading `var` marks the parameter mutable, so the body may reassign it
+        // or mutate its fields (`fn f(var e: T) …` then `e.x += 1`) without a
+        // `var copy = e` shim. Parameters are immutable (const) otherwise; an
+        // explicit `const` is accepted as a no-op for symmetry.
+        const start = try self.peekToken();
+        var is_mutable = false;
+        if (start.tag == .kw_var) {
+            _ = try self.nextToken();
+            is_mutable = true;
+        } else if (start.tag == .kw_const) {
+            _ = try self.nextToken();
+        }
+
         const pattern = try self.parseBindingPattern();
         const annotation = try self.parseMaybeTypeAnnotation();
         const default_value = try self.parseMaybeDefaultValue();
@@ -3421,7 +3434,7 @@ pub const Parser = struct {
             .pattern = pattern,
             .type_annotation = annotation,
             .default_value = default_value,
-            .is_mutable = false,
+            .is_mutable = is_mutable,
             .span = pattern.span().endAt(end),
         };
 

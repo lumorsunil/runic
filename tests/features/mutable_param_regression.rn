@@ -1,0 +1,26 @@
+# A parameter marked `var` is mutable: its fields may be assigned and the whole
+# binding reassigned, without a `var copy = param` shim. Parameters are immutable
+# (const) by default — mutating a plain parameter is rejected (see
+# tests/diagnostics/const_param_field_mutation.rn). An explicit `const` marker is
+# accepted as a no-op.
+fn Void @() Void
+
+const V = struct { x: Int, y: Int }
+
+# Mutate a `var` struct parameter's field directly.
+fn Void bumpField(var e: V) Void {
+  e.x += 1
+  echo "field=${e.x},${e.y}"
+}
+bumpField V{ .x = 10, .y = 20 }
+
+# Reassign a whole `var` scalar parameter.
+fn Void scale(var n: Int) Int {
+  n = n * 10
+  yield n
+}
+echo "scale=${scale 5}"
+
+# An explicit `const` parameter is immutable (marker is a no-op); a copy is used.
+fn Void viaConst(const e: V) Int { yield e.x + e.y }
+echo "const=${viaConst V{ .x = 3, .y = 4 }}"

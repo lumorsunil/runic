@@ -1588,7 +1588,7 @@ pub const TypeChecker = struct {
                     param.pattern,
                     param_type,
                     false,
-                    false,
+                    param.is_mutable,
                 );
             },
             ._variadic => |param| {
@@ -1599,7 +1599,7 @@ pub const TypeChecker = struct {
                     param.pattern,
                     param_type,
                     false,
-                    false,
+                    param.is_mutable,
                 );
             },
         }
