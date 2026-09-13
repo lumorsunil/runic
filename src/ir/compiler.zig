@@ -7026,6 +7026,15 @@ pub const IRCompiler = struct {
             else => null,
         } orelse return .byte_stream;
 
+        // An array-valued stage streams its elements by value (typed).
+        if (binding.type_expr) |bt| {
+            const unaliased = switch (bt) {
+                .alias => |a| a.type_expr.*,
+                else => bt,
+            };
+            if (unaliased == .array) return .exact_typed;
+        }
+
         const fn_type = switch (binding.type_expr orelse return .byte_stream) {
             .function => |f| f,
             else => return .byte_stream,
@@ -7124,6 +7133,16 @@ pub const IRCompiler = struct {
             .identifier => |id| self.lookup(id.name, .{ .shallow = false }),
             else => null,
         } orelse return null;
+
+        // An array-valued stage streams its elements (see the array-source
+        // producer stage), so its per-value stdout type is the element type.
+        if (binding.type_expr) |bt| {
+            const unaliased = switch (bt) {
+                .alias => |a| a.type_expr.*,
+                else => bt,
+            };
+            if (unaliased == .array) return unaliased.array.element.*;
+        }
 
         const fn_type = switch (binding.type_expr orelse return null) {
             .function => |f| f,
@@ -7499,6 +7518,47 @@ pub const IRCompiler = struct {
         return .fromValue(.void);
     }
 
+    /// An array used as a pipeline *source* (`xs | consume`) streams its elements:
+    /// each element is yielded, one at a time, to the stage's stdout — so a
+    /// downstream consumer runs per element (like a generator function). Lowered by
+    /// synthesizing `for (stage) |elem| yield elem`; the inter-stage boundary is
+    /// typed (see `stageStdoutType`), so a struct element crosses by value. Returns
+    /// null when the stage isn't array-valued, so normal stage compilation applies.
+    fn tryCompileArraySourceStage(self: *IRCompiler, source: *ast.Expression, stage_expr: *ast.Expression) Error!?Result {
+        const static_type = self.resolveStaticType(stage_expr) orelse return null;
+        const unaliased = switch (static_type) {
+            .alias => |a| a.type_expr.*,
+            else => static_type,
+        };
+        if (unaliased != .array) return null;
+
+        // Synthesize `for (stage_expr) |<elem>| yield <elem>` and compile it.
+        const elem = ast.Identifier{ .name = "\x00pipe_src_elem", .span = source.span() };
+
+        const pattern = try self.allocator.create(ast.BindingPattern);
+        pattern.* = .{ .identifier = elem };
+        const bindings = try self.allocator.dupe(*ast.BindingPattern, &.{pattern});
+
+        const elem_value = try self.allocator.create(ast.Expression);
+        elem_value.* = .{ .identifier = elem };
+        const yield_stmt = try self.allocator.create(ast.Statement);
+        yield_stmt.* = .{ .yield_stmt = .{ .value = elem_value, .fd = 1, .span = source.span() } };
+        const statements = try self.allocator.dupe(*ast.Statement, &.{yield_stmt});
+        const body = try self.allocator.create(ast.Expression);
+        body.* = .{ .block = .{ .statements = statements, .span = source.span() } };
+
+        const sources = try self.allocator.dupe(*ast.Expression, &.{stage_expr});
+        const for_expr = try self.allocator.create(ast.Expression);
+        for_expr.* = .{ .for_expr = .{
+            .sources = sources,
+            .capture = .{ .bindings = bindings, .span = source.span() },
+            .body = body,
+            .span = source.span(),
+        } };
+
+        return try self.compileExpression(for_expr);
+    }
+
     /// A bare `&0` used as a pipeline stage forwards its stdin straight through
     /// to its stdout (so `&0 | cat` pipes the enclosing function's stdin into
     /// `cat`), instead of reading stdin as a single value. Returns null when the
@@ -7618,7 +7678,8 @@ pub const IRCompiler = struct {
             else if (i > 0)
                 (try self.tryCompilePipelineParamStage(source, stage_expr)) orelse try self.compileExpression(stage_expr)
             else
-                try self.compileExpression(stage_expr);
+                // The producer (i == 0): an array source streams its elements.
+                (try self.tryCompileArraySourceStage(source, stage_expr)) orelse try self.compileExpression(stage_expr);
             if (pushed_stdin) _ = self.stdin_type_stack.pop();
 
             // A stage's value is no longer auto-pushed to stdout; output is

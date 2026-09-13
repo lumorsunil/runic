@@ -1,0 +1,19 @@
+# An array used as a pipeline *source* (`xs | consume`) streams its elements one
+# at a time to the downstream stage, which runs per element — like a generator
+# function. Previously piping an array delivered a single byte-serialized value
+# (garbage, or a segfault for a struct element). Lowered by iterating the array
+# and yielding each element over a typed inter-stage boundary. Applies to an
+# array-valued binding as the producer stage.
+fn Void @() Void
+
+# Scalar elements: the consumer runs once per element.
+fn Void show(n: Int) Void { echo "n=${n}" }
+var xs = .{ 10, 20, 30 }
+xs | show
+
+# Struct elements cross the boundary by value (not byte-serialized); a `var`
+# consumer parameter may mutate its copy.
+const V = struct { x: Int, y: Int }
+fn Void draw(var v: V) Void { v.x += 1; echo "draw ${v.x},${v.y}" }
+var vs = .{ V{ .x = 1, .y = 2 }, V{ .x = 3, .y = 4 } }
+vs | draw
