@@ -3156,6 +3156,20 @@ pub const TypeChecker = struct {
             // type so reads after the assignment see the new (narrowed) type.
             if (referencedBindingName(binary.left)) |name| {
                 if (scope.lookup(name)) |binding| {
+                    // Reassigning (or compound-assigning) an immutable binding is
+                    // rejected — a `const` (and a plain, non-`var` parameter) may
+                    // not change. Without this the assignment slipped through to
+                    // the IR compiler, which panicked on a const's value source.
+                    if (!binding.is_mutable) {
+                        try self.reportSpanError(
+                            binary.left.span(),
+                            Error.TypeMismatch,
+                            .@"error",
+                            "cannot assign to immutable '{s}'; declare it with var",
+                            .{name},
+                        );
+                        return;
+                    }
                     const declared = binding.declared_type orelse left_type;
                     try self.validateTypeAssignment(declared, resolved_right, .{ .span = right_type.span() });
                     if (binary.op == .assign and self.unaliasType(declared).* == .sum) {

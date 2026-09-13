@@ -8273,13 +8273,18 @@ pub const IRCompiler = struct {
     /// (non-variadic) list of plain identifier parameters, none generic. A
     /// generic parameter (`x: |T|`) is monomorphized per call type through the
     /// fork path (`maybeSpecialize`); the sync call bypasses that, so a generic
-    /// function must stay on the fork path.
+    /// function must stay on the fork path. A `var` (mutable) parameter also stays
+    /// on the fork path: the sync frame binds a parameter directly to its
+    /// caller-pushed slot for reading, which is not an assignable location, so a
+    /// reassignment inside a sync entry would fail — the fork path binds it as an
+    /// ordinary mutable local and handles mutation correctly.
     fn syncParamsSupported(params: ast.FunctionDecl.Parameters) bool {
         return switch (params) {
             ._variadic => false,
             ._non_variadic => |ps| blk: {
                 for (ps) |p| {
                     if (p.pattern.* != .identifier) break :blk false;
+                    if (p.is_mutable) break :blk false;
                     if (p.type_annotation) |ta| if (hasTypeCapture(ta.*)) break :blk false;
                 }
                 break :blk true;

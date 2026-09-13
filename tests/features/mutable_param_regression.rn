@@ -14,12 +14,28 @@ fn Void bumpField(var e: V) Void {
 }
 bumpField V{ .x = 10, .y = 20 }
 
-# Reassign a whole `var` scalar parameter.
+# Reassign a whole `var` scalar parameter to a fresh value (not derived from the
+# parameter itself), then yield it — this path previously crashed for a
+# sync-lowered function, so a `var` parameter now takes the fork path.
+fn Void reset(var n: Int) Int {
+  n = 99
+  yield n
+}
+echo "reset=${reset 5}"
+
+# Reassign a `var` parameter from itself (compound-style) also works.
 fn Void scale(var n: Int) Int {
   n = n * 10
   yield n
 }
 echo "scale=${scale 5}"
+
+# Reassign a whole `var` struct parameter.
+fn Void replace(var e: V) Int {
+  e = V{ .x = 7, .y = 8 }
+  yield e.x + e.y
+}
+echo "replace=${replace V{ .x = 1, .y = 2 }}"
 
 # An explicit `const` parameter is immutable (marker is a no-op); a copy is used.
 fn Void viaConst(const e: V) Int { yield e.x + e.y }

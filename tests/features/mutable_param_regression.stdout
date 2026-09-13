@@ -1,3 +1,5 @@
 field=11,20
+reset=99
 scale=50
+replace=15
 const=7

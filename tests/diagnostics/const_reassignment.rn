@@ -1,0 +1,6 @@
+# Reassigning an immutable (const) binding is rejected — previously this slipped
+# past the type checker and panicked in the IR compiler. Declare it `var` to
+# reassign.
+const x = 5
+x = 6
+echo "${x}"

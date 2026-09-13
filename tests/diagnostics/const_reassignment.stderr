@@ -1,0 +1,7 @@
+[error]: tests/diagnostics/const_reassignment.rn:5:1: cannot assign to immutable 'x'; declare it with var
+   3:# reassign.
+   4:const x = 5
+   5:[41m[30mx[0m = 6
+   6:echo "${x}"
+   7:
+
