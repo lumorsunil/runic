@@ -8926,8 +8926,11 @@ pub const IRCompiler = struct {
             return self.compileExpression(call_expr);
         }
 
-        const left = try self.compileExpression(binary.left);
-        const right = try self.compileExpression(binary.right);
+        // Operands are values: a producing operand (a function call, UFCS
+        // method, pipeline, …) must be *captured* so the comparison sees its
+        // yielded value, not a fork/thread handle. Mirror arithmetic operands.
+        const left = try self.compileArithmeticOperand(source, binary.left);
+        const right = try self.compileArithmeticOperand(source, binary.right);
 
         if (evaluateCompare(.from(binary.op), left.source, right.source)) |comptime_result| {
             return .from(comptime_result);
