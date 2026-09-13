@@ -755,14 +755,24 @@ correctly; **comparison** and **logical `&&`/`||`** did not.
   operands through `compileArithmeticOperand` like arithmetic does. Was a real
   wrong-answer bug: `const c = a < b` (a=3,b=5) yielded false. Guard:
   `tests/features/call_in_comparison_regression.rn`.
-- **Logical `&&`/`||` with forking operands — DEFERRED.** Not the same easy swap:
-  when an operand needs stdio capture, routing goes to
-  `compileLogicalBinary(.value)` (compiler.zig ~9445), which *deliberately*
-  forks operands directly into the outer capture pipe (nested captures would
-  leave the outer pipe empty — documented there). So `yes && yes` concatenates
-  both bools into the capture → `"00"`. Fixing it means capturing each operand
-  as its own value within the capture-fork model — the monadic/capture crux of
-  the systematic call-path rework, not an isolated change. Left for that rework.
+- **Logical `&&`/`||` with Bool call operands — FIXED (commit 8cbfe3a).** When an
+  operand needs stdio capture, routing goes to `compileLogicalBinary(.value)`,
+  which forked operands directly into the outer capture pipe, concatenating each
+  operand's yielded bool (`yes && yes` → `"00"`). The fix adds a value path at
+  the top of `.value` mode: when both operands are *Bool-valued* (a Bool-yielding
+  call, a comparison, or a nested `!`/`&&`/`||`, via the recursive
+  `exprIsBoolValued` predicate), capture each as a value and combine with `.log`
+  — exactly like the non-capture value path. The result flows back through %r so
+  the outer capture pipe is legitimately empty. Key boundaries that keep the
+  change safe: a **command** operand (its output *is* the value) keeps the
+  exit-code pipe path; **error-union** monadic `&&`/`||` route elsewhere
+  (`compileLogicalOrValue`/`AndValue` via `lhs_captures_error`) and their
+  operands aren't Bool-valued; and `.log` requires a Bool left (Int/exit-code is
+  unsupported there, as for plain-var `a && b`), so non-Bool operands fall
+  through to the existing lowering. Guard:
+  `tests/features/call_in_logical_regression.rn`. This closes the operand-capture
+  correctness gap for scalar values; command/exit-code logical semantics are
+  unchanged.
 
 ## Open design questions (for when Phase 2 starts)
 
