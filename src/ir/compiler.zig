@@ -9312,6 +9312,22 @@ pub const IRCompiler = struct {
         const left = try self.compileArithmeticOperand(source, binary.left);
         const right = try self.compileArithmeticOperand(source, binary.right);
 
+        // `a + b` on two arrays concatenates them into a new array (a's elements
+        // followed by b's). Scalar `+` falls through to the arithmetic op below.
+        if (binary.op == .add) {
+            const left_is_array = if (left.typeExpr()) |t| t == .array else false;
+            const right_is_array = if (right.typeExpr()) |t| t == .array else false;
+            if (left_is_array and right_is_array) {
+                const concat_ref = try self.newRef(source, "array_concat_result");
+                try self.addInstruction(.init(.from(source), .{ .array_concat = .{
+                    .left = left.source,
+                    .right = right.source,
+                    .result = concat_ref.dereference(),
+                } }));
+                return .fromLocation(concat_ref.dereference().typed(left.typeExpr().?));
+            }
+        }
+
         if (evaluateArithmetic(.from(binary.op), left.source, right.source)) |comptime_result| {
             return .from(comptime_result);
         }

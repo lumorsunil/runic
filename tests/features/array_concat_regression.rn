@@ -1,0 +1,38 @@
+// `a + b` on two arrays concatenates them into a new array holding a's elements
+// followed by b's (a fresh copy; the operands are unchanged). Works for any
+// element type, with empty operands, and composes with indexing/iteration.
+// Scalar `+` is unaffected.
+fn Void @() Void
+
+var a = .{ 1, 2 }
+var b = .{ 3, 4, 5 }
+const c = a + b
+echo "len=${c.len}"
+echo "elems=${c[0]},${c[2]},${c[4]}"
+
+// Operands are not mutated.
+echo "a.len=${a.len} b.len=${b.len}"
+
+// String elements.
+const s = .{ "x", "y" } + .{ "z" }
+echo "str=${s[0]}${s[1]}${s[2]}"
+
+// Empty operand.
+const e = .{} + .{ 7, 8 }
+echo "empty=${e.len}:${e[0]}"
+
+// Struct elements.
+const P = struct { n: Int }
+const ps = .{ P{ .n = 1 } } + .{ P{ .n = 2 } }
+echo "struct=${ps[1].n}"
+
+// Concatenate in a loop to build up an array.
+var acc = .{ 0 }
+for (1..4) |i| acc = acc + .{ i }
+echo "acc=${acc.len}:${acc[3]}"
+
+// Iterate a concatenation directly.
+for (.{ 10, 20 } + .{ 30 }) |v| echo "iter=${v}"
+
+// Scalar addition still works.
+echo "scalar=${3 + 4}"

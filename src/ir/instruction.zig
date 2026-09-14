@@ -144,6 +144,9 @@ pub const Instruction = struct {
         /// `arr[start..end]` — a new array of the half-open element range,
         /// copied. Bounds are clamped to `[0, len]`.
         array_slice: ArraySlice,
+        /// `a + b` on two arrays — a new array holding a's elements followed by
+        /// b's, copied.
+        array_concat: ArrayConcat,
         /// constructs an error value (boxing the runtime payload, if any)
         make_err: MakeErr,
         /// sets result to a boolean: whether operand is an error value whose
@@ -493,6 +496,15 @@ pub const Instruction = struct {
 
         pub fn format(self: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
             try w.print("{f} = push({f}, {f})", .{ self.result, self.array, self.value });
+        }
+    };
+    pub const ArrayConcat = struct {
+        left: ValueSource,
+        right: ValueSource,
+        result: Location,
+
+        pub fn format(self: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
+            try w.print("{f} = concat({f}, {f})", .{ self.result, self.left, self.right });
         }
     };
 

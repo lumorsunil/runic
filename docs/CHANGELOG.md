@@ -14,6 +14,11 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Added
 
+- **Array concatenation with `+`.** `a + b` on two arrays produces a new array
+  holding `a`'s elements followed by `b`'s (a fresh copy; the operands are
+  unchanged). Works for any element type, with empty operands, and composes with
+  indexing and iteration. Scalar `+` is unaffected. Previously this errored with
+  `UnsupportedBinaryExpression`; arrays could only grow via `.push`.
 - **`break` and `continue`.** Loop control statements now exist: `break` exits
   the innermost enclosing loop and `continue` skips to its next iteration. They
   work in every loop form — a counted range `for`, an array/multi-source `for`, a

@@ -1805,6 +1805,23 @@ pub const IREvaluator = struct {
                 try self.setLocation(thread, sl.result, new_base);
                 return .cont;
             },
+            .array_concat => |cc| {
+                const a = try self.resolveValueSource(thread, cc.left);
+                const b = try self.resolveValueSource(thread, cc.right);
+                const a_len: usize = if (a == .addr) @intCast(thread.shared.heapGet(a.addr).?.integer) else 0;
+                const b_len: usize = if (b == .addr) @intCast(thread.shared.heapGet(b.addr).?.integer) else 0;
+                const new_base = try thread.shared.alloc(self.allocator, a_len + b_len + 1);
+                const nb = new_base.addr;
+                thread.shared.heapGetPtr(nb).?.* = .{ .integer = @intCast(a_len + b_len) };
+                if (a == .addr) for (0..a_len) |i| {
+                    thread.shared.heapGetPtr(nb + 1 + i).?.* = thread.shared.heapGet(a.addr + 1 + i).?;
+                };
+                if (b == .addr) for (0..b_len) |i| {
+                    thread.shared.heapGetPtr(nb + 1 + a_len + i).?.* = thread.shared.heapGet(b.addr + 1 + i).?;
+                };
+                try self.setLocation(thread, cc.result, new_base);
+                return .cont;
+            },
             .array_set_inplace => |as| {
                 const arr = try self.resolveValueSource(thread, as.array);
                 const index = try self.resolveValueSource(thread, as.index);
