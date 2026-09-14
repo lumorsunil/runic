@@ -30,3 +30,25 @@ echo "nums=${nums[0]},${nums[1]},${nums[2]}"
 // An empty array literal still parses as an array.
 const empty: []Int = .{ }
 echo "empty=${empty.len()}"
+
+// --- Inference from a call argument's parameter type ---
+
+const Entity = struct { name: String }
+
+fn Void moveEntity(entity: Entity, pos: Vector) Void {
+    echo "moved ${entity.name} to ${pos.x},${pos.y}"
+}
+
+const hero = Entity{ .name = "hero" }
+
+// Command-style call: the second argument infers `Vector` from the parameter.
+moveEntity hero .{ .x = 3, .y = 5 }
+
+// More than one inferred argument in a single call.
+fn Void span(a: Vector, b: Vector) Void { echo "span=${a.x}..${b.x}" }
+span .{ .x = 1, .y = 0 } .{ .x = 9, .y = 0 }
+
+// UFCS method call: the receiver fills parameter 0, so the written argument
+// infers from parameter 1.
+fn Void warpTo(self: Entity, target: Vector) Void { echo "warp=${target.x},${target.y}" }
+hero.warpTo(.{ .x = 7, .y = 2 })

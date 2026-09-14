@@ -17,9 +17,12 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 - **Inferred struct literals.** When the struct type is known from context, a
   struct value can be written `.{ .field = value, … }` without repeating the type
   name — `const v: Vector = .{ .x = 3, .y = 5 }` instead of `Vector{ … }`. The
-  type is taken from the binding's annotation (and validated as before). An
-  anonymous struct literal with no type to infer from is a compile error asking
-  for an annotation; the array-literal form `.{ e0, e1 }` is unchanged.
+  type is taken from the context: a binding's annotation, or the matching
+  parameter type of a call argument (`moveEntity e .{ .x = 3, .y = 5 }`, including
+  UFCS method calls where the receiver fills the first parameter). The literal is
+  validated against that type exactly as the named form is. An anonymous struct
+  literal with no type to infer from is a compile error asking for an annotation;
+  the array-literal form `.{ e0, e1 }` is unchanged.
 - **Tuple and record destructuring in bindings.** A binding target can now be a
   tuple pattern — `const a, b = .{ 1, 2 }` binds the positional elements of an
   array/tuple — or a record pattern — `const { x, y } = point` binds a struct's

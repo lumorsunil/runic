@@ -1065,15 +1065,107 @@ pub const TypeChecker = struct {
     }
 
     /// The type name an inferred struct literal (`.{ … }`) should adopt from a
-    /// binding annotation. Only a plain single-segment named type (`Vector`, or an
-    /// alias to a struct) yields a name; a path, generic application, or wrapper
-    /// type does not, leaving the literal anonymous (and thus a later error).
-    fn inferredStructTypeName(annotation: ?*const ast.TypeExpr) ?ast.Identifier {
-        const t = annotation orelse return null;
-        if (t.* != .identifier) return null;
-        const segments = t.identifier.path.segments;
-        if (segments.len != 1) return null;
-        return segments[0];
+    /// known context type (a binding annotation, or a callee's parameter type).
+    /// A raw single-segment named type (`Vector`) yields that name; a resolved
+    /// alias yields its name only when it unaliases to a struct type. Anything
+    /// else (a path, generic application, wrapper, or non-struct) yields nothing,
+    /// leaving the literal anonymous (and thus a later "cannot infer" error).
+    fn structTypeNameToStamp(self: *TypeChecker, context: ?*const ast.TypeExpr) ?ast.Identifier {
+        const t = context orelse return null;
+        switch (t.*) {
+            .identifier => |id| {
+                if (id.path.segments.len != 1) return null;
+                return id.path.segments[0];
+            },
+            .alias => |alias| {
+                if (self.unaliasType(t).* != .struct_type) return null;
+                return .{ .name = alias.name, .span = alias.span };
+            },
+            else => return null,
+        }
+    }
+
+    /// Whether an expression is an anonymous struct literal `.{ .field = … }`
+    /// (empty name, no qualifying object) awaiting a type from context.
+    fn isAnonStructLiteral(expr: *const ast.Expression) bool {
+        return expr.* == .struct_literal and
+            expr.struct_literal.name.name.len == 0 and
+            expr.struct_literal.object == null;
+    }
+
+    /// Stamp each anonymous struct-literal argument of a call with the struct type
+    /// name of its matching parameter, so `f a .{ .x = 1 }` infers the literal's
+    /// type from the callee's signature (mirroring the binding-annotation case).
+    fn stampInferredStructArgs(self: *TypeChecker, scope: *Scope, call: *ast.CallExpr) Error!void {
+        var any = false;
+        for (call.arguments) |arg| {
+            if (isAnonStructLiteral(arg)) {
+                any = true;
+                break;
+            }
+        }
+        if (!any) return;
+
+        const callee = (try self.calleeFunctionForInference(scope, call.callee)) orelse return;
+
+        for (call.arguments, 0..) |arg, i| {
+            if (!isAnonStructLiteral(arg)) continue;
+            // A UFCS receiver fills parameter 0, so the written arguments start at
+            // `offset` (0 for a plain call, 1 for `recv.method args`).
+            const param_index = i + callee.offset;
+            const param_type: ?*const ast.TypeExpr = switch (callee.params) {
+                ._non_variadic => |list| if (param_index < list.len) list[param_index] else null,
+                ._variadic => |element| element,
+            };
+            if (self.structTypeNameToStamp(param_type)) |named| {
+                arg.struct_literal.name = named;
+            }
+        }
+    }
+
+    /// Resolve the callee of a call to the function signature its written
+    /// arguments should be typed against, plus the offset at which those
+    /// arguments begin among the parameters. A plain call (`f a`) or a module
+    /// member (`m.f a`) maps arguments 1:1 (offset 0); a UFCS method call
+    /// (`recv.method a`) prepends the receiver as parameter 0 (offset 1).
+    fn calleeFunctionForInference(
+        self: *TypeChecker,
+        scope: *Scope,
+        callee: *ast.Expression,
+    ) Error!?struct { params: ast.TypeExpr.FunctionType.Parameters, offset: usize } {
+        // A member access `object.method`: either a module member (no receiver) or
+        // a UFCS method (receiver fills parameter 0).
+        const member: ?struct { object: *ast.Expression, name: []const u8 } = switch (callee.*) {
+            .member => |*m| .{ .object = m.object, .name = m.member.name },
+            .binary => |*b| if (b.op == .member and b.right.* == .identifier)
+                .{ .object = b.left, .name = b.right.identifier.name }
+            else
+                null,
+            else => null,
+        };
+
+        if (member) |ma| {
+            const object_is_module = if (try self.resolveExprType(scope, ma.object)) |obj_raw|
+                self.unaliasType(obj_raw).* == .module
+            else
+                false;
+            if (!object_is_module) {
+                // UFCS: the bare method name resolves to a free function whose
+                // first parameter is the receiver.
+                if (scope.lookup(ma.name)) |binding| {
+                    if (binding.type_expr) |bt| {
+                        const t = self.unaliasType(bt);
+                        if (t.* == .function) return .{ .params = t.function.params, .offset = 1 };
+                    }
+                }
+                return null;
+            }
+        }
+
+        const raw = (try self.resolveExprType(scope, callee)) orelse return null;
+        const t = self.unaliasType(raw);
+        if (t.* != .function) return null;
+        return .{ .params = t.function.params, .offset = 0 };
     }
 
     fn runBindingDecl(
@@ -1088,10 +1180,8 @@ pub const TypeChecker = struct {
         // anonymous struct literal (empty name); take its type from the binding's
         // annotation by stamping the annotation's type name onto the literal, so
         // every downstream stage treats it exactly like `Vector{ .x = 3 }`.
-        if (binding_decl.initializer.* == .struct_literal and
-            binding_decl.initializer.struct_literal.name.name.len == 0)
-        {
-            if (inferredStructTypeName(binding_decl.annotation)) |named| {
+        if (isAnonStructLiteral(binding_decl.initializer)) {
+            if (self.structTypeNameToStamp(binding_decl.annotation)) |named| {
                 binding_decl.initializer.struct_literal.name = named;
             }
         }
@@ -1978,6 +2068,13 @@ pub const TypeChecker = struct {
 
     fn runCall(self: *TypeChecker, scope: *Scope, call: *ast.CallExpr) Error!void {
         try self.runExpression(scope, call.callee);
+
+        // Inferred struct-literal arguments: `f entity .{ .x = 3 }` takes each
+        // anonymous literal's type from the matching parameter of the callee, so
+        // the struct name need not be repeated at the call site. Stamp the name
+        // before checking the argument, so it validates like the named form.
+        try self.stampInferredStructArgs(scope, call);
+
         for (call.arguments) |arg| try self.runExpression(scope, arg);
 
         // A bare command (an identifier callee with no scope binding — `echo`,

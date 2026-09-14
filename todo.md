@@ -126,9 +126,12 @@
 - [x] recursive functions (add function def to closure?)
 - [x] exit/return statement
 - [x] inferred struct literals (`const v: Vector = .{ .x = 3, .y = 5 }`) — type
-      taken from the binding annotation; anonymous literal with no context errors
-  - [ ] infer from other contexts too: a function argument's expected parameter
-        type, a function's declared return type, a struct field's type
+      taken from context; anonymous literal with no context errors
+  - [x] infer from a call argument's parameter type (`moveEntity e .{ … }`,
+        including UFCS method calls where the receiver fills parameter 0)
+  - [ ] infer from other contexts too: a function's declared return type
+        (`yield .{ … }`), a struct field's type in a construction, an array
+        element type
 - [x] tuple/record destructuring bindings (`const a, b = …`, `const { x, y } = …`,
       nested, heterogeneous array-literal tuples)
   - [ ] heterogeneous destructuring from a *non-literal* source (a `var` holding
