@@ -902,5 +902,5 @@ Initial versioned release. Establishes a baseline for tracking changes going for
 - Optional types, promise types (`^T`), and error sets
 - Background process execution with `^` operator
 - Module system via `.rn.module.json` manifests
-- Bash interop via `bash { ... }` blocks
+- Bash interop by invoking `bash` as a command (`bash "-c" "…"`)
 - LSP support (completions, diagnostics, hover)
