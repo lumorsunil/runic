@@ -1156,6 +1156,18 @@ Constructing a struct checks every field: an unknown field, a missing field, a
 duplicate field, or a value whose type doesn't match the field's type is a
 compile error.
 
+**Inferred literals.** When the type is already known from context — currently a
+binding's annotation — the name can be dropped and written `.{ .field = value }`,
+mirroring the array-literal syntax. The type is taken from the annotation:
+
+```rn
+const p: Point = .{ .x = 3, .y = 4 }
+var q: Point = .{ .x = 0, .y = 0 }
+```
+
+An anonymous struct literal with nothing to infer from (no annotation) is a
+compile error asking for a type annotation.
+
 **Nesting.** A field may itself be a struct; construction and access nest:
 
 ```rn

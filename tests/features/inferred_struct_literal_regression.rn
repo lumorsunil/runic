@@ -1,0 +1,32 @@
+// Inferred (anonymous) struct literals: `.{ .field = value }` takes its type
+// from the binding's annotation, so `const v: Vector = .{ .x = 3 }` works
+// without repeating the type name as in `Vector{ .x = 3 }`.
+fn Void @() Void
+
+const Vector = struct { x: Int, y: Int }
+
+// Basic inference from the annotation.
+const v: Vector = .{ .x = 3, .y = 5 }
+echo "v=${v.x},${v.y}"
+
+// `var`, then mutate a field.
+var m: Vector = .{ .x = 1, .y = 2 }
+m.x += 10
+echo "m=${m.x},${m.y}"
+
+// A record pattern destructures directly from an inferred literal.
+const V = struct { w: Int, h: Int }
+const { w, h }: V = .{ .w = 30, .h = 40 }
+echo "d=${w},${h}"
+
+// The named form still works alongside the inferred one.
+const named = Vector{ .x = 7, .y = 8 }
+echo "named=${named.x},${named.y}"
+
+// A plain array literal `.{ e0, e1 }` is unaffected by the struct-literal path.
+const nums: []Int = .{ 1, 2, 3 }
+echo "nums=${nums[0]},${nums[1]},${nums[2]}"
+
+// An empty array literal still parses as an array.
+const empty: []Int = .{ }
+echo "empty=${empty.len()}"

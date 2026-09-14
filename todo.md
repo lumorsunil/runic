@@ -125,6 +125,17 @@
       nested_if_pipeline_logical_regression.
 - [x] recursive functions (add function def to closure?)
 - [x] exit/return statement
+- [x] inferred struct literals (`const v: Vector = .{ .x = 3, .y = 5 }`) — type
+      taken from the binding annotation; anonymous literal with no context errors
+  - [ ] infer from other contexts too: a function argument's expected parameter
+        type, a function's declared return type, a struct field's type
+- [x] tuple/record destructuring bindings (`const a, b = …`, `const { x, y } = …`,
+      nested, heterogeneous array-literal tuples)
+  - [ ] heterogeneous destructuring from a *non-literal* source (a `var` holding
+        mixed types) still goes through the homogenized-array path, so a struct
+        element loses its type — only array-literal tuples and struct records
+        keep per-element/field types. Needs a real tuple type (per-element) or a
+        way to recover element types from a non-literal source.
 - [ ] blocks as anonymous functions?
 - [ ] value references `const my_function = &module.some_function`
   - [ ] partial applications

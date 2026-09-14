@@ -1064,6 +1064,18 @@ pub const TypeChecker = struct {
         }
     }
 
+    /// The type name an inferred struct literal (`.{ … }`) should adopt from a
+    /// binding annotation. Only a plain single-segment named type (`Vector`, or an
+    /// alias to a struct) yields a name; a path, generic application, or wrapper
+    /// type does not, leaving the literal anonymous (and thus a later error).
+    fn inferredStructTypeName(annotation: ?*const ast.TypeExpr) ?ast.Identifier {
+        const t = annotation orelse return null;
+        if (t.* != .identifier) return null;
+        const segments = t.identifier.path.segments;
+        if (segments.len != 1) return null;
+        return segments[0];
+    }
+
     fn runBindingDecl(
         self: *TypeChecker,
         scope: *Scope,
@@ -1071,6 +1083,18 @@ pub const TypeChecker = struct {
     ) Error!void {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, binding_decl.span);
+
+        // Inferred struct literal: `const v: Vector = .{ .x = 3 }` parses as an
+        // anonymous struct literal (empty name); take its type from the binding's
+        // annotation by stamping the annotation's type name onto the literal, so
+        // every downstream stage treats it exactly like `Vector{ .x = 3 }`.
+        if (binding_decl.initializer.* == .struct_literal and
+            binding_decl.initializer.struct_literal.name.name.len == 0)
+        {
+            if (inferredStructTypeName(binding_decl.annotation)) |named| {
+                binding_decl.initializer.struct_literal.name = named;
+            }
+        }
 
         try self.runExpression(scope, binding_decl.initializer);
 
@@ -3954,6 +3978,20 @@ pub const TypeChecker = struct {
         try self.logTypeCheckTrace(@src().fn_name, struct_literal.span);
 
         for (struct_literal.fields) |field| try self.runExpression(scope, field.value);
+
+        // An anonymous struct literal `.{ .x = … }` whose name was never inferred
+        // from context (no annotation to take a type from). Give a directed error
+        // instead of falling through to a lookup of the empty name.
+        if (struct_literal.object == null and struct_literal.name.name.len == 0) {
+            try self.reportSpanError(
+                struct_literal.span,
+                Error.UnsupportedExpression,
+                .@"error",
+                "cannot infer the type of this struct literal; add a type annotation (e.g. `const v: Vector = .{{ … }}`)",
+                .{},
+            );
+            return;
+        }
 
         // Qualified construction `m.Vector3{ … }`: the struct type lives in the
         // module `m`. Struct types can't be `pub` (the parser rejects

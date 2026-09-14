@@ -1139,11 +1139,12 @@ pub const Parser = struct {
                             });
                         },
                         .dot_l_brace => {
-                            // TODO: add support for structs/tuples?
-                            const breadcrumbInner = try self.createBreadcrumb("PBE:array");
+                            // `.{ … }` is either an array literal or an anonymous
+                            // (context-typed) struct literal; the dispatcher decides.
+                            const breadcrumbInner = try self.createBreadcrumb("PBE:brace");
                             defer breadcrumbInner.end();
                             try components.append(self.allocator, .{
-                                .literal = .{ .array = try self.parseArrayLiteral() },
+                                .expr = try self.parseBraceLiteralExpression(),
                             });
                             continue;
                         },
@@ -2354,36 +2355,64 @@ pub const Parser = struct {
         return .fromToken(integer);
     }
 
-    fn parseArrayLiteral(self: *Self) Error!ast.ArrayLiteral {
-        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
-        defer breadcrumb.end();
-
-        const start = try self.expectTokenTag(.dot_l_brace);
-
-        // Empty array literal `.{ }`.
-        self.skipNewlines();
-        if ((try self.peekToken()).tag == .r_brace) {
-            const close = try self.expectTokenTag(.r_brace);
-            return .{ .elements = &.{}, .span = start.span.endAt(close.span) };
-        }
-
-        const elements = try self.parseList(.comma, parseExpression, .{ .skipNewLines = true });
-
-        _ = try self.expectTokenTag(.r_brace);
-
-        return .{
-            .elements = elements.payload,
-            .span = elements.span,
-        };
-    }
-
     fn parseArrayLiteralExpression(self: *Self) Error!*ast.Expression {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
-        return try self.allocExpression(.{
-            .array = try self.parseArrayLiteral(),
-        });
+        return self.parseBraceLiteralExpression();
+    }
+
+    /// Parses a `.{ … }` literal, dispatching on its contents: `.{ .field = … }`
+    /// is an *anonymous* struct literal (its type is inferred from context, e.g.
+    /// a binding annotation) and `.{ e0, e1, … }` (or `.{ }`) is an array literal.
+    fn parseBraceLiteralExpression(self: *Self) Error!*ast.Expression {
+        const start = try self.expectTokenTag(.dot_l_brace);
+        self.skipNewlines();
+        // `.{ .x = … }` — a field initializer starts with `.`, so this is an
+        // anonymous struct literal rather than an array of expressions.
+        if ((try self.peekToken()).tag == .dot) {
+            return self.parseAnonStructLiteral(start.span);
+        }
+        if ((try self.peekToken()).tag == .r_brace) {
+            const close = try self.expectTokenTag(.r_brace);
+            return self.allocExpression(.{ .array = .{ .elements = &.{}, .span = start.span.endAt(close.span) } });
+        }
+        const elements = try self.parseList(.comma, parseExpression, .{ .skipNewLines = true });
+        const close = try self.expectTokenTag(.r_brace);
+        return self.allocExpression(.{ .array = .{
+            .elements = elements.payload,
+            .span = start.span.endAt(close.span),
+        } });
+    }
+
+    /// Parses the fields of an anonymous struct literal `.{ .x = 3, .y = 5 }` (the
+    /// leading `.{` already consumed). Its `name` is left empty — the type is
+    /// resolved from context (currently a binding annotation).
+    fn parseAnonStructLiteral(self: *Self, start_span: ast.Span) Error!*ast.Expression {
+        var fields = std.ArrayList(ast.StructLiteral.FieldInit).empty;
+        defer fields.deinit(self.allocator);
+
+        while (true) {
+            self.skipNewlines();
+            if ((try self.peekToken()).tag == .r_brace) break;
+            const dot = try self.expectTokenTag(.dot);
+            const field_name = try self.parseIdentifier();
+            _ = try self.expectTokenTag(.assign);
+            const value = try self.parseExpression();
+            try fields.append(self.allocator, .{
+                .name = field_name,
+                .value = value,
+                .span = dot.span.endAt(value.span()),
+            });
+            self.skipNewlines();
+            if ((try self.peekToken()).tag == .comma) _ = try self.nextToken();
+        }
+        const close = try self.expectTokenTag(.r_brace);
+        return self.allocExpression(.{ .struct_literal = .{
+            .name = .{ .name = "", .span = start_span },
+            .fields = try self.copyToArena(ast.StructLiteral.FieldInit, fields.items),
+            .span = start_span.endAt(close.span),
+        } });
     }
 
     fn parseCaptureClause(self: *Self) Error!ast.CaptureClause {
