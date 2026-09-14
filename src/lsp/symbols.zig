@@ -62,7 +62,7 @@ pub fn collectSymbols(
             .bash_block, .while_stmt => {
                 // Not Yet Implemented,
             },
-            .exit_stmt, .yield_stmt => {
+            .exit_stmt, .yield_stmt, .break_stmt, .continue_stmt => {
                 // Does not produce symbols
             },
             .expression => |expr_stmt| {

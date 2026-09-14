@@ -14,6 +14,14 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Added
 
+- **`break` and `continue`.** Loop control statements now exist: `break` exits
+  the innermost enclosing loop and `continue` skips to its next iteration. They
+  work in every loop form — a counted range `for`, an array/multi-source `for`, a
+  `for (&0)` stream, and `while` — bind to the innermost loop when nested, and
+  clean up body-local bindings on the jump. Using either outside a loop is a
+  compile error. A range loop whose body uses `break`/`continue` runs on the
+  regular (non-atomic) path; loops without them keep the fast `counted_loop`
+  lowering.
 - **String indexing `s[i]`.** A string can be indexed by a single position,
   yielding a one-character `String` (lowered to a one-char slice `s[i .. i+1]`),
   complementing string slicing. Out-of-range and negative indices clamp to the

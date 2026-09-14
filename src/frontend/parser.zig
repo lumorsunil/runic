@@ -2116,7 +2116,7 @@ pub const Parser = struct {
 
         const next = try self.peekToken();
         const stmt: *ast.Statement = switch (next.tag) {
-            .kw_yield, .kw_exit => try self.parseSingleBodyStatement(),
+            .kw_yield, .kw_exit, .kw_break, .kw_continue => try self.parseSingleBodyStatement(),
             else => return self.parseExpression(),
         };
 
@@ -2136,10 +2136,22 @@ pub const Parser = struct {
             stmt.* = .{ .yield_stmt = yield_stmt };
         } else if (try self.parseMaybeExit()) |exit_stmt| {
             stmt.* = .{ .exit_stmt = exit_stmt };
+        } else if (try self.parseMaybeLoopControl()) |loop_control| {
+            stmt.* = loop_control;
         } else {
             unreachable;
         }
         return stmt;
+    }
+
+    /// Parses a bare `break` or `continue` statement, if the next token is one.
+    fn parseMaybeLoopControl(self: *Self) Error!?ast.Statement {
+        const next = try self.peekToken();
+        return switch (next.tag) {
+            .kw_break => .{ .break_stmt = .{ .span = (try self.nextToken()).span } },
+            .kw_continue => .{ .continue_stmt = .{ .span = (try self.nextToken()).span } },
+            else => null,
+        };
     }
 
     fn parseMatchExpression(self: *Self) Error!*ast.Expression {
@@ -2677,6 +2689,12 @@ pub const Parser = struct {
 
         if (try self.parseMaybeYield()) |yield_stmt| {
             stmt.* = .{ .yield_stmt = yield_stmt };
+            return stmt;
+        }
+
+        if (try self.parseMaybeLoopControl()) |loop_control| {
+            stmt.* = loop_control;
+            try self.consumeStatementTerminator();
             return stmt;
         }
 

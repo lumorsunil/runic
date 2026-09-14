@@ -1315,7 +1315,7 @@ pub const Server = struct {
                 try self.walkExprCalls(ctx, ws.condition);
                 for (ws.body.statements) |s| try self.walkStmtCalls(ctx, s);
             },
-            .bash_block, .type_binding_decl => {},
+            .bash_block, .type_binding_decl, .break_stmt, .continue_stmt => {},
         }
     }
 

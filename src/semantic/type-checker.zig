@@ -585,6 +585,9 @@ pub const TypeChecker = struct {
             .binding_decl => |*binding_decl| self.runBindingDecl(scope, binding_decl),
             .exit_stmt => |*exit_stmt| self.runExit(scope, exit_stmt),
             .yield_stmt => |*yield_stmt| self.runYield(scope, yield_stmt),
+            // `break`/`continue` carry no value and introduce no bindings; the IR
+            // compiler validates that they appear inside a loop.
+            .break_stmt, .continue_stmt => {},
             .while_stmt => |*while_stmt| self.runWhile(scope, while_stmt),
             .expression => |*expr_stmt| self.runExpressionStatement(scope, expr_stmt),
             else => error.UnsupportedStatement,
@@ -1800,7 +1803,7 @@ pub const TypeChecker = struct {
             .exit_stmt => |exit_stmt| if (exit_stmt.value) |value| try self.validateFunctionBodyStdin(scope, value, enclosing_stdin),
             .yield_stmt => |yield_stmt| try self.validateFunctionBodyStdin(scope, yield_stmt.value, enclosing_stdin),
             .while_stmt => |while_stmt| try self.validateBlockStdin(scope, while_stmt.body, enclosing_stdin),
-            .type_binding_decl, .bash_block => {},
+            .type_binding_decl, .bash_block, .break_stmt, .continue_stmt => {},
         }
     }
 

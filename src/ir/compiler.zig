@@ -281,6 +281,18 @@ fn typeExprIsNamed(type_expr: ast.TypeExpr, name: []const u8) bool {
 
 const capture_temp_ref_count = 5;
 
+/// One entry per enclosing loop (see `IRCompiler.loop_contexts`). `break` jumps
+/// to `break_label` (the loop's exit) and `continue` to `continue_label` (the
+/// re-test / increment point); each first pops the current iteration's body
+/// slots down to the corresponding stack base, which is where that label expects
+/// the runtime stack to be.
+const LoopContext = struct {
+    break_label: ir.InstructionAddr,
+    continue_label: ir.InstructionAddr,
+    break_base: usize,
+    continue_base: usize,
+};
+
 pub const IRData = struct {
     data: std.ArrayList(Page) = .empty,
 
@@ -649,6 +661,12 @@ pub const IRCompiler = struct {
     /// infinite recursion when two forward-referenced functions fork each other
     /// (a cycle falls back to whatever captures are known so far).
     compiling_fn_sets: std.AutoHashMapUnmanaged(usize, void) = .empty,
+
+    /// Stack of enclosing loops, innermost last. A `break`/`continue` jumps to
+    /// the top entry's exit/continue label after popping its own iteration's
+    /// body slots. Saved/cleared across a function boundary (a nested function's
+    /// `break` must not target an outer loop).
+    loop_contexts: std.ArrayListUnmanaged(LoopContext) = .empty,
 
     /// Concrete types bound by `|T|` captures in binding positions (`const x:
     /// []|T| = …` → `T` = the element type). A later `: T` resolves through here.
@@ -1480,6 +1498,8 @@ pub const IRCompiler = struct {
             .binding_decl => |*b| self.compileBindingDecl(stmt, b),
             .exit_stmt => |e| self.compileExit(stmt, e),
             .yield_stmt => |y| self.compileYield(stmt, y),
+            .break_stmt => self.compileLoopControl(stmt, true),
+            .continue_stmt => self.compileLoopControl(stmt, false),
             .while_stmt => |w| self.compileWhileLoop(stmt, w),
             .expression => |expr| self.compileExpressionStatement(stmt, expr.expression),
             else => {
@@ -8606,6 +8626,15 @@ pub const IRCompiler = struct {
         self.current_instruction_set = instr_set;
         try self.scopes.push(self.allocator, .closure);
 
+        // A function body starts with no enclosing loops of its own — a `break`
+        // in a nested function must not target a loop in the outer function.
+        const saved_loop_contexts = self.loop_contexts;
+        self.loop_contexts = .empty;
+        defer {
+            self.loop_contexts.deinit(self.allocator);
+            self.loop_contexts = saved_loop_contexts;
+        }
+
         if (fn_decl.name) |name| {
             // Give the (self-visible) function binding a `.function` type carrying
             // its return type, so a recursive call in the body can be value-captured
@@ -9093,6 +9122,9 @@ pub const IRCompiler = struct {
                 linScanExpr(scan, w.condition);
                 for (w.body.statements) |bs| linScanStmt(scan, bs);
             },
+            // break/continue reference no bindings and don't alias — no effect on
+            // linear-buffer recognition.
+            .break_stmt, .continue_stmt => {},
             .type_binding_decl => {},
             .bash_block => scan.recognized = false,
         }
@@ -10378,6 +10410,8 @@ pub const IRCompiler = struct {
 
         const after_label = try self.newLabel("for_after", .unknown);
         const for_label = try self.newLabel("for", .abs);
+        // `continue` jumps to the increment + re-test, not the loop top.
+        const continue_label = try self.newLabel("for_continue", .unknown);
 
         try self.cmp(source, .less, .from(counter_ref.dereference()), .from(iterations_ref.dereference()), .initRegister(.r2));
         try self.jmp(source, .fromLocation(.initRegister(.r2)), false, after_label);
@@ -10414,7 +10448,16 @@ pub const IRCompiler = struct {
         // 4. Compile for body as statement
 
         const stack_before_body = self.currentFrame().rel_stack_counter;
+        // Captures write to pre-allocated per-source refs (no per-iteration push),
+        // so both break and continue pop the body back to stack_before_body.
+        try self.loop_contexts.append(self.allocator, .{
+            .break_label = after_label,
+            .continue_label = continue_label,
+            .break_base = stack_before_body,
+            .continue_base = stack_before_body,
+        });
         const fallback_for_body_result = try self.compileExpressionAsStatement(source, for_expr.body);
+        _ = self.loop_contexts.pop();
 
         if (isWaitable(fallback_for_body_result)) |loc| {
             try self.wait(source, loc);
@@ -10432,6 +10475,7 @@ pub const IRCompiler = struct {
 
         self.scopes.pop();
 
+        try self.setLabel(continue_label.local_addr.label, .abs);
         try self.ath(
             source,
             .add,
@@ -10445,6 +10489,80 @@ pub const IRCompiler = struct {
 
         // TODO: return something like the block compilation is doing
         return .fromValue(.void);
+    }
+
+    /// Compiles a `break` (to the loop's exit) or `continue` (to its re-test /
+    /// increment). Pops this iteration's body slots down to the target label's
+    /// stack base, then jumps — but restores the compile-time stack counter
+    /// afterward, since any statements following `break`/`continue` in the same
+    /// block are unreachable yet still compiled at the pre-jump depth.
+    fn compileLoopControl(self: *IRCompiler, source: *ast.Statement, is_break: bool) Error!Result {
+        if (self.loop_contexts.items.len == 0) {
+            try self.reportSourceError(
+                source,
+                Error.UnsupportedExpression,
+                .@"error",
+                "'{s}' outside of a loop",
+                .{if (is_break) "break" else "continue"},
+            );
+            return .fromValue(.void);
+        }
+        const ctx = self.loop_contexts.items[self.loop_contexts.items.len - 1];
+        const target_label = if (is_break) ctx.break_label else ctx.continue_label;
+        const target_base = if (is_break) ctx.break_base else ctx.continue_base;
+
+        const saved = self.currentFrame().rel_stack_counter;
+        try self.popToStackBase(source, target_base);
+        try self.jmp(source, null, true, target_label);
+        self.currentFrame().rel_stack_counter = saved;
+        return .fromValue(.void);
+    }
+
+    /// Whether a loop body contains a `break`/`continue` bound to *this* loop —
+    /// i.e. not nested inside another `for`/`while` (which owns its own). Used to
+    /// keep such a body off the atomic `counted_loop` path (whose runner cannot
+    /// follow a jump out of the body set) and onto the label-based path where
+    /// `break`/`continue` resolve. Conservative by construction: if it ever
+    /// under-reports, the counted-loop body compiles with no loop context pushed,
+    /// so `compileLoopControl` reports a clean "outside a loop" error rather than
+    /// miscompiling.
+    fn bodyHasLoopControl(expr: *const ast.Expression) bool {
+        return switch (expr.*) {
+            .block => |b| {
+                for (b.statements) |s| if (stmtHasLoopControl(s)) return true;
+                return false;
+            },
+            .if_expr => |ife| ifHasLoopControl(ife),
+            .match_expr => |m| {
+                for (m.cases) |c| for (c.body.statements) |s| if (stmtHasLoopControl(s)) return true;
+                return false;
+            },
+            // A nested loop owns its own break/continue — a barrier.
+            .for_expr => false,
+            else => false,
+        };
+    }
+
+    fn ifHasLoopControl(ife: ast.IfExpr) bool {
+        if (bodyHasLoopControl(ife.then_expr)) return true;
+        if (ife.else_branch) |eb| return switch (eb) {
+            .expr => |ex| bodyHasLoopControl(ex),
+            .if_expr => |ip| ifHasLoopControl(ip.*),
+            .condition => false,
+        };
+        return false;
+    }
+
+    fn stmtHasLoopControl(stmt: *const ast.Statement) bool {
+        return switch (stmt.*) {
+            .break_stmt, .continue_stmt => true,
+            .expression => |e| bodyHasLoopControl(e.expression),
+            .binding_decl => |b| bodyHasLoopControl(b.initializer),
+            .yield_stmt => |y| bodyHasLoopControl(y.value),
+            .exit_stmt => |e| if (e.value) |v| bodyHasLoopControl(v) else false,
+            // A nested while owns its own break/continue.
+            .while_stmt, .type_binding_decl, .bash_block => false,
+        };
     }
 
     /// Lowers `while (condition) { body }`: re-evaluate the condition at the top
@@ -10560,6 +10678,15 @@ pub const IRCompiler = struct {
             },
         };
 
+        // `break` exits to after_label, `continue` re-tests at while_label; both
+        // targets expect the stack at loop_stack_base (== stack_before_body).
+        try self.loop_contexts.append(self.allocator, .{
+            .break_label = after_label,
+            .continue_label = while_label,
+            .break_base = loop_stack_base,
+            .continue_base = loop_stack_base,
+        });
+
         var body_result: Result = .fromValue(.void);
         for (while_stmt.body.statements) |body_stmt| {
             body_result = try self.compileStatement(body_stmt);
@@ -10567,6 +10694,8 @@ pub const IRCompiler = struct {
         if (isWaitable(body_result)) |loc| {
             try self.wait(source, loc);
         }
+
+        _ = self.loop_contexts.pop();
 
         try self.popToStackBase(source, stack_before_body);
         self.scopes.pop();
@@ -10650,7 +10779,16 @@ pub const IRCompiler = struct {
         }
 
         const stack_before_body = self.currentFrame().rel_stack_counter;
+        // `continue` returns to for_label, whose `collect_stdin` reads the next
+        // value (there is no separate increment); `break` exits to after_label.
+        try self.loop_contexts.append(self.allocator, .{
+            .break_label = after_label,
+            .continue_label = for_label,
+            .break_base = stack_before_body,
+            .continue_base = stack_before_body,
+        });
         const body_result = try self.compileExpressionAsStatement(source, for_expr.body);
+        _ = self.loop_contexts.pop();
         if (isWaitable(body_result)) |loc| try self.wait(source, loc);
 
         const body_extra_refs = self.currentFrame().rel_stack_counter - stack_before_body;
@@ -10680,6 +10818,12 @@ pub const IRCompiler = struct {
         }
 
         const frame_before_body = self.currentFrame().rel_stack_counter;
+
+        // A break/continue bound to this loop can't run as an atomic counted_loop
+        // (its runner cannot follow a jump out of the body set), so it forces the
+        // label-based path below.
+        const has_control = bodyHasLoopControl(for_expr.body);
+
         const body_set = try self.addInstructionSet();
         const prev_set = self.current_instruction_set;
         self.current_instruction_set = body_set;
@@ -10721,13 +10865,15 @@ pub const IRCompiler = struct {
         }
 
         const counted_loop_stack_before_body = self.currentFrame().rel_stack_counter;
-        const for_body_result = try self.compileExpressionAsStatement(source, for_expr.body);
-        const body_extra_refs = self.currentFrame().rel_stack_counter - counted_loop_stack_before_body;
-        for (0..body_extra_refs) |_| {
-            _ = try self.pop(source);
+        var can_use_counted_loop = false;
+        if (!has_control) {
+            const for_body_result = try self.compileExpressionAsStatement(source, for_expr.body);
+            const body_extra_refs = self.currentFrame().rel_stack_counter - counted_loop_stack_before_body;
+            for (0..body_extra_refs) |_| {
+                _ = try self.pop(source);
+            }
+            can_use_counted_loop = isWaitable(for_body_result) == null and self.instructionSetIsCountedLoopSafe(body_set);
         }
-
-        const can_use_counted_loop = isWaitable(for_body_result) == null and self.instructionSetIsCountedLoopSafe(body_set);
         self.currentFrame().rel_stack_counter = frame_before_body;
 
         self.current_instruction_set = prev_set;
@@ -10742,6 +10888,9 @@ pub const IRCompiler = struct {
 
         const after_label = try self.newLabel("for_after", .unknown);
         const for_label = try self.newLabel("for", .abs);
+        // `continue` jumps here — the increment + re-test, not the loop top —
+        // so it advances the counter (a plain jump to for_label would spin).
+        const continue_label = try self.newLabel("for_continue", .unknown);
 
         try self.cmp(source, .less, .from(iter_ref.dereference()), .from(for_source.range_limit_ref.?.dereference()), .initRegister(.r2));
         try self.jmp(source, .fromLocation(.initRegister(.r2)), false, after_label);
@@ -10771,7 +10920,17 @@ pub const IRCompiler = struct {
         }
 
         const stack_before_body = self.currentFrame().rel_stack_counter;
+        // break → after_label (stack at frame_before_body == stack_before_body,
+        // the capture aliases the counter and pushes no slot); continue →
+        // continue_label after popping the body back to stack_before_body.
+        try self.loop_contexts.append(self.allocator, .{
+            .break_label = after_label,
+            .continue_label = continue_label,
+            .break_base = stack_before_body,
+            .continue_base = stack_before_body,
+        });
         const fallback_for_body_result = try self.compileExpressionAsStatement(source, for_expr.body);
+        _ = self.loop_contexts.pop();
 
         if (isWaitable(fallback_for_body_result)) |loc| {
             try self.wait(source, loc);
@@ -10784,6 +10943,7 @@ pub const IRCompiler = struct {
 
         self.scopes.pop();
 
+        try self.setLabel(continue_label.local_addr.label, .abs);
         try self.ath(
             source,
             .add,

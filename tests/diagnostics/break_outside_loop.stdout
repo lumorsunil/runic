@@ -1,0 +1,6 @@
+[error]: tests/diagnostics/break_outside_loop.rn:4:1: 'break' outside of a loop
+   2:# in a function body that is not inside a loop) is a compile error.
+   3:echo "before"
+   4:[41m[30mbreak[0m
+   5:
+

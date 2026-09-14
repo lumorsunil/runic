@@ -469,6 +469,18 @@ for (fruits, 0..) |fruit, idx| {
 
 **Result:** Iteration works uniformly across arrays and ranges without manual indexing, and the capture clause makes loop variables explicit without leaking bindings outside the block.
 
+Inside any loop — a `for` (over a range, array, multiple sources, or a `for (&0)` stream) or a `while` — `break` exits the innermost enclosing loop and `continue` skips to its next iteration:
+
+```rn
+for (0..10) |i| {
+  if (i == 3) continue   // skip 3
+  if (i == 6) break      // stop at 6
+  echo "${i}"
+}
+```
+
+**Result:** prints `0 1 2 4 5`. `break`/`continue` bind to the innermost loop, so an inner-loop `break` leaves the outer loop running. Using either outside a loop is a compile error.
+
 A `for` or `if`/`else` body does not have to be a block. It may be a bare
 expression or a single `yield`/`exit` statement, which avoids `{ }` for
 one-liners:

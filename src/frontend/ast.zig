@@ -1922,6 +1922,8 @@ pub const Statement = union(enum) {
 
     exit_stmt: ExitStmt,
     yield_stmt: YieldStmt,
+    break_stmt: BreakStmt,
+    continue_stmt: ContinueStmt,
     while_stmt: WhileStmt,
     bash_block: BashBlock,
 
@@ -1931,6 +1933,8 @@ pub const Statement = union(enum) {
             .binding_decl => |decl| decl.span,
             .exit_stmt => |exit_stmt| exit_stmt.span,
             .yield_stmt => |yield_stmt| yield_stmt.span,
+            .break_stmt => |break_stmt| break_stmt.span,
+            .continue_stmt => |continue_stmt| continue_stmt.span,
             // .for_stmt => |loop_stmt| loop_stmt.span,
             .while_stmt => |loop_stmt| loop_stmt.span,
             .bash_block => |bash_block| bash_block.span,
@@ -2118,6 +2122,34 @@ pub const YieldStmt = struct {
 pub const ExitStmt = struct {
     value: ?*Expression,
     span: Span,
+};
+
+/// `break` — exit the innermost enclosing loop.
+pub const BreakStmt = struct {
+    span: Span,
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.Io,
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*const TypeExpr {
+        return null;
+    }
+};
+
+/// `continue` — skip to the next iteration of the innermost enclosing loop.
+pub const ContinueStmt = struct {
+    span: Span,
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.Io,
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*const TypeExpr {
+        return null;
+    }
 };
 
 pub const ForExpr = struct {
