@@ -20,8 +20,11 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   fields to same-named locals, with `{ x: local }` to rebind a field to a
   different name and a subset of fields allowed. `_` discards an element;
   `const`/`var` sets mutability for all parts. A record field the struct doesn't
-  have is a "struct has no field" error. (Nested patterns work for records;
-  a record/tuple *inside* a tuple element is not yet parsed.)
+  have is a "struct has no field" error. Patterns nest arbitrarily — a record or
+  tuple can appear as a tuple element or a record-field rebinding (a nested tuple
+  is parenthesized, `(a, b)`, since a bare comma separates the outer elements),
+  and a tuple over an array literal keeps each element's type, so a heterogeneous
+  `const s, n, p = .{ "hi", 2, point }` destructures each part at its own type.
 - **Array concatenation with `+`.** `a + b` on two arrays produces a new array
   holding `a`'s elements followed by `b`'s (a fresh copy; the operands are
   unchanged). Works for any element type, with empty operands, and composes with

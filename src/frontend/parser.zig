@@ -2418,14 +2418,10 @@ pub const Parser = struct {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
-        // A record destructuring pattern: `{ x, y }` binds the struct's `x`/`y`
-        // fields to same-named locals.
-        if ((try self.peekToken()).tag == .l_brace) return self.parseRecordPattern();
+        const first = try self.parseElementPattern();
 
-        const first = try self.parseSingleBindingPattern();
-
-        // A tuple destructuring pattern: `a, b` (comma-separated) binds the
-        // positional elements of the initializer array/tuple.
+        // A top-level tuple destructuring pattern: `a, b` (comma-separated) binds
+        // the positional elements of the initializer array/tuple.
         if ((try self.peekToken()).tag != .comma) return first;
 
         var elements = std.ArrayList(*ast.BindingPattern).empty;
@@ -2433,7 +2429,7 @@ pub const Parser = struct {
         try elements.append(self.arena.allocator(), first);
         var end_span = first.span();
         while (try self.stream.consumeIf(.comma)) {
-            const el = try self.parseSingleBindingPattern();
+            const el = try self.parseElementPattern();
             end_span = el.span();
             try elements.append(self.arena.allocator(), el);
         }
@@ -2441,6 +2437,40 @@ pub const Parser = struct {
         pattern.* = .{ .tuple = .{
             .elements = try elements.toOwnedSlice(self.arena.allocator()),
             .span = first.span().endAt(end_span),
+            .has_rest = false,
+        } };
+        return pattern;
+    }
+
+    /// Parses one destructuring element — the building block of tuple elements
+    /// and record-field rebindings. It is an identifier/discard, a record
+    /// (`{ x, y }`), or a *parenthesized* tuple (`(a, b)`). A nested tuple must
+    /// be parenthesized because a bare comma separates the elements of the
+    /// enclosing pattern.
+    fn parseElementPattern(self: *Self) Error!*ast.BindingPattern {
+        return switch ((try self.peekToken()).tag) {
+            .l_brace => self.parseRecordPattern(),
+            .l_paren => self.parseParenTuplePattern(),
+            else => self.parseSingleBindingPattern(),
+        };
+    }
+
+    /// Parses `( a, b, … )` — a parenthesized tuple pattern (a nested tuple, or a
+    /// grouped top-level one). A single `( a )` is just that element.
+    fn parseParenTuplePattern(self: *Self) Error!*ast.BindingPattern {
+        const open = try self.expectTokenTag(.l_paren);
+        var elements = std.ArrayList(*ast.BindingPattern).empty;
+        defer elements.deinit(self.arena.allocator());
+        while ((try self.peekToken()).tag != .r_paren) {
+            try elements.append(self.arena.allocator(), try self.parseElementPattern());
+            if (!try self.stream.consumeIf(.comma)) break;
+        }
+        const close = try self.expectTokenTag(.r_paren);
+        if (elements.items.len == 1) return elements.items[0];
+        const pattern = try self.arena.allocator().create(ast.BindingPattern);
+        pattern.* = .{ .tuple = .{
+            .elements = try elements.toOwnedSlice(self.arena.allocator()),
+            .span = open.span.endAt(close.span),
             .has_rest = false,
         } };
         return pattern;
@@ -2482,7 +2512,7 @@ pub const Parser = struct {
             var binding: ?*ast.BindingPattern = null;
             var field_end = label.span;
             if (try self.stream.consumeIf(.colon)) {
-                const sub = try self.parseSingleBindingPattern();
+                const sub = try self.parseElementPattern();
                 field_end = sub.span();
                 binding = sub;
             }

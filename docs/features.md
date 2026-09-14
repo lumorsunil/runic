@@ -98,7 +98,11 @@ const { x: px } = p                   // rebind a field to a different local nam
 array/tuple; a record pattern `{ x, y }` binds a struct's fields to same-named
 locals (a subset is allowed, and `{ field: name }` rebinds). `const`/`var` sets
 the mutability of all the parts, and a record field the struct doesn't have is a
-compile error.
+compile error. Patterns **nest** — a record or tuple can be a tuple element or a
+record-field rebinding (`const { inner: { x } }, rest = …`); a nested tuple is
+parenthesized (`(a, b)`) since a bare comma separates the outer elements. A
+tuple over an array literal keeps each element's type, so
+`const s, n, p = .{ "hi", 2, point }` destructures a heterogeneous group.
 
 ### Compound assignment
 

@@ -39,3 +39,24 @@ echo "subset=${justH}"
 const Box = struct { size: V }
 const { size } = Box{ .size = V{ .w = 5, .h = 6 } }
 echo "nested=${size.w},${size.h}"
+
+// Nested destructuring: a record/tuple inside another pattern. A nested tuple is
+// parenthesized (`(a, b)`) since a bare comma separates the outer elements.
+const W = struct { x: Int }
+
+// A record pattern as a tuple element (heterogeneous — struct + Int).
+const { x: wx }, count = .{ W{ .x = 11 }, 5 }
+echo "nested-rec=${wx},${count}"
+
+// A parenthesized nested tuple element.
+const (np, nq), rest = .{ .{ 1, 2 }, 3 }
+echo "nested-tup=${np},${nq},${rest}"
+
+// A record field destructured into a nested record.
+const Outer = struct { inner: W, tag: Int }
+const { inner: { x: ix }, tag } = Outer{ .inner = W{ .x = 8 }, .tag = 9 }
+echo "field-nest=${ix},${tag}"
+
+// Fully heterogeneous tuple.
+const str, num, ws = .{ "hi", 2, W{ .x = 3 } }
+echo "het=${str},${num},${ws.x}"

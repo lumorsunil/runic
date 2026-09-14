@@ -1126,6 +1126,22 @@ pub const TypeChecker = struct {
 
         if (type_expr) |t| try self.runTypeExpression(scope, t);
 
+        // A tuple pattern destructuring an array *literal* (`const a, b =
+        // .{ e0, e1 }`) types each element binding from its own expression, so a
+        // heterogeneous literal keeps per-element types (which the homogenized
+        // array element type would lose).
+        if (binding_decl.pattern.* == .tuple and binding_decl.initializer.* == .array) {
+            const tuple = binding_decl.pattern.tuple;
+            const elems = binding_decl.initializer.array.elements;
+            if (tuple.elements.len == elems.len) {
+                for (tuple.elements, elems) |el_pat, el_expr| {
+                    const el_type = if (try self.resolveExprType(scope, el_expr)) |raw| try self.resolveTypeExpr(scope, raw) else null;
+                    try self.runBindingPattern(scope, el_pat, el_type, binding_decl.is_pub, binding_decl.is_mutable);
+                }
+                return;
+            }
+        }
+
         try self.runBindingPattern(
             scope,
             binding_decl.pattern,

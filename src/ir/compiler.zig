@@ -1874,9 +1874,31 @@ pub const IRCompiler = struct {
                 );
                 return .fromValue(.void);
             },
-            .tuple, .record => {
+            .tuple => |tuple| {
+                // A tuple pattern over an array *literal* binds each element to
+                // its own expression — preserving per-element (heterogeneous)
+                // types and avoiding a round-trip through a homogenized array.
+                if (expr.* == .array and expr.array.elements.len == tuple.elements.len) {
+                    for (tuple.elements, expr.array.elements) |el_pat, el_expr| {
+                        _ = try self.compileBinding(source, el_pat, el_expr, null, is_mutable);
+                    }
+                    return .fromValue(.void);
+                }
+                // Otherwise compile the initializer once and index into it.
+                const value = try self.compileExpressionWithCapture(source, expr);
+                const base_ref = try self.newRef(source, "destructure_base");
+                try self.set(source, base_ref, stableResultSource(value));
+                try self.compilePatternFromValue(
+                    source,
+                    pattern,
+                    try .from(base_ref.dereference().typed(value.typeExpr())),
+                    is_mutable,
+                );
+                return .fromValue(.void);
+            },
+            .record => {
                 // Destructuring: compile the initializer once into a stable ref,
-                // then bind each element/field from that value.
+                // then bind each field from that value.
                 const value = try self.compileExpressionWithCapture(source, expr);
                 const base_ref = try self.newRef(source, "destructure_base");
                 try self.set(source, base_ref, stableResultSource(value));
