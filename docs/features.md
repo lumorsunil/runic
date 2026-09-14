@@ -581,6 +581,12 @@ generic functions are written once, and mismatches are still caught
 captured type is a purely compile-time entity — it never exists at runtime.
 (This subsumes the earlier `@TypeOf`, which has been removed.)
 
+A type variable exists only once it has been introduced by a `|T|` capture. A
+**bare** uppercase type name with no such capture is an *undeclared type* — a
+typo like `Recangle`, not a silent generic — and is a compile error that points
+you at the `|T|` form. So write a generic parameter's first occurrence as `|T|`
+and reference it bare thereafter (`fn Void first(xs: []|T|) T`).
+
 ### Generic type constructors
 
 A type binding can take type parameters, defining a generic type constructor:

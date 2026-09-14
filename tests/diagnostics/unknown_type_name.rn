@@ -1,0 +1,8 @@
+# An unknown uppercase type name is an undeclared-type error, not a silent
+# generic. A generic type parameter must be introduced explicitly with a `|T|`
+# capture (`fn Void first(xs: []|T|) |T|`), so a bare unknown uppercase name — a
+# common typo — is reported with a hint pointing at the `|T|` form.
+fn Void area(r: Recangle) Int {
+  yield r.w * r.h
+}
+echo "${area 5}"

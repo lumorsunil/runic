@@ -205,6 +205,14 @@ Likely near- to mid-term candidates:
 - first-class / anonymous blocks — bare `{ … }` is already an eager
   expression-block, so a lambda form needs distinct syntax; a design decision
 - better user-defined struct/type support
+- **comptime functions returning types** (Zig-style) to supersede the current
+  generic type-constructor form. Today a parameterized type is written
+  `const Box(T) = struct { value: T }`; the intended long-term replacement is a
+  comptime function that returns a type —
+  `fn Box(comptime T: type) type { return struct { value: T } }` — unifying
+  generic types with ordinary functions and comptime evaluation. (Generic type
+  *variables* in signatures are now introduced explicitly with `|T|`; a bare
+  unknown uppercase type name is an error rather than a silent generic.)
 - support escaping whitespace in bareword executable/identifier syntax so
   commands or names containing spaces can be represented without immediately
   collapsing to quoted-string behavior

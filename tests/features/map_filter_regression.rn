@@ -3,19 +3,19 @@
 # value`, which returns a new array). One definition works for any element type.
 fn Void @() Void
 
-fn Void map(xs: []T, f: fn(T) U) []U {
+fn Void map(xs: []|T|, f: fn(|T|) |U|) []|U| {
   var result = .{ }
   for (xs) |x| { result = result.push (f x) }
   yield result
 }
 
-fn Void filter(xs: []T, keep: fn(T) Bool) []T {
+fn Void filter(xs: []|T|, keep: fn(|T|) Bool) []|T| {
   var result = .{ }
   for (xs) |x| { if (keep x) { result = result.push x } }
   yield result
 }
 
-fn Void reduce(xs: []T, f: fn(U, T) U, init: U) U {
+fn Void reduce(xs: []|T|, f: fn(|U|, |T|) |U|, init: |U|) |U| {
   var acc = init
   for (xs) |x| { acc = f acc x }
   yield acc

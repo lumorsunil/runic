@@ -1,12 +1,13 @@
-# Generics via implicit type variables (stdlib Phase 2): an uppercase name in a
-# function signature that isn't a declared type is a type variable (`T`/`U`),
-# scoped to the function. Since the runtime is dynamic, the function compiles
-# once and works for any element type; the type checker treats type variables
-# permissively.
+# Generics via explicit type-variable captures: a `|T|` in a function signature
+# introduces a type variable, scoped to the function; a bare `T` afterward
+# references it. Since the runtime is dynamic, the function compiles once and
+# works for any element type; the type checker treats type variables
+# permissively. (A bare uppercase name that is not introduced by a `|T|` is an
+# undeclared-type error, not a silent generic — see the diagnostics fixtures.)
 fn Void @() Void
 
 # A generic function used at two different element types.
-fn Void count(xs: []T) Int {
+fn Void count(xs: []|T|) Int {
   var n = 0
   for (xs) |x| { n = n + 1 }
   yield n
@@ -15,13 +16,13 @@ const nums = .{ 7, 8, 9 }
 const names = .{ "a", "b" }
 echo "count int=${count nums} count str=${count names}"
 
-# Generic first: returns the element type T.
-fn Void first(xs: []T) T { yield xs[0] }
+# Generic first: returns the element type |T|.
+fn Void first(xs: []|T|) |T| { yield xs[0] }
 echo "first=${first nums}"
 
-# Generic reduce: type variables T (element) and U (accumulator) plus a
+# Generic reduce: type variables |T| (element) and |U| (accumulator) plus a
 # higher-order function.
-fn Void reduce(xs: []T, f: fn(U, T) U, init: U) U {
+fn Void reduce(xs: []|T|, f: fn(|U|, |T|) |U|, init: |U|) |U| {
   var acc = init
   for (xs) |x| { acc = f acc x }
   yield acc

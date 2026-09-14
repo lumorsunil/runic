@@ -885,6 +885,46 @@ pub const TypeChecker = struct {
         }
     }
 
+    /// Resolves a generic constructor's body (`const Box(T) = struct { value: T }`)
+    /// with its type parameters bound in scope as permissive type variables, so a
+    /// bare parameter reference in the body (`value: T`) resolves as that
+    /// parameter rather than an undeclared type. Used where the body is resolved
+    /// before the type arguments are known — an inferred `Box{ … }` construction.
+    /// (A `Box(Int)` *application* substitutes the args first; see
+    /// `resolveTypeApplication`.)
+    fn resolveGenericCtorBody(
+        self: *TypeChecker,
+        scope: *Scope,
+        ctor: GenericTypeCtor,
+    ) Error!*const ast.TypeExpr {
+        const ctor_scope = try self.arena.allocator().create(Scope);
+        ctor_scope.* = .initWithParent(scope, ctor.body.span());
+        for (ctor.params) |param| {
+            const marker = try self.allocTypeExpression(.{ .type_var = .{ .name = param.name, .span = param.span } });
+            try ctor_scope.declare(self.arena.allocator(), param, marker, false, false);
+        }
+        const resolved = try self.resolveTypeExpr(ctor_scope, ctor.body);
+        // `resolveTypeExpr` leaves a struct's plainly-named field types alone (to
+        // avoid expanding ordinary nested structs), so a bare parameter field
+        // (`value: T`) would stay unresolved and hit the undeclared-type error.
+        // Resolve each field explicitly in the param scope so `T` becomes its
+        // type variable — and a field naming a genuinely undeclared type still
+        // errors.
+        const unaliased = self.unaliasType(resolved);
+        if (unaliased.* == .struct_type) {
+            const st = unaliased.struct_type;
+            const new_fields = try self.arena.allocator().alloc(ast.TypeExpr.StructField, st.fields.len);
+            for (st.fields, new_fields) |field, *dst| {
+                dst.* = field;
+                dst.type_expr = try self.resolveTypeExpr(ctor_scope, field.type_expr);
+            }
+            var new_st = st;
+            new_st.fields = new_fields;
+            return try self.allocTypeExpression(.{ .struct_type = new_st });
+        }
+        return resolved;
+    }
+
     /// Resolves a `Name(args…)` application against a registered generic
     /// constructor: substitutes the args into its body, then resolves the result.
     fn resolveTypeApplication(
@@ -1051,7 +1091,23 @@ pub const TypeChecker = struct {
             // resolve the annotation: bound captures become their concrete type,
             // unmatched ones (e.g. `?|T| = null`) stay permissive type variables.
             if (typeExprHasCapture(annotation)) {
-                if (initializer_type) |it| try self.bindTypeCaptures(scope, annotation, it);
+                if (initializer_type) |it| {
+                    try self.bindTypeCaptures(scope, annotation, it);
+                } else {
+                    // No concrete initializer type to match against (e.g. an
+                    // untyped array literal, or `?|T| = null`): declare each
+                    // captured name as a permissive type variable so a later bare
+                    // reference to it still resolves.
+                    var captures: std.StringHashMapUnmanaged(void) = .empty;
+                    defer captures.deinit(self.arena.allocator());
+                    try self.collectTypeVars(scope, annotation, &captures);
+                    var it = captures.keyIterator();
+                    while (it.next()) |name| {
+                        if (scope.lookup(name.*) != null) continue;
+                        const marker = try self.allocTypeExpression(.{ .type_var = .{ .name = name.*, .span = annotation.span() } });
+                        try scope.declareType(self.arena.allocator(), ast.Identifier.global(name.*), marker, false);
+                    }
+                }
             }
             break :brk try self.resolveTypeExpr(scope, annotation);
         };
@@ -1301,12 +1357,11 @@ pub const TypeChecker = struct {
         out: *std.StringHashMapUnmanaged(void),
     ) Error!void {
         switch (type_expr.*) {
-            .identifier => |named| {
-                const seg = named.path.segments[0];
-                if (seg.isTypeIdentifier() and outer.lookup(seg.name) == null) {
-                    try out.put(self.arena.allocator(), seg.name, {});
-                }
-            },
+            // A generic type parameter is introduced only by an explicit `|T|`
+            // capture. A bare uppercase identifier is NOT collected — it must
+            // resolve to an already-introduced type variable (from a `|T|`
+            // capture elsewhere in the signature) or a declared type; otherwise
+            // it is an undeclared-type error (a typo), not a silent generic.
             .type_capture => |capture| try out.put(self.arena.allocator(), capture.name, {}),
             .type_application => |app| for (app.args) |arg| try self.collectTypeVars(outer, arg, out),
             .array => |a| try self.collectTypeVars(outer, a.element, out),
@@ -1397,15 +1452,22 @@ pub const TypeChecker = struct {
             // rather than reporting "not declared". (A lowercase unknown name is
             // still an error.)
             if (identifier.path.segments[0].isTypeIdentifier()) {
-                return try self.allocTypeExpression(.{ .type_var = .{ .name = name, .span = identifier.span } });
+                try self.reportSpanError(
+                    identifier.span,
+                    Error.IdentifierNotFound,
+                    .@"error",
+                    "type '{s}' is not declared (to introduce a generic type parameter, write it as |{s}|)",
+                    .{ name, name },
+                );
+            } else {
+                try self.reportSpanError(
+                    identifier.span,
+                    Error.IdentifierNotFound,
+                    .@"error",
+                    "type {s} not declared",
+                    .{name},
+                );
             }
-            try self.reportSpanError(
-                identifier.span,
-                Error.IdentifierNotFound,
-                .@"error",
-                "type {s} not declared",
-                .{name},
-            );
 
             return try self.allocTypeExpression(.{ .failed = .{ .span = identifier.span } });
         };
@@ -1922,6 +1984,11 @@ pub const TypeChecker = struct {
     /// pipeline whose final stage yields an error union). Commands
     /// (`.execution` / `ExecutableError`) are exempt.
     fn statementHasUnhandledError(self: *TypeChecker, scope: *Scope, expr: *ast.Expression) Error!bool {
+        // A function *declaration* statement never produces an unhandled error,
+        // and resolving its type here would re-resolve the signature (e.g. a
+        // generic return `|T|`) in this outer scope, where the function's type
+        // variables are not declared — a spurious "type not declared".
+        if (expr.* == .fn_decl) return false;
         const raw = (try self.resolveExprType(scope, expr)) orelse return false;
         // Resolve so a function call's raw `identifier` err_set (e.g.
         // `ExecutableError`) becomes an alias `isExecutableErrorSet` can see.
@@ -3886,7 +3953,7 @@ pub const TypeChecker = struct {
         // A generic constructor (`Box{ … }` for `const Box(T) = struct { … }`):
         // validate against the body struct with its type parameters permissive.
         if (self.generic_type_ctors.get(struct_literal.name.name)) |ctor| {
-            const resolved = self.unaliasType(try self.resolveTypeExpr(scope, ctor.body));
+            const resolved = self.unaliasType(try self.resolveGenericCtorBody(scope, ctor));
             if (resolved.* == .struct_type) try self.runStructValueLiteral(scope, resolved.struct_type, struct_literal);
             return;
         }
@@ -4454,7 +4521,7 @@ pub const TypeChecker = struct {
         // value so `Box{ .value = 5 }` is `struct { value: Int }` (not `{ T }`).
         if (T == *ast.Expression and expr.* == .struct_literal) {
             if (self.generic_type_ctors.get(expr.struct_literal.name.name)) |ctor| {
-                const body = self.unaliasType(try self.resolveTypeExpr(scope, ctor.body));
+                const body = self.unaliasType(try self.resolveGenericCtorBody(scope, ctor));
                 if (body.* != .struct_type) return body;
                 const new_fields = try self.arena.allocator().alloc(ast.TypeExpr.StructField, body.struct_type.fields.len);
                 for (body.struct_type.fields, new_fields) |field, *dst| {

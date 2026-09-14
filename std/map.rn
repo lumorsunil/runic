@@ -43,7 +43,7 @@ fn Void bucketFor(key: |K|, count: Int) Int {
 }
 
 // An empty map with 16 buckets.
-pub fn Void empty() Map(K, V) {
+pub fn Void empty() Map(|K|, |V|) {
   var bs = .{ }
   var i = 0
   while (i < 16) {

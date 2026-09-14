@@ -1,0 +1,18 @@
+[error]: tests/diagnostics/unknown_type_name.rn:5:17: type 'Recangle' is not declared (to introduce a generic type parameter, write it as |Recangle|)
+   3:# capture (`fn Void first(xs: []|T|) |T|`), so a bare unknown uppercase name — a
+   4:# common typo — is reported with a hint pointing at the `|T|` form.
+   5:fn Void area(r: [41m[30mRecangle[0m) Int {
+   6:  yield r.w * r.h
+   7:}
+   8:echo "${area 5}"
+   9:
+
+[error]: tests/diagnostics/unknown_type_name.rn:5:17: type 'Recangle' is not declared (to introduce a generic type parameter, write it as |Recangle|)
+   3:# capture (`fn Void first(xs: []|T|) |T|`), so a bare unknown uppercase name — a
+   4:# common typo — is reported with a hint pointing at the `|T|` form.
+   5:fn Void area(r: [41m[30mRecangle[0m) Int {
+   6:  yield r.w * r.h
+   7:}
+   8:echo "${area 5}"
+   9:
+

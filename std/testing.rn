@@ -23,7 +23,7 @@ pub fn Void assert(cond: Bool, msg: String) Void {
 }
 
 // Abort with `msg` unless `a` equals `b` (scalar/string equality).
-pub fn Void assertEq(a: T, b: T, msg: String) Void {
+pub fn Void assertEq(a: |T|, b: |T|, msg: String) Void {
   if (a == b) {
     // ok
   } else {

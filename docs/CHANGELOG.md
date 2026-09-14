@@ -40,6 +40,20 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Changed
 
+- **Generic type parameters must be introduced with `|T|`; a bare unknown
+  uppercase type name is an error.** Previously an uppercase type name that
+  wasn't declared was silently treated as an implicit generic type variable, so
+  a typo like `Recangle` slipped through. Now a type variable is introduced only
+  by an explicit `|T|` capture (`fn Void first(xs: []|T|) |T|`); a bare `T` after
+  it references the same variable, and a bare uppercase name with no such capture
+  is an undeclared-type error with a hint pointing at the `|T|` form. **Breaking**
+  for signatures written with bare implicit generics — add `|…|` at each type
+  variable's first occurrence (the standard library was migrated). User-defined
+  generic type *constructors* (`const Box(T) = struct { value: T }`) are
+  unchanged — their `(T)` parameters are now properly scoped when resolving the
+  body (so a typo in a constructor body is also caught). *(Longer term, the
+  `Box(T)` constructor form is expected to be superseded by comptime functions
+  returning types, Zig-style — see `docs/plan.md`.)*
 - **`;` after a binding is always a plain statement separator.** A binding whose
   initializer was a command/pipeline used to "absorb" a following `;`-separated
   statement into the bound value as a command sequence (`const b = cmd1; cmd2`
