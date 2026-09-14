@@ -22,6 +22,14 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Fixed
 
+- **`;` after a command-producing binding.** A binding whose initializer is a
+  command/pipeline (`const n = echo "9" | parseInt`) no longer swallows a
+  following statement that cannot be part of a command sequence — a `yield` or
+  `exit`, a closing `}`, or a statement that uses the just-bound value. Such a
+  `;` now separates statements (as a newline does): `const n = pipe; yield n`
+  parses, and `const n = pipe; echo "${n}"` binds `n` before the `echo` reads
+  it. Sequencing two commands under one binding (`const s = cmd1; cmd2`) still
+  works.
 - **Constructing a struct field from another struct's field.** A struct literal
   whose field value is a member access — `V{ .x = e.x }` — now type-checks. The
   member access surfaced the field's raw declared type (an unresolved identifier

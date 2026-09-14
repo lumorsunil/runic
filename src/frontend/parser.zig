@@ -3246,6 +3246,20 @@ pub const Parser = struct {
         while (true) {
             const next = try self.peekToken();
             if (next.tag != .semicolon) break;
+            // Only absorb the following statement into the binding's command
+            // sequence when it actually begins a command/expression. A statement
+            // keyword (`yield`, `exit`), a block/group terminator (`}`, `)`,
+            // `]`), an empty statement, a following newline, or end of input is a
+            // *separate* statement — the `;` is a plain separator there (like a
+            // newline), not a sequence operator. Without this, e.g.
+            // `const n = "9" | parseInt; yield n` fails to parse (the absorb tried
+            // to read a value after `;` and hit `yield`).
+            const after = try self.peekSlice(2);
+            if (after.len < 2) break;
+            switch (after[1].tag) {
+                .r_brace, .r_paren, .r_bracket, .eof, .semicolon, .newline, .kw_yield, .kw_exit => break,
+                else => {},
+            }
             switch (initializer.*) {
                 // A bare zero-arg identifier call (`const z = y`) is a value
                 // reference, not a multi-part command — don't absorb the next

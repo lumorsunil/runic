@@ -17,3 +17,14 @@ const x = "hello"; echo "${x}"
 const v = 5
 const w = v; echo "w=${w}"
 const s = 1 + 2; echo "s=${s}"
+
+// A command-producing binding initializer followed by `;` and a statement that
+// cannot begin a command sequence — a `yield`, a closing `}`, or a statement
+// referencing the just-bound value — ends the binding: the `;` is a plain
+// separator there, not a sequence operator. (Previously `const n = pipe; yield`
+// failed to parse, and `const n = pipe; echo "${n}"` bound `n` to the sequence.)
+fn Void pick() Int { const n = echo "7" | parseInt catch 0; yield n }
+echo "pick=${pick}"
+fn Void last() Void { const z = echo "5" | parseInt catch 0; }
+last
+const parsed = echo "42" | parseInt catch 0; echo "parsed=${parsed}"

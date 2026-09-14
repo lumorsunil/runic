@@ -7,3 +7,5 @@ hello
 cat
 w=5
 s=3
+pick=7
+parsed=42
