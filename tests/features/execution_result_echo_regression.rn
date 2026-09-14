@@ -1,3 +1,6 @@
+// A command-producing binding captures the evaluated expression's buffered
+// stdout / stderr / exit metadata. `&&` (and `||`) chain commands into a single
+// expression, so the whole chain is captured.
 const a = printf "hello\n" && printf "error: some error" >&2
 
 echo a
@@ -5,9 +8,10 @@ echo a.stdout
 echo a.stderr
 echo a.exit_code
 
-const b = printf "hello\n"; printf "error: some error" >&2
-
-echo b
-echo b.stdout
-echo b.stderr
-echo b.exit_code
+// A `;` is a plain statement separator (like a newline), NOT a sequence operator:
+// `b` captures only the first command; the second command runs as its own
+// statement. This is what lets the common `const r = cmd; echo "${r}"` work — `r`
+// stays in scope for the next statement, instead of the next statement being
+// folded into `r`'s value.
+const b = printf "captured\n"; echo "separate-statement"
+echo "b.stdout=[${b.stdout}]"

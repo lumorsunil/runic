@@ -666,16 +666,15 @@ const combined = printf "hello\n" && printf "warning\n" >&2
 echo "${combined.stdout}"
 echo "${combined.stderr}"
 
-const sequenced = printf "hello\n"; printf "warning\n" >&2
-echo "${sequenced.stdout}"
-echo "${sequenced.stderr}"
+const first = printf "hello\n"; printf "world\n"   // `;` separates: `first` captures only `printf "hello"`; `printf "world"` is its own statement
+echo "${first.stdout}"
 
 const async_proc = (sleep 0.05; echo "done" &)
 async_proc.wait
 echo "${async_proc.stdout}"
 ```
 
-**Result:** Binding `const proc = <command ...>` executes the program synchronously and returns its buffered output plus exit metadata, read as `proc.stdout`, `proc.stderr`, and `proc.exit_code`. When command-producing expressions are chained with `&&`, `||`, or `;`, the resulting bound value still exposes the buffered `stdout`, `stderr`, and exit metadata from the evaluated expression. Appending `&` runs the work in the background; when you bind that value, its output is still buffered rather than printed immediately, and `.wait` blocks until it finishes.
+**Result:** Binding `const proc = <command ...>` executes the program synchronously and returns its buffered output plus exit metadata, read as `proc.stdout`, `proc.stderr`, and `proc.exit_code`. Commands chained into a single expression with `&&` or `||` are captured as a whole. A `;` is a plain statement separator (like a newline): `const proc = cmd1; cmd2` binds `proc` to `cmd1` only and runs `cmd2` as its own statement — so `proc` is in scope for it (`const r = cmd; echo "${r.stdout}"`). To capture an arbitrary command *sequence*, wrap it in a `$( … )` subshell. Appending `&` runs the work in the background; when you bind that value, its output is still buffered rather than printed immediately, and `.wait` blocks until it finishes.
 
 ### File descriptor redirects
 

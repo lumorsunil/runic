@@ -3269,55 +3269,16 @@ pub const Parser = struct {
         const pattern = try self.parseBindingPattern();
         const annotation = try self.parseMaybeTypeAnnotation();
         _ = try self.expectTokenTag(.assign);
-        var initializer = try self.parseExpression();
+        const initializer = try self.parseExpression();
 
-        // If the initializer is a command-producing expression, allow `;` to sequence
-        // additional commands under the same capture (e.g. `const b = cmd1; cmd2`).
-        // String literals, identifiers, and other non-command expressions do NOT
-        // continue the sequence, preserving `const x = "hello"; echo x` semantics.
-        while (true) {
-            const next = try self.peekToken();
-            if (next.tag != .semicolon) break;
-            // Only absorb the following statement into the binding's command
-            // sequence when it actually begins a command/expression. A statement
-            // keyword (`yield`, `exit`), a block/group terminator (`}`, `)`,
-            // `]`), an empty statement, a following newline, or end of input is a
-            // *separate* statement — the `;` is a plain separator there (like a
-            // newline), not a sequence operator. Without this, e.g.
-            // `const n = "9" | parseInt; yield n` fails to parse (the absorb tried
-            // to read a value after `;` and hit `yield`).
-            const after = try self.peekSlice(2);
-            if (after.len < 2) break;
-            switch (after[1].tag) {
-                .r_brace, .r_paren, .r_bracket, .eof, .semicolon, .newline, .kw_yield, .kw_exit => break,
-                else => {},
-            }
-            switch (initializer.*) {
-                // A bare zero-arg identifier call (`const z = y`) is a value
-                // reference, not a multi-part command — don't absorb the next
-                // statement; let `;` separate it (e.g. `const z = y; echo "hi"`).
-                .call => |call| if (call.arguments.len == 0 and call.callee.* == .identifier) break,
-                // Only command-producing binaries sequence; value ops
-                // (arithmetic, comparison, …) don't (`const x = 1 + 2; echo` must
-                // run the echo).
-                .binary => |binary| switch (binary.op) {
-                    .apply, .pipe, .logical_and, .logical_or, .sequence, .append_redirect, .redirect_fd, .fd_source_truncate_redirect, .fd_source_append_redirect => {},
-                    else => break,
-                },
-                .pipeline, .block, .subshell => {},
-                else => break,
-            }
-            _ = try self.nextToken(); // consume `;`
-            const right = try self.parseExpression();
-            const seq_expr = try self.arena.allocator().create(ast.Expression);
-            seq_expr.* = .{ .binary = .{
-                .left = initializer,
-                .right = right,
-                .op = .sequence,
-                .span = initializer.span().endAt(right.span()),
-            } };
-            initializer = seq_expr;
-        }
+        // A `;` after the initializer is a plain statement separator (like a
+        // newline) — it is consumed by the statement loop, not the binding. The
+        // initializer is exactly the expression on the right of `=`. A command
+        // *sequence* to capture is written explicitly with `&&`/`||` (single
+        // expressions, parsed above) or a `$( … )` subshell — a bare `;` never
+        // folds the next statement into the binding. (This previously "absorbed"
+        // `const b = cmd1; cmd2` into one captured sequence, which surprised the
+        // common `const r = cmd; echo "${r}"` — `r` was pulled out of scope.)
 
         return ast.BindingDecl{
             .is_pub = pub_token != null,

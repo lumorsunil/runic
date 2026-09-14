@@ -40,6 +40,14 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Changed
 
+- **`;` after a binding is always a plain statement separator.** A binding whose
+  initializer was a command/pipeline used to "absorb" a following `;`-separated
+  statement into the bound value as a command sequence (`const b = cmd1; cmd2`
+  captured both). That special-cased `;` — the one place it was not equivalent to
+  a newline — and surprised the common `const r = cmd; echo "${r}"` by pulling
+  `r` out of scope. Now `;` never folds the next statement into a binding: the
+  initializer is exactly the expression right of `=`. Command *sequences* are
+  still captured via `&&`/`||` (single expressions) or a `$( … )` subshell.
 - **Clearer `for`-loop capture-count diagnostic.** A `for` loop with a capture
   count that doesn't match its sources (e.g. `for (items) |v, i|`) now reports a
   located error that points at the index idiom — `for (items, 0..) |item, i|` —

@@ -11,20 +11,24 @@ const x = "hello"; echo "${x}"
 // Parenthesized command sequence
 (echo "hello"; echo "cat")
 
-// A value-producing binding initializer (a bare identifier reference, or an
-// arithmetic expression) does NOT absorb the following `;` statement — only
-// command-producing initializers sequence.
+// A `;` after ANY binding is a plain statement separator — the initializer is
+// exactly the expression to the right of `=`, and the following statement is its
+// own. This holds for value bindings…
 const v = 5
 const w = v; echo "w=${w}"
 const s = 1 + 2; echo "s=${s}"
 
-// A command-producing binding initializer followed by `;` and a statement that
-// cannot begin a command sequence — a `yield`, a closing `}`, or a statement
-// referencing the just-bound value — ends the binding: the `;` is a plain
-// separator there, not a sequence operator. (Previously `const n = pipe; yield`
-// failed to parse, and `const n = pipe; echo "${n}"` bound `n` to the sequence.)
+// …and for command-producing bindings: the next statement is NOT folded into the
+// binding's value, so it can reference the just-bound variable. (A binding
+// followed by `;` then a `yield`, a closing `}`, or a use of the binding all just
+// work.)
+const parsed = echo "42" | parseInt catch 0; echo "parsed=${parsed}"
+const proc = printf "cap\n"; echo "proc=[${proc.stdout}]"
 fn Void pick() Int { const n = echo "7" | parseInt catch 0; yield n }
 echo "pick=${pick}"
 fn Void last() Void { const z = echo "5" | parseInt catch 0; }
 last
-const parsed = echo "42" | parseInt catch 0; echo "parsed=${parsed}"
+
+// To capture a command *sequence*, use `&&`/`||` (one expression) or a subshell.
+const chained = printf "x" && printf "y"; echo "chained=[${chained.stdout}]"
+const sub = $(echo "a"; echo "b"); echo "sub=[${sub}]"
