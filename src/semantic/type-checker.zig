@@ -2060,8 +2060,38 @@ pub const TypeChecker = struct {
             .type_capture => {},
             // A `Box(args…)` application is validated where it resolves.
             .type_application => {},
-            .struct_type, .module, .tuple, .function, .fn_ref_type => {},
+            .struct_type => |st| self.runStructType(scope, st),
+            .module, .tuple, .function, .fn_ref_type => {},
         };
+    }
+
+    /// Validates a struct type: resolves each field's type and reports duplicate
+    /// field names (mirrors runErrorSet for error sets). Struct types were
+    /// previously not validated at all, so `struct { x: Int, x: Int }` was
+    /// silently accepted.
+    fn runStructType(
+        self: *TypeChecker,
+        scope: *Scope,
+        struct_type: ast.TypeExpr.StructType,
+    ) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+
+        for (struct_type.fields, 0..) |field, i| {
+            try self.runTypeExpression(scope, field.type_expr);
+
+            for (struct_type.fields[0..i]) |prev| {
+                if (std.mem.eql(u8, prev.name.name, field.name.name)) {
+                    try self.reportSpanError(
+                        field.name.span,
+                        Error.TypeMismatch,
+                        .@"error",
+                        "duplicate field '{s}' in struct type",
+                        .{field.name.name},
+                    );
+                    break;
+                }
+            }
+        }
     }
 
     /// Validates an error set declaration: resolves each variant's payload type

@@ -30,6 +30,11 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Fixed
 
+- **Duplicate struct field names are rejected.** A struct type declaration with
+  a repeated field (`struct { x: Int, x: Int }`) was silently accepted — struct
+  types weren't validated at all. They now are: a duplicate field name is a
+  located error, and each field's type is validated. (An inline struct type in a
+  parameter position is still unchecked here.)
 - **An un-annotated function parameter reports a clean diagnostic.** A parameter
   with no type annotation (`fn Void f(x) Void`) aborted the entire type-check
   run with an uncaught `error.TypeNotFound` ("Type checker failed to run"). It
