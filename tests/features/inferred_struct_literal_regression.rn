@@ -52,3 +52,29 @@ span .{ .x = 1, .y = 0 } .{ .x = 9, .y = 0 }
 // infers from parameter 1.
 fn Void warpTo(self: Entity, target: Vector) Void { echo "warp=${target.x},${target.y}" }
 hero.warpTo(.{ .x = 7, .y = 2 })
+
+// --- Inference from a function's declared return type (`yield`) ---
+
+fn Void origin() Vector { yield .{ .x = 0, .y = 0 } }
+const o = origin
+echo "ret=${o.x},${o.y}"
+
+// --- Inference from a struct field's type in a construction ---
+
+const Line = struct { from: Vector, to: Vector }
+const line = Line{ .from = .{ .x = 1, .y = 2 }, .to = .{ .x = 3, .y = 4 } }
+echo "line=${line.from.x},${line.to.y}"
+
+// --- Inference from an array element type (nested literals) ---
+
+const path: []Vector = .{ .{ .x = 5, .y = 6 }, .{ .x = 7, .y = 8 } }
+echo "path=${path[0].x},${path[1].y}"
+
+// Combined: an array of structs inside a field, and returned from a function.
+const Poly = struct { points: []Vector }
+const poly = Poly{ .points = .{ .{ .x = 9, .y = 9 } } }
+echo "poly=${poly.points[0].y}"
+
+fn Void twoPoints() []Vector { yield .{ .{ .x = 2, .y = 2 }, .{ .x = 4, .y = 4 } } }
+const tp = twoPoints
+echo "yieldarr=${tp[0].x},${tp[1].y}"

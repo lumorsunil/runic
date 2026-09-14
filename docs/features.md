@@ -1158,18 +1158,25 @@ compile error.
 
 **Inferred literals.** When the type is already known from context the name can
 be dropped and written `.{ .field = value }`, mirroring the array-literal syntax.
-The type is taken from the context — a binding's annotation, or a call argument's
-parameter type:
+The type is taken from the context:
 
 ```rn
+# a binding's annotation
 const p: Point = .{ .x = 3, .y = 4 }
-var q: Point = .{ .x = 0, .y = 0 }
 
+# a call argument's parameter type (including UFCS, where the receiver is param 0)
 fn Void moveTo(target: Point) Void { echo "${target.x},${target.y}" }
-moveTo .{ .x = 5, .y = 6 }          # infers Point from the parameter
+moveTo .{ .x = 5, .y = 6 }
 
-const p2 = Point{ .x = 1, .y = 1 }
-p2.dist(.{ .x = 4, .y = 5 })        # UFCS: infers from the method's 2nd parameter
+# a function's declared return type
+fn Void origin() Point { yield .{ .x = 0, .y = 0 } }
+
+# a struct field's type in a construction
+const Line = struct { from: Point, to: Point }
+const l = Line{ .from = .{ .x = 0, .y = 0 }, .to = .{ .x = 3, .y = 4 } }
+
+# an array element type (nested literals infer too)
+const path: []Point = .{ .{ .x = 1, .y = 1 }, .{ .x = 2, .y = 2 } }
 ```
 
 An anonymous struct literal with nothing to infer from is a compile error asking

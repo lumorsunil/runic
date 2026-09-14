@@ -7,3 +7,8 @@ empty=0
 moved hero to 3,5
 span=1..9
 warp=7,2
+ret=0,0
+line=1,4
+path=5,8
+poly=9
+yieldarr=2,4

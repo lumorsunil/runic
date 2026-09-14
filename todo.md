@@ -129,9 +129,9 @@
       taken from context; anonymous literal with no context errors
   - [x] infer from a call argument's parameter type (`moveEntity e .{ … }`,
         including UFCS method calls where the receiver fills parameter 0)
-  - [ ] infer from other contexts too: a function's declared return type
-        (`yield .{ … }`), a struct field's type in a construction, an array
-        element type
+  - [x] infer from a function's declared return type (`yield .{ … }`)
+  - [x] infer from a struct field's type in a construction (`Line{ .from = .{ … } }`)
+  - [x] infer from an array element type (`const p: []Vector = .{ .{ … } }`), nesting
 - [x] tuple/record destructuring bindings (`const a, b = …`, `const { x, y } = …`,
       nested, heterogeneous array-literal tuples)
   - [ ] heterogeneous destructuring from a *non-literal* source (a `var` holding

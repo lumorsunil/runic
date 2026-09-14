@@ -658,6 +658,15 @@ pub const TypeChecker = struct {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, yield_stmt.span);
 
+        // Inferred struct literal returned by value: `yield .{ .x = 3 }` takes its
+        // type from the enclosing function's declared stdout (return) type. Only a
+        // yield to stdout (&1) carries that type.
+        if (yield_stmt.fd == 1 and exprMayNeedStructInference(yield_stmt.value) and
+            self.stdout_type_stack.items.len > 0)
+        {
+            self.stampInferredLiteral(yield_stmt.value, self.stdout_type_stack.items[self.stdout_type_stack.items.len - 1]);
+        }
+
         try self.runExpression(scope, yield_stmt.value);
 
         // Only `yield`s to stdout (&1) are constrained by the enclosing
@@ -1093,13 +1102,48 @@ pub const TypeChecker = struct {
             expr.struct_literal.object == null;
     }
 
+    /// Whether an expression contains an anonymous struct literal that a known
+    /// context type could give a name — directly, or as an element of an array
+    /// literal (`.{ .{ .x = 1 }, … }`). Used to skip context resolution when
+    /// there is nothing to infer.
+    fn exprMayNeedStructInference(expr: *const ast.Expression) bool {
+        if (isAnonStructLiteral(expr)) return true;
+        if (expr.* == .array) {
+            for (expr.array.elements) |el| {
+                if (exprMayNeedStructInference(el)) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Give an anonymous struct literal (or the anonymous struct elements of an
+    /// array literal) the name of its expected type, taken from `context`. An
+    /// array literal against an array context type stamps each element from the
+    /// element type, so nested `[]Vector = .{ .{ … }, … }` works. A no-op unless
+    /// the expression and context line up.
+    fn stampInferredLiteral(
+        self: *TypeChecker,
+        expr: *ast.Expression,
+        context: ?*const ast.TypeExpr,
+    ) void {
+        const ctx = context orelse return;
+        if (isAnonStructLiteral(expr)) {
+            if (self.structTypeNameToStamp(ctx)) |named| expr.struct_literal.name = named;
+            return;
+        }
+        if (expr.* == .array and self.unaliasType(ctx).* == .array) {
+            const element_type = self.unaliasType(ctx).array.element;
+            for (expr.array.elements) |el| self.stampInferredLiteral(el, element_type);
+        }
+    }
+
     /// Stamp each anonymous struct-literal argument of a call with the struct type
     /// name of its matching parameter, so `f a .{ .x = 1 }` infers the literal's
     /// type from the callee's signature (mirroring the binding-annotation case).
     fn stampInferredStructArgs(self: *TypeChecker, scope: *Scope, call: *ast.CallExpr) Error!void {
         var any = false;
         for (call.arguments) |arg| {
-            if (isAnonStructLiteral(arg)) {
+            if (exprMayNeedStructInference(arg)) {
                 any = true;
                 break;
             }
@@ -1109,7 +1153,7 @@ pub const TypeChecker = struct {
         const callee = (try self.calleeFunctionForInference(scope, call.callee)) orelse return;
 
         for (call.arguments, 0..) |arg, i| {
-            if (!isAnonStructLiteral(arg)) continue;
+            if (!exprMayNeedStructInference(arg)) continue;
             // A UFCS receiver fills parameter 0, so the written arguments start at
             // `offset` (0 for a plain call, 1 for `recv.method args`).
             const param_index = i + callee.offset;
@@ -1117,9 +1161,7 @@ pub const TypeChecker = struct {
                 ._non_variadic => |list| if (param_index < list.len) list[param_index] else null,
                 ._variadic => |element| element,
             };
-            if (self.structTypeNameToStamp(param_type)) |named| {
-                arg.struct_literal.name = named;
-            }
+            self.stampInferredLiteral(arg, param_type);
         }
     }
 
@@ -1180,10 +1222,8 @@ pub const TypeChecker = struct {
         // anonymous struct literal (empty name); take its type from the binding's
         // annotation by stamping the annotation's type name onto the literal, so
         // every downstream stage treats it exactly like `Vector{ .x = 3 }`.
-        if (isAnonStructLiteral(binding_decl.initializer)) {
-            if (self.structTypeNameToStamp(binding_decl.annotation)) |named| {
-                binding_decl.initializer.struct_literal.name = named;
-            }
+        if (binding_decl.annotation != null and exprMayNeedStructInference(binding_decl.initializer)) {
+            self.stampInferredLiteral(binding_decl.initializer, binding_decl.annotation);
         }
 
         try self.runExpression(scope, binding_decl.initializer);
@@ -4070,9 +4110,58 @@ pub const TypeChecker = struct {
         for (array.elements) |expr| try self.runExpression(scope, expr);
     }
 
+    /// The struct type a *named* struct literal constructs (a plain binding, a
+    /// generic constructor, or a module-qualified type), read-only, for inferring
+    /// nested field-value literal types. Returns null when it can't be resolved to
+    /// a plain struct type (an anonymous literal, an error set, unknown name, …).
+    fn structTypeOfNamedLiteral(
+        self: *TypeChecker,
+        scope: *Scope,
+        struct_literal: *ast.StructLiteral,
+    ) Error!?ast.TypeExpr.StructType {
+        if (struct_literal.name.name.len == 0) return null;
+
+        if (struct_literal.object) |object| {
+            const obj_raw = (try self.resolveExprType(scope, object)) orelse return null;
+            const object_type = self.unaliasType(obj_raw);
+            if (object_type.* != .module) return null;
+            const module_scope = (try self.requestModuleScope(object_type.module)) orelse return null;
+            const member = module_scope.lookup(struct_literal.name.name) orelse return null;
+            const member_type = member.type_expr orelse return null;
+            const st = self.unaliasType(try self.resolveModuleMemberFields(module_scope, member_type));
+            return if (st.* == .struct_type) st.struct_type else null;
+        }
+
+        if (self.generic_type_ctors.get(struct_literal.name.name)) |ctor| {
+            const resolved = self.unaliasType(try self.resolveGenericCtorBody(scope, ctor));
+            return if (resolved.* == .struct_type) resolved.struct_type else null;
+        }
+
+        const binding = scope.lookup(struct_literal.name.name) orelse return null;
+        const type_expr = self.unaliasType(binding.type_expr orelse return null);
+        return if (type_expr.* == .struct_type) type_expr.struct_type else null;
+    }
+
     pub fn runStructLiteral(self: *TypeChecker, scope: *Scope, struct_literal: *ast.StructLiteral) Error!void {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, struct_literal.span);
+
+        // Inferred nested literals: `Outer{ .inner = .{ .x = 1 } }` takes each
+        // anonymous field value's type from that field's declared type, so the
+        // inner struct name need not be repeated. Stamp before the fields are
+        // checked, so each validates like the named form.
+        for (struct_literal.fields) |field| {
+            if (exprMayNeedStructInference(field.value)) {
+                if (try self.structTypeOfNamedLiteral(scope, struct_literal)) |st| {
+                    for (struct_literal.fields) |f| {
+                        if (exprMayNeedStructInference(f.value)) {
+                            self.stampInferredLiteral(f.value, st.memberType(f.name.name));
+                        }
+                    }
+                }
+                break;
+            }
+        }
 
         for (struct_literal.fields) |field| try self.runExpression(scope, field.value);
 
