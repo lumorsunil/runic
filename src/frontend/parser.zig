@@ -1253,7 +1253,11 @@ pub const Parser = struct {
                         },
                         else => {
                             if (next.tag == .range) break;
-                            if (isExprTerminator(next.tag)) break;
+                            // `.{ … }` (an array literal) is unambiguously a value,
+                            // so a following one is a function/command argument
+                            // (`f .{ 1, 2 }`), not a terminator — unlike `{` (a
+                            // block body). Fall through to apply it.
+                            if (next.tag != .dot_l_brace and isExprTerminator(next.tag)) break;
 
                             try components.append(self.allocator, .{
                                 .op = token.Spanned(ast.BinaryOp){

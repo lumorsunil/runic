@@ -70,6 +70,12 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Fixed
 
+- **An array literal as a function/command argument.** `f .{ 1, 2 }` now passes
+  the array literal as an argument — previously a bare `.{` ended argument
+  parsing, so it was misparsed as a nullary call `f` plus a separate dangling
+  array (and failed outright inside string interpolation). Only the parenthesized
+  form `f (.{ 1, 2 })` worked before. This also fixes calling stdlib
+  higher-order helpers with a literal, e.g. `std.list.map .{ 1, 2, 3 } dbl`.
 - **Member access, indexing, and slicing on a call result.** Reading a field
   (`(f x).field`, `recv.method.field`, a chain like `v.inc.inc.x`), indexing
   (`(mk)[1]`), or slicing (`(mk)[1..3]`) directly off a call result failed with
