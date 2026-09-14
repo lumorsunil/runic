@@ -9754,7 +9754,13 @@ pub const IRCompiler = struct {
                 };
             },
             else => {
-                const source_result = try self.compileExpression(for_source);
+                // Iterating a call result (`for (mk)` where `mk` yields an array)
+                // needs the array value, so value-capture a source that would
+                // otherwise fork into a thread/exec-result handle.
+                const source_result = if (self.memberObjectForks(for_source))
+                    try self.compileExpressionWithCapture(source, for_source)
+                else
+                    try self.compileExpression(for_source);
 
                 if (source_result.source != .location or source_result.source.location.options.type_expr != .array) {
                     try self.reportSourceError(source, Error.NotImplemented, .@"error", "for loops with source type \"{t}\" not yet implemented", .{for_source.*});

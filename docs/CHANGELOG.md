@@ -51,6 +51,11 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   in each case, so it sees the produced value instead of a thread handle. Plain
   struct-field chains (`b.a.n`), string builtins (`s.trim.upper`), and array/
   string variables are unaffected. Binding first already worked.
+- **Iterating a call result.** `for (mk)` (a function returning an array) or
+  `for (v.items)` (a UFCS method call) now iterates the produced array instead of
+  erroring "for loops with source type 'call' not yet implemented" — the source
+  is value-captured like other call-result positions. Binding first already
+  worked.
 - **A non-boolean `if`/`while` condition no longer crashes.** A condition that
   resolves to `void` — e.g. `if ((f) > 3)`, where the `>` binds as an output
   redirect of the command `(f)` rather than a comparison — panicked on a union

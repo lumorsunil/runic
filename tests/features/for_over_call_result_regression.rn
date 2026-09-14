@@ -1,0 +1,23 @@
+// A `for` loop can iterate directly over a call result — a function returning an
+// array (`for (mk)`), or a UFCS method call (`for (v.items)`) — by value-capturing
+// the source instead of forking it. Previously this errored with "for loops with
+// source type 'call' not yet implemented"; binding first already worked.
+fn Void @() Void
+
+fn Void mk() []Int { yield .{ 1, 2, 3 } }
+for (mk) |v| echo "call=${v}"
+
+// With an index source.
+for (mk, 0..) |v, i| echo "idx=${i}:${v}"
+
+// A UFCS method call as the source.
+const V = struct { xs: []Int }
+fn Void items(self: V) []Int { yield self.xs }
+const v = V{ .xs = .{ 7, 8, 9 } }
+for (v.items) |x| echo "ufcs=${x}"
+
+// break/continue work in a call-sourced loop too.
+for (mk) |n| {
+  if (n == 3) break
+  echo "brk=${n}"
+}
