@@ -1,0 +1,8 @@
+# A function parameter must carry a type annotation. An un-annotated parameter
+# now produces a clean, located diagnostic naming the parameter (one per bad
+# param), instead of aborting the whole type-check run with an uncaught
+# error.TypeNotFound ("Type checker failed to run").
+fn Void greet(name) Void {
+  echo "hello ${name}"
+}
+greet "world"

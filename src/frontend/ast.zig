@@ -2006,7 +2006,11 @@ pub const Parameter = struct {
             allocator,
             scope,
         );
-        return semantic.Scope.Error.TypeNotFound;
+        // An un-annotated parameter with no default has no inferable type.
+        // Return null (untyped) rather than error.TypeNotFound so the type
+        // checker can report a clean, located diagnostic and keep going, instead
+        // of the whole run aborting with an uncaught error.
+        return null;
     }
 };
 

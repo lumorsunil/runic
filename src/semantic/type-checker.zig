@@ -1536,6 +1536,31 @@ pub const TypeChecker = struct {
         try scope.declare(self.arena.allocator(), identifier, resolved_fn_type, fn_decl.is_pub, false);
     }
 
+    /// A function parameter must carry a type annotation (or a default value it
+    /// can be inferred from). Report a clean, located diagnostic when it does
+    /// not — `Parameter.resolveType` returns null for such a param rather than
+    /// aborting the whole checker run.
+    fn checkParamAnnotated(self: *TypeChecker, param: *const ast.Parameter) Error!void {
+        if (param.type_annotation != null or param.default_value != null) return;
+        if (param.pattern.* == .identifier) {
+            try self.reportSpanError(
+                param.span,
+                Error.TypeNotFound,
+                .@"error",
+                "parameter '{s}' requires a type annotation (e.g. `{s}: Int`)",
+                .{ param.pattern.identifier.name, param.pattern.identifier.name },
+            );
+        } else {
+            try self.reportSpanError(
+                param.span,
+                Error.TypeNotFound,
+                .@"error",
+                "function parameter requires a type annotation (e.g. `name: Int`)",
+                .{},
+            );
+        }
+    }
+
     fn runFnDecl(self: *TypeChecker, scope: *Scope, fn_decl: *ast.FunctionDecl) Error!void {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, fn_decl.span);
@@ -1575,6 +1600,7 @@ pub const TypeChecker = struct {
 
         switch (fn_decl.params) {
             ._non_variadic => |params| for (params) |param| {
+                try self.checkParamAnnotated(param);
                 // Resolve the param's declared type (like the stdin/fn types
                 // above), so a primitive annotation such as `Int` — parsed as a
                 // bare identifier — becomes the resolved primitive rather than an
@@ -1592,6 +1618,7 @@ pub const TypeChecker = struct {
                 );
             },
             ._variadic => |param| {
+                try self.checkParamAnnotated(param);
                 const raw = try self.resolveExprType(fn_scope, param);
                 const param_type = if (raw) |t| try self.resolveTypeExpr(fn_scope, t) else null;
                 try self.runBindingPattern(

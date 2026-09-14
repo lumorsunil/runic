@@ -30,6 +30,11 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Fixed
 
+- **An un-annotated function parameter reports a clean diagnostic.** A parameter
+  with no type annotation (`fn Void f(x) Void`) aborted the entire type-check
+  run with an uncaught `error.TypeNotFound` ("Type checker failed to run"). It
+  now produces a located diagnostic naming the parameter — one per bad param —
+  and checking continues, so other errors are still reported.
 - **A negative array index no longer crashes the interpreter.** Reading an
   index computed to a negative value (e.g. `a[0 - 1]`) panicked with "integer
   does not fit in destination type" (a `@intCast` of the negative pointer offset
