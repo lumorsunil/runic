@@ -3537,6 +3537,26 @@ pub const IRCompiler = struct {
     /// `[base + offset]` slot, written to immediately by the caller).
     const MemberMode = enum { read, lvalue };
 
+    /// Whether compiling `obj` as a member-access receiver would fork it — a
+    /// call, pipeline, or block, or a nullary UFCS method call (`recv.method`
+    /// where `method` names a function, not a struct field). Such a receiver
+    /// must be value-captured so the field read sees the produced value, not the
+    /// thread/exec-result handle a plain compile would hand back.
+    fn memberObjectForks(self: *IRCompiler, obj: *ast.Expression) bool {
+        if (self.argNeedsValueCapture(obj)) return true;
+        const m: struct { base: *ast.Expression, name: []const u8 } = switch (obj.*) {
+            .member => |mm| .{ .base = mm.object, .name = mm.member.name },
+            .binary => |b| if (b.op == .member and b.right.* == .identifier)
+                .{ .base = b.left, .name = b.right.identifier.name }
+            else
+                return false,
+            else => return false,
+        };
+        if (self.memberIsStructField(m.base, m.name)) return false;
+        const binding = self.lookup(m.name, .{ .shallow = false }) orelse return false;
+        return binding.result.isFunctionRef();
+    }
+
     fn compileMember(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -3566,7 +3586,16 @@ pub const IRCompiler = struct {
             }
         }
 
-        const object = try self.compileExpression(member.object);
+        // A member access on a call/pipeline result (`(dbl v).x`, `v.method.x`
+        // where `method` is a function) must value-capture the object — a plain
+        // compile forks it and hands back a thread/exec-result handle instead of
+        // the produced struct, so the field read below fails. A plain value
+        // object (an identifier, a struct-field chain, a string builtin like
+        // `s.trim`) is unaffected.
+        const object = if (self.memberObjectForks(member.object))
+            try self.compileExpressionWithCapture(source, member.object)
+        else
+            try self.compileExpression(member.object);
 
         // String builtins with no arguments (`s.len`, `s.upper`, `s.trim`, …).
         // `len` also names an array's length, so it only applies to a string

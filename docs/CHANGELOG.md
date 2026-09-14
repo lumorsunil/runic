@@ -43,6 +43,13 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Fixed
 
+- **Field access on a call result.** Reading a field directly off a call —
+  `(f x).field`, a UFCS method call `recv.method.field`, or a chain like
+  `v.inc.inc.x` — failed with "member access is only supported for struct types
+  in IR". The receiver is now value-captured (not forked), so the field read sees
+  the produced struct instead of a thread handle. Plain struct-field chains
+  (`b.a.n`) and string builtins (`s.trim.upper`) are unaffected. Binding first
+  (`const r = f x; r.field`) already worked.
 - **Duplicate struct field names are rejected.** A struct type declaration with
   a repeated field (`struct { x: Int, x: Int }`) was silently accepted — struct
   types weren't validated at all. They now are: a duplicate field name is a
