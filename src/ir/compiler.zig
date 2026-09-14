@@ -9504,10 +9504,43 @@ pub const IRCompiler = struct {
                 // `x[a..b]` — a range-valued index is a slice, not an element read.
                 if (binary.right.* == .range) return self.compileSlice(source, binary);
 
-                const array_access_ref = try self.newRef(source, "array_access_ref");
-
                 const left = try self.compileExpression(binary.left);
-                const left_type = left.typeExpr() orelse return Error.UnsupportedBinaryOperation;
+                const maybe_left_type = left.typeExpr();
+
+                // `s[i]` on a string is a single-character read, lowered to a
+                // one-char slice `s[i .. i+1]` (reusing the string slice op). A
+                // bare string literal carries no ast type, so an unknown type is
+                // treated as a string — arrays are always typed. Out-of-range and
+                // negative indices clamp like a slice (empty string), never crash.
+                if (if (maybe_left_type) |t| self.typeIsString(t) else true) {
+                    const str_ref = try self.newRef(source, "strindex_str");
+                    try self.set(source, str_ref, stableResultSource(left));
+                    const idx = try self.compileArithmeticOperand(source, binary.right);
+                    const idx_ref = try self.newRef(source, "strindex_i");
+                    try self.set(source, idx_ref, stableResultSource(idx));
+                    // end = i + 1
+                    try self.set(source, .initRegister(.r2), .from(idx_ref.dereference()));
+                    try self.addInstruction(.init(.from(source), .{ .ath = .{
+                        .op = .add,
+                        .a = .fromLocation(.initRegister(.r2)),
+                        .b = .fromValue(.{ .integer = 1 }),
+                        .result = .initRegister(.r2),
+                    } }));
+                    const end_ref = try self.newRef(source, "strindex_end");
+                    try self.set(source, end_ref, .fromLocation(.initRegister(.r2)));
+                    const result_ref = try self.newRef(source, "strindex_result");
+                    try self.addInstruction(.init(.from(source), .{ .str_op = .{
+                        .op = .slice,
+                        .operand = .from(str_ref.dereference()),
+                        .arg0 = .from(idx_ref.dereference()),
+                        .arg1 = .from(end_ref.dereference()),
+                        .result = result_ref.dereference(),
+                    } }));
+                    return .fromLocation(result_ref.dereference().typed(string_type));
+                }
+
+                const array_access_ref = try self.newRef(source, "array_access_ref");
+                const left_type = maybe_left_type orelse return Error.UnsupportedBinaryOperation;
                 if (left_type != .array) return Error.UnsupportedBinaryOperation;
                 const element_type = left_type.array.element.*;
                 const left_ref = try self.newRef(source, "array_access_left_ref");

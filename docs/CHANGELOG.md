@@ -14,6 +14,11 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Added
 
+- **String indexing `s[i]`.** A string can be indexed by a single position,
+  yielding a one-character `String` (lowered to a one-char slice `s[i .. i+1]`),
+  complementing string slicing. Out-of-range and negative indices clamp to the
+  empty string like a slice. Previously `s[i]` failed with a bare
+  `UnsupportedBinaryOperation`.
 - **`c.Str` return values.** A `cimport` extern declared to return `c.Str` (a C
   `char*`) now yields a Runic `String` — the borrowed C string is copied into
   Runic-owned memory, so it composes like any string (`.len`, interpolation,

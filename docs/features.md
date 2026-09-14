@@ -76,7 +76,9 @@ const word = "hello world"[0..5]   // "hello"
 **Result:** `x[a..b]` copies the elements/bytes in `[a, b)`; `x[a..]` runs to the
 end and `x[..b]` from the start (`x[..]` is a full copy). Bounds are clamped to
 `[0, len]`, so an out-of-range or inverted range yields an empty result rather
-than an error. Plain indexing `x[i]` is unchanged.
+than an error. Plain indexing `x[i]` reads a single element: an array element,
+or — for a string — the one-character `String` at position `i` (equivalent to
+`s[i .. i+1]`, so an out-of-range or negative `i` clamps to the empty string).
 
 ### Compound assignment
 
