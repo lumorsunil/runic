@@ -1,0 +1,8 @@
+[error]: tests/diagnostics/for_index_capture_hint.rn:5:23: a `for` loop needs one capture per source (1 source(s), 2 capture(s)). To iterate with an index, add a `0..` range source: `for (items, 0..) |item, i|`.
+   3:# points at the `for (items, 0..) |item, i|` index idiom instead of emitting a
+   4:# bare error enum.
+   5:for (.{ 10, 20, 30 }) [41m[30m|v, i|[0m {
+   6:  echo "${i}:${v}"
+   7:}
+   8:
+

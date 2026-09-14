@@ -2059,7 +2059,21 @@ pub const Parser = struct {
         _ = try self.expect(.r_paren);
         const capture = try self.parseCaptureClause();
 
-        if (capture.bindings.len != sources.len) return Error.ForCapturesMustMatchSources;
+        if (capture.bindings.len != sources.len) {
+            // One capture per source (parallel iteration). The common mistake is
+            // wanting a value + index from a single source — point at the `0..`
+            // idiom rather than emitting the bare error enum.
+            try self.reportParseError(
+                Error.ForCapturesMustMatchSources,
+                capture.span,
+                "a `for` loop needs one capture per source ({d} source(s), {d} capture(s)). To iterate with an index, add a `0..` range source: `for (items, 0..) |item, i|`.",
+                .{ sources.len, capture.bindings.len },
+            );
+            // Consume the loop body so the trailing `}` doesn't trigger a second,
+            // cascading "expected value" error during top-level recovery.
+            _ = self.parseControlFlowBody() catch {};
+            return Error.ForCapturesMustMatchSources;
+        }
 
         const body = try self.parseControlFlowBody();
 

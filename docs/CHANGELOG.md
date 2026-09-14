@@ -20,6 +20,14 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   builtins). A NULL return (e.g. `getenv` of an unset variable) becomes the
   empty string. This closes the last scalar-marshalling gap of the C FFI MVP.
 
+### Changed
+
+- **Clearer `for`-loop capture-count diagnostic.** A `for` loop with a capture
+  count that doesn't match its sources (e.g. `for (items) |v, i|`) now reports a
+  located error that points at the index idiom — `for (items, 0..) |item, i|` —
+  instead of surfacing the bare `ForCapturesMustMatchSources` enum, and no longer
+  emits a cascading second error for the loop body.
+
 ### Fixed
 
 - **A negative array index no longer crashes the interpreter.** Reading an

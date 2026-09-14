@@ -1,0 +1,7 @@
+# A `for` loop takes one capture per source (parallel iteration). Two captures
+# with a single source is the common "value + index" mistake; the diagnostic
+# points at the `for (items, 0..) |item, i|` index idiom instead of emitting a
+# bare error enum.
+for (.{ 10, 20, 30 }) |v, i| {
+  echo "${i}:${v}"
+}
