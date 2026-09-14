@@ -2492,7 +2492,17 @@ pub const IREvaluator = struct {
                     const float_right: f64 = @floatFromInt(right.value.integer);
                     return .{ .float = left.value.float + float_right };
                 } else if (left.isValueTag(.addr) and right.isValueTag(.integer)) {
-                    return .{ .addr = left.value.addr +| @as(usize, @intCast(right.value.integer)) };
+                    // A negative offset (e.g. a negative array index, `a[0 - 1]`)
+                    // must not `@intCast` to usize — that panics. Subtract its
+                    // magnitude with saturation instead, so an out-of-range index
+                    // degrades to a bad address (caught later as a failed
+                    // dereference) rather than crashing the interpreter, matching
+                    // how a positive out-of-bounds index already behaves.
+                    const off = right.value.integer;
+                    return .{ .addr = if (off >= 0)
+                        left.value.addr +| @as(usize, @intCast(off))
+                    else
+                        left.value.addr -| @as(usize, @abs(off)) };
                 }
             },
             .sub => {

@@ -22,6 +22,13 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Fixed
 
+- **A negative array index no longer crashes the interpreter.** Reading an
+  index computed to a negative value (e.g. `a[0 - 1]`) panicked with "integer
+  does not fit in destination type" (a `@intCast` of the negative pointer offset
+  to `usize`). The offset arithmetic is now signed-aware and saturating, so a
+  negative or otherwise out-of-range index degrades gracefully — an unspecified
+  value or a caught failed dereference — the same as a positive out-of-bounds
+  read. (Indexing is still not bounds-checked; that remains future work.)
 - **`;` after a command-producing binding.** A binding whose initializer is a
   command/pipeline (`const n = echo "9" | parseInt`) no longer swallows a
   following statement that cannot be part of a command sequence — a `yield` or
