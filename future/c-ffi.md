@@ -442,13 +442,15 @@ block loads a C library via `std.DynLib`, resolves each `extern fn`, and a
 member call (`m.pow 2.0 10.0`) marshals through a statically-linked `libffi`
 and returns the value, in both bound and interpolated positions. Landed on the
 `cffi` branch across phases 0a/0b/1 below; scalar args/returns (int widths,
-float/double, bool, pointer) and `c.Str` *arguments* are supported. The
+float/double, bool, pointer) and `c.Str` arguments **and returns** are supported
+(a returned `char*` is copied into a Runic `String`; NULL → empty string). The
 `runic cbind` generator (phase 3) is also implemented — it emits a `cimport`
 block plus the header's enum values / `#define` constants from a C header via
 `zig translate-c`. **By-value struct arguments and returns (phase 4) have since
 landed** — including nested and module-qualified struct types, and a Runic call
-returning a by-value struct passed straight to an extern. Remaining: `c.Str`
-*returns*, varargs, and the cross-compile vendoring. (The closure-capture fix so
+returning a by-value struct passed straight to an extern. Remaining: varargs,
+`c.Str` *inside a returned struct* (the scalar `c.Str` return is done), and the
+cross-compile vendoring. (The closure-capture fix so
 an extern is callable from inside a function/forked consumer without a local
 re-import has since landed — see *Known limitation* below.)
 

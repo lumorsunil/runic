@@ -1227,9 +1227,15 @@ pub const IREvaluator = struct {
                         .float => .{ .float = @floatCast(ret.ff) },
                         .bool => .{ .exit_code = ExitCode.fromBoolean(ret.i != 0) },
                         .ptr => .{ .addr = @intFromPtr(ret.p) },
-                        // A `c.Str` return (a borrowed `char*`) needs copying into
-                        // a Runic string — deferred; see future/c-ffi.md.
-                        .str => return Error.CImportUnsupportedType,
+                        // A `c.Str` return is a borrowed `char*`: copy it into a
+                        // Runic-owned string (the C memory may be freed/reused by
+                        // the callee). A NULL return (e.g. `getenv` of an unset
+                        // var) becomes the empty string — `c.Str` maps to the
+                        // non-optional `String`.
+                        .str => if (ret.p) |p|
+                            ir.Value{ .zig_string = try self.allocator.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(p)))) }
+                        else
+                            ir.Value{ .zig_string = "" },
                         // Integer widths are widened to `ffi_arg`; read the word.
                         else => .{ .integer = ret.i },
                     },

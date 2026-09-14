@@ -12,6 +12,14 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ## [Unreleased]
 
+### Added
+
+- **`c.Str` return values.** A `cimport` extern declared to return `c.Str` (a C
+  `char*`) now yields a Runic `String` — the borrowed C string is copied into
+  Runic-owned memory, so it composes like any string (`.len`, interpolation,
+  builtins). A NULL return (e.g. `getenv` of an unset variable) becomes the
+  empty string. This closes the last scalar-marshalling gap of the C FFI MVP.
+
 ### Fixed
 
 - **Constructing a struct field from another struct's field.** A struct literal

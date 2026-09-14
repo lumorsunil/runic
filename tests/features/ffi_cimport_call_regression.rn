@@ -16,6 +16,8 @@ const libc = cimport "libc.so.6" {
     extern fn abs(n: c.Int) c.Int
     extern fn strlen(s: c.Str) c.ULong
     extern fn getpid() c.Int
+    extern fn setenv(name: c.Str, value: c.Str, overwrite: c.Int) c.Int
+    extern fn getenv(name: c.Str) c.Str
 }
 echo "abs=${libc.abs (0 - 5)}"
 echo "strlen=${libc.strlen "hello"}"
@@ -41,3 +43,12 @@ echo "abs_call_arg=${libc.abs (neg 7)}"
 fn Void powTwice() Float { for (0..2) |i| yield m.pow 2.0 5.0 }
 powTwice
 echo ""
+
+// A `c.Str` return (a borrowed `char*`) is copied into a Runic String and
+// composes like any string (`.len`, interpolation). Round-tripped through libc
+// setenv/getenv so it is deterministic; a NULL return becomes the empty string.
+const set_rc = libc.setenv "RUNIC_FFI_TEST" "hello" 1
+const got = libc.getenv "RUNIC_FFI_TEST"
+echo "cstr_return=${got} len=${got.len}"
+const unset = libc.getenv "RUNIC_FFI_UNSET_VAR_XYZ"
+echo "cstr_null_len=${unset.len}"
