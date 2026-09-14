@@ -70,6 +70,13 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Fixed
 
+- **An optional struct field stays optional when given a non-null value.**
+  `struct { x: ?Int }` constructed as `P{ .x = 5 }` kept the field optional only
+  when the value was `null`; a bare non-null value re-typed the field to the
+  value's concrete type (`Int`), so `p.x orelse …` failed at compile time ("left
+  side of orelse must be an optional"). A struct-literal field now keeps an
+  optional/promise declared type (the value is coerced into it); generic fields
+  still specialize to their value's type.
 - **An array literal as a function/command argument.** `f .{ 1, 2 }` now passes
   the array literal as an argument — previously a bare `.{` ended argument
   parsing, so it was misparsed as a nullary call `f` plus a separate dangling

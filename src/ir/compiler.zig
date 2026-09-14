@@ -3248,10 +3248,17 @@ pub const IRCompiler = struct {
             const value: Result = blk: {
                 for (struct_literal.fields) |lit_field| {
                     if (std.mem.eql(u8, lit_field.name.name, field.name.name)) {
-                        if (self.argTypeExpr(lit_field.value)) |vt| {
-                            const ft = try self.allocator.create(ast.TypeExpr);
-                            ft.* = vt;
-                            concrete_fields[i].type_expr = ft;
+                        // Specialize the field type to the supplied value's type
+                        // (so a generic `T`/`|T|` field binds) — except an
+                        // optional/promise wrapper, which must stay so e.g.
+                        // `x: ?Int` given `5` keeps `?Int` and `p.x orelse …`
+                        // still sees an optional.
+                        if (structFieldTypeSpecializes(field.type_expr.*)) {
+                            if (self.argTypeExpr(lit_field.value)) |vt| {
+                                const ft = try self.allocator.create(ast.TypeExpr);
+                                ft.* = vt;
+                                concrete_fields[i].type_expr = ft;
+                            }
                         }
                         // A call/pipeline field value (`{ .pos = mk x y }`)
                         // forks a thread; capture it to its produced value first
@@ -5824,6 +5831,19 @@ pub const IRCompiler = struct {
                 if (hasTypeCapture(arg.*)) break true;
             } else false,
             else => false,
+        };
+    }
+
+    /// Whether a struct-literal field's declared type should be specialized to
+    /// its supplied value's concrete type (so a generic `T`/`|T|` field binds to
+    /// the value). An `?T`/`^T` **wrapper** must not be — flattening it to the
+    /// value's type would drop the optional/promise (e.g. `x: ?Int` given `5`
+    /// must stay `?Int`, so `p.x orelse …` still sees an optional). The value is
+    /// coerced into the declared wrapper instead.
+    fn structFieldTypeSpecializes(t: ast.TypeExpr) bool {
+        return switch (t) {
+            .optional, .promise => false,
+            else => true,
         };
     }
 
