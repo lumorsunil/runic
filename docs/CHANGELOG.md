@@ -43,13 +43,20 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Fixed
 
-- **Field access on a call result.** Reading a field directly off a call —
-  `(f x).field`, a UFCS method call `recv.method.field`, or a chain like
-  `v.inc.inc.x` — failed with "member access is only supported for struct types
-  in IR". The receiver is now value-captured (not forked), so the field read sees
-  the produced struct instead of a thread handle. Plain struct-field chains
-  (`b.a.n`) and string builtins (`s.trim.upper`) are unaffected. Binding first
-  (`const r = f x; r.field`) already worked.
+- **Member access, indexing, and slicing on a call result.** Reading a field
+  (`(f x).field`, `recv.method.field`, a chain like `v.inc.inc.x`), indexing
+  (`(mk)[1]`), or slicing (`(mk)[1..3]`) directly off a call result failed with
+  "member access is only supported for struct types in IR" /
+  "UnsupportedBinaryOperation". The receiver is now value-captured (not forked)
+  in each case, so it sees the produced value instead of a thread handle. Plain
+  struct-field chains (`b.a.n`), string builtins (`s.trim.upper`), and array/
+  string variables are unaffected. Binding first already worked.
+- **A non-boolean `if`/`while` condition no longer crashes.** A condition that
+  resolves to `void` — e.g. `if ((f) > 3)`, where the `>` binds as an output
+  redirect of the command `(f)` rather than a comparison — panicked on a union
+  access (`exit_code` while `void` active). A void/non-boolean condition is now
+  treated as false. (To compare a function's result, bind it first:
+  `const r = f; if (r > 3)`.)
 - **Duplicate struct field names are rejected.** A struct type declaration with
   a repeated field (`struct { x: Int, x: Int }`) was silently accepted — struct
   types weren't validated at all. They now are: a duplicate field name is a

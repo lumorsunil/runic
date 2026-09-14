@@ -2013,9 +2013,22 @@ pub const IREvaluator = struct {
                         thread.setInstructionCounter(dest);
                         return .cont_no_instr_counter_inc;
                     }
-                } else if (cond_value.exit_code.toBoolean() == jmp.jump_if) {
-                    thread.setInstructionCounter(dest);
-                    return .cont_no_instr_counter_inc;
+                } else {
+                    // A plain value condition. Normally an `.exit_code` (a Bool),
+                    // but guard the union access: a condition that resolved to a
+                    // non-boolean value — e.g. `void` from `if ((f) > 3)`, where
+                    // the `>` bound as an output redirect of the command `(f)`
+                    // rather than a comparison — must not crash. Such a value is
+                    // treated as false (the branch is not taken).
+                    const cond_bool = switch (cond_value) {
+                        .exit_code => |ec| ec.toBoolean(),
+                        .integer => |i| i != 0,
+                        else => false,
+                    };
+                    if (cond_bool == jmp.jump_if) {
+                        thread.setInstructionCounter(dest);
+                        return .cont_no_instr_counter_inc;
+                    }
                 }
 
                 return .cont;
