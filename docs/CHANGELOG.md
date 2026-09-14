@@ -12,6 +12,16 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Calling a C extern through a captured `cimport` value.** A function that
+  references a top-level `cimport` const and calls its externs now works even
+  when the function forks (a pipeline/loop consumer, a threaded body) — no local
+  re-import of the library is needed. A cimport value is an immutable
+  `.closeable` handle; it is now captured by value instead of by the slot
+  reference used for aliasable structs, which `cimport_call` could not resolve
+  as a library (`CImportLoadFailed`).
+
 ## [0.10.1] - 2026-09-14
 
 ### Fixed

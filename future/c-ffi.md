@@ -406,34 +406,34 @@ emit a stub `cimport` block with every symbol name filled in and `// TODO:`
 types. Not callable as-is, but it saves typing the names and shows the surface
 area when no header is available.
 
-## Known limitation: direct access / wrappers need a closure-capture fix
+## Closure capture of a cimport value — FIXED
 
-A generated binding is used through the raw cimport value —
-`rl.raylib.InitWindow 800 600 "…"` (import → cimport member → extern). Two nicer
-forms are **blocked by the same underlying bug** and are not generated:
+A function body may reference a top-level `cimport` const and call its externs
+directly, even when the function forks (a pipeline/loop consumer, a threaded
+body) — no local re-import of the library is needed. This was previously broken.
+
+The root cause was in closure capture. A cimport value is *typed* as a struct
+(so `m.pow x` dispatches like struct-member access) but its *runtime value* is a
+`.closeable` handle. A closure captured a top-level const **by slot reference** —
+the captured value was the address of the const's slot, not the handle. Struct
+*member access* resolved that extra indirection (so `p.x` on a captured struct
+works), but `cimport_call`'s library resolution did not, so the extern call got a
+bogus library (`CImportLoadFailed` / a bad dereference).
+
+The fix (compiler `compileFunctionCall`, closure-capture emission): a cimport
+value — an immutable, non-aliased `.closeable` handle — is now captured **by
+value** rather than by slot reference (detected via `bindingTypeIsCImport`, i.e.
+a struct type carrying `cimport_externs`). Aliasable structs and scalars keep the
+by-reference capture. Covered by `tests/features/ffi_cimport_call_regression.rn`.
+
+Still open on the `cbind` side (a *separate* concern, no longer blocked by
+capture): emitting the nicer wrapper/alias forms —
 
 - **Aliases** — `pub const InitWindow = raylib.InitWindow` (bare access to a
   multi-arg extern is treated as a nullary call, and there is no first-class
   extern value to bind); and
-- **Wrapper functions** — `pub fn Void InitWindow(…) { raylib.InitWindow … }`.
-
-The root cause is in closure capture, not cbind. A cimport value is *typed* as a
-struct (so `m.pow x` dispatches like struct-member access) but its *runtime
-value* is a `.closeable` handle. When a function body references a top-level
-cimport const, the closure captures it **by slot reference** — the captured
-value is the address of the const's slot, not the handle. Struct *member access*
-resolves that extra indirection (so `p.x` on a captured struct works), but
-`cimport_call`'s library resolution does not, so the extern call gets a bogus
-library (`CImportLoadFailed` / a bad dereference). Verified: `const lib2 = lib`
-(top-level copy) works and captured scalars — even runtime-computed — work; only
-a captured cimport handle breaks. Wrapping the handle in a heap slot did not
-help: the capture still stored the slot reference rather than the value.
-
-Fixing this (capturing a cimport/closeable by value, or making `cimport_call`
-resolve the captured object the way struct member access does) would unblock both
-wrappers and the alias form. It is a contained change but in the closure /
-stack-vs-heap addressing model, so it wants a focused pass rather than a rushed
-one.
+- **Wrapper functions** — `pub fn Void InitWindow(…) { raylib.InitWindow … }`
+  (now runnable when hand-written; `cbind` does not yet generate them).
 
 ## Phased plan
 
@@ -448,10 +448,9 @@ block plus the header's enum values / `#define` constants from a C header via
 `zig translate-c`. **By-value struct arguments and returns (phase 4) have since
 landed** — including nested and module-qualified struct types, and a Runic call
 returning a by-value struct passed straight to an extern. Remaining: `c.Str`
-*returns*, varargs, the cross-compile vendoring, and the closure-capture fix so
+*returns*, varargs, and the cross-compile vendoring. (The closure-capture fix so
 an extern is callable from inside a function/forked consumer without a local
-re-import (see *Known limitation: direct access / wrappers need a closure-capture
-fix* below) — see below.
+re-import has since landed — see *Known limitation* below.)
 
 0a. **Language prerequisite — mostly already present (re-verified 2026-09).**
    The critical path for `c.Double` is a *qualified type reference in annotation

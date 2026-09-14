@@ -6151,28 +6151,24 @@ pub const IRCompiler = struct {
         if (!is_self_recursive) {
             for (closure_captures) |capture| {
                 // NOTE: Guard against refering to internal identifiers
-                if (self.lookup(capture.identifier.name, .{ .shallow = false }) == null) continue;
+                const cap_binding = self.lookup(capture.identifier.name, .{ .shallow = false }) orelse continue;
 
                 const identifier_result = try self.compileIdentifier(source, capture.identifier);
+                const dst = ir.Location.initAdd(.{ .register = .r }, capture.slot, .{ .dereference = true });
 
-                if (identifier_result.source == .location and identifier_result.source.location.abs == .data) {
-                    try self.set(
-                        source,
-                        .initAdd(.{ .register = .r }, capture.slot, .{ .dereference = true }),
-                        identifier_result.source.undereference(),
-                    );
+                // A `cimport` value is an immutable `.closeable` handle, never
+                // aliased. Capture it *by value* — the by-reference form below
+                // stores the address of the const's slot, which `cimport_call`
+                // cannot resolve as a library, so calling an extern from inside a
+                // forked function/consumer failed with CImportLoadFailed.
+                if (identifier_result.source == .location and self.bindingTypeIsCImport(cap_binding.type_expr)) {
+                    try self.set(source, dst, identifier_result.source);
                 } else if (identifier_result.source == .location) {
-                    try self.set(
-                        source,
-                        .initAdd(.{ .register = .r }, capture.slot, .{ .dereference = true }),
-                        identifier_result.source.undereference(),
-                    );
+                    // A struct/scalar outer binding is captured by slot reference
+                    // (`.data` and general locations resolve identically here).
+                    try self.set(source, dst, identifier_result.source.undereference());
                 } else {
-                    try self.set(
-                        source,
-                        .initAdd(.{ .register = .r }, capture.slot, .{ .dereference = true }),
-                        identifier_result.source,
-                    );
+                    try self.set(source, dst, identifier_result.source);
                 }
             }
         }
@@ -8187,6 +8183,17 @@ pub const IRCompiler = struct {
             return self.user_struct_types.contains(ret.identifier.path.segments[0].name);
         }
         return false;
+    }
+
+    /// Whether a binding's type is a `cimport` value — a struct type carrying
+    /// `cimport_externs` (possibly behind aliases). Such a value is an immutable
+    /// `.closeable` handle, so a closure captures it by value rather than by the
+    /// slot-reference used for aliasable structs.
+    fn bindingTypeIsCImport(self: *IRCompiler, type_expr: ?ast.TypeExpr) bool {
+        _ = self;
+        var t = type_expr orelse return false;
+        while (t == .alias) t = t.alias.type_expr.*;
+        return t == .struct_type and t.struct_type.cimport_externs != null;
     }
 
     /// Compiles `m.extern args` where `m` is a cimport value and `extern` names a
