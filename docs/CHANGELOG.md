@@ -14,6 +14,13 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Fixed
 
+- **Constructing a struct field from another struct's field.** A struct literal
+  whose field value is a member access — `V{ .x = e.x }` — now type-checks. The
+  member access surfaced the field's raw declared type (an unresolved identifier
+  such as `Int`, or an alias like `c.Int`), which was compared unresolved
+  against the declared field type and spuriously rejected with "expected type
+  Int, actual: Int" (or "actual: c.Int"). The value's type is now resolved
+  before the comparison.
 - **Calling a C extern through a captured `cimport` value.** A function that
   references a top-level `cimport` const and calls its externs now works even
   when the function forks (a pipeline/loop consumer, a threaded body) — no local

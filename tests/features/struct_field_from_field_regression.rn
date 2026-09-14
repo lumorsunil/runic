@@ -1,0 +1,25 @@
+// Constructing a struct field from another struct value's field access
+// (`V{ .x = e.x }`) must type-check. A member access surfaces the field's raw
+// declared type (an unresolved `.identifier` such as "Int") from the AST's own
+// resolveType; the struct-literal check now resolves it before comparing it
+// against the declared field type. Previously this failed with the spurious
+// "expected type Int, actual: Int".
+fn Void @() Void
+
+const V = struct { x: Int, y: Int }
+
+// Rebuild a struct from a parameter's field accesses.
+fn Void copy(e: V) V { yield V{ .x = e.x, .y = e.y } }
+const a = copy V{ .x = 1, .y = 2 }
+echo "copy=${a.x},${a.y}"
+
+// Field accesses mixed with arithmetic and literals as field values.
+fn Void bump(e: V) V { yield V{ .x = e.x + 10, .y = 0 } }
+const b = bump V{ .x = 5, .y = 9 }
+echo "bump=${b.x},${b.y}"
+
+// Nested struct whose field is built from an outer struct's field.
+const Pair = struct { a: V, n: Int }
+fn Void wrap(e: V) Pair { yield Pair{ .a = V{ .x = e.x, .y = e.y }, .n = e.x } }
+const p = wrap V{ .x = 3, .y = 4 }
+echo "wrap=${p.a.x},${p.a.y},${p.n}"

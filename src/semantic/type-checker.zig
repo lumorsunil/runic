@@ -3891,7 +3891,14 @@ pub const TypeChecker = struct {
                 continue;
             };
             const resolved_field = try self.resolveTypeExpr(scope, declared);
-            const value_type = (try self.resolveExprType(scope, field.value)) orelse continue;
+            const value_raw = (try self.resolveExprType(scope, field.value)) orelse continue;
+            // A member/field access (`e.x`) can surface the field's *raw*
+            // declared type from the AST's own resolveType — an unresolved
+            // `.identifier` ("Int", or an alias like `c.Int`). Resolve it so it
+            // compares against the (already-resolved) declared field type;
+            // otherwise `V{ .x = e.x }` fails with "expected Int, actual: Int"
+            // (and "actual: c.Int" for a `c.Int`-aliased field).
+            const value_type = try self.resolveTypeExpr(scope, value_raw);
             try self.validateTypeAssignment(resolved_field, value_type, .{ .span = field.value.span() });
         }
 
