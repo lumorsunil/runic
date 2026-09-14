@@ -101,8 +101,38 @@ the mutability of all the parts, and a record field the struct doesn't have is a
 compile error. Patterns **nest** — a record or tuple can be a tuple element or a
 record-field rebinding (`const { inner: { x } }, rest = …`); a nested tuple is
 parenthesized (`(a, b)`) since a bare comma separates the outer elements. A
-tuple over an array literal keeps each element's type, so
-`const s, n, p = .{ "hi", 2, point }` destructures a heterogeneous group.
+tuple keeps each element's type — even through a variable — so
+`const s, n, p = .{ "hi", 2, point }` destructures a heterogeneous group (see
+Tuples below).
+
+### Tuples and arrays
+
+A `.{ … }` literal is a **tuple** when its elements have different types and an
+**array** when they share one:
+
+```rn
+var xs = .{ 1, 2, 3 }        // array []Int
+var t  = .{ 1, "hi", point } // tuple (Int, String, Point)
+```
+
+An array is a single element type; a tuple is an ordered, fixed set of
+per-position types. They share the same runtime representation (indexing, `for`,
+`.len()`, `.push`, concatenation all work the same), so the difference is a
+static-typing one: a tuple remembers each position's type. That is what lets a
+heterogeneous collection be **stored in a variable and destructured later**
+without the elements collapsing to a common type:
+
+```rn
+const A = struct { a: Int }
+const B = struct { b: Int }
+var mixed = .{ A{ .a = 1 }, B{ .b = 2 } }
+const x, y = mixed           // x is an A, y is a B — fields resolve correctly
+```
+
+Because an array is one type, forcing a heterogeneous tuple into an array
+annotation is an error — `const xs: []Int = .{ 1, "two" }` fails; a homogeneous
+literal coerces fine (`const xs: []Int = .{ 1, 2, 3 }`). Tuples are inferred;
+there is no tuple type-annotation syntax yet.
 
 ### Compound assignment
 

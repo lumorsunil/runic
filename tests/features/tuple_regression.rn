@@ -1,0 +1,45 @@
+// Tuples: a `.{ … }` literal whose elements have different types is a tuple —
+// an ordered, per-position-typed collection sharing the array runtime
+// representation. A homogeneous literal stays an array. The key win over a plain
+// (homogeneous) array is that a heterogeneous collection keeps each element's
+// type even after it is stored in a variable, so it can be destructured with the
+// right per-element type later.
+fn Void @() Void
+
+const A = struct { a: Int }
+const B = struct { b: Int }
+
+// A heterogeneous tuple destructured straight from a variable — each binding
+// recovers its own element type (previously the element type was homogenized
+// and a struct element lost its fields).
+var mixed = .{ A{ .a = 1 }, B{ .b = 2 } }
+const x, y = mixed
+echo "het-var=${x.a},${y.b}"
+
+// Mixed primitives through a variable.
+var mp = .{ 7, "hi" }
+const n, s = mp
+echo "prim-var=${n},${s}"
+
+// A homogeneous literal still behaves as an ordinary array: index, len, for, and
+// a `[]T` annotation coercion.
+var xs = .{ 10, 20, 30 }
+echo "index=${xs[0]}"
+echo "len=${xs.len()}"
+var sum = 0
+for (xs) |v| { sum += v }
+echo "for-sum=${sum}"
+
+const ys: []Int = .{ 1, 2, 3 }
+echo "coerce=${ys[2]}"
+
+// A homogeneous struct array destructured from a variable keeps the element type.
+var as = .{ A{ .a = 4 }, A{ .a = 5 } }
+const p, q = as
+echo "homo-struct=${p.a},${q.a}"
+
+// The empty-literal accumulator idiom is unaffected (stays an array).
+var acc = .{ }
+acc = acc.push "one"
+acc = acc.push "two"
+echo "acc=${acc[0]},${acc[1]}"

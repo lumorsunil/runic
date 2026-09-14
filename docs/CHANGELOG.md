@@ -14,6 +14,18 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Added
 
+- **Tuples.** A `.{ … }` literal whose elements have different types is now a
+  *tuple* — an ordered, per-position-typed collection — rather than a
+  homogenized array; a literal whose elements share one type is still an array
+  `[]T`. Tuples share the array runtime representation (index, `for`, `.len()`,
+  `.push`, concatenation all work), so the distinction is static: a tuple keeps
+  each element's type. That fixes heterogeneous **destructuring from a variable**
+  — `var m = .{ A{…}, B{…} }; const x, y = m` binds `x` as an `A` and `y` as a
+  `B`, where before both collapsed to one element type and a struct element lost
+  its fields. Because an array is a single type, forcing a heterogeneous tuple
+  into an array annotation (`const xs: []Int = .{ 1, "two" }`) is a compile
+  error; a homogeneous literal coerces to `[]T` as before. Tuples are inferred
+  (no tuple annotation syntax yet).
 - **Inferred struct literals.** When the struct type is known from context, a
   struct value can be written `.{ .field = value, … }` without repeating the type
   name — `const v: Vector = .{ .x = 3, .y = 5 }` instead of `Vector{ … }`. The

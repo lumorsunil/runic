@@ -134,11 +134,21 @@
   - [x] infer from an array element type (`const p: []Vector = .{ .{ … } }`), nesting
 - [x] tuple/record destructuring bindings (`const a, b = …`, `const { x, y } = …`,
       nested, heterogeneous array-literal tuples)
-  - [ ] heterogeneous destructuring from a *non-literal* source (a `var` holding
-        mixed types) still goes through the homogenized-array path, so a struct
-        element loses its type — only array-literal tuples and struct records
-        keep per-element/field types. Needs a real tuple type (per-element) or a
-        way to recover element types from a non-literal source.
+  - [x] heterogeneous destructuring from a *non-literal* source (a `var` holding
+        mixed types) — a heterogeneous `.{ … }` literal is now a tuple type that
+        carries per-position types through a variable, so a struct element keeps
+        its fields. A homogeneous literal stays an array `[]T`.
+- [ ] tuples: follow-ups
+  - [ ] tuple type *annotation* syntax (e.g. `(Int, String)`) — currently
+        inference-only, so a tuple can't be named in a signature/return type
+  - [ ] make *every* `.{ … }` a tuple (even homogeneous), coercing to `[]T` in
+        array contexts — deferred: it broke the empty/homogeneous accumulator
+        idiom (`var xs = .{}; xs = xs.push …`) and yields to `[]T`, which would
+        need tuple→array coercion wired through the yield/pipe/push paths. The
+        current homogeneous→array / heterogeneous→tuple split delivers the same
+        user-facing behavior without that churn.
+  - [ ] precise element typing for a *constant* index into a heterogeneous tuple
+        (`t[1]` → its 2nd position's type); a runtime index stays permissive
 - [ ] blocks as anonymous functions?
 - [ ] value references `const my_function = &module.some_function`
   - [ ] partial applications

@@ -482,8 +482,13 @@ pub const TypeExpr = union(enum) {
         elements: []const *const TypeExpr,
         span: Span,
 
-        pub fn format(_: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
-            try writer.writeAll("<tuple>");
+        pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try writer.writeByte('(');
+            for (self.elements, 0..) |element, i| {
+                if (i > 0) try writer.writeAll(", ");
+                try element.format(writer);
+            }
+            try writer.writeByte(')');
         }
     };
 

@@ -1934,13 +1934,17 @@ pub const IRCompiler = struct {
                 .normal,
             ),
             .tuple => |tuple| {
-                const elem_type: ?ast.TypeExpr = if (value.typeExpr()) |t|
-                    (if (t == .array) t.array.element.* else null)
-                else
-                    null;
+                // A tuple-typed source carries a type per position; an array-typed
+                // source has one element type shared by all positions.
+                const value_type = value.typeExpr();
                 const base_ref = try self.newRef(source, "tuple_base");
                 try self.set(source, base_ref, stableResultSource(value));
                 for (tuple.elements, 0..) |el, i| {
+                    const elem_type: ?ast.TypeExpr = if (value_type) |t| switch (t) {
+                        .tuple => if (i < t.tuple.elements.len) t.tuple.elements[i].* else null,
+                        .array => t.array.element.*,
+                        else => null,
+                    } else null;
                     // The element lives at heap slot `base + 1 + i` (slot 0 is the
                     // array length). Address it through %r2 (volatile) and copy
                     // into a fresh stable ref.
@@ -9822,18 +9826,51 @@ pub const IRCompiler = struct {
         try self.set(source, .initAbs(.{ .register = .r }, .{ .dereference = true }), .fromValue(.{ .integer = @as(i64, @intCast(array.elements.len)) }));
         const array_ref = try self.newRef(source, "array");
         try self.set(source, array_ref, .fromLocation(.initRegister(.r)));
-        var element_type: ?ast.TypeExpr = null;
-        for (array.elements, 1..) |element, i| {
+        // Record each element's static type by position. A `.{ … }` literal is a
+        // tuple; it is tagged as an array `[]T` only when every element shares the
+        // type T (the common case), and as a tuple otherwise — so a heterogeneous
+        // literal keeps per-position types (needed to destructure it later with
+        // the right per-element struct layout). The runtime value is identical.
+        const element_types = try self.allocator.alloc(?ast.TypeExpr, array.elements.len);
+        for (array.elements, 0..) |element, idx| {
             const result = try self.compileExpressionWithCapture(source, element);
             // Literals carry no type on their Result; fall back to the element
             // expression's static type so `.{ 1, 2, 3 }` infers `[]Int`.
-            element_type = result.typeExpr() orelse self.argTypeExpr(element);
+            element_types[idx] = result.typeExpr() orelse self.argTypeExpr(element);
             try self.set(source, .initRegister(.r2), .from(array_ref.dereference()));
-            try self.set(source, .initAdd(.{ .register = .r2 }, i, .{ .dereference = true }), result.source);
+            try self.set(source, .initAdd(.{ .register = .r2 }, idx + 1, .{ .dereference = true }), result.source);
         }
-        const resolved_element_type = try self.allocator.create(ast.TypeExpr);
-        resolved_element_type.* = element_type orelse .global(.void);
-        return .from(array_ref.dereference().typed(array_type(resolved_element_type)));
+
+        if (try self.elementTypesUniform(element_types)) {
+            const resolved_element_type = try self.allocator.create(ast.TypeExpr);
+            resolved_element_type.* = if (element_types.len > 0) (element_types[0] orelse .global(.void)) else .global(.void);
+            return .from(array_ref.dereference().typed(array_type(resolved_element_type)));
+        }
+
+        const elements = try self.allocator.alloc(*const ast.TypeExpr, element_types.len);
+        for (element_types, elements) |maybe, *dst| {
+            const p = try self.allocator.create(ast.TypeExpr);
+            p.* = maybe orelse .global(.void);
+            dst.* = p;
+        }
+        return .from(array_ref.dereference().typed(.{ .tuple = .{ .elements = elements, .span = array.span } }));
+    }
+
+    /// Whether every element type is present and structurally identical (compared
+    /// by rendered form, which ignores spans). An empty or single-element literal
+    /// is uniform. A uniform literal is tagged `[]T`; a non-uniform one a tuple.
+    fn elementTypesUniform(self: *IRCompiler, element_types: []const ?ast.TypeExpr) Error!bool {
+        var first: ?[]const u8 = null;
+        for (element_types) |maybe| {
+            const t = maybe orelse return false;
+            const rendered = try std.fmt.allocPrint(self.allocator, "{f}", .{t});
+            if (first) |f| {
+                if (!std.mem.eql(u8, f, rendered)) return false;
+            } else {
+                first = rendered;
+            }
+        }
+        return true;
     }
 
     const ForSource = struct {

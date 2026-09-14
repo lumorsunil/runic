@@ -1716,12 +1716,15 @@ pub const TypeChecker = struct {
             },
             .discard => {},
             .tuple => |tuple| {
-                // Positional destructuring: the initializer is an array/tuple;
-                // each element binds the corresponding positional type (a
-                // homogeneous array gives every element the same element type).
+                // Positional destructuring: the initializer is an array/tuple.
+                // A tuple source gives each binding its own *per-position* type
+                // (so a heterogeneous collection keeps element types through a
+                // variable); an array source gives every binding the single
+                // element type.
                 const resolved = if (type_expr) |t| self.unaliasType(t) else null;
-                for (tuple.elements) |el| {
+                for (tuple.elements, 0..) |el, i| {
                     const el_type: ?*const ast.TypeExpr = if (resolved) |r| switch (r.*) {
+                        .tuple => |src| if (i < src.elements.len) src.elements[i] else null,
                         .array => |a| a.element,
                         else => null,
                     } else null;
@@ -2462,6 +2465,12 @@ pub const TypeChecker = struct {
             const element_type: ?*const ast.TypeExpr = blk: {
                 const st = source_type orelse break :blk null;
                 const unaliased = self.unaliasType(st);
+                // A tuple iterates like an array of its unified element type
+                // (permissive when its positions differ).
+                if (unaliased.* == .tuple) {
+                    const el = self.tupleElementType(unaliased.tuple) orelse break :blk null;
+                    break :blk try self.resolveTypeExpr(scope, el);
+                }
                 if (unaliased.* != .array) break :blk source_type;
                 // Resolve the element so a named primitive element (`[]Int` whose
                 // element parsed as the identifier `Int`) normalizes to its tag.
@@ -3627,10 +3636,13 @@ pub const TypeChecker = struct {
             .identifier => return error.UnresolvedTypeLiteral,
             .optional => return error.MemberAccessOnOptional,
             .array => |array| try self.runArrayMemberAccess(array, &member.member),
+            // A tuple supports the same members as an array (`len`, …); it shares
+            // the array's positional/slice representation.
+            .tuple => try self.runArrayMemberAccess(undefined, &member.member),
             .thread => try self.runThreadMemberAccess(&member.member),
             .struct_type => |struct_type| try self.runStructMemberAccess(struct_type, &member.member),
             .error_set => |error_set| try self.runErrorSetMemberAccess(error_set, &member.member),
-            .null, .promise, .error_union, .err, .tuple, .function, .fn_ref_type, .integer, .float, .boolean, .byte, .alias, .void, .type_merge, .sum, .type_capture, .type_application => return error.UnsupportedMemberAccess,
+            .null, .promise, .error_union, .err, .function, .fn_ref_type, .integer, .float, .boolean, .byte, .alias, .void, .type_merge, .sum, .type_capture, .type_application => return error.UnsupportedMemberAccess,
             .module => |module| try self.runModuleMemberAccess(module, &member.member),
             .execution => |execution| try self.runExecutionMemberAccess(execution, &member.member),
             // .lazy => {
@@ -4024,6 +4036,16 @@ pub const TypeChecker = struct {
                 }
                 break :blk true;
             },
+            // Tuples compare structurally: same arity, pairwise-equal positions
+            // (like arrays and structs, not by node identity).
+            .tuple => |left_tuple| blk: {
+                const right_tuple = resolved_right.tuple;
+                if (left_tuple.elements.len != right_tuple.elements.len) break :blk false;
+                for (left_tuple.elements, right_tuple.elements) |le, re| {
+                    if (!self.pipeTypesEqual(le, re)) break :blk false;
+                }
+                break :blk true;
+            },
             .void, .integer, .float, .boolean, .byte, .null, .execution, .thread => true,
             else => std.meta.eql(resolved_left.*, resolved_right.*),
         };
@@ -4034,6 +4056,20 @@ pub const TypeChecker = struct {
             .alias => |*alias| self.unaliasType(self.resolveAliasType(alias)),
             else => type_expr,
         };
+    }
+
+    /// The single element type of a tuple when every position shares it (under
+    /// `pipeTypesEqual`), else null. A tuple behaves as `[]element` for array
+    /// operations (index, `for`, `len`, concat); a null result means the
+    /// positions differ, so the element type is left permissive — matching the
+    /// (untyped) behavior of an un-annotated literal before tuples existed.
+    fn tupleElementType(self: *TypeChecker, tuple: ast.TypeExpr.TupleType) ?*const ast.TypeExpr {
+        if (tuple.elements.len == 0) return null;
+        const first = tuple.elements[0];
+        for (tuple.elements[1..]) |element| {
+            if (!self.pipeTypesEqual(first, element)) return null;
+        }
+        return first;
     }
 
     pub fn runPipelineStage(
@@ -4821,6 +4857,41 @@ pub const TypeChecker = struct {
             }
         }
 
+        // A *heterogeneous* `.{ … }` literal is typed as a tuple, carrying each
+        // element's type by position, so it survives being stored in a variable
+        // and later destructured with per-element types. A homogeneous or empty
+        // literal keeps the prior permissive (null) typing — it flows as an array
+        // (accumulators like `var xs = .{}; xs = xs.push …`, yields to `[]T`,
+        // coercions) exactly as before. When a heterogeneous tuple is assigned to
+        // an array `[]T`, the array-coercion check rejects it (see
+        // `validateTypeAssignmentArray`), which is where "an array is one type" is
+        // enforced. (`ArrayLiteral.resolveType` returns null on its own.)
+        if (T == *ast.Expression and expr.* == .array and expr.array.elements.len >= 2) {
+            const elements = try self.arena.allocator().alloc(*const ast.TypeExpr, expr.array.elements.len);
+            var all_resolved = true;
+            for (expr.array.elements, elements) |el, *dst| {
+                if (try self.resolveExprType(scope, el)) |t| {
+                    dst.* = t;
+                } else {
+                    all_resolved = false;
+                    dst.* = try self.allocTypeExpression(.{ .type_var = .{ .name = "_", .span = el.span() } });
+                }
+            }
+            if (all_resolved) {
+                var uniform = true;
+                for (elements[1..]) |el| {
+                    if (!self.pipeTypesEqual(elements[0], el)) {
+                        uniform = false;
+                        break;
+                    }
+                }
+                if (!uniform) {
+                    return try self.allocTypeExpression(.{ .tuple = .{ .elements = elements, .span = expr.array.span } });
+                }
+            }
+            return null;
+        }
+
         // A cimport value is typed as a struct of its externs (see
         // buildCImportValueType), so `m.pow 2.0 10.0` resolves and checks like
         // any struct-member call. The AST's own resolveType returns null here.
@@ -5344,6 +5415,14 @@ pub const TypeChecker = struct {
             .array => |array| {
                 try self.validateTypeAssignment(assignee.element, array.element, options);
             },
+            // A tuple (`.{ … }` literal) coerces to an array `[]T` only when it is
+            // homogeneous — every position must assign to the element type. This
+            // is where "an array is a single type" is enforced.
+            .tuple => |tuple| {
+                for (tuple.elements) |element| {
+                    try self.validateTypeAssignment(assignee.element, element, options);
+                }
+            },
             else => try self.reportAssignmentError(
                 assignee,
                 assignment_type,
@@ -5387,12 +5466,29 @@ pub const TypeChecker = struct {
 
     pub fn validateTypeAssignmentTuple(
         self: *TypeChecker,
-        _: ast.TypeExpr.TupleType,
+        assignee: ast.TypeExpr.TupleType,
         assignment_type: *const ast.TypeExpr,
-        _: ValidateTypeAssignmentOptions,
+        options: ValidateTypeAssignmentOptions,
     ) Error!void {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, assignment_type.span());
+
+        // A tuple target accepts another tuple of the same arity whose positions
+        // are pairwise assignable. (A tuple annotation has no surface syntax yet,
+        // so this mainly covers tuple-to-tuple flow the checker infers.)
+        switch (self.unaliasType(assignment_type).*) {
+            .tuple => |tuple| {
+                if (tuple.elements.len == assignee.elements.len) {
+                    for (assignee.elements, tuple.elements) |a, v| {
+                        try self.validateTypeAssignment(a, v, options);
+                    }
+                    return;
+                }
+            },
+            else => {},
+        }
+
+        try self.reportAssignmentError(assignee, assignment_type, options);
     }
 
     pub fn validateTypeAssignmentFunction(
