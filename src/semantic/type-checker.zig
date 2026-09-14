@@ -1545,7 +1545,43 @@ pub const TypeChecker = struct {
                 };
             },
             .discard => {},
-            .tuple, .record => return error.BindingPatternNotSupported,
+            .tuple => |tuple| {
+                // Positional destructuring: the initializer is an array/tuple;
+                // each element binds the corresponding positional type (a
+                // homogeneous array gives every element the same element type).
+                const resolved = if (type_expr) |t| self.unaliasType(t) else null;
+                for (tuple.elements) |el| {
+                    const el_type: ?*const ast.TypeExpr = if (resolved) |r| switch (r.*) {
+                        .array => |a| a.element,
+                        else => null,
+                    } else null;
+                    try self.runBindingPattern(scope, el, el_type, is_pub, is_mutable);
+                }
+            },
+            .record => |record| {
+                // Field destructuring: the initializer is a struct; each field
+                // binds that struct member (to the label, or to the explicit
+                // rebinding after `:`).
+                const resolved = if (type_expr) |t| self.unaliasType(t) else null;
+                for (record.fields) |field| {
+                    const field_type: ?*const ast.TypeExpr = if (resolved) |r| switch (r.*) {
+                        .struct_type => |st| st.memberType(field.label.name),
+                        else => null,
+                    } else null;
+                    // A named field that the struct doesn't have is an error.
+                    if (field_type == null and resolved != null and resolved.?.* == .struct_type) {
+                        try self.reportSpanError(field.span, Error.MemberNotFound, .@"error", "struct has no field '{s}'", .{field.label.name});
+                    }
+                    if (field.binding) |target| {
+                        try self.runBindingPattern(scope, target, field_type, is_pub, is_mutable);
+                    } else {
+                        scope.declare(self.arena.allocator(), field.label, field_type, is_pub, is_mutable) catch |err| try switch (err) {
+                            error.IdentifierAlreadyDeclared => self.reportSpanError(field.span, error.IdentifierAlreadyDeclared, .@"error", "identifier {s} already declared", .{field.label.name}),
+                            else => err,
+                        };
+                    }
+                }
+            },
         }
     }
 

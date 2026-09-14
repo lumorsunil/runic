@@ -1,0 +1,5 @@
+# A record destructuring pattern naming a field the struct doesn't have is an
+# error (a typo, not a silent void binding).
+const P = struct { x: Int, y: Int }
+const { x, z } = P{ .x = 1, .y = 2 }
+echo "${x}"

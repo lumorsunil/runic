@@ -221,10 +221,10 @@
 - [x] workspace symbol search
 - [x] add support for document links
 - [x] `.sym_link` entries in module-path completion (follows the link's target)
-- [ ] document symbols for destructuring patterns — BLOCKED: the parser does
-      not support tuple/record binding destructuring yet (parseBindingPattern
-      only accepts a single identifier or `_`); bash blocks / while statements
-      declare no top-level symbols, so nothing to add there
+- [ ] document symbols for destructuring patterns — the parser now supports
+      tuple (`const a, b = …`) and record (`const { x, y } = …`) binding
+      destructuring; the LSP symbol/completion walkers can now surface each
+      destructured name (currently they treat the binding as one node)
 - [x] inlay hints: inferred types after un-annotated bindings (`const x«: Int»`)
 - [x] inlay hints: parameter-name hints before call arguments (top-level and
       binding-initializer calls to same-file functions)

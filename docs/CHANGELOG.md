@@ -14,6 +14,14 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Added
 
+- **Tuple and record destructuring in bindings.** A binding target can now be a
+  tuple pattern — `const a, b = .{ 1, 2 }` binds the positional elements of an
+  array/tuple — or a record pattern — `const { x, y } = point` binds a struct's
+  fields to same-named locals, with `{ x: local }` to rebind a field to a
+  different name and a subset of fields allowed. `_` discards an element;
+  `const`/`var` sets mutability for all parts. A record field the struct doesn't
+  have is a "struct has no field" error. (Nested patterns work for records;
+  a record/tuple *inside* a tuple element is not yet parsed.)
 - **Array concatenation with `+`.** `a + b` on two arrays produces a new array
   holding `a`'s elements followed by `b`'s (a fresh copy; the operands are
   unchanged). Works for any element type, with empty operands, and composes with

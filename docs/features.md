@@ -80,6 +80,26 @@ than an error. Plain indexing `x[i]` reads a single element: an array element,
 or — for a string — the one-character `String` at position `i` (equivalent to
 `s[i .. i+1]`, so an out-of-range or negative `i` clamps to the empty string).
 
+### Destructuring bindings
+
+A binding target can be a **tuple** or **record** pattern instead of a single name:
+
+```rn
+const a, b = .{ 10, 20 }              // tuple: a = 10, b = 20
+const first, _, third = .{ 1, 2, 3 }  // `_` discards an element
+
+const P = struct { x: Int, y: Int }
+const p = P{ .x = 3, .y = 4 }
+const { x, y } = p                    // record: binds x and y from the fields
+const { x: px } = p                   // rebind a field to a different local name
+```
+
+**Result:** a tuple pattern `a, b` binds the positional elements of an
+array/tuple; a record pattern `{ x, y }` binds a struct's fields to same-named
+locals (a subset is allowed, and `{ field: name }` rebinds). `const`/`var` sets
+the mutability of all the parts, and a record field the struct doesn't have is a
+compile error.
+
 ### Compound assignment
 
 A `var` can be updated with a **compound assignment**, which applies an operator to its current value: `+=`, `-=`, `*=`, `/=`, `%=` for arithmetic, and `||=`, `&&=` for logical values (`x ||= y` is exactly `x = x || y`, with the same short-circuit behavior).

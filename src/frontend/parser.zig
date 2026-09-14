@@ -2402,7 +2402,10 @@ pub const Parser = struct {
 
         _ = try self.nextToken(); // consume opening '|'
         const capture_start = next.span.start;
-        const bindings = try self.parseList(.comma, parseBindingPattern, .{});
+        // A capture clause is a comma-separated LIST of patterns (one per loop
+        // source / captured value), so each element parses as a single pattern —
+        // the comma is the list separator, not a tuple-pattern delimiter.
+        const bindings = try self.parseList(.comma, parseCapturePattern, .{});
         const close_tok = try self.expect(.pipe);
 
         return ast.CaptureClause{
@@ -2415,20 +2418,88 @@ pub const Parser = struct {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
-        // TODO: Support deconstructions
+        // A record destructuring pattern: `{ x, y }` binds the struct's `x`/`y`
+        // fields to same-named locals.
+        if ((try self.peekToken()).tag == .l_brace) return self.parseRecordPattern();
+
+        const first = try self.parseSingleBindingPattern();
+
+        // A tuple destructuring pattern: `a, b` (comma-separated) binds the
+        // positional elements of the initializer array/tuple.
+        if ((try self.peekToken()).tag != .comma) return first;
+
+        var elements = std.ArrayList(*ast.BindingPattern).empty;
+        defer elements.deinit(self.arena.allocator());
+        try elements.append(self.arena.allocator(), first);
+        var end_span = first.span();
+        while (try self.stream.consumeIf(.comma)) {
+            const el = try self.parseSingleBindingPattern();
+            end_span = el.span();
+            try elements.append(self.arena.allocator(), el);
+        }
+        const pattern = try self.arena.allocator().create(ast.BindingPattern);
+        pattern.* = .{ .tuple = .{
+            .elements = try elements.toOwnedSlice(self.arena.allocator()),
+            .span = first.span().endAt(end_span),
+            .has_rest = false,
+        } };
+        return pattern;
+    }
+
+    /// Parses one capture-clause pattern: a single identifier/discard, or a
+    /// record pattern (`{ x, y }`). Not a comma-tuple — the comma separates
+    /// captures in the enclosing list.
+    fn parseCapturePattern(self: *Self) Error!*ast.BindingPattern {
+        if ((try self.peekToken()).tag == .l_brace) return self.parseRecordPattern();
+        return self.parseSingleBindingPattern();
+    }
+
+    /// Parses a single identifier (or `_` discard) binding target. Each element
+    /// of a tuple pattern and each rebinding of a record pattern is one of these.
+    fn parseSingleBindingPattern(self: *Self) Error!*ast.BindingPattern {
         const tok = try self.nextToken();
         if (tok.tag != .identifier) return self.failExpectedToken(tok.tag, .identifier);
 
         const pattern = try self.arena.allocator().create(ast.BindingPattern);
         if (tok.lexeme.len == 1 and tok.lexeme[0] == '_') {
-            pattern.* = .{
-                .discard = tok.span,
-            };
+            pattern.* = .{ .discard = tok.span };
         } else {
-            pattern.* = .{
-                .identifier = .{ .name = tok.lexeme, .span = tok.span },
-            };
+            pattern.* = .{ .identifier = .{ .name = tok.lexeme, .span = tok.span } };
         }
+        return pattern;
+    }
+
+    /// Parses `{ x, y }` (or `{ x: rebind, … }`) — a record destructuring
+    /// pattern. Each field binds the initializer struct's same-named field to a
+    /// local (the field name, or the explicit rebinding after `:`).
+    fn parseRecordPattern(self: *Self) Error!*ast.BindingPattern {
+        const open = try self.expectTokenTag(.l_brace);
+        var fields = std.ArrayList(ast.BindingPattern.RecordField).empty;
+        defer fields.deinit(self.arena.allocator());
+
+        while ((try self.peekToken()).tag != .r_brace) {
+            const label = try self.expectTokenTag(.identifier);
+            var binding: ?*ast.BindingPattern = null;
+            var field_end = label.span;
+            if (try self.stream.consumeIf(.colon)) {
+                const sub = try self.parseSingleBindingPattern();
+                field_end = sub.span();
+                binding = sub;
+            }
+            try fields.append(self.arena.allocator(), .{
+                .label = .{ .name = label.lexeme, .span = label.span },
+                .binding = binding,
+                .span = label.span.endAt(field_end),
+            });
+            if (!try self.stream.consumeIf(.comma)) break;
+        }
+        const close = try self.expectTokenTag(.r_brace);
+        const pattern = try self.arena.allocator().create(ast.BindingPattern);
+        pattern.* = .{ .record = .{
+            .fields = try fields.toOwnedSlice(self.arena.allocator()),
+            .span = open.span.endAt(close.span),
+            .has_rest = false,
+        } };
         return pattern;
     }
 

@@ -1,0 +1,41 @@
+// Tuple and record destructuring in a binding. A tuple pattern `a, b` binds the
+// positional elements of an array/tuple; a record pattern `{ x, y }` binds a
+// struct's fields (optionally rebinding a field with `{ x: local }`). `_`
+// discards. Works with `const` and `var`, and the parts are ordinary bindings.
+fn Void @() Void
+
+// Tuple destructuring from an array literal.
+const a, b = .{ 10, 20 }
+echo "tuple=${a},${b}"
+
+// Three elements, and using them in arithmetic.
+const x, y, z = .{ 1, 2, 3 }
+echo "sum=${x + y + z}"
+
+// Discard an element with `_`.
+const first, _, third = .{ 7, 8, 9 }
+echo "skip=${first},${third}"
+
+// From a bound variable, and `var` makes the parts mutable.
+var arr = .{ 4, 5 }
+var p, q = arr
+p += 100
+echo "var=${p},${q}"
+
+// Record destructuring: bind same-named locals.
+const V = struct { w: Int, h: Int }
+const { w, h } = V{ .w = 30, .h = 40 }
+echo "record=${w},${h}"
+
+// Rebind a field to a different local name.
+const { w: width, h: height } = V{ .w = 3, .h = 4 }
+echo "rebind=${width},${height}"
+
+// Bind only a subset of fields (rebound to a fresh name).
+const { h: justH } = V{ .w = 1, .h = 9 }
+echo "subset=${justH}"
+
+// A struct-typed field destructured, then a member access on it.
+const Box = struct { size: V }
+const { size } = Box{ .size = V{ .w = 5, .h = 6 } }
+echo "nested=${size.w},${size.h}"

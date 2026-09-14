@@ -1874,17 +1874,106 @@ pub const IRCompiler = struct {
                 );
                 return .fromValue(.void);
             },
-            else => {
-                try self.reportSourceError(
+            .tuple, .record => {
+                // Destructuring: compile the initializer once into a stable ref,
+                // then bind each element/field from that value.
+                const value = try self.compileExpressionWithCapture(source, expr);
+                const base_ref = try self.newRef(source, "destructure_base");
+                try self.set(source, base_ref, stableResultSource(value));
+                try self.compilePatternFromValue(
                     source,
-                    Error.UnsupportedBindingPattern,
-                    .@"error",
-                    "binding pattern type \"{t}\" not yet supported",
-                    .{pattern.*},
+                    pattern,
+                    try .from(base_ref.dereference().typed(value.typeExpr())),
+                    is_mutable,
                 );
                 return .fromValue(.void);
             },
         };
+    }
+
+    /// Binds a pattern to an already-compiled value. An identifier/discard binds
+    /// (or drops) the whole value; a tuple destructures an array positionally; a
+    /// record destructures a struct by field name. Nested patterns recurse.
+    fn compilePatternFromValue(
+        self: *IRCompiler,
+        source: anytype,
+        pattern: *ast.BindingPattern,
+        value: Result,
+        is_mutable: bool,
+    ) Error!void {
+        switch (pattern.*) {
+            .discard => {},
+            .identifier => |identifier| try self.compileIdentifierBinding(
+                source,
+                identifier,
+                value.source,
+                null,
+                is_mutable,
+                .normal,
+            ),
+            .tuple => |tuple| {
+                const elem_type: ?ast.TypeExpr = if (value.typeExpr()) |t|
+                    (if (t == .array) t.array.element.* else null)
+                else
+                    null;
+                const base_ref = try self.newRef(source, "tuple_base");
+                try self.set(source, base_ref, stableResultSource(value));
+                for (tuple.elements, 0..) |el, i| {
+                    // The element lives at heap slot `base + 1 + i` (slot 0 is the
+                    // array length). Address it through %r2 (volatile) and copy
+                    // into a fresh stable ref.
+                    try self.set(source, .initRegister(.r2), .from(base_ref.dereference()));
+                    const elem_ref = try self.newRef(source, "tuple_elem");
+                    try self.set(source, elem_ref, .fromLocation(.initAdd(
+                        .{ .register = .r2 },
+                        i + 1,
+                        .{ .dereference = true },
+                    )));
+                    try self.compilePatternFromValue(
+                        source,
+                        el,
+                        try .from(elem_ref.dereference().typed(elem_type)),
+                        is_mutable,
+                    );
+                }
+            },
+            .record => |record| {
+                const struct_type: ?ast.TypeExpr.StructType = if (value.typeExpr()) |t| blk: {
+                    if (t == .array) break :blk null;
+                    if (t == .struct_type) break :blk t.struct_type;
+                    if (t == .identifier) break :blk self.user_struct_types.get(t.identifier.path.segments[t.identifier.path.segments.len - 1].name);
+                    break :blk null;
+                } else null;
+                const base_ref = try self.newRef(source, "record_base");
+                try self.set(source, base_ref, stableResultSource(value));
+                for (record.fields) |field| {
+                    const layout = if (struct_type) |st| (st.fieldLayout(field.label.name) catch null) else null;
+                    const field_ref = try self.newRef(source, "record_field");
+                    if (layout) |l| {
+                        try self.set(source, .initRegister(.r2), .from(base_ref.dereference()));
+                        try self.set(source, field_ref, .fromLocation(.initAdd(
+                            .{ .register = .r2 },
+                            l.offset,
+                            .{ .dereference = true, .type_expr = l.type_expr },
+                        )));
+                    } else {
+                        try self.set(source, field_ref, .fromValue(.void));
+                    }
+                    const field_type: ?ast.TypeExpr = if (layout) |l| l.type_expr else null;
+                    const target = field.binding orelse blk: {
+                        const p = try self.allocator.create(ast.BindingPattern);
+                        p.* = .{ .identifier = field.label };
+                        break :blk p;
+                    };
+                    try self.compilePatternFromValue(
+                        source,
+                        target,
+                        try .from(field_ref.dereference().typed(field_type)),
+                        is_mutable,
+                    );
+                }
+            },
+        }
     }
 
     fn compileIdentifierBinding(
