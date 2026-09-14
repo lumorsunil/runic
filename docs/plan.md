@@ -29,6 +29,11 @@ Runic already has:
   binary integer literals
 - a small standard library (`std.map`, `std.list`, `std.str`, …) and pipeline
   builtins (`parseInt`/`parseFloat`/`parseBool`/`lines`)
+- a **C FFI layer** — `cimport "lib" { extern fn … }` blocks that load a shared
+  library and call externs through vendored, statically linked `libffi`, with a
+  `std/ffi` C-type module (`c.Int`/`c.Double`/`c.Str`/…), scalar **and by-value
+  struct** arguments and returns (including nested and module-qualified struct
+  types), plus a `runic cbind <header.h>` binding generator
 
 Runic is still experimental. Language design and implementation details are
 expected to keep moving while the core model stabilizes.
@@ -61,6 +66,21 @@ A cycle of feature work and engineering-health work:
   interpreter's ceiling; the plain interpreter is still the zero-startup
   default, and native compilation stays deferred. A `bench_guard` CI stage
   protects these fast paths. Full history: `future/execution-optimization.md`.
+- **C FFI (`cimport`):** the MVP landed end-to-end — dynamic-library loading and
+  typed extern calls through vendored `libffi`, a `std/ffi` C-type module, and a
+  `runic cbind` header-to-binding generator. Building it also delivered two
+  independently useful language features it depends on: a module exporting a
+  *type* (`pub const X = struct {…}`) and *qualified type references*
+  (`module.Type` in annotation/expression position). Scalar and by-value struct
+  args/returns work; remaining gaps are tracked in `future/c-ffi.md`.
+- **FFI/module correctness (0.10.1):** a batch of fixes found driving real C
+  (raylib) programs — module-struct field types resolved in the module's scope;
+  every generator value piped into a param-coercion consumer; forward references
+  and mutual recursion for top-level functions (incl. as pipeline/loop
+  consumers that capture globals); `var` mutable parameters with an immutability
+  guard for `const`; an array as a streaming pipeline source; and Runic-call
+  arguments (incl. by-value struct returns) value-captured across the FFI
+  boundary.
 
 A known constraint discovered this cycle: `compiler.zig` is large (~10k lines)
 but cannot be cleanly split in current Zig — `usingnamespace` was removed and
@@ -96,7 +116,9 @@ Current focus areas:
   Nested (in-construct) recovery is still future work.
 - remaining gaps in function behavior, especially stdin/stdout semantics and
   piping through functions/blocks (a bare `&0` stage can now forward stdin into
-  a pipeline; first-class/anonymous blocks are still open — see Theme 3)
+  a pipeline; forward references / mutual recursion, `var` mutable parameters,
+  and piping every generator value into a consumer all landed this cycle;
+  first-class/anonymous blocks are still open — see Theme 3)
 - cleanup of execution-result behavior across more expression forms
 - better handling of background execution, pipes, and edge-case cleanup
 - reducing semantic mismatches between documented behavior and actual runtime
@@ -179,6 +201,12 @@ open.
 ### 4. Import/module model refinement
 
 Imports currently work, but the surrounding module story is still evolving.
+
+Landed this cycle: a module can export a *type* (`pub const X = struct {…}`),
+types are referenceable *qualified* (`module.Type`) in annotation and expression
+positions, and a module struct's field types resolve in the module's own scope
+(so a field typed via the module's own imports works in an importer without that
+import in scope). These unblocked the C FFI type surface.
 
 Current direction:
 

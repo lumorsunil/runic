@@ -445,8 +445,13 @@ and returns the value, in both bound and interpolated positions. Landed on the
 float/double, bool, pointer) and `c.Str` *arguments* are supported. The
 `runic cbind` generator (phase 3) is also implemented — it emits a `cimport`
 block plus the header's enum values / `#define` constants from a C header via
-`zig translate-c`. Remaining: `c.Str` *returns*, structs/varargs at the call
-boundary, and the cross-compile vendoring — see below.
+`zig translate-c`. **By-value struct arguments and returns (phase 4) have since
+landed** — including nested and module-qualified struct types, and a Runic call
+returning a by-value struct passed straight to an extern. Remaining: `c.Str`
+*returns*, varargs, the cross-compile vendoring, and the closure-capture fix so
+an extern is callable from inside a function/forked consumer without a local
+re-import (see *Known limitation: direct access / wrappers need a closure-capture
+fix* below) — see below.
 
 0a. **Language prerequisite — mostly already present (re-verified 2026-09).**
    The critical path for `c.Double` is a *qualified type reference in annotation
@@ -455,13 +460,12 @@ boundary, and the cross-compile vendoring — see below.
    defaults to `true`, so no `pub` is needed to export), referenced qualified in
    a parameter/return annotation (`fn Void f(p: s.Point) …`, `n: s.MyInt`),
    parses, type-checks, and runs. The parser builds a multi-segment
-   `.identifier` path and the type checker resolves it. What is *not* needed for
-   FFI and can stay out of scope: qualified *construction* (`s.Point{…}` in
-   expression position — member access currently rejects a type identifier) and
-   the cosmetic `pub const X = struct {…}` (only the `struct`-literal RHS after
-   `pub const` fails; the plain `const` form already exports). A separate
+   `.identifier` path and the type checker resolves it. Qualified *construction*
+   (`s.Point{…}` in expression position) has since landed too (see
+   `tests/features/qualified_struct_construction_regression.rn`). A separate
    pre-existing bug — `expected type Int, actual: Int` when a module fn
-   constructs a struct from its own params — is noted but unrelated.
+   constructs a struct from its own params (a `c.Int`-aliased field comparing
+   its alias against itself) — is still open and unrelated.
 0b. **Vendor + link `libffi`** — get `libffi` compiling from vendored source and
    statically linked into `runic` via `build.zig` for the primary dev target,
    with a trivial `ffi_call` smoke test. The load-bearing prerequisite for the
@@ -483,8 +487,10 @@ boundary, and the cross-compile vendoring — see below.
    in `src/ffi/cbind.zig` (pure, unit-tested); the CLI glue is
    `cmd/runic/cbind.zig`. Still open (phase 5): a `.dynsym`-only fallback when
    no header is available, and a libclang backend.
-4. **Structs / varargs** — `libffi` already calls them; this phase is the
-   marshalling side (struct-layout `ffi_type`s, Runic ↔ struct value mapping).
+4. **Structs — DONE / varargs — open.** By-value struct marshalling landed
+   (struct-layout `ffi_type`s via `ffi_get_struct_offsets`, Runic ↔ struct value
+   mapping for args and returns, incl. nested and module-qualified structs).
+   Varargs remain open.
 5. **Later / maybe** — a libclang backend for `cbind`; the pure-Zig trampoline
    fallback (if the `libffi` build matrix proves a burden); Runic → C callbacks;
    a `--safe` gate; typed pointer views over `c.Ptr` memory.
