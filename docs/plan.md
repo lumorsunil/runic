@@ -129,26 +129,44 @@ surface predictable and regression-tested.
 
 ### 2. Typed dataflow and error model
 
-Two major language directions are now explicit enough to count as roadmap
-themes rather than loose backlog items.
+Two related language directions. Typed pipes have **landed** (0.2.0); the error
+model is the remaining planned direction, and the two are coupled because both
+shape how command output, function output, and failures are represented in the
+type system.
 
-#### Typed pipes
+#### Typed pipes — landed (0.2.0)
 
-Planned direction:
+The core feature shipped in 0.2.0 and is covered by ~16 `typed_pipe_*`
+regression tests. Delivered:
 
-- keep stdin/stdout types as meaningful parts of function signatures
-- allow `|` to connect functions and expressions when the upstream stdout type
-  matches the downstream stdin type
-- model executable calls with a catch-all typed boundary rather than pretending
-  external commands have precise static signatures
-- define coercion rules carefully for cases such as optional wrapping and error
-  unions
-- extend the compiler/runtime so pipelines are not limited to byte-stream
-  transport when the connected stages are fully typed
+- stdin/stdout types are meaningful parts of a function signature
+  (`fn StdinType name() StdoutType`), and `&0`/`&1`/`&2` are the stream
+  expressions (`yield` writes stdout);
+- every `|` boundary is type-checked — the upstream stdout type must match the
+  downstream stdin type, and a mismatch is a located compile-time error;
+- external executables use a catch-all typed boundary
+  (`fn String @(…String) ExecutableError!String`);
+- coercions: `T → ?T` end-to-end, and `T → E!T` accepted by the type checker;
+- non-byte transport: an exact scalar boundary (`Int`/`Float`, no executable on
+  either side) passes the value in-process through a typed side channel instead
+  of serializing to text and re-parsing; `String`/executable boundaries keep the
+  byte path;
+- multi-value streaming: a producer `yield`s many values, a consumer drains them
+  with `for (&0) |v|`, live as they arrive; `parseInt`/`parseFloat` bridge a
+  byte stream to typed values, and `lines` frames a byte stream per line.
 
-This is a significant feature, not a small type-checking tweak. It will affect
-function semantics, pipeline compilation, and the runtime representation of
-data flowing through pipes.
+Historical detail lives in `docs/typed-pipes-update.md` and
+`docs/typed-pipes-implementation-plan.md` (both marked historical).
+
+Remaining follow-ups (smaller than the feature itself):
+
+- `lines` buffers its whole input before splitting (not line-by-line live);
+- `T → E!T` is type-checked but runtime error-union stdin parsing was left
+  pending;
+- per-value framing for `String` streams is opt-in via `lines` (raw byte streams
+  read whole);
+- an untyped function parameter errors with a rough `error.TypeNotFound`
+  ("Type checker failed to run") rather than a clean, located diagnostic.
 
 #### Error handling
 
