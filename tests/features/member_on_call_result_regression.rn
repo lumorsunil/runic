@@ -33,3 +33,8 @@ echo "field=${b.a.n}"
 # String builtins chain as before.
 const s = "  hi  "
 echo "str=${s.trim.upper}"
+
+# Indexing and slicing a call result also value-capture the receiver.
+fn Void nums() []Int { yield .{ 10, 20, 30, 40 } }
+echo "idx=${(nums)[2]}"
+echo "slice=${(nums)[1..3][0]}"

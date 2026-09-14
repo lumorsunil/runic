@@ -9254,7 +9254,12 @@ pub const IRCompiler = struct {
     /// length at runtime.
     fn compileSlice(self: *IRCompiler, source: anytype, binary: ast.BinaryExpr) Error!Result {
         const range = binary.right.range;
-        const target = try self.compileExpression(binary.left);
+        // Slicing a call result (`(mk)[1..3]`) needs the array/string value, so
+        // value-capture a receiver that would otherwise fork.
+        const target = if (self.memberObjectForks(binary.left))
+            try self.compileExpressionWithCapture(source, binary.left)
+        else
+            try self.compileExpression(binary.left);
         // A bare string literal carries no ast type (it is a raw `.slice` value);
         // treat an unknown type as a string (arrays are always typed).
         const maybe_type = target.typeExpr();
@@ -9565,7 +9570,12 @@ pub const IRCompiler = struct {
                 // `x[a..b]` — a range-valued index is a slice, not an element read.
                 if (binary.right.* == .range) return self.compileSlice(source, binary);
 
-                const left = try self.compileExpression(binary.left);
+                // Indexing a call result (`(mk)[1]`, `(v.method)[i]`) needs the
+                // array/string value, so value-capture a receiver that would fork.
+                const left = if (self.memberObjectForks(binary.left))
+                    try self.compileExpressionWithCapture(source, binary.left)
+                else
+                    try self.compileExpression(binary.left);
                 const maybe_left_type = left.typeExpr();
 
                 // `s[i]` on a string is a single-character read, lowered to a
