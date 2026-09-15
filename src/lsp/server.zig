@@ -111,7 +111,15 @@ pub const Server = struct {
             };
             defer self.allocator.free(payload);
             try self.log("Recieved message: {s}", .{payload});
-            const continue_loop = try self.handleEnvelope(payload);
+            // A single request must never take the server down. A handler that
+            // errors (a bad path, an edge-case document, an unexpected shape) is
+            // logged and the session continues, rather than propagating out of
+            // run() and killing the process. (Malformed-JSON envelopes are
+            // dropped inside handleEnvelope; this covers the handlers themselves.)
+            const continue_loop = self.handleEnvelope(payload) catch |err| blk: {
+                self.log("request handler errored, continuing: {}", .{err}) catch {};
+                break :blk true;
+            };
             if (!continue_loop) break;
             try self.flushDiagnostics();
         }
