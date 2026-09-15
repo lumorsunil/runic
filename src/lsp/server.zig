@@ -872,6 +872,15 @@ pub const Server = struct {
             }
         }
 
+        // An error-set member is a variant; show it as it reads in the set —
+        // `Variant` or `Variant: PayloadType` — rather than as a `const`.
+        if (resolved_type.* == .error_set) {
+            if (resolved_type.error_set.variant(member_name)) |v| {
+                alloc_writer.writer.print("```\nerror variant {f}\n```", .{v}) catch {};
+                return;
+            }
+        }
+
         alloc_writer.writer.writeAll("```\n") catch {};
         alloc_writer.writer.print("const {s}: ", .{member_name}) catch {};
 

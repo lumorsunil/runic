@@ -407,6 +407,19 @@ fn appendMembersForType(
                 try appendOwnedMatch(matches, context.allocator, kind, decl.name.name, detail, decl.span);
             }
         },
+        // `E.` completes the error set's variants; a payload variant shows its
+        // payload type as the detail.
+        .error_set => |error_set| {
+            for (error_set.variants) |v| {
+                if (v.payload) |payload| {
+                    const variant_detail = try std.fmt.allocPrint(context.allocator, "error variant: {f}", .{payload});
+                    defer context.allocator.free(variant_detail);
+                    try appendOwnedMatch(matches, context.allocator, .field, v.name.name, variant_detail, v.name.span);
+                } else {
+                    try appendOwnedMatch(matches, context.allocator, .field, v.name.name, "error variant", v.name.span);
+                }
+            }
+        },
         else => {},
     }
 }

@@ -229,10 +229,10 @@ Goal: dispatch on error variants, capturing payloads (spec lines 73-80).
 - [x] Diagnostics in place: `catch`/`try` on a non-error, unknown variant (construction + match), payload type mismatch, unhandled error value, `try` outside an erroring fn. (Non-exhaustive `match` checking is deferred — backlog 13.)
 - [x] Rewrote `docs/features.md` "Errors as first-class types" + "Error-aware pipelines" to the **actual implemented** syntax (`const E = error {…}`, `E!T`/`!T`, `E.Variant` / `E{ .Variant = … }`, `catch`/`||`/`try`, `match (err) {…}`, command error unions) — the old sections were aspirational/incorrect.
 - [x] Added `examples/error_handling.rn` (runs clean): error sets, `catch`, `if (errorUnion) |v|`, command `catch`/`||`, `match` with payload capture.
-- [ ] LSP hover/completion for error sets & variants — **deferred** (separate subsystem; not required for the language surface).
+- [x] LSP hover/completion for error sets & variants — `E.` completes the set's variants (payload shown as detail) and hover on a variant shows `error variant Name[: Payload]`. (Also fixed a pre-existing leak: `Document.deinit` didn't free per-diagnostic messages, which the completion scratch document exposed.)
 - [x] Full CI green: `zig build run -- scripts/run_ci.rn` (formatter, linter, unit tests, 83 CLI smoke scripts).
 
-**Status / Notes:** ✅ Complete (LSP polish deferred — the one remaining open item, backlog 232). Backlog item 15 (stack-counter drift when sequencing capture-binding error constructs), flagged here as "to fix next", was subsequently fixed (see backlog item 15). The whole error-handling backlog (items 1–18) is now resolved; the only open error-handling work is LSP hover/completion for error sets & variants.
+**Status / Notes:** ✅ Complete. Backlog item 15 (stack-counter drift when sequencing capture-binding error constructs), flagged here as "to fix next", was subsequently fixed (see backlog item 15). The whole error-handling backlog (items 1–18) is resolved, and LSP hover/completion for error sets & variants (the last deferred item) is now done too.
 
 ---
 

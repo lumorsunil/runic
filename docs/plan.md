@@ -204,8 +204,8 @@ Spec: `future/error-handling.md`; implementation record: `error-handling-plan.md
 
 Remaining follow-ups (small; none block the language surface):
 
-- **LSP** hover/completion for error sets and their variants — deferred as a
-  separate subsystem (see Theme 5);
+- ~~**LSP** hover/completion for error sets and their variants~~ — done: `E.`
+  completes variants (payload shown as detail); hover on a variant shows it;
 - a **cross-process** error wire format — external programs carry only exit code
   + bytes (i.e. `ExecutableError`); a real serialized error boundary is a
   separate, larger effort;

@@ -410,6 +410,10 @@ const Document = struct {
         for (self.symbols.items) |*entry| entry.deinit(allocator);
         self.symbols.deinit(allocator);
         if (self.parser) |*p| p.deinit();
+        // Each diagnostic owns a duped uri+message; free those before the list
+        // (mirrors `clearDiagnostics`) so closing a document with diagnostics —
+        // e.g. the throwaway completion scratch document — doesn't leak them.
+        for (self.diagnostics.items) |*entry| entry.deinit(allocator);
         self.diagnostics.deinit(allocator);
         self.* = undefined;
     }

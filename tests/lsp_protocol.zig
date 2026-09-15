@@ -2366,6 +2366,83 @@ test "lsp member completion shows a struct field's type as detail" {
     try std.testing.expectEqualStrings("String", y_detail.?);
 }
 
+test "lsp member completion lists an error set's variants with payload detail" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\const E = error { NotFound, Failed: String }
+        \\echo "${E.}"
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeCompletionRequest(allocator, 12, uri, 1, 10),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 12);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const items = parsed.value.object.get("result").?.object.get("items").?.array.items;
+    var saw_not_found = false;
+    var failed_detail: ?[]const u8 = null;
+    for (items) |item| {
+        const label = item.object.get("label").?.string;
+        if (std.mem.eql(u8, label, "NotFound")) saw_not_found = true;
+        if (std.mem.eql(u8, label, "Failed")) {
+            failed_detail = if (item.object.get("detail")) |d| d.string else null;
+        }
+    }
+    try std.testing.expect(saw_not_found);
+    try std.testing.expect(failed_detail != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed_detail.?, "String") != null);
+}
+
+test "lsp hover shows an error variant with its payload type" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\const E = error { Failed: String }
+        \\fn Void f() E!Int { yield E.Failed }
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        // Cursor on `Failed` in `E.Failed` (line 1).
+        try makeHoverRequest(allocator, 12, uri, 1, 28),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 12);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const value = parsed.value.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, value, "Failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, value, "String") != null);
+}
+
 test "lsp chained member completion resolves nested struct fields" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
