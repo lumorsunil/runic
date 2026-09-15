@@ -3900,6 +3900,19 @@ pub const IRCompiler = struct {
                         return .fromValue(type_name);
                     }
                 }
+                // An empty struct is what an unannotated empty `.{}` types as;
+                // a member access on it (`.push`, `.len`, …) is the classic
+                // "forgot to annotate an empty array" mistake — direct the fix.
+                if (struct_type.fields.len == 0) {
+                    try self.reportSourceError(
+                        source,
+                        Error.NotImplemented,
+                        .@"error",
+                        "cannot access '.{s}' on an empty struct; annotate the element type to make it an array (e.g. `var xs: []T = .{{}}`)",
+                        .{member.member.name},
+                    );
+                    return .fromValue(.void);
+                }
                 try self.reportSourceError(
                     source,
                     Error.NotImplemented,

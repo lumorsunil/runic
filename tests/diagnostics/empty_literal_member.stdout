@@ -1,0 +1,6 @@
+[error]: tests/diagnostics/empty_literal_member.rn:5:9: cannot access '.len' on an empty struct; annotate the element type to make it an array (e.g. `var xs: []T = .{}`)
+   3:# annotation instead of the generic "member not found on struct".
+   4:var xs = .{ }
+   5:echo "${[41m[30mxs.len[0m}"
+   6:
+

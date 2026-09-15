@@ -147,9 +147,10 @@
       an appendable empty array must annotate its element type (`var xs: []T =
       .{}`); empty coerces to an array in an array context (annotation, struct
       field, concat operand)
-  - [ ] error quality: `.push`/`.len`/member access on an unannotated empty
-        struct still reports the generic "member not found" rather than the
-        directed "annotate the element type" hint (only indexing does so far)
+  - [x] error quality: indexing and member access (`.len`, a field) on an
+        unannotated empty struct report the directed "annotate the element type"
+        hint. (`.push`/`.with`/`.slice` are name-resolved array methods that stay
+        permissive on the receiver, so the hint fires at the next read instead.)
 - [ ] tuples: remaining follow-up
   - [ ] make *every* `.{ … }` a tuple (even homogeneous), coercing to `[]T` in
         array contexts — deferred: it broke the empty/homogeneous accumulator
