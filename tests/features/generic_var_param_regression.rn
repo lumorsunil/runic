@@ -1,0 +1,32 @@
+// A `var` parameter of a generic type with an array field (`var b: Box(|T|)`
+// where `Box(T) = struct { items: []T }`) used to crash the compiler: matching
+// the capture against the argument could bind `T` to the bare name `T`, and
+// normalizing that self-referential type recursed until the stack overflowed.
+// The capture-binding and type-normalization now break that self-reference, so
+// reading and mutating the field compiles and runs.
+fn Void @() Void
+
+const Box(T) = struct { items: []T }
+
+// Read a field of a var generic-typed parameter.
+pub fn Void firstOr(b: Box(|T|), fallback: T) T {
+    if (b.items.len > 0) { yield b.items[0] } else { yield fallback }
+}
+
+// Mutate the field in place through a `var` parameter (by reference).
+pub fn Void replaceAll(var b: Box(|T|), x: T) Void {
+    var fresh: []T = .{ }
+    fresh = fresh.push x
+    b.items = fresh
+}
+
+var box = Box(Int){ .items = .{ 10, 20, 30 } }
+echo "first=${firstOr box 0}"
+echo "len=${box.items.len}"
+
+replaceAll box 99
+echo "after=${box.items.len},${box.items[0]}"
+
+// Works for another element type too (compiles the generic once).
+var names = Box(String){ .items = .{ "a", "b" } }
+echo "names=${firstOr names "none"}"

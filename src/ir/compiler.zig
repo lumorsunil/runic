@@ -5780,9 +5780,23 @@ pub const IRCompiler = struct {
         return self.substituteTypeParams(.{ .struct_type = body_st }, params, app.args) catch null;
     }
 
+    /// Whether a type is the bare single-segment name `name` — a capture `T`
+    /// bound to (or normalized toward) an identifier `T` is self-referential and
+    /// must not recurse.
+    fn isBareName(t: ast.TypeExpr, name: []const u8) bool {
+        return switch (t) {
+            .identifier => |id| id.path.segments.len == 1 and std.mem.eql(u8, id.path.segments[0].name, name),
+            .type_capture => |c| std.mem.eql(u8, c.name, name),
+            else => false,
+        };
+    }
+
     fn bindTypeCaptures(self: *IRCompiler, pattern: ast.TypeExpr, subject: ast.TypeExpr) void {
         switch (pattern) {
             .type_capture => |capture| {
+                // Never bind a capture to its own name (`T` ← `T`): that is a
+                // no-op that would make later type normalization recurse forever.
+                if (isBareName(subject, capture.name)) return;
                 self.type_captures.put(self.allocator, capture.name, subject) catch {};
             },
             .array => |a| if (subject == .array) self.bindTypeCaptures(a.element.*, subject.array.element.*),
@@ -5975,7 +5989,12 @@ pub const IRCompiler = struct {
             .identifier => |id| {
                 const segs = id.path.segments;
                 if (segs.len == 1) {
-                    if (self.lookupTypeCapture(segs[0].name)) |bound| return self.normalizeStringTypes(bound);
+                    // A capture bound to its own name is unresolved — treat it as a
+                    // permissive type variable rather than recursing forever.
+                    if (self.lookupTypeCapture(segs[0].name)) |bound| {
+                        if (isBareName(bound, segs[0].name)) return .{ .type_var = .{ .name = segs[0].name, .span = id.span } };
+                        return self.normalizeStringTypes(bound);
+                    }
                     if (std.mem.eql(u8, segs[segs.len - 1].name, "String")) return string_type;
                 }
                 return t;
@@ -5994,7 +6013,10 @@ pub const IRCompiler = struct {
             // concrete binding position resolves it against its initializer
             // via `bindTypeCaptures` before this is consulted.
             .type_capture => |capture| {
-                if (self.lookupTypeCapture(capture.name)) |bound| return self.normalizeStringTypes(bound);
+                if (self.lookupTypeCapture(capture.name)) |bound| {
+                    if (isBareName(bound, capture.name)) return .{ .type_var = .{ .name = capture.name, .span = capture.span } };
+                    return self.normalizeStringTypes(bound);
+                }
                 return .{ .type_var = .{ .name = capture.name, .span = capture.span } };
             },
             // A generic application `Box(Int)` resolves to the constructor's
