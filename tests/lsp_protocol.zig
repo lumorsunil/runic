@@ -2799,6 +2799,78 @@ test "lsp survives out-of-bounds position requests" {
     try std.testing.expect(parsed.value.object.get("result").?.array.items.len >= 1);
 }
 
+test "lsp survives position requests on an empty document" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const uri = try fixture.writeDocument("main.rn", "");
+    defer allocator.free(uri);
+
+    // An empty document put the position→offset scan at offset 0 of a zero-length
+    // buffer; `extractIdentifier` read `text[0]` and crashed the server.
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, ""),
+        try makeHoverRequest(allocator, 2, uri, 0, 0),
+        try makeDefinitionRequest(allocator, 3, uri, 0, 0),
+        try makeDocumentHighlightRequest(allocator, 4, uri, 0, 0),
+        try makeRenameRequest(allocator, 5, uri, 0, 0, "x"),
+        // A later request proves the server stayed alive.
+        try makeDocumentSymbolRequest(allocator, 6, uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    for ([_]i64{ 2, 3, 4, 5, 6 }) |id| {
+        const response = try findResponseById(allocator, output, id);
+        defer allocator.free(response.body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("result") != null);
+    }
+}
+
+test "lsp survives requests on a document with a multibyte identifier" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    // A non-ASCII identifier is a byte the lexer rejects; scanning the whole
+    // document (rename/highlight occurrence search, the import scan for member
+    // completion) used to propagate that error and take the server down.
+    const source =
+        \\const foo = 1
+        \\const 名前 = foo
+        \\echo "${foo}"
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeDocumentHighlightRequest(allocator, 2, uri, 0, 6),
+        try makeRenameRequest(allocator, 3, uri, 0, 6, "bar"),
+        try makeCompletionRequest(allocator, 4, uri, 2, 11),
+        // Still alive afterwards.
+        try makeDocumentSymbolRequest(allocator, 5, uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    for ([_]i64{ 2, 3, 4, 5 }) |id| {
+        const response = try findResponseById(allocator, output, id);
+        defer allocator.free(response.body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("result") != null);
+    }
+}
+
 test "lsp returns method-not-found for an unknown request method" {
     const allocator = std.testing.allocator;
     const request = try toJsonAlloc(allocator, .{

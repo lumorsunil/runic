@@ -642,7 +642,11 @@ pub const Server = struct {
         defer lexer.deinit();
 
         while (true) {
-            const tok = try lexer.next();
+            // A document being edited can hold a byte the lexer rejects (a
+            // multibyte/unicode identifier, a stray control byte); stop scanning
+            // rather than propagating the error and taking down the request —
+            // the occurrences found so far are still returned.
+            const tok = lexer.next() catch break;
             switch (tok.tag) {
                 .identifier => if (std.mem.eql(u8, tok.lexeme, name)) {
                     try ranges.append(self.allocator, types.Range.fromSpan(tok.span));
@@ -719,6 +723,9 @@ pub const Server = struct {
         loc: runic.token.Location,
         text: []const u8,
     ) ?ExtractedIdentifier {
+        // The offset can land at (or past) the end of the text — an empty
+        // document, or a position at EOF — so there is no character to read.
+        if (loc.offset >= text.len) return null;
         const ch = text[loc.offset];
 
         if (!runic.lexer.isIdentifierStart(ch) and !runic.lexer.isIdentifierContinue(ch)) {

@@ -229,22 +229,22 @@ fn appendImportedModuleMembersFromText(
     defer lexer.deinit();
 
     while (true) {
-        const tok = try lexer.next();
+        const tok = lexer.next() catch return;
         switch (tok.tag) {
             .kw_const, .kw_var => {
-                const identifier = try lexer.next();
+                const identifier = lexer.next() catch return;
                 if (identifier.tag != .identifier or !std.mem.eql(u8, identifier.lexeme, object_name)) continue;
-                const assign = try lexer.next();
+                const assign = lexer.next() catch return;
                 if (assign.tag != .assign) continue;
-                const import_kw = try lexer.next();
+                const import_kw = lexer.next() catch return;
                 if (import_kw.tag != .kw_import) continue;
 
-                var next = try lexer.next();
+                var next = lexer.next() catch return;
                 if (next.tag == .l_paren) {
-                    next = try lexer.next();
+                    next = lexer.next() catch return;
                 }
                 if (next.tag != .string_start) continue;
-                const string_text = try lexer.next();
+                const string_text = lexer.next() catch return;
                 if (string_text.tag != .string_text) continue;
 
                 const module_path = runic.document.resolveModulePath(
@@ -323,19 +323,19 @@ fn appendPubModuleDeclsFromFile(
     defer lexer.deinit();
 
     while (true) {
-        const tok = try lexer.next();
+        const tok = lexer.next() catch return;
         if (tok.tag == .eof) return;
         if (tok.tag != .kw_pub) continue;
 
-        const decl_tok = try lexer.next();
+        const decl_tok = lexer.next() catch return;
         switch (decl_tok.tag) {
             .kw_const, .kw_var => {
-                const identifier = try lexer.next();
+                const identifier = lexer.next() catch return;
                 if (identifier.tag != .identifier) continue;
                 try appendOwnedMatch(matches, allocator, .variable, identifier.lexeme, module_path, identifier.span);
             },
             .kw_fn => {
-                const identifier = try lexer.next();
+                const identifier = lexer.next() catch return;
                 if (identifier.tag != .identifier) continue;
                 try appendOwnedMatch(matches, allocator, .function, identifier.lexeme, module_path, identifier.span);
             },
