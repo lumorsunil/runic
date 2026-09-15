@@ -8,7 +8,7 @@ const Entry(K, V) = struct { key: K, value: V }
 const Map(K, V) = struct { entries: []Entry(K, V) }
 
 fn Void mapSet(m: Map(|K|, |V|), key: K, value: V) Map(K, V) {
-    var out = .{ }
+    var out: []Entry(K, V) = .{ }
     var replaced = false
     for (m.entries) |e| {
         if (e.key == key) {

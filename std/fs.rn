@@ -41,7 +41,7 @@ pub fn Void appendText(p: String, content: String) Void {
 // `ls` — entry names of a directory (empty lines dropped).
 pub fn Void listDir(p: String) []String {
   const out: String = "${ls p}"
-  var result = .{ }
+  var result: []String = .{ }
   for (out.split "\n") |line| {
     if (line.len > 0) { result = result.push line }
   }

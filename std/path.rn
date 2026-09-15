@@ -96,7 +96,7 @@ pub fn Void isAbsolute(p: String) Bool {
 pub fn Void normalize(p: String) String {
   const absolute = p.startsWith "/"
   const parts = p.split "/"
-  var stack = .{ }
+  var stack: []String = .{ }
   for (parts) |part| {
     if (part.len == 0) {
       // skip `//` and leading/trailing slashes
@@ -113,7 +113,7 @@ pub fn Void normalize(p: String) String {
               stack = stack.push ".."
             } else {
               // pop the last component
-              var rebuilt = .{ }
+              var rebuilt: []String = .{ }
               for (0..(n - 1)) |i| { rebuilt = rebuilt.push stack[i] }
               stack = rebuilt
             }

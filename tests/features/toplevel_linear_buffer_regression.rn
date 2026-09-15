@@ -8,7 +8,7 @@
 fn Void @() Void
 
 # Range-source loop: build 0..9, sum and spot-check elements.
-var a = .{ }
+var a: []Int = .{ }
 for (0..10) |i| {
   a = a.push (i * i)
 }
@@ -21,14 +21,14 @@ echo "sum=${sum}"
 
 # Array-source loop feeding another linear buffer.
 const words = .{ "a", "b", "c" }
-var joined = .{ }
+var joined: []String = .{ }
 for (words) |w| {
   joined = joined.push w
 }
 echo "joined=${joined[0]}${joined[1]}${joined[2]} n=${joined.len}"
 
 # In-place `.with` element replacement on a linear buffer.
-var b = .{ }
+var b: []Int = .{ }
 for (0..5) |i| {
   b = b.push i
 }

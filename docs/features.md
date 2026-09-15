@@ -112,7 +112,7 @@ A `.{ … }` literal is a **tuple** when its elements have different types and a
 
 ```rn
 var xs = .{ 1, 2, 3 }        // array []Int
-var t  = .{ 1, "hi", point } // tuple (Int, String, Point)
+var t  = .{ 1, "hi", point } // tuple struct { Int, String, Point }
 ```
 
 An array is a single element type; a tuple is an ordered, fixed set of
@@ -132,6 +132,21 @@ const x, y = mixed           // x is an A, y is a B — fields resolve correctly
 Because an array is one type, forcing a heterogeneous tuple into an array
 annotation is an error — `const xs: []Int = .{ 1, "two" }` fails; a homogeneous
 literal coerces fine (`const xs: []Int = .{ 1, 2, 3 }`).
+
+**The empty literal `.{}`** has no element type, so it is an *empty struct* — a
+value you can pass around but not index, iterate, or `.push`. To build an
+appendable array, name the element type with an annotation; the empty struct then
+coerces to the empty array. In an array context (a `[]T` annotation, a struct
+field, or a concat operand) an empty `.{}` counts as an empty array.
+
+```rn
+var xs: []Int = .{ }         // an appendable empty array
+xs = xs.push 10
+const ys = .{ } + .{ 1, 2 }  // empty as a concat operand → []Int
+
+var oops = .{ }              // an empty struct (no element type)
+const first = oops[0]        // error: cannot index an empty struct — annotate it
+```
 
 A tuple type is written `struct { T0, T1, … }` — a struct body with positional
 types and no field names — and can annotate a binding, a function parameter, or

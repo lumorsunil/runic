@@ -14,6 +14,15 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Added
 
+- **The empty literal `.{}` is an empty struct.** With no elements it has no
+  element type, so it is a value you can pass around but not index, iterate, or
+  `.push` — an appendable empty array must name its element type
+  (`var xs: []Int = .{}`), and the empty struct then coerces to the empty array.
+  An empty `.{}` still counts as an empty array in an array context — a `[]T`
+  annotation, a struct field's declared array type, or a concat operand
+  (`.{} + xs`). Indexing an unannotated empty literal reports a directed error
+  pointing at the missing annotation. (Previously an unannotated `.{}` was a
+  permissive "any" array.)
 - **Tuples.** A `.{ … }` literal whose elements have different types is now a
   *tuple* — an ordered, per-position-typed collection — rather than a
   homogenized array; a literal whose elements share one type is still an array

@@ -6,7 +6,7 @@ pub fn Void triple(n: Int) Int { yield n + n + n }
 # A generic pub fn returning an array (`[]|U|`) — the result must stay a real
 # array through the member call, so `.len` and `for` work on it.
 pub fn Void map(xs: []|T|, f: fn(|T|) |U|) []|U| {
-  var result = .{ }
+  var result: []|U| = .{ }
   for (xs) |x| { result = result.push (f x) }
   yield result
 }

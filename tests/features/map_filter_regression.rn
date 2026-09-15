@@ -4,13 +4,13 @@
 fn Void @() Void
 
 fn Void map(xs: []|T|, f: fn(|T|) |U|) []|U| {
-  var result = .{ }
+  var result: []|U| = .{ }
   for (xs) |x| { result = result.push (f x) }
   yield result
 }
 
 fn Void filter(xs: []|T|, keep: fn(|T|) Bool) []|T| {
-  var result = .{ }
+  var result: []|T| = .{ }
   for (xs) |x| { if (keep x) { result = result.push x } }
   yield result
 }

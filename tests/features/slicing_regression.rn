@@ -10,7 +10,7 @@ echo "clamp oob=${(a[2..99]).len} inverted=${(a[3..1]).len}"
 echo "index still=${a[4]}"
 
 // A slice of a var-grown array; element access on the slice result works.
-var xs = .{ }
+var xs: []Int = .{ }
 xs = xs.push 100
 xs = xs.push 200
 xs = xs.push 300

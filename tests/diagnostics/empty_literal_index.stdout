@@ -1,0 +1,6 @@
+[error]: tests/diagnostics/empty_literal_index.rn:5:9: cannot index an empty struct; annotate the element type to make it an array (e.g. `var xs: []T = .{}`)
+   3:# annotation (`var xs: []Int = .{}`) to build an appendable/indexable array.
+   4:var xs = .{ }
+   5:echo "${[41m[30mxs[0m[0]}"
+   6:
+

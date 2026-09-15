@@ -119,6 +119,12 @@ pub fn array_type(element: *const ast.TypeExpr) ast.TypeExpr {
     } };
 }
 
+/// Whether a type is the empty struct `struct {}` — the type of an empty `.{}`
+/// literal, which counts as an empty array in array contexts (e.g. concat).
+fn isEmptyStructType(t: ast.TypeExpr) bool {
+    return t == .struct_type and t.struct_type.fields.len == 0;
+}
+
 /// The compile-time value of a constant integer-literal index expression (`t[2]`),
 /// used to select a tuple position's type. Null for a non-constant (runtime)
 /// index, which keeps the element type permissive.
@@ -9478,18 +9484,25 @@ pub const IRCompiler = struct {
         const right = try self.compileArithmeticOperand(source, binary.right);
 
         // `a + b` on two arrays concatenates them into a new array (a's elements
-        // followed by b's). Scalar `+` falls through to the arithmetic op below.
+        // followed by b's). An empty `.{}` operand (typed as an empty struct)
+        // counts as an empty array, so `.{} + xs` / `xs + .{}` work. Scalar `+`
+        // falls through to the arithmetic op below.
         if (binary.op == .add) {
             const left_is_array = if (left.typeExpr()) |t| t == .array else false;
             const right_is_array = if (right.typeExpr()) |t| t == .array else false;
-            if (left_is_array and right_is_array) {
+            const left_is_empty = if (left.typeExpr()) |t| isEmptyStructType(t) else false;
+            const right_is_empty = if (right.typeExpr()) |t| isEmptyStructType(t) else false;
+            if ((left_is_array or left_is_empty) and (right_is_array or right_is_empty) and (left_is_array or right_is_array)) {
                 const concat_ref = try self.newRef(source, "array_concat_result");
                 try self.addInstruction(.init(.from(source), .{ .array_concat = .{
                     .left = left.source,
                     .right = right.source,
                     .result = concat_ref.dereference(),
                 } }));
-                return .fromLocation(concat_ref.dereference().typed(left.typeExpr().?));
+                // The result's element type comes from whichever operand is a
+                // real array (an empty operand contributes no element type).
+                const result_type = if (left_is_array) left.typeExpr().? else right.typeExpr().?;
+                return .fromLocation(concat_ref.dereference().typed(result_type));
             }
         }
 
@@ -9797,6 +9810,12 @@ pub const IRCompiler = struct {
                 // per-position, so a *constant* index selects that position's type
                 // (a runtime index stays permissive). Both share the slice access
                 // lowering below.
+                // An empty `.{}` is an empty struct; indexing it is the classic
+                // "forgot to annotate an empty array" mistake — report it clearly.
+                if (isEmptyStructType(left_type)) {
+                    try self.reportSourceError(binary.left, Error.UnsupportedBinaryOperation, .@"error", "cannot index an empty struct; annotate the element type to make it an array (e.g. `var xs: []T = .{{}}`)", .{});
+                    return .fromValue(.void);
+                }
                 const element_type: ast.TypeExpr = switch (left_type) {
                     .array => left_type.array.element.*,
                     .tuple => |tuple| blk: {
@@ -9873,6 +9892,18 @@ pub const IRCompiler = struct {
         // type T (the common case), and as a tuple otherwise — so a heterogeneous
         // literal keeps per-position types (needed to destructure it later with
         // the right per-element struct layout). The runtime value is identical.
+        // An empty `.{}` has no element type: it is an empty struct — a value you
+        // can pass around but not operate on. An appendable empty array must name
+        // its element type with an annotation (`var xs: []T = .{}`), which then
+        // drives the binding type. The runtime value is a length-0 slice either way.
+        if (array.elements.len == 0) {
+            return .from(array_ref.dereference().typed(.{ .struct_type = .{
+                .fields = &.{},
+                .decls = &.{},
+                .span = array.span,
+            } }));
+        }
+
         const element_types = try self.allocator.alloc(?ast.TypeExpr, array.elements.len);
         for (array.elements, 0..) |element, idx| {
             const result = try self.compileExpressionWithCapture(source, element);

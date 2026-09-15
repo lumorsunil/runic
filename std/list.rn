@@ -7,14 +7,14 @@ fn Void @() Void
 
 // Each element mapped through `f`.
 pub fn Void map(xs: []|T|, f: fn(|T|) |U|) []|U| {
-  var result = .{ }
+  var result: []|U| = .{ }
   for (xs) |x| { result = result.push (f x) }
   yield result
 }
 
 // Only the elements for which `keep` returns true.
 pub fn Void filter(xs: []|T|, keep: fn(|T|) Bool) []|T| {
-  var result = .{ }
+  var result: []|T| = .{ }
   for (xs) |x| { if (keep x) { result = result.push x } }
   yield result
 }
@@ -75,7 +75,7 @@ pub fn Void contains(xs: []|T|, target: |T|) Bool {
 
 // A reversed copy.
 pub fn Void reverse(xs: []|T|) []|T| {
-  var result = .{ }
+  var result: []|T| = .{ }
   const n = xs.len
   for (0..n) |i| { result = result.push xs[n - 1 - i] }
   yield result
@@ -83,7 +83,7 @@ pub fn Void reverse(xs: []|T|) []|T| {
 
 // `a` followed by `b`.
 pub fn Void concat(a: []|T|, b: []|T|) []|T| {
-  var result = .{ }
+  var result: []|T| = .{ }
   for (a) |x| { result = result.push x }
   for (b) |x| { result = result.push x }
   yield result
@@ -91,7 +91,7 @@ pub fn Void concat(a: []|T|, b: []|T|) []|T| {
 
 // `[start, start+1, …, end-1]` (empty when `end <= start`).
 pub fn Void range(start: Int, end: Int) []Int {
-  var result = .{ }
+  var result: []Int = .{ }
   const n = end - start
   var i = start
   for (0..n) |_| {
@@ -103,9 +103,9 @@ pub fn Void range(start: Int, end: Int) []Int {
 
 // A copy sorted by `lt` (a stable insertion sort: `lt a b` means `a` before `b`).
 pub fn Void sort(xs: []|T|, lt: fn(|T|, |T|) Bool) []|T| {
-  var result = .{ }
+  var result: []|T| = .{ }
   for (xs) |x| {
-    var out = .{ }
+    var out: []|T| = .{ }
     var inserted = false
     for (result) |r| {
       if (inserted) {

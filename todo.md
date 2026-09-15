@@ -143,6 +143,13 @@
       position. (Parens `(T)` stay grouping; a final tuple syntax is still open.)
 - [x] precise element typing for a *constant* index into a tuple (`t[1]` → its
       2nd position's type); a runtime index stays permissive
+- [x] the empty literal `.{}` is an empty struct (pass-around, not operable);
+      an appendable empty array must annotate its element type (`var xs: []T =
+      .{}`); empty coerces to an array in an array context (annotation, struct
+      field, concat operand)
+  - [ ] error quality: `.push`/`.len`/member access on an unannotated empty
+        struct still reports the generic "member not found" rather than the
+        directed "annotate the element type" hint (only indexing does so far)
 - [ ] tuples: remaining follow-up
   - [ ] make *every* `.{ … }` a tuple (even homogeneous), coercing to `[]T` in
         array contexts — deferred: it broke the empty/homogeneous accumulator

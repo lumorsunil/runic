@@ -38,8 +38,9 @@ var as = .{ A{ .a = 4 }, A{ .a = 5 } }
 const p, q = as
 echo "homo-struct=${p.a},${q.a}"
 
-// The empty-literal accumulator idiom is unaffected (stays an array).
-var acc = .{ }
+// An empty-literal accumulator declares its element type (`[]String`); an empty
+// `.{}` on its own is an empty struct, so the annotation makes it an array.
+var acc: []String = .{ }
 acc = acc.push "one"
 acc = acc.push "two"
 echo "acc=${acc[0]},${acc[1]}"

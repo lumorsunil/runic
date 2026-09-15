@@ -4099,6 +4099,14 @@ pub const TypeChecker = struct {
     /// operations (index, `for`, `len`, concat); a null result means the
     /// positions differ, so the element type is left permissive — matching the
     /// (untyped) behavior of an un-annotated literal before tuples existed.
+    /// Whether a type is the empty struct `struct {}` — the type of an empty
+    /// `.{}` literal. Such a value coerces to an empty array of any element type
+    /// but otherwise carries no element type to operate on.
+    fn isEmptyStructType(self: *TypeChecker, type_expr: *const ast.TypeExpr) bool {
+        const t = self.unaliasType(type_expr);
+        return t.* == .struct_type and t.struct_type.fields.len == 0;
+    }
+
     fn tupleElementType(self: *TypeChecker, tuple: ast.TypeExpr.TupleType) ?*const ast.TypeExpr {
         if (tuple.elements.len == 0) return null;
         const first = tuple.elements[0];
@@ -4881,7 +4889,12 @@ pub const TypeChecker = struct {
                     var field_type = field.type_expr;
                     for (expr.struct_literal.fields) |lit_field| {
                         if (std.mem.eql(u8, lit_field.name.name, field.name.name)) {
-                            if (try self.resolveExprType(scope, lit_field.value)) |vt| field_type = vt;
+                            // An empty `.{}` value is an empty struct; keep the
+                            // field's declared type (e.g. `[]Entry`) rather than
+                            // collapsing the field to `struct {}`.
+                            if (try self.resolveExprType(scope, lit_field.value)) |vt| {
+                                if (!self.isEmptyStructType(vt)) field_type = vt;
+                            }
                             break;
                         }
                     }
@@ -4893,11 +4906,24 @@ pub const TypeChecker = struct {
             }
         }
 
+        // An empty `.{}` with no element type is an *empty struct* — a value you
+        // can pass around but not operate on (no element type to index, iterate,
+        // or push). An appendable empty array must say its element type with an
+        // annotation: `var xs: []T = .{}` (the empty struct then coerces to the
+        // empty array — see `validateTypeAssignmentArray`).
+        if (T == *ast.Expression and expr.* == .array and expr.array.elements.len == 0) {
+            return try self.allocTypeExpression(.{ .struct_type = .{
+                .fields = &.{},
+                .decls = &.{},
+                .span = expr.array.span,
+            } });
+        }
+
         // A *heterogeneous* `.{ … }` literal is typed as a tuple, carrying each
         // element's type by position, so it survives being stored in a variable
-        // and later destructured with per-element types. A homogeneous or empty
-        // literal keeps the prior permissive (null) typing — it flows as an array
-        // (accumulators like `var xs = .{}; xs = xs.push …`, yields to `[]T`,
+        // and later destructured with per-element types. A homogeneous literal
+        // keeps the prior permissive (null) typing — it flows as an array (a
+        // homogeneous accumulator like `var xs: []T = .{ 1 }`, yields to `[]T`,
         // coercions) exactly as before. When a heterogeneous tuple is assigned to
         // an array `[]T`, the array-coercion check rejects it (see
         // `validateTypeAssignmentArray`), which is where "an array is one type" is
@@ -5459,6 +5485,10 @@ pub const TypeChecker = struct {
                     try self.validateTypeAssignment(assignee.element, element, options);
                 }
             },
+            // An empty `.{}` is typed as an empty struct; it coerces to an empty
+            // array of any element type (`var xs: []Int = .{}`). A non-empty
+            // struct is not an array.
+            .struct_type => |st| if (st.fields.len != 0) try self.reportAssignmentError(assignee, assignment_type, options),
             else => try self.reportAssignmentError(
                 assignee,
                 assignment_type,
