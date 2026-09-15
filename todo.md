@@ -138,8 +138,9 @@
         mixed types) — a heterogeneous `.{ … }` literal is now a tuple type that
         carries per-position types through a variable, so a struct element keeps
         its fields. A homogeneous literal stays an array `[]T`.
-- [x] tuple type *annotation* syntax `(Int, String)` — annotate a binding,
-      parameter, or return type; `(T)` is grouping; checked position by position
+- [x] tuple type *annotation* syntax `struct { Int, String }` (positional struct
+      body) — annotate a binding, parameter, or return type; checked position by
+      position. (Parens `(T)` stay grouping; a final tuple syntax is still open.)
 - [x] precise element typing for a *constant* index into a tuple (`t[1]` → its
       2nd position's type); a runtime index stays permissive
 - [ ] tuples: remaining follow-up

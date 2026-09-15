@@ -3680,34 +3680,16 @@ pub const Parser = struct {
             .l_bracket => self.parseArrayTypeExpr(),
             // .caret => self.parsePromiseTypeExpr(),
             .question => self.parseOptionalTypeExpr(),
-            .l_paren => self.parseParenTypeExpr(),
+            .l_paren => {
+                // Parentheses in a type position are just grouping — `(T)` is
+                // `T`. (A tuple type is written `struct { T0, T1, … }`.)
+                _ = try self.nextToken();
+                const type_expr = try self.parseTypeExpr();
+                _ = try self.expectTokenTag(.r_paren);
+                return type_expr;
+            },
             else => null,
         };
-    }
-
-    /// Parses a parenthesized type: `(T)` is just `T` (grouping), while
-    /// `(T0, T1, …)` is a tuple type — an ordered, per-position-typed collection.
-    /// `()` is the empty tuple.
-    fn parseParenTypeExpr(self: *Self) Error!?*const ast.TypeExpr {
-        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
-        defer breadcrumb.end();
-
-        const open = try self.expectTokenTag(.l_paren);
-        if ((try self.peekToken()).tag == .r_paren) {
-            const close = try self.expectTokenTag(.r_paren);
-            return try self.allocTypeExpression(.{ .tuple = .{
-                .elements = &.{},
-                .span = open.span.endAt(close.span),
-            } });
-        }
-        const elements = try self.parseList(.comma, parseTypeExprArg, .{});
-        const close = try self.expectTokenTag(.r_paren);
-        // A single parenthesized type is just grouping, not a 1-tuple.
-        if (elements.payload.len == 1) return elements.payload[0];
-        return try self.allocTypeExpression(.{ .tuple = .{
-            .elements = elements.payload,
-            .span = open.span.endAt(close.span),
-        } });
     }
 
     /// Parses a leading-`!` error union (`!T`). The error set is left empty as
@@ -3847,6 +3829,16 @@ pub const Parser = struct {
 
         const start = try self.expectTokenTag(.kw_struct);
         _ = try self.expectTokenTag(.l_brace);
+        self.skipNewlines();
+
+        // Positional (tuple) form `struct { T0, T1, … }` vs named struct
+        // `struct { name: T, … }`: a named field always begins `identifier :`;
+        // anything else begins a bare type, so the body is a tuple. Empty
+        // `struct {}` stays a named (empty) struct.
+        const ahead = try self.peekSlice(2);
+        const is_named = (ahead.len >= 1 and ahead[0].tag == .r_brace) or
+            (ahead.len >= 2 and ahead[0].tag == .identifier and ahead[1].tag == .colon);
+        if (!is_named) return self.parseTupleTypeBody(start);
 
         var fields = std.ArrayList(ast.TypeExpr.StructField).empty;
         defer fields.deinit(self.allocator);
@@ -3882,6 +3874,33 @@ pub const Parser = struct {
                 .span = start.span.endAt(close.span),
             },
         });
+    }
+
+    /// Parses the positional body of a tuple type — `struct { T0, T1, … }` (the
+    /// `struct {` already consumed). Each element is a bare type; there are no
+    /// field names.
+    fn parseTupleTypeBody(self: *Self, start: token.Token) Error!*const ast.TypeExpr {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        var elements = std.ArrayList(*const ast.TypeExpr).empty;
+        defer elements.deinit(self.allocator);
+
+        while (true) {
+            self.skipNewlines();
+            if ((try self.peekToken()).tag == .r_brace) break;
+            const element = try self.parseTypeExpr();
+            try elements.append(self.allocator, element);
+            self.skipNewlines();
+            if ((try self.peekToken()).tag == .comma) _ = try self.nextToken();
+        }
+
+        const close = try self.expectTokenTag(.r_brace);
+
+        return self.allocTypeExpression(.{ .tuple = .{
+            .elements = try self.copyToArena(*const ast.TypeExpr, elements.items),
+            .span = start.span.endAt(close.span),
+        } });
     }
 
     fn parseTypeExpr(self: *Self) Error!*const ast.TypeExpr {

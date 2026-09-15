@@ -25,9 +25,10 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   its fields. Because an array is a single type, forcing a heterogeneous tuple
   into an array annotation (`const xs: []Int = .{ 1, "two" }`) is a compile
   error; a homogeneous literal coerces to `[]T` as before. A tuple type is
-  written `(T0, T1, …)` and can annotate a binding, parameter, or return type (a
-  single `(T)` is grouping); it is checked position by position, so
-  `const t: (Int, String) = .{ 1, 2 }` errors. Indexing a tuple with a *constant*
+  written `struct { T0, T1, … }` (a struct body with positional types and no
+  field names) and can annotate a binding, parameter, or return type; it is
+  checked position by position, so `const t: struct { Int, String } = .{ 1, 2 }`
+  errors. Indexing a tuple with a *constant*
   index has that position's type (`t[0]` is `Int`, `t[1]` is `String`), so a
   method/field on the result resolves; a runtime index stays permissive.
 - **Inferred struct literals.** When the struct type is known from context, a
