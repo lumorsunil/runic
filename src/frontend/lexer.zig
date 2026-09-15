@@ -408,7 +408,10 @@ pub const Lexer = struct {
         const start = self.mark();
 
         {
-            const ch = self.peek().?;
+            // At EOF the string was never closed; the loop below reports the
+            // same, but this immediate-close check runs first — guard it so
+            // lexing a string context at end-of-input doesn't panic on `peek().?`.
+            const ch = self.peek() orelse return Error.UnterminatedString;
             if (ch == '"') {
                 try self.popContext();
                 _ = self.advance();
