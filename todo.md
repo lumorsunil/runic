@@ -273,9 +273,13 @@
       diagnostic-linked quick fix; this also wired up `context.diagnostics` on
       code-action requests (the reliable source, since the server's own
       diagnostics are cleared after each publish)
-- [ ] more diagnostic-linked quick fixes now that `context.diagnostics` is wired
-      (e.g. the empty-literal annotate-element-type hint, the lowercase-type
-      "did you mean" suggestion)
+- [x] code action: change a lowercase type name to its suggested capitalized
+      form (`x: int` → `x: Int`) — driven off the "did you mean …?" diagnostic,
+      and works even when the parse error left no AST (fixes run before the
+      AST-dependent actions). Diagnostic-fix plumbing factored into
+      `appendDiagnosticFixes`.
+  - [ ] the empty-literal "annotate the element type" hint is not offered as a
+        fix: the element type is unknown, so there's nothing complete to insert
 - [x] prepare-rename (validates the target, pre-fills the identifier)
 - [x] completion-resolve: promotes a completion's detail to documentation on focus
 - [x] signature help: shows the callee's `name(p0: T0, …)` signature with the

@@ -297,6 +297,49 @@ test "lsp code action wraps an undeclared uppercase type as a type parameter" {
     try std.testing.expectEqual(@as(i64, 19), edits[1].object.get("range").?.object.get("start").?.object.get("character").?.integer);
 }
 
+test "lsp code action changes a lowercase type to the suggested capitalized one" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    // `int` is a lowercase type name — a parse error; the checker suggests `Int`.
+    // (This exercises the diagnostic-linked path even without a valid AST.)
+    const source =
+        \\fn Void f(x: int) Void { echo "hi" }
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    // `int` is at line 0, characters 13-16.
+    const message = "expected type identifier (did you mean Int?)";
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeCodeActionWithDiagnostic(allocator, 2, uri, 0, 13, 16, message),
+    };
+    defer for (messages) |message_bytes| allocator.free(message_bytes);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    var change: ?std.json.Value = null;
+    for (parsed.value.object.get("result").?.array.items) |a| {
+        if (std.mem.eql(u8, a.object.get("title").?.string, "Change to 'Int'")) change = a;
+    }
+    try std.testing.expect(change != null);
+    const edit = change.?.object.get("edit").?.object.get("documentChanges").?.array
+        .items[0].object.get("edits").?.array.items[0].object;
+    try std.testing.expectEqualStrings("Int", edit.get("newText").?.string);
+    // Replaces the exact `int` range (chars 13-16).
+    try std.testing.expectEqual(@as(i64, 13), edit.get("range").?.object.get("start").?.object.get("character").?.integer);
+    try std.testing.expectEqual(@as(i64, 16), edit.get("range").?.object.get("end").?.object.get("character").?.integer);
+}
+
 test "lsp document symbols nest struct fields and function parameters" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);

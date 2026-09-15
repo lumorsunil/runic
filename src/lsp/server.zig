@@ -1732,17 +1732,21 @@ pub const Server = struct {
             try self.sendJson(types.response(id, std.json.Value{ .null = {} }));
             return;
         };
-        const script = doc.ast orelse {
-            try self.sendJson(types.response(id, &[_]types.CodeAction{}));
-            return;
-        };
-        const module_scope = self.workspace.type_checker.modules.get(path);
-
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const arena_allocator = arena.allocator();
 
         var actions = std.ArrayList(types.CodeAction).empty;
+
+        // Diagnostic-linked quick fixes only need the diagnostics the client
+        // passes back, so they run even when a parse error left no AST.
+        try self.appendDiagnosticFixes(&actions, arena_allocator, params);
+
+        const script = doc.ast orelse {
+            try self.sendJson(types.response(id, actions.items));
+            return;
+        };
+        const module_scope = self.workspace.type_checker.modules.get(path);
 
         // Offer "add the inferred type" for un-annotated top-level bindings whose
         // declaration line falls within the requested range.
@@ -1861,34 +1865,83 @@ pub const Server = struct {
             });
         }
 
-        // Diagnostic-linked quick fix: a bare uppercase type name the checker
-        // flagged as undeclared (its diagnostic suggests writing it as `|T|`).
-        // The client passes the diagnostics overlapping the range in `context`;
-        // the fix wraps the flagged identifier — at the diagnostic's range — in
-        // `|…|`. (The server's own diagnostics are cleared after each publish, so
-        // the request context is the reliable source.)
-        for (params.context.diagnostics) |diagnostic| {
-            if (std.mem.indexOf(u8, diagnostic.message, "write it as |") == null) continue;
-            const name = typeNameFromDiagnostic(diagnostic.message);
-
-            // Insert `|` before and after the identifier (non-overlapping edits).
-            const edits = try arena_allocator.alloc(types.TextEdit, 2);
-            edits[0] = .{ .range = .{ .start = diagnostic.range.start, .end = diagnostic.range.start }, .newText = "|" };
-            edits[1] = .{ .range = .{ .start = diagnostic.range.end, .end = diagnostic.range.end }, .newText = "|" };
-            const changes = try arena_allocator.alloc(types.DocumentChangeOperation, 1);
-            changes[0] = .{ .textDocumentEdit = .{
-                .textDocument = .{ .uri = params.textDocument.uri, .version = null },
-                .edits = edits,
-            } };
-
-            try actions.append(arena_allocator, .{
-                .title = try std.fmt.allocPrint(arena_allocator, "Introduce type parameter |{s}|", .{name}),
-                .kind = "quickfix",
-                .edit = .{ .documentChanges = changes },
-            });
-        }
-
         try self.sendJson(types.response(id, actions.items));
+    }
+
+    /// Appends quick fixes keyed off the diagnostics the client passes back in
+    /// the code-action request (the reliable source, since the server clears its
+    /// own diagnostics after each publish). These need only the diagnostic's
+    /// range and message, so they work even without an AST (a parse error).
+    fn appendDiagnosticFixes(
+        self: *Server,
+        actions: *std.ArrayList(types.CodeAction),
+        arena: Allocator,
+        params: types.CodeActionParams,
+    ) !void {
+        for (params.context.diagnostics) |diagnostic| {
+            // "type 'T' is not declared … write it as |T|" — wrap the identifier
+            // in `|…|` (two non-overlapping inserts at the diagnostic's range).
+            if (std.mem.indexOf(u8, diagnostic.message, "write it as |") != null) {
+                const name = typeNameFromDiagnostic(diagnostic.message);
+                const edits = try arena.alloc(types.TextEdit, 2);
+                edits[0] = .{ .range = .{ .start = diagnostic.range.start, .end = diagnostic.range.start }, .newText = "|" };
+                edits[1] = .{ .range = .{ .start = diagnostic.range.end, .end = diagnostic.range.end }, .newText = "|" };
+                try self.appendEditAction(
+                    actions,
+                    arena,
+                    params.textDocument.uri,
+                    try std.fmt.allocPrint(arena, "Introduce type parameter |{s}|", .{name}),
+                    edits,
+                );
+                continue;
+            }
+
+            // "expected type identifier (did you mean Int?)" — a lowercase type
+            // name; replace it (at the diagnostic's range) with the suggestion.
+            if (suggestionFromDiagnostic(diagnostic.message, "did you mean ")) |suggestion| {
+                const edits = try arena.alloc(types.TextEdit, 1);
+                edits[0] = .{ .range = diagnostic.range, .newText = suggestion };
+                try self.appendEditAction(
+                    actions,
+                    arena,
+                    params.textDocument.uri,
+                    try std.fmt.allocPrint(arena, "Change to '{s}'", .{suggestion}),
+                    edits,
+                );
+                continue;
+            }
+        }
+    }
+
+    /// Appends a "quickfix" code action carrying a single-document text edit.
+    fn appendEditAction(
+        _: *Server,
+        actions: *std.ArrayList(types.CodeAction),
+        arena: Allocator,
+        uri: []const u8,
+        title: []const u8,
+        edits: []types.TextEdit,
+    ) !void {
+        const changes = try arena.alloc(types.DocumentChangeOperation, 1);
+        changes[0] = .{ .textDocumentEdit = .{
+            .textDocument = .{ .uri = uri, .version = null },
+            .edits = edits,
+        } };
+        try actions.append(arena, .{
+            .title = title,
+            .kind = "quickfix",
+            .edit = .{ .documentChanges = changes },
+        });
+    }
+
+    /// The text a "… {marker}X?" diagnostic suggests — between `marker` and the
+    /// next `?` (or end). Null when the marker is absent.
+    fn suggestionFromDiagnostic(message: []const u8, marker: []const u8) ?[]const u8 {
+        const at = std.mem.indexOf(u8, message, marker) orelse return null;
+        const rest = message[at + marker.len ..];
+        const end = std.mem.indexOfScalar(u8, rest, '?') orelse rest.len;
+        if (end == 0) return null;
+        return rest[0..end];
     }
 
     fn handleWorkspaceSymbol(
