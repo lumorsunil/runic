@@ -47,6 +47,17 @@ A cycle of feature work and engineering-health work:
   `||=`/`&&=`; array/string slicing; hex/octal/binary literals; `$(a; b)`
   subshell statement sequences; a bare `&0` pipeline stage that forwards stdin;
   `parseBool`; unary-prefix-after-binary parsing.
+- **Language (random-fixes cycle):** tuple/record **destructuring** in bindings
+  (nested, and heterogeneous over an array literal); **inferred struct literals**
+  (`.{ .x = 3 }` typed from a binding annotation, a call argument, a return type,
+  a struct field, or an array element); **tuples** — a heterogeneous `.{ … }` is
+  an ordered per-position-typed collection (annotated `struct { A, B }`, with
+  constant-index precision) while a homogeneous one stays an array; the empty
+  `.{}` is an empty struct (appendable arrays annotate their element type);
+  requiring `|T|` to introduce a generic type variable (a bare unknown uppercase
+  type name is now an error); `break`/`continue`; string indexing; array `+`
+  concat. Plus a batch of FFI/value-capture fixes and a compiler crash fix
+  (self-referential type capture on a generic `var` parameter).
 - **Diagnostics:** top-level parser error recovery (report multiple errors per
   parse); clear diagnostics for unterminated strings/block comments;
   `command not found: '<name>'` instead of a bare `FileNotFound`.
@@ -129,10 +140,10 @@ surface predictable and regression-tested.
 
 ### 2. Typed dataflow and error model
 
-Two related language directions. Typed pipes have **landed** (0.2.0); the error
-model is the remaining planned direction, and the two are coupled because both
-shape how command output, function output, and failures are represented in the
-type system.
+Two related language directions, **both landed**: typed pipes (0.2.0) and the
+error model (0.4.0). They were coupled because both shape how command output,
+function output, and failures are represented in the type system. What remains in
+this theme is a handful of small follow-ups (below), not new model work.
 
 #### Typed pipes — landed (0.2.0)
 
@@ -168,23 +179,39 @@ Remaining follow-ups (smaller than the feature itself):
 - an untyped function parameter errors with a rough `error.TypeNotFound`
   ("Type checker failed to run") rather than a clean, located diagnostic.
 
-#### Error handling
+#### Error handling — landed (0.4.0)
 
-Planned direction:
+A Zig-like error model for both values and types shipped in 0.4.0 and is covered
+by the `error_*` regression suite. Delivered:
 
-- move toward a Zig-like error model for both values and types
-- support explicit error-set/error-union usage in bindings and function return
-  types
-- add `catch` and `try` semantics that work naturally with command and function
-  expressions
-- define how executable calls surface their inherent failure model, likely as a
-  built-in error-union boundary such as `ExecutableError!String`
-- support inference of error-union types where the implementation can determine
-  them safely
+- `error { Variant, Variant: PayloadType }` sets, `E!T` error unions, and a
+  leading `!T` whose set is **inferred** from the body;
+- explicit error-set/error-union usage in bindings and function return types;
+- `catch` / `catch |err|` handlers, `||` (catch-and-discard), and `try`
+  (re-yield to propagate), with a **superset check** on what `try` propagates;
+- **mandatory handling** — an error that is neither caught nor propagated is a
+  compile error (commands keep the implicit exit-code model);
+- executable calls surface as `ExecutableError!String`; `parseInt`/`parseFloat`
+  return `ParseError!Int`/`ParseError!Float`;
+- `match` on an error value with payload capture, **exhaustiveness** checking,
+  and paren-less / bare-body case syntax;
+- error-set **merge** (`A || B`), pipeline `pipefail`-style errors, and
+  in-process preservation of the structured error value across the call boundary
+  (so `catch`/`match`/`try`/`||` see the real variant, not flattened text).
 
-This work should be coordinated with typed pipes because both features change
-how command output, function output, and failures are represented in the type
-system.
+Spec: `future/error-handling.md`; implementation record: `error-handling-plan.md`
+(+ `pipeline-errors-plan.md`); showcase: `examples/error_handling.rn`.
+
+Remaining follow-ups (small; none block the language surface):
+
+- **LSP** hover/completion for error sets and their variants — deferred as a
+  separate subsystem (see Theme 5);
+- a **cross-process** error wire format — external programs carry only exit code
+  + bytes (i.e. `ExecutableError`); a real serialized error boundary is a
+  separate, larger effort;
+- inferred-set collection has a couple of niche edges (a mid-*stream* error in a
+  multi-value pipeline isn't guaranteed first; a bare mid-transform pipeline
+  isn't enforcement-flagged).
 
 ### 3. Core language growth
 

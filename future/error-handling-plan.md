@@ -232,7 +232,7 @@ Goal: dispatch on error variants, capturing payloads (spec lines 73-80).
 - [ ] LSP hover/completion for error sets & variants — **deferred** (separate subsystem; not required for the language surface).
 - [x] Full CI green: `zig build run -- scripts/run_ci.rn` (formatter, linter, unit tests, 83 CLI smoke scripts).
 
-**Status / Notes:** ✅ Complete (LSP polish deferred). Exposed and documented backlog item 15 (stack-counter drift when sequencing capture-binding error constructs) — a real robustness bug to fix next.
+**Status / Notes:** ✅ Complete (LSP polish deferred — the one remaining open item, backlog 232). Backlog item 15 (stack-counter drift when sequencing capture-binding error constructs), flagged here as "to fix next", was subsequently fixed (see backlog item 15). The whole error-handling backlog (items 1–18) is now resolved; the only open error-handling work is LSP hover/completion for error sets & variants.
 
 ---
 
