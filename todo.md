@@ -254,10 +254,10 @@
 - [x] workspace symbol search
 - [x] add support for document links
 - [x] `.sym_link` entries in module-path completion (follows the link's target)
-- [ ] document symbols for destructuring patterns — the parser now supports
-      tuple (`const a, b = …`) and record (`const { x, y } = …`) binding
-      destructuring; the LSP symbol/completion walkers can now surface each
-      destructured name (currently they treat the binding as one node)
+- [x] document symbols for destructuring patterns — the outline now surfaces
+      each name a tuple (`const a, b = …`) or record (`const { x, y } = …`)
+      binding introduces, recursing through nested patterns and rebindings, and
+      skipping `_` discards
 - [x] inlay hints: inferred types after un-annotated bindings (`const x«: Int»`)
 - [x] inlay hints: parameter-name hints before call arguments (top-level and
       binding-initializer calls to same-file functions)

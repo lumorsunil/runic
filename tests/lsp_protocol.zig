@@ -150,6 +150,59 @@ test "lsp document symbols include top-level functions" {
     try std.testing.expectEqual(@as(?i64, 12), greet_kind);
 }
 
+test "lsp document symbols surface destructured binding names" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    // Tuple, record (with a rebinding), a `_` discard, and a nested pattern.
+    const source =
+        \\const P = struct { x: Int, y: Int }
+        \\const a, b = .{ 1, 2 }
+        \\const { x, y: height } = P{ .x = 1, .y = 2 }
+        \\const first, _, third = .{ 7, 8, 9 }
+        \\const { x: (nx) }, rest = .{ P{ .x = 5, .y = 6 }, 9 }
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeDocumentSymbolRequest(allocator, 2, uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const syms = parsed.value.object.get("result").?.array.items;
+    const want = [_][]const u8{ "a", "b", "x", "height", "first", "third", "nx", "rest" };
+    var seen = [_]bool{false} ** want.len;
+    var saw_discard = false;
+    for (syms) |s| {
+        const name = s.object.get("name").?.string;
+        if (std.mem.eql(u8, name, "_")) saw_discard = true;
+        for (want, &seen) |w, *hit| {
+            if (std.mem.eql(u8, name, w)) hit.* = true;
+        }
+    }
+    for (seen, want) |hit, w| {
+        if (!hit) {
+            std.debug.print("missing destructured symbol: {s}\n", .{w});
+            return error.MissingSymbol;
+        }
+    }
+    // A `_` discard binds nothing, so it must not appear.
+    try std.testing.expect(!saw_discard);
+}
+
 test "lsp document symbols nest struct fields and function parameters" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
