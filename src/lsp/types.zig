@@ -110,6 +110,7 @@ pub const ClientRequestPayload = union(enum) {
     @"textDocument/completion": CompletionParams,
     @"completionItem/resolve": std.json.Value,
     @"textDocument/hover": HoverParams,
+    @"textDocument/signatureHelp": SignatureHelpParams,
     @"textDocument/definition": DefinitionParams,
     @"textDocument/references": ReferenceParams,
     @"textDocument/documentHighlight": DocumentHighlightParams,
@@ -198,6 +199,30 @@ pub const HoverParams = struct {
 
     /// The position inside the text document.
     position: Position,
+};
+
+pub const SignatureHelpParams = struct {
+    textDocument: TextDocumentIdentifier,
+    position: Position,
+};
+
+pub const ParameterInformation = struct {
+    /// The parameter's label as it appears within the signature's `label`.
+    label: []const u8,
+};
+
+pub const SignatureInformation = struct {
+    /// The full signature label, e.g. `greet(name: String, times: Int)`.
+    label: []const u8,
+    parameters: []const ParameterInformation,
+    /// The parameter being entered (0-based), within `parameters`.
+    activeParameter: ?u32 = null,
+};
+
+pub const SignatureHelp = struct {
+    signatures: []const SignatureInformation,
+    activeSignature: ?u32 = 0,
+    activeParameter: ?u32 = null,
 };
 
 pub const DefinitionParams = struct {

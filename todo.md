@@ -269,6 +269,9 @@
 - [ ] more code actions / quick fixes (add missing import, remove unused, etc.)
 - [x] prepare-rename (validates the target, pre-fills the identifier)
 - [x] completion-resolve: promotes a completion's detail to documentation on focus
+- [x] signature help: shows the callee's `name(p0: T0, …)` signature with the
+      parameter being entered highlighted (same-file top-level functions and
+      imported-module functions; innermost call at the cursor)
 - [ ] call hierarchy
 - [ ] richer/robust formatting (current formatter is minimal)
 

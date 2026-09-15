@@ -188,6 +188,10 @@ pub const Server = struct {
                 if (request.id) |id| try self.handleCompletionResolve(id, item);
                 return true;
             },
+            .@"textDocument/signatureHelp" => |params| {
+                if (request.id) |id| try self.handleSignatureHelp(id, params);
+                return true;
+            },
             .@"textDocument/hover" => |params| {
                 if (request.id) |id| {
                     try self.handleHover(id, params);
@@ -1486,6 +1490,192 @@ pub const Server = struct {
         return null;
     }
 
+    /// Signature help for the call the cursor is inside: shows the callee's
+    /// signature (a same-file top-level function, or an imported module
+    /// function) with the parameter being entered highlighted.
+    fn handleSignatureHelp(self: *Server, id: types.RequestId, params: types.SignatureHelpParams) !void {
+        const null_result = types.response(id, std.json.Value{ .null = {} });
+        const path = try self.resolveUriPath(params.textDocument.uri);
+        defer self.allocator.free(path);
+
+        const doc = self.documents.get(params.textDocument.uri) orelse return self.sendJson(null_result);
+        const script = doc.ast orelse return self.sendJson(null_result);
+        const offset = params.position.findIndex(doc.text) orelse return self.sendJson(null_result);
+
+        // The innermost call whose span contains the cursor.
+        const call: *const runic.ast.CallExpr = blk: {
+            for (script.statements) |stmt| {
+                if (findCallInStmt(stmt, offset)) |c| break :blk c;
+            }
+            return self.sendJson(null_result);
+        };
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
+        // A callee name -> declaration map (a call to a function declared later
+        // still resolves), mirroring the inlay-hint path.
+        var fn_decls = std.StringHashMap(runic.ast.FunctionDecl).init(aa);
+        for (script.statements) |stmt| switch (stmt.*) {
+            .expression => |es| switch (es.expression.*) {
+                .fn_decl => |fn_decl| if (fn_decl.name) |n| try fn_decls.put(n.name, fn_decl),
+                else => {},
+            },
+            else => {},
+        };
+        var dummy_hints = std.ArrayList(types.InlayHint).empty;
+        const ctx = CallHintCtx{
+            .arena = aa,
+            .hints = &dummy_hints,
+            .fn_decls = &fn_decls,
+            .range = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 0 } },
+            .scope = self.workspace.type_checker.modules.get(path),
+        };
+        const fn_params = self.resolveCallParams(ctx, call.*) orelse return self.sendJson(null_result);
+
+        const callee_name: []const u8 = switch (call.callee.*) {
+            .identifier => |i| i.name,
+            .binary => |b| if (b.right.* == .identifier) b.right.identifier.name else "fn",
+            else => "fn",
+        };
+
+        // Build `name(p0: T0, p1: T1, …)`; each parameter's label is its own
+        // `p: T` fragment (used to highlight the active parameter).
+        var param_infos = std.ArrayList(types.ParameterInformation).empty;
+        var label = std.Io.Writer.Allocating.init(aa);
+        try label.writer.print("{s}(", .{callee_name});
+        for (fn_params, 0..) |p, i| {
+            if (i > 0) try label.writer.writeAll(", ");
+            const frag = try paramLabel(aa, p);
+            try label.writer.writeAll(frag);
+            try param_infos.append(aa, .{ .label = frag });
+        }
+        try label.writer.writeByte(')');
+
+        const active: u32 = if (fn_params.len == 0)
+            0
+        else
+            @intCast(@min(activeArgIndex(call.*, offset), fn_params.len - 1));
+
+        const signature = types.SignatureInformation{
+            .label = label.written(),
+            .parameters = param_infos.items,
+            .activeParameter = active,
+        };
+        try self.sendJson(types.response(id, types.SignatureHelp{
+            .signatures = &.{signature},
+            .activeSignature = 0,
+            .activeParameter = active,
+        }));
+    }
+
+    /// A parameter's `name: Type` label (just `name` when it has no annotation).
+    fn paramLabel(arena: Allocator, param: *const runic.ast.Parameter) ![]const u8 {
+        const name = switch (param.pattern.*) {
+            .identifier => |identifier| identifier.name,
+            else => "_",
+        };
+        if (param.type_annotation) |t| {
+            return std.fmt.allocPrint(arena, "{s}: {f}", .{ name, t });
+        }
+        return arena.dupe(u8, name);
+    }
+
+    /// Which parameter the cursor is entering: the argument it sits within, or
+    /// the next slot when it sits past a completed argument.
+    fn activeArgIndex(call: runic.ast.CallExpr, offset: usize) usize {
+        var active: usize = 0;
+        for (call.arguments, 0..) |arg, i| {
+            const span = arg.span();
+            if (offset > span.end.offset) {
+                active = i + 1;
+            } else if (offset >= span.start.offset) {
+                return i;
+            } else {
+                break;
+            }
+        }
+        return active;
+    }
+
+    fn spanHasOffset(span: runic.ast.Span, offset: usize) bool {
+        return offset >= span.start.offset and offset <= span.end.offset;
+    }
+
+    /// The innermost call expression whose span contains `offset`, searching a
+    /// statement's sub-expressions (children first, so a nested call wins).
+    fn findCallInStmt(stmt: *const runic.ast.Statement, offset: usize) ?*const runic.ast.CallExpr {
+        return switch (stmt.*) {
+            .expression => |es| findCallInExpr(es.expression, offset),
+            .binding_decl => |bd| findCallInExpr(bd.initializer, offset),
+            .yield_stmt => |ys| findCallInExpr(ys.value, offset),
+            .exit_stmt => |xs| if (xs.value) |v| findCallInExpr(v, offset) else null,
+            .while_stmt => |ws| blk: {
+                if (findCallInExpr(ws.condition, offset)) |c| break :blk c;
+                for (ws.body.statements) |s| if (findCallInStmt(s, offset)) |c| break :blk c;
+                break :blk null;
+            },
+            else => null,
+        };
+    }
+
+    fn findCallInExpr(expr: *const runic.ast.Expression, offset: usize) ?*const runic.ast.CallExpr {
+        if (expr.* == .call) {
+            const call = &expr.call;
+            for (call.arguments) |arg| if (findCallInExpr(arg, offset)) |c| return c;
+            if (findCallInExpr(call.callee, offset)) |c| return c;
+            if (spanHasOffset(call.span, offset)) return call;
+            return null;
+        }
+        switch (expr.*) {
+            .pipeline => |p| for (p.stages) |s| {
+                if (findCallInExpr(s, offset)) |c| return c;
+            },
+            .binary => |b| {
+                if (findCallInExpr(b.left, offset)) |c| return c;
+                if (findCallInExpr(b.right, offset)) |c| return c;
+            },
+            .unary => |u| return findCallInExpr(u.operand, offset),
+            .assignment => |a| return findCallInExpr(a.expr, offset),
+            .block => |b| for (b.statements) |s| {
+                if (findCallInStmt(s, offset)) |c| return c;
+            },
+            .fn_decl => |fd| return findCallInExpr(fd.body, offset),
+            .if_expr => |i| return findCallInIf(&i, offset),
+            .for_expr => |f| {
+                for (f.sources) |s| if (findCallInExpr(s, offset)) |c| return c;
+                return findCallInExpr(f.body, offset);
+            },
+            .match_expr => |m| {
+                if (findCallInExpr(m.subject, offset)) |c| return c;
+                for (m.cases) |cs| for (cs.body.statements) |s| {
+                    if (findCallInStmt(s, offset)) |c| return c;
+                };
+            },
+            .literal => |lit| switch (lit) {
+                .string => |s| for (s.segments) |seg| switch (seg) {
+                    .interpolation => |e| if (findCallInExpr(e, offset)) |c| return c,
+                    else => {},
+                },
+                else => {},
+            },
+            else => {},
+        }
+        return null;
+    }
+
+    fn findCallInIf(if_expr: *const runic.ast.IfExpr, offset: usize) ?*const runic.ast.CallExpr {
+        if (findCallInExpr(if_expr.condition, offset)) |c| return c;
+        if (findCallInExpr(if_expr.then_expr, offset)) |c| return c;
+        if (if_expr.else_branch) |else_branch| switch (else_branch) {
+            .expr => |e| return findCallInExpr(e, offset),
+            .if_expr => |nested| return findCallInIf(nested, offset),
+            .condition => {},
+        };
+        return null;
+    }
+
     fn handleFoldingRange(
         self: *Server,
         id: types.RequestId,
@@ -1921,6 +2111,12 @@ pub const Server = struct {
                         .workDoneProgress = false,
                     },
                 } },
+                // Runic calls are space-separated (`f a b`), and `(` opens a
+                // parenthesized argument — trigger help on both.
+                .signatureHelpProvider = .{
+                    .triggerCharacters = &.{ " ", "(" },
+                    .retriggerCharacters = &.{ " ", "," },
+                },
                 .definitionProvider = .{ .payload = .{
                     .definitionOptions = .{
                         .workDoneProgress = false,

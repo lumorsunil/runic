@@ -203,6 +203,55 @@ test "lsp document symbols surface destructured binding names" {
     try std.testing.expect(!saw_discard);
 }
 
+test "lsp signature help shows the callee signature and active parameter" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\fn Void greet(name: String, times: Int) Void { echo "${name}" }
+        \\greet "hi" 3
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        // Cursor inside the first argument ("hi") on line 1.
+        try makeSignatureHelpRequest(allocator, 2, uri, 1, 7),
+        // Cursor on the second argument (3).
+        try makeSignatureHelpRequest(allocator, 3, uri, 1, 11),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    // First arg -> the label lists both params and the active one is 0.
+    {
+        const response = try findResponseById(allocator, output, 2);
+        defer allocator.free(response.body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        const result = parsed.value.object.get("result").?.object;
+        const sig = result.get("signatures").?.array.items[0].object;
+        const label = sig.get("label").?.string;
+        try std.testing.expect(std.mem.indexOf(u8, label, "name: String") != null);
+        try std.testing.expect(std.mem.indexOf(u8, label, "times: Int") != null);
+        try std.testing.expectEqual(@as(i64, 0), result.get("activeParameter").?.integer);
+    }
+    // Second arg -> active parameter advances to 1.
+    {
+        const response = try findResponseById(allocator, output, 3);
+        defer allocator.free(response.body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        const result = parsed.value.object.get("result").?.object;
+        try std.testing.expectEqual(@as(i64, 1), result.get("activeParameter").?.integer);
+    }
+}
+
 test "lsp document symbols nest struct fields and function parameters" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
@@ -3742,6 +3791,24 @@ fn makeDefinitionRequest(
                 .line = line,
                 .character = character,
             },
+        },
+    });
+}
+
+fn makeSignatureHelpRequest(
+    allocator: Allocator,
+    id: i64,
+    uri: []const u8,
+    line: u32,
+    character: u32,
+) ![]u8 {
+    return toJsonAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .id = id,
+        .method = "textDocument/signatureHelp",
+        .params = .{
+            .textDocument = .{ .uri = uri },
+            .position = .{ .line = line, .character = character },
         },
     });
 }
