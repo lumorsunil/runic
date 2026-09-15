@@ -278,11 +278,24 @@ pub const FoldingRangeParams = struct {
     textDocument: TextDocumentIdentifier,
 };
 
+/// A diagnostic as the client passes it back in a code-action request. Only the
+/// fields we key quick fixes off are declared; the rest are ignored on parse.
+pub const ClientDiagnostic = struct {
+    range: Range,
+    message: []const u8 = "",
+};
+
+pub const CodeActionContext = struct {
+    /// The diagnostics overlapping the requested range — the source for
+    /// diagnostic-linked quick fixes.
+    diagnostics: []const ClientDiagnostic = &.{},
+};
+
 pub const CodeActionParams = struct {
     textDocument: TextDocumentIdentifier,
     /// The range the action is requested for (the selection or cursor line).
     range: Range,
-    // `context` (diagnostics, requested kinds) is ignored for now.
+    context: CodeActionContext = .{},
 };
 
 /// A code action offered for a range — currently only edit-carrying quick fixes

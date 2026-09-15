@@ -252,6 +252,51 @@ test "lsp signature help shows the callee signature and active parameter" {
     }
 }
 
+test "lsp code action wraps an undeclared uppercase type as a type parameter" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    // `T` is an undeclared uppercase type; the checker flags it and suggests
+    // writing it as `|T|`. The client passes that diagnostic back in context.
+    const source =
+        \\fn Void map(xs: []T) []T { yield xs }
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    // The `T` in `[]T` is at line 0, characters 18-19.
+    const message = "type 'T' is not declared (to introduce a generic type parameter, write it as |T|)";
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeCodeActionWithDiagnostic(allocator, 2, uri, 0, 18, 19, message),
+    };
+    defer for (messages) |message_bytes| allocator.free(message_bytes);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    var wrap: ?std.json.Value = null;
+    for (parsed.value.object.get("result").?.array.items) |a| {
+        if (std.mem.eql(u8, a.object.get("title").?.string, "Introduce type parameter |T|")) wrap = a;
+    }
+    try std.testing.expect(wrap != null);
+    // Two inserts of `|`: one at the start of `T`, one at its end.
+    const edits = wrap.?.object.get("edit").?.object.get("documentChanges").?.array
+        .items[0].object.get("edits").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), edits.len);
+    try std.testing.expectEqualStrings("|", edits[0].object.get("newText").?.string);
+    try std.testing.expectEqualStrings("|", edits[1].object.get("newText").?.string);
+    try std.testing.expectEqual(@as(i64, 18), edits[0].object.get("range").?.object.get("start").?.object.get("character").?.integer);
+    try std.testing.expectEqual(@as(i64, 19), edits[1].object.get("range").?.object.get("start").?.object.get("character").?.integer);
+}
+
 test "lsp document symbols nest struct fields and function parameters" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
@@ -3764,6 +3809,33 @@ fn makeCodeActionRequest(allocator: Allocator, id: i64, uri: []const u8, line: u
                 .end = .{ .line = line, .character = 0 },
             },
             .context = .{ .diagnostics = .{} },
+        },
+    });
+}
+
+/// A code-action request carrying one diagnostic in `context` (as a client
+/// passes back a diagnostic it received) over the given identifier range.
+fn makeCodeActionWithDiagnostic(
+    allocator: Allocator,
+    id: i64,
+    uri: []const u8,
+    line: u32,
+    char_start: u32,
+    char_end: u32,
+    message: []const u8,
+) ![]u8 {
+    const range = .{
+        .start = .{ .line = line, .character = char_start },
+        .end = .{ .line = line, .character = char_end },
+    };
+    return toJsonAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .id = id,
+        .method = "textDocument/codeAction",
+        .params = .{
+            .textDocument = .{ .uri = uri },
+            .range = range,
+            .context = .{ .diagnostics = .{.{ .range = range, .message = message }} },
         },
     });
 }

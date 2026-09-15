@@ -1711,6 +1711,15 @@ pub const Server = struct {
         try self.sendJson(types.response(id, ranges.items));
     }
 
+    /// The type name a "type 'X' is not declared …" diagnostic names — the text
+    /// between the first pair of single quotes (falls back to "T").
+    fn typeNameFromDiagnostic(message: []const u8) []const u8 {
+        const open = std.mem.indexOfScalar(u8, message, '\'') orelse return "T";
+        const rest = message[open + 1 ..];
+        const close = std.mem.indexOfScalar(u8, rest, '\'') orelse return "T";
+        return rest[0..close];
+    }
+
     fn handleCodeAction(
         self: *Server,
         id: types.RequestId,
@@ -1817,6 +1826,33 @@ pub const Server = struct {
 
             try actions.append(arena_allocator, .{
                 .title = try std.fmt.allocPrint(arena_allocator, "Remove unused '{s}'", .{identifier.name}),
+                .kind = "quickfix",
+                .edit = .{ .documentChanges = changes },
+            });
+        }
+
+        // Diagnostic-linked quick fix: a bare uppercase type name the checker
+        // flagged as undeclared (its diagnostic suggests writing it as `|T|`).
+        // The client passes the diagnostics overlapping the range in `context`;
+        // the fix wraps the flagged identifier — at the diagnostic's range — in
+        // `|…|`. (The server's own diagnostics are cleared after each publish, so
+        // the request context is the reliable source.)
+        for (params.context.diagnostics) |diagnostic| {
+            if (std.mem.indexOf(u8, diagnostic.message, "write it as |") == null) continue;
+            const name = typeNameFromDiagnostic(diagnostic.message);
+
+            // Insert `|` before and after the identifier (non-overlapping edits).
+            const edits = try arena_allocator.alloc(types.TextEdit, 2);
+            edits[0] = .{ .range = .{ .start = diagnostic.range.start, .end = diagnostic.range.start }, .newText = "|" };
+            edits[1] = .{ .range = .{ .start = diagnostic.range.end, .end = diagnostic.range.end }, .newText = "|" };
+            const changes = try arena_allocator.alloc(types.DocumentChangeOperation, 1);
+            changes[0] = .{ .textDocumentEdit = .{
+                .textDocument = .{ .uri = params.textDocument.uri, .version = null },
+                .edits = edits,
+            } };
+
+            try actions.append(arena_allocator, .{
+                .title = try std.fmt.allocPrint(arena_allocator, "Introduce type parameter |{s}|", .{name}),
                 .kind = "quickfix",
                 .edit = .{ .documentChanges = changes },
             });
