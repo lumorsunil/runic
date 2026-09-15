@@ -58,7 +58,10 @@ pub const Lexer = struct {
             }
 
             pub fn dec(self: *@This(), comptime ctType: CounterType) void {
-                self.field(ctType).* -= 1;
+                // A stray closing delimiter (`)`/`]`/`}` with no matching open, as
+                // in a document being edited) must not underflow the unsigned
+                // counter and panic — clamp at zero.
+                self.field(ctType).* -|= 1;
             }
 
             pub fn canEnd(self: @This()) bool {
