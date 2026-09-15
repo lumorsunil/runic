@@ -483,12 +483,13 @@ pub const TypeExpr = union(enum) {
         span: Span,
 
         pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
-            try writer.writeByte('(');
+            // Matches the surface syntax: a tuple type is a positional struct body.
+            try writer.writeAll("struct { ");
             for (self.elements, 0..) |element, i| {
                 if (i > 0) try writer.writeAll(", ");
                 try element.format(writer);
             }
-            try writer.writeByte(')');
+            try writer.writeAll(" }");
         }
     };
 
