@@ -1600,6 +1600,47 @@ test "lsp code action removes an unused binding but not a used one" {
     }
 }
 
+test "lsp code action offers remove-all for multiple unused bindings" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\const keep = 1
+        \\const d1 = 2
+        \\const d2 = 3
+        \\echo "${keep}"
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeCodeActionRequest(allocator, 2, uri, 1),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    var all: ?std.json.Value = null;
+    for (parsed.value.object.get("result").?.array.items) |a| {
+        const title = a.object.get("title").?.string;
+        if (std.mem.startsWith(u8, title, "Remove all unused bindings")) all = a;
+    }
+    try std.testing.expect(all != null);
+    // Two unused bindings (d1, d2) -> two delete edits; `keep` is untouched.
+    const edits = all.?.object.get("edit").?.object.get("documentChanges").?.array
+        .items[0].object.get("edits").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), edits.len);
+}
+
 test "lsp folding ranges cover multi-line statements" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);

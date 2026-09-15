@@ -267,9 +267,15 @@
 - [x] folding ranges (multi-line statements: functions, structs, control flow)
 - [x] code action: add an inferred type annotation to an un-annotated binding
 - [x] code action: remove an unused top-level binding/import (offered only when
-      the name is lexically unreferenced — conservative, never a false positive)
-- [ ] more code actions / quick fixes (add missing import, and diagnostic-linked
-      fixes like the annotate-element-type hint)
+      the name is lexically unreferenced — conservative, never a false positive),
+      plus a source action to remove all unused bindings at once
+- [x] code action: wrap a bare undeclared uppercase type as `|T|` — a
+      diagnostic-linked quick fix; this also wired up `context.diagnostics` on
+      code-action requests (the reliable source, since the server's own
+      diagnostics are cleared after each publish)
+- [ ] more diagnostic-linked quick fixes now that `context.diagnostics` is wired
+      (e.g. the empty-literal annotate-element-type hint, the lowercase-type
+      "did you mean" suggestion)
 - [x] prepare-rename (validates the target, pre-fills the identifier)
 - [x] completion-resolve: promotes a completion's detail to documentation on focus
 - [x] signature help: shows the callee's `name(p0: T0, …)` signature with the

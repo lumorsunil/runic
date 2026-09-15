@@ -1790,6 +1790,13 @@ pub const Server = struct {
         // so string bodies don't count but `${x}` does); a name shared with an
         // unrelated binding elsewhere counts >1, so removal is only offered when
         // it is genuinely unreferenced — conservative, never a false positive.
+        const UnusedBinding = struct {
+            name: []const u8,
+            // The line-based range to delete (whole statement + trailing newline).
+            del: types.Range,
+            in_request_range: bool,
+        };
+        var unused = std.ArrayList(UnusedBinding).empty;
         for (script.statements) |stmt| {
             const binding_decl = switch (stmt.*) {
                 .binding_decl => |b| b,
@@ -1799,9 +1806,6 @@ pub const Server = struct {
                 .identifier => |i| i,
                 else => continue,
             };
-            const id_range = types.Range.fromSpan(identifier.span);
-            if (id_range.start.line < params.range.start.line or id_range.start.line > params.range.end.line) continue;
-
             var ranges = try self.findIdentifierRanges(doc.text, identifier.name);
             defer ranges.deinit(self.allocator);
             // Exactly one occurrence — the declaration itself — means unused.
@@ -1810,23 +1814,49 @@ pub const Server = struct {
             // Delete the whole statement, including its trailing newline (from the
             // start of its first line to the start of the line after its last).
             const stmt_range = types.Range.fromSpan(binding_decl.span);
-            const edits = try arena_allocator.alloc(types.TextEdit, 1);
-            edits[0] = .{
-                .range = .{
+            const id_range = types.Range.fromSpan(identifier.span);
+            try unused.append(arena_allocator, .{
+                .name = identifier.name,
+                .del = .{
                     .start = .{ .line = stmt_range.start.line, .character = 0 },
                     .end = .{ .line = stmt_range.end.line + 1, .character = 0 },
                 },
-                .newText = "",
-            };
+                .in_request_range = !(id_range.start.line < params.range.start.line or id_range.start.line > params.range.end.line),
+            });
+        }
+
+        // An individual "Remove unused 'x'" for each unused binding whose line is
+        // in the requested range.
+        for (unused.items) |binding| {
+            if (!binding.in_request_range) continue;
+            const edits = try arena_allocator.alloc(types.TextEdit, 1);
+            edits[0] = .{ .range = binding.del, .newText = "" };
             const changes = try arena_allocator.alloc(types.DocumentChangeOperation, 1);
             changes[0] = .{ .textDocumentEdit = .{
                 .textDocument = .{ .uri = params.textDocument.uri, .version = null },
                 .edits = edits,
             } };
-
             try actions.append(arena_allocator, .{
-                .title = try std.fmt.allocPrint(arena_allocator, "Remove unused '{s}'", .{identifier.name}),
+                .title = try std.fmt.allocPrint(arena_allocator, "Remove unused '{s}'", .{binding.name}),
                 .kind = "quickfix",
+                .edit = .{ .documentChanges = changes },
+            });
+        }
+
+        // One "Remove all unused bindings" that clears every unused binding in the
+        // document at once (offered only when there is more than one to remove;
+        // otherwise the individual action already covers it).
+        if (unused.items.len >= 2) {
+            const edits = try arena_allocator.alloc(types.TextEdit, unused.items.len);
+            for (unused.items, edits) |binding, *edit| edit.* = .{ .range = binding.del, .newText = "" };
+            const changes = try arena_allocator.alloc(types.DocumentChangeOperation, 1);
+            changes[0] = .{ .textDocumentEdit = .{
+                .textDocument = .{ .uri = params.textDocument.uri, .version = null },
+                .edits = edits,
+            } };
+            try actions.append(arena_allocator, .{
+                .title = try std.fmt.allocPrint(arena_allocator, "Remove all unused bindings ({d})", .{unused.items.len}),
+                .kind = "source",
                 .edit = .{ .documentChanges = changes },
             });
         }
