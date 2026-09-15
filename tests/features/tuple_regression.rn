@@ -43,3 +43,31 @@ var acc = .{ }
 acc = acc.push "one"
 acc = acc.push "two"
 echo "acc=${acc[0]},${acc[1]}"
+
+// --- Tuple type annotations `(T0, T1, …)` ---
+
+// A binding annotation; `(T)` is still just grouping.
+const annotated: (Int, String) = .{ 9, "z" }
+const ai, as2 = annotated
+echo "ann=${ai},${as2}"
+const grouped: (Int) = 5
+echo "group=${grouped}"
+
+// A function that returns a tuple, and one that takes a tuple parameter.
+fn Void makePair() (Int, String) { yield .{ 8, "yo" } }
+const mp2 = makePair
+const mi, ms = mp2
+echo "ret=${mi},${ms}"
+
+fn Void showPair(pr: (Int, String)) Void {
+    const pi, ps = pr
+    echo "param=${pi},${ps}"
+}
+showPair .{ 3, "q" }
+
+// --- Constant-index precision ---
+
+// A constant index selects that position's type, so a method/field resolves.
+var tv = .{ "hello", A{ .a = 7 } }
+echo "idx0-len=${tv[0].len()}"
+echo "idx1-field=${tv[1].a}"

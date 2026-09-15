@@ -3680,14 +3680,34 @@ pub const Parser = struct {
             .l_bracket => self.parseArrayTypeExpr(),
             // .caret => self.parsePromiseTypeExpr(),
             .question => self.parseOptionalTypeExpr(),
-            .l_paren => {
-                _ = try self.nextToken();
-                const type_expr = try self.parseTypeExpr();
-                _ = try self.expectTokenTag(.r_paren);
-                return type_expr;
-            },
+            .l_paren => self.parseParenTypeExpr(),
             else => null,
         };
+    }
+
+    /// Parses a parenthesized type: `(T)` is just `T` (grouping), while
+    /// `(T0, T1, …)` is a tuple type — an ordered, per-position-typed collection.
+    /// `()` is the empty tuple.
+    fn parseParenTypeExpr(self: *Self) Error!?*const ast.TypeExpr {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        const open = try self.expectTokenTag(.l_paren);
+        if ((try self.peekToken()).tag == .r_paren) {
+            const close = try self.expectTokenTag(.r_paren);
+            return try self.allocTypeExpression(.{ .tuple = .{
+                .elements = &.{},
+                .span = open.span.endAt(close.span),
+            } });
+        }
+        const elements = try self.parseList(.comma, parseTypeExprArg, .{});
+        const close = try self.expectTokenTag(.r_paren);
+        // A single parenthesized type is just grouping, not a 1-tuple.
+        if (elements.payload.len == 1) return elements.payload[0];
+        return try self.allocTypeExpression(.{ .tuple = .{
+            .elements = elements.payload,
+            .span = open.span.endAt(close.span),
+        } });
     }
 
     /// Parses a leading-`!` error union (`!T`). The error set is left empty as

@@ -131,8 +131,22 @@ const x, y = mixed           // x is an A, y is a B — fields resolve correctly
 
 Because an array is one type, forcing a heterogeneous tuple into an array
 annotation is an error — `const xs: []Int = .{ 1, "two" }` fails; a homogeneous
-literal coerces fine (`const xs: []Int = .{ 1, 2, 3 }`). Tuples are inferred;
-there is no tuple type-annotation syntax yet.
+literal coerces fine (`const xs: []Int = .{ 1, 2, 3 }`).
+
+A tuple type is written `(T0, T1, …)` and can annotate a binding, a function
+parameter, or a return type (a single `(T)` is just grouping):
+
+```rn
+const pair: (Int, String) = .{ 1, "hi" }
+fn Void makePair() (Int, String) { yield .{ 1, "hi" } }
+fn Void take(p: (Int, String)) Void { const n, s = p; … }
+```
+
+A tuple annotation is checked position by position, so `const t: (Int, String)
+= .{ 1, 2 }` is an error (position 1 is `Int`, not `String`). Indexing a tuple
+with a **constant** index has that position's type — `t[0]` is `Int`, `t[1]` is
+`String` — so a method or field on the result resolves; a runtime (variable)
+index stays permissive.
 
 ### Compound assignment
 

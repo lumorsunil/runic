@@ -119,6 +119,14 @@ pub fn array_type(element: *const ast.TypeExpr) ast.TypeExpr {
     } };
 }
 
+/// The compile-time value of a constant integer-literal index expression (`t[2]`),
+/// used to select a tuple position's type. Null for a non-constant (runtime)
+/// index, which keeps the element type permissive.
+fn constIndexValue(expr: *const ast.Expression) ?i64 {
+    if (expr.* != .literal or expr.literal != .integer) return null;
+    return std.fmt.parseInt(i64, expr.literal.integer.text, 0) catch null;
+}
+
 pub const Error =
     Allocator.Error ||
     std.Io.Writer.Error ||
@@ -9763,8 +9771,20 @@ pub const IRCompiler = struct {
 
                 const array_access_ref = try self.newRef(source, "array_access_ref");
                 const left_type = maybe_left_type orelse return Error.UnsupportedBinaryOperation;
-                if (left_type != .array) return Error.UnsupportedBinaryOperation;
-                const element_type = left_type.array.element.*;
+                // An array element type is shared by every position; a tuple's is
+                // per-position, so a *constant* index selects that position's type
+                // (a runtime index stays permissive). Both share the slice access
+                // lowering below.
+                const element_type: ast.TypeExpr = switch (left_type) {
+                    .array => left_type.array.element.*,
+                    .tuple => |tuple| blk: {
+                        if (constIndexValue(binary.right)) |k| {
+                            if (k >= 0 and k < tuple.elements.len) break :blk tuple.elements[@intCast(k)].*;
+                        }
+                        break :blk .global(.void);
+                    },
+                    else => return Error.UnsupportedBinaryOperation,
+                };
                 const left_ref = try self.newRef(source, "array_access_left_ref");
                 try self.set(source, left_ref, left.source);
                 // The index may be a function call whose result is delivered as a

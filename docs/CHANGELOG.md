@@ -24,8 +24,12 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   `B`, where before both collapsed to one element type and a struct element lost
   its fields. Because an array is a single type, forcing a heterogeneous tuple
   into an array annotation (`const xs: []Int = .{ 1, "two" }`) is a compile
-  error; a homogeneous literal coerces to `[]T` as before. Tuples are inferred
-  (no tuple annotation syntax yet).
+  error; a homogeneous literal coerces to `[]T` as before. A tuple type is
+  written `(T0, T1, …)` and can annotate a binding, parameter, or return type (a
+  single `(T)` is grouping); it is checked position by position, so
+  `const t: (Int, String) = .{ 1, 2 }` errors. Indexing a tuple with a *constant*
+  index has that position's type (`t[0]` is `Int`, `t[1]` is `String`), so a
+  method/field on the result resolves; a runtime index stays permissive.
 - **Inferred struct literals.** When the struct type is known from context, a
   struct value can be written `.{ .field = value, … }` without repeating the type
   name — `const v: Vector = .{ .x = 3, .y = 5 }` instead of `Vector{ … }`. The

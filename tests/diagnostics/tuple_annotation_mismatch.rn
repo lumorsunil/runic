@@ -1,0 +1,5 @@
+# A tuple annotation `(T0, T1, …)` is checked position by position. A literal
+# whose element at some position has the wrong type is a compile error — even
+# when the literal's own elements happen to be uniform.
+const t: (Int, String) = .{ 1, 2 }
+echo "${t}"

@@ -1210,6 +1210,20 @@ pub const TypeChecker = struct {
         return .{ .params = t.function.params, .offset = 0 };
     }
 
+    /// Builds a tuple type from an array literal's elements, typing each position
+    /// independently (a permissive type variable when a position's type doesn't
+    /// resolve). Used to validate a literal against a *tuple* annotation, where a
+    /// homogeneous literal must still be checked position-by-position.
+    fn arrayLiteralTupleType(self: *TypeChecker, scope: *Scope, array: ast.ArrayLiteral) Error!*const ast.TypeExpr {
+        const elements = try self.arena.allocator().alloc(*const ast.TypeExpr, array.elements.len);
+        for (array.elements, elements) |el, *dst| {
+            const raw = (try self.resolveExprType(scope, el)) orelse
+                try self.allocTypeExpression(.{ .type_var = .{ .name = "_", .span = el.span() } });
+            dst.* = try self.resolveTypeExpr(scope, raw);
+        }
+        return try self.allocTypeExpression(.{ .tuple = .{ .elements = elements, .span = array.span } });
+    }
+
     fn runBindingDecl(
         self: *TypeChecker,
         scope: *Scope,
@@ -1266,10 +1280,22 @@ pub const TypeChecker = struct {
             break :brk try self.resolveTypeExpr(scope, annotation);
         };
 
-        const type_expr = binding_annotation_type_expr orelse initializer_type;
+        // Against a *tuple* annotation, type a `.{ … }` literal position-by-
+        // position (even a homogeneous one, which otherwise resolves permissively)
+        // so a per-position mismatch — `const t: (Int, String) = .{ 1, 2 }` — is
+        // caught.
+        const effective_initializer_type = brk: {
+            const annotation_type = binding_annotation_type_expr orelse break :brk initializer_type;
+            if (self.unaliasType(annotation_type).* == .tuple and binding_decl.initializer.* == .array) {
+                break :brk try self.arrayLiteralTupleType(scope, binding_decl.initializer.array);
+            }
+            break :brk initializer_type;
+        };
+
+        const type_expr = binding_annotation_type_expr orelse effective_initializer_type;
 
         if (binding_annotation_type_expr) |annotation_type| {
-            if (initializer_type) |init_type| {
+            if (effective_initializer_type) |init_type| {
                 try self.validateTypeAssignment(
                     annotation_type,
                     init_type,
@@ -1342,6 +1368,13 @@ pub const TypeChecker = struct {
                     .span = array.span,
                 },
             }),
+            // Resolve each position of a tuple type so named element types
+            // (`(Vector, Int)`) normalize the same way an array element does.
+            .tuple => |tuple| blk: {
+                const elements = try self.arena.allocator().alloc(*const ast.TypeExpr, tuple.elements.len);
+                for (tuple.elements, elements) |el, *dst| dst.* = try self.resolveTypeExpr(scope, el);
+                break :blk try self.allocTypeExpression(.{ .tuple = .{ .elements = elements, .span = tuple.span } });
+            },
             .type_merge => |merge| try self.resolveTypeMerge(scope, merge),
             // Resolve a function type's parts so any type variables in a generic
             // signature are baked into the stored type (as `.type_var`), rather
@@ -2347,7 +2380,10 @@ pub const TypeChecker = struct {
             // A `Box(args…)` application is validated where it resolves.
             .type_application => {},
             .struct_type => |st| self.runStructType(scope, st),
-            .module, .tuple, .function, .fn_ref_type => {},
+            // Validate each position of a tuple type so an unknown element type is
+            // reported (`(Vector, Nope)`).
+            .tuple => |tuple| for (tuple.elements) |element| try self.runTypeExpression(scope, element),
+            .module, .function, .fn_ref_type => {},
         };
     }
 
