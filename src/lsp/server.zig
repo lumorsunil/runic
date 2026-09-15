@@ -754,7 +754,10 @@ pub const Server = struct {
 
         return switch (tok.tag) {
             .identifier => blk: {
-                const start_column = loc.column -| (loc.offset - start);
+                // `start` can end up just past `loc.offset` (a non-identifier-start
+                // byte at offset 0, e.g. a digit), so saturate the inner subtract
+                // too — an unsigned underflow here would panic.
+                const start_column = loc.column -| (loc.offset -| start);
                 break :blk .{
                     .name = tok.lexeme,
                     .span = .{
