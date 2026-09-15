@@ -1776,6 +1776,52 @@ pub const Server = struct {
             });
         }
 
+        // Offer "Remove unused" for a top-level `const`/`var`/import binding whose
+        // name never appears again. Usage is counted lexically (identifier tokens,
+        // so string bodies don't count but `${x}` does); a name shared with an
+        // unrelated binding elsewhere counts >1, so removal is only offered when
+        // it is genuinely unreferenced — conservative, never a false positive.
+        for (script.statements) |stmt| {
+            const binding_decl = switch (stmt.*) {
+                .binding_decl => |b| b,
+                else => continue,
+            };
+            const identifier = switch (binding_decl.pattern.*) {
+                .identifier => |i| i,
+                else => continue,
+            };
+            const id_range = types.Range.fromSpan(identifier.span);
+            if (id_range.start.line < params.range.start.line or id_range.start.line > params.range.end.line) continue;
+
+            var ranges = try self.findIdentifierRanges(doc.text, identifier.name);
+            defer ranges.deinit(self.allocator);
+            // Exactly one occurrence — the declaration itself — means unused.
+            if (ranges.items.len != 1) continue;
+
+            // Delete the whole statement, including its trailing newline (from the
+            // start of its first line to the start of the line after its last).
+            const stmt_range = types.Range.fromSpan(binding_decl.span);
+            const edits = try arena_allocator.alloc(types.TextEdit, 1);
+            edits[0] = .{
+                .range = .{
+                    .start = .{ .line = stmt_range.start.line, .character = 0 },
+                    .end = .{ .line = stmt_range.end.line + 1, .character = 0 },
+                },
+                .newText = "",
+            };
+            const changes = try arena_allocator.alloc(types.DocumentChangeOperation, 1);
+            changes[0] = .{ .textDocumentEdit = .{
+                .textDocument = .{ .uri = params.textDocument.uri, .version = null },
+                .edits = edits,
+            } };
+
+            try actions.append(arena_allocator, .{
+                .title = try std.fmt.allocPrint(arena_allocator, "Remove unused '{s}'", .{identifier.name}),
+                .kind = "quickfix",
+                .edit = .{ .documentChanges = changes },
+            });
+        }
+
         try self.sendJson(types.response(id, actions.items));
     }
 

@@ -266,7 +266,10 @@
 - [x] inlay parameter hints for imported-module functions (`m.f x`)
 - [x] folding ranges (multi-line statements: functions, structs, control flow)
 - [x] code action: add an inferred type annotation to an un-annotated binding
-- [ ] more code actions / quick fixes (add missing import, remove unused, etc.)
+- [x] code action: remove an unused top-level binding/import (offered only when
+      the name is lexically unreferenced — conservative, never a false positive)
+- [ ] more code actions / quick fixes (add missing import, and diagnostic-linked
+      fixes like the annotate-element-type hint)
 - [x] prepare-rename (validates the target, pre-fills the identifier)
 - [x] completion-resolve: promotes a completion's detail to documentation on focus
 - [x] signature help: shows the callee's `name(p0: T0, …)` signature with the

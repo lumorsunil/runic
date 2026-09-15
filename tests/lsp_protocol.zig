@@ -1454,8 +1454,10 @@ test "lsp code action adds an inferred type annotation" {
     var fixture = try TestFixture.init(allocator);
     defer fixture.deinit();
 
+    // `x` is referenced so the (separate) remove-unused action does not also fire.
     const source =
         \\const x = 5
+        \\echo "${x}"
         \\
     ;
     const uri = try fixture.writeDocument("main.rn", source);
@@ -1493,6 +1495,64 @@ test "lsp code action adds an inferred type annotation" {
     const start = edits[0].object.get("range").?.object.get("start").?.object;
     try std.testing.expectEqual(@as(i64, 0), start.get("line").?.integer);
     try std.testing.expectEqual(@as(i64, 7), start.get("character").?.integer);
+}
+
+test "lsp code action removes an unused binding but not a used one" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\const keep = 1
+        \\const drop = 2
+        \\echo "${keep}"
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        // Line 1 is the unused `drop`.
+        try makeCodeActionRequest(allocator, 2, uri, 1),
+        // Line 0 is the used `keep`.
+        try makeCodeActionRequest(allocator, 3, uri, 0),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    // `drop` is unreferenced, so a remove action is offered and deletes its line.
+    {
+        const response = try findResponseById(allocator, output, 2);
+        defer allocator.free(response.body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        var remove: ?std.json.Value = null;
+        for (parsed.value.object.get("result").?.array.items) |a| {
+            const title = a.object.get("title").?.string;
+            if (std.mem.eql(u8, title, "Remove unused 'drop'")) remove = a;
+        }
+        try std.testing.expect(remove != null);
+        const edit = remove.?.object.get("edit").?.object.get("documentChanges").?.array
+            .items[0].object.get("edits").?.array.items[0].object;
+        try std.testing.expectEqualStrings("", edit.get("newText").?.string);
+        const range = edit.get("range").?.object;
+        try std.testing.expectEqual(@as(i64, 1), range.get("start").?.object.get("line").?.integer);
+        try std.testing.expectEqual(@as(i64, 2), range.get("end").?.object.get("line").?.integer);
+    }
+    // `keep` is referenced, so no remove action is offered for it.
+    {
+        const response = try findResponseById(allocator, output, 3);
+        defer allocator.free(response.body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        for (parsed.value.object.get("result").?.array.items) |a| {
+            const title = a.object.get("title").?.string;
+            try std.testing.expect(std.mem.indexOf(u8, title, "Remove unused") == null);
+        }
+    }
 }
 
 test "lsp folding ranges cover multi-line statements" {
