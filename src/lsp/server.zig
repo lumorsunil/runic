@@ -13,8 +13,32 @@ const Allocator = std.mem.Allocator;
 /// Shared state threaded through the recursive parameter-hint walk.
 /// The semantic-token type legend (the index of each is the `tokenType` emitted
 /// for a token). Standard LSP names, so a client applies its theme colors.
-const semantic_token_types = [_][]const u8{ "keyword", "string", "number", "operator", "type", "variable" };
-const SemanticTokenType = enum(u32) { keyword = 0, string = 1, number = 2, operator = 3, type = 4, variable = 5 };
+const semantic_token_types = [_][]const u8{ "keyword", "string", "number", "operator", "type", "variable", "function", "parameter" };
+const SemanticTokenType = enum(u32) { keyword = 0, string = 1, number = 2, operator = 3, type = 4, variable = 5, function = 6, parameter = 7 };
+
+/// The token-modifier legend. Emitted as a bitmask (the index of each is the
+/// bit). `declaration` marks the defining occurrence of a name; `readonly` marks
+/// an immutable (`const`) binding.
+const semantic_token_modifiers = [_][]const u8{ "declaration", "readonly" };
+const SEM_MOD_DECLARATION: u32 = 1 << 0;
+const SEM_MOD_READONLY: u32 = 1 << 1;
+
+/// A refinement for the token at a given position, computed from the AST and
+/// overriding the purely lexical classification (e.g. a bare identifier the
+/// lexer sees becomes a `function` at a call site or a `parameter` at a
+/// declaration).
+const SemOverride = struct { ttype: SemanticTokenType, mods: u32 };
+const SemOverlay = std.AutoHashMap(u64, SemOverride);
+
+/// Packs a 0-based (line, character) position into a single map key.
+fn semKey(line: u32, character: u32) u64 {
+    return (@as(u64, line) << 32) | character;
+}
+
+fn semSpanKey(span: runic.ast.Span) u64 {
+    const range = types.Range.fromSpan(span);
+    return semKey(range.start.line, range.start.character);
+}
 
 const CallHintCtx = struct {
     arena: Allocator,
@@ -1843,8 +1867,7 @@ pub const Server = struct {
         var results = std.ArrayList(types.CallHierarchyIncomingCall).empty;
 
         // Same-file callers: each top-level function whose body has a direct call
-        // to the queried name (`f x`, not a `m.f` member call). Cross-file callers
-        // (via `m.f`) are a follow-up.
+        // to the queried name (`f x`, not a `m.f` member call).
         const doc = self.documents.get(params.item.uri) orelse return self.sendJson(types.response(id, results.items));
         const script = doc.ast orelse return self.sendJson(types.response(id, results.items));
 
@@ -1874,6 +1897,57 @@ pub const Server = struct {
                 .from = fnItem(caller, params.item.uri) orelse continue,
                 .fromRanges = from_ranges.items,
             });
+        }
+
+        // Cross-file callers: a `m.f` call in an importing file where `m` resolves
+        // to this file. The workspace index makes every `.rn` file available; each
+        // importer is type-checked on demand so its import aliases resolve.
+        const target_path = try self.resolveUriPath(params.item.uri);
+        defer self.allocator.free(target_path);
+        self.workspace.ensureIndexed();
+
+        var it = self.documents.map.iterator();
+        while (it.next()) |entry| {
+            const caller_uri = entry.key_ptr.*;
+            const caller_doc = entry.value_ptr.*;
+            // The same-file callers are handled above; skip this file here.
+            if (std.mem.eql(u8, caller_doc.path, target_path)) continue;
+
+            const caller_script = (self.documents.document_store.getAst(caller_doc.path) catch continue) orelse continue;
+            if (!self.workspace.type_checker.modules.contains(caller_doc.path)) {
+                _ = self.workspace.type_checker.typeCheck(caller_doc.path) catch {};
+            }
+            const caller_scope = self.workspace.type_checker.modules.get(caller_doc.path);
+
+            for (caller_script.statements) |stmt| {
+                const caller = switch (stmt.*) {
+                    .expression => |es| switch (es.expression.*) {
+                        .fn_decl => |f| f,
+                        else => continue,
+                    },
+                    else => continue,
+                };
+                if (caller.name == null) continue;
+
+                var calls = std.ArrayList(runic.ast.CallExpr).empty;
+                try collectCallsInExpr(caller.body, &calls, aa);
+
+                var from_ranges = std.ArrayList(types.Range).empty;
+                for (calls.items) |call| {
+                    const ref = calleeRef(call) orelse continue;
+                    const object = ref.object orelse continue; // only `m.f` reaches across files
+                    if (!std.mem.eql(u8, ref.name, params.item.name)) continue;
+                    const module_path = self.memberCallModulePath(object, caller_scope) orelse continue;
+                    if (!std.mem.eql(u8, module_path, target_path)) continue;
+                    try from_ranges.append(aa, types.Range.fromSpan(ref.span));
+                }
+                if (from_ranges.items.len == 0) continue;
+
+                try results.append(aa, .{
+                    .from = fnItem(caller, caller_uri) orelse continue,
+                    .fromRanges = from_ranges.items,
+                });
+            }
         }
 
         try self.sendJson(types.response(id, results.items));
@@ -1944,27 +2018,146 @@ pub const Server = struct {
     ) ?types.CallHierarchyItem {
         if (ref.object) |object_name| {
             // `m.f`: resolve `m` to an imported module, find `f` in its AST.
-            const scope = module_scope orelse return null;
-            const binding = scope.lookup(object_name) orelse return null;
-            const binding_type = binding.type_expr orelse return null;
-            const resolved = switch (binding_type.*) {
-                .alias => |alias_type| self.workspace.type_checker.resolveAliasType(&alias_type),
-                else => binding_type,
-            };
-            const module_type = switch (resolved.*) {
-                .module => |m| m,
-                else => return null,
-            };
-            const module_script = (self.documents.document_store.getAst(module_type.path) catch return null) orelse return null;
+            const module_path = self.memberCallModulePath(object_name, module_scope) orelse return null;
+            const module_script = (self.documents.document_store.getAst(module_path) catch return null) orelse return null;
             const fn_decl = findTopLevelFn(module_script, ref.name) orelse return null;
-            const module_uri = std.fmt.allocPrint(arena, "file://{s}", .{module_type.path}) catch return null;
+            const module_uri = std.fmt.allocPrint(arena, "file://{s}", .{module_path}) catch return null;
             return fnItem(fn_decl, module_uri);
         }
         const fn_decl = findTopLevelFn(script, ref.name) orelse return null;
         return fnItem(fn_decl, doc_uri);
     }
 
+    /// The file path of the module an object name (`m` in `m.f`) refers to in a
+    /// given module scope, or null if it does not resolve to an imported module.
+    fn memberCallModulePath(self: *Server, object_name: []const u8, module_scope: ?*runic.semantic.Scope) ?[]const u8 {
+        const scope = module_scope orelse return null;
+        const binding = scope.lookup(object_name) orelse return null;
+        const binding_type = binding.type_expr orelse return null;
+        const resolved = switch (binding_type.*) {
+            .alias => |alias_type| self.workspace.type_checker.resolveAliasType(&alias_type),
+            else => binding_type,
+        };
+        return switch (resolved.*) {
+            .module => |m| m.path,
+            else => null,
+        };
+    }
+
     // --- Semantic tokens --------------------------------------------------
+
+    /// Records every name a binding pattern introduces (recursing tuples and
+    /// records, skipping `_` discards) with the given token type and modifiers.
+    fn semOverlayPattern(map: *SemOverlay, pattern: *const runic.ast.BindingPattern, ttype: SemanticTokenType, mods: u32) !void {
+        switch (pattern.*) {
+            .identifier => |id| try map.put(semSpanKey(id.span), .{ .ttype = ttype, .mods = mods }),
+            .discard => {},
+            .tuple => |tuple| for (tuple.elements) |element| try semOverlayPattern(map, element, ttype, mods),
+            .record => |record| for (record.fields) |field| {
+                // With an explicit binding (`{ x: inner }`) the binding is the
+                // variable; without one (`{ x }`) the label itself is.
+                if (field.binding) |binding| {
+                    try semOverlayPattern(map, binding, ttype, mods);
+                } else try map.put(semSpanKey(field.label.span), .{ .ttype = ttype, .mods = mods });
+            },
+        }
+    }
+
+    fn semOverlayCapture(map: *SemOverlay, capture: runic.ast.CaptureClause) !void {
+        for (capture.bindings) |binding| try semOverlayPattern(map, binding, .variable, SEM_MOD_DECLARATION);
+    }
+
+    /// Walks a statement recording AST-derived token refinements: binding and
+    /// parameter declarations, function names, capture bindings, and call sites.
+    fn semOverlayStmt(map: *SemOverlay, stmt: *const runic.ast.Statement) Allocator.Error!void {
+        switch (stmt.*) {
+            .binding_decl => |bd| {
+                const mods: u32 = SEM_MOD_DECLARATION | (if (bd.is_mutable) 0 else SEM_MOD_READONLY);
+                try semOverlayPattern(map, bd.pattern, .variable, mods);
+                try semOverlayExpr(map, bd.initializer);
+            },
+            .expression => |es| try semOverlayExpr(map, es.expression),
+            .yield_stmt => |ys| try semOverlayExpr(map, ys.value),
+            .exit_stmt => |xs| if (xs.value) |v| try semOverlayExpr(map, v),
+            .while_stmt => |ws| {
+                try semOverlayExpr(map, ws.condition);
+                if (ws.capture) |capture| try semOverlayCapture(map, capture);
+                for (ws.body.statements) |s| try semOverlayStmt(map, s);
+            },
+            else => {},
+        }
+    }
+
+    fn semOverlayExpr(map: *SemOverlay, expr: *const runic.ast.Expression) Allocator.Error!void {
+        switch (expr.*) {
+            .call => |call| {
+                // A bare word (`count`, `name`) parses as a zero-argument call but
+                // is usually a variable read, so only an invocation that actually
+                // passes arguments is treated as a function call site. Zero-arg
+                // references fall through to the lexical default.
+                if (call.arguments.len > 0) {
+                    if (calleeRef(call)) |ref| try map.put(semSpanKey(ref.span), .{ .ttype = .function, .mods = 0 });
+                }
+                try semOverlayExpr(map, call.callee);
+                for (call.arguments) |arg| try semOverlayExpr(map, arg);
+            },
+            .fn_decl => |f| {
+                if (f.name) |name| try map.put(semSpanKey(name.span), .{ .ttype = .function, .mods = SEM_MOD_DECLARATION });
+                switch (f.params) {
+                    ._non_variadic => |ps| for (ps) |p| try semOverlayPattern(map, p.pattern, .parameter, SEM_MOD_DECLARATION),
+                    ._variadic => |p| try semOverlayPattern(map, p.pattern, .parameter, SEM_MOD_DECLARATION),
+                }
+                try semOverlayExpr(map, f.body);
+            },
+            .pipeline => |p| for (p.stages) |s| try semOverlayExpr(map, s),
+            .binary => |b| {
+                try semOverlayExpr(map, b.left);
+                try semOverlayExpr(map, b.right);
+            },
+            .unary => |u| try semOverlayExpr(map, u.operand),
+            .assignment => |a| try semOverlayExpr(map, a.expr),
+            .block => |b| for (b.statements) |s| try semOverlayStmt(map, s),
+            .if_expr => |i| try semOverlayIf(map, &i),
+            .for_expr => |f| {
+                for (f.sources) |s| try semOverlayExpr(map, s);
+                try semOverlayCapture(map, f.capture);
+                try semOverlayExpr(map, f.body);
+            },
+            .match_expr => |m| {
+                try semOverlayExpr(map, m.subject);
+                for (m.cases) |c| {
+                    // A case binds names via its pattern (`.binding`/destructure)
+                    // and/or an explicit `|capture|`.
+                    switch (c.pattern) {
+                        .binding => |id| try map.put(semSpanKey(id.span), .{ .ttype = .variable, .mods = SEM_MOD_DECLARATION }),
+                        .destructure => |pattern| try semOverlayPattern(map, pattern, .variable, SEM_MOD_DECLARATION),
+                        else => {},
+                    }
+                    if (c.capture) |capture| try semOverlayCapture(map, capture);
+                    for (c.body.statements) |s| try semOverlayStmt(map, s);
+                }
+            },
+            .literal => |lit| switch (lit) {
+                .string => |s| for (s.segments) |seg| switch (seg) {
+                    .interpolation => |e| try semOverlayExpr(map, e),
+                    else => {},
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
+
+    fn semOverlayIf(map: *SemOverlay, if_expr: *const runic.ast.IfExpr) Allocator.Error!void {
+        try semOverlayExpr(map, if_expr.condition);
+        if (if_expr.capture) |capture| try semOverlayCapture(map, capture);
+        try semOverlayExpr(map, if_expr.then_expr);
+        if (if_expr.else_branch) |else_branch| switch (else_branch) {
+            .expr => |e| try semOverlayExpr(map, e),
+            .if_expr => |nested| try semOverlayIf(map, nested),
+            .condition => {},
+        };
+    }
 
     /// Maps a lexer token to its semantic-token type, or null to skip it
     /// (delimiters, comments — which the lexer drops — and stream/interpolation
@@ -2023,7 +2216,17 @@ pub const Server = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
+        const aa = arena.allocator();
         var data = std.ArrayList(u32).empty;
+
+        // Refine the lexical classification with AST-derived facts (a call site's
+        // callee is a `function`, a parameter/binding name is a `parameter`/
+        // `variable` marked as a `declaration`, …). The overlay is keyed by token
+        // start position; tokens not in it keep the lexical default.
+        var overlay = SemOverlay.init(aa);
+        if (doc.ast) |script| {
+            for (script.statements) |stmt| semOverlayStmt(&overlay, stmt) catch break;
+        }
 
         var lexer = runic.lexer.Lexer.init(self.io, self.allocator, self.env_map, "", doc.text) catch return self.sendJson(empty);
         defer lexer.deinit();
@@ -2035,7 +2238,7 @@ pub const Server = struct {
             // still valid semantic highlighting.
             const tok = lexer.next() catch break;
             if (tok.tag == .eof) break;
-            const token_type = semanticType(tok.tag, tok.lexeme) orelse continue;
+            var token_type = semanticType(tok.tag, tok.lexeme) orelse continue;
 
             const range = types.Range.fromSpan(tok.span);
             // Tokens are single-line; the length is the char span on that line.
@@ -2043,13 +2246,23 @@ pub const Server = struct {
             const length = range.end.character -| range.start.character;
             if (length == 0) continue;
 
+            // An identifier the AST classified more precisely wins over the
+            // lexical guess, and carries its declaration/readonly modifiers.
+            var modifiers: u32 = 0;
+            if (tok.tag == .identifier) {
+                if (overlay.get(semKey(range.start.line, range.start.character))) |ov| {
+                    token_type = ov.ttype;
+                    modifiers = ov.mods;
+                }
+            }
+
             const delta_line = range.start.line -| prev_line;
             const delta_char = if (delta_line == 0) range.start.character -| prev_char else range.start.character;
-            try data.append(arena.allocator(), delta_line);
-            try data.append(arena.allocator(), delta_char);
-            try data.append(arena.allocator(), length);
-            try data.append(arena.allocator(), @intFromEnum(token_type));
-            try data.append(arena.allocator(), 0);
+            try data.append(aa, delta_line);
+            try data.append(aa, delta_char);
+            try data.append(aa, length);
+            try data.append(aa, @intFromEnum(token_type));
+            try data.append(aa, modifiers);
             prev_line = range.start.line;
             prev_char = range.start.character;
         }
@@ -2596,7 +2809,7 @@ pub const Server = struct {
                 },
                 .callHierarchyProvider = .{ .payload = .{ .bool = true } },
                 .semanticTokensProvider = .{ .payload = .{ .semanticTokensOptions = .{
-                    .legend = .{ .tokenTypes = &semantic_token_types, .tokenModifiers = &.{} },
+                    .legend = .{ .tokenTypes = &semantic_token_types, .tokenModifiers = &semantic_token_modifiers },
                     .range = false,
                     .full = .{ .payload = .{ .bool = true } },
                 } } },

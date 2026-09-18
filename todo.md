@@ -285,16 +285,21 @@
 - [x] signature help: shows the callee's `name(p0: T0, …)` signature with the
       parameter being entered highlighted (same-file top-level functions and
       imported-module functions; innermost call at the cursor)
-- [x] call hierarchy (top-level functions): prepare, incoming calls (same-file
-      callers), and outgoing calls (same-file functions + imported-module `m.f`).
-  - [ ] cross-file incoming calls (a `m.f` caller in an importing file) — needs
-        the import graph to resolve which module `m` refers to this file
+- [x] call hierarchy (top-level functions): prepare, incoming calls, and
+      outgoing calls (same-file functions + imported-module `m.f`).
+  - [x] cross-file incoming calls: a `m.f` caller in an importing file, resolved
+        by type-checking each indexed importer on demand and matching the alias's
+        module path to the queried function's file
 - [x] semantic tokens (`textDocument/semanticTokens/full`): lexer-driven
       classification into keyword / type / variable / number / string / operator,
       delta-encoded per the LSP legend (interpolated `${…}` code inside strings is
       typed as code, not string).
-  - [ ] AST-based refinement: distinguish function names and parameters from
-        plain variables, and mark declarations vs. references via token modifiers
+  - [x] AST-based refinement: function declarations and call sites (calls with
+        arguments) are `function`, parameter declarations are `parameter`, and
+        binding/parameter/capture declarations carry a `declaration` modifier
+        (`const` bindings also `readonly`). Reference sites beyond call callees
+        keep the lexical classification (a precise per-reference resolution would
+        need scope-aware classification)
 - [x] richer/robust formatting: re-indents by structural nesting depth (four
       spaces), string/comment-aware so braces inside strings or comments never
       shift indentation, and multi-line strings and block comments are left

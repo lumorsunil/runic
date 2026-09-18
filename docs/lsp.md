@@ -40,9 +40,12 @@ Today it provides:
   uppercase type as `|T|`, capitalize a lowercase type name)
 - signature help (the callee's parameter list with the active argument
   highlighted, for same-file and imported-module functions)
-- call hierarchy for top-level functions (prepare, incoming and outgoing calls)
+- call hierarchy for top-level functions (prepare, incoming and outgoing calls),
+  including cross-file incoming calls from `m.f` accesses in importing files
 - semantic tokens (`textDocument/semanticTokens/full`) classifying keywords,
-  types, variables, numbers, strings, and operators
+  types, variables, numbers, strings, and operators, refined from the AST so
+  function declarations and call sites are `function`, parameters are
+  `parameter`, and declarations carry `declaration`/`readonly` modifiers
 - document formatting — re-indents by structural nesting depth while preserving
   each line's interior verbatim (command-argument spacing is significant), leaves
   comments and string contents untouched, and collapses blank runs
@@ -187,8 +190,8 @@ That means:
 
 These may happen later, but they are not the immediate focus:
 
-- AST-driven semantic tokens (function/parameter classification, declaration vs.
-  reference modifiers) beyond the current lexer-driven highlighting
+- scope-aware semantic tokens for reference sites (classifying every use of a
+  parameter or local as such, not just its declaration and call callees)
 - a wide LSP feature matrix for every editor capability
 - TCP-first workflows for normal development
 

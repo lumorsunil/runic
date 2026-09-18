@@ -455,6 +455,59 @@ test "lsp call hierarchy resolves callers and callees" {
     }
 }
 
+test "lsp call hierarchy finds cross-file incoming calls" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const lib_uri = try fixture.writeDocument("lib.rn",
+        \\pub fn Int greet(x: Int) Int { yield x }
+        \\
+    );
+    defer allocator.free(lib_uri);
+    // An importer that calls `m.greet` — only indexed, never opened.
+    const main_uri = try fixture.writeDocument("main.rn",
+        \\const m = import "./lib.rn"
+        \\fn Void run() Void {
+        \\  const a = m.greet 1
+        \\  echo "${a}"
+        \\}
+        \\
+    );
+    defer allocator.free(main_uri);
+
+    const root_uri = try std.fmt.allocPrint(allocator, "file://{s}", .{fixture.root_path});
+    defer allocator.free(root_uri);
+
+    const messages = [_][]const u8{
+        try makeInitializeWithRoot(allocator, 1, root_uri),
+        try makeDidOpen(allocator, lib_uri,
+            \\pub fn Int greet(x: Int) Int { yield x }
+            \\
+        ),
+        // Prepare on `greet`'s declaration, then ask for its incoming calls.
+        try makePrepareCallHierarchyRequest(allocator, 2, lib_uri, 0, 12),
+        try makeCallHierarchyItemRequest(allocator, 3, "callHierarchy/incomingCalls", lib_uri, "greet"),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 3);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    // `run` in the never-opened importer calls `m.greet` once.
+    const calls = parsed.value.object.get("result").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    const from = calls[0].object.get("from").?.object;
+    try std.testing.expectEqualStrings("run", from.get("name").?.string);
+    try std.testing.expectEqualStrings(main_uri, from.get("uri").?.string);
+    try std.testing.expectEqual(@as(usize, 1), calls[0].object.get("fromRanges").?.array.items.len);
+}
+
 test "lsp semantic tokens classify keywords, types, numbers and strings" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
@@ -536,6 +589,86 @@ test "lsp semantic tokens classify keywords, types, numbers and strings" {
     try std.testing.expectEqual(@as(?i64, variable), findType(toks.items, 1, 43));
     // The opening quote of the string is a string token.
     try std.testing.expectEqual(@as(?i64, string), findType(toks.items, 1, 40));
+}
+
+test "lsp semantic tokens refine functions, parameters and declarations from the ast" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\fn Int greet(name: String) Int { yield name }
+        \\const result = greet "x"
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeSemanticTokensRequest(allocator, 2, uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const data = parsed.value.object.get("result").?.object.get("data").?.array.items;
+
+    // Decode to absolute (line, char) with type and modifier bitmask.
+    const Tok = struct { line: i64, char: i64, ttype: i64, mods: i64 };
+    var toks = std.ArrayList(Tok).empty;
+    defer toks.deinit(allocator);
+    var line: i64 = 0;
+    var char: i64 = 0;
+    var i: usize = 0;
+    while (i < data.len) : (i += 5) {
+        const dline = data[i].integer;
+        line += dline;
+        if (dline != 0) char = 0;
+        char += data[i + 1].integer;
+        try toks.append(allocator, .{ .line = line, .char = char, .ttype = data[i + 3].integer, .mods = data[i + 4].integer });
+    }
+
+    const find = struct {
+        fn at(list: []const Tok, l: i64, c: i64) ?Tok {
+            for (list) |t| if (t.line == l and t.char == c) return t;
+            return null;
+        }
+    }.at;
+
+    // Type codes: type=4, variable=5, function=6, parameter=7.
+    // Modifier bits: declaration=1<<0, readonly=1<<1.
+    const function = 6;
+    const parameter = 7;
+    const variable = 5;
+    const decl_mod: i64 = 1;
+    const readonly_mod: i64 = 2;
+
+    // `greet` is a function declaration.
+    const greet_decl = find(toks.items, 0, 7).?;
+    try std.testing.expectEqual(@as(i64, function), greet_decl.ttype);
+    try std.testing.expectEqual(decl_mod, greet_decl.mods & decl_mod);
+    // `name` is a parameter declaration.
+    const name_param = find(toks.items, 0, 13).?;
+    try std.testing.expectEqual(@as(i64, parameter), name_param.ttype);
+    try std.testing.expectEqual(decl_mod, name_param.mods & decl_mod);
+    // `name` used in `yield name` is a plain reference (lexical variable), not a
+    // parameter or a zero-arg call misread as a function.
+    try std.testing.expectEqual(@as(i64, variable), find(toks.items, 0, 39).?.ttype);
+    // `result` is a readonly (const) binding declaration.
+    const result_bind = find(toks.items, 1, 6).?;
+    try std.testing.expectEqual(@as(i64, variable), result_bind.ttype);
+    try std.testing.expectEqual(decl_mod, result_bind.mods & decl_mod);
+    try std.testing.expectEqual(readonly_mod, result_bind.mods & readonly_mod);
+    // `greet "x"` is a call with an argument, so the callee is a function.
+    try std.testing.expectEqual(@as(i64, function), find(toks.items, 1, 15).?.ttype);
 }
 
 test "lsp document symbols nest struct fields and function parameters" {
