@@ -681,10 +681,24 @@ pub const Server = struct {
         span: runic.ast.Span,
     };
 
+    /// The maximum object depth of a member access the LSP resolves (`a.b.c.…`).
+    /// Deeper chains are truncated to the innermost segments.
+    const max_member_chain = 16;
+
     const ExtractedMember = struct {
+        /// The immediate object (the segment right before the member), kept for
+        /// callers that only need the nearest object (hover).
         object_name: []const u8,
         member_name: []const u8,
         member_span: runic.ast.Span,
+        /// The full object chain, outermost first: `a.b.c` with the cursor on `c`
+        /// gives `[a, b]`. Slices borrow the document text.
+        object_chain: [max_member_chain][]const u8 = undefined,
+        object_chain_len: usize = 0,
+
+        fn chain(self: *const ExtractedMember) []const []const u8 {
+            return self.object_chain[0..self.object_chain_len];
+        }
     };
 
     fn findIdentifierRanges(
@@ -839,19 +853,41 @@ pub const Server = struct {
         if (text[member.span.start.offset - 1] != '.') return null;
         if (member.span.start.offset < 2) return null;
 
-        const object_loc = runic.token.Location{
-            .file = loc.file,
-            .line = member.span.start.line,
-            .column = member.span.start.column -| 2,
-            .offset = member.span.start.offset - 2,
-        };
-        const object = self.extractIdentifier(object_loc, text) orelse return null;
+        // Walk back over the dotted object chain. `a.b.c` with the cursor on `c`
+        // discovers objects innermost-first as [b, a]; the walk stops at the first
+        // non-identifier segment (a literal, a call `f().x`, etc.).
+        var discovered: [max_member_chain][]const u8 = undefined;
+        var count: usize = 0;
+        var seg_offset = member.span.start.offset;
+        var seg_line = member.span.start.line;
+        var seg_column = member.span.start.column;
+        while (count < max_member_chain) {
+            if (seg_offset < 2) break;
+            if (text[seg_offset - 1] != '.') break;
+            const object_loc = runic.token.Location{
+                .file = loc.file,
+                .line = seg_line,
+                .column = seg_column -| 2,
+                .offset = seg_offset - 2,
+            };
+            const object = self.extractIdentifier(object_loc, text) orelse break;
+            discovered[count] = object.name;
+            count += 1;
+            seg_offset = object.span.start.offset;
+            seg_line = object.span.start.line;
+            seg_column = object.span.start.column;
+        }
+        if (count == 0) return null;
 
-        return .{
-            .object_name = object.name,
+        var result = ExtractedMember{
+            .object_name = discovered[0],
             .member_name = member.name,
             .member_span = member.span,
+            .object_chain_len = count,
         };
+        // Reverse into outermost-first order for the type walk.
+        for (0..count) |i| result.object_chain[i] = discovered[count - 1 - i];
+        return result;
     }
 
     fn writeHoverBinding(
@@ -1032,6 +1068,15 @@ pub const Server = struct {
             }
         };
 
+        // A struct-literal field (`Vector{ .x = … }`) is not a member access, so
+        // find it by walking the AST and resolve it to the field declaration.
+        if (scope) |s| if (doc) |d| if (d.ast) |script| {
+            if (self.resolveStructLiteralFieldSpan(s, script, params.position)) |field_span| {
+                try self.sendDefinitionSpan(id, field_span);
+                return;
+            }
+        };
+
         const binding: ?*runic.semantic.Scope.Binding = brk: {
             if (scope) |s| if (extracted_identifier) |i| {
                 break :brk s.lookup(i.name);
@@ -1103,29 +1148,56 @@ pub const Server = struct {
         scope: *runic.semantic.Scope,
         member: ExtractedMember,
     ) ?runic.ast.Span {
-        const binding = scope.lookup(member.object_name) orelse return null;
-        const binding_type = binding.type_expr orelse return null;
-        const resolved = switch (binding_type.*) {
-            .alias => |alias_type| self.workspace.type_checker.resolveAliasType(&alias_type),
-            else => binding_type,
-        };
+        const object_type = self.resolveObjectChainType(scope, member.chain()) orelse return null;
+        return self.resolveMemberSpanInType(scope, object_type, member.member_name);
+    }
+
+    /// Walks an object chain (`a.b.c` → `[a, b]`, outermost first) to the type of
+    /// the innermost object: the first segment is a scope binding, and each later
+    /// segment descends into that field's (struct or module member) type. Named
+    /// field types (`from: Point`) are resolved to their concrete struct.
+    fn resolveObjectChainType(
+        self: *Server,
+        scope: *runic.semantic.Scope,
+        objects: []const []const u8,
+    ) ?*const runic.ast.TypeExpr {
+        if (objects.len == 0) return null;
+        const binding = scope.lookup(objects[0]) orelse return null;
+        var current = binding.type_expr orelse return null;
+        for (objects[1..]) |field_name| {
+            current = completion.resolveMemberType(&self.workspace.type_checker, scope, current, field_name) orelse return null;
+        }
+        return current;
+    }
+
+    /// The declaration span of a named member within an object type — a struct
+    /// field or `decl` (method/const member), a `cimport` extern, or a module's
+    /// `pub` declaration. The type is first peeled to its concrete shape so a
+    /// named field type (`inner: Inner`) resolves through to `Inner`'s struct.
+    fn resolveMemberSpanInType(
+        self: *Server,
+        scope: *runic.semantic.Scope,
+        type_expr: *const runic.ast.TypeExpr,
+        member_name: []const u8,
+    ) ?runic.ast.Span {
+        const resolved = completion.concreteType(&self.workspace.type_checker, scope, type_expr) orelse return null;
         switch (resolved.*) {
             .struct_type => |struct_type| {
                 // A `cimport` member resolves to its `extern fn` declaration.
                 if (struct_type.cimport_externs) |externs| {
                     for (externs) |ext| {
-                        if (std.mem.eql(u8, ext.name.name, member.member_name)) {
+                        if (std.mem.eql(u8, ext.name.name, member_name)) {
                             return ext.name.span;
                         }
                     }
                 }
                 for (struct_type.fields) |field| {
-                    if (std.mem.eql(u8, field.name.name, member.member_name)) {
+                    if (std.mem.eql(u8, field.name.name, member_name)) {
                         return field.name.span;
                     }
                 }
                 for (struct_type.decls) |decl| {
-                    if (std.mem.eql(u8, decl.name.name, member.member_name)) {
+                    if (std.mem.eql(u8, decl.name.name, member_name)) {
                         return decl.name.span;
                     }
                 }
@@ -1135,11 +1207,138 @@ pub const Server = struct {
             // imported module file.
             .module => |module_type| {
                 const module_scope = (self.workspace.type_checker.resolveModuleScopeForMemberCompletion(module_type) catch return null) orelse return null;
-                const member_binding = module_scope.lookup(member.member_name) orelse return null;
+                const member_binding = module_scope.lookup(member_name) orelse return null;
                 return member_binding.identifier.span;
             },
             else => return null,
         }
+    }
+
+    /// Finds a struct-literal field name at `pos` (the `.x` in `Vector{ .x = … }`)
+    /// and resolves it to the field's declaration span in the struct type. Unlike
+    /// a member access, a literal field is not an `object.member`, so it is found
+    /// by walking the AST for the enclosing literal.
+    fn resolveStructLiteralFieldSpan(
+        self: *Server,
+        scope: *runic.semantic.Scope,
+        script: runic.ast.Script,
+        pos: types.Position,
+    ) ?runic.ast.Span {
+        for (script.statements) |stmt| {
+            if (self.structLitFieldInStmt(scope, stmt, pos)) |span| return span;
+        }
+        return null;
+    }
+
+    /// The type a struct literal constructs: a scope binding for a plain
+    /// `Vector{…}`, or a module member for a qualified `m.Vector{…}`.
+    fn structLiteralType(
+        self: *Server,
+        scope: *runic.semantic.Scope,
+        lit: runic.ast.StructLiteral,
+    ) ?*const runic.ast.TypeExpr {
+        if (lit.object) |object| {
+            const object_name = switch (object.*) {
+                .identifier => |id| id.name,
+                else => return null,
+            };
+            const object_type = self.resolveObjectChainType(scope, &.{object_name}) orelse return null;
+            return completion.resolveMemberType(&self.workspace.type_checker, scope, object_type, lit.name.name);
+        }
+        const binding = scope.lookup(lit.name.name) orelse return null;
+        return binding.type_expr;
+    }
+
+    fn structLitFieldInBlock(self: *Server, scope: *runic.semantic.Scope, block: runic.ast.Block, pos: types.Position) ?runic.ast.Span {
+        for (block.statements) |s| {
+            if (self.structLitFieldInStmt(scope, s, pos)) |span| return span;
+        }
+        return null;
+    }
+
+    fn structLitFieldInStmt(self: *Server, scope: *runic.semantic.Scope, stmt: *const runic.ast.Statement, pos: types.Position) ?runic.ast.Span {
+        return switch (stmt.*) {
+            .binding_decl => |bd| self.structLitFieldInExpr(scope, bd.initializer, pos),
+            .expression => |es| self.structLitFieldInExpr(scope, es.expression, pos),
+            .yield_stmt => |ys| self.structLitFieldInExpr(scope, ys.value, pos),
+            .exit_stmt => |xs| if (xs.value) |v| self.structLitFieldInExpr(scope, v, pos) else null,
+            .while_stmt => |ws| self.structLitFieldInExpr(scope, ws.condition, pos) orelse self.structLitFieldInBlock(scope, ws.body, pos),
+            else => null,
+        };
+    }
+
+    fn structLitFieldInExpr(self: *Server, scope: *runic.semantic.Scope, expr: *const runic.ast.Expression, pos: types.Position) ?runic.ast.Span {
+        switch (expr.*) {
+            .struct_literal => |lit| {
+                for (lit.fields) |field| {
+                    if (positionInRange(pos, types.Range.fromSpan(field.name.span))) {
+                        const lit_type = self.structLiteralType(scope, lit) orelse return null;
+                        if (self.resolveMemberSpanInType(scope, lit_type, field.name.name)) |span| return span;
+                    }
+                    // A field value can hold a nested literal (`.p = Point{ … }`).
+                    if (self.structLitFieldInExpr(scope, field.value, pos)) |span| return span;
+                }
+                if (lit.object) |object| return self.structLitFieldInExpr(scope, object, pos);
+                return null;
+            },
+            .call => |call| {
+                if (self.structLitFieldInExpr(scope, call.callee, pos)) |s| return s;
+                for (call.arguments) |arg| if (self.structLitFieldInExpr(scope, arg, pos)) |s| return s;
+                return null;
+            },
+            .binary => |b| return self.structLitFieldInExpr(scope, b.left, pos) orelse self.structLitFieldInExpr(scope, b.right, pos),
+            .unary => |u| return self.structLitFieldInExpr(scope, u.operand, pos),
+            .assignment => |a| return self.structLitFieldInExpr(scope, a.expr, pos),
+            .pipeline => |p| {
+                for (p.stages) |s| if (self.structLitFieldInExpr(scope, s, pos)) |sp| return sp;
+                return null;
+            },
+            .block => |b| return self.structLitFieldInBlock(scope, b, pos),
+            .if_expr => |i| return self.structLitFieldInIf(scope, &i, pos),
+            .for_expr => |f| {
+                for (f.sources) |s| if (self.structLitFieldInExpr(scope, s, pos)) |sp| return sp;
+                return self.structLitFieldInExpr(scope, f.body, pos);
+            },
+            .match_expr => |m| {
+                if (self.structLitFieldInExpr(scope, m.subject, pos)) |s| return s;
+                for (m.cases) |c| if (self.structLitFieldInBlock(scope, c.body, pos)) |s| return s;
+                return null;
+            },
+            .fn_decl => |f| return self.structLitFieldInExpr(scope, f.body, pos),
+            .array => |arr| {
+                for (arr.elements) |e| if (self.structLitFieldInExpr(scope, e, pos)) |s| return s;
+                return null;
+            },
+            .map => |mp| {
+                for (mp.entries) |e| {
+                    if (self.structLitFieldInExpr(scope, e.key, pos)) |s| return s;
+                    if (self.structLitFieldInExpr(scope, e.value, pos)) |s| return s;
+                }
+                return null;
+            },
+            .literal => |lit| switch (lit) {
+                .string => |s| {
+                    for (s.segments) |seg| switch (seg) {
+                        .interpolation => |e| if (self.structLitFieldInExpr(scope, e, pos)) |sp| return sp,
+                        else => {},
+                    };
+                    return null;
+                },
+                else => return null,
+            },
+            else => return null,
+        }
+    }
+
+    fn structLitFieldInIf(self: *Server, scope: *runic.semantic.Scope, if_expr: *const runic.ast.IfExpr, pos: types.Position) ?runic.ast.Span {
+        if (self.structLitFieldInExpr(scope, if_expr.condition, pos)) |s| return s;
+        if (self.structLitFieldInExpr(scope, if_expr.then_expr, pos)) |s| return s;
+        if (if_expr.else_branch) |else_branch| switch (else_branch) {
+            .expr => |e| return self.structLitFieldInExpr(scope, e, pos),
+            .if_expr => |nested| return self.structLitFieldInIf(scope, nested, pos),
+            .condition => {},
+        };
+        return null;
     }
 
     fn handleReferences(

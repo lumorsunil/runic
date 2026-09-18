@@ -563,7 +563,7 @@ fn extractMemberChain(context: CollectMatchesContext, allocator: Allocator) !?Me
 /// named-type identifiers (e.g. a struct field declared `inner: Inner`, stored
 /// as an unresolved identifier) to the type they name. Returns null when a name
 /// can't be resolved.
-fn concreteType(
+pub fn concreteType(
     type_checker: *runic.semantic.TypeChecker,
     scope: ?*runic.semantic.Scope,
     type_expr: *const ast.TypeExpr,
@@ -586,7 +586,7 @@ fn concreteType(
 /// Resolves the type of `name` as a member of `type_expr` — a struct field, or a
 /// pub declaration of an imported module. Returns null when the type has no such
 /// traversable member. Used to walk chained member access one segment at a time.
-fn resolveMemberType(
+pub fn resolveMemberType(
     type_checker: *runic.semantic.TypeChecker,
     scope: ?*runic.semantic.Scope,
     type_expr: *const ast.TypeExpr,

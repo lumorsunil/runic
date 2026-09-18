@@ -222,6 +222,10 @@
   - [x] basic hover implementation, identifier lookup
 - [x] go to definition
   - [x] struct field / decl member access resolves to the declaration
+  - [x] nested member access (`a.b.c`) descends each segment's type, not just
+        the first level (named field types are resolved to their struct)
+  - [x] struct-literal field names (`Vector{ .x = … }`, including nested
+        literals) resolve to the field declaration
 - [x] workspace-wide go to definition for symbols not present in currently tracked documents
   - via the workspace index (loads all .rn files under a client-provided root)
 - [x] completions for keywords

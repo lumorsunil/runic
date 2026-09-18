@@ -1234,6 +1234,43 @@ test "lsp definition resolves a struct field member access to the field declarat
     , 2, 10, 0, 23);
 }
 
+test "lsp definition resolves a nested struct field member access two levels deep" {
+    // Cursor on `x` in `l.from.x` must descend Line -> Point and resolve to
+    // Point's `x` field, not stop at the first level.
+    try expectDefinition(
+        \\const Point = struct { x: Int, y: Int }
+        \\const Line = struct { from: Point, to: Point }
+        \\fn Void main() Void {
+        \\    const l = Line{ .from = Point{ .x = 1, .y = 2 }, .to = Point{ .x = 3, .y = 4 } }
+        \\    echo "${l.from.x}"
+        \\}
+        \\
+    , 4, 19, 0, 23);
+}
+
+test "lsp definition resolves a struct literal field to the field declaration" {
+    // Cursor on `.x` inside the `Point{ … }` literal jumps to the `x` field
+    // declaration — a literal field is not an `object.member` access.
+    try expectDefinition(
+        \\const Point = struct { x: Int, y: Int }
+        \\const p = Point{ .x = 1, .y = 2 }
+        \\echo "${p.y}"
+        \\
+    , 1, 18, 0, 23);
+}
+
+test "lsp definition resolves a nested struct literal field" {
+    // The `.x` belongs to the inner `Point{ … }` nested in the `Line{ … }`
+    // literal; it must resolve to Point's field, not Line's.
+    try expectDefinition(
+        \\const Point = struct { x: Int, y: Int }
+        \\const Line = struct { from: Point, to: Point }
+        \\const l = Line{ .from = Point{ .x = 1, .y = 2 }, .to = Point{ .x = 3, .y = 4 } }
+        \\echo "${l.from.x}"
+        \\
+    , 2, 32, 0, 23);
+}
+
 test "lsp definition on an embedded std-module member does not crash" {
     // The member resolves into an embedded std module whose declaration span
     // has a virtual file path with no on-disk location. Resolving that path to a
