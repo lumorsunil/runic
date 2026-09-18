@@ -92,6 +92,14 @@ A cycle of feature work and engineering-health work:
   guard for `const`; an array as a streaming pipeline source; and Runic-call
   arguments (incl. by-value struct returns) value-captured across the FFI
   boundary.
+- **LSP maturity (0.11.0):** the language server gained call hierarchy (incl.
+  cross-file incoming calls), AST-refined semantic tokens, an indentation-based
+  document formatter, signature help, four code actions (add annotation, remove
+  unused, wrap `|T|`, capitalize a type), error-set completion/hover,
+  destructuring names in the outline, and go-to-definition/hover for nested
+  member chains and struct-literal fields. Alongside: a batch of fuzz-found
+  crash/leak fixes and a type-checker-reset segfault fix so editing a file with
+  functions no longer takes the server down. See theme 5 below.
 
 A known constraint discovered this cycle: `compiler.zig` is large (~10k lines)
 but cannot be cleanly split in current Zig — `usingnamespace` was removed and
@@ -274,23 +282,33 @@ infrastructure.
 
 ### 5. LSP maturity
 
-The language server saw a major build-out this cycle and now offers a broad,
-tested feature surface. Delivered:
+The language server saw a major build-out over the last two cycles and now
+offers a broad, tested feature surface. Delivered:
 
-- **Completion** — keyword snippets, member access (chained + trailing-dot
-  recovery), signature/type detail, `$PATH` executables, resolve-on-focus.
-- **Navigation** — go-to-definition, and binding-aware, workspace-wide
-  references and rename (including cross-file module members).
-- **Symbols & structure** — nested document outline, highlight, links,
-  workspace symbol search, folding ranges.
-- **Hints & actions** — inlay type and parameter hints, prepare-rename, an
-  add-type-annotation code action.
-- **Stability** — bounded per-edit analysis memory and re-check, and a
-  document-close use-after-free fix.
+- **Completion & hover** — keyword snippets, member access (chained +
+  trailing-dot recovery), signature/type detail, `$PATH` executables,
+  resolve-on-focus; error-set variant completion/hover; and hover that follows a
+  full member chain (`a.b.c`) and types struct-literal field names.
+- **Navigation** — go-to-definition (nested member chains and struct-literal
+  fields included), and binding-aware, workspace-wide references and rename
+  (including cross-file module members); call hierarchy for top-level functions
+  (prepare, outgoing, and incoming — incl. cross-file `m.f` callers).
+- **Symbols & structure** — nested document outline (with destructuring binding
+  names), highlight, links, workspace symbol search, folding ranges.
+- **Hints & actions** — inlay type and parameter hints, prepare-rename,
+  signature help, and code actions (add type annotation, remove unused
+  binding(s), wrap `|T|`, capitalize a type name).
+- **Highlighting & formatting** — AST-refined semantic tokens and an
+  indentation-based document formatter that preserves each line's interior.
+- **Stability** — bounded per-edit analysis memory and re-check; a batch of
+  fuzz-found crash/leak fixes (empty/non-ASCII documents, contained handler
+  errors, lexer EOF/underflow hardening); a document-close use-after-free fix;
+  and a type-checker-reset fix so re-checking a file with functions after an
+  edit no longer segfaults.
 
-Remaining work (tracked in `docs/lsp.md` and `todo.md`): more code actions
-(add-missing-import, remove-unused), call hierarchy, richer formatting, and
-semantic tokens. Diagnostics stay aligned with the CLI's parser/type checker.
+Remaining work (tracked in `docs/lsp.md` and `todo.md`) is polish: scope-aware
+semantic tokens for reference sites, and richer whole-program formatting.
+Diagnostics stay aligned with the CLI's parser/type checker.
 
 ### 6. Developer workflow and documentation
 

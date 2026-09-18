@@ -10,7 +10,7 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ---
 
-## [Unreleased]
+## [0.11.0] - 2026-09-18
 
 ### Added
 
