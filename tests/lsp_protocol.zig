@@ -671,6 +671,56 @@ test "lsp semantic tokens refine functions, parameters and declarations from the
     try std.testing.expectEqual(@as(i64, function), find(toks.items, 1, 15).?.ttype);
 }
 
+test "lsp survives incremental edits to a file with functions" {
+    // Every edit resets the workspace type checker (to reclaim its arena) and
+    // re-checks the open documents. The reset used to leave the checker's
+    // arena-backed stacks (stdout_type_stack, inferred-error collectors)
+    // dangling into freed memory, so the first function body re-checked after an
+    // edit wrote into freed memory and segfaulted. Delete lines across a file
+    // with several top-level functions, then confirm the server still answers.
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\const base = 10
+        \\fn Int add(x: Int) Int { yield x + base }
+        \\fn Int dbl(x: Int) Int { yield x + x }
+        \\fn Void greet(name: String) Void { echo "hi ${name}" }
+        \\const total = add 5
+        \\echo "${total}"
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        // Delete the `dbl` function (line 2).
+        try makeDidChangeIncremental(allocator, uri, 2, 2, 0, 3, 0, ""),
+        // Delete the `greet` function (now line 2).
+        try makeDidChangeIncremental(allocator, uri, 3, 2, 0, 3, 0, ""),
+        // The server must still respond after the edits.
+        try makeDocumentSymbolRequest(allocator, 9, uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 9);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+    // A well-formed result (not a crash) with the surviving `add` symbol.
+    const syms = parsed.value.object.get("result").?.array.items;
+    var saw_add = false;
+    for (syms) |s| {
+        if (std.mem.eql(u8, s.object.get("name").?.string, "add")) saw_add = true;
+    }
+    try std.testing.expect(saw_add);
+}
+
 test "lsp document symbols nest struct fields and function parameters" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);

@@ -165,6 +165,13 @@ pub const TypeChecker = struct {
         self.modules = .empty;
         self.diagnostics = .empty;
         self.generic_type_ctors = .empty;
+        // These collections are arena-backed, so `reset(.free_all)` just freed
+        // their storage: clear the now-dangling headers too, otherwise the next
+        // pass appends into freed memory (a segfault the moment a function body
+        // is type-checked). This is why re-checking after an edit crashed.
+        self.stdout_type_stack = .empty;
+        self.inferred_error_sets = .empty;
+        self.inferred_collector_stack = .empty;
     }
 
     fn reportSpanError(

@@ -224,6 +224,13 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   to end-of-input (now a clean unterminated-string diagnostic) or underflows its
   delimiter counters on a stray `)`/`]`/`}` — fixes that harden the compiler too.
   A memory leak in the diagnostics list was also closed.
+- **Editing a file with functions no longer crashes the language server.** Each
+  edit resets the workspace type checker to reclaim its arena and then re-checks
+  the open documents. The reset freed the arena but left the checker's
+  arena-backed stacks (the enclosing-function stdout types and inferred-error
+  collectors) pointing into freed memory, so the first function body re-checked
+  after an edit wrote into freed memory and segfaulted. The reset now clears
+  those stacks too.
 
 ## [0.10.1] - 2026-09-14
 
