@@ -340,6 +340,69 @@ test "lsp code action changes a lowercase type to the suggested capitalized one"
     try std.testing.expectEqual(@as(i64, 16), edit.get("range").?.object.get("end").?.object.get("character").?.integer);
 }
 
+test "lsp call hierarchy resolves callers and callees" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\fn Void helper(x: Int) Int { yield x }
+        \\fn Void run() Void {
+        \\  const a = helper 1
+        \\  const b = helper 2
+        \\  echo "${a}${b}"
+        \\}
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        // Prepare on `helper`'s declaration name (line 0).
+        try makePrepareCallHierarchyRequest(allocator, 2, uri, 0, 10),
+        try makeCallHierarchyItemRequest(allocator, 3, "callHierarchy/incomingCalls", uri, "helper"),
+        try makeCallHierarchyItemRequest(allocator, 4, "callHierarchy/outgoingCalls", uri, "run"),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    // prepare -> one item named `helper`.
+    {
+        const response = try findResponseById(allocator, output, 2);
+        defer allocator.free(response.body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        const items = parsed.value.object.get("result").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), items.len);
+        try std.testing.expectEqualStrings("helper", items[0].object.get("name").?.string);
+    }
+    // incoming(helper) -> `run` calls it twice.
+    {
+        const response = try findResponseById(allocator, output, 3);
+        defer allocator.free(response.body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        const calls = parsed.value.object.get("result").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), calls.len);
+        try std.testing.expectEqualStrings("run", calls[0].object.get("from").?.object.get("name").?.string);
+        try std.testing.expectEqual(@as(usize, 2), calls[0].object.get("fromRanges").?.array.items.len);
+    }
+    // outgoing(run) -> calls helper twice.
+    {
+        const response = try findResponseById(allocator, output, 4);
+        defer allocator.free(response.body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        const calls = parsed.value.object.get("result").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), calls.len);
+        try std.testing.expectEqualStrings("helper", calls[0].object.get("to").?.object.get("name").?.string);
+        try std.testing.expectEqual(@as(usize, 2), calls[0].object.get("fromRanges").?.array.items.len);
+    }
+}
+
 test "lsp document symbols nest struct fields and function parameters" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
@@ -4026,6 +4089,46 @@ fn makeSignatureHelpRequest(
             .textDocument = .{ .uri = uri },
             .position = .{ .line = line, .character = character },
         },
+    });
+}
+
+fn makePrepareCallHierarchyRequest(
+    allocator: Allocator,
+    id: i64,
+    uri: []const u8,
+    line: u32,
+    character: u32,
+) ![]u8 {
+    return toJsonAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .id = id,
+        .method = "textDocument/prepareCallHierarchy",
+        .params = .{
+            .textDocument = .{ .uri = uri },
+            .position = .{ .line = line, .character = character },
+        },
+    });
+}
+
+fn makeCallHierarchyItemRequest(
+    allocator: Allocator,
+    id: i64,
+    method: []const u8,
+    uri: []const u8,
+    name: []const u8,
+) ![]u8 {
+    const zero = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 0 } };
+    return toJsonAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .id = id,
+        .method = method,
+        .params = .{ .item = .{
+            .name = name,
+            .kind = 12,
+            .uri = uri,
+            .range = zero,
+            .selectionRange = zero,
+        } },
     });
 }
 

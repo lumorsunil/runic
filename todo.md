@@ -285,7 +285,10 @@
 - [x] signature help: shows the callee's `name(p0: T0, …)` signature with the
       parameter being entered highlighted (same-file top-level functions and
       imported-module functions; innermost call at the cursor)
-- [ ] call hierarchy
+- [x] call hierarchy (top-level functions): prepare, incoming calls (same-file
+      callers), and outgoing calls (same-file functions + imported-module `m.f`).
+  - [ ] cross-file incoming calls (a `m.f` caller in an importing file) — needs
+        the import graph to resolve which module `m` refers to this file
 - [ ] richer/robust formatting (current formatter is minimal)
 
 ## imports

@@ -192,6 +192,18 @@ pub const Server = struct {
                 if (request.id) |id| try self.handleSignatureHelp(id, params);
                 return true;
             },
+            .@"textDocument/prepareCallHierarchy" => |params| {
+                if (request.id) |id| try self.handlePrepareCallHierarchy(id, params);
+                return true;
+            },
+            .@"callHierarchy/incomingCalls" => |params| {
+                if (request.id) |id| try self.handleIncomingCalls(id, params);
+                return true;
+            },
+            .@"callHierarchy/outgoingCalls" => |params| {
+                if (request.id) |id| try self.handleOutgoingCalls(id, params);
+                return true;
+            },
             .@"textDocument/hover" => |params| {
                 if (request.id) |id| {
                     try self.handleHover(id, params);
@@ -1676,6 +1688,273 @@ pub const Server = struct {
         return null;
     }
 
+    // --- Call hierarchy ---------------------------------------------------
+
+    /// A call's callee: the function name, the identifier's span (used as the
+    /// call-site range), and the receiver object for a `m.f` member call.
+    const CalleeRef = struct { name: []const u8, span: runic.ast.Span, object: ?[]const u8 };
+
+    fn calleeRef(call: runic.ast.CallExpr) ?CalleeRef {
+        switch (call.callee.*) {
+            .identifier => |identifier| return .{ .name = identifier.name, .span = identifier.span, .object = null },
+            .binary => |binary| {
+                if (std.meta.activeTag(binary.op) != .member) return null;
+                const member = switch (binary.right.*) {
+                    .identifier => |i| i,
+                    else => return null,
+                };
+                const object = switch (binary.left.*) {
+                    .identifier => |i| i.name,
+                    else => return null,
+                };
+                return .{ .name = member.name, .span = member.span, .object = object };
+            },
+            else => return null,
+        }
+    }
+
+    /// A call-hierarchy item for a top-level function declaration (null if it is
+    /// anonymous). `range` spans the declaration; `selectionRange` is its name.
+    fn fnItem(fn_decl: runic.ast.FunctionDecl, uri: []const u8) ?types.CallHierarchyItem {
+        const name = fn_decl.name orelse return null;
+        return .{
+            .name = name.name,
+            .kind = .function,
+            .uri = uri,
+            .range = types.Range.fromSpan(fn_decl.span),
+            .selectionRange = types.Range.fromSpan(name.span),
+        };
+    }
+
+    /// Appends every call expression in a statement (recursing through blocks and
+    /// control flow) to `list`.
+    fn collectCallsInStmt(stmt: *const runic.ast.Statement, list: *std.ArrayList(runic.ast.CallExpr), arena: Allocator) Allocator.Error!void {
+        switch (stmt.*) {
+            .expression => |es| try collectCallsInExpr(es.expression, list, arena),
+            .binding_decl => |bd| try collectCallsInExpr(bd.initializer, list, arena),
+            .yield_stmt => |ys| try collectCallsInExpr(ys.value, list, arena),
+            .exit_stmt => |xs| if (xs.value) |v| try collectCallsInExpr(v, list, arena),
+            .while_stmt => |ws| {
+                try collectCallsInExpr(ws.condition, list, arena);
+                for (ws.body.statements) |s| try collectCallsInStmt(s, list, arena);
+            },
+            else => {},
+        }
+    }
+
+    fn collectCallsInExpr(expr: *const runic.ast.Expression, list: *std.ArrayList(runic.ast.CallExpr), arena: Allocator) Allocator.Error!void {
+        switch (expr.*) {
+            .call => |call| {
+                try list.append(arena, call);
+                try collectCallsInExpr(call.callee, list, arena);
+                for (call.arguments) |arg| try collectCallsInExpr(arg, list, arena);
+            },
+            .pipeline => |p| for (p.stages) |s| try collectCallsInExpr(s, list, arena),
+            .binary => |b| {
+                try collectCallsInExpr(b.left, list, arena);
+                try collectCallsInExpr(b.right, list, arena);
+            },
+            .unary => |u| try collectCallsInExpr(u.operand, list, arena),
+            .assignment => |a| try collectCallsInExpr(a.expr, list, arena),
+            .block => |b| for (b.statements) |s| try collectCallsInStmt(s, list, arena),
+            .if_expr => |i| try collectCallsInIf(&i, list, arena),
+            .for_expr => |f| {
+                for (f.sources) |s| try collectCallsInExpr(s, list, arena);
+                try collectCallsInExpr(f.body, list, arena);
+            },
+            .match_expr => |m| {
+                try collectCallsInExpr(m.subject, list, arena);
+                for (m.cases) |c| for (c.body.statements) |s| try collectCallsInStmt(s, list, arena);
+            },
+            .literal => |lit| switch (lit) {
+                .string => |s| for (s.segments) |seg| switch (seg) {
+                    .interpolation => |e| try collectCallsInExpr(e, list, arena),
+                    else => {},
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
+
+    fn collectCallsInIf(if_expr: *const runic.ast.IfExpr, list: *std.ArrayList(runic.ast.CallExpr), arena: Allocator) Allocator.Error!void {
+        try collectCallsInExpr(if_expr.condition, list, arena);
+        try collectCallsInExpr(if_expr.then_expr, list, arena);
+        if (if_expr.else_branch) |else_branch| switch (else_branch) {
+            .expr => |e| try collectCallsInExpr(e, list, arena),
+            .if_expr => |nested| try collectCallsInIf(nested, list, arena),
+            .condition => {},
+        };
+    }
+
+    /// The top-level function whose body contains `offset`, or that is named at
+    /// `offset` — the entry point for a call-hierarchy tree.
+    fn topLevelFnAt(script: runic.ast.Script, offset: usize) ?runic.ast.FunctionDecl {
+        for (script.statements) |stmt| {
+            const fn_decl = switch (stmt.*) {
+                .expression => |es| switch (es.expression.*) {
+                    .fn_decl => |f| f,
+                    else => continue,
+                },
+                else => continue,
+            };
+            if (fn_decl.name == null) continue;
+            if (spanHasOffset(fn_decl.span, offset)) return fn_decl;
+        }
+        return null;
+    }
+
+    fn handlePrepareCallHierarchy(self: *Server, id: types.RequestId, params: types.CallHierarchyPrepareParams) !void {
+        const null_result = types.response(id, std.json.Value{ .null = {} });
+        const path = try self.resolveUriPath(params.textDocument.uri);
+        defer self.allocator.free(path);
+
+        const doc = self.documents.get(params.textDocument.uri) orelse return self.sendJson(null_result);
+        const script = doc.ast orelse return self.sendJson(null_result);
+        const offset = params.position.findIndex(doc.text) orelse return self.sendJson(null_result);
+
+        // The function under the cursor: a declaration the cursor sits in, or a
+        // call whose callee names a top-level function in this document.
+        var target: ?runic.ast.FunctionDecl = topLevelFnAt(script, offset);
+        if (target == null) {
+            if (self.extractIdentifier(.{ .file = path, .line = 0, .column = 0, .offset = offset }, doc.text)) |ident| {
+                target = findTopLevelFn(script, ident.name);
+            }
+        }
+        const fn_decl = target orelse return self.sendJson(null_result);
+        const item = fnItem(fn_decl, params.textDocument.uri) orelse return self.sendJson(null_result);
+        try self.sendJson(types.response(id, &[_]types.CallHierarchyItem{item}));
+    }
+
+    fn handleIncomingCalls(self: *Server, id: types.RequestId, params: types.CallHierarchyIncomingCallsParams) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
+        var results = std.ArrayList(types.CallHierarchyIncomingCall).empty;
+
+        // Same-file callers: each top-level function whose body has a direct call
+        // to the queried name (`f x`, not a `m.f` member call). Cross-file callers
+        // (via `m.f`) are a follow-up.
+        const doc = self.documents.get(params.item.uri) orelse return self.sendJson(types.response(id, results.items));
+        const script = doc.ast orelse return self.sendJson(types.response(id, results.items));
+
+        for (script.statements) |stmt| {
+            const caller = switch (stmt.*) {
+                .expression => |es| switch (es.expression.*) {
+                    .fn_decl => |f| f,
+                    else => continue,
+                },
+                else => continue,
+            };
+            if (caller.name == null) continue;
+
+            var calls = std.ArrayList(runic.ast.CallExpr).empty;
+            try collectCallsInExpr(caller.body, &calls, aa);
+
+            var from_ranges = std.ArrayList(types.Range).empty;
+            for (calls.items) |call| {
+                const ref = calleeRef(call) orelse continue;
+                if (ref.object != null) continue; // a `m.f` call, not this file's `f`
+                if (!std.mem.eql(u8, ref.name, params.item.name)) continue;
+                try from_ranges.append(aa, types.Range.fromSpan(ref.span));
+            }
+            if (from_ranges.items.len == 0) continue;
+
+            try results.append(aa, .{
+                .from = fnItem(caller, params.item.uri) orelse continue,
+                .fromRanges = from_ranges.items,
+            });
+        }
+
+        try self.sendJson(types.response(id, results.items));
+    }
+
+    fn handleOutgoingCalls(self: *Server, id: types.RequestId, params: types.CallHierarchyOutgoingCallsParams) !void {
+        const path = try self.resolveUriPath(params.item.uri);
+        defer self.allocator.free(path);
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
+        var results = std.ArrayList(types.CallHierarchyOutgoingCall).empty;
+
+        const doc = self.documents.get(params.item.uri) orelse return self.sendJson(types.response(id, results.items));
+        const script = doc.ast orelse return self.sendJson(types.response(id, results.items));
+        const caller = findTopLevelFn(script, params.item.name) orelse return self.sendJson(types.response(id, results.items));
+        const module_scope = self.workspace.type_checker.modules.get(path);
+
+        var calls = std.ArrayList(runic.ast.CallExpr).empty;
+        try collectCallsInExpr(caller.body, &calls, aa);
+
+        // Group call sites by resolved callee (same-file function, or an imported
+        // module's function).
+        var groups = std.ArrayList(struct {
+            item: types.CallHierarchyItem,
+            ranges: std.ArrayList(types.Range),
+        }).empty;
+
+        for (calls.items) |call| {
+            const ref = calleeRef(call) orelse continue;
+            const callee = self.resolveCalleeItem(ref, script, module_scope, params.item.uri, aa) orelse continue;
+            const range = types.Range.fromSpan(ref.span);
+
+            var group_index: ?usize = null;
+            for (groups.items, 0..) |g, gi| {
+                if (std.mem.eql(u8, g.item.name, callee.name) and std.mem.eql(u8, g.item.uri, callee.uri)) {
+                    group_index = gi;
+                    break;
+                }
+            }
+            if (group_index) |gi| {
+                try groups.items[gi].ranges.append(aa, range);
+            } else {
+                var ranges = std.ArrayList(types.Range).empty;
+                try ranges.append(aa, range);
+                try groups.append(aa, .{ .item = callee, .ranges = ranges });
+            }
+        }
+
+        for (groups.items) |g| {
+            try results.append(aa, .{ .to = g.item, .fromRanges = g.ranges.items });
+        }
+
+        try self.sendJson(types.response(id, results.items));
+    }
+
+    /// Resolves a call's callee to a call-hierarchy item: a same-file top-level
+    /// function (identifier callee), or an imported module's function (`m.f`).
+    fn resolveCalleeItem(
+        self: *Server,
+        ref: CalleeRef,
+        script: runic.ast.Script,
+        module_scope: ?*runic.semantic.Scope,
+        doc_uri: []const u8,
+        arena: Allocator,
+    ) ?types.CallHierarchyItem {
+        if (ref.object) |object_name| {
+            // `m.f`: resolve `m` to an imported module, find `f` in its AST.
+            const scope = module_scope orelse return null;
+            const binding = scope.lookup(object_name) orelse return null;
+            const binding_type = binding.type_expr orelse return null;
+            const resolved = switch (binding_type.*) {
+                .alias => |alias_type| self.workspace.type_checker.resolveAliasType(&alias_type),
+                else => binding_type,
+            };
+            const module_type = switch (resolved.*) {
+                .module => |m| m,
+                else => return null,
+            };
+            const module_script = (self.documents.document_store.getAst(module_type.path) catch return null) orelse return null;
+            const fn_decl = findTopLevelFn(module_script, ref.name) orelse return null;
+            const module_uri = std.fmt.allocPrint(arena, "file://{s}", .{module_type.path}) catch return null;
+            return fnItem(fn_decl, module_uri);
+        }
+        const fn_decl = findTopLevelFn(script, ref.name) orelse return null;
+        return fnItem(fn_decl, doc_uri);
+    }
+
     fn handleFoldingRange(
         self: *Server,
         id: types.RequestId,
@@ -2282,6 +2561,7 @@ pub const Server = struct {
                     .triggerCharacters = &.{ " ", "(" },
                     .retriggerCharacters = &.{ " ", "," },
                 },
+                .callHierarchyProvider = .{ .payload = .{ .bool = true } },
                 .definitionProvider = .{ .payload = .{
                     .definitionOptions = .{
                         .workDoneProgress = false,

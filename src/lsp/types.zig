@@ -111,6 +111,9 @@ pub const ClientRequestPayload = union(enum) {
     @"completionItem/resolve": std.json.Value,
     @"textDocument/hover": HoverParams,
     @"textDocument/signatureHelp": SignatureHelpParams,
+    @"textDocument/prepareCallHierarchy": CallHierarchyPrepareParams,
+    @"callHierarchy/incomingCalls": CallHierarchyIncomingCallsParams,
+    @"callHierarchy/outgoingCalls": CallHierarchyOutgoingCallsParams,
     @"textDocument/definition": DefinitionParams,
     @"textDocument/references": ReferenceParams,
     @"textDocument/documentHighlight": DocumentHighlightParams,
@@ -1203,6 +1206,43 @@ pub const CallHierarchyRegistrationOptions = struct {
     id: ?[]const u8 = null,
     documentSelector: ?DocumentSelector = null,
     workDoneProgress: ?bool = null,
+};
+
+pub const CallHierarchyPrepareParams = struct {
+    textDocument: TextDocumentIdentifier,
+    position: Position,
+};
+
+/// A function in a call-hierarchy tree. `range` spans the whole declaration;
+/// `selectionRange` is the name. The name + uri identify it for the follow-up
+/// incoming/outgoing requests.
+pub const CallHierarchyItem = struct {
+    name: []const u8,
+    kind: SymbolKind = .function,
+    uri: Uri,
+    range: Range,
+    selectionRange: Range,
+};
+
+pub const CallHierarchyIncomingCallsParams = struct {
+    item: CallHierarchyItem,
+};
+
+pub const CallHierarchyOutgoingCallsParams = struct {
+    item: CallHierarchyItem,
+};
+
+/// A caller of the queried function, with the ranges of its call sites.
+pub const CallHierarchyIncomingCall = struct {
+    from: CallHierarchyItem,
+    fromRanges: []const Range,
+};
+
+/// A function the queried function calls, with the call-site ranges (in the
+/// queried function's body).
+pub const CallHierarchyOutgoingCall = struct {
+    to: CallHierarchyItem,
+    fromRanges: []const Range,
 };
 
 pub const SemanticTokensOptions = struct {
