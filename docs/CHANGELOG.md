@@ -86,6 +86,32 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   Runic-owned memory, so it composes like any string (`.len`, interpolation,
   builtins). A NULL return (e.g. `getenv` of an unset variable) becomes the
   empty string. This closes the last scalar-marshalling gap of the C FFI MVP.
+- **Language server — deeper analysis and editing features.** `runic-lsp` gained
+  a batch of new capabilities on top of the [0.8.0] surface (see `docs/lsp.md`):
+  - _Completion & hover:_ error sets complete and hover with their variants
+    (`Variant` / `Variant: PayloadType`). Hover and go-to-definition now follow
+    a full member chain — a nested access like `a.b.c` resolves `c` against the
+    type of `a.b`, descending named field types to their struct — and resolve
+    struct-literal field names (the `.x` in `Vector{ .x = … }`, including nested
+    literals), which are not `object.member` accesses.
+  - _Navigation:_ call hierarchy for top-level functions — prepare, outgoing
+    calls (same-file functions and imported-module `m.f`), and incoming calls
+    including **cross-file** callers (a `m.f` access in an importing file,
+    resolved through the workspace index).
+  - _Symbols:_ the document outline now surfaces the names introduced by a
+    destructuring binding (`const a, b = …`, `const { x, y } = …`), recursing
+    through nested patterns.
+  - _Editing:_ signature help (the callee's parameter list with the active
+    argument highlighted); code actions — add an inferred type annotation, remove
+    an unused binding (individually or all at once as a source action), wrap a
+    bare undeclared uppercase type as `|T|`, and capitalize a lowercase type name
+    (the last two driven off diagnostics); a document formatter that re-indents by
+    structural nesting depth while preserving each line's interior (command-
+    argument spacing is significant); and semantic tokens
+    (`textDocument/semanticTokens/full`) classifying keywords, types, variables,
+    numbers, strings, and operators, refined from the AST so function
+    declarations and call sites are `function`, parameters are `parameter`, and
+    declarations carry `declaration`/`readonly` modifiers.
 
 ### Changed
 
@@ -190,6 +216,14 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   `.closeable` handle; it is now captured by value instead of by the slot
   reference used for aliasable structs, which `cimport_call` could not resolve
   as a library (`CImportLoadFailed`).
+- **Language server resilience.** A batch of crashes found by fuzzing the server
+  are fixed, so a document being edited can no longer take it down: an empty or
+  non-ASCII document (an out-of-bounds read and a lexer error escaping a scan),
+  and any single request handler that errors is now contained and logged instead
+  of killing the server. The lexer itself no longer panics on a string that runs
+  to end-of-input (now a clean unterminated-string diagnostic) or underflows its
+  delimiter counters on a stray `)`/`]`/`}` — fixes that harden the compiler too.
+  A memory leak in the diagnostics list was also closed.
 
 ## [0.10.1] - 2026-09-14
 
