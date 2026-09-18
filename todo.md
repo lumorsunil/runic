@@ -220,6 +220,9 @@
 - [x] completions for executables found on $PATH
 - [x] hover
   - [x] basic hover implementation, identifier lookup
+  - [x] member access, including nested (`a.b.c`) via the same object-chain type
+        walk as go-to-definition, and struct-literal field names
+        (`Vector{ .x = … }`, including nested literals)
 - [x] go to definition
   - [x] struct field / decl member access resolves to the declaration
   - [x] nested member access (`a.b.c`) descends each segment's type, not just

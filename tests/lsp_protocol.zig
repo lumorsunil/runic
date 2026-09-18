@@ -2557,6 +2557,61 @@ test "lsp hover shows execution result member type" {
     try std.testing.expect(std.mem.indexOf(u8, value, "Byte") != null);
 }
 
+/// Runs a single-document hover and asserts the rendered markdown contains each
+/// of `needles`.
+fn expectHoverContains(source: []const u8, line: u32, char: u32, needles: []const []const u8) !void {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeHoverRequest(allocator, 1, uri, line, char),
+    };
+    defer for (messages) |m| allocator.free(m);
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+    const response = try findResponseById(allocator, output, 1);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+    const value = parsed.value.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    for (needles) |needle| try std.testing.expect(std.mem.indexOf(u8, value, needle) != null);
+}
+
+test "lsp hover types a nested struct field member access two levels deep" {
+    // `l.from.x` descends Line -> Point; hovering `x` shows Point's field type.
+    try expectHoverContains(
+        \\const Point = struct { x: Int, y: Int }
+        \\const Line = struct { from: Point, to: Point }
+        \\fn Void main() Void {
+        \\    const l = Line{ .from = Point{ .x = 1, .y = 2 }, .to = Point{ .x = 3, .y = 4 } }
+        \\    echo "${l.from.x}"
+        \\}
+        \\
+    , 4, 19, &.{ "x", "Int" });
+}
+
+test "lsp hover types a struct literal field" {
+    // Hovering `.y` inside the `Point{ … }` literal shows the field type.
+    try expectHoverContains(
+        \\const Point = struct { x: Int, y: Int }
+        \\const p = Point{ .x = 1, .y = 2 }
+        \\
+    , 1, 26, &.{ "y", "Int" });
+}
+
+test "lsp hover types a nested struct literal field" {
+    // The `.from` field of the `Line{ … }` literal is typed as `Point`.
+    try expectHoverContains(
+        \\const Point = struct { x: Int, y: Int }
+        \\const Line = struct { from: Point, to: Point }
+        \\const l = Line{ .from = Point{ .x = 1, .y = 2 }, .to = Point{ .x = 3, .y = 4 } }
+        \\
+    , 2, 17, &.{ "from", "Point" });
+}
+
 test "lsp hover shows a cimport extern's C signature" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);

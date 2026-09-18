@@ -635,16 +635,27 @@ pub const Server = struct {
             break :brk null;
         };
 
-        const member_binding: ?*runic.semantic.Scope.Binding = brk: {
+        // The type of the object a member access is taken from, walking the full
+        // chain so `a.b.c` resolves `c` in the type of `a.b`, not just `a`.
+        const member_object_type: ?*const runic.ast.TypeExpr = brk: {
             if (scope) |s| if (extracted_member) |m| {
-                break :brk s.lookup(m.object_name);
+                break :brk self.resolveObjectChainType(s, m.chain());
             };
+            break :brk null;
+        };
 
+        // A struct-literal field name under the cursor (`Vector{ .x = … }`).
+        const literal_field: ?StructLitField = brk: {
+            if (extracted_member != null) break :brk null;
+            if (scope) |s| if (doc) |d| if (d.ast) |script| {
+                break :brk self.resolveStructLiteralField(s, script, params.position);
+            };
             break :brk null;
         };
 
         const range: types.Range = brk: {
             if (extracted_member) |m| break :brk .fromSpan(m.member_span);
+            if (literal_field) |f| break :brk .fromSpan(f.member_span);
             if (binding) |b| break :brk .fromSpan(b.identifier.span);
             if (extracted_identifier) |i| break :brk .fromSpan(i.span);
             break :brk .fromLocation(loc);
@@ -654,11 +665,11 @@ pub const Server = struct {
         defer alloc_writer.deinit();
 
         if (extracted_member) |member| {
-            if (member_binding) |b| {
-                if (b.type_expr) |binding_type| {
-                    self.writeHoverMember(&alloc_writer, binding_type, member.member_name);
-                }
+            if (member_object_type) |object_type| {
+                self.writeHoverMember(&alloc_writer, scope, object_type, member.member_name);
             }
+        } else if (literal_field) |f| {
+            self.writeHoverMember(&alloc_writer, scope, f.object_type, f.member_name);
         } else if (binding) |b| {
             self.writeHoverBinding(&alloc_writer, b);
         } else {
@@ -954,13 +965,13 @@ pub const Server = struct {
     fn writeHoverMember(
         self: *Server,
         alloc_writer: *std.Io.Writer.Allocating,
+        scope: ?*runic.semantic.Scope,
         binding_type: *const runic.ast.TypeExpr,
         member_name: []const u8,
     ) void {
-        const resolved_type = switch (binding_type.*) {
-            .alias => |alias_type| self.workspace.type_checker.resolveAliasType(&alias_type),
-            else => binding_type,
-        };
+        // Peel to the concrete shape so a named object/field type (`p: Point`,
+        // `from: Point`) resolves through to its struct before the member lookup.
+        const resolved_type = completion.concreteType(&self.workspace.type_checker, scope, binding_type) orelse binding_type;
 
         // A `cimport` member is a declared extern; show its C signature.
         if (resolved_type.* == .struct_type) {
@@ -1071,9 +1082,11 @@ pub const Server = struct {
         // A struct-literal field (`Vector{ .x = … }`) is not a member access, so
         // find it by walking the AST and resolve it to the field declaration.
         if (scope) |s| if (doc) |d| if (d.ast) |script| {
-            if (self.resolveStructLiteralFieldSpan(s, script, params.position)) |field_span| {
-                try self.sendDefinitionSpan(id, field_span);
-                return;
+            if (self.resolveStructLiteralField(s, script, params.position)) |field| {
+                if (self.resolveMemberSpanInType(s, field.object_type, field.member_name)) |field_span| {
+                    try self.sendDefinitionSpan(id, field_span);
+                    return;
+                }
             }
         };
 
@@ -1214,18 +1227,25 @@ pub const Server = struct {
         }
     }
 
-    /// Finds a struct-literal field name at `pos` (the `.x` in `Vector{ .x = … }`)
-    /// and resolves it to the field's declaration span in the struct type. Unlike
-    /// a member access, a literal field is not an `object.member`, so it is found
-    /// by walking the AST for the enclosing literal.
-    fn resolveStructLiteralFieldSpan(
+    /// A struct-literal field name under the cursor (the `.x` in
+    /// `Vector{ .x = … }`): the struct type being constructed, the field name,
+    /// and the field's occurrence span. Unlike a member access this is not an
+    /// `object.member`, so it is found by walking the AST for the enclosing
+    /// literal.
+    const StructLitField = struct {
+        object_type: *const runic.ast.TypeExpr,
+        member_name: []const u8,
+        member_span: runic.ast.Span,
+    };
+
+    fn resolveStructLiteralField(
         self: *Server,
         scope: *runic.semantic.Scope,
         script: runic.ast.Script,
         pos: types.Position,
-    ) ?runic.ast.Span {
+    ) ?StructLitField {
         for (script.statements) |stmt| {
-            if (self.structLitFieldInStmt(scope, stmt, pos)) |span| return span;
+            if (self.structLitFieldInStmt(scope, stmt, pos)) |field| return field;
         }
         return null;
     }
@@ -1249,14 +1269,14 @@ pub const Server = struct {
         return binding.type_expr;
     }
 
-    fn structLitFieldInBlock(self: *Server, scope: *runic.semantic.Scope, block: runic.ast.Block, pos: types.Position) ?runic.ast.Span {
+    fn structLitFieldInBlock(self: *Server, scope: *runic.semantic.Scope, block: runic.ast.Block, pos: types.Position) ?StructLitField {
         for (block.statements) |s| {
-            if (self.structLitFieldInStmt(scope, s, pos)) |span| return span;
+            if (self.structLitFieldInStmt(scope, s, pos)) |field| return field;
         }
         return null;
     }
 
-    fn structLitFieldInStmt(self: *Server, scope: *runic.semantic.Scope, stmt: *const runic.ast.Statement, pos: types.Position) ?runic.ast.Span {
+    fn structLitFieldInStmt(self: *Server, scope: *runic.semantic.Scope, stmt: *const runic.ast.Statement, pos: types.Position) ?StructLitField {
         return switch (stmt.*) {
             .binding_decl => |bd| self.structLitFieldInExpr(scope, bd.initializer, pos),
             .expression => |es| self.structLitFieldInExpr(scope, es.expression, pos),
@@ -1267,16 +1287,16 @@ pub const Server = struct {
         };
     }
 
-    fn structLitFieldInExpr(self: *Server, scope: *runic.semantic.Scope, expr: *const runic.ast.Expression, pos: types.Position) ?runic.ast.Span {
+    fn structLitFieldInExpr(self: *Server, scope: *runic.semantic.Scope, expr: *const runic.ast.Expression, pos: types.Position) ?StructLitField {
         switch (expr.*) {
             .struct_literal => |lit| {
                 for (lit.fields) |field| {
                     if (positionInRange(pos, types.Range.fromSpan(field.name.span))) {
                         const lit_type = self.structLiteralType(scope, lit) orelse return null;
-                        if (self.resolveMemberSpanInType(scope, lit_type, field.name.name)) |span| return span;
+                        return .{ .object_type = lit_type, .member_name = field.name.name, .member_span = field.name.span };
                     }
                     // A field value can hold a nested literal (`.p = Point{ … }`).
-                    if (self.structLitFieldInExpr(scope, field.value, pos)) |span| return span;
+                    if (self.structLitFieldInExpr(scope, field.value, pos)) |nested| return nested;
                 }
                 if (lit.object) |object| return self.structLitFieldInExpr(scope, object, pos);
                 return null;
@@ -1330,7 +1350,7 @@ pub const Server = struct {
         }
     }
 
-    fn structLitFieldInIf(self: *Server, scope: *runic.semantic.Scope, if_expr: *const runic.ast.IfExpr, pos: types.Position) ?runic.ast.Span {
+    fn structLitFieldInIf(self: *Server, scope: *runic.semantic.Scope, if_expr: *const runic.ast.IfExpr, pos: types.Position) ?StructLitField {
         if (self.structLitFieldInExpr(scope, if_expr.condition, pos)) |s| return s;
         if (self.structLitFieldInExpr(scope, if_expr.then_expr, pos)) |s| return s;
         if (if_expr.else_branch) |else_branch| switch (else_branch) {
