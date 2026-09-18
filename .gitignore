@@ -33,3 +33,6 @@ tmp/
 
 # Codex
 .codex
+
+# development notes
+.devnotes
