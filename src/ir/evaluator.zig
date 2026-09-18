@@ -1227,9 +1227,15 @@ pub const IREvaluator = struct {
                         .float => .{ .float = @floatCast(ret.ff) },
                         .bool => .{ .exit_code = ExitCode.fromBoolean(ret.i != 0) },
                         .ptr => .{ .addr = @intFromPtr(ret.p) },
-                        // A `c.Str` return (a borrowed `char*`) needs copying into
-                        // a Runic string — deferred; see future/c-ffi.md.
-                        .str => return Error.CImportUnsupportedType,
+                        // A `c.Str` return is a borrowed `char*`: copy it into a
+                        // Runic-owned string (the C memory may be freed/reused by
+                        // the callee). A NULL return (e.g. `getenv` of an unset
+                        // var) becomes the empty string — `c.Str` maps to the
+                        // non-optional `String`.
+                        .str => if (ret.p) |p|
+                            ir.Value{ .zig_string = try self.allocator.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(p)))) }
+                        else
+                            ir.Value{ .zig_string = "" },
                         // Integer widths are widened to `ffi_arg`; read the word.
                         else => .{ .integer = ret.i },
                     },
@@ -1799,6 +1805,23 @@ pub const IREvaluator = struct {
                 try self.setLocation(thread, sl.result, new_base);
                 return .cont;
             },
+            .array_concat => |cc| {
+                const a = try self.resolveValueSource(thread, cc.left);
+                const b = try self.resolveValueSource(thread, cc.right);
+                const a_len: usize = if (a == .addr) @intCast(thread.shared.heapGet(a.addr).?.integer) else 0;
+                const b_len: usize = if (b == .addr) @intCast(thread.shared.heapGet(b.addr).?.integer) else 0;
+                const new_base = try thread.shared.alloc(self.allocator, a_len + b_len + 1);
+                const nb = new_base.addr;
+                thread.shared.heapGetPtr(nb).?.* = .{ .integer = @intCast(a_len + b_len) };
+                if (a == .addr) for (0..a_len) |i| {
+                    thread.shared.heapGetPtr(nb + 1 + i).?.* = thread.shared.heapGet(a.addr + 1 + i).?;
+                };
+                if (b == .addr) for (0..b_len) |i| {
+                    thread.shared.heapGetPtr(nb + 1 + a_len + i).?.* = thread.shared.heapGet(b.addr + 1 + i).?;
+                };
+                try self.setLocation(thread, cc.result, new_base);
+                return .cont;
+            },
             .array_set_inplace => |as| {
                 const arr = try self.resolveValueSource(thread, as.array);
                 const index = try self.resolveValueSource(thread, as.index);
@@ -2007,9 +2030,22 @@ pub const IREvaluator = struct {
                         thread.setInstructionCounter(dest);
                         return .cont_no_instr_counter_inc;
                     }
-                } else if (cond_value.exit_code.toBoolean() == jmp.jump_if) {
-                    thread.setInstructionCounter(dest);
-                    return .cont_no_instr_counter_inc;
+                } else {
+                    // A plain value condition. Normally an `.exit_code` (a Bool),
+                    // but guard the union access: a condition that resolved to a
+                    // non-boolean value — e.g. `void` from `if ((f) > 3)`, where
+                    // the `>` bound as an output redirect of the command `(f)`
+                    // rather than a comparison — must not crash. Such a value is
+                    // treated as false (the branch is not taken).
+                    const cond_bool = switch (cond_value) {
+                        .exit_code => |ec| ec.toBoolean(),
+                        .integer => |i| i != 0,
+                        else => false,
+                    };
+                    if (cond_bool == jmp.jump_if) {
+                        thread.setInstructionCounter(dest);
+                        return .cont_no_instr_counter_inc;
+                    }
                 }
 
                 return .cont;
@@ -2486,7 +2522,17 @@ pub const IREvaluator = struct {
                     const float_right: f64 = @floatFromInt(right.value.integer);
                     return .{ .float = left.value.float + float_right };
                 } else if (left.isValueTag(.addr) and right.isValueTag(.integer)) {
-                    return .{ .addr = left.value.addr +| @as(usize, @intCast(right.value.integer)) };
+                    // A negative offset (e.g. a negative array index, `a[0 - 1]`)
+                    // must not `@intCast` to usize — that panics. Subtract its
+                    // magnitude with saturation instead, so an out-of-range index
+                    // degrades to a bad address (caught later as a failed
+                    // dereference) rather than crashing the interpreter, matching
+                    // how a positive out-of-bounds index already behaves.
+                    const off = right.value.integer;
+                    return .{ .addr = if (off >= 0)
+                        left.value.addr +| @as(usize, @intCast(off))
+                    else
+                        left.value.addr -| @as(usize, @abs(off)) };
                 }
             },
             .sub => {

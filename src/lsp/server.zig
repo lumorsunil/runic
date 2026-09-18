@@ -11,6 +11,35 @@ const runic = @import("runic");
 const Allocator = std.mem.Allocator;
 
 /// Shared state threaded through the recursive parameter-hint walk.
+/// The semantic-token type legend (the index of each is the `tokenType` emitted
+/// for a token). Standard LSP names, so a client applies its theme colors.
+const semantic_token_types = [_][]const u8{ "keyword", "string", "number", "operator", "type", "variable", "function", "parameter" };
+const SemanticTokenType = enum(u32) { keyword = 0, string = 1, number = 2, operator = 3, type = 4, variable = 5, function = 6, parameter = 7 };
+
+/// The token-modifier legend. Emitted as a bitmask (the index of each is the
+/// bit). `declaration` marks the defining occurrence of a name; `readonly` marks
+/// an immutable (`const`) binding.
+const semantic_token_modifiers = [_][]const u8{ "declaration", "readonly" };
+const SEM_MOD_DECLARATION: u32 = 1 << 0;
+const SEM_MOD_READONLY: u32 = 1 << 1;
+
+/// A refinement for the token at a given position, computed from the AST and
+/// overriding the purely lexical classification (e.g. a bare identifier the
+/// lexer sees becomes a `function` at a call site or a `parameter` at a
+/// declaration).
+const SemOverride = struct { ttype: SemanticTokenType, mods: u32 };
+const SemOverlay = std.AutoHashMap(u64, SemOverride);
+
+/// Packs a 0-based (line, character) position into a single map key.
+fn semKey(line: u32, character: u32) u64 {
+    return (@as(u64, line) << 32) | character;
+}
+
+fn semSpanKey(span: runic.ast.Span) u64 {
+    const range = types.Range.fromSpan(span);
+    return semKey(range.start.line, range.start.character);
+}
+
 const CallHintCtx = struct {
     arena: Allocator,
     hints: *std.ArrayList(types.InlayHint),
@@ -111,7 +140,15 @@ pub const Server = struct {
             };
             defer self.allocator.free(payload);
             try self.log("Recieved message: {s}", .{payload});
-            const continue_loop = try self.handleEnvelope(payload);
+            // A single request must never take the server down. A handler that
+            // errors (a bad path, an edge-case document, an unexpected shape) is
+            // logged and the session continues, rather than propagating out of
+            // run() and killing the process. (Malformed-JSON envelopes are
+            // dropped inside handleEnvelope; this covers the handlers themselves.)
+            const continue_loop = self.handleEnvelope(payload) catch |err| blk: {
+                self.log("request handler errored, continuing: {}", .{err}) catch {};
+                break :blk true;
+            };
             if (!continue_loop) break;
             try self.flushDiagnostics();
         }
@@ -178,6 +215,26 @@ pub const Server = struct {
             },
             .@"completionItem/resolve" => |item| {
                 if (request.id) |id| try self.handleCompletionResolve(id, item);
+                return true;
+            },
+            .@"textDocument/signatureHelp" => |params| {
+                if (request.id) |id| try self.handleSignatureHelp(id, params);
+                return true;
+            },
+            .@"textDocument/prepareCallHierarchy" => |params| {
+                if (request.id) |id| try self.handlePrepareCallHierarchy(id, params);
+                return true;
+            },
+            .@"callHierarchy/incomingCalls" => |params| {
+                if (request.id) |id| try self.handleIncomingCalls(id, params);
+                return true;
+            },
+            .@"callHierarchy/outgoingCalls" => |params| {
+                if (request.id) |id| try self.handleOutgoingCalls(id, params);
+                return true;
+            },
+            .@"textDocument/semanticTokens/full" => |params| {
+                if (request.id) |id| try self.handleSemanticTokensFull(id, params);
                 return true;
             },
             .@"textDocument/hover" => |params| {
@@ -578,16 +635,27 @@ pub const Server = struct {
             break :brk null;
         };
 
-        const member_binding: ?*runic.semantic.Scope.Binding = brk: {
+        // The type of the object a member access is taken from, walking the full
+        // chain so `a.b.c` resolves `c` in the type of `a.b`, not just `a`.
+        const member_object_type: ?*const runic.ast.TypeExpr = brk: {
             if (scope) |s| if (extracted_member) |m| {
-                break :brk s.lookup(m.object_name);
+                break :brk self.resolveObjectChainType(s, m.chain());
             };
+            break :brk null;
+        };
 
+        // A struct-literal field name under the cursor (`Vector{ .x = … }`).
+        const literal_field: ?StructLitField = brk: {
+            if (extracted_member != null) break :brk null;
+            if (scope) |s| if (doc) |d| if (d.ast) |script| {
+                break :brk self.resolveStructLiteralField(s, script, params.position);
+            };
             break :brk null;
         };
 
         const range: types.Range = brk: {
             if (extracted_member) |m| break :brk .fromSpan(m.member_span);
+            if (literal_field) |f| break :brk .fromSpan(f.member_span);
             if (binding) |b| break :brk .fromSpan(b.identifier.span);
             if (extracted_identifier) |i| break :brk .fromSpan(i.span);
             break :brk .fromLocation(loc);
@@ -597,11 +665,11 @@ pub const Server = struct {
         defer alloc_writer.deinit();
 
         if (extracted_member) |member| {
-            if (member_binding) |b| {
-                if (b.type_expr) |binding_type| {
-                    self.writeHoverMember(&alloc_writer, binding_type, member.member_name);
-                }
+            if (member_object_type) |object_type| {
+                self.writeHoverMember(&alloc_writer, scope, object_type, member.member_name);
             }
+        } else if (literal_field) |f| {
+            self.writeHoverMember(&alloc_writer, scope, f.object_type, f.member_name);
         } else if (binding) |b| {
             self.writeHoverBinding(&alloc_writer, b);
         } else {
@@ -624,10 +692,24 @@ pub const Server = struct {
         span: runic.ast.Span,
     };
 
+    /// The maximum object depth of a member access the LSP resolves (`a.b.c.…`).
+    /// Deeper chains are truncated to the innermost segments.
+    const max_member_chain = 16;
+
     const ExtractedMember = struct {
+        /// The immediate object (the segment right before the member), kept for
+        /// callers that only need the nearest object (hover).
         object_name: []const u8,
         member_name: []const u8,
         member_span: runic.ast.Span,
+        /// The full object chain, outermost first: `a.b.c` with the cursor on `c`
+        /// gives `[a, b]`. Slices borrow the document text.
+        object_chain: [max_member_chain][]const u8 = undefined,
+        object_chain_len: usize = 0,
+
+        fn chain(self: *const ExtractedMember) []const []const u8 {
+            return self.object_chain[0..self.object_chain_len];
+        }
     };
 
     fn findIdentifierRanges(
@@ -642,7 +724,11 @@ pub const Server = struct {
         defer lexer.deinit();
 
         while (true) {
-            const tok = try lexer.next();
+            // A document being edited can hold a byte the lexer rejects (a
+            // multibyte/unicode identifier, a stray control byte); stop scanning
+            // rather than propagating the error and taking down the request —
+            // the occurrences found so far are still returned.
+            const tok = lexer.next() catch break;
             switch (tok.tag) {
                 .identifier => if (std.mem.eql(u8, tok.lexeme, name)) {
                     try ranges.append(self.allocator, types.Range.fromSpan(tok.span));
@@ -719,6 +805,9 @@ pub const Server = struct {
         loc: runic.token.Location,
         text: []const u8,
     ) ?ExtractedIdentifier {
+        // The offset can land at (or past) the end of the text — an empty
+        // document, or a position at EOF — so there is no character to read.
+        if (loc.offset >= text.len) return null;
         const ch = text[loc.offset];
 
         if (!runic.lexer.isIdentifierStart(ch) and !runic.lexer.isIdentifierContinue(ch)) {
@@ -739,7 +828,10 @@ pub const Server = struct {
 
         return switch (tok.tag) {
             .identifier => blk: {
-                const start_column = loc.column -| (loc.offset - start);
+                // `start` can end up just past `loc.offset` (a non-identifier-start
+                // byte at offset 0, e.g. a digit), so saturate the inner subtract
+                // too — an unsigned underflow here would panic.
+                const start_column = loc.column -| (loc.offset -| start);
                 break :blk .{
                     .name = tok.lexeme,
                     .span = .{
@@ -772,19 +864,41 @@ pub const Server = struct {
         if (text[member.span.start.offset - 1] != '.') return null;
         if (member.span.start.offset < 2) return null;
 
-        const object_loc = runic.token.Location{
-            .file = loc.file,
-            .line = member.span.start.line,
-            .column = member.span.start.column -| 2,
-            .offset = member.span.start.offset - 2,
-        };
-        const object = self.extractIdentifier(object_loc, text) orelse return null;
+        // Walk back over the dotted object chain. `a.b.c` with the cursor on `c`
+        // discovers objects innermost-first as [b, a]; the walk stops at the first
+        // non-identifier segment (a literal, a call `f().x`, etc.).
+        var discovered: [max_member_chain][]const u8 = undefined;
+        var count: usize = 0;
+        var seg_offset = member.span.start.offset;
+        var seg_line = member.span.start.line;
+        var seg_column = member.span.start.column;
+        while (count < max_member_chain) {
+            if (seg_offset < 2) break;
+            if (text[seg_offset - 1] != '.') break;
+            const object_loc = runic.token.Location{
+                .file = loc.file,
+                .line = seg_line,
+                .column = seg_column -| 2,
+                .offset = seg_offset - 2,
+            };
+            const object = self.extractIdentifier(object_loc, text) orelse break;
+            discovered[count] = object.name;
+            count += 1;
+            seg_offset = object.span.start.offset;
+            seg_line = object.span.start.line;
+            seg_column = object.span.start.column;
+        }
+        if (count == 0) return null;
 
-        return .{
-            .object_name = object.name,
+        var result = ExtractedMember{
+            .object_name = discovered[0],
             .member_name = member.name,
             .member_span = member.span,
+            .object_chain_len = count,
         };
+        // Reverse into outermost-first order for the type walk.
+        for (0..count) |i| result.object_chain[i] = discovered[count - 1 - i];
+        return result;
     }
 
     fn writeHoverBinding(
@@ -851,13 +965,13 @@ pub const Server = struct {
     fn writeHoverMember(
         self: *Server,
         alloc_writer: *std.Io.Writer.Allocating,
+        scope: ?*runic.semantic.Scope,
         binding_type: *const runic.ast.TypeExpr,
         member_name: []const u8,
     ) void {
-        const resolved_type = switch (binding_type.*) {
-            .alias => |alias_type| self.workspace.type_checker.resolveAliasType(&alias_type),
-            else => binding_type,
-        };
+        // Peel to the concrete shape so a named object/field type (`p: Point`,
+        // `from: Point`) resolves through to its struct before the member lookup.
+        const resolved_type = completion.concreteType(&self.workspace.type_checker, scope, binding_type) orelse binding_type;
 
         // A `cimport` member is a declared extern; show its C signature.
         if (resolved_type.* == .struct_type) {
@@ -869,6 +983,15 @@ pub const Server = struct {
                     alloc_writer.writer.writeAll("\n```") catch {};
                     return;
                 }
+            }
+        }
+
+        // An error-set member is a variant; show it as it reads in the set —
+        // `Variant` or `Variant: PayloadType` — rather than as a `const`.
+        if (resolved_type.* == .error_set) {
+            if (resolved_type.error_set.variant(member_name)) |v| {
+                alloc_writer.writer.print("```\nerror variant {f}\n```", .{v}) catch {};
+                return;
             }
         }
 
@@ -956,6 +1079,17 @@ pub const Server = struct {
             }
         };
 
+        // A struct-literal field (`Vector{ .x = … }`) is not a member access, so
+        // find it by walking the AST and resolve it to the field declaration.
+        if (scope) |s| if (doc) |d| if (d.ast) |script| {
+            if (self.resolveStructLiteralField(s, script, params.position)) |field| {
+                if (self.resolveMemberSpanInType(s, field.object_type, field.member_name)) |field_span| {
+                    try self.sendDefinitionSpan(id, field_span);
+                    return;
+                }
+            }
+        };
+
         const binding: ?*runic.semantic.Scope.Binding = brk: {
             if (scope) |s| if (extracted_identifier) |i| {
                 break :brk s.lookup(i.name);
@@ -1027,29 +1161,56 @@ pub const Server = struct {
         scope: *runic.semantic.Scope,
         member: ExtractedMember,
     ) ?runic.ast.Span {
-        const binding = scope.lookup(member.object_name) orelse return null;
-        const binding_type = binding.type_expr orelse return null;
-        const resolved = switch (binding_type.*) {
-            .alias => |alias_type| self.workspace.type_checker.resolveAliasType(&alias_type),
-            else => binding_type,
-        };
+        const object_type = self.resolveObjectChainType(scope, member.chain()) orelse return null;
+        return self.resolveMemberSpanInType(scope, object_type, member.member_name);
+    }
+
+    /// Walks an object chain (`a.b.c` → `[a, b]`, outermost first) to the type of
+    /// the innermost object: the first segment is a scope binding, and each later
+    /// segment descends into that field's (struct or module member) type. Named
+    /// field types (`from: Point`) are resolved to their concrete struct.
+    fn resolveObjectChainType(
+        self: *Server,
+        scope: *runic.semantic.Scope,
+        objects: []const []const u8,
+    ) ?*const runic.ast.TypeExpr {
+        if (objects.len == 0) return null;
+        const binding = scope.lookup(objects[0]) orelse return null;
+        var current = binding.type_expr orelse return null;
+        for (objects[1..]) |field_name| {
+            current = completion.resolveMemberType(&self.workspace.type_checker, scope, current, field_name) orelse return null;
+        }
+        return current;
+    }
+
+    /// The declaration span of a named member within an object type — a struct
+    /// field or `decl` (method/const member), a `cimport` extern, or a module's
+    /// `pub` declaration. The type is first peeled to its concrete shape so a
+    /// named field type (`inner: Inner`) resolves through to `Inner`'s struct.
+    fn resolveMemberSpanInType(
+        self: *Server,
+        scope: *runic.semantic.Scope,
+        type_expr: *const runic.ast.TypeExpr,
+        member_name: []const u8,
+    ) ?runic.ast.Span {
+        const resolved = completion.concreteType(&self.workspace.type_checker, scope, type_expr) orelse return null;
         switch (resolved.*) {
             .struct_type => |struct_type| {
                 // A `cimport` member resolves to its `extern fn` declaration.
                 if (struct_type.cimport_externs) |externs| {
                     for (externs) |ext| {
-                        if (std.mem.eql(u8, ext.name.name, member.member_name)) {
+                        if (std.mem.eql(u8, ext.name.name, member_name)) {
                             return ext.name.span;
                         }
                     }
                 }
                 for (struct_type.fields) |field| {
-                    if (std.mem.eql(u8, field.name.name, member.member_name)) {
+                    if (std.mem.eql(u8, field.name.name, member_name)) {
                         return field.name.span;
                     }
                 }
                 for (struct_type.decls) |decl| {
-                    if (std.mem.eql(u8, decl.name.name, member.member_name)) {
+                    if (std.mem.eql(u8, decl.name.name, member_name)) {
                         return decl.name.span;
                     }
                 }
@@ -1059,11 +1220,145 @@ pub const Server = struct {
             // imported module file.
             .module => |module_type| {
                 const module_scope = (self.workspace.type_checker.resolveModuleScopeForMemberCompletion(module_type) catch return null) orelse return null;
-                const member_binding = module_scope.lookup(member.member_name) orelse return null;
+                const member_binding = module_scope.lookup(member_name) orelse return null;
                 return member_binding.identifier.span;
             },
             else => return null,
         }
+    }
+
+    /// A struct-literal field name under the cursor (the `.x` in
+    /// `Vector{ .x = … }`): the struct type being constructed, the field name,
+    /// and the field's occurrence span. Unlike a member access this is not an
+    /// `object.member`, so it is found by walking the AST for the enclosing
+    /// literal.
+    const StructLitField = struct {
+        object_type: *const runic.ast.TypeExpr,
+        member_name: []const u8,
+        member_span: runic.ast.Span,
+    };
+
+    fn resolveStructLiteralField(
+        self: *Server,
+        scope: *runic.semantic.Scope,
+        script: runic.ast.Script,
+        pos: types.Position,
+    ) ?StructLitField {
+        for (script.statements) |stmt| {
+            if (self.structLitFieldInStmt(scope, stmt, pos)) |field| return field;
+        }
+        return null;
+    }
+
+    /// The type a struct literal constructs: a scope binding for a plain
+    /// `Vector{…}`, or a module member for a qualified `m.Vector{…}`.
+    fn structLiteralType(
+        self: *Server,
+        scope: *runic.semantic.Scope,
+        lit: runic.ast.StructLiteral,
+    ) ?*const runic.ast.TypeExpr {
+        if (lit.object) |object| {
+            const object_name = switch (object.*) {
+                .identifier => |id| id.name,
+                else => return null,
+            };
+            const object_type = self.resolveObjectChainType(scope, &.{object_name}) orelse return null;
+            return completion.resolveMemberType(&self.workspace.type_checker, scope, object_type, lit.name.name);
+        }
+        const binding = scope.lookup(lit.name.name) orelse return null;
+        return binding.type_expr;
+    }
+
+    fn structLitFieldInBlock(self: *Server, scope: *runic.semantic.Scope, block: runic.ast.Block, pos: types.Position) ?StructLitField {
+        for (block.statements) |s| {
+            if (self.structLitFieldInStmt(scope, s, pos)) |field| return field;
+        }
+        return null;
+    }
+
+    fn structLitFieldInStmt(self: *Server, scope: *runic.semantic.Scope, stmt: *const runic.ast.Statement, pos: types.Position) ?StructLitField {
+        return switch (stmt.*) {
+            .binding_decl => |bd| self.structLitFieldInExpr(scope, bd.initializer, pos),
+            .expression => |es| self.structLitFieldInExpr(scope, es.expression, pos),
+            .yield_stmt => |ys| self.structLitFieldInExpr(scope, ys.value, pos),
+            .exit_stmt => |xs| if (xs.value) |v| self.structLitFieldInExpr(scope, v, pos) else null,
+            .while_stmt => |ws| self.structLitFieldInExpr(scope, ws.condition, pos) orelse self.structLitFieldInBlock(scope, ws.body, pos),
+            else => null,
+        };
+    }
+
+    fn structLitFieldInExpr(self: *Server, scope: *runic.semantic.Scope, expr: *const runic.ast.Expression, pos: types.Position) ?StructLitField {
+        switch (expr.*) {
+            .struct_literal => |lit| {
+                for (lit.fields) |field| {
+                    if (positionInRange(pos, types.Range.fromSpan(field.name.span))) {
+                        const lit_type = self.structLiteralType(scope, lit) orelse return null;
+                        return .{ .object_type = lit_type, .member_name = field.name.name, .member_span = field.name.span };
+                    }
+                    // A field value can hold a nested literal (`.p = Point{ … }`).
+                    if (self.structLitFieldInExpr(scope, field.value, pos)) |nested| return nested;
+                }
+                if (lit.object) |object| return self.structLitFieldInExpr(scope, object, pos);
+                return null;
+            },
+            .call => |call| {
+                if (self.structLitFieldInExpr(scope, call.callee, pos)) |s| return s;
+                for (call.arguments) |arg| if (self.structLitFieldInExpr(scope, arg, pos)) |s| return s;
+                return null;
+            },
+            .binary => |b| return self.structLitFieldInExpr(scope, b.left, pos) orelse self.structLitFieldInExpr(scope, b.right, pos),
+            .unary => |u| return self.structLitFieldInExpr(scope, u.operand, pos),
+            .assignment => |a| return self.structLitFieldInExpr(scope, a.expr, pos),
+            .pipeline => |p| {
+                for (p.stages) |s| if (self.structLitFieldInExpr(scope, s, pos)) |sp| return sp;
+                return null;
+            },
+            .block => |b| return self.structLitFieldInBlock(scope, b, pos),
+            .if_expr => |i| return self.structLitFieldInIf(scope, &i, pos),
+            .for_expr => |f| {
+                for (f.sources) |s| if (self.structLitFieldInExpr(scope, s, pos)) |sp| return sp;
+                return self.structLitFieldInExpr(scope, f.body, pos);
+            },
+            .match_expr => |m| {
+                if (self.structLitFieldInExpr(scope, m.subject, pos)) |s| return s;
+                for (m.cases) |c| if (self.structLitFieldInBlock(scope, c.body, pos)) |s| return s;
+                return null;
+            },
+            .fn_decl => |f| return self.structLitFieldInExpr(scope, f.body, pos),
+            .array => |arr| {
+                for (arr.elements) |e| if (self.structLitFieldInExpr(scope, e, pos)) |s| return s;
+                return null;
+            },
+            .map => |mp| {
+                for (mp.entries) |e| {
+                    if (self.structLitFieldInExpr(scope, e.key, pos)) |s| return s;
+                    if (self.structLitFieldInExpr(scope, e.value, pos)) |s| return s;
+                }
+                return null;
+            },
+            .literal => |lit| switch (lit) {
+                .string => |s| {
+                    for (s.segments) |seg| switch (seg) {
+                        .interpolation => |e| if (self.structLitFieldInExpr(scope, e, pos)) |sp| return sp,
+                        else => {},
+                    };
+                    return null;
+                },
+                else => return null,
+            },
+            else => return null,
+        }
+    }
+
+    fn structLitFieldInIf(self: *Server, scope: *runic.semantic.Scope, if_expr: *const runic.ast.IfExpr, pos: types.Position) ?StructLitField {
+        if (self.structLitFieldInExpr(scope, if_expr.condition, pos)) |s| return s;
+        if (self.structLitFieldInExpr(scope, if_expr.then_expr, pos)) |s| return s;
+        if (if_expr.else_branch) |else_branch| switch (else_branch) {
+            .expr => |e| return self.structLitFieldInExpr(scope, e, pos),
+            .if_expr => |nested| return self.structLitFieldInIf(scope, nested, pos),
+            .condition => {},
+        };
+        return null;
     }
 
     fn handleReferences(
@@ -1315,7 +1610,7 @@ pub const Server = struct {
                 try self.walkExprCalls(ctx, ws.condition);
                 for (ws.body.statements) |s| try self.walkStmtCalls(ctx, s);
             },
-            .bash_block, .type_binding_decl => {},
+            .bash_block, .type_binding_decl, .break_stmt, .continue_stmt => {},
         }
     }
 
@@ -1459,6 +1754,741 @@ pub const Server = struct {
         return null;
     }
 
+    /// Signature help for the call the cursor is inside: shows the callee's
+    /// signature (a same-file top-level function, or an imported module
+    /// function) with the parameter being entered highlighted.
+    fn handleSignatureHelp(self: *Server, id: types.RequestId, params: types.SignatureHelpParams) !void {
+        const null_result = types.response(id, std.json.Value{ .null = {} });
+        const path = try self.resolveUriPath(params.textDocument.uri);
+        defer self.allocator.free(path);
+
+        const doc = self.documents.get(params.textDocument.uri) orelse return self.sendJson(null_result);
+        const script = doc.ast orelse return self.sendJson(null_result);
+        const offset = params.position.findIndex(doc.text) orelse return self.sendJson(null_result);
+
+        // The innermost call whose span contains the cursor.
+        const call: *const runic.ast.CallExpr = blk: {
+            for (script.statements) |stmt| {
+                if (findCallInStmt(stmt, offset)) |c| break :blk c;
+            }
+            return self.sendJson(null_result);
+        };
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
+        // A callee name -> declaration map (a call to a function declared later
+        // still resolves), mirroring the inlay-hint path.
+        var fn_decls = std.StringHashMap(runic.ast.FunctionDecl).init(aa);
+        for (script.statements) |stmt| switch (stmt.*) {
+            .expression => |es| switch (es.expression.*) {
+                .fn_decl => |fn_decl| if (fn_decl.name) |n| try fn_decls.put(n.name, fn_decl),
+                else => {},
+            },
+            else => {},
+        };
+        var dummy_hints = std.ArrayList(types.InlayHint).empty;
+        const ctx = CallHintCtx{
+            .arena = aa,
+            .hints = &dummy_hints,
+            .fn_decls = &fn_decls,
+            .range = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 0 } },
+            .scope = self.workspace.type_checker.modules.get(path),
+        };
+        const fn_params = self.resolveCallParams(ctx, call.*) orelse return self.sendJson(null_result);
+
+        const callee_name: []const u8 = switch (call.callee.*) {
+            .identifier => |i| i.name,
+            .binary => |b| if (b.right.* == .identifier) b.right.identifier.name else "fn",
+            else => "fn",
+        };
+
+        // Build `name(p0: T0, p1: T1, …)`; each parameter's label is its own
+        // `p: T` fragment (used to highlight the active parameter).
+        var param_infos = std.ArrayList(types.ParameterInformation).empty;
+        var label = std.Io.Writer.Allocating.init(aa);
+        try label.writer.print("{s}(", .{callee_name});
+        for (fn_params, 0..) |p, i| {
+            if (i > 0) try label.writer.writeAll(", ");
+            const frag = try paramLabel(aa, p);
+            try label.writer.writeAll(frag);
+            try param_infos.append(aa, .{ .label = frag });
+        }
+        try label.writer.writeByte(')');
+
+        const active: u32 = if (fn_params.len == 0)
+            0
+        else
+            @intCast(@min(activeArgIndex(call.*, offset), fn_params.len - 1));
+
+        const signature = types.SignatureInformation{
+            .label = label.written(),
+            .parameters = param_infos.items,
+            .activeParameter = active,
+        };
+        try self.sendJson(types.response(id, types.SignatureHelp{
+            .signatures = &.{signature},
+            .activeSignature = 0,
+            .activeParameter = active,
+        }));
+    }
+
+    /// A parameter's `name: Type` label (just `name` when it has no annotation).
+    fn paramLabel(arena: Allocator, param: *const runic.ast.Parameter) ![]const u8 {
+        const name = switch (param.pattern.*) {
+            .identifier => |identifier| identifier.name,
+            else => "_",
+        };
+        if (param.type_annotation) |t| {
+            return std.fmt.allocPrint(arena, "{s}: {f}", .{ name, t });
+        }
+        return arena.dupe(u8, name);
+    }
+
+    /// Which parameter the cursor is entering: the argument it sits within, or
+    /// the next slot when it sits past a completed argument.
+    fn activeArgIndex(call: runic.ast.CallExpr, offset: usize) usize {
+        var active: usize = 0;
+        for (call.arguments, 0..) |arg, i| {
+            const span = arg.span();
+            if (offset > span.end.offset) {
+                active = i + 1;
+            } else if (offset >= span.start.offset) {
+                return i;
+            } else {
+                break;
+            }
+        }
+        return active;
+    }
+
+    fn spanHasOffset(span: runic.ast.Span, offset: usize) bool {
+        return offset >= span.start.offset and offset <= span.end.offset;
+    }
+
+    /// The innermost call expression whose span contains `offset`, searching a
+    /// statement's sub-expressions (children first, so a nested call wins).
+    fn findCallInStmt(stmt: *const runic.ast.Statement, offset: usize) ?*const runic.ast.CallExpr {
+        return switch (stmt.*) {
+            .expression => |es| findCallInExpr(es.expression, offset),
+            .binding_decl => |bd| findCallInExpr(bd.initializer, offset),
+            .yield_stmt => |ys| findCallInExpr(ys.value, offset),
+            .exit_stmt => |xs| if (xs.value) |v| findCallInExpr(v, offset) else null,
+            .while_stmt => |ws| blk: {
+                if (findCallInExpr(ws.condition, offset)) |c| break :blk c;
+                for (ws.body.statements) |s| if (findCallInStmt(s, offset)) |c| break :blk c;
+                break :blk null;
+            },
+            else => null,
+        };
+    }
+
+    fn findCallInExpr(expr: *const runic.ast.Expression, offset: usize) ?*const runic.ast.CallExpr {
+        if (expr.* == .call) {
+            const call = &expr.call;
+            for (call.arguments) |arg| if (findCallInExpr(arg, offset)) |c| return c;
+            if (findCallInExpr(call.callee, offset)) |c| return c;
+            if (spanHasOffset(call.span, offset)) return call;
+            return null;
+        }
+        switch (expr.*) {
+            .pipeline => |p| for (p.stages) |s| {
+                if (findCallInExpr(s, offset)) |c| return c;
+            },
+            .binary => |b| {
+                if (findCallInExpr(b.left, offset)) |c| return c;
+                if (findCallInExpr(b.right, offset)) |c| return c;
+            },
+            .unary => |u| return findCallInExpr(u.operand, offset),
+            .assignment => |a| return findCallInExpr(a.expr, offset),
+            .block => |b| for (b.statements) |s| {
+                if (findCallInStmt(s, offset)) |c| return c;
+            },
+            .fn_decl => |fd| return findCallInExpr(fd.body, offset),
+            .if_expr => |i| return findCallInIf(&i, offset),
+            .for_expr => |f| {
+                for (f.sources) |s| if (findCallInExpr(s, offset)) |c| return c;
+                return findCallInExpr(f.body, offset);
+            },
+            .match_expr => |m| {
+                if (findCallInExpr(m.subject, offset)) |c| return c;
+                for (m.cases) |cs| for (cs.body.statements) |s| {
+                    if (findCallInStmt(s, offset)) |c| return c;
+                };
+            },
+            .literal => |lit| switch (lit) {
+                .string => |s| for (s.segments) |seg| switch (seg) {
+                    .interpolation => |e| if (findCallInExpr(e, offset)) |c| return c,
+                    else => {},
+                },
+                else => {},
+            },
+            else => {},
+        }
+        return null;
+    }
+
+    fn findCallInIf(if_expr: *const runic.ast.IfExpr, offset: usize) ?*const runic.ast.CallExpr {
+        if (findCallInExpr(if_expr.condition, offset)) |c| return c;
+        if (findCallInExpr(if_expr.then_expr, offset)) |c| return c;
+        if (if_expr.else_branch) |else_branch| switch (else_branch) {
+            .expr => |e| return findCallInExpr(e, offset),
+            .if_expr => |nested| return findCallInIf(nested, offset),
+            .condition => {},
+        };
+        return null;
+    }
+
+    // --- Call hierarchy ---------------------------------------------------
+
+    /// A call's callee: the function name, the identifier's span (used as the
+    /// call-site range), and the receiver object for a `m.f` member call.
+    const CalleeRef = struct { name: []const u8, span: runic.ast.Span, object: ?[]const u8 };
+
+    fn calleeRef(call: runic.ast.CallExpr) ?CalleeRef {
+        switch (call.callee.*) {
+            .identifier => |identifier| return .{ .name = identifier.name, .span = identifier.span, .object = null },
+            .binary => |binary| {
+                if (std.meta.activeTag(binary.op) != .member) return null;
+                const member = switch (binary.right.*) {
+                    .identifier => |i| i,
+                    else => return null,
+                };
+                const object = switch (binary.left.*) {
+                    .identifier => |i| i.name,
+                    else => return null,
+                };
+                return .{ .name = member.name, .span = member.span, .object = object };
+            },
+            else => return null,
+        }
+    }
+
+    /// A call-hierarchy item for a top-level function declaration (null if it is
+    /// anonymous). `range` spans the declaration; `selectionRange` is its name.
+    fn fnItem(fn_decl: runic.ast.FunctionDecl, uri: []const u8) ?types.CallHierarchyItem {
+        const name = fn_decl.name orelse return null;
+        return .{
+            .name = name.name,
+            .kind = .function,
+            .uri = uri,
+            .range = types.Range.fromSpan(fn_decl.span),
+            .selectionRange = types.Range.fromSpan(name.span),
+        };
+    }
+
+    /// Appends every call expression in a statement (recursing through blocks and
+    /// control flow) to `list`.
+    fn collectCallsInStmt(stmt: *const runic.ast.Statement, list: *std.ArrayList(runic.ast.CallExpr), arena: Allocator) Allocator.Error!void {
+        switch (stmt.*) {
+            .expression => |es| try collectCallsInExpr(es.expression, list, arena),
+            .binding_decl => |bd| try collectCallsInExpr(bd.initializer, list, arena),
+            .yield_stmt => |ys| try collectCallsInExpr(ys.value, list, arena),
+            .exit_stmt => |xs| if (xs.value) |v| try collectCallsInExpr(v, list, arena),
+            .while_stmt => |ws| {
+                try collectCallsInExpr(ws.condition, list, arena);
+                for (ws.body.statements) |s| try collectCallsInStmt(s, list, arena);
+            },
+            else => {},
+        }
+    }
+
+    fn collectCallsInExpr(expr: *const runic.ast.Expression, list: *std.ArrayList(runic.ast.CallExpr), arena: Allocator) Allocator.Error!void {
+        switch (expr.*) {
+            .call => |call| {
+                try list.append(arena, call);
+                try collectCallsInExpr(call.callee, list, arena);
+                for (call.arguments) |arg| try collectCallsInExpr(arg, list, arena);
+            },
+            .pipeline => |p| for (p.stages) |s| try collectCallsInExpr(s, list, arena),
+            .binary => |b| {
+                try collectCallsInExpr(b.left, list, arena);
+                try collectCallsInExpr(b.right, list, arena);
+            },
+            .unary => |u| try collectCallsInExpr(u.operand, list, arena),
+            .assignment => |a| try collectCallsInExpr(a.expr, list, arena),
+            .block => |b| for (b.statements) |s| try collectCallsInStmt(s, list, arena),
+            .if_expr => |i| try collectCallsInIf(&i, list, arena),
+            .for_expr => |f| {
+                for (f.sources) |s| try collectCallsInExpr(s, list, arena);
+                try collectCallsInExpr(f.body, list, arena);
+            },
+            .match_expr => |m| {
+                try collectCallsInExpr(m.subject, list, arena);
+                for (m.cases) |c| for (c.body.statements) |s| try collectCallsInStmt(s, list, arena);
+            },
+            .literal => |lit| switch (lit) {
+                .string => |s| for (s.segments) |seg| switch (seg) {
+                    .interpolation => |e| try collectCallsInExpr(e, list, arena),
+                    else => {},
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
+
+    fn collectCallsInIf(if_expr: *const runic.ast.IfExpr, list: *std.ArrayList(runic.ast.CallExpr), arena: Allocator) Allocator.Error!void {
+        try collectCallsInExpr(if_expr.condition, list, arena);
+        try collectCallsInExpr(if_expr.then_expr, list, arena);
+        if (if_expr.else_branch) |else_branch| switch (else_branch) {
+            .expr => |e| try collectCallsInExpr(e, list, arena),
+            .if_expr => |nested| try collectCallsInIf(nested, list, arena),
+            .condition => {},
+        };
+    }
+
+    /// The top-level function whose body contains `offset`, or that is named at
+    /// `offset` — the entry point for a call-hierarchy tree.
+    fn topLevelFnAt(script: runic.ast.Script, offset: usize) ?runic.ast.FunctionDecl {
+        for (script.statements) |stmt| {
+            const fn_decl = switch (stmt.*) {
+                .expression => |es| switch (es.expression.*) {
+                    .fn_decl => |f| f,
+                    else => continue,
+                },
+                else => continue,
+            };
+            if (fn_decl.name == null) continue;
+            if (spanHasOffset(fn_decl.span, offset)) return fn_decl;
+        }
+        return null;
+    }
+
+    fn handlePrepareCallHierarchy(self: *Server, id: types.RequestId, params: types.CallHierarchyPrepareParams) !void {
+        const null_result = types.response(id, std.json.Value{ .null = {} });
+        const path = try self.resolveUriPath(params.textDocument.uri);
+        defer self.allocator.free(path);
+
+        const doc = self.documents.get(params.textDocument.uri) orelse return self.sendJson(null_result);
+        const script = doc.ast orelse return self.sendJson(null_result);
+        const offset = params.position.findIndex(doc.text) orelse return self.sendJson(null_result);
+
+        // The function under the cursor: a declaration the cursor sits in, or a
+        // call whose callee names a top-level function in this document.
+        var target: ?runic.ast.FunctionDecl = topLevelFnAt(script, offset);
+        if (target == null) {
+            if (self.extractIdentifier(.{ .file = path, .line = 0, .column = 0, .offset = offset }, doc.text)) |ident| {
+                target = findTopLevelFn(script, ident.name);
+            }
+        }
+        const fn_decl = target orelse return self.sendJson(null_result);
+        const item = fnItem(fn_decl, params.textDocument.uri) orelse return self.sendJson(null_result);
+        try self.sendJson(types.response(id, &[_]types.CallHierarchyItem{item}));
+    }
+
+    fn handleIncomingCalls(self: *Server, id: types.RequestId, params: types.CallHierarchyIncomingCallsParams) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
+        var results = std.ArrayList(types.CallHierarchyIncomingCall).empty;
+
+        // Same-file callers: each top-level function whose body has a direct call
+        // to the queried name (`f x`, not a `m.f` member call).
+        const doc = self.documents.get(params.item.uri) orelse return self.sendJson(types.response(id, results.items));
+        const script = doc.ast orelse return self.sendJson(types.response(id, results.items));
+
+        for (script.statements) |stmt| {
+            const caller = switch (stmt.*) {
+                .expression => |es| switch (es.expression.*) {
+                    .fn_decl => |f| f,
+                    else => continue,
+                },
+                else => continue,
+            };
+            if (caller.name == null) continue;
+
+            var calls = std.ArrayList(runic.ast.CallExpr).empty;
+            try collectCallsInExpr(caller.body, &calls, aa);
+
+            var from_ranges = std.ArrayList(types.Range).empty;
+            for (calls.items) |call| {
+                const ref = calleeRef(call) orelse continue;
+                if (ref.object != null) continue; // a `m.f` call, not this file's `f`
+                if (!std.mem.eql(u8, ref.name, params.item.name)) continue;
+                try from_ranges.append(aa, types.Range.fromSpan(ref.span));
+            }
+            if (from_ranges.items.len == 0) continue;
+
+            try results.append(aa, .{
+                .from = fnItem(caller, params.item.uri) orelse continue,
+                .fromRanges = from_ranges.items,
+            });
+        }
+
+        // Cross-file callers: a `m.f` call in an importing file where `m` resolves
+        // to this file. The workspace index makes every `.rn` file available; each
+        // importer is type-checked on demand so its import aliases resolve.
+        const target_path = try self.resolveUriPath(params.item.uri);
+        defer self.allocator.free(target_path);
+        self.workspace.ensureIndexed();
+
+        var it = self.documents.map.iterator();
+        while (it.next()) |entry| {
+            const caller_uri = entry.key_ptr.*;
+            const caller_doc = entry.value_ptr.*;
+            // The same-file callers are handled above; skip this file here.
+            if (std.mem.eql(u8, caller_doc.path, target_path)) continue;
+
+            const caller_script = (self.documents.document_store.getAst(caller_doc.path) catch continue) orelse continue;
+            if (!self.workspace.type_checker.modules.contains(caller_doc.path)) {
+                _ = self.workspace.type_checker.typeCheck(caller_doc.path) catch {};
+            }
+            const caller_scope = self.workspace.type_checker.modules.get(caller_doc.path);
+
+            for (caller_script.statements) |stmt| {
+                const caller = switch (stmt.*) {
+                    .expression => |es| switch (es.expression.*) {
+                        .fn_decl => |f| f,
+                        else => continue,
+                    },
+                    else => continue,
+                };
+                if (caller.name == null) continue;
+
+                var calls = std.ArrayList(runic.ast.CallExpr).empty;
+                try collectCallsInExpr(caller.body, &calls, aa);
+
+                var from_ranges = std.ArrayList(types.Range).empty;
+                for (calls.items) |call| {
+                    const ref = calleeRef(call) orelse continue;
+                    const object = ref.object orelse continue; // only `m.f` reaches across files
+                    if (!std.mem.eql(u8, ref.name, params.item.name)) continue;
+                    const module_path = self.memberCallModulePath(object, caller_scope) orelse continue;
+                    if (!std.mem.eql(u8, module_path, target_path)) continue;
+                    try from_ranges.append(aa, types.Range.fromSpan(ref.span));
+                }
+                if (from_ranges.items.len == 0) continue;
+
+                try results.append(aa, .{
+                    .from = fnItem(caller, caller_uri) orelse continue,
+                    .fromRanges = from_ranges.items,
+                });
+            }
+        }
+
+        try self.sendJson(types.response(id, results.items));
+    }
+
+    fn handleOutgoingCalls(self: *Server, id: types.RequestId, params: types.CallHierarchyOutgoingCallsParams) !void {
+        const path = try self.resolveUriPath(params.item.uri);
+        defer self.allocator.free(path);
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
+        var results = std.ArrayList(types.CallHierarchyOutgoingCall).empty;
+
+        const doc = self.documents.get(params.item.uri) orelse return self.sendJson(types.response(id, results.items));
+        const script = doc.ast orelse return self.sendJson(types.response(id, results.items));
+        const caller = findTopLevelFn(script, params.item.name) orelse return self.sendJson(types.response(id, results.items));
+        const module_scope = self.workspace.type_checker.modules.get(path);
+
+        var calls = std.ArrayList(runic.ast.CallExpr).empty;
+        try collectCallsInExpr(caller.body, &calls, aa);
+
+        // Group call sites by resolved callee (same-file function, or an imported
+        // module's function).
+        var groups = std.ArrayList(struct {
+            item: types.CallHierarchyItem,
+            ranges: std.ArrayList(types.Range),
+        }).empty;
+
+        for (calls.items) |call| {
+            const ref = calleeRef(call) orelse continue;
+            const callee = self.resolveCalleeItem(ref, script, module_scope, params.item.uri, aa) orelse continue;
+            const range = types.Range.fromSpan(ref.span);
+
+            var group_index: ?usize = null;
+            for (groups.items, 0..) |g, gi| {
+                if (std.mem.eql(u8, g.item.name, callee.name) and std.mem.eql(u8, g.item.uri, callee.uri)) {
+                    group_index = gi;
+                    break;
+                }
+            }
+            if (group_index) |gi| {
+                try groups.items[gi].ranges.append(aa, range);
+            } else {
+                var ranges = std.ArrayList(types.Range).empty;
+                try ranges.append(aa, range);
+                try groups.append(aa, .{ .item = callee, .ranges = ranges });
+            }
+        }
+
+        for (groups.items) |g| {
+            try results.append(aa, .{ .to = g.item, .fromRanges = g.ranges.items });
+        }
+
+        try self.sendJson(types.response(id, results.items));
+    }
+
+    /// Resolves a call's callee to a call-hierarchy item: a same-file top-level
+    /// function (identifier callee), or an imported module's function (`m.f`).
+    fn resolveCalleeItem(
+        self: *Server,
+        ref: CalleeRef,
+        script: runic.ast.Script,
+        module_scope: ?*runic.semantic.Scope,
+        doc_uri: []const u8,
+        arena: Allocator,
+    ) ?types.CallHierarchyItem {
+        if (ref.object) |object_name| {
+            // `m.f`: resolve `m` to an imported module, find `f` in its AST.
+            const module_path = self.memberCallModulePath(object_name, module_scope) orelse return null;
+            const module_script = (self.documents.document_store.getAst(module_path) catch return null) orelse return null;
+            const fn_decl = findTopLevelFn(module_script, ref.name) orelse return null;
+            const module_uri = std.fmt.allocPrint(arena, "file://{s}", .{module_path}) catch return null;
+            return fnItem(fn_decl, module_uri);
+        }
+        const fn_decl = findTopLevelFn(script, ref.name) orelse return null;
+        return fnItem(fn_decl, doc_uri);
+    }
+
+    /// The file path of the module an object name (`m` in `m.f`) refers to in a
+    /// given module scope, or null if it does not resolve to an imported module.
+    fn memberCallModulePath(self: *Server, object_name: []const u8, module_scope: ?*runic.semantic.Scope) ?[]const u8 {
+        const scope = module_scope orelse return null;
+        const binding = scope.lookup(object_name) orelse return null;
+        const binding_type = binding.type_expr orelse return null;
+        const resolved = switch (binding_type.*) {
+            .alias => |alias_type| self.workspace.type_checker.resolveAliasType(&alias_type),
+            else => binding_type,
+        };
+        return switch (resolved.*) {
+            .module => |m| m.path,
+            else => null,
+        };
+    }
+
+    // --- Semantic tokens --------------------------------------------------
+
+    /// Records every name a binding pattern introduces (recursing tuples and
+    /// records, skipping `_` discards) with the given token type and modifiers.
+    fn semOverlayPattern(map: *SemOverlay, pattern: *const runic.ast.BindingPattern, ttype: SemanticTokenType, mods: u32) !void {
+        switch (pattern.*) {
+            .identifier => |id| try map.put(semSpanKey(id.span), .{ .ttype = ttype, .mods = mods }),
+            .discard => {},
+            .tuple => |tuple| for (tuple.elements) |element| try semOverlayPattern(map, element, ttype, mods),
+            .record => |record| for (record.fields) |field| {
+                // With an explicit binding (`{ x: inner }`) the binding is the
+                // variable; without one (`{ x }`) the label itself is.
+                if (field.binding) |binding| {
+                    try semOverlayPattern(map, binding, ttype, mods);
+                } else try map.put(semSpanKey(field.label.span), .{ .ttype = ttype, .mods = mods });
+            },
+        }
+    }
+
+    fn semOverlayCapture(map: *SemOverlay, capture: runic.ast.CaptureClause) !void {
+        for (capture.bindings) |binding| try semOverlayPattern(map, binding, .variable, SEM_MOD_DECLARATION);
+    }
+
+    /// Walks a statement recording AST-derived token refinements: binding and
+    /// parameter declarations, function names, capture bindings, and call sites.
+    fn semOverlayStmt(map: *SemOverlay, stmt: *const runic.ast.Statement) Allocator.Error!void {
+        switch (stmt.*) {
+            .binding_decl => |bd| {
+                const mods: u32 = SEM_MOD_DECLARATION | (if (bd.is_mutable) 0 else SEM_MOD_READONLY);
+                try semOverlayPattern(map, bd.pattern, .variable, mods);
+                try semOverlayExpr(map, bd.initializer);
+            },
+            .expression => |es| try semOverlayExpr(map, es.expression),
+            .yield_stmt => |ys| try semOverlayExpr(map, ys.value),
+            .exit_stmt => |xs| if (xs.value) |v| try semOverlayExpr(map, v),
+            .while_stmt => |ws| {
+                try semOverlayExpr(map, ws.condition);
+                if (ws.capture) |capture| try semOverlayCapture(map, capture);
+                for (ws.body.statements) |s| try semOverlayStmt(map, s);
+            },
+            else => {},
+        }
+    }
+
+    fn semOverlayExpr(map: *SemOverlay, expr: *const runic.ast.Expression) Allocator.Error!void {
+        switch (expr.*) {
+            .call => |call| {
+                // A bare word (`count`, `name`) parses as a zero-argument call but
+                // is usually a variable read, so only an invocation that actually
+                // passes arguments is treated as a function call site. Zero-arg
+                // references fall through to the lexical default.
+                if (call.arguments.len > 0) {
+                    if (calleeRef(call)) |ref| try map.put(semSpanKey(ref.span), .{ .ttype = .function, .mods = 0 });
+                }
+                try semOverlayExpr(map, call.callee);
+                for (call.arguments) |arg| try semOverlayExpr(map, arg);
+            },
+            .fn_decl => |f| {
+                if (f.name) |name| try map.put(semSpanKey(name.span), .{ .ttype = .function, .mods = SEM_MOD_DECLARATION });
+                switch (f.params) {
+                    ._non_variadic => |ps| for (ps) |p| try semOverlayPattern(map, p.pattern, .parameter, SEM_MOD_DECLARATION),
+                    ._variadic => |p| try semOverlayPattern(map, p.pattern, .parameter, SEM_MOD_DECLARATION),
+                }
+                try semOverlayExpr(map, f.body);
+            },
+            .pipeline => |p| for (p.stages) |s| try semOverlayExpr(map, s),
+            .binary => |b| {
+                try semOverlayExpr(map, b.left);
+                try semOverlayExpr(map, b.right);
+            },
+            .unary => |u| try semOverlayExpr(map, u.operand),
+            .assignment => |a| try semOverlayExpr(map, a.expr),
+            .block => |b| for (b.statements) |s| try semOverlayStmt(map, s),
+            .if_expr => |i| try semOverlayIf(map, &i),
+            .for_expr => |f| {
+                for (f.sources) |s| try semOverlayExpr(map, s);
+                try semOverlayCapture(map, f.capture);
+                try semOverlayExpr(map, f.body);
+            },
+            .match_expr => |m| {
+                try semOverlayExpr(map, m.subject);
+                for (m.cases) |c| {
+                    // A case binds names via its pattern (`.binding`/destructure)
+                    // and/or an explicit `|capture|`.
+                    switch (c.pattern) {
+                        .binding => |id| try map.put(semSpanKey(id.span), .{ .ttype = .variable, .mods = SEM_MOD_DECLARATION }),
+                        .destructure => |pattern| try semOverlayPattern(map, pattern, .variable, SEM_MOD_DECLARATION),
+                        else => {},
+                    }
+                    if (c.capture) |capture| try semOverlayCapture(map, capture);
+                    for (c.body.statements) |s| try semOverlayStmt(map, s);
+                }
+            },
+            .literal => |lit| switch (lit) {
+                .string => |s| for (s.segments) |seg| switch (seg) {
+                    .interpolation => |e| try semOverlayExpr(map, e),
+                    else => {},
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
+
+    fn semOverlayIf(map: *SemOverlay, if_expr: *const runic.ast.IfExpr) Allocator.Error!void {
+        try semOverlayExpr(map, if_expr.condition);
+        if (if_expr.capture) |capture| try semOverlayCapture(map, capture);
+        try semOverlayExpr(map, if_expr.then_expr);
+        if (if_expr.else_branch) |else_branch| switch (else_branch) {
+            .expr => |e| try semOverlayExpr(map, e),
+            .if_expr => |nested| try semOverlayIf(map, nested),
+            .condition => {},
+        };
+    }
+
+    /// Maps a lexer token to its semantic-token type, or null to skip it
+    /// (delimiters, comments — which the lexer drops — and stream/interpolation
+    /// markers, all left to the client's grammar). An identifier is a `type` when
+    /// it starts uppercase, else a `variable`.
+    fn semanticType(tag: runic.token.Tag, lexeme: []const u8) ?SemanticTokenType {
+        if (tag.toKeyword() != null) return .keyword;
+        return switch (tag) {
+            .identifier => if (lexeme.len > 0 and std.ascii.isUpper(lexeme[0])) .type else .variable,
+            .int_literal, .float_literal => .number,
+            .string_start, .string_end, .string_text => .string,
+            .plus,
+            .minus,
+            .star,
+            .star_star,
+            .slash,
+            .percent,
+            .dollar,
+            .caret,
+            .plus_assign,
+            .minus_assign,
+            .mul_assign,
+            .div_assign,
+            .rem_assign,
+            .or_assign,
+            .and_assign,
+            .assign,
+            .equal_equal,
+            .bang_equal,
+            .greater,
+            .greater_equal,
+            .less,
+            .less_equal,
+            .shift_left,
+            .bang,
+            .question,
+            .amp,
+            .amp_amp,
+            .pipe,
+            .pipe_pipe,
+            .arrow,
+            .fat_arrow,
+            .range,
+            .ellipsis,
+            => .operator,
+            else => null,
+        };
+    }
+
+    /// Full-document semantic tokens: the lexer's token stream mapped to types
+    /// and delta-encoded (five ints per token). Positions/lengths are byte-based,
+    /// which matches UTF-16 for the ASCII that Runic source is in practice.
+    fn handleSemanticTokensFull(self: *Server, id: types.RequestId, params: types.SemanticTokensParams) !void {
+        const empty = types.response(id, types.SemanticTokens{ .data = &.{} });
+        const doc = self.documents.get(params.textDocument.uri) orelse return self.sendJson(empty);
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+        var data = std.ArrayList(u32).empty;
+
+        // Refine the lexical classification with AST-derived facts (a call site's
+        // callee is a `function`, a parameter/binding name is a `parameter`/
+        // `variable` marked as a `declaration`, …). The overlay is keyed by token
+        // start position; tokens not in it keep the lexical default.
+        var overlay = SemOverlay.init(aa);
+        if (doc.ast) |script| {
+            for (script.statements) |stmt| semOverlayStmt(&overlay, stmt) catch break;
+        }
+
+        var lexer = runic.lexer.Lexer.init(self.io, self.allocator, self.env_map, "", doc.text) catch return self.sendJson(empty);
+        defer lexer.deinit();
+
+        var prev_line: u32 = 0;
+        var prev_char: u32 = 0;
+        while (true) {
+            // A byte the lexer rejects stops the stream; the tokens so far are
+            // still valid semantic highlighting.
+            const tok = lexer.next() catch break;
+            if (tok.tag == .eof) break;
+            var token_type = semanticType(tok.tag, tok.lexeme) orelse continue;
+
+            const range = types.Range.fromSpan(tok.span);
+            // Tokens are single-line; the length is the char span on that line.
+            if (range.end.line != range.start.line) continue;
+            const length = range.end.character -| range.start.character;
+            if (length == 0) continue;
+
+            // An identifier the AST classified more precisely wins over the
+            // lexical guess, and carries its declaration/readonly modifiers.
+            var modifiers: u32 = 0;
+            if (tok.tag == .identifier) {
+                if (overlay.get(semKey(range.start.line, range.start.character))) |ov| {
+                    token_type = ov.ttype;
+                    modifiers = ov.mods;
+                }
+            }
+
+            const delta_line = range.start.line -| prev_line;
+            const delta_char = if (delta_line == 0) range.start.character -| prev_char else range.start.character;
+            try data.append(aa, delta_line);
+            try data.append(aa, delta_char);
+            try data.append(aa, length);
+            try data.append(aa, @intFromEnum(token_type));
+            try data.append(aa, modifiers);
+            prev_line = range.start.line;
+            prev_char = range.start.character;
+        }
+
+        try self.sendJson(types.response(id, types.SemanticTokens{ .data = data.items }));
+    }
+
     fn handleFoldingRange(
         self: *Server,
         id: types.RequestId,
@@ -1494,6 +2524,15 @@ pub const Server = struct {
         try self.sendJson(types.response(id, ranges.items));
     }
 
+    /// The type name a "type 'X' is not declared …" diagnostic names — the text
+    /// between the first pair of single quotes (falls back to "T").
+    fn typeNameFromDiagnostic(message: []const u8) []const u8 {
+        const open = std.mem.indexOfScalar(u8, message, '\'') orelse return "T";
+        const rest = message[open + 1 ..];
+        const close = std.mem.indexOfScalar(u8, rest, '\'') orelse return "T";
+        return rest[0..close];
+    }
+
     fn handleCodeAction(
         self: *Server,
         id: types.RequestId,
@@ -1506,17 +2545,21 @@ pub const Server = struct {
             try self.sendJson(types.response(id, std.json.Value{ .null = {} }));
             return;
         };
-        const script = doc.ast orelse {
-            try self.sendJson(types.response(id, &[_]types.CodeAction{}));
-            return;
-        };
-        const module_scope = self.workspace.type_checker.modules.get(path);
-
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const arena_allocator = arena.allocator();
 
         var actions = std.ArrayList(types.CodeAction).empty;
+
+        // Diagnostic-linked quick fixes only need the diagnostics the client
+        // passes back, so they run even when a parse error left no AST.
+        try self.appendDiagnosticFixes(&actions, arena_allocator, params);
+
+        const script = doc.ast orelse {
+            try self.sendJson(types.response(id, actions.items));
+            return;
+        };
+        const module_scope = self.workspace.type_checker.modules.get(path);
 
         // Offer "add the inferred type" for un-annotated top-level bindings whose
         // declaration line falls within the requested range.
@@ -1559,7 +2602,159 @@ pub const Server = struct {
             });
         }
 
+        // Offer "Remove unused" for a top-level `const`/`var`/import binding whose
+        // name never appears again. Usage is counted lexically (identifier tokens,
+        // so string bodies don't count but `${x}` does); a name shared with an
+        // unrelated binding elsewhere counts >1, so removal is only offered when
+        // it is genuinely unreferenced — conservative, never a false positive.
+        const UnusedBinding = struct {
+            name: []const u8,
+            // The line-based range to delete (whole statement + trailing newline).
+            del: types.Range,
+            in_request_range: bool,
+        };
+        var unused = std.ArrayList(UnusedBinding).empty;
+        for (script.statements) |stmt| {
+            const binding_decl = switch (stmt.*) {
+                .binding_decl => |b| b,
+                else => continue,
+            };
+            const identifier = switch (binding_decl.pattern.*) {
+                .identifier => |i| i,
+                else => continue,
+            };
+            var ranges = try self.findIdentifierRanges(doc.text, identifier.name);
+            defer ranges.deinit(self.allocator);
+            // Exactly one occurrence — the declaration itself — means unused.
+            if (ranges.items.len != 1) continue;
+
+            // Delete the whole statement, including its trailing newline (from the
+            // start of its first line to the start of the line after its last).
+            const stmt_range = types.Range.fromSpan(binding_decl.span);
+            const id_range = types.Range.fromSpan(identifier.span);
+            try unused.append(arena_allocator, .{
+                .name = identifier.name,
+                .del = .{
+                    .start = .{ .line = stmt_range.start.line, .character = 0 },
+                    .end = .{ .line = stmt_range.end.line + 1, .character = 0 },
+                },
+                .in_request_range = !(id_range.start.line < params.range.start.line or id_range.start.line > params.range.end.line),
+            });
+        }
+
+        // An individual "Remove unused 'x'" for each unused binding whose line is
+        // in the requested range.
+        for (unused.items) |binding| {
+            if (!binding.in_request_range) continue;
+            const edits = try arena_allocator.alloc(types.TextEdit, 1);
+            edits[0] = .{ .range = binding.del, .newText = "" };
+            const changes = try arena_allocator.alloc(types.DocumentChangeOperation, 1);
+            changes[0] = .{ .textDocumentEdit = .{
+                .textDocument = .{ .uri = params.textDocument.uri, .version = null },
+                .edits = edits,
+            } };
+            try actions.append(arena_allocator, .{
+                .title = try std.fmt.allocPrint(arena_allocator, "Remove unused '{s}'", .{binding.name}),
+                .kind = "quickfix",
+                .edit = .{ .documentChanges = changes },
+            });
+        }
+
+        // One "Remove all unused bindings" that clears every unused binding in the
+        // document at once (offered only when there is more than one to remove;
+        // otherwise the individual action already covers it).
+        if (unused.items.len >= 2) {
+            const edits = try arena_allocator.alloc(types.TextEdit, unused.items.len);
+            for (unused.items, edits) |binding, *edit| edit.* = .{ .range = binding.del, .newText = "" };
+            const changes = try arena_allocator.alloc(types.DocumentChangeOperation, 1);
+            changes[0] = .{ .textDocumentEdit = .{
+                .textDocument = .{ .uri = params.textDocument.uri, .version = null },
+                .edits = edits,
+            } };
+            try actions.append(arena_allocator, .{
+                .title = try std.fmt.allocPrint(arena_allocator, "Remove all unused bindings ({d})", .{unused.items.len}),
+                .kind = "source",
+                .edit = .{ .documentChanges = changes },
+            });
+        }
+
         try self.sendJson(types.response(id, actions.items));
+    }
+
+    /// Appends quick fixes keyed off the diagnostics the client passes back in
+    /// the code-action request (the reliable source, since the server clears its
+    /// own diagnostics after each publish). These need only the diagnostic's
+    /// range and message, so they work even without an AST (a parse error).
+    fn appendDiagnosticFixes(
+        self: *Server,
+        actions: *std.ArrayList(types.CodeAction),
+        arena: Allocator,
+        params: types.CodeActionParams,
+    ) !void {
+        for (params.context.diagnostics) |diagnostic| {
+            // "type 'T' is not declared … write it as |T|" — wrap the identifier
+            // in `|…|` (two non-overlapping inserts at the diagnostic's range).
+            if (std.mem.indexOf(u8, diagnostic.message, "write it as |") != null) {
+                const name = typeNameFromDiagnostic(diagnostic.message);
+                const edits = try arena.alloc(types.TextEdit, 2);
+                edits[0] = .{ .range = .{ .start = diagnostic.range.start, .end = diagnostic.range.start }, .newText = "|" };
+                edits[1] = .{ .range = .{ .start = diagnostic.range.end, .end = diagnostic.range.end }, .newText = "|" };
+                try self.appendEditAction(
+                    actions,
+                    arena,
+                    params.textDocument.uri,
+                    try std.fmt.allocPrint(arena, "Introduce type parameter |{s}|", .{name}),
+                    edits,
+                );
+                continue;
+            }
+
+            // "expected type identifier (did you mean Int?)" — a lowercase type
+            // name; replace it (at the diagnostic's range) with the suggestion.
+            if (suggestionFromDiagnostic(diagnostic.message, "did you mean ")) |suggestion| {
+                const edits = try arena.alloc(types.TextEdit, 1);
+                edits[0] = .{ .range = diagnostic.range, .newText = suggestion };
+                try self.appendEditAction(
+                    actions,
+                    arena,
+                    params.textDocument.uri,
+                    try std.fmt.allocPrint(arena, "Change to '{s}'", .{suggestion}),
+                    edits,
+                );
+                continue;
+            }
+        }
+    }
+
+    /// Appends a "quickfix" code action carrying a single-document text edit.
+    fn appendEditAction(
+        _: *Server,
+        actions: *std.ArrayList(types.CodeAction),
+        arena: Allocator,
+        uri: []const u8,
+        title: []const u8,
+        edits: []types.TextEdit,
+    ) !void {
+        const changes = try arena.alloc(types.DocumentChangeOperation, 1);
+        changes[0] = .{ .textDocumentEdit = .{
+            .textDocument = .{ .uri = uri, .version = null },
+            .edits = edits,
+        } };
+        try actions.append(arena, .{
+            .title = title,
+            .kind = "quickfix",
+            .edit = .{ .documentChanges = changes },
+        });
+    }
+
+    /// The text a "… {marker}X?" diagnostic suggests — between `marker` and the
+    /// next `?` (or end). Null when the marker is absent.
+    fn suggestionFromDiagnostic(message: []const u8, marker: []const u8) ?[]const u8 {
+        const at = std.mem.indexOf(u8, message, marker) orelse return null;
+        const rest = message[at + marker.len ..];
+        const end = std.mem.indexOfScalar(u8, rest, '?') orelse rest.len;
+        if (end == 0) return null;
+        return rest[0..end];
     }
 
     fn handleWorkspaceSymbol(
@@ -1782,95 +2977,26 @@ pub const Server = struct {
         };
 
         const text = doc.text;
-        var formatted = std.ArrayList(u8).empty;
-        defer formatted.deinit(self.allocator);
+        const formatted = try formatSource(self.allocator, text);
+        defer self.allocator.free(formatted);
 
-        var i: usize = 0;
-        var indent_level: usize = 0;
-        var in_string = false;
-        var string_char: u8 = '"';
-
-        while (i < text.len) : (i += 1) {
-            const ch = text[i];
-
-            if (!in_string and (ch == '"' or ch == '\'')) {
-                in_string = true;
-                string_char = ch;
-                try formatted.append(self.allocator, ch);
-                continue;
-            }
-
-            if (in_string and ch == string_char and (i == 0 or text[i - 1] != '\\')) {
-                in_string = false;
-                try formatted.append(self.allocator, ch);
-                continue;
-            }
-
-            if (in_string) {
-                try formatted.append(self.allocator, ch);
-                continue;
-            }
-
-            if (ch == '#') {
-                try formatted.append(self.allocator, ch);
-                while (i + 1 < text.len and text[i + 1] != '\n') : (i += 1) {
-                    try formatted.append(self.allocator, text[i + 1]);
-                }
-                if (i + 1 < text.len and text[i + 1] == '\n') {
-                    i += 1;
-                    try formatted.append(self.allocator, '\n');
-                    var j: usize = 0;
-                    while (j < indent_level) : (j += 1) {
-                        try formatted.append(self.allocator, ' ');
-                        try formatted.append(self.allocator, ' ');
-                    }
-                }
-                continue;
-            }
-
-            if (ch == '{') {
-                try formatted.append(self.allocator, ch);
-                try formatted.append(self.allocator, ' ');
-                indent_level += 1;
-                continue;
-            }
-
-            if (ch == '}') {
-                indent_level -= 1;
-                if (formatted.items.len > 1 and formatted.items[formatted.items.len - 1] == ' ') {
-                    _ = formatted.pop();
-                }
-                try formatted.append(self.allocator, ch);
-                continue;
-            }
-
-            if (ch == '\n') {
-                try formatted.append(self.allocator, ch);
-                var j: usize = 0;
-                while (j < indent_level) : (j += 1) {
-                    try formatted.append(self.allocator, ' ');
-                    try formatted.append(self.allocator, ' ');
-                }
-                continue;
-            }
-
-            if (ch == ' ' or ch == '\t') {
-                if (formatted.items.len == 0 or formatted.items[formatted.items.len - 1] == ' ' or formatted.items[formatted.items.len - 1] == '\n' or formatted.items[formatted.items.len - 1] == '{') {
-                    continue;
-                }
-                try formatted.append(self.allocator, ch);
-                continue;
-            }
-
-            try formatted.append(self.allocator, ch);
-        }
+        // Replace the whole document. The end position is the last line index
+        // and the byte length of that last line (columns are byte-based here,
+        // matching the rest of the server), so trailing content on a file with
+        // no final newline is still covered.
+        const last_newline = std.mem.lastIndexOfScalar(u8, text, '\n');
+        const end_line: u32 = @intCast(std.mem.count(u8, text, "\n"));
+        const end_char: u32 = if (last_newline) |idx|
+            @intCast(text.len - (idx + 1))
+        else
+            @intCast(text.len);
 
         const text_edit = types.TextEdit{
             .range = types.Range{
                 .start = .{ .line = 0, .character = 0 },
-                .end = .{ .line = @intCast(std.mem.count(u8, text, "\n")), .character = 0 },
+                .end = .{ .line = end_line, .character = end_char },
             },
-            .newText = formatted.items,
+            .newText = formatted,
         };
 
         try self.sendJson(types.response(id, &.{text_edit}));
@@ -1894,6 +3020,18 @@ pub const Server = struct {
                         .workDoneProgress = false,
                     },
                 } },
+                // Runic calls are space-separated (`f a b`), and `(` opens a
+                // parenthesized argument — trigger help on both.
+                .signatureHelpProvider = .{
+                    .triggerCharacters = &.{ " ", "(" },
+                    .retriggerCharacters = &.{ " ", "," },
+                },
+                .callHierarchyProvider = .{ .payload = .{ .bool = true } },
+                .semanticTokensProvider = .{ .payload = .{ .semanticTokensOptions = .{
+                    .legend = .{ .tokenTypes = &semantic_token_types, .tokenModifiers = &semantic_token_modifiers },
+                    .range = false,
+                    .full = .{ .payload = .{ .bool = true } },
+                } } },
                 .definitionProvider = .{ .payload = .{
                     .definitionOptions = .{
                         .workDoneProgress = false,
@@ -2078,6 +3216,188 @@ pub const Server = struct {
         return try self.allocator.dupe(u8, real);
     }
 };
+
+/// One indentation level. Runic code in the examples and stdlib is written with
+/// four-space indents (matching the host language), so the formatter normalizes
+/// to that.
+const format_indent_unit = "    ";
+
+/// A lexical context the formatter is inside while scanning. Structural
+/// delimiters (`{}`, `()`, `[]`) do not push frames — they only move the indent
+/// depth; frames exist so the scanner can tell string/interpolation text apart
+/// from code and leave it untouched.
+const FormatFrame = union(enum) {
+    /// Inside a string literal opened with this delimiter (`"` or `'`).
+    string: u8,
+    /// Inside a `${ … }` interpolation within a string; the payload is the
+    /// structural brace depth inside the interpolation, so the closing `}` is
+    /// told apart from a `{ … }` written in the interpolated expression.
+    interp: usize,
+};
+
+const FormatState = struct {
+    frames: std.ArrayList(FormatFrame) = .empty,
+    /// Structural indent depth (net open `{`/`(`/`[` at top level).
+    depth: usize = 0,
+    /// Nesting depth of `/* … */` block comments (they nest, per the lexer).
+    block_comment_depth: usize = 0,
+
+    fn deinit(self: *FormatState, allocator: Allocator) void {
+        self.frames.deinit(allocator);
+    }
+
+    /// True when a string or block comment is open across the line boundary, so
+    /// the next line must be emitted verbatim rather than re-indented.
+    fn straddling(self: *const FormatState) bool {
+        return self.block_comment_depth > 0 or self.frames.items.len != 0;
+    }
+};
+
+/// Number of structural closing delimiters at the very start of a line — they
+/// dedent the line itself (e.g. a lone `}` or a `} else {`). Only meaningful in
+/// code mode (the caller guarantees the line does not start mid-string).
+fn formatLeadingClosers(trimmed: []const u8) usize {
+    var count: usize = 0;
+    for (trimmed) |c| switch (c) {
+        ')', ']', '}' => count += 1,
+        ' ', '\t' => {},
+        else => break,
+    };
+    return count;
+}
+
+/// Advance the scanner state over one line of content (no trailing newline),
+/// updating string/comment frames and the structural indent depth.
+fn formatAdvanceLine(state: *FormatState, allocator: Allocator, line: []const u8) !void {
+    var i: usize = 0;
+    while (i < line.len) {
+        const c = line[i];
+        const next: ?u8 = if (i + 1 < line.len) line[i + 1] else null;
+
+        if (state.block_comment_depth > 0) {
+            if (c == '/' and next == '*') {
+                state.block_comment_depth += 1;
+                i += 2;
+            } else if (c == '*' and next == '/') {
+                state.block_comment_depth -= 1;
+                i += 2;
+            } else i += 1;
+            continue;
+        }
+
+        // Inside a string literal: only the closing delimiter, an escape, or the
+        // start of an interpolation are significant.
+        if (state.frames.items.len > 0 and state.frames.items[state.frames.items.len - 1] == .string) {
+            const delim = state.frames.items[state.frames.items.len - 1].string;
+            if (c == '\\') {
+                i += 2;
+            } else if (c == delim) {
+                _ = state.frames.pop();
+                i += 1;
+            } else if (c == '$' and next == '{') {
+                try state.frames.append(allocator, .{ .interp = 0 });
+                i += 2;
+            } else i += 1;
+            continue;
+        }
+
+        // Code mode: either top level, or inside a `${ … }` interpolation.
+        const in_interp = state.frames.items.len > 0;
+        switch (c) {
+            '"', '\'' => {
+                try state.frames.append(allocator, .{ .string = c });
+                i += 1;
+            },
+            '#' => return, // line comment runs to end of line
+            '/' => {
+                if (next == '/') return; // line comment
+                if (next == '*') {
+                    state.block_comment_depth = 1;
+                    i += 2;
+                } else i += 1;
+            },
+            '{' => {
+                if (in_interp) {
+                    state.frames.items[state.frames.items.len - 1].interp += 1;
+                } else state.depth += 1;
+                i += 1;
+            },
+            '(', '[' => {
+                if (!in_interp) state.depth += 1;
+                i += 1;
+            },
+            '}' => {
+                if (in_interp) {
+                    const idx = state.frames.items.len - 1;
+                    if (state.frames.items[idx].interp == 0) {
+                        _ = state.frames.pop(); // end interpolation
+                    } else state.frames.items[idx].interp -= 1;
+                } else if (state.depth > 0) state.depth -= 1;
+                i += 1;
+            },
+            ')', ']' => {
+                if (!in_interp and state.depth > 0) state.depth -= 1;
+                i += 1;
+            },
+            else => i += 1,
+        }
+    }
+}
+
+/// Re-indent a document by structural nesting depth while preserving each line's
+/// interior verbatim (Runic is command-oriented, so inter-argument spacing is
+/// significant and must not be reflowed). Comments and string contents are left
+/// untouched, blank runs are collapsed to a single blank line, trailing
+/// whitespace is trimmed, and the result ends in exactly one newline.
+fn formatSource(allocator: Allocator, text: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+
+    var state = FormatState{};
+    defer state.deinit(allocator);
+
+    var pending_blank = false;
+    var wrote_any = false;
+
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw_line| {
+        // Drop a trailing '\r' so CRLF input is normalized to LF.
+        var line = raw_line;
+        if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+
+        // A line that begins inside a multi-line string or block comment is part
+        // of that literal — emit it exactly as written.
+        if (state.straddling()) {
+            try out.appendSlice(allocator, line);
+            try out.append(allocator, '\n');
+            wrote_any = true;
+            pending_blank = false;
+            try formatAdvanceLine(&state, allocator, line);
+            continue;
+        }
+
+        const trimmed = std.mem.trim(u8, line, " \t");
+        if (trimmed.len == 0) {
+            if (wrote_any) pending_blank = true;
+            continue;
+        }
+
+        if (pending_blank) try out.append(allocator, '\n');
+        pending_blank = false;
+
+        const closers = formatLeadingClosers(trimmed);
+        const indent = if (state.depth > closers) state.depth - closers else 0;
+        var k: usize = 0;
+        while (k < indent) : (k += 1) try out.appendSlice(allocator, format_indent_unit);
+        try out.appendSlice(allocator, trimmed);
+        try out.append(allocator, '\n');
+        wrote_any = true;
+
+        try formatAdvanceLine(&state, allocator, trimmed);
+    }
+
+    return out.toOwnedSlice(allocator);
+}
 
 fn readLine(allocator: Allocator, reader: *std.Io.Reader) ![]u8 {
     // `takeDelimiterInclusive` consumes and returns the trailing '\n'; drop it so

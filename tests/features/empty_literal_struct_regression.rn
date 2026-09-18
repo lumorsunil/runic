@@ -1,0 +1,22 @@
+// An empty `.{}` literal is an empty struct — a value you can pass around but
+// not operate on. To build an appendable array you name its element type with an
+// annotation (`var xs: []T = .{}`); the empty struct then coerces to the empty
+// array. In an array context (a `[]T` annotation, a struct field, a concat
+// operand) an empty `.{}` counts as an empty array.
+fn Void @() Void
+
+// An annotated empty array is appendable and indexable.
+var xs: []Int = .{ }
+xs = xs.push 10
+xs = xs.push 20
+echo "push=${xs[0]},${xs[1]},len=${xs.len}"
+
+// Empty as a concat operand (either side) is an empty array.
+const a = .{ } + .{ 1, 2 }
+const b = .{ 3, 4 } + .{ }
+echo "concat=${a[0]},${a[1]},${b[0]},${b[1]}"
+
+// Empty as a struct field value takes the field's declared array type.
+const Bag = struct { items: []Int }
+const bag = Bag{ .items = .{ } }
+echo "field=${bag.items.len}"

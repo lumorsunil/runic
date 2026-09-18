@@ -14,7 +14,7 @@ echo "zs=${zs[0]} ${zs[3]} len=${zs.len}"
 
 // Struct elements, and a computed index.
 const P = struct { n: Int }
-var ps = .{ }
+var ps: []P = .{ }
 ps = ps.push P{ .n = 1 }
 ps = ps.push P{ .n = 2 }
 ps = ps.push P{ .n = 3 }

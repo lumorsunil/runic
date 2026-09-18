@@ -1,0 +1,5 @@
+# An array is a single type. A heterogeneous `.{ … }` literal is a tuple, and
+# forcing it into an array annotation `[]T` is an error (each position must be
+# that element type). Store it without the annotation to keep it as a tuple.
+const xs: []Int = .{ 1, "two", 3 }
+echo "${xs[0]}"

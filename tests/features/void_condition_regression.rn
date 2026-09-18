@@ -1,0 +1,23 @@
+// An `if`/`while` condition that resolves to a non-boolean value (e.g. `void`)
+// must not crash the interpreter. `(f) > 3` binds the `>` as an output redirect
+// of the command `(f)` (a function call is a command; bind the result first to
+// compare — `const r = f; if (r > 3)`), which yields `void`; a `void` condition
+// is treated as false rather than panicking on the union access.
+fn Void @() Void
+
+fn Void n() Int { yield 5 }
+
+# `(n) > 3` is a redirect, not a comparison — its void result takes the else path.
+if ((n) > 3) {
+  echo "unexpected-then"
+} else {
+  echo "void-cond-else"
+}
+
+# The intended comparison, with the result bound first, still works.
+const r = n
+if (r > 3) {
+  echo "bound-then"
+} else {
+  echo "bound-else"
+}

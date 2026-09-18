@@ -1,0 +1,9 @@
+[error]: tests/diagnostics/untyped_parameter.rn:5:15: parameter 'name' requires a type annotation (e.g. `name: Int`)
+   3:# param), instead of aborting the whole type-check run with an uncaught
+   4:# error.TypeNotFound ("Type checker failed to run").
+   5:fn Void greet([41m[30mname[0m) Void {
+   6:  echo "hello ${name}"
+   7:}
+   8:greet "world"
+   9:
+

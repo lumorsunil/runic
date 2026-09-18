@@ -10,7 +10,227 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ---
 
-## [Unreleased]
+## [0.11.0] - 2026-09-18
+
+### Added
+
+- **The empty literal `.{}` is an empty struct.** With no elements it has no
+  element type, so it is a value you can pass around but not index, iterate, or
+  `.push` — an appendable empty array must name its element type
+  (`var xs: []Int = .{}`), and the empty struct then coerces to the empty array.
+  An empty `.{}` still counts as an empty array in an array context — a `[]T`
+  annotation, a struct field's declared array type, or a concat operand
+  (`.{} + xs`). Indexing an unannotated empty literal reports a directed error
+  pointing at the missing annotation. (Previously an unannotated `.{}` was a
+  permissive "any" array.)
+- **Tuples.** A `.{ … }` literal whose elements have different types is now a
+  *tuple* — an ordered, per-position-typed collection — rather than a
+  homogenized array; a literal whose elements share one type is still an array
+  `[]T`. Tuples share the array runtime representation (index, `for`, `.len()`,
+  `.push`, concatenation all work), so the distinction is static: a tuple keeps
+  each element's type. That fixes heterogeneous **destructuring from a variable**
+  — `var m = .{ A{…}, B{…} }; const x, y = m` binds `x` as an `A` and `y` as a
+  `B`, where before both collapsed to one element type and a struct element lost
+  its fields. Because an array is a single type, forcing a heterogeneous tuple
+  into an array annotation (`const xs: []Int = .{ 1, "two" }`) is a compile
+  error; a homogeneous literal coerces to `[]T` as before. A tuple type is
+  written `struct { T0, T1, … }` (a struct body with positional types and no
+  field names) and can annotate a binding, parameter, or return type; it is
+  checked position by position, so `const t: struct { Int, String } = .{ 1, 2 }`
+  errors. Indexing a tuple with a *constant*
+  index has that position's type (`t[0]` is `Int`, `t[1]` is `String`), so a
+  method/field on the result resolves; a runtime index stays permissive.
+- **Inferred struct literals.** When the struct type is known from context, a
+  struct value can be written `.{ .field = value, … }` without repeating the type
+  name — `const v: Vector = .{ .x = 3, .y = 5 }` instead of `Vector{ … }`. The
+  type is taken from the context: a binding's annotation; the matching parameter
+  type of a call argument (`moveEntity e .{ .x = 3, .y = 5 }`, including UFCS
+  method calls where the receiver fills the first parameter); a function's
+  declared return type (`yield .{ … }`); a struct field's declared type in a
+  construction (`Line{ .from = .{ … } }`); and an array's element type
+  (`const path: []Vector = .{ .{ … }, .{ … } }`), which nests. The literal is
+  validated against that type exactly as the named form is. An anonymous struct
+  literal with no type to infer from is a compile error asking for an annotation;
+  the array-literal form `.{ e0, e1 }` is unchanged.
+- **Tuple and record destructuring in bindings.** A binding target can now be a
+  tuple pattern — `const a, b = .{ 1, 2 }` binds the positional elements of an
+  array/tuple — or a record pattern — `const { x, y } = point` binds a struct's
+  fields to same-named locals, with `{ x: local }` to rebind a field to a
+  different name and a subset of fields allowed. `_` discards an element;
+  `const`/`var` sets mutability for all parts. A record field the struct doesn't
+  have is a "struct has no field" error. Patterns nest arbitrarily — a record or
+  tuple can appear as a tuple element or a record-field rebinding (a nested tuple
+  is parenthesized, `(a, b)`, since a bare comma separates the outer elements),
+  and a tuple over an array literal keeps each element's type, so a heterogeneous
+  `const s, n, p = .{ "hi", 2, point }` destructures each part at its own type.
+- **Array concatenation with `+`.** `a + b` on two arrays produces a new array
+  holding `a`'s elements followed by `b`'s (a fresh copy; the operands are
+  unchanged). Works for any element type, with empty operands, and composes with
+  indexing and iteration. Scalar `+` is unaffected. Previously this errored with
+  `UnsupportedBinaryExpression`; arrays could only grow via `.push`.
+- **`break` and `continue`.** Loop control statements now exist: `break` exits
+  the innermost enclosing loop and `continue` skips to its next iteration. They
+  work in every loop form — a counted range `for`, an array/multi-source `for`, a
+  `for (&0)` stream, and `while` — bind to the innermost loop when nested, and
+  clean up body-local bindings on the jump. Using either outside a loop is a
+  compile error. A range loop whose body uses `break`/`continue` runs on the
+  regular (non-atomic) path; loops without them keep the fast `counted_loop`
+  lowering.
+- **String indexing `s[i]`.** A string can be indexed by a single position,
+  yielding a one-character `String` (lowered to a one-char slice `s[i .. i+1]`),
+  complementing string slicing. Out-of-range and negative indices clamp to the
+  empty string like a slice. Previously `s[i]` failed with a bare
+  `UnsupportedBinaryOperation`.
+- **`c.Str` return values.** A `cimport` extern declared to return `c.Str` (a C
+  `char*`) now yields a Runic `String` — the borrowed C string is copied into
+  Runic-owned memory, so it composes like any string (`.len`, interpolation,
+  builtins). A NULL return (e.g. `getenv` of an unset variable) becomes the
+  empty string. This closes the last scalar-marshalling gap of the C FFI MVP.
+- **Language server — deeper analysis and editing features.** `runic-lsp` gained
+  a batch of new capabilities on top of the [0.8.0] surface (see `docs/lsp.md`):
+  - _Completion & hover:_ error sets complete and hover with their variants
+    (`Variant` / `Variant: PayloadType`). Hover and go-to-definition now follow
+    a full member chain — a nested access like `a.b.c` resolves `c` against the
+    type of `a.b`, descending named field types to their struct — and resolve
+    struct-literal field names (the `.x` in `Vector{ .x = … }`, including nested
+    literals), which are not `object.member` accesses.
+  - _Navigation:_ call hierarchy for top-level functions — prepare, outgoing
+    calls (same-file functions and imported-module `m.f`), and incoming calls
+    including **cross-file** callers (a `m.f` access in an importing file,
+    resolved through the workspace index).
+  - _Symbols:_ the document outline now surfaces the names introduced by a
+    destructuring binding (`const a, b = …`, `const { x, y } = …`), recursing
+    through nested patterns.
+  - _Editing:_ signature help (the callee's parameter list with the active
+    argument highlighted); code actions — add an inferred type annotation, remove
+    an unused binding (individually or all at once as a source action), wrap a
+    bare undeclared uppercase type as `|T|`, and capitalize a lowercase type name
+    (the last two driven off diagnostics); a document formatter that re-indents by
+    structural nesting depth while preserving each line's interior (command-
+    argument spacing is significant); and semantic tokens
+    (`textDocument/semanticTokens/full`) classifying keywords, types, variables,
+    numbers, strings, and operators, refined from the AST so function
+    declarations and call sites are `function`, parameters are `parameter`, and
+    declarations carry `declaration`/`readonly` modifiers.
+
+### Changed
+
+- **Generic type parameters must be introduced with `|T|`; a bare unknown
+  uppercase type name is an error.** Previously an uppercase type name that
+  wasn't declared was silently treated as an implicit generic type variable, so
+  a typo like `Recangle` slipped through. Now a type variable is introduced only
+  by an explicit `|T|` capture (`fn Void first(xs: []|T|) |T|`); a bare `T` after
+  it references the same variable, and a bare uppercase name with no such capture
+  is an undeclared-type error with a hint pointing at the `|T|` form. **Breaking**
+  for signatures written with bare implicit generics — add `|…|` at each type
+  variable's first occurrence (the standard library was migrated). User-defined
+  generic type *constructors* (`const Box(T) = struct { value: T }`) are
+  unchanged — their `(T)` parameters are now properly scoped when resolving the
+  body (so a typo in a constructor body is also caught). *(Longer term, the
+  `Box(T)` constructor form is expected to be superseded by comptime functions
+  returning types, Zig-style — see `docs/plan.md`.)*
+- **`;` after a binding is always a plain statement separator.** A binding whose
+  initializer was a command/pipeline used to "absorb" a following `;`-separated
+  statement into the bound value as a command sequence (`const b = cmd1; cmd2`
+  captured both). That special-cased `;` — the one place it was not equivalent to
+  a newline — and surprised the common `const r = cmd; echo "${r}"` by pulling
+  `r` out of scope. Now `;` never folds the next statement into a binding: the
+  initializer is exactly the expression right of `=`. Command *sequences* are
+  still captured via `&&`/`||` (single expressions) or a `$( … )` subshell.
+- **Clearer `for`-loop capture-count diagnostic.** A `for` loop with a capture
+  count that doesn't match its sources (e.g. `for (items) |v, i|`) now reports a
+  located error that points at the index idiom — `for (items, 0..) |item, i|` —
+  instead of surfacing the bare `ForCapturesMustMatchSources` enum, and no longer
+  emits a cascading second error for the loop body.
+
+### Fixed
+
+- **An optional struct field stays optional when given a non-null value.**
+  `struct { x: ?Int }` constructed as `P{ .x = 5 }` kept the field optional only
+  when the value was `null`; a bare non-null value re-typed the field to the
+  value's concrete type (`Int`), so `p.x orelse …` failed at compile time ("left
+  side of orelse must be an optional"). A struct-literal field now keeps an
+  optional/promise declared type (the value is coerced into it); generic fields
+  still specialize to their value's type.
+- **An array literal as a function/command argument.** `f .{ 1, 2 }` now passes
+  the array literal as an argument — previously a bare `.{` ended argument
+  parsing, so it was misparsed as a nullary call `f` plus a separate dangling
+  array (and failed outright inside string interpolation). Only the parenthesized
+  form `f (.{ 1, 2 })` worked before. This also fixes calling stdlib
+  higher-order helpers with a literal, e.g. `std.list.map .{ 1, 2, 3 } dbl`.
+- **Member access, indexing, and slicing on a call result.** Reading a field
+  (`(f x).field`, `recv.method.field`, a chain like `v.inc.inc.x`), indexing
+  (`(mk)[1]`), or slicing (`(mk)[1..3]`) directly off a call result failed with
+  "member access is only supported for struct types in IR" /
+  "UnsupportedBinaryOperation". The receiver is now value-captured (not forked)
+  in each case, so it sees the produced value instead of a thread handle. Plain
+  struct-field chains (`b.a.n`), string builtins (`s.trim.upper`), and array/
+  string variables are unaffected. Binding first already worked.
+- **Iterating a call result.** `for (mk)` (a function returning an array) or
+  `for (v.items)` (a UFCS method call) now iterates the produced array instead of
+  erroring "for loops with source type 'call' not yet implemented" — the source
+  is value-captured like other call-result positions. Binding first already
+  worked.
+- **A non-boolean `if`/`while` condition no longer crashes.** A condition that
+  resolves to `void` — e.g. `if ((f) > 3)`, where the `>` binds as an output
+  redirect of the command `(f)` rather than a comparison — panicked on a union
+  access (`exit_code` while `void` active). A void/non-boolean condition is now
+  treated as false. (To compare a function's result, bind it first:
+  `const r = f; if (r > 3)`.)
+- **Duplicate struct field names are rejected.** A struct type declaration with
+  a repeated field (`struct { x: Int, x: Int }`) was silently accepted — struct
+  types weren't validated at all. They now are: a duplicate field name is a
+  located error, and each field's type is validated. (An inline struct type in a
+  parameter position is still unchecked here.)
+- **An un-annotated function parameter reports a clean diagnostic.** A parameter
+  with no type annotation (`fn Void f(x) Void`) aborted the entire type-check
+  run with an uncaught `error.TypeNotFound` ("Type checker failed to run"). It
+  now produces a located diagnostic naming the parameter — one per bad param —
+  and checking continues, so other errors are still reported.
+- **A negative array index no longer crashes the interpreter.** Reading an
+  index computed to a negative value (e.g. `a[0 - 1]`) panicked with "integer
+  does not fit in destination type" (a `@intCast` of the negative pointer offset
+  to `usize`). The offset arithmetic is now signed-aware and saturating, so a
+  negative or otherwise out-of-range index degrades gracefully — an unspecified
+  value or a caught failed dereference — the same as a positive out-of-bounds
+  read. (Indexing is still not bounds-checked; that remains future work.)
+- **`;` after a command-producing binding.** A binding whose initializer is a
+  command/pipeline (`const n = echo "9" | parseInt`) no longer swallows a
+  following statement that cannot be part of a command sequence — a `yield` or
+  `exit`, a closing `}`, or a statement that uses the just-bound value. Such a
+  `;` now separates statements (as a newline does): `const n = pipe; yield n`
+  parses, and `const n = pipe; echo "${n}"` binds `n` before the `echo` reads
+  it. Sequencing two commands under one binding (`const s = cmd1; cmd2`) still
+  works.
+- **Constructing a struct field from another struct's field.** A struct literal
+  whose field value is a member access — `V{ .x = e.x }` — now type-checks. The
+  member access surfaced the field's raw declared type (an unresolved identifier
+  such as `Int`, or an alias like `c.Int`), which was compared unresolved
+  against the declared field type and spuriously rejected with "expected type
+  Int, actual: Int" (or "actual: c.Int"). The value's type is now resolved
+  before the comparison.
+- **Calling a C extern through a captured `cimport` value.** A function that
+  references a top-level `cimport` const and calls its externs now works even
+  when the function forks (a pipeline/loop consumer, a threaded body) — no local
+  re-import of the library is needed. A cimport value is an immutable
+  `.closeable` handle; it is now captured by value instead of by the slot
+  reference used for aliasable structs, which `cimport_call` could not resolve
+  as a library (`CImportLoadFailed`).
+- **Language server resilience.** A batch of crashes found by fuzzing the server
+  are fixed, so a document being edited can no longer take it down: an empty or
+  non-ASCII document (an out-of-bounds read and a lexer error escaping a scan),
+  and any single request handler that errors is now contained and logged instead
+  of killing the server. The lexer itself no longer panics on a string that runs
+  to end-of-input (now a clean unterminated-string diagnostic) or underflows its
+  delimiter counters on a stray `)`/`]`/`}` — fixes that harden the compiler too.
+  A memory leak in the diagnostics list was also closed.
+- **Editing a file with functions no longer crashes the language server.** Each
+  edit resets the workspace type checker to reclaim its arena and then re-checks
+  the open documents. The reset freed the arena but left the checker's
+  arena-backed stacks (the enclosing-function stdout types and inferred-error
+  collectors) pointing into freed memory, so the first function body re-checked
+  after an edit wrote into freed memory and segfaulted. The reset now clears
+  those stacks too.
 
 ## [0.10.1] - 2026-09-14
 
@@ -772,5 +992,5 @@ Initial versioned release. Establishes a baseline for tracking changes going for
 - Optional types, promise types (`^T`), and error sets
 - Background process execution with `^` operator
 - Module system via `.rn.module.json` manifests
-- Bash interop via `bash { ... }` blocks
+- Bash interop by invoking `bash` as a command (`bash "-c" "…"`)
 - LSP support (completions, diagnostics, hover)

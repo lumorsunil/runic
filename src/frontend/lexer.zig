@@ -58,7 +58,10 @@ pub const Lexer = struct {
             }
 
             pub fn dec(self: *@This(), comptime ctType: CounterType) void {
-                self.field(ctType).* -= 1;
+                // A stray closing delimiter (`)`/`]`/`}` with no matching open, as
+                // in a document being edited) must not underflow the unsigned
+                // counter and panic — clamp at zero.
+                self.field(ctType).* -|= 1;
             }
 
             pub fn canEnd(self: @This()) bool {
@@ -408,7 +411,10 @@ pub const Lexer = struct {
         const start = self.mark();
 
         {
-            const ch = self.peek().?;
+            // At EOF the string was never closed; the loop below reports the
+            // same, but this immediate-close check runs first — guard it so
+            // lexing a string context at end-of-input doesn't panic on `peek().?`.
+            const ch = self.peek() orelse return Error.UnterminatedString;
             if (ch == '"') {
                 try self.popContext();
                 _ = self.advance();

@@ -1,0 +1,7 @@
+[error]: tests/diagnostics/inferred_struct_literal_no_context.rn:4:11: cannot infer the type of this struct literal; add a type annotation (e.g. `const v: Vector = .{ … }`)
+   2:# no annotation to infer from, that is an error (with a directed hint), not a
+   3:# lookup of an empty type name.
+   4:const v = [41m[30m.{ .x = 3 }[0m
+   5:echo "${v.x}"
+   6:
+

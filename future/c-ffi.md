@@ -406,34 +406,34 @@ emit a stub `cimport` block with every symbol name filled in and `// TODO:`
 types. Not callable as-is, but it saves typing the names and shows the surface
 area when no header is available.
 
-## Known limitation: direct access / wrappers need a closure-capture fix
+## Closure capture of a cimport value — FIXED
 
-A generated binding is used through the raw cimport value —
-`rl.raylib.InitWindow 800 600 "…"` (import → cimport member → extern). Two nicer
-forms are **blocked by the same underlying bug** and are not generated:
+A function body may reference a top-level `cimport` const and call its externs
+directly, even when the function forks (a pipeline/loop consumer, a threaded
+body) — no local re-import of the library is needed. This was previously broken.
+
+The root cause was in closure capture. A cimport value is *typed* as a struct
+(so `m.pow x` dispatches like struct-member access) but its *runtime value* is a
+`.closeable` handle. A closure captured a top-level const **by slot reference** —
+the captured value was the address of the const's slot, not the handle. Struct
+*member access* resolved that extra indirection (so `p.x` on a captured struct
+works), but `cimport_call`'s library resolution did not, so the extern call got a
+bogus library (`CImportLoadFailed` / a bad dereference).
+
+The fix (compiler `compileFunctionCall`, closure-capture emission): a cimport
+value — an immutable, non-aliased `.closeable` handle — is now captured **by
+value** rather than by slot reference (detected via `bindingTypeIsCImport`, i.e.
+a struct type carrying `cimport_externs`). Aliasable structs and scalars keep the
+by-reference capture. Covered by `tests/features/ffi_cimport_call_regression.rn`.
+
+Still open on the `cbind` side (a *separate* concern, no longer blocked by
+capture): emitting the nicer wrapper/alias forms —
 
 - **Aliases** — `pub const InitWindow = raylib.InitWindow` (bare access to a
   multi-arg extern is treated as a nullary call, and there is no first-class
   extern value to bind); and
-- **Wrapper functions** — `pub fn Void InitWindow(…) { raylib.InitWindow … }`.
-
-The root cause is in closure capture, not cbind. A cimport value is *typed* as a
-struct (so `m.pow x` dispatches like struct-member access) but its *runtime
-value* is a `.closeable` handle. When a function body references a top-level
-cimport const, the closure captures it **by slot reference** — the captured
-value is the address of the const's slot, not the handle. Struct *member access*
-resolves that extra indirection (so `p.x` on a captured struct works), but
-`cimport_call`'s library resolution does not, so the extern call gets a bogus
-library (`CImportLoadFailed` / a bad dereference). Verified: `const lib2 = lib`
-(top-level copy) works and captured scalars — even runtime-computed — work; only
-a captured cimport handle breaks. Wrapping the handle in a heap slot did not
-help: the capture still stored the slot reference rather than the value.
-
-Fixing this (capturing a cimport/closeable by value, or making `cimport_call`
-resolve the captured object the way struct member access does) would unblock both
-wrappers and the alias form. It is a contained change but in the closure /
-stack-vs-heap addressing model, so it wants a focused pass rather than a rushed
-one.
+- **Wrapper functions** — `pub fn Void InitWindow(…) { raylib.InitWindow … }`
+  (now runnable when hand-written; `cbind` does not yet generate them).
 
 ## Phased plan
 
@@ -442,11 +442,17 @@ block loads a C library via `std.DynLib`, resolves each `extern fn`, and a
 member call (`m.pow 2.0 10.0`) marshals through a statically-linked `libffi`
 and returns the value, in both bound and interpolated positions. Landed on the
 `cffi` branch across phases 0a/0b/1 below; scalar args/returns (int widths,
-float/double, bool, pointer) and `c.Str` *arguments* are supported. The
+float/double, bool, pointer) and `c.Str` arguments **and returns** are supported
+(a returned `char*` is copied into a Runic `String`; NULL → empty string). The
 `runic cbind` generator (phase 3) is also implemented — it emits a `cimport`
 block plus the header's enum values / `#define` constants from a C header via
-`zig translate-c`. Remaining: `c.Str` *returns*, structs/varargs at the call
-boundary, and the cross-compile vendoring — see below.
+`zig translate-c`. **By-value struct arguments and returns (phase 4) have since
+landed** — including nested and module-qualified struct types, and a Runic call
+returning a by-value struct passed straight to an extern. Remaining: varargs,
+`c.Str` *inside a returned struct* (the scalar `c.Str` return is done), and the
+cross-compile vendoring. (The closure-capture fix so
+an extern is callable from inside a function/forked consumer without a local
+re-import has since landed — see *Known limitation* below.)
 
 0a. **Language prerequisite — mostly already present (re-verified 2026-09).**
    The critical path for `c.Double` is a *qualified type reference in annotation
@@ -455,13 +461,12 @@ boundary, and the cross-compile vendoring — see below.
    defaults to `true`, so no `pub` is needed to export), referenced qualified in
    a parameter/return annotation (`fn Void f(p: s.Point) …`, `n: s.MyInt`),
    parses, type-checks, and runs. The parser builds a multi-segment
-   `.identifier` path and the type checker resolves it. What is *not* needed for
-   FFI and can stay out of scope: qualified *construction* (`s.Point{…}` in
-   expression position — member access currently rejects a type identifier) and
-   the cosmetic `pub const X = struct {…}` (only the `struct`-literal RHS after
-   `pub const` fails; the plain `const` form already exports). A separate
+   `.identifier` path and the type checker resolves it. Qualified *construction*
+   (`s.Point{…}` in expression position) has since landed too (see
+   `tests/features/qualified_struct_construction_regression.rn`). A separate
    pre-existing bug — `expected type Int, actual: Int` when a module fn
-   constructs a struct from its own params — is noted but unrelated.
+   constructs a struct from its own params (a `c.Int`-aliased field comparing
+   its alias against itself) — is still open and unrelated.
 0b. **Vendor + link `libffi`** — get `libffi` compiling from vendored source and
    statically linked into `runic` via `build.zig` for the primary dev target,
    with a trivial `ffi_call` smoke test. The load-bearing prerequisite for the
@@ -483,8 +488,10 @@ boundary, and the cross-compile vendoring — see below.
    in `src/ffi/cbind.zig` (pure, unit-tested); the CLI glue is
    `cmd/runic/cbind.zig`. Still open (phase 5): a `.dynsym`-only fallback when
    no header is available, and a libclang backend.
-4. **Structs / varargs** — `libffi` already calls them; this phase is the
-   marshalling side (struct-layout `ffi_type`s, Runic ↔ struct value mapping).
+4. **Structs — DONE / varargs — open.** By-value struct marshalling landed
+   (struct-layout `ffi_type`s via `ffi_get_struct_offsets`, Runic ↔ struct value
+   mapping for args and returns, incl. nested and module-qualified structs).
+   Varargs remain open.
 5. **Later / maybe** — a libclang backend for `cbind`; the pure-Zig trampoline
    fallback (if the `libffi` build matrix proves a burden); Runic → C callbacks;
    a `--safe` gate; typed pointer views over `c.Ptr` memory.

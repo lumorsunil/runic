@@ -229,22 +229,22 @@ fn appendImportedModuleMembersFromText(
     defer lexer.deinit();
 
     while (true) {
-        const tok = try lexer.next();
+        const tok = lexer.next() catch return;
         switch (tok.tag) {
             .kw_const, .kw_var => {
-                const identifier = try lexer.next();
+                const identifier = lexer.next() catch return;
                 if (identifier.tag != .identifier or !std.mem.eql(u8, identifier.lexeme, object_name)) continue;
-                const assign = try lexer.next();
+                const assign = lexer.next() catch return;
                 if (assign.tag != .assign) continue;
-                const import_kw = try lexer.next();
+                const import_kw = lexer.next() catch return;
                 if (import_kw.tag != .kw_import) continue;
 
-                var next = try lexer.next();
+                var next = lexer.next() catch return;
                 if (next.tag == .l_paren) {
-                    next = try lexer.next();
+                    next = lexer.next() catch return;
                 }
                 if (next.tag != .string_start) continue;
-                const string_text = try lexer.next();
+                const string_text = lexer.next() catch return;
                 if (string_text.tag != .string_text) continue;
 
                 const module_path = runic.document.resolveModulePath(
@@ -323,19 +323,19 @@ fn appendPubModuleDeclsFromFile(
     defer lexer.deinit();
 
     while (true) {
-        const tok = try lexer.next();
+        const tok = lexer.next() catch return;
         if (tok.tag == .eof) return;
         if (tok.tag != .kw_pub) continue;
 
-        const decl_tok = try lexer.next();
+        const decl_tok = lexer.next() catch return;
         switch (decl_tok.tag) {
             .kw_const, .kw_var => {
-                const identifier = try lexer.next();
+                const identifier = lexer.next() catch return;
                 if (identifier.tag != .identifier) continue;
                 try appendOwnedMatch(matches, allocator, .variable, identifier.lexeme, module_path, identifier.span);
             },
             .kw_fn => {
-                const identifier = try lexer.next();
+                const identifier = lexer.next() catch return;
                 if (identifier.tag != .identifier) continue;
                 try appendOwnedMatch(matches, allocator, .function, identifier.lexeme, module_path, identifier.span);
             },
@@ -405,6 +405,19 @@ fn appendMembersForType(
                     .binding_decl => .field,
                 };
                 try appendOwnedMatch(matches, context.allocator, kind, decl.name.name, detail, decl.span);
+            }
+        },
+        // `E.` completes the error set's variants; a payload variant shows its
+        // payload type as the detail.
+        .error_set => |error_set| {
+            for (error_set.variants) |v| {
+                if (v.payload) |payload| {
+                    const variant_detail = try std.fmt.allocPrint(context.allocator, "error variant: {f}", .{payload});
+                    defer context.allocator.free(variant_detail);
+                    try appendOwnedMatch(matches, context.allocator, .field, v.name.name, variant_detail, v.name.span);
+                } else {
+                    try appendOwnedMatch(matches, context.allocator, .field, v.name.name, "error variant", v.name.span);
+                }
             }
         },
         else => {},
@@ -550,7 +563,7 @@ fn extractMemberChain(context: CollectMatchesContext, allocator: Allocator) !?Me
 /// named-type identifiers (e.g. a struct field declared `inner: Inner`, stored
 /// as an unresolved identifier) to the type they name. Returns null when a name
 /// can't be resolved.
-fn concreteType(
+pub fn concreteType(
     type_checker: *runic.semantic.TypeChecker,
     scope: ?*runic.semantic.Scope,
     type_expr: *const ast.TypeExpr,
@@ -573,7 +586,7 @@ fn concreteType(
 /// Resolves the type of `name` as a member of `type_expr` — a struct field, or a
 /// pub declaration of an imported module. Returns null when the type has no such
 /// traversable member. Used to walk chained member access one segment at a time.
-fn resolveMemberType(
+pub fn resolveMemberType(
     type_checker: *runic.semantic.TypeChecker,
     scope: ?*runic.semantic.Scope,
     type_expr: *const ast.TypeExpr,

@@ -4,9 +4,6 @@ hello
 
 error: some error
 0
-hello
-error: some error
-hello
-
-error: some error
-0
+separate-statement
+b.stdout=[captured
+]

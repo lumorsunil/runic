@@ -1,0 +1,4 @@
+# `break` and `continue` are only valid inside a loop. Using one at top level (or
+# in a function body that is not inside a loop) is a compile error.
+echo "before"
+break

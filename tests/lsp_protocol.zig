@@ -60,7 +60,59 @@ test "lsp formatting preserves comments" {
     const edits = parsed.value.object.get("result").?.array.items;
     try std.testing.expect(edits.len > 0);
     const new_text = edits[0].object.get("newText").?.string;
+    // The trailing comment survives verbatim.
     try std.testing.expect(std.mem.indexOf(u8, new_text, "# keep") != null);
+    // The body of the `if` block is indented one level (four spaces).
+    try std.testing.expect(std.mem.indexOf(u8, new_text, "\n    echo foo\n") != null);
+    // The closing brace returns to column zero.
+    try std.testing.expect(std.mem.indexOf(u8, new_text, "\n}\n") != null);
+}
+
+test "lsp formatting is indentation-only and string/comment safe" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    // Braces inside a string and a comment must not shift indentation, and
+    // command-argument spacing inside a line must be preserved verbatim.
+    const source =
+        \\fn Void run() Void {
+        \\echo "a { brace } in a string"   "two   spaces"
+        \\const arr = .{
+        \\"x",
+        \\}
+        \\}
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeFormattingRequest(allocator, 1, uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 1);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const edits = parsed.value.object.get("result").?.array.items;
+    try std.testing.expect(edits.len > 0);
+    const new_text = edits[0].object.get("newText").?.string;
+
+    // The `echo` line sits at one level; the brace inside the string did not
+    // push a further level (the array element `"x"` is still at two levels).
+    try std.testing.expect(std.mem.indexOf(u8, new_text, "\n    echo \"a { brace } in a string\"   \"two   spaces\"\n") != null);
+    // The `.{` array literal indents its element one level deeper.
+    try std.testing.expect(std.mem.indexOf(u8, new_text, "\n        \"x\",\n") != null);
+    // Interior command-argument spacing is preserved (not reflowed).
+    try std.testing.expect(std.mem.indexOf(u8, new_text, "\"two   spaces\"") != null);
 }
 
 test "lsp document symbols include real ranges" {
@@ -148,6 +200,525 @@ test "lsp document symbols include top-level functions" {
     try std.testing.expect(saw_budget);
     // The function appears in the outline with LSP SymbolKind.Function (12).
     try std.testing.expectEqual(@as(?i64, 12), greet_kind);
+}
+
+test "lsp document symbols surface destructured binding names" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    // Tuple, record (with a rebinding), a `_` discard, and a nested pattern.
+    const source =
+        \\const P = struct { x: Int, y: Int }
+        \\const a, b = .{ 1, 2 }
+        \\const { x, y: height } = P{ .x = 1, .y = 2 }
+        \\const first, _, third = .{ 7, 8, 9 }
+        \\const { x: (nx) }, rest = .{ P{ .x = 5, .y = 6 }, 9 }
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeDocumentSymbolRequest(allocator, 2, uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const syms = parsed.value.object.get("result").?.array.items;
+    const want = [_][]const u8{ "a", "b", "x", "height", "first", "third", "nx", "rest" };
+    var seen = [_]bool{false} ** want.len;
+    var saw_discard = false;
+    for (syms) |s| {
+        const name = s.object.get("name").?.string;
+        if (std.mem.eql(u8, name, "_")) saw_discard = true;
+        for (want, &seen) |w, *hit| {
+            if (std.mem.eql(u8, name, w)) hit.* = true;
+        }
+    }
+    for (seen, want) |hit, w| {
+        if (!hit) {
+            std.debug.print("missing destructured symbol: {s}\n", .{w});
+            return error.MissingSymbol;
+        }
+    }
+    // A `_` discard binds nothing, so it must not appear.
+    try std.testing.expect(!saw_discard);
+}
+
+test "lsp signature help shows the callee signature and active parameter" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\fn Void greet(name: String, times: Int) Void { echo "${name}" }
+        \\greet "hi" 3
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        // Cursor inside the first argument ("hi") on line 1.
+        try makeSignatureHelpRequest(allocator, 2, uri, 1, 7),
+        // Cursor on the second argument (3).
+        try makeSignatureHelpRequest(allocator, 3, uri, 1, 11),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    // First arg -> the label lists both params and the active one is 0.
+    {
+        const response = try findResponseById(allocator, output, 2);
+        defer allocator.free(response.body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        const result = parsed.value.object.get("result").?.object;
+        const sig = result.get("signatures").?.array.items[0].object;
+        const label = sig.get("label").?.string;
+        try std.testing.expect(std.mem.indexOf(u8, label, "name: String") != null);
+        try std.testing.expect(std.mem.indexOf(u8, label, "times: Int") != null);
+        try std.testing.expectEqual(@as(i64, 0), result.get("activeParameter").?.integer);
+    }
+    // Second arg -> active parameter advances to 1.
+    {
+        const response = try findResponseById(allocator, output, 3);
+        defer allocator.free(response.body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        const result = parsed.value.object.get("result").?.object;
+        try std.testing.expectEqual(@as(i64, 1), result.get("activeParameter").?.integer);
+    }
+}
+
+test "lsp code action wraps an undeclared uppercase type as a type parameter" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    // `T` is an undeclared uppercase type; the checker flags it and suggests
+    // writing it as `|T|`. The client passes that diagnostic back in context.
+    const source =
+        \\fn Void map(xs: []T) []T { yield xs }
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    // The `T` in `[]T` is at line 0, characters 18-19.
+    const message = "type 'T' is not declared (to introduce a generic type parameter, write it as |T|)";
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeCodeActionWithDiagnostic(allocator, 2, uri, 0, 18, 19, message),
+    };
+    defer for (messages) |message_bytes| allocator.free(message_bytes);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    var wrap: ?std.json.Value = null;
+    for (parsed.value.object.get("result").?.array.items) |a| {
+        if (std.mem.eql(u8, a.object.get("title").?.string, "Introduce type parameter |T|")) wrap = a;
+    }
+    try std.testing.expect(wrap != null);
+    // Two inserts of `|`: one at the start of `T`, one at its end.
+    const edits = wrap.?.object.get("edit").?.object.get("documentChanges").?.array
+        .items[0].object.get("edits").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), edits.len);
+    try std.testing.expectEqualStrings("|", edits[0].object.get("newText").?.string);
+    try std.testing.expectEqualStrings("|", edits[1].object.get("newText").?.string);
+    try std.testing.expectEqual(@as(i64, 18), edits[0].object.get("range").?.object.get("start").?.object.get("character").?.integer);
+    try std.testing.expectEqual(@as(i64, 19), edits[1].object.get("range").?.object.get("start").?.object.get("character").?.integer);
+}
+
+test "lsp code action changes a lowercase type to the suggested capitalized one" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    // `int` is a lowercase type name — a parse error; the checker suggests `Int`.
+    // (This exercises the diagnostic-linked path even without a valid AST.)
+    const source =
+        \\fn Void f(x: int) Void { echo "hi" }
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    // `int` is at line 0, characters 13-16.
+    const message = "expected type identifier (did you mean Int?)";
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeCodeActionWithDiagnostic(allocator, 2, uri, 0, 13, 16, message),
+    };
+    defer for (messages) |message_bytes| allocator.free(message_bytes);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    var change: ?std.json.Value = null;
+    for (parsed.value.object.get("result").?.array.items) |a| {
+        if (std.mem.eql(u8, a.object.get("title").?.string, "Change to 'Int'")) change = a;
+    }
+    try std.testing.expect(change != null);
+    const edit = change.?.object.get("edit").?.object.get("documentChanges").?.array
+        .items[0].object.get("edits").?.array.items[0].object;
+    try std.testing.expectEqualStrings("Int", edit.get("newText").?.string);
+    // Replaces the exact `int` range (chars 13-16).
+    try std.testing.expectEqual(@as(i64, 13), edit.get("range").?.object.get("start").?.object.get("character").?.integer);
+    try std.testing.expectEqual(@as(i64, 16), edit.get("range").?.object.get("end").?.object.get("character").?.integer);
+}
+
+test "lsp call hierarchy resolves callers and callees" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\fn Void helper(x: Int) Int { yield x }
+        \\fn Void run() Void {
+        \\  const a = helper 1
+        \\  const b = helper 2
+        \\  echo "${a}${b}"
+        \\}
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        // Prepare on `helper`'s declaration name (line 0).
+        try makePrepareCallHierarchyRequest(allocator, 2, uri, 0, 10),
+        try makeCallHierarchyItemRequest(allocator, 3, "callHierarchy/incomingCalls", uri, "helper"),
+        try makeCallHierarchyItemRequest(allocator, 4, "callHierarchy/outgoingCalls", uri, "run"),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    // prepare -> one item named `helper`.
+    {
+        const response = try findResponseById(allocator, output, 2);
+        defer allocator.free(response.body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        const items = parsed.value.object.get("result").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), items.len);
+        try std.testing.expectEqualStrings("helper", items[0].object.get("name").?.string);
+    }
+    // incoming(helper) -> `run` calls it twice.
+    {
+        const response = try findResponseById(allocator, output, 3);
+        defer allocator.free(response.body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        const calls = parsed.value.object.get("result").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), calls.len);
+        try std.testing.expectEqualStrings("run", calls[0].object.get("from").?.object.get("name").?.string);
+        try std.testing.expectEqual(@as(usize, 2), calls[0].object.get("fromRanges").?.array.items.len);
+    }
+    // outgoing(run) -> calls helper twice.
+    {
+        const response = try findResponseById(allocator, output, 4);
+        defer allocator.free(response.body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        const calls = parsed.value.object.get("result").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), calls.len);
+        try std.testing.expectEqualStrings("helper", calls[0].object.get("to").?.object.get("name").?.string);
+        try std.testing.expectEqual(@as(usize, 2), calls[0].object.get("fromRanges").?.array.items.len);
+    }
+}
+
+test "lsp call hierarchy finds cross-file incoming calls" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const lib_uri = try fixture.writeDocument("lib.rn",
+        \\pub fn Int greet(x: Int) Int { yield x }
+        \\
+    );
+    defer allocator.free(lib_uri);
+    // An importer that calls `m.greet` — only indexed, never opened.
+    const main_uri = try fixture.writeDocument("main.rn",
+        \\const m = import "./lib.rn"
+        \\fn Void run() Void {
+        \\  const a = m.greet 1
+        \\  echo "${a}"
+        \\}
+        \\
+    );
+    defer allocator.free(main_uri);
+
+    const root_uri = try std.fmt.allocPrint(allocator, "file://{s}", .{fixture.root_path});
+    defer allocator.free(root_uri);
+
+    const messages = [_][]const u8{
+        try makeInitializeWithRoot(allocator, 1, root_uri),
+        try makeDidOpen(allocator, lib_uri,
+            \\pub fn Int greet(x: Int) Int { yield x }
+            \\
+        ),
+        // Prepare on `greet`'s declaration, then ask for its incoming calls.
+        try makePrepareCallHierarchyRequest(allocator, 2, lib_uri, 0, 12),
+        try makeCallHierarchyItemRequest(allocator, 3, "callHierarchy/incomingCalls", lib_uri, "greet"),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 3);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    // `run` in the never-opened importer calls `m.greet` once.
+    const calls = parsed.value.object.get("result").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    const from = calls[0].object.get("from").?.object;
+    try std.testing.expectEqualStrings("run", from.get("name").?.string);
+    try std.testing.expectEqualStrings(main_uri, from.get("uri").?.string);
+    try std.testing.expectEqual(@as(usize, 1), calls[0].object.get("fromRanges").?.array.items.len);
+}
+
+test "lsp semantic tokens classify keywords, types, numbers and strings" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\const x = 5
+        \\fn Void greet(name: String) Void { echo "${name}" }
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeSemanticTokensRequest(allocator, 2, uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const data = parsed.value.object.get("result").?.object.get("data").?.array.items;
+    // Five ints per token; at least the tokens we assert below.
+    try std.testing.expect(data.len % 5 == 0);
+    try std.testing.expect(data.len >= 5 * 10);
+
+    // Decode the delta-encoded stream into absolute (line, char, type) tuples.
+    const Tok = struct { line: i64, char: i64, ttype: i64 };
+    var toks = std.ArrayList(Tok).empty;
+    defer toks.deinit(allocator);
+    var line: i64 = 0;
+    var char: i64 = 0;
+    var i: usize = 0;
+    while (i < data.len) : (i += 5) {
+        const dline = data[i].integer;
+        const dchar = data[i + 1].integer;
+        const ttype = data[i + 3].integer;
+        line += dline;
+        if (dline != 0) char = 0;
+        char += dchar;
+        try toks.append(allocator, .{ .line = line, .char = char, .ttype = ttype });
+    }
+
+    // Token type codes from server.zig: keyword=0, string=1, number=2, type=4, variable=5.
+    const keyword = 0;
+    const string = 1;
+    const number = 2;
+    const typ = 4;
+    const variable = 5;
+
+    // Find a token at a given position and assert its type.
+    const findType = struct {
+        fn at(list: []const Tok, l: i64, c: i64) ?i64 {
+            for (list) |t| if (t.line == l and t.char == c) return t.ttype;
+            return null;
+        }
+    }.at;
+
+    // `const` keyword at (0,0).
+    try std.testing.expectEqual(@as(?i64, keyword), findType(toks.items, 0, 0));
+    // `x` variable at (0,6).
+    try std.testing.expectEqual(@as(?i64, variable), findType(toks.items, 0, 6));
+    // `5` number at (0,10).
+    try std.testing.expectEqual(@as(?i64, number), findType(toks.items, 0, 10));
+    // `fn` keyword at (1,0).
+    try std.testing.expectEqual(@as(?i64, keyword), findType(toks.items, 1, 0));
+    // `Void` type at (1,3).
+    try std.testing.expectEqual(@as(?i64, typ), findType(toks.items, 1, 3));
+    // `String` type at (1,20).
+    try std.testing.expectEqual(@as(?i64, typ), findType(toks.items, 1, 20));
+    // The interpolated `name` inside `${name}` is code (variable), not string.
+    try std.testing.expectEqual(@as(?i64, variable), findType(toks.items, 1, 43));
+    // The opening quote of the string is a string token.
+    try std.testing.expectEqual(@as(?i64, string), findType(toks.items, 1, 40));
+}
+
+test "lsp semantic tokens refine functions, parameters and declarations from the ast" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\fn Int greet(name: String) Int { yield name }
+        \\const result = greet "x"
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeSemanticTokensRequest(allocator, 2, uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const data = parsed.value.object.get("result").?.object.get("data").?.array.items;
+
+    // Decode to absolute (line, char) with type and modifier bitmask.
+    const Tok = struct { line: i64, char: i64, ttype: i64, mods: i64 };
+    var toks = std.ArrayList(Tok).empty;
+    defer toks.deinit(allocator);
+    var line: i64 = 0;
+    var char: i64 = 0;
+    var i: usize = 0;
+    while (i < data.len) : (i += 5) {
+        const dline = data[i].integer;
+        line += dline;
+        if (dline != 0) char = 0;
+        char += data[i + 1].integer;
+        try toks.append(allocator, .{ .line = line, .char = char, .ttype = data[i + 3].integer, .mods = data[i + 4].integer });
+    }
+
+    const find = struct {
+        fn at(list: []const Tok, l: i64, c: i64) ?Tok {
+            for (list) |t| if (t.line == l and t.char == c) return t;
+            return null;
+        }
+    }.at;
+
+    // Type codes: type=4, variable=5, function=6, parameter=7.
+    // Modifier bits: declaration=1<<0, readonly=1<<1.
+    const function = 6;
+    const parameter = 7;
+    const variable = 5;
+    const decl_mod: i64 = 1;
+    const readonly_mod: i64 = 2;
+
+    // `greet` is a function declaration.
+    const greet_decl = find(toks.items, 0, 7).?;
+    try std.testing.expectEqual(@as(i64, function), greet_decl.ttype);
+    try std.testing.expectEqual(decl_mod, greet_decl.mods & decl_mod);
+    // `name` is a parameter declaration.
+    const name_param = find(toks.items, 0, 13).?;
+    try std.testing.expectEqual(@as(i64, parameter), name_param.ttype);
+    try std.testing.expectEqual(decl_mod, name_param.mods & decl_mod);
+    // `name` used in `yield name` is a plain reference (lexical variable), not a
+    // parameter or a zero-arg call misread as a function.
+    try std.testing.expectEqual(@as(i64, variable), find(toks.items, 0, 39).?.ttype);
+    // `result` is a readonly (const) binding declaration.
+    const result_bind = find(toks.items, 1, 6).?;
+    try std.testing.expectEqual(@as(i64, variable), result_bind.ttype);
+    try std.testing.expectEqual(decl_mod, result_bind.mods & decl_mod);
+    try std.testing.expectEqual(readonly_mod, result_bind.mods & readonly_mod);
+    // `greet "x"` is a call with an argument, so the callee is a function.
+    try std.testing.expectEqual(@as(i64, function), find(toks.items, 1, 15).?.ttype);
+}
+
+test "lsp survives incremental edits to a file with functions" {
+    // Every edit resets the workspace type checker (to reclaim its arena) and
+    // re-checks the open documents. The reset used to leave the checker's
+    // arena-backed stacks (stdout_type_stack, inferred-error collectors)
+    // dangling into freed memory, so the first function body re-checked after an
+    // edit wrote into freed memory and segfaulted. Delete lines across a file
+    // with several top-level functions, then confirm the server still answers.
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\const base = 10
+        \\fn Int add(x: Int) Int { yield x + base }
+        \\fn Int dbl(x: Int) Int { yield x + x }
+        \\fn Void greet(name: String) Void { echo "hi ${name}" }
+        \\const total = add 5
+        \\echo "${total}"
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        // Delete the `dbl` function (line 2).
+        try makeDidChangeIncremental(allocator, uri, 2, 2, 0, 3, 0, ""),
+        // Delete the `greet` function (now line 2).
+        try makeDidChangeIncremental(allocator, uri, 3, 2, 0, 3, 0, ""),
+        // The server must still respond after the edits.
+        try makeDocumentSymbolRequest(allocator, 9, uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 9);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+    // A well-formed result (not a crash) with the surviving `add` symbol.
+    const syms = parsed.value.object.get("result").?.array.items;
+    var saw_add = false;
+    for (syms) |s| {
+        if (std.mem.eql(u8, s.object.get("name").?.string, "add")) saw_add = true;
+    }
+    try std.testing.expect(saw_add);
 }
 
 test "lsp document symbols nest struct fields and function parameters" {
@@ -711,6 +1282,43 @@ test "lsp definition resolves a struct field member access to the field declarat
         \\echo "${p.x}"
         \\
     , 2, 10, 0, 23);
+}
+
+test "lsp definition resolves a nested struct field member access two levels deep" {
+    // Cursor on `x` in `l.from.x` must descend Line -> Point and resolve to
+    // Point's `x` field, not stop at the first level.
+    try expectDefinition(
+        \\const Point = struct { x: Int, y: Int }
+        \\const Line = struct { from: Point, to: Point }
+        \\fn Void main() Void {
+        \\    const l = Line{ .from = Point{ .x = 1, .y = 2 }, .to = Point{ .x = 3, .y = 4 } }
+        \\    echo "${l.from.x}"
+        \\}
+        \\
+    , 4, 19, 0, 23);
+}
+
+test "lsp definition resolves a struct literal field to the field declaration" {
+    // Cursor on `.x` inside the `Point{ … }` literal jumps to the `x` field
+    // declaration — a literal field is not an `object.member` access.
+    try expectDefinition(
+        \\const Point = struct { x: Int, y: Int }
+        \\const p = Point{ .x = 1, .y = 2 }
+        \\echo "${p.y}"
+        \\
+    , 1, 18, 0, 23);
+}
+
+test "lsp definition resolves a nested struct literal field" {
+    // The `.x` belongs to the inner `Point{ … }` nested in the `Line{ … }`
+    // literal; it must resolve to Point's field, not Line's.
+    try expectDefinition(
+        \\const Point = struct { x: Int, y: Int }
+        \\const Line = struct { from: Point, to: Point }
+        \\const l = Line{ .from = Point{ .x = 1, .y = 2 }, .to = Point{ .x = 3, .y = 4 } }
+        \\echo "${l.from.x}"
+        \\
+    , 2, 32, 0, 23);
 }
 
 test "lsp definition on an embedded std-module member does not crash" {
@@ -1352,8 +1960,10 @@ test "lsp code action adds an inferred type annotation" {
     var fixture = try TestFixture.init(allocator);
     defer fixture.deinit();
 
+    // `x` is referenced so the (separate) remove-unused action does not also fire.
     const source =
         \\const x = 5
+        \\echo "${x}"
         \\
     ;
     const uri = try fixture.writeDocument("main.rn", source);
@@ -1391,6 +2001,105 @@ test "lsp code action adds an inferred type annotation" {
     const start = edits[0].object.get("range").?.object.get("start").?.object;
     try std.testing.expectEqual(@as(i64, 0), start.get("line").?.integer);
     try std.testing.expectEqual(@as(i64, 7), start.get("character").?.integer);
+}
+
+test "lsp code action removes an unused binding but not a used one" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\const keep = 1
+        \\const drop = 2
+        \\echo "${keep}"
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        // Line 1 is the unused `drop`.
+        try makeCodeActionRequest(allocator, 2, uri, 1),
+        // Line 0 is the used `keep`.
+        try makeCodeActionRequest(allocator, 3, uri, 0),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    // `drop` is unreferenced, so a remove action is offered and deletes its line.
+    {
+        const response = try findResponseById(allocator, output, 2);
+        defer allocator.free(response.body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        var remove: ?std.json.Value = null;
+        for (parsed.value.object.get("result").?.array.items) |a| {
+            const title = a.object.get("title").?.string;
+            if (std.mem.eql(u8, title, "Remove unused 'drop'")) remove = a;
+        }
+        try std.testing.expect(remove != null);
+        const edit = remove.?.object.get("edit").?.object.get("documentChanges").?.array
+            .items[0].object.get("edits").?.array.items[0].object;
+        try std.testing.expectEqualStrings("", edit.get("newText").?.string);
+        const range = edit.get("range").?.object;
+        try std.testing.expectEqual(@as(i64, 1), range.get("start").?.object.get("line").?.integer);
+        try std.testing.expectEqual(@as(i64, 2), range.get("end").?.object.get("line").?.integer);
+    }
+    // `keep` is referenced, so no remove action is offered for it.
+    {
+        const response = try findResponseById(allocator, output, 3);
+        defer allocator.free(response.body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        for (parsed.value.object.get("result").?.array.items) |a| {
+            const title = a.object.get("title").?.string;
+            try std.testing.expect(std.mem.indexOf(u8, title, "Remove unused") == null);
+        }
+    }
+}
+
+test "lsp code action offers remove-all for multiple unused bindings" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\const keep = 1
+        \\const d1 = 2
+        \\const d2 = 3
+        \\echo "${keep}"
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeCodeActionRequest(allocator, 2, uri, 1),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    var all: ?std.json.Value = null;
+    for (parsed.value.object.get("result").?.array.items) |a| {
+        const title = a.object.get("title").?.string;
+        if (std.mem.startsWith(u8, title, "Remove all unused bindings")) all = a;
+    }
+    try std.testing.expect(all != null);
+    // Two unused bindings (d1, d2) -> two delete edits; `keep` is untouched.
+    const edits = all.?.object.get("edit").?.object.get("documentChanges").?.array
+        .items[0].object.get("edits").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), edits.len);
 }
 
 test "lsp folding ranges cover multi-line statements" {
@@ -1898,6 +2607,61 @@ test "lsp hover shows execution result member type" {
     try std.testing.expect(std.mem.indexOf(u8, value, "Byte") != null);
 }
 
+/// Runs a single-document hover and asserts the rendered markdown contains each
+/// of `needles`.
+fn expectHoverContains(source: []const u8, line: u32, char: u32, needles: []const []const u8) !void {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeHoverRequest(allocator, 1, uri, line, char),
+    };
+    defer for (messages) |m| allocator.free(m);
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+    const response = try findResponseById(allocator, output, 1);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+    const value = parsed.value.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    for (needles) |needle| try std.testing.expect(std.mem.indexOf(u8, value, needle) != null);
+}
+
+test "lsp hover types a nested struct field member access two levels deep" {
+    // `l.from.x` descends Line -> Point; hovering `x` shows Point's field type.
+    try expectHoverContains(
+        \\const Point = struct { x: Int, y: Int }
+        \\const Line = struct { from: Point, to: Point }
+        \\fn Void main() Void {
+        \\    const l = Line{ .from = Point{ .x = 1, .y = 2 }, .to = Point{ .x = 3, .y = 4 } }
+        \\    echo "${l.from.x}"
+        \\}
+        \\
+    , 4, 19, &.{ "x", "Int" });
+}
+
+test "lsp hover types a struct literal field" {
+    // Hovering `.y` inside the `Point{ … }` literal shows the field type.
+    try expectHoverContains(
+        \\const Point = struct { x: Int, y: Int }
+        \\const p = Point{ .x = 1, .y = 2 }
+        \\
+    , 1, 26, &.{ "y", "Int" });
+}
+
+test "lsp hover types a nested struct literal field" {
+    // The `.from` field of the `Line{ … }` literal is typed as `Point`.
+    try expectHoverContains(
+        \\const Point = struct { x: Int, y: Int }
+        \\const Line = struct { from: Point, to: Point }
+        \\const l = Line{ .from = Point{ .x = 1, .y = 2 }, .to = Point{ .x = 3, .y = 4 } }
+        \\
+    , 2, 17, &.{ "from", "Point" });
+}
+
 test "lsp hover shows a cimport extern's C signature" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
@@ -2366,6 +3130,83 @@ test "lsp member completion shows a struct field's type as detail" {
     try std.testing.expectEqualStrings("String", y_detail.?);
 }
 
+test "lsp member completion lists an error set's variants with payload detail" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\const E = error { NotFound, Failed: String }
+        \\echo "${E.}"
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeCompletionRequest(allocator, 12, uri, 1, 10),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 12);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const items = parsed.value.object.get("result").?.object.get("items").?.array.items;
+    var saw_not_found = false;
+    var failed_detail: ?[]const u8 = null;
+    for (items) |item| {
+        const label = item.object.get("label").?.string;
+        if (std.mem.eql(u8, label, "NotFound")) saw_not_found = true;
+        if (std.mem.eql(u8, label, "Failed")) {
+            failed_detail = if (item.object.get("detail")) |d| d.string else null;
+        }
+    }
+    try std.testing.expect(saw_not_found);
+    try std.testing.expect(failed_detail != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed_detail.?, "String") != null);
+}
+
+test "lsp hover shows an error variant with its payload type" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\const E = error { Failed: String }
+        \\fn Void f() E!Int { yield E.Failed }
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        // Cursor on `Failed` in `E.Failed` (line 1).
+        try makeHoverRequest(allocator, 12, uri, 1, 28),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 12);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const value = parsed.value.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, value, "Failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, value, "String") != null);
+}
+
 test "lsp chained member completion resolves nested struct fields" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
@@ -2720,6 +3561,78 @@ test "lsp survives out-of-bounds position requests" {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, final.body, .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value.object.get("result").?.array.items.len >= 1);
+}
+
+test "lsp survives position requests on an empty document" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const uri = try fixture.writeDocument("main.rn", "");
+    defer allocator.free(uri);
+
+    // An empty document put the position→offset scan at offset 0 of a zero-length
+    // buffer; `extractIdentifier` read `text[0]` and crashed the server.
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, ""),
+        try makeHoverRequest(allocator, 2, uri, 0, 0),
+        try makeDefinitionRequest(allocator, 3, uri, 0, 0),
+        try makeDocumentHighlightRequest(allocator, 4, uri, 0, 0),
+        try makeRenameRequest(allocator, 5, uri, 0, 0, "x"),
+        // A later request proves the server stayed alive.
+        try makeDocumentSymbolRequest(allocator, 6, uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    for ([_]i64{ 2, 3, 4, 5, 6 }) |id| {
+        const response = try findResponseById(allocator, output, id);
+        defer allocator.free(response.body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("result") != null);
+    }
+}
+
+test "lsp survives requests on a document with a multibyte identifier" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    // A non-ASCII identifier is a byte the lexer rejects; scanning the whole
+    // document (rename/highlight occurrence search, the import scan for member
+    // completion) used to propagate that error and take the server down.
+    const source =
+        \\const foo = 1
+        \\const 名前 = foo
+        \\echo "${foo}"
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeDocumentHighlightRequest(allocator, 2, uri, 0, 6),
+        try makeRenameRequest(allocator, 3, uri, 0, 6, "bar"),
+        try makeCompletionRequest(allocator, 4, uri, 2, 11),
+        // Still alive afterwards.
+        try makeDocumentSymbolRequest(allocator, 5, uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    for ([_]i64{ 2, 3, 4, 5 }) |id| {
+        const response = try findResponseById(allocator, output, id);
+        defer allocator.free(response.body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("result") != null);
+    }
 }
 
 test "lsp returns method-not-found for an unknown request method" {
@@ -3457,6 +4370,33 @@ fn makeCodeActionRequest(allocator: Allocator, id: i64, uri: []const u8, line: u
     });
 }
 
+/// A code-action request carrying one diagnostic in `context` (as a client
+/// passes back a diagnostic it received) over the given identifier range.
+fn makeCodeActionWithDiagnostic(
+    allocator: Allocator,
+    id: i64,
+    uri: []const u8,
+    line: u32,
+    char_start: u32,
+    char_end: u32,
+    message: []const u8,
+) ![]u8 {
+    const range = .{
+        .start = .{ .line = line, .character = char_start },
+        .end = .{ .line = line, .character = char_end },
+    };
+    return toJsonAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .id = id,
+        .method = "textDocument/codeAction",
+        .params = .{
+            .textDocument = .{ .uri = uri },
+            .range = range,
+            .context = .{ .diagnostics = .{.{ .range = range, .message = message }} },
+        },
+    });
+}
+
 fn makeFoldingRangeRequest(allocator: Allocator, id: i64, uri: []const u8) ![]u8 {
     return toJsonAlloc(allocator, .{
         .jsonrpc = "2.0",
@@ -3540,6 +4480,79 @@ fn makeDefinitionRequest(
                 .line = line,
                 .character = character,
             },
+        },
+    });
+}
+
+fn makeSignatureHelpRequest(
+    allocator: Allocator,
+    id: i64,
+    uri: []const u8,
+    line: u32,
+    character: u32,
+) ![]u8 {
+    return toJsonAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .id = id,
+        .method = "textDocument/signatureHelp",
+        .params = .{
+            .textDocument = .{ .uri = uri },
+            .position = .{ .line = line, .character = character },
+        },
+    });
+}
+
+fn makePrepareCallHierarchyRequest(
+    allocator: Allocator,
+    id: i64,
+    uri: []const u8,
+    line: u32,
+    character: u32,
+) ![]u8 {
+    return toJsonAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .id = id,
+        .method = "textDocument/prepareCallHierarchy",
+        .params = .{
+            .textDocument = .{ .uri = uri },
+            .position = .{ .line = line, .character = character },
+        },
+    });
+}
+
+fn makeCallHierarchyItemRequest(
+    allocator: Allocator,
+    id: i64,
+    method: []const u8,
+    uri: []const u8,
+    name: []const u8,
+) ![]u8 {
+    const zero = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 0 } };
+    return toJsonAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .id = id,
+        .method = method,
+        .params = .{ .item = .{
+            .name = name,
+            .kind = 12,
+            .uri = uri,
+            .range = zero,
+            .selectionRange = zero,
+        } },
+    });
+}
+
+fn makeSemanticTokensRequest(
+    allocator: Allocator,
+    id: i64,
+    uri: []const u8,
+) ![]u8 {
+    return toJsonAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .id = id,
+        .method = "textDocument/semanticTokens/full",
+        .params = .{
+            .textDocument = .{ .uri = uri },
         },
     });
 }

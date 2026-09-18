@@ -62,7 +62,7 @@ pub fn collectSymbols(
             .bash_block, .while_stmt => {
                 // Not Yet Implemented,
             },
-            .exit_stmt, .yield_stmt => {
+            .exit_stmt, .yield_stmt, .break_stmt, .continue_stmt => {
                 // Does not produce symbols
             },
             .expression => |expr_stmt| {
@@ -100,9 +100,9 @@ pub fn collectSymbols(
             .binding_decl => |binding_decl| {
                 switch (binding_decl.pattern.*) {
                     .discard => {},
-                    .record, .tuple => {
-                        // Not Yet Implemented
-                    },
+                    // A destructuring binding introduces one local per bound
+                    // name; surface each so the outline lists them individually.
+                    .record, .tuple => try appendPatternSymbols(allocator, list, binding_decl.pattern, detail),
                     .identifier => |identifier| {
                         const name = identifier.name;
                         // A `cimport` binding is module-like: surface it with its
@@ -146,6 +146,29 @@ pub fn collectSymbols(
     //     }
     //     cursor.advance();
     // }
+}
+
+/// Emits a `.variable` symbol for every name a binding pattern introduces,
+/// recursing through nested tuple/record patterns. A record field binds the
+/// label (or the explicit rebinding after `:`); `_` discards bind nothing.
+fn appendPatternSymbols(
+    allocator: Allocator,
+    list: *std.ArrayList(Symbol),
+    pattern: *const ast.BindingPattern,
+    detail: []const u8,
+) !void {
+    switch (pattern.*) {
+        .identifier => |identifier| try appendSymbol(allocator, list, .variable, identifier.name, detail, identifier.span),
+        .discard => {},
+        .tuple => |tuple| for (tuple.elements) |element| try appendPatternSymbols(allocator, list, element, detail),
+        .record => |record| for (record.fields) |field| {
+            if (field.binding) |binding| {
+                try appendPatternSymbols(allocator, list, binding, detail);
+            } else {
+                try appendSymbol(allocator, list, .variable, field.label.name, detail, field.label.span);
+            }
+        },
+    }
 }
 
 fn appendSymbol(

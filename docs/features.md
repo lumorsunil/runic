@@ -76,7 +76,96 @@ const word = "hello world"[0..5]   // "hello"
 **Result:** `x[a..b]` copies the elements/bytes in `[a, b)`; `x[a..]` runs to the
 end and `x[..b]` from the start (`x[..]` is a full copy). Bounds are clamped to
 `[0, len]`, so an out-of-range or inverted range yields an empty result rather
-than an error. Plain indexing `x[i]` is unchanged.
+than an error. Plain indexing `x[i]` reads a single element: an array element,
+or — for a string — the one-character `String` at position `i` (equivalent to
+`s[i .. i+1]`, so an out-of-range or negative `i` clamps to the empty string).
+
+### Destructuring bindings
+
+A binding target can be a **tuple** or **record** pattern instead of a single name:
+
+```rn
+const a, b = .{ 10, 20 }              // tuple: a = 10, b = 20
+const first, _, third = .{ 1, 2, 3 }  // `_` discards an element
+
+const P = struct { x: Int, y: Int }
+const p = P{ .x = 3, .y = 4 }
+const { x, y } = p                    // record: binds x and y from the fields
+const { x: px } = p                   // rebind a field to a different local name
+```
+
+**Result:** a tuple pattern `a, b` binds the positional elements of an
+array/tuple; a record pattern `{ x, y }` binds a struct's fields to same-named
+locals (a subset is allowed, and `{ field: name }` rebinds). `const`/`var` sets
+the mutability of all the parts, and a record field the struct doesn't have is a
+compile error. Patterns **nest** — a record or tuple can be a tuple element or a
+record-field rebinding (`const { inner: { x } }, rest = …`); a nested tuple is
+parenthesized (`(a, b)`) since a bare comma separates the outer elements. A
+tuple keeps each element's type — even through a variable — so
+`const s, n, p = .{ "hi", 2, point }` destructures a heterogeneous group (see
+Tuples below).
+
+### Tuples and arrays
+
+A `.{ … }` literal is a **tuple** when its elements have different types and an
+**array** when they share one:
+
+```rn
+var xs = .{ 1, 2, 3 }        // array []Int
+var t  = .{ 1, "hi", point } // tuple struct { Int, String, Point }
+```
+
+An array is a single element type; a tuple is an ordered, fixed set of
+per-position types. They share the same runtime representation (indexing, `for`,
+`.len()`, `.push`, concatenation all work the same), so the difference is a
+static-typing one: a tuple remembers each position's type. That is what lets a
+heterogeneous collection be **stored in a variable and destructured later**
+without the elements collapsing to a common type:
+
+```rn
+const A = struct { a: Int }
+const B = struct { b: Int }
+var mixed = .{ A{ .a = 1 }, B{ .b = 2 } }
+const x, y = mixed           // x is an A, y is a B — fields resolve correctly
+```
+
+Because an array is one type, forcing a heterogeneous tuple into an array
+annotation is an error — `const xs: []Int = .{ 1, "two" }` fails; a homogeneous
+literal coerces fine (`const xs: []Int = .{ 1, 2, 3 }`).
+
+**The empty literal `.{}`** has no element type, so it is an *empty struct* — a
+value you can pass around but not index, iterate, or `.push`. To build an
+appendable array, name the element type with an annotation; the empty struct then
+coerces to the empty array. In an array context (a `[]T` annotation, a struct
+field, or a concat operand) an empty `.{}` counts as an empty array.
+
+```rn
+var xs: []Int = .{ }         // an appendable empty array
+xs = xs.push 10
+const ys = .{ } + .{ 1, 2 }  // empty as a concat operand → []Int
+
+var oops = .{ }              // an empty struct (no element type)
+const first = oops[0]        // error: cannot index an empty struct — annotate it
+```
+
+A tuple type is written `struct { T0, T1, … }` — a struct body with positional
+types and no field names — and can annotate a binding, a function parameter, or
+a return type:
+
+```rn
+const pair: struct { Int, String } = .{ 1, "hi" }
+fn Void makePair() struct { Int, String } { yield .{ 1, "hi" } }
+fn Void take(p: struct { Int, String }) Void { const n, s = p; … }
+```
+
+(Named fields make it an ordinary struct — `struct { x: Int }`; positional
+elements make it a tuple. Parentheses in a type position are just grouping, not
+tuple syntax.) A tuple annotation is checked position by position, so
+`const t: struct { Int, String } = .{ 1, 2 }` is an error (position 1 is `Int`,
+not `String`). Indexing a tuple
+with a **constant** index has that position's type — `t[0]` is `Int`, `t[1]` is
+`String` — so a method or field on the result resolves; a runtime (variable)
+index stays permissive.
 
 ### Compound assignment
 
@@ -467,6 +556,18 @@ for (fruits, 0..) |fruit, idx| {
 
 **Result:** Iteration works uniformly across arrays and ranges without manual indexing, and the capture clause makes loop variables explicit without leaking bindings outside the block.
 
+Inside any loop — a `for` (over a range, array, multiple sources, or a `for (&0)` stream) or a `while` — `break` exits the innermost enclosing loop and `continue` skips to its next iteration:
+
+```rn
+for (0..10) |i| {
+  if (i == 3) continue   // skip 3
+  if (i == 6) break      // stop at 6
+  echo "${i}"
+}
+```
+
+**Result:** prints `0 1 2 4 5`. `break`/`continue` bind to the innermost loop, so an inner-loop `break` leaves the outer loop running. Using either outside a loop is a compile error.
+
 A `for` or `if`/`else` body does not have to be a block. It may be a bare
 expression or a single `yield`/`exit` statement, which avoids `{ }` for
 one-liners:
@@ -567,6 +668,12 @@ generic functions are written once, and mismatches are still caught
 captured type is a purely compile-time entity — it never exists at runtime.
 (This subsumes the earlier `@TypeOf`, which has been removed.)
 
+A type variable exists only once it has been introduced by a `|T|` capture. A
+**bare** uppercase type name with no such capture is an *undeclared type* — a
+typo like `Recangle`, not a silent generic — and is a compile error that points
+you at the `|T|` form. So write a generic parameter's first occurrence as `|T|`
+and reference it bare thereafter (`fn Void first(xs: []|T|) T`).
+
 ### Generic type constructors
 
 A type binding can take type parameters, defining a generic type constructor:
@@ -652,16 +759,15 @@ const combined = printf "hello\n" && printf "warning\n" >&2
 echo "${combined.stdout}"
 echo "${combined.stderr}"
 
-const sequenced = printf "hello\n"; printf "warning\n" >&2
-echo "${sequenced.stdout}"
-echo "${sequenced.stderr}"
+const first = printf "hello\n"; printf "world\n"   // `;` separates: `first` captures only `printf "hello"`; `printf "world"` is its own statement
+echo "${first.stdout}"
 
 const async_proc = (sleep 0.05; echo "done" &)
 async_proc.wait
 echo "${async_proc.stdout}"
 ```
 
-**Result:** Binding `const proc = <command ...>` executes the program synchronously and returns its buffered output plus exit metadata, read as `proc.stdout`, `proc.stderr`, and `proc.exit_code`. When command-producing expressions are chained with `&&`, `||`, or `;`, the resulting bound value still exposes the buffered `stdout`, `stderr`, and exit metadata from the evaluated expression. Appending `&` runs the work in the background; when you bind that value, its output is still buffered rather than printed immediately, and `.wait` blocks until it finishes.
+**Result:** Binding `const proc = <command ...>` executes the program synchronously and returns its buffered output plus exit metadata, read as `proc.stdout`, `proc.stderr`, and `proc.exit_code`. Commands chained into a single expression with `&&` or `||` are captured as a whole. A `;` is a plain statement separator (like a newline): `const proc = cmd1; cmd2` binds `proc` to `cmd1` only and runs `cmd2` as its own statement — so `proc` is in scope for it (`const r = cmd; echo "${r.stdout}"`). To capture an arbitrary command *sequence*, wrap it in a `$( … )` subshell. Appending `&` runs the work in the background; when you bind that value, its output is still buffered rather than printed immediately, and `.wait` blocks until it finishes.
 
 ### File descriptor redirects
 
@@ -1112,6 +1218,32 @@ echo "x=${p.x} y=${p.y}"
 Constructing a struct checks every field: an unknown field, a missing field, a
 duplicate field, or a value whose type doesn't match the field's type is a
 compile error.
+
+**Inferred literals.** When the type is already known from context the name can
+be dropped and written `.{ .field = value }`, mirroring the array-literal syntax.
+The type is taken from the context:
+
+```rn
+# a binding's annotation
+const p: Point = .{ .x = 3, .y = 4 }
+
+# a call argument's parameter type (including UFCS, where the receiver is param 0)
+fn Void moveTo(target: Point) Void { echo "${target.x},${target.y}" }
+moveTo .{ .x = 5, .y = 6 }
+
+# a function's declared return type
+fn Void origin() Point { yield .{ .x = 0, .y = 0 } }
+
+# a struct field's type in a construction
+const Line = struct { from: Point, to: Point }
+const l = Line{ .from = .{ .x = 0, .y = 0 }, .to = .{ .x = 3, .y = 4 } }
+
+# an array element type (nested literals infer too)
+const path: []Point = .{ .{ .x = 1, .y = 1 }, .{ .x = 2, .y = 2 } }
+```
+
+An anonymous struct literal with nothing to infer from is a compile error asking
+for a type annotation.
 
 **Nesting.** A field may itself be a struct; construction and access nest:
 

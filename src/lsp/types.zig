@@ -110,6 +110,11 @@ pub const ClientRequestPayload = union(enum) {
     @"textDocument/completion": CompletionParams,
     @"completionItem/resolve": std.json.Value,
     @"textDocument/hover": HoverParams,
+    @"textDocument/signatureHelp": SignatureHelpParams,
+    @"textDocument/prepareCallHierarchy": CallHierarchyPrepareParams,
+    @"callHierarchy/incomingCalls": CallHierarchyIncomingCallsParams,
+    @"callHierarchy/outgoingCalls": CallHierarchyOutgoingCallsParams,
+    @"textDocument/semanticTokens/full": SemanticTokensParams,
     @"textDocument/definition": DefinitionParams,
     @"textDocument/references": ReferenceParams,
     @"textDocument/documentHighlight": DocumentHighlightParams,
@@ -200,6 +205,30 @@ pub const HoverParams = struct {
     position: Position,
 };
 
+pub const SignatureHelpParams = struct {
+    textDocument: TextDocumentIdentifier,
+    position: Position,
+};
+
+pub const ParameterInformation = struct {
+    /// The parameter's label as it appears within the signature's `label`.
+    label: []const u8,
+};
+
+pub const SignatureInformation = struct {
+    /// The full signature label, e.g. `greet(name: String, times: Int)`.
+    label: []const u8,
+    parameters: []const ParameterInformation,
+    /// The parameter being entered (0-based), within `parameters`.
+    activeParameter: ?u32 = null,
+};
+
+pub const SignatureHelp = struct {
+    signatures: []const SignatureInformation,
+    activeSignature: ?u32 = 0,
+    activeParameter: ?u32 = null,
+};
+
 pub const DefinitionParams = struct {
     textDocument: TextDocumentIdentifier,
     position: Position,
@@ -253,11 +282,24 @@ pub const FoldingRangeParams = struct {
     textDocument: TextDocumentIdentifier,
 };
 
+/// A diagnostic as the client passes it back in a code-action request. Only the
+/// fields we key quick fixes off are declared; the rest are ignored on parse.
+pub const ClientDiagnostic = struct {
+    range: Range,
+    message: []const u8 = "",
+};
+
+pub const CodeActionContext = struct {
+    /// The diagnostics overlapping the requested range — the source for
+    /// diagnostic-linked quick fixes.
+    diagnostics: []const ClientDiagnostic = &.{},
+};
+
 pub const CodeActionParams = struct {
     textDocument: TextDocumentIdentifier,
     /// The range the action is requested for (the selection or cursor line).
     range: Range,
-    // `context` (diagnostics, requested kinds) is ignored for now.
+    context: CodeActionContext = .{},
 };
 
 /// A code action offered for a range — currently only edit-carrying quick fixes
@@ -1167,6 +1209,43 @@ pub const CallHierarchyRegistrationOptions = struct {
     workDoneProgress: ?bool = null,
 };
 
+pub const CallHierarchyPrepareParams = struct {
+    textDocument: TextDocumentIdentifier,
+    position: Position,
+};
+
+/// A function in a call-hierarchy tree. `range` spans the whole declaration;
+/// `selectionRange` is the name. The name + uri identify it for the follow-up
+/// incoming/outgoing requests.
+pub const CallHierarchyItem = struct {
+    name: []const u8,
+    kind: SymbolKind = .function,
+    uri: Uri,
+    range: Range,
+    selectionRange: Range,
+};
+
+pub const CallHierarchyIncomingCallsParams = struct {
+    item: CallHierarchyItem,
+};
+
+pub const CallHierarchyOutgoingCallsParams = struct {
+    item: CallHierarchyItem,
+};
+
+/// A caller of the queried function, with the ranges of its call sites.
+pub const CallHierarchyIncomingCall = struct {
+    from: CallHierarchyItem,
+    fromRanges: []const Range,
+};
+
+/// A function the queried function calls, with the call-site ranges (in the
+/// queried function's body).
+pub const CallHierarchyOutgoingCall = struct {
+    to: CallHierarchyItem,
+    fromRanges: []const Range,
+};
+
 pub const SemanticTokensOptions = struct {
     /// The legend used by the server
     legend: SemanticTokensLegend,
@@ -1207,6 +1286,16 @@ pub const SemanticTokensLegend = struct {
 
     /// The token modifiers a server uses.
     tokenModifiers: []const []const u8,
+};
+
+pub const SemanticTokensParams = struct {
+    textDocument: TextDocumentIdentifier,
+};
+
+/// The flat, delta-encoded token stream — five integers per token
+/// (deltaLine, deltaStartChar, length, tokenType, tokenModifiers).
+pub const SemanticTokens = struct {
+    data: []const u32,
 };
 
 pub const MonikerOptions = struct {

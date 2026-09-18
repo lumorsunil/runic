@@ -1,0 +1,6 @@
+# A struct type declaration with a repeated field name is rejected. Struct
+# types were previously not validated at all, so a duplicate field silently
+# shadowed the earlier one.
+const Point = struct { x: Int, y: Int, x: Float }
+const p = Point{ .x = 1, .y = 2 }
+echo "${p.x}"

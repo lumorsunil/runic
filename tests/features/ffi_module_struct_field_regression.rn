@@ -19,3 +19,13 @@ echo "shifted.x=${s.x}"
 // A function taking the module struct as a parameter and reading a field.
 fn Void area(rect: m.Rect) Int { yield rect.w * rect.h }
 echo "area=${area r}"
+
+// Construct the struct from ANOTHER struct value's field accesses. Each field
+// value is a member access (`rect.x`) whose type surfaces as the field's raw
+// `c.Int` alias; it must resolve to compare against the declared `c.Int` field
+// (previously failed with "expected Int, actual: c.Int").
+fn Void grow(rect: m.Rect) m.Rect {
+  yield m.Rect{ .x = rect.x, .y = rect.y, .w = rect.w, .h = rect.h }
+}
+const g = grow r
+echo "grown=${g.x},${g.y},${g.w},${g.h}"

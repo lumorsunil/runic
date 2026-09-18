@@ -7,3 +7,11 @@ hello
 cat
 w=5
 s=3
+parsed=42
+proc=[cap
+]
+pick=7
+chained=[xy]
+sub=[a
+b
+]

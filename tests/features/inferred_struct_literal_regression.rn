@@ -1,0 +1,80 @@
+// Inferred (anonymous) struct literals: `.{ .field = value }` takes its type
+// from the binding's annotation, so `const v: Vector = .{ .x = 3 }` works
+// without repeating the type name as in `Vector{ .x = 3 }`.
+fn Void @() Void
+
+const Vector = struct { x: Int, y: Int }
+
+// Basic inference from the annotation.
+const v: Vector = .{ .x = 3, .y = 5 }
+echo "v=${v.x},${v.y}"
+
+// `var`, then mutate a field.
+var m: Vector = .{ .x = 1, .y = 2 }
+m.x += 10
+echo "m=${m.x},${m.y}"
+
+// A record pattern destructures directly from an inferred literal.
+const V = struct { w: Int, h: Int }
+const { w, h }: V = .{ .w = 30, .h = 40 }
+echo "d=${w},${h}"
+
+// The named form still works alongside the inferred one.
+const named = Vector{ .x = 7, .y = 8 }
+echo "named=${named.x},${named.y}"
+
+// A plain array literal `.{ e0, e1 }` is unaffected by the struct-literal path.
+const nums: []Int = .{ 1, 2, 3 }
+echo "nums=${nums[0]},${nums[1]},${nums[2]}"
+
+// An empty array literal still parses as an array.
+const empty: []Int = .{ }
+echo "empty=${empty.len()}"
+
+// --- Inference from a call argument's parameter type ---
+
+const Entity = struct { name: String }
+
+fn Void moveEntity(entity: Entity, pos: Vector) Void {
+    echo "moved ${entity.name} to ${pos.x},${pos.y}"
+}
+
+const hero = Entity{ .name = "hero" }
+
+// Command-style call: the second argument infers `Vector` from the parameter.
+moveEntity hero .{ .x = 3, .y = 5 }
+
+// More than one inferred argument in a single call.
+fn Void span(a: Vector, b: Vector) Void { echo "span=${a.x}..${b.x}" }
+span .{ .x = 1, .y = 0 } .{ .x = 9, .y = 0 }
+
+// UFCS method call: the receiver fills parameter 0, so the written argument
+// infers from parameter 1.
+fn Void warpTo(self: Entity, target: Vector) Void { echo "warp=${target.x},${target.y}" }
+hero.warpTo(.{ .x = 7, .y = 2 })
+
+// --- Inference from a function's declared return type (`yield`) ---
+
+fn Void origin() Vector { yield .{ .x = 0, .y = 0 } }
+const o = origin
+echo "ret=${o.x},${o.y}"
+
+// --- Inference from a struct field's type in a construction ---
+
+const Line = struct { from: Vector, to: Vector }
+const line = Line{ .from = .{ .x = 1, .y = 2 }, .to = .{ .x = 3, .y = 4 } }
+echo "line=${line.from.x},${line.to.y}"
+
+// --- Inference from an array element type (nested literals) ---
+
+const path: []Vector = .{ .{ .x = 5, .y = 6 }, .{ .x = 7, .y = 8 } }
+echo "path=${path[0].x},${path[1].y}"
+
+// Combined: an array of structs inside a field, and returned from a function.
+const Poly = struct { points: []Vector }
+const poly = Poly{ .points = .{ .{ .x = 9, .y = 9 } } }
+echo "poly=${poly.points[0].y}"
+
+fn Void twoPoints() []Vector { yield .{ .{ .x = 2, .y = 2 }, .{ .x = 4, .y = 4 } } }
+const tp = twoPoints
+echo "yieldarr=${tp[0].x},${tp[1].y}"

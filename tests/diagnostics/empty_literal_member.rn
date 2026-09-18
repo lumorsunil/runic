@@ -1,0 +1,5 @@
+# A member access like `.len` on an unannotated empty `.{}` (an empty struct) is
+# the "forgot to annotate an empty array" mistake — the error directs you to the
+# annotation instead of the generic "member not found on struct".
+var xs = .{ }
+echo "${xs.len}"

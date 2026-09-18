@@ -7,7 +7,7 @@ fn Void @() Void
 
 // Split on whitespace, dropping empty fields (so runs of spaces collapse).
 pub fn Void words(s: String) []String {
-  var result = .{ }
+  var result: []String = .{ }
   const parts = s.split " "
   for (parts) |p| { if (p.len > 0) { result = result.push p } }
   yield result

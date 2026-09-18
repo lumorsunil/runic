@@ -482,8 +482,14 @@ pub const TypeExpr = union(enum) {
         elements: []const *const TypeExpr,
         span: Span,
 
-        pub fn format(_: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
-            try writer.writeAll("<tuple>");
+        pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            // Matches the surface syntax: a tuple type is a positional struct body.
+            try writer.writeAll("struct { ");
+            for (self.elements, 0..) |element, i| {
+                if (i > 0) try writer.writeAll(", ");
+                try element.format(writer);
+            }
+            try writer.writeAll(" }");
         }
     };
 
@@ -1922,6 +1928,8 @@ pub const Statement = union(enum) {
 
     exit_stmt: ExitStmt,
     yield_stmt: YieldStmt,
+    break_stmt: BreakStmt,
+    continue_stmt: ContinueStmt,
     while_stmt: WhileStmt,
     bash_block: BashBlock,
 
@@ -1931,6 +1939,8 @@ pub const Statement = union(enum) {
             .binding_decl => |decl| decl.span,
             .exit_stmt => |exit_stmt| exit_stmt.span,
             .yield_stmt => |yield_stmt| yield_stmt.span,
+            .break_stmt => |break_stmt| break_stmt.span,
+            .continue_stmt => |continue_stmt| continue_stmt.span,
             // .for_stmt => |loop_stmt| loop_stmt.span,
             .while_stmt => |loop_stmt| loop_stmt.span,
             .bash_block => |bash_block| bash_block.span,
@@ -2006,7 +2016,11 @@ pub const Parameter = struct {
             allocator,
             scope,
         );
-        return semantic.Scope.Error.TypeNotFound;
+        // An un-annotated parameter with no default has no inferable type.
+        // Return null (untyped) rather than error.TypeNotFound so the type
+        // checker can report a clean, located diagnostic and keep going, instead
+        // of the whole run aborting with an uncaught error.
+        return null;
     }
 };
 
@@ -2114,6 +2128,34 @@ pub const YieldStmt = struct {
 pub const ExitStmt = struct {
     value: ?*Expression,
     span: Span,
+};
+
+/// `break` — exit the innermost enclosing loop.
+pub const BreakStmt = struct {
+    span: Span,
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.Io,
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*const TypeExpr {
+        return null;
+    }
+};
+
+/// `continue` — skip to the next iteration of the innermost enclosing loop.
+pub const ContinueStmt = struct {
+    span: Span,
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.Io,
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*const TypeExpr {
+        return null;
+    }
 };
 
 pub const ForExpr = struct {

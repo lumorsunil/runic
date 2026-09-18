@@ -7,7 +7,7 @@
 const Box = struct { n: Int }
 
 // Empty literal grown by push; the element type is inferred as Box.
-var xs = .{ }
+var xs: []Box = .{ }
 xs = xs.push Box{ .n = 7 }
 xs = xs.push Box{ .n = 9 }
 echo "direct=${xs[1].n}"
@@ -17,11 +17,11 @@ const b = xs[0]
 echo "bound=${b.n}"
 
 // Nested arrays: element .len and double indexing.
-var rows = .{ }
-var r0 = .{ }
+var rows: [][]Int = .{ }
+var r0: []Int = .{ }
 r0 = r0.push 1
 rows = rows.push r0
-var r1 = .{ }
+var r1: []Int = .{ }
 r1 = r1.push 2
 r1 = r1.push 3
 rows = rows.push r1

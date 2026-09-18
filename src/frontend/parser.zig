@@ -1139,11 +1139,12 @@ pub const Parser = struct {
                             });
                         },
                         .dot_l_brace => {
-                            // TODO: add support for structs/tuples?
-                            const breadcrumbInner = try self.createBreadcrumb("PBE:array");
+                            // `.{ … }` is either an array literal or an anonymous
+                            // (context-typed) struct literal; the dispatcher decides.
+                            const breadcrumbInner = try self.createBreadcrumb("PBE:brace");
                             defer breadcrumbInner.end();
                             try components.append(self.allocator, .{
-                                .literal = .{ .array = try self.parseArrayLiteral() },
+                                .expr = try self.parseBraceLiteralExpression(),
                             });
                             continue;
                         },
@@ -1253,7 +1254,11 @@ pub const Parser = struct {
                         },
                         else => {
                             if (next.tag == .range) break;
-                            if (isExprTerminator(next.tag)) break;
+                            // `.{ … }` (an array literal) is unambiguously a value,
+                            // so a following one is a function/command argument
+                            // (`f .{ 1, 2 }`), not a terminator — unlike `{` (a
+                            // block body). Fall through to apply it.
+                            if (next.tag != .dot_l_brace and isExprTerminator(next.tag)) break;
 
                             try components.append(self.allocator, .{
                                 .op = token.Spanned(ast.BinaryOp){
@@ -2059,7 +2064,21 @@ pub const Parser = struct {
         _ = try self.expect(.r_paren);
         const capture = try self.parseCaptureClause();
 
-        if (capture.bindings.len != sources.len) return Error.ForCapturesMustMatchSources;
+        if (capture.bindings.len != sources.len) {
+            // One capture per source (parallel iteration). The common mistake is
+            // wanting a value + index from a single source — point at the `0..`
+            // idiom rather than emitting the bare error enum.
+            try self.reportParseError(
+                Error.ForCapturesMustMatchSources,
+                capture.span,
+                "a `for` loop needs one capture per source ({d} source(s), {d} capture(s)). To iterate with an index, add a `0..` range source: `for (items, 0..) |item, i|`.",
+                .{ sources.len, capture.bindings.len },
+            );
+            // Consume the loop body so the trailing `}` doesn't trigger a second,
+            // cascading "expected value" error during top-level recovery.
+            _ = self.parseControlFlowBody() catch {};
+            return Error.ForCapturesMustMatchSources;
+        }
 
         const body = try self.parseControlFlowBody();
 
@@ -2102,7 +2121,7 @@ pub const Parser = struct {
 
         const next = try self.peekToken();
         const stmt: *ast.Statement = switch (next.tag) {
-            .kw_yield, .kw_exit => try self.parseSingleBodyStatement(),
+            .kw_yield, .kw_exit, .kw_break, .kw_continue => try self.parseSingleBodyStatement(),
             else => return self.parseExpression(),
         };
 
@@ -2122,10 +2141,22 @@ pub const Parser = struct {
             stmt.* = .{ .yield_stmt = yield_stmt };
         } else if (try self.parseMaybeExit()) |exit_stmt| {
             stmt.* = .{ .exit_stmt = exit_stmt };
+        } else if (try self.parseMaybeLoopControl()) |loop_control| {
+            stmt.* = loop_control;
         } else {
             unreachable;
         }
         return stmt;
+    }
+
+    /// Parses a bare `break` or `continue` statement, if the next token is one.
+    fn parseMaybeLoopControl(self: *Self) Error!?ast.Statement {
+        const next = try self.peekToken();
+        return switch (next.tag) {
+            .kw_break => .{ .break_stmt = .{ .span = (try self.nextToken()).span } },
+            .kw_continue => .{ .continue_stmt = .{ .span = (try self.nextToken()).span } },
+            else => null,
+        };
     }
 
     fn parseMatchExpression(self: *Self) Error!*ast.Expression {
@@ -2324,36 +2355,64 @@ pub const Parser = struct {
         return .fromToken(integer);
     }
 
-    fn parseArrayLiteral(self: *Self) Error!ast.ArrayLiteral {
-        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
-        defer breadcrumb.end();
-
-        const start = try self.expectTokenTag(.dot_l_brace);
-
-        // Empty array literal `.{ }`.
-        self.skipNewlines();
-        if ((try self.peekToken()).tag == .r_brace) {
-            const close = try self.expectTokenTag(.r_brace);
-            return .{ .elements = &.{}, .span = start.span.endAt(close.span) };
-        }
-
-        const elements = try self.parseList(.comma, parseExpression, .{ .skipNewLines = true });
-
-        _ = try self.expectTokenTag(.r_brace);
-
-        return .{
-            .elements = elements.payload,
-            .span = elements.span,
-        };
-    }
-
     fn parseArrayLiteralExpression(self: *Self) Error!*ast.Expression {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
-        return try self.allocExpression(.{
-            .array = try self.parseArrayLiteral(),
-        });
+        return self.parseBraceLiteralExpression();
+    }
+
+    /// Parses a `.{ … }` literal, dispatching on its contents: `.{ .field = … }`
+    /// is an *anonymous* struct literal (its type is inferred from context, e.g.
+    /// a binding annotation) and `.{ e0, e1, … }` (or `.{ }`) is an array literal.
+    fn parseBraceLiteralExpression(self: *Self) Error!*ast.Expression {
+        const start = try self.expectTokenTag(.dot_l_brace);
+        self.skipNewlines();
+        // `.{ .x = … }` — a field initializer starts with `.`, so this is an
+        // anonymous struct literal rather than an array of expressions.
+        if ((try self.peekToken()).tag == .dot) {
+            return self.parseAnonStructLiteral(start.span);
+        }
+        if ((try self.peekToken()).tag == .r_brace) {
+            const close = try self.expectTokenTag(.r_brace);
+            return self.allocExpression(.{ .array = .{ .elements = &.{}, .span = start.span.endAt(close.span) } });
+        }
+        const elements = try self.parseList(.comma, parseExpression, .{ .skipNewLines = true });
+        const close = try self.expectTokenTag(.r_brace);
+        return self.allocExpression(.{ .array = .{
+            .elements = elements.payload,
+            .span = start.span.endAt(close.span),
+        } });
+    }
+
+    /// Parses the fields of an anonymous struct literal `.{ .x = 3, .y = 5 }` (the
+    /// leading `.{` already consumed). Its `name` is left empty — the type is
+    /// resolved from context (currently a binding annotation).
+    fn parseAnonStructLiteral(self: *Self, start_span: ast.Span) Error!*ast.Expression {
+        var fields = std.ArrayList(ast.StructLiteral.FieldInit).empty;
+        defer fields.deinit(self.allocator);
+
+        while (true) {
+            self.skipNewlines();
+            if ((try self.peekToken()).tag == .r_brace) break;
+            const dot = try self.expectTokenTag(.dot);
+            const field_name = try self.parseIdentifier();
+            _ = try self.expectTokenTag(.assign);
+            const value = try self.parseExpression();
+            try fields.append(self.allocator, .{
+                .name = field_name,
+                .value = value,
+                .span = dot.span.endAt(value.span()),
+            });
+            self.skipNewlines();
+            if ((try self.peekToken()).tag == .comma) _ = try self.nextToken();
+        }
+        const close = try self.expectTokenTag(.r_brace);
+        return self.allocExpression(.{ .struct_literal = .{
+            .name = .{ .name = "", .span = start_span },
+            .fields = try self.copyToArena(ast.StructLiteral.FieldInit, fields.items),
+            .span = start_span.endAt(close.span),
+        } });
     }
 
     fn parseCaptureClause(self: *Self) Error!ast.CaptureClause {
@@ -2372,7 +2431,10 @@ pub const Parser = struct {
 
         _ = try self.nextToken(); // consume opening '|'
         const capture_start = next.span.start;
-        const bindings = try self.parseList(.comma, parseBindingPattern, .{});
+        // A capture clause is a comma-separated LIST of patterns (one per loop
+        // source / captured value), so each element parses as a single pattern —
+        // the comma is the list separator, not a tuple-pattern delimiter.
+        const bindings = try self.parseList(.comma, parseCapturePattern, .{});
         const close_tok = try self.expect(.pipe);
 
         return ast.CaptureClause{
@@ -2385,20 +2447,118 @@ pub const Parser = struct {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
-        // TODO: Support deconstructions
+        const first = try self.parseElementPattern();
+
+        // A top-level tuple destructuring pattern: `a, b` (comma-separated) binds
+        // the positional elements of the initializer array/tuple.
+        if ((try self.peekToken()).tag != .comma) return first;
+
+        var elements = std.ArrayList(*ast.BindingPattern).empty;
+        defer elements.deinit(self.arena.allocator());
+        try elements.append(self.arena.allocator(), first);
+        var end_span = first.span();
+        while (try self.stream.consumeIf(.comma)) {
+            const el = try self.parseElementPattern();
+            end_span = el.span();
+            try elements.append(self.arena.allocator(), el);
+        }
+        const pattern = try self.arena.allocator().create(ast.BindingPattern);
+        pattern.* = .{ .tuple = .{
+            .elements = try elements.toOwnedSlice(self.arena.allocator()),
+            .span = first.span().endAt(end_span),
+            .has_rest = false,
+        } };
+        return pattern;
+    }
+
+    /// Parses one destructuring element — the building block of tuple elements
+    /// and record-field rebindings. It is an identifier/discard, a record
+    /// (`{ x, y }`), or a *parenthesized* tuple (`(a, b)`). A nested tuple must
+    /// be parenthesized because a bare comma separates the elements of the
+    /// enclosing pattern.
+    fn parseElementPattern(self: *Self) Error!*ast.BindingPattern {
+        return switch ((try self.peekToken()).tag) {
+            .l_brace => self.parseRecordPattern(),
+            .l_paren => self.parseParenTuplePattern(),
+            else => self.parseSingleBindingPattern(),
+        };
+    }
+
+    /// Parses `( a, b, … )` — a parenthesized tuple pattern (a nested tuple, or a
+    /// grouped top-level one). A single `( a )` is just that element.
+    fn parseParenTuplePattern(self: *Self) Error!*ast.BindingPattern {
+        const open = try self.expectTokenTag(.l_paren);
+        var elements = std.ArrayList(*ast.BindingPattern).empty;
+        defer elements.deinit(self.arena.allocator());
+        while ((try self.peekToken()).tag != .r_paren) {
+            try elements.append(self.arena.allocator(), try self.parseElementPattern());
+            if (!try self.stream.consumeIf(.comma)) break;
+        }
+        const close = try self.expectTokenTag(.r_paren);
+        if (elements.items.len == 1) return elements.items[0];
+        const pattern = try self.arena.allocator().create(ast.BindingPattern);
+        pattern.* = .{ .tuple = .{
+            .elements = try elements.toOwnedSlice(self.arena.allocator()),
+            .span = open.span.endAt(close.span),
+            .has_rest = false,
+        } };
+        return pattern;
+    }
+
+    /// Parses one capture-clause pattern: a single identifier/discard, or a
+    /// record pattern (`{ x, y }`). Not a comma-tuple — the comma separates
+    /// captures in the enclosing list.
+    fn parseCapturePattern(self: *Self) Error!*ast.BindingPattern {
+        if ((try self.peekToken()).tag == .l_brace) return self.parseRecordPattern();
+        return self.parseSingleBindingPattern();
+    }
+
+    /// Parses a single identifier (or `_` discard) binding target. Each element
+    /// of a tuple pattern and each rebinding of a record pattern is one of these.
+    fn parseSingleBindingPattern(self: *Self) Error!*ast.BindingPattern {
         const tok = try self.nextToken();
         if (tok.tag != .identifier) return self.failExpectedToken(tok.tag, .identifier);
 
         const pattern = try self.arena.allocator().create(ast.BindingPattern);
         if (tok.lexeme.len == 1 and tok.lexeme[0] == '_') {
-            pattern.* = .{
-                .discard = tok.span,
-            };
+            pattern.* = .{ .discard = tok.span };
         } else {
-            pattern.* = .{
-                .identifier = .{ .name = tok.lexeme, .span = tok.span },
-            };
+            pattern.* = .{ .identifier = .{ .name = tok.lexeme, .span = tok.span } };
         }
+        return pattern;
+    }
+
+    /// Parses `{ x, y }` (or `{ x: rebind, … }`) — a record destructuring
+    /// pattern. Each field binds the initializer struct's same-named field to a
+    /// local (the field name, or the explicit rebinding after `:`).
+    fn parseRecordPattern(self: *Self) Error!*ast.BindingPattern {
+        const open = try self.expectTokenTag(.l_brace);
+        var fields = std.ArrayList(ast.BindingPattern.RecordField).empty;
+        defer fields.deinit(self.arena.allocator());
+
+        while ((try self.peekToken()).tag != .r_brace) {
+            const label = try self.expectTokenTag(.identifier);
+            var binding: ?*ast.BindingPattern = null;
+            var field_end = label.span;
+            if (try self.stream.consumeIf(.colon)) {
+                const sub = try self.parseElementPattern();
+                field_end = sub.span();
+                binding = sub;
+            }
+            try fields.append(self.arena.allocator(), .{
+                .label = .{ .name = label.lexeme, .span = label.span },
+                .binding = binding,
+                .span = label.span.endAt(field_end),
+            });
+            if (!try self.stream.consumeIf(.comma)) break;
+        }
+        const close = try self.expectTokenTag(.r_brace);
+        const pattern = try self.arena.allocator().create(ast.BindingPattern);
+        pattern.* = .{ .record = .{
+            .fields = try fields.toOwnedSlice(self.arena.allocator()),
+            .span = open.span.endAt(close.span),
+            .has_rest = false,
+        } };
         return pattern;
     }
 
@@ -2663,6 +2823,12 @@ pub const Parser = struct {
 
         if (try self.parseMaybeYield()) |yield_stmt| {
             stmt.* = .{ .yield_stmt = yield_stmt };
+            return stmt;
+        }
+
+        if (try self.parseMaybeLoopControl()) |loop_control| {
+            stmt.* = loop_control;
+            try self.consumeStatementTerminator();
             return stmt;
         }
 
@@ -3237,41 +3403,16 @@ pub const Parser = struct {
         const pattern = try self.parseBindingPattern();
         const annotation = try self.parseMaybeTypeAnnotation();
         _ = try self.expectTokenTag(.assign);
-        var initializer = try self.parseExpression();
+        const initializer = try self.parseExpression();
 
-        // If the initializer is a command-producing expression, allow `;` to sequence
-        // additional commands under the same capture (e.g. `const b = cmd1; cmd2`).
-        // String literals, identifiers, and other non-command expressions do NOT
-        // continue the sequence, preserving `const x = "hello"; echo x` semantics.
-        while (true) {
-            const next = try self.peekToken();
-            if (next.tag != .semicolon) break;
-            switch (initializer.*) {
-                // A bare zero-arg identifier call (`const z = y`) is a value
-                // reference, not a multi-part command — don't absorb the next
-                // statement; let `;` separate it (e.g. `const z = y; echo "hi"`).
-                .call => |call| if (call.arguments.len == 0 and call.callee.* == .identifier) break,
-                // Only command-producing binaries sequence; value ops
-                // (arithmetic, comparison, …) don't (`const x = 1 + 2; echo` must
-                // run the echo).
-                .binary => |binary| switch (binary.op) {
-                    .apply, .pipe, .logical_and, .logical_or, .sequence, .append_redirect, .redirect_fd, .fd_source_truncate_redirect, .fd_source_append_redirect => {},
-                    else => break,
-                },
-                .pipeline, .block, .subshell => {},
-                else => break,
-            }
-            _ = try self.nextToken(); // consume `;`
-            const right = try self.parseExpression();
-            const seq_expr = try self.arena.allocator().create(ast.Expression);
-            seq_expr.* = .{ .binary = .{
-                .left = initializer,
-                .right = right,
-                .op = .sequence,
-                .span = initializer.span().endAt(right.span()),
-            } };
-            initializer = seq_expr;
-        }
+        // A `;` after the initializer is a plain statement separator (like a
+        // newline) — it is consumed by the statement loop, not the binding. The
+        // initializer is exactly the expression on the right of `=`. A command
+        // *sequence* to capture is written explicitly with `&&`/`||` (single
+        // expressions, parsed above) or a `$( … )` subshell — a bare `;` never
+        // folds the next statement into the binding. (This previously "absorbed"
+        // `const b = cmd1; cmd2` into one captured sequence, which surprised the
+        // common `const r = cmd; echo "${r}"` — `r` was pulled out of scope.)
 
         return ast.BindingDecl{
             .is_pub = pub_token != null,
@@ -3540,6 +3681,8 @@ pub const Parser = struct {
             // .caret => self.parsePromiseTypeExpr(),
             .question => self.parseOptionalTypeExpr(),
             .l_paren => {
+                // Parentheses in a type position are just grouping — `(T)` is
+                // `T`. (A tuple type is written `struct { T0, T1, … }`.)
                 _ = try self.nextToken();
                 const type_expr = try self.parseTypeExpr();
                 _ = try self.expectTokenTag(.r_paren);
@@ -3686,6 +3829,16 @@ pub const Parser = struct {
 
         const start = try self.expectTokenTag(.kw_struct);
         _ = try self.expectTokenTag(.l_brace);
+        self.skipNewlines();
+
+        // Positional (tuple) form `struct { T0, T1, … }` vs named struct
+        // `struct { name: T, … }`: a named field always begins `identifier :`;
+        // anything else begins a bare type, so the body is a tuple. Empty
+        // `struct {}` stays a named (empty) struct.
+        const ahead = try self.peekSlice(2);
+        const is_named = (ahead.len >= 1 and ahead[0].tag == .r_brace) or
+            (ahead.len >= 2 and ahead[0].tag == .identifier and ahead[1].tag == .colon);
+        if (!is_named) return self.parseTupleTypeBody(start);
 
         var fields = std.ArrayList(ast.TypeExpr.StructField).empty;
         defer fields.deinit(self.allocator);
@@ -3721,6 +3874,33 @@ pub const Parser = struct {
                 .span = start.span.endAt(close.span),
             },
         });
+    }
+
+    /// Parses the positional body of a tuple type — `struct { T0, T1, … }` (the
+    /// `struct {` already consumed). Each element is a bare type; there are no
+    /// field names.
+    fn parseTupleTypeBody(self: *Self, start: token.Token) Error!*const ast.TypeExpr {
+        const breadcrumb = try self.createBreadcrumb(@src().fn_name);
+        defer breadcrumb.end();
+
+        var elements = std.ArrayList(*const ast.TypeExpr).empty;
+        defer elements.deinit(self.allocator);
+
+        while (true) {
+            self.skipNewlines();
+            if ((try self.peekToken()).tag == .r_brace) break;
+            const element = try self.parseTypeExpr();
+            try elements.append(self.allocator, element);
+            self.skipNewlines();
+            if ((try self.peekToken()).tag == .comma) _ = try self.nextToken();
+        }
+
+        const close = try self.expectTokenTag(.r_brace);
+
+        return self.allocTypeExpression(.{ .tuple = .{
+            .elements = try self.copyToArena(*const ast.TypeExpr, elements.items),
+            .span = start.span.endAt(close.span),
+        } });
     }
 
     fn parseTypeExpr(self: *Self) Error!*const ast.TypeExpr {

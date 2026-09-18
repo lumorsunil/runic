@@ -165,6 +165,13 @@ pub const TypeChecker = struct {
         self.modules = .empty;
         self.diagnostics = .empty;
         self.generic_type_ctors = .empty;
+        // These collections are arena-backed, so `reset(.free_all)` just freed
+        // their storage: clear the now-dangling headers too, otherwise the next
+        // pass appends into freed memory (a segfault the moment a function body
+        // is type-checked). This is why re-checking after an edit crashed.
+        self.stdout_type_stack = .empty;
+        self.inferred_error_sets = .empty;
+        self.inferred_collector_stack = .empty;
     }
 
     fn reportSpanError(
@@ -585,6 +592,9 @@ pub const TypeChecker = struct {
             .binding_decl => |*binding_decl| self.runBindingDecl(scope, binding_decl),
             .exit_stmt => |*exit_stmt| self.runExit(scope, exit_stmt),
             .yield_stmt => |*yield_stmt| self.runYield(scope, yield_stmt),
+            // `break`/`continue` carry no value and introduce no bindings; the IR
+            // compiler validates that they appear inside a loop.
+            .break_stmt, .continue_stmt => {},
             .while_stmt => |*while_stmt| self.runWhile(scope, while_stmt),
             .expression => |*expr_stmt| self.runExpressionStatement(scope, expr_stmt),
             else => error.UnsupportedStatement,
@@ -654,6 +664,15 @@ pub const TypeChecker = struct {
     fn runYield(self: *TypeChecker, scope: *Scope, yield_stmt: *ast.YieldStmt) Error!void {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, yield_stmt.span);
+
+        // Inferred struct literal returned by value: `yield .{ .x = 3 }` takes its
+        // type from the enclosing function's declared stdout (return) type. Only a
+        // yield to stdout (&1) carries that type.
+        if (yield_stmt.fd == 1 and exprMayNeedStructInference(yield_stmt.value) and
+            self.stdout_type_stack.items.len > 0)
+        {
+            self.stampInferredLiteral(yield_stmt.value, self.stdout_type_stack.items[self.stdout_type_stack.items.len - 1]);
+        }
 
         try self.runExpression(scope, yield_stmt.value);
 
@@ -882,6 +901,46 @@ pub const TypeChecker = struct {
         }
     }
 
+    /// Resolves a generic constructor's body (`const Box(T) = struct { value: T }`)
+    /// with its type parameters bound in scope as permissive type variables, so a
+    /// bare parameter reference in the body (`value: T`) resolves as that
+    /// parameter rather than an undeclared type. Used where the body is resolved
+    /// before the type arguments are known — an inferred `Box{ … }` construction.
+    /// (A `Box(Int)` *application* substitutes the args first; see
+    /// `resolveTypeApplication`.)
+    fn resolveGenericCtorBody(
+        self: *TypeChecker,
+        scope: *Scope,
+        ctor: GenericTypeCtor,
+    ) Error!*const ast.TypeExpr {
+        const ctor_scope = try self.arena.allocator().create(Scope);
+        ctor_scope.* = .initWithParent(scope, ctor.body.span());
+        for (ctor.params) |param| {
+            const marker = try self.allocTypeExpression(.{ .type_var = .{ .name = param.name, .span = param.span } });
+            try ctor_scope.declare(self.arena.allocator(), param, marker, false, false);
+        }
+        const resolved = try self.resolveTypeExpr(ctor_scope, ctor.body);
+        // `resolveTypeExpr` leaves a struct's plainly-named field types alone (to
+        // avoid expanding ordinary nested structs), so a bare parameter field
+        // (`value: T`) would stay unresolved and hit the undeclared-type error.
+        // Resolve each field explicitly in the param scope so `T` becomes its
+        // type variable — and a field naming a genuinely undeclared type still
+        // errors.
+        const unaliased = self.unaliasType(resolved);
+        if (unaliased.* == .struct_type) {
+            const st = unaliased.struct_type;
+            const new_fields = try self.arena.allocator().alloc(ast.TypeExpr.StructField, st.fields.len);
+            for (st.fields, new_fields) |field, *dst| {
+                dst.* = field;
+                dst.type_expr = try self.resolveTypeExpr(ctor_scope, field.type_expr);
+            }
+            var new_st = st;
+            new_st.fields = new_fields;
+            return try self.allocTypeExpression(.{ .struct_type = new_st });
+        }
+        return resolved;
+    }
+
     /// Resolves a `Name(args…)` application against a registered generic
     /// constructor: substitutes the args into its body, then resolves the result.
     fn resolveTypeApplication(
@@ -1021,6 +1080,157 @@ pub const TypeChecker = struct {
         }
     }
 
+    /// The type name an inferred struct literal (`.{ … }`) should adopt from a
+    /// known context type (a binding annotation, or a callee's parameter type).
+    /// A raw single-segment named type (`Vector`) yields that name; a resolved
+    /// alias yields its name only when it unaliases to a struct type. Anything
+    /// else (a path, generic application, wrapper, or non-struct) yields nothing,
+    /// leaving the literal anonymous (and thus a later "cannot infer" error).
+    fn structTypeNameToStamp(self: *TypeChecker, context: ?*const ast.TypeExpr) ?ast.Identifier {
+        const t = context orelse return null;
+        switch (t.*) {
+            .identifier => |id| {
+                if (id.path.segments.len != 1) return null;
+                return id.path.segments[0];
+            },
+            .alias => |alias| {
+                if (self.unaliasType(t).* != .struct_type) return null;
+                return .{ .name = alias.name, .span = alias.span };
+            },
+            else => return null,
+        }
+    }
+
+    /// Whether an expression is an anonymous struct literal `.{ .field = … }`
+    /// (empty name, no qualifying object) awaiting a type from context.
+    fn isAnonStructLiteral(expr: *const ast.Expression) bool {
+        return expr.* == .struct_literal and
+            expr.struct_literal.name.name.len == 0 and
+            expr.struct_literal.object == null;
+    }
+
+    /// Whether an expression contains an anonymous struct literal that a known
+    /// context type could give a name — directly, or as an element of an array
+    /// literal (`.{ .{ .x = 1 }, … }`). Used to skip context resolution when
+    /// there is nothing to infer.
+    fn exprMayNeedStructInference(expr: *const ast.Expression) bool {
+        if (isAnonStructLiteral(expr)) return true;
+        if (expr.* == .array) {
+            for (expr.array.elements) |el| {
+                if (exprMayNeedStructInference(el)) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Give an anonymous struct literal (or the anonymous struct elements of an
+    /// array literal) the name of its expected type, taken from `context`. An
+    /// array literal against an array context type stamps each element from the
+    /// element type, so nested `[]Vector = .{ .{ … }, … }` works. A no-op unless
+    /// the expression and context line up.
+    fn stampInferredLiteral(
+        self: *TypeChecker,
+        expr: *ast.Expression,
+        context: ?*const ast.TypeExpr,
+    ) void {
+        const ctx = context orelse return;
+        if (isAnonStructLiteral(expr)) {
+            if (self.structTypeNameToStamp(ctx)) |named| expr.struct_literal.name = named;
+            return;
+        }
+        if (expr.* == .array and self.unaliasType(ctx).* == .array) {
+            const element_type = self.unaliasType(ctx).array.element;
+            for (expr.array.elements) |el| self.stampInferredLiteral(el, element_type);
+        }
+    }
+
+    /// Stamp each anonymous struct-literal argument of a call with the struct type
+    /// name of its matching parameter, so `f a .{ .x = 1 }` infers the literal's
+    /// type from the callee's signature (mirroring the binding-annotation case).
+    fn stampInferredStructArgs(self: *TypeChecker, scope: *Scope, call: *ast.CallExpr) Error!void {
+        var any = false;
+        for (call.arguments) |arg| {
+            if (exprMayNeedStructInference(arg)) {
+                any = true;
+                break;
+            }
+        }
+        if (!any) return;
+
+        const callee = (try self.calleeFunctionForInference(scope, call.callee)) orelse return;
+
+        for (call.arguments, 0..) |arg, i| {
+            if (!exprMayNeedStructInference(arg)) continue;
+            // A UFCS receiver fills parameter 0, so the written arguments start at
+            // `offset` (0 for a plain call, 1 for `recv.method args`).
+            const param_index = i + callee.offset;
+            const param_type: ?*const ast.TypeExpr = switch (callee.params) {
+                ._non_variadic => |list| if (param_index < list.len) list[param_index] else null,
+                ._variadic => |element| element,
+            };
+            self.stampInferredLiteral(arg, param_type);
+        }
+    }
+
+    /// Resolve the callee of a call to the function signature its written
+    /// arguments should be typed against, plus the offset at which those
+    /// arguments begin among the parameters. A plain call (`f a`) or a module
+    /// member (`m.f a`) maps arguments 1:1 (offset 0); a UFCS method call
+    /// (`recv.method a`) prepends the receiver as parameter 0 (offset 1).
+    fn calleeFunctionForInference(
+        self: *TypeChecker,
+        scope: *Scope,
+        callee: *ast.Expression,
+    ) Error!?struct { params: ast.TypeExpr.FunctionType.Parameters, offset: usize } {
+        // A member access `object.method`: either a module member (no receiver) or
+        // a UFCS method (receiver fills parameter 0).
+        const member: ?struct { object: *ast.Expression, name: []const u8 } = switch (callee.*) {
+            .member => |*m| .{ .object = m.object, .name = m.member.name },
+            .binary => |*b| if (b.op == .member and b.right.* == .identifier)
+                .{ .object = b.left, .name = b.right.identifier.name }
+            else
+                null,
+            else => null,
+        };
+
+        if (member) |ma| {
+            const object_is_module = if (try self.resolveExprType(scope, ma.object)) |obj_raw|
+                self.unaliasType(obj_raw).* == .module
+            else
+                false;
+            if (!object_is_module) {
+                // UFCS: the bare method name resolves to a free function whose
+                // first parameter is the receiver.
+                if (scope.lookup(ma.name)) |binding| {
+                    if (binding.type_expr) |bt| {
+                        const t = self.unaliasType(bt);
+                        if (t.* == .function) return .{ .params = t.function.params, .offset = 1 };
+                    }
+                }
+                return null;
+            }
+        }
+
+        const raw = (try self.resolveExprType(scope, callee)) orelse return null;
+        const t = self.unaliasType(raw);
+        if (t.* != .function) return null;
+        return .{ .params = t.function.params, .offset = 0 };
+    }
+
+    /// Builds a tuple type from an array literal's elements, typing each position
+    /// independently (a permissive type variable when a position's type doesn't
+    /// resolve). Used to validate a literal against a *tuple* annotation, where a
+    /// homogeneous literal must still be checked position-by-position.
+    fn arrayLiteralTupleType(self: *TypeChecker, scope: *Scope, array: ast.ArrayLiteral) Error!*const ast.TypeExpr {
+        const elements = try self.arena.allocator().alloc(*const ast.TypeExpr, array.elements.len);
+        for (array.elements, elements) |el, *dst| {
+            const raw = (try self.resolveExprType(scope, el)) orelse
+                try self.allocTypeExpression(.{ .type_var = .{ .name = "_", .span = el.span() } });
+            dst.* = try self.resolveTypeExpr(scope, raw);
+        }
+        return try self.allocTypeExpression(.{ .tuple = .{ .elements = elements, .span = array.span } });
+    }
+
     fn runBindingDecl(
         self: *TypeChecker,
         scope: *Scope,
@@ -1028,6 +1238,14 @@ pub const TypeChecker = struct {
     ) Error!void {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, binding_decl.span);
+
+        // Inferred struct literal: `const v: Vector = .{ .x = 3 }` parses as an
+        // anonymous struct literal (empty name); take its type from the binding's
+        // annotation by stamping the annotation's type name onto the literal, so
+        // every downstream stage treats it exactly like `Vector{ .x = 3 }`.
+        if (binding_decl.annotation != null and exprMayNeedStructInference(binding_decl.initializer)) {
+            self.stampInferredLiteral(binding_decl.initializer, binding_decl.annotation);
+        }
 
         try self.runExpression(scope, binding_decl.initializer);
 
@@ -1048,15 +1266,43 @@ pub const TypeChecker = struct {
             // resolve the annotation: bound captures become their concrete type,
             // unmatched ones (e.g. `?|T| = null`) stay permissive type variables.
             if (typeExprHasCapture(annotation)) {
-                if (initializer_type) |it| try self.bindTypeCaptures(scope, annotation, it);
+                if (initializer_type) |it| {
+                    try self.bindTypeCaptures(scope, annotation, it);
+                } else {
+                    // No concrete initializer type to match against (e.g. an
+                    // untyped array literal, or `?|T| = null`): declare each
+                    // captured name as a permissive type variable so a later bare
+                    // reference to it still resolves.
+                    var captures: std.StringHashMapUnmanaged(void) = .empty;
+                    defer captures.deinit(self.arena.allocator());
+                    try self.collectTypeVars(scope, annotation, &captures);
+                    var it = captures.keyIterator();
+                    while (it.next()) |name| {
+                        if (scope.lookup(name.*) != null) continue;
+                        const marker = try self.allocTypeExpression(.{ .type_var = .{ .name = name.*, .span = annotation.span() } });
+                        try scope.declareType(self.arena.allocator(), ast.Identifier.global(name.*), marker, false);
+                    }
+                }
             }
             break :brk try self.resolveTypeExpr(scope, annotation);
         };
 
-        const type_expr = binding_annotation_type_expr orelse initializer_type;
+        // Against a *tuple* annotation, type a `.{ … }` literal position-by-
+        // position (even a homogeneous one, which otherwise resolves permissively)
+        // so a per-position mismatch — `const t: (Int, String) = .{ 1, 2 }` — is
+        // caught.
+        const effective_initializer_type = brk: {
+            const annotation_type = binding_annotation_type_expr orelse break :brk initializer_type;
+            if (self.unaliasType(annotation_type).* == .tuple and binding_decl.initializer.* == .array) {
+                break :brk try self.arrayLiteralTupleType(scope, binding_decl.initializer.array);
+            }
+            break :brk initializer_type;
+        };
+
+        const type_expr = binding_annotation_type_expr orelse effective_initializer_type;
 
         if (binding_annotation_type_expr) |annotation_type| {
-            if (initializer_type) |init_type| {
+            if (effective_initializer_type) |init_type| {
                 try self.validateTypeAssignment(
                     annotation_type,
                     init_type,
@@ -1066,6 +1312,22 @@ pub const TypeChecker = struct {
         }
 
         if (type_expr) |t| try self.runTypeExpression(scope, t);
+
+        // A tuple pattern destructuring an array *literal* (`const a, b =
+        // .{ e0, e1 }`) types each element binding from its own expression, so a
+        // heterogeneous literal keeps per-element types (which the homogenized
+        // array element type would lose).
+        if (binding_decl.pattern.* == .tuple and binding_decl.initializer.* == .array) {
+            const tuple = binding_decl.pattern.tuple;
+            const elems = binding_decl.initializer.array.elements;
+            if (tuple.elements.len == elems.len) {
+                for (tuple.elements, elems) |el_pat, el_expr| {
+                    const el_type = if (try self.resolveExprType(scope, el_expr)) |raw| try self.resolveTypeExpr(scope, raw) else null;
+                    try self.runBindingPattern(scope, el_pat, el_type, binding_decl.is_pub, binding_decl.is_mutable);
+                }
+                return;
+            }
+        }
 
         try self.runBindingPattern(
             scope,
@@ -1113,6 +1375,13 @@ pub const TypeChecker = struct {
                     .span = array.span,
                 },
             }),
+            // Resolve each position of a tuple type so named element types
+            // (`(Vector, Int)`) normalize the same way an array element does.
+            .tuple => |tuple| blk: {
+                const elements = try self.arena.allocator().alloc(*const ast.TypeExpr, tuple.elements.len);
+                for (tuple.elements, elements) |el, *dst| dst.* = try self.resolveTypeExpr(scope, el);
+                break :blk try self.allocTypeExpression(.{ .tuple = .{ .elements = elements, .span = tuple.span } });
+            },
             .type_merge => |merge| try self.resolveTypeMerge(scope, merge),
             // Resolve a function type's parts so any type variables in a generic
             // signature are baked into the stored type (as `.type_var`), rather
@@ -1298,12 +1567,11 @@ pub const TypeChecker = struct {
         out: *std.StringHashMapUnmanaged(void),
     ) Error!void {
         switch (type_expr.*) {
-            .identifier => |named| {
-                const seg = named.path.segments[0];
-                if (seg.isTypeIdentifier() and outer.lookup(seg.name) == null) {
-                    try out.put(self.arena.allocator(), seg.name, {});
-                }
-            },
+            // A generic type parameter is introduced only by an explicit `|T|`
+            // capture. A bare uppercase identifier is NOT collected — it must
+            // resolve to an already-introduced type variable (from a `|T|`
+            // capture elsewhere in the signature) or a declared type; otherwise
+            // it is an undeclared-type error (a typo), not a silent generic.
             .type_capture => |capture| try out.put(self.arena.allocator(), capture.name, {}),
             .type_application => |app| for (app.args) |arg| try self.collectTypeVars(outer, arg, out),
             .array => |a| try self.collectTypeVars(outer, a.element, out),
@@ -1394,15 +1662,22 @@ pub const TypeChecker = struct {
             // rather than reporting "not declared". (A lowercase unknown name is
             // still an error.)
             if (identifier.path.segments[0].isTypeIdentifier()) {
-                return try self.allocTypeExpression(.{ .type_var = .{ .name = name, .span = identifier.span } });
+                try self.reportSpanError(
+                    identifier.span,
+                    Error.IdentifierNotFound,
+                    .@"error",
+                    "type '{s}' is not declared (to introduce a generic type parameter, write it as |{s}|)",
+                    .{ name, name },
+                );
+            } else {
+                try self.reportSpanError(
+                    identifier.span,
+                    Error.IdentifierNotFound,
+                    .@"error",
+                    "type {s} not declared",
+                    .{name},
+                );
             }
-            try self.reportSpanError(
-                identifier.span,
-                Error.IdentifierNotFound,
-                .@"error",
-                "type {s} not declared",
-                .{name},
-            );
 
             return try self.allocTypeExpression(.{ .failed = .{ .span = identifier.span } });
         };
@@ -1480,7 +1755,46 @@ pub const TypeChecker = struct {
                 };
             },
             .discard => {},
-            .tuple, .record => return error.BindingPatternNotSupported,
+            .tuple => |tuple| {
+                // Positional destructuring: the initializer is an array/tuple.
+                // A tuple source gives each binding its own *per-position* type
+                // (so a heterogeneous collection keeps element types through a
+                // variable); an array source gives every binding the single
+                // element type.
+                const resolved = if (type_expr) |t| self.unaliasType(t) else null;
+                for (tuple.elements, 0..) |el, i| {
+                    const el_type: ?*const ast.TypeExpr = if (resolved) |r| switch (r.*) {
+                        .tuple => |src| if (i < src.elements.len) src.elements[i] else null,
+                        .array => |a| a.element,
+                        else => null,
+                    } else null;
+                    try self.runBindingPattern(scope, el, el_type, is_pub, is_mutable);
+                }
+            },
+            .record => |record| {
+                // Field destructuring: the initializer is a struct; each field
+                // binds that struct member (to the label, or to the explicit
+                // rebinding after `:`).
+                const resolved = if (type_expr) |t| self.unaliasType(t) else null;
+                for (record.fields) |field| {
+                    const field_type: ?*const ast.TypeExpr = if (resolved) |r| switch (r.*) {
+                        .struct_type => |st| st.memberType(field.label.name),
+                        else => null,
+                    } else null;
+                    // A named field that the struct doesn't have is an error.
+                    if (field_type == null and resolved != null and resolved.?.* == .struct_type) {
+                        try self.reportSpanError(field.span, Error.MemberNotFound, .@"error", "struct has no field '{s}'", .{field.label.name});
+                    }
+                    if (field.binding) |target| {
+                        try self.runBindingPattern(scope, target, field_type, is_pub, is_mutable);
+                    } else {
+                        scope.declare(self.arena.allocator(), field.label, field_type, is_pub, is_mutable) catch |err| try switch (err) {
+                            error.IdentifierAlreadyDeclared => self.reportSpanError(field.span, error.IdentifierAlreadyDeclared, .@"error", "identifier {s} already declared", .{field.label.name}),
+                            else => err,
+                        };
+                    }
+                }
+            },
         }
     }
 
@@ -1536,6 +1850,31 @@ pub const TypeChecker = struct {
         try scope.declare(self.arena.allocator(), identifier, resolved_fn_type, fn_decl.is_pub, false);
     }
 
+    /// A function parameter must carry a type annotation (or a default value it
+    /// can be inferred from). Report a clean, located diagnostic when it does
+    /// not — `Parameter.resolveType` returns null for such a param rather than
+    /// aborting the whole checker run.
+    fn checkParamAnnotated(self: *TypeChecker, param: *const ast.Parameter) Error!void {
+        if (param.type_annotation != null or param.default_value != null) return;
+        if (param.pattern.* == .identifier) {
+            try self.reportSpanError(
+                param.span,
+                Error.TypeNotFound,
+                .@"error",
+                "parameter '{s}' requires a type annotation (e.g. `{s}: Int`)",
+                .{ param.pattern.identifier.name, param.pattern.identifier.name },
+            );
+        } else {
+            try self.reportSpanError(
+                param.span,
+                Error.TypeNotFound,
+                .@"error",
+                "function parameter requires a type annotation (e.g. `name: Int`)",
+                .{},
+            );
+        }
+    }
+
     fn runFnDecl(self: *TypeChecker, scope: *Scope, fn_decl: *ast.FunctionDecl) Error!void {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, fn_decl.span);
@@ -1575,6 +1914,7 @@ pub const TypeChecker = struct {
 
         switch (fn_decl.params) {
             ._non_variadic => |params| for (params) |param| {
+                try self.checkParamAnnotated(param);
                 // Resolve the param's declared type (like the stdin/fn types
                 // above), so a primitive annotation such as `Int` — parsed as a
                 // bare identifier — becomes the resolved primitive rather than an
@@ -1592,6 +1932,7 @@ pub const TypeChecker = struct {
                 );
             },
             ._variadic => |param| {
+                try self.checkParamAnnotated(param);
                 const raw = try self.resolveExprType(fn_scope, param);
                 const param_type = if (raw) |t| try self.resolveTypeExpr(fn_scope, t) else null;
                 try self.runBindingPattern(
@@ -1773,7 +2114,7 @@ pub const TypeChecker = struct {
             .exit_stmt => |exit_stmt| if (exit_stmt.value) |value| try self.validateFunctionBodyStdin(scope, value, enclosing_stdin),
             .yield_stmt => |yield_stmt| try self.validateFunctionBodyStdin(scope, yield_stmt.value, enclosing_stdin),
             .while_stmt => |while_stmt| try self.validateBlockStdin(scope, while_stmt.body, enclosing_stdin),
-            .type_binding_decl, .bash_block => {},
+            .type_binding_decl, .bash_block, .break_stmt, .continue_stmt => {},
         }
     }
 
@@ -1810,6 +2151,13 @@ pub const TypeChecker = struct {
 
     fn runCall(self: *TypeChecker, scope: *Scope, call: *ast.CallExpr) Error!void {
         try self.runExpression(scope, call.callee);
+
+        // Inferred struct-literal arguments: `f entity .{ .x = 3 }` takes each
+        // anonymous literal's type from the matching parameter of the callee, so
+        // the struct name need not be repeated at the call site. Stamp the name
+        // before checking the argument, so it validates like the named form.
+        try self.stampInferredStructArgs(scope, call);
+
         for (call.arguments) |arg| try self.runExpression(scope, arg);
 
         // A bare command (an identifier callee with no scope binding — `echo`,
@@ -1892,6 +2240,11 @@ pub const TypeChecker = struct {
     /// pipeline whose final stage yields an error union). Commands
     /// (`.execution` / `ExecutableError`) are exempt.
     fn statementHasUnhandledError(self: *TypeChecker, scope: *Scope, expr: *ast.Expression) Error!bool {
+        // A function *declaration* statement never produces an unhandled error,
+        // and resolving its type here would re-resolve the signature (e.g. a
+        // generic return `|T|`) in this outer scope, where the function's type
+        // variables are not declared — a spurious "type not declared".
+        if (expr.* == .fn_decl) return false;
         const raw = (try self.resolveExprType(scope, expr)) orelse return false;
         // Resolve so a function call's raw `identifier` err_set (e.g.
         // `ExecutableError`) becomes an alias `isExecutableErrorSet` can see.
@@ -2033,8 +2386,41 @@ pub const TypeChecker = struct {
             .type_capture => {},
             // A `Box(args…)` application is validated where it resolves.
             .type_application => {},
-            .struct_type, .module, .tuple, .function, .fn_ref_type => {},
+            .struct_type => |st| self.runStructType(scope, st),
+            // Validate each position of a tuple type so an unknown element type is
+            // reported (`(Vector, Nope)`).
+            .tuple => |tuple| for (tuple.elements) |element| try self.runTypeExpression(scope, element),
+            .module, .function, .fn_ref_type => {},
         };
+    }
+
+    /// Validates a struct type: resolves each field's type and reports duplicate
+    /// field names (mirrors runErrorSet for error sets). Struct types were
+    /// previously not validated at all, so `struct { x: Int, x: Int }` was
+    /// silently accepted.
+    fn runStructType(
+        self: *TypeChecker,
+        scope: *Scope,
+        struct_type: ast.TypeExpr.StructType,
+    ) Error!void {
+        errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
+
+        for (struct_type.fields, 0..) |field, i| {
+            try self.runTypeExpression(scope, field.type_expr);
+
+            for (struct_type.fields[0..i]) |prev| {
+                if (std.mem.eql(u8, prev.name.name, field.name.name)) {
+                    try self.reportSpanError(
+                        field.name.span,
+                        Error.TypeMismatch,
+                        .@"error",
+                        "duplicate field '{s}' in struct type",
+                        .{field.name.name},
+                    );
+                    break;
+                }
+            }
+        }
     }
 
     /// Validates an error set declaration: resolves each variant's payload type
@@ -2122,6 +2508,12 @@ pub const TypeChecker = struct {
             const element_type: ?*const ast.TypeExpr = blk: {
                 const st = source_type orelse break :blk null;
                 const unaliased = self.unaliasType(st);
+                // A tuple iterates like an array of its unified element type
+                // (permissive when its positions differ).
+                if (unaliased.* == .tuple) {
+                    const el = self.tupleElementType(unaliased.tuple) orelse break :blk null;
+                    break :blk try self.resolveTypeExpr(scope, el);
+                }
                 if (unaliased.* != .array) break :blk source_type;
                 // Resolve the element so a named primitive element (`[]Int` whose
                 // element parsed as the identifier `Int`) normalizes to its tag.
@@ -3287,10 +3679,13 @@ pub const TypeChecker = struct {
             .identifier => return error.UnresolvedTypeLiteral,
             .optional => return error.MemberAccessOnOptional,
             .array => |array| try self.runArrayMemberAccess(array, &member.member),
+            // A tuple supports the same members as an array (`len`, …); it shares
+            // the array's positional/slice representation.
+            .tuple => try self.runArrayMemberAccess(undefined, &member.member),
             .thread => try self.runThreadMemberAccess(&member.member),
             .struct_type => |struct_type| try self.runStructMemberAccess(struct_type, &member.member),
             .error_set => |error_set| try self.runErrorSetMemberAccess(error_set, &member.member),
-            .null, .promise, .error_union, .err, .tuple, .function, .fn_ref_type, .integer, .float, .boolean, .byte, .alias, .void, .type_merge, .sum, .type_capture, .type_application => return error.UnsupportedMemberAccess,
+            .null, .promise, .error_union, .err, .function, .fn_ref_type, .integer, .float, .boolean, .byte, .alias, .void, .type_merge, .sum, .type_capture, .type_application => return error.UnsupportedMemberAccess,
             .module => |module| try self.runModuleMemberAccess(module, &member.member),
             .execution => |execution| try self.runExecutionMemberAccess(execution, &member.member),
             // .lazy => {
@@ -3684,6 +4079,16 @@ pub const TypeChecker = struct {
                 }
                 break :blk true;
             },
+            // Tuples compare structurally: same arity, pairwise-equal positions
+            // (like arrays and structs, not by node identity).
+            .tuple => |left_tuple| blk: {
+                const right_tuple = resolved_right.tuple;
+                if (left_tuple.elements.len != right_tuple.elements.len) break :blk false;
+                for (left_tuple.elements, right_tuple.elements) |le, re| {
+                    if (!self.pipeTypesEqual(le, re)) break :blk false;
+                }
+                break :blk true;
+            },
             .void, .integer, .float, .boolean, .byte, .null, .execution, .thread => true,
             else => std.meta.eql(resolved_left.*, resolved_right.*),
         };
@@ -3694,6 +4099,28 @@ pub const TypeChecker = struct {
             .alias => |*alias| self.unaliasType(self.resolveAliasType(alias)),
             else => type_expr,
         };
+    }
+
+    /// The single element type of a tuple when every position shares it (under
+    /// `pipeTypesEqual`), else null. A tuple behaves as `[]element` for array
+    /// operations (index, `for`, `len`, concat); a null result means the
+    /// positions differ, so the element type is left permissive — matching the
+    /// (untyped) behavior of an un-annotated literal before tuples existed.
+    /// Whether a type is the empty struct `struct {}` — the type of an empty
+    /// `.{}` literal. Such a value coerces to an empty array of any element type
+    /// but otherwise carries no element type to operate on.
+    fn isEmptyStructType(self: *TypeChecker, type_expr: *const ast.TypeExpr) bool {
+        const t = self.unaliasType(type_expr);
+        return t.* == .struct_type and t.struct_type.fields.len == 0;
+    }
+
+    fn tupleElementType(self: *TypeChecker, tuple: ast.TypeExpr.TupleType) ?*const ast.TypeExpr {
+        if (tuple.elements.len == 0) return null;
+        const first = tuple.elements[0];
+        for (tuple.elements[1..]) |element| {
+            if (!self.pipeTypesEqual(first, element)) return null;
+        }
+        return first;
     }
 
     pub fn runPipelineStage(
@@ -3770,11 +4197,74 @@ pub const TypeChecker = struct {
         for (array.elements) |expr| try self.runExpression(scope, expr);
     }
 
+    /// The struct type a *named* struct literal constructs (a plain binding, a
+    /// generic constructor, or a module-qualified type), read-only, for inferring
+    /// nested field-value literal types. Returns null when it can't be resolved to
+    /// a plain struct type (an anonymous literal, an error set, unknown name, …).
+    fn structTypeOfNamedLiteral(
+        self: *TypeChecker,
+        scope: *Scope,
+        struct_literal: *ast.StructLiteral,
+    ) Error!?ast.TypeExpr.StructType {
+        if (struct_literal.name.name.len == 0) return null;
+
+        if (struct_literal.object) |object| {
+            const obj_raw = (try self.resolveExprType(scope, object)) orelse return null;
+            const object_type = self.unaliasType(obj_raw);
+            if (object_type.* != .module) return null;
+            const module_scope = (try self.requestModuleScope(object_type.module)) orelse return null;
+            const member = module_scope.lookup(struct_literal.name.name) orelse return null;
+            const member_type = member.type_expr orelse return null;
+            const st = self.unaliasType(try self.resolveModuleMemberFields(module_scope, member_type));
+            return if (st.* == .struct_type) st.struct_type else null;
+        }
+
+        if (self.generic_type_ctors.get(struct_literal.name.name)) |ctor| {
+            const resolved = self.unaliasType(try self.resolveGenericCtorBody(scope, ctor));
+            return if (resolved.* == .struct_type) resolved.struct_type else null;
+        }
+
+        const binding = scope.lookup(struct_literal.name.name) orelse return null;
+        const type_expr = self.unaliasType(binding.type_expr orelse return null);
+        return if (type_expr.* == .struct_type) type_expr.struct_type else null;
+    }
+
     pub fn runStructLiteral(self: *TypeChecker, scope: *Scope, struct_literal: *ast.StructLiteral) Error!void {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, struct_literal.span);
 
+        // Inferred nested literals: `Outer{ .inner = .{ .x = 1 } }` takes each
+        // anonymous field value's type from that field's declared type, so the
+        // inner struct name need not be repeated. Stamp before the fields are
+        // checked, so each validates like the named form.
+        for (struct_literal.fields) |field| {
+            if (exprMayNeedStructInference(field.value)) {
+                if (try self.structTypeOfNamedLiteral(scope, struct_literal)) |st| {
+                    for (struct_literal.fields) |f| {
+                        if (exprMayNeedStructInference(f.value)) {
+                            self.stampInferredLiteral(f.value, st.memberType(f.name.name));
+                        }
+                    }
+                }
+                break;
+            }
+        }
+
         for (struct_literal.fields) |field| try self.runExpression(scope, field.value);
+
+        // An anonymous struct literal `.{ .x = … }` whose name was never inferred
+        // from context (no annotation to take a type from). Give a directed error
+        // instead of falling through to a lookup of the empty name.
+        if (struct_literal.object == null and struct_literal.name.name.len == 0) {
+            try self.reportSpanError(
+                struct_literal.span,
+                Error.UnsupportedExpression,
+                .@"error",
+                "cannot infer the type of this struct literal; add a type annotation (e.g. `const v: Vector = .{{ … }}`)",
+                .{},
+            );
+            return;
+        }
 
         // Qualified construction `m.Vector3{ … }`: the struct type lives in the
         // module `m`. Struct types can't be `pub` (the parser rejects
@@ -3826,7 +4316,7 @@ pub const TypeChecker = struct {
         // A generic constructor (`Box{ … }` for `const Box(T) = struct { … }`):
         // validate against the body struct with its type parameters permissive.
         if (self.generic_type_ctors.get(struct_literal.name.name)) |ctor| {
-            const resolved = self.unaliasType(try self.resolveTypeExpr(scope, ctor.body));
+            const resolved = self.unaliasType(try self.resolveGenericCtorBody(scope, ctor));
             if (resolved.* == .struct_type) try self.runStructValueLiteral(scope, resolved.struct_type, struct_literal);
             return;
         }
@@ -3891,7 +4381,14 @@ pub const TypeChecker = struct {
                 continue;
             };
             const resolved_field = try self.resolveTypeExpr(scope, declared);
-            const value_type = (try self.resolveExprType(scope, field.value)) orelse continue;
+            const value_raw = (try self.resolveExprType(scope, field.value)) orelse continue;
+            // A member/field access (`e.x`) can surface the field's *raw*
+            // declared type from the AST's own resolveType — an unresolved
+            // `.identifier` ("Int", or an alias like `c.Int`). Resolve it so it
+            // compares against the (already-resolved) declared field type;
+            // otherwise `V{ .x = e.x }` fails with "expected Int, actual: Int"
+            // (and "actual: c.Int" for a `c.Int`-aliased field).
+            const value_type = try self.resolveTypeExpr(scope, value_raw);
             try self.validateTypeAssignment(resolved_field, value_type, .{ .span = field.value.span() });
         }
 
@@ -4387,7 +4884,7 @@ pub const TypeChecker = struct {
         // value so `Box{ .value = 5 }` is `struct { value: Int }` (not `{ T }`).
         if (T == *ast.Expression and expr.* == .struct_literal) {
             if (self.generic_type_ctors.get(expr.struct_literal.name.name)) |ctor| {
-                const body = self.unaliasType(try self.resolveTypeExpr(scope, ctor.body));
+                const body = self.unaliasType(try self.resolveGenericCtorBody(scope, ctor));
                 if (body.* != .struct_type) return body;
                 const new_fields = try self.arena.allocator().alloc(ast.TypeExpr.StructField, body.struct_type.fields.len);
                 for (body.struct_type.fields, new_fields) |field, *dst| {
@@ -4399,7 +4896,12 @@ pub const TypeChecker = struct {
                     var field_type = field.type_expr;
                     for (expr.struct_literal.fields) |lit_field| {
                         if (std.mem.eql(u8, lit_field.name.name, field.name.name)) {
-                            if (try self.resolveExprType(scope, lit_field.value)) |vt| field_type = vt;
+                            // An empty `.{}` value is an empty struct; keep the
+                            // field's declared type (e.g. `[]Entry`) rather than
+                            // collapsing the field to `struct {}`.
+                            if (try self.resolveExprType(scope, lit_field.value)) |vt| {
+                                if (!self.isEmptyStructType(vt)) field_type = vt;
+                            }
                             break;
                         }
                     }
@@ -4409,6 +4911,54 @@ pub const TypeChecker = struct {
                 new_st.fields = new_fields;
                 return try self.allocTypeExpression(.{ .struct_type = new_st });
             }
+        }
+
+        // An empty `.{}` with no element type is an *empty struct* — a value you
+        // can pass around but not operate on (no element type to index, iterate,
+        // or push). An appendable empty array must say its element type with an
+        // annotation: `var xs: []T = .{}` (the empty struct then coerces to the
+        // empty array — see `validateTypeAssignmentArray`).
+        if (T == *ast.Expression and expr.* == .array and expr.array.elements.len == 0) {
+            return try self.allocTypeExpression(.{ .struct_type = .{
+                .fields = &.{},
+                .decls = &.{},
+                .span = expr.array.span,
+            } });
+        }
+
+        // A *heterogeneous* `.{ … }` literal is typed as a tuple, carrying each
+        // element's type by position, so it survives being stored in a variable
+        // and later destructured with per-element types. A homogeneous literal
+        // keeps the prior permissive (null) typing — it flows as an array (a
+        // homogeneous accumulator like `var xs: []T = .{ 1 }`, yields to `[]T`,
+        // coercions) exactly as before. When a heterogeneous tuple is assigned to
+        // an array `[]T`, the array-coercion check rejects it (see
+        // `validateTypeAssignmentArray`), which is where "an array is one type" is
+        // enforced. (`ArrayLiteral.resolveType` returns null on its own.)
+        if (T == *ast.Expression and expr.* == .array and expr.array.elements.len >= 2) {
+            const elements = try self.arena.allocator().alloc(*const ast.TypeExpr, expr.array.elements.len);
+            var all_resolved = true;
+            for (expr.array.elements, elements) |el, *dst| {
+                if (try self.resolveExprType(scope, el)) |t| {
+                    dst.* = t;
+                } else {
+                    all_resolved = false;
+                    dst.* = try self.allocTypeExpression(.{ .type_var = .{ .name = "_", .span = el.span() } });
+                }
+            }
+            if (all_resolved) {
+                var uniform = true;
+                for (elements[1..]) |el| {
+                    if (!self.pipeTypesEqual(elements[0], el)) {
+                        uniform = false;
+                        break;
+                    }
+                }
+                if (!uniform) {
+                    return try self.allocTypeExpression(.{ .tuple = .{ .elements = elements, .span = expr.array.span } });
+                }
+            }
+            return null;
         }
 
         // A cimport value is typed as a struct of its externs (see
@@ -4934,6 +5484,18 @@ pub const TypeChecker = struct {
             .array => |array| {
                 try self.validateTypeAssignment(assignee.element, array.element, options);
             },
+            // A tuple (`.{ … }` literal) coerces to an array `[]T` only when it is
+            // homogeneous — every position must assign to the element type. This
+            // is where "an array is a single type" is enforced.
+            .tuple => |tuple| {
+                for (tuple.elements) |element| {
+                    try self.validateTypeAssignment(assignee.element, element, options);
+                }
+            },
+            // An empty `.{}` is typed as an empty struct; it coerces to an empty
+            // array of any element type (`var xs: []Int = .{}`). A non-empty
+            // struct is not an array.
+            .struct_type => |st| if (st.fields.len != 0) try self.reportAssignmentError(assignee, assignment_type, options),
             else => try self.reportAssignmentError(
                 assignee,
                 assignment_type,
@@ -4977,12 +5539,29 @@ pub const TypeChecker = struct {
 
     pub fn validateTypeAssignmentTuple(
         self: *TypeChecker,
-        _: ast.TypeExpr.TupleType,
+        assignee: ast.TypeExpr.TupleType,
         assignment_type: *const ast.TypeExpr,
-        _: ValidateTypeAssignmentOptions,
+        options: ValidateTypeAssignmentOptions,
     ) Error!void {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, assignment_type.span());
+
+        // A tuple target accepts another tuple of the same arity whose positions
+        // are pairwise assignable. (A tuple annotation has no surface syntax yet,
+        // so this mainly covers tuple-to-tuple flow the checker infers.)
+        switch (self.unaliasType(assignment_type).*) {
+            .tuple => |tuple| {
+                if (tuple.elements.len == assignee.elements.len) {
+                    for (assignee.elements, tuple.elements) |a, v| {
+                        try self.validateTypeAssignment(a, v, options);
+                    }
+                    return;
+                }
+            },
+            else => {},
+        }
+
+        try self.reportAssignmentError(assignee, assignment_type, options);
     }
 
     pub fn validateTypeAssignmentFunction(

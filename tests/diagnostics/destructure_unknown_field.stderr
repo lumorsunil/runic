@@ -1,0 +1,7 @@
+[error]: tests/diagnostics/destructure_unknown_field.rn:4:12: struct has no field 'z'
+   2:# error (a typo, not a silent void binding).
+   3:const P = struct { x: Int, y: Int }
+   4:const { x, [41m[30mz[0m } = P{ .x = 1, .y = 2 }
+   5:echo "${x}"
+   6:
+

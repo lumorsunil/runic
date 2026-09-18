@@ -119,6 +119,20 @@ pub fn array_type(element: *const ast.TypeExpr) ast.TypeExpr {
     } };
 }
 
+/// Whether a type is the empty struct `struct {}` — the type of an empty `.{}`
+/// literal, which counts as an empty array in array contexts (e.g. concat).
+fn isEmptyStructType(t: ast.TypeExpr) bool {
+    return t == .struct_type and t.struct_type.fields.len == 0;
+}
+
+/// The compile-time value of a constant integer-literal index expression (`t[2]`),
+/// used to select a tuple position's type. Null for a non-constant (runtime)
+/// index, which keeps the element type permissive.
+fn constIndexValue(expr: *const ast.Expression) ?i64 {
+    if (expr.* != .literal or expr.literal != .integer) return null;
+    return std.fmt.parseInt(i64, expr.literal.integer.text, 0) catch null;
+}
+
 pub const Error =
     Allocator.Error ||
     std.Io.Writer.Error ||
@@ -280,6 +294,18 @@ fn typeExprIsNamed(type_expr: ast.TypeExpr, name: []const u8) bool {
 }
 
 const capture_temp_ref_count = 5;
+
+/// One entry per enclosing loop (see `IRCompiler.loop_contexts`). `break` jumps
+/// to `break_label` (the loop's exit) and `continue` to `continue_label` (the
+/// re-test / increment point); each first pops the current iteration's body
+/// slots down to the corresponding stack base, which is where that label expects
+/// the runtime stack to be.
+const LoopContext = struct {
+    break_label: ir.InstructionAddr,
+    continue_label: ir.InstructionAddr,
+    break_base: usize,
+    continue_base: usize,
+};
 
 pub const IRData = struct {
     data: std.ArrayList(Page) = .empty,
@@ -649,6 +675,12 @@ pub const IRCompiler = struct {
     /// infinite recursion when two forward-referenced functions fork each other
     /// (a cycle falls back to whatever captures are known so far).
     compiling_fn_sets: std.AutoHashMapUnmanaged(usize, void) = .empty,
+
+    /// Stack of enclosing loops, innermost last. A `break`/`continue` jumps to
+    /// the top entry's exit/continue label after popping its own iteration's
+    /// body slots. Saved/cleared across a function boundary (a nested function's
+    /// `break` must not target an outer loop).
+    loop_contexts: std.ArrayListUnmanaged(LoopContext) = .empty,
 
     /// Concrete types bound by `|T|` captures in binding positions (`const x:
     /// []|T| = …` → `T` = the element type). A later `: T` resolves through here.
@@ -1480,6 +1512,8 @@ pub const IRCompiler = struct {
             .binding_decl => |*b| self.compileBindingDecl(stmt, b),
             .exit_stmt => |e| self.compileExit(stmt, e),
             .yield_stmt => |y| self.compileYield(stmt, y),
+            .break_stmt => self.compileLoopControl(stmt, true),
+            .continue_stmt => self.compileLoopControl(stmt, false),
             .while_stmt => |w| self.compileWhileLoop(stmt, w),
             .expression => |expr| self.compileExpressionStatement(stmt, expr.expression),
             else => {
@@ -1854,17 +1888,132 @@ pub const IRCompiler = struct {
                 );
                 return .fromValue(.void);
             },
-            else => {
-                try self.reportSourceError(
+            .tuple => |tuple| {
+                // A tuple pattern over an array *literal* binds each element to
+                // its own expression — preserving per-element (heterogeneous)
+                // types and avoiding a round-trip through a homogenized array.
+                if (expr.* == .array and expr.array.elements.len == tuple.elements.len) {
+                    for (tuple.elements, expr.array.elements) |el_pat, el_expr| {
+                        _ = try self.compileBinding(source, el_pat, el_expr, null, is_mutable);
+                    }
+                    return .fromValue(.void);
+                }
+                // Otherwise compile the initializer once and index into it.
+                const value = try self.compileExpressionWithCapture(source, expr);
+                const base_ref = try self.newRef(source, "destructure_base");
+                try self.set(source, base_ref, stableResultSource(value));
+                try self.compilePatternFromValue(
                     source,
-                    Error.UnsupportedBindingPattern,
-                    .@"error",
-                    "binding pattern type \"{t}\" not yet supported",
-                    .{pattern.*},
+                    pattern,
+                    try .from(base_ref.dereference().typed(value.typeExpr())),
+                    is_mutable,
+                );
+                return .fromValue(.void);
+            },
+            .record => {
+                // Destructuring: compile the initializer once into a stable ref,
+                // then bind each field from that value.
+                const value = try self.compileExpressionWithCapture(source, expr);
+                const base_ref = try self.newRef(source, "destructure_base");
+                try self.set(source, base_ref, stableResultSource(value));
+                try self.compilePatternFromValue(
+                    source,
+                    pattern,
+                    try .from(base_ref.dereference().typed(value.typeExpr())),
+                    is_mutable,
                 );
                 return .fromValue(.void);
             },
         };
+    }
+
+    /// Binds a pattern to an already-compiled value. An identifier/discard binds
+    /// (or drops) the whole value; a tuple destructures an array positionally; a
+    /// record destructures a struct by field name. Nested patterns recurse.
+    fn compilePatternFromValue(
+        self: *IRCompiler,
+        source: anytype,
+        pattern: *ast.BindingPattern,
+        value: Result,
+        is_mutable: bool,
+    ) Error!void {
+        switch (pattern.*) {
+            .discard => {},
+            .identifier => |identifier| try self.compileIdentifierBinding(
+                source,
+                identifier,
+                value.source,
+                null,
+                is_mutable,
+                .normal,
+            ),
+            .tuple => |tuple| {
+                // A tuple-typed source carries a type per position; an array-typed
+                // source has one element type shared by all positions.
+                const value_type = value.typeExpr();
+                const base_ref = try self.newRef(source, "tuple_base");
+                try self.set(source, base_ref, stableResultSource(value));
+                for (tuple.elements, 0..) |el, i| {
+                    const elem_type: ?ast.TypeExpr = if (value_type) |t| switch (t) {
+                        .tuple => if (i < t.tuple.elements.len) t.tuple.elements[i].* else null,
+                        .array => t.array.element.*,
+                        else => null,
+                    } else null;
+                    // The element lives at heap slot `base + 1 + i` (slot 0 is the
+                    // array length). Address it through %r2 (volatile) and copy
+                    // into a fresh stable ref.
+                    try self.set(source, .initRegister(.r2), .from(base_ref.dereference()));
+                    const elem_ref = try self.newRef(source, "tuple_elem");
+                    try self.set(source, elem_ref, .fromLocation(.initAdd(
+                        .{ .register = .r2 },
+                        i + 1,
+                        .{ .dereference = true },
+                    )));
+                    try self.compilePatternFromValue(
+                        source,
+                        el,
+                        try .from(elem_ref.dereference().typed(elem_type)),
+                        is_mutable,
+                    );
+                }
+            },
+            .record => |record| {
+                const struct_type: ?ast.TypeExpr.StructType = if (value.typeExpr()) |t| blk: {
+                    if (t == .array) break :blk null;
+                    if (t == .struct_type) break :blk t.struct_type;
+                    if (t == .identifier) break :blk self.user_struct_types.get(t.identifier.path.segments[t.identifier.path.segments.len - 1].name);
+                    break :blk null;
+                } else null;
+                const base_ref = try self.newRef(source, "record_base");
+                try self.set(source, base_ref, stableResultSource(value));
+                for (record.fields) |field| {
+                    const layout = if (struct_type) |st| (st.fieldLayout(field.label.name) catch null) else null;
+                    const field_ref = try self.newRef(source, "record_field");
+                    if (layout) |l| {
+                        try self.set(source, .initRegister(.r2), .from(base_ref.dereference()));
+                        try self.set(source, field_ref, .fromLocation(.initAdd(
+                            .{ .register = .r2 },
+                            l.offset,
+                            .{ .dereference = true, .type_expr = l.type_expr },
+                        )));
+                    } else {
+                        try self.set(source, field_ref, .fromValue(.void));
+                    }
+                    const field_type: ?ast.TypeExpr = if (layout) |l| l.type_expr else null;
+                    const target = field.binding orelse blk: {
+                        const p = try self.allocator.create(ast.BindingPattern);
+                        p.* = .{ .identifier = field.label };
+                        break :blk p;
+                    };
+                    try self.compilePatternFromValue(
+                        source,
+                        target,
+                        try .from(field_ref.dereference().typed(field_type)),
+                        is_mutable,
+                    );
+                }
+            },
+        }
     }
 
     fn compileIdentifierBinding(
@@ -3228,10 +3377,17 @@ pub const IRCompiler = struct {
             const value: Result = blk: {
                 for (struct_literal.fields) |lit_field| {
                     if (std.mem.eql(u8, lit_field.name.name, field.name.name)) {
-                        if (self.argTypeExpr(lit_field.value)) |vt| {
-                            const ft = try self.allocator.create(ast.TypeExpr);
-                            ft.* = vt;
-                            concrete_fields[i].type_expr = ft;
+                        // Specialize the field type to the supplied value's type
+                        // (so a generic `T`/`|T|` field binds) — except an
+                        // optional/promise wrapper, which must stay so e.g.
+                        // `x: ?Int` given `5` keeps `?Int` and `p.x orelse …`
+                        // still sees an optional.
+                        if (structFieldTypeSpecializes(field.type_expr.*)) {
+                            if (self.argTypeExpr(lit_field.value)) |vt| {
+                                const ft = try self.allocator.create(ast.TypeExpr);
+                                ft.* = vt;
+                                concrete_fields[i].type_expr = ft;
+                            }
                         }
                         // A call/pipeline field value (`{ .pos = mk x y }`)
                         // forks a thread; capture it to its produced value first
@@ -3517,6 +3673,26 @@ pub const IRCompiler = struct {
     /// `[base + offset]` slot, written to immediately by the caller).
     const MemberMode = enum { read, lvalue };
 
+    /// Whether compiling `obj` as a member-access receiver would fork it — a
+    /// call, pipeline, or block, or a nullary UFCS method call (`recv.method`
+    /// where `method` names a function, not a struct field). Such a receiver
+    /// must be value-captured so the field read sees the produced value, not the
+    /// thread/exec-result handle a plain compile would hand back.
+    fn memberObjectForks(self: *IRCompiler, obj: *ast.Expression) bool {
+        if (self.argNeedsValueCapture(obj)) return true;
+        const m: struct { base: *ast.Expression, name: []const u8 } = switch (obj.*) {
+            .member => |mm| .{ .base = mm.object, .name = mm.member.name },
+            .binary => |b| if (b.op == .member and b.right.* == .identifier)
+                .{ .base = b.left, .name = b.right.identifier.name }
+            else
+                return false,
+            else => return false,
+        };
+        if (self.memberIsStructField(m.base, m.name)) return false;
+        const binding = self.lookup(m.name, .{ .shallow = false }) orelse return false;
+        return binding.result.isFunctionRef();
+    }
+
     fn compileMember(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -3546,7 +3722,16 @@ pub const IRCompiler = struct {
             }
         }
 
-        const object = try self.compileExpression(member.object);
+        // A member access on a call/pipeline result (`(dbl v).x`, `v.method.x`
+        // where `method` is a function) must value-capture the object — a plain
+        // compile forks it and hands back a thread/exec-result handle instead of
+        // the produced struct, so the field read below fails. A plain value
+        // object (an identifier, a struct-field chain, a string builtin like
+        // `s.trim`) is unaffected.
+        const object = if (self.memberObjectForks(member.object))
+            try self.compileExpressionWithCapture(source, member.object)
+        else
+            try self.compileExpression(member.object);
 
         // String builtins with no arguments (`s.len`, `s.upper`, `s.trim`, …).
         // `len` also names an array's length, so it only applies to a string
@@ -3714,6 +3899,19 @@ pub const IRCompiler = struct {
                     if (try self.typeIdentifierString(member.member.name)) |type_name| {
                         return .fromValue(type_name);
                     }
+                }
+                // An empty struct is what an unannotated empty `.{}` types as;
+                // a member access on it (`.push`, `.len`, …) is the classic
+                // "forgot to annotate an empty array" mistake — direct the fix.
+                if (struct_type.fields.len == 0) {
+                    try self.reportSourceError(
+                        source,
+                        Error.NotImplemented,
+                        .@"error",
+                        "cannot access '.{s}' on an empty struct; annotate the element type to make it an array (e.g. `var xs: []T = .{{}}`)",
+                        .{member.member.name},
+                    );
+                    return .fromValue(.void);
                 }
                 try self.reportSourceError(
                     source,
@@ -5601,9 +5799,23 @@ pub const IRCompiler = struct {
         return self.substituteTypeParams(.{ .struct_type = body_st }, params, app.args) catch null;
     }
 
+    /// Whether a type is the bare single-segment name `name` — a capture `T`
+    /// bound to (or normalized toward) an identifier `T` is self-referential and
+    /// must not recurse.
+    fn isBareName(t: ast.TypeExpr, name: []const u8) bool {
+        return switch (t) {
+            .identifier => |id| id.path.segments.len == 1 and std.mem.eql(u8, id.path.segments[0].name, name),
+            .type_capture => |c| std.mem.eql(u8, c.name, name),
+            else => false,
+        };
+    }
+
     fn bindTypeCaptures(self: *IRCompiler, pattern: ast.TypeExpr, subject: ast.TypeExpr) void {
         switch (pattern) {
             .type_capture => |capture| {
+                // Never bind a capture to its own name (`T` ← `T`): that is a
+                // no-op that would make later type normalization recurse forever.
+                if (isBareName(subject, capture.name)) return;
                 self.type_captures.put(self.allocator, capture.name, subject) catch {};
             },
             .array => |a| if (subject == .array) self.bindTypeCaptures(a.element.*, subject.array.element.*),
@@ -5778,12 +5990,30 @@ pub const IRCompiler = struct {
         };
     }
 
+    /// Whether a struct-literal field's declared type should be specialized to
+    /// its supplied value's concrete type (so a generic `T`/`|T|` field binds to
+    /// the value). An `?T`/`^T` **wrapper** must not be — flattening it to the
+    /// value's type would drop the optional/promise (e.g. `x: ?Int` given `5`
+    /// must stay `?Int`, so `p.x orelse …` still sees an optional). The value is
+    /// coerced into the declared wrapper instead.
+    fn structFieldTypeSpecializes(t: ast.TypeExpr) bool {
+        return switch (t) {
+            .optional, .promise => false,
+            else => true,
+        };
+    }
+
     fn normalizeStringTypes(self: *IRCompiler, t: ast.TypeExpr) ast.TypeExpr {
         switch (t) {
             .identifier => |id| {
                 const segs = id.path.segments;
                 if (segs.len == 1) {
-                    if (self.lookupTypeCapture(segs[0].name)) |bound| return self.normalizeStringTypes(bound);
+                    // A capture bound to its own name is unresolved — treat it as a
+                    // permissive type variable rather than recursing forever.
+                    if (self.lookupTypeCapture(segs[0].name)) |bound| {
+                        if (isBareName(bound, segs[0].name)) return .{ .type_var = .{ .name = segs[0].name, .span = id.span } };
+                        return self.normalizeStringTypes(bound);
+                    }
                     if (std.mem.eql(u8, segs[segs.len - 1].name, "String")) return string_type;
                 }
                 return t;
@@ -5802,7 +6032,10 @@ pub const IRCompiler = struct {
             // concrete binding position resolves it against its initializer
             // via `bindTypeCaptures` before this is consulted.
             .type_capture => |capture| {
-                if (self.lookupTypeCapture(capture.name)) |bound| return self.normalizeStringTypes(bound);
+                if (self.lookupTypeCapture(capture.name)) |bound| {
+                    if (isBareName(bound, capture.name)) return .{ .type_var = .{ .name = capture.name, .span = capture.span } };
+                    return self.normalizeStringTypes(bound);
+                }
                 return .{ .type_var = .{ .name = capture.name, .span = capture.span } };
             },
             // A generic application `Box(Int)` resolves to the constructor's
@@ -6151,28 +6384,24 @@ pub const IRCompiler = struct {
         if (!is_self_recursive) {
             for (closure_captures) |capture| {
                 // NOTE: Guard against refering to internal identifiers
-                if (self.lookup(capture.identifier.name, .{ .shallow = false }) == null) continue;
+                const cap_binding = self.lookup(capture.identifier.name, .{ .shallow = false }) orelse continue;
 
                 const identifier_result = try self.compileIdentifier(source, capture.identifier);
+                const dst = ir.Location.initAdd(.{ .register = .r }, capture.slot, .{ .dereference = true });
 
-                if (identifier_result.source == .location and identifier_result.source.location.abs == .data) {
-                    try self.set(
-                        source,
-                        .initAdd(.{ .register = .r }, capture.slot, .{ .dereference = true }),
-                        identifier_result.source.undereference(),
-                    );
+                // A `cimport` value is an immutable `.closeable` handle, never
+                // aliased. Capture it *by value* — the by-reference form below
+                // stores the address of the const's slot, which `cimport_call`
+                // cannot resolve as a library, so calling an extern from inside a
+                // forked function/consumer failed with CImportLoadFailed.
+                if (identifier_result.source == .location and self.bindingTypeIsCImport(cap_binding.type_expr)) {
+                    try self.set(source, dst, identifier_result.source);
                 } else if (identifier_result.source == .location) {
-                    try self.set(
-                        source,
-                        .initAdd(.{ .register = .r }, capture.slot, .{ .dereference = true }),
-                        identifier_result.source.undereference(),
-                    );
+                    // A struct/scalar outer binding is captured by slot reference
+                    // (`.data` and general locations resolve identically here).
+                    try self.set(source, dst, identifier_result.source.undereference());
                 } else {
-                    try self.set(
-                        source,
-                        .initAdd(.{ .register = .r }, capture.slot, .{ .dereference = true }),
-                        identifier_result.source,
-                    );
+                    try self.set(source, dst, identifier_result.source);
                 }
             }
         }
@@ -8189,6 +8418,17 @@ pub const IRCompiler = struct {
         return false;
     }
 
+    /// Whether a binding's type is a `cimport` value — a struct type carrying
+    /// `cimport_externs` (possibly behind aliases). Such a value is an immutable
+    /// `.closeable` handle, so a closure captures it by value rather than by the
+    /// slot-reference used for aliasable structs.
+    fn bindingTypeIsCImport(self: *IRCompiler, type_expr: ?ast.TypeExpr) bool {
+        _ = self;
+        var t = type_expr orelse return false;
+        while (t == .alias) t = t.alias.type_expr.*;
+        return t == .struct_type and t.struct_type.cimport_externs != null;
+    }
+
     /// Compiles `m.extern args` where `m` is a cimport value and `extern` names a
     /// declared extern, into a `cimport_call` (a libffi dispatch). Returns null
     /// when `expr` is not such a call, so other call paths still apply.
@@ -8598,6 +8838,15 @@ pub const IRCompiler = struct {
         const orig_instr_set = self.current_instruction_set;
         self.current_instruction_set = instr_set;
         try self.scopes.push(self.allocator, .closure);
+
+        // A function body starts with no enclosing loops of its own — a `break`
+        // in a nested function must not target a loop in the outer function.
+        const saved_loop_contexts = self.loop_contexts;
+        self.loop_contexts = .empty;
+        defer {
+            self.loop_contexts.deinit(self.allocator);
+            self.loop_contexts = saved_loop_contexts;
+        }
 
         if (fn_decl.name) |name| {
             // Give the (self-visible) function binding a `.function` type carrying
@@ -9086,6 +9335,9 @@ pub const IRCompiler = struct {
                 linScanExpr(scan, w.condition);
                 for (w.body.statements) |bs| linScanStmt(scan, bs);
             },
+            // break/continue reference no bindings and don't alias — no effect on
+            // linear-buffer recognition.
+            .break_stmt, .continue_stmt => {},
             .type_binding_decl => {},
             .bash_block => scan.recognized = false,
         }
@@ -9186,7 +9438,12 @@ pub const IRCompiler = struct {
     /// length at runtime.
     fn compileSlice(self: *IRCompiler, source: anytype, binary: ast.BinaryExpr) Error!Result {
         const range = binary.right.range;
-        const target = try self.compileExpression(binary.left);
+        // Slicing a call result (`(mk)[1..3]`) needs the array/string value, so
+        // value-capture a receiver that would otherwise fork.
+        const target = if (self.memberObjectForks(binary.left))
+            try self.compileExpressionWithCapture(source, binary.left)
+        else
+            try self.compileExpression(binary.left);
         // A bare string literal carries no ast type (it is a raw `.slice` value);
         // treat an unknown type as a string (arrays are always typed).
         const maybe_type = target.typeExpr();
@@ -9238,6 +9495,29 @@ pub const IRCompiler = struct {
 
         const left = try self.compileArithmeticOperand(source, binary.left);
         const right = try self.compileArithmeticOperand(source, binary.right);
+
+        // `a + b` on two arrays concatenates them into a new array (a's elements
+        // followed by b's). An empty `.{}` operand (typed as an empty struct)
+        // counts as an empty array, so `.{} + xs` / `xs + .{}` work. Scalar `+`
+        // falls through to the arithmetic op below.
+        if (binary.op == .add) {
+            const left_is_array = if (left.typeExpr()) |t| t == .array else false;
+            const right_is_array = if (right.typeExpr()) |t| t == .array else false;
+            const left_is_empty = if (left.typeExpr()) |t| isEmptyStructType(t) else false;
+            const right_is_empty = if (right.typeExpr()) |t| isEmptyStructType(t) else false;
+            if ((left_is_array or left_is_empty) and (right_is_array or right_is_empty) and (left_is_array or right_is_array)) {
+                const concat_ref = try self.newRef(source, "array_concat_result");
+                try self.addInstruction(.init(.from(source), .{ .array_concat = .{
+                    .left = left.source,
+                    .right = right.source,
+                    .result = concat_ref.dereference(),
+                } }));
+                // The result's element type comes from whichever operand is a
+                // real array (an empty operand contributes no element type).
+                const result_type = if (left_is_array) left.typeExpr().? else right.typeExpr().?;
+                return .fromLocation(concat_ref.dereference().typed(result_type));
+            }
+        }
 
         if (evaluateArithmetic(.from(binary.op), left.source, right.source)) |comptime_result| {
             return .from(comptime_result);
@@ -9497,12 +9777,68 @@ pub const IRCompiler = struct {
                 // `x[a..b]` — a range-valued index is a slice, not an element read.
                 if (binary.right.* == .range) return self.compileSlice(source, binary);
 
-                const array_access_ref = try self.newRef(source, "array_access_ref");
+                // Indexing a call result (`(mk)[1]`, `(v.method)[i]`) needs the
+                // array/string value, so value-capture a receiver that would fork.
+                const left = if (self.memberObjectForks(binary.left))
+                    try self.compileExpressionWithCapture(source, binary.left)
+                else
+                    try self.compileExpression(binary.left);
+                const maybe_left_type = left.typeExpr();
 
-                const left = try self.compileExpression(binary.left);
-                const left_type = left.typeExpr() orelse return Error.UnsupportedBinaryOperation;
-                if (left_type != .array) return Error.UnsupportedBinaryOperation;
-                const element_type = left_type.array.element.*;
+                // `s[i]` on a string is a single-character read, lowered to a
+                // one-char slice `s[i .. i+1]` (reusing the string slice op). A
+                // bare string literal carries no ast type, so an unknown type is
+                // treated as a string — arrays are always typed. Out-of-range and
+                // negative indices clamp like a slice (empty string), never crash.
+                if (if (maybe_left_type) |t| self.typeIsString(t) else true) {
+                    const str_ref = try self.newRef(source, "strindex_str");
+                    try self.set(source, str_ref, stableResultSource(left));
+                    const idx = try self.compileArithmeticOperand(source, binary.right);
+                    const idx_ref = try self.newRef(source, "strindex_i");
+                    try self.set(source, idx_ref, stableResultSource(idx));
+                    // end = i + 1
+                    try self.set(source, .initRegister(.r2), .from(idx_ref.dereference()));
+                    try self.addInstruction(.init(.from(source), .{ .ath = .{
+                        .op = .add,
+                        .a = .fromLocation(.initRegister(.r2)),
+                        .b = .fromValue(.{ .integer = 1 }),
+                        .result = .initRegister(.r2),
+                    } }));
+                    const end_ref = try self.newRef(source, "strindex_end");
+                    try self.set(source, end_ref, .fromLocation(.initRegister(.r2)));
+                    const result_ref = try self.newRef(source, "strindex_result");
+                    try self.addInstruction(.init(.from(source), .{ .str_op = .{
+                        .op = .slice,
+                        .operand = .from(str_ref.dereference()),
+                        .arg0 = .from(idx_ref.dereference()),
+                        .arg1 = .from(end_ref.dereference()),
+                        .result = result_ref.dereference(),
+                    } }));
+                    return .fromLocation(result_ref.dereference().typed(string_type));
+                }
+
+                const array_access_ref = try self.newRef(source, "array_access_ref");
+                const left_type = maybe_left_type orelse return Error.UnsupportedBinaryOperation;
+                // An array element type is shared by every position; a tuple's is
+                // per-position, so a *constant* index selects that position's type
+                // (a runtime index stays permissive). Both share the slice access
+                // lowering below.
+                // An empty `.{}` is an empty struct; indexing it is the classic
+                // "forgot to annotate an empty array" mistake — report it clearly.
+                if (isEmptyStructType(left_type)) {
+                    try self.reportSourceError(binary.left, Error.UnsupportedBinaryOperation, .@"error", "cannot index an empty struct; annotate the element type to make it an array (e.g. `var xs: []T = .{{}}`)", .{});
+                    return .fromValue(.void);
+                }
+                const element_type: ast.TypeExpr = switch (left_type) {
+                    .array => left_type.array.element.*,
+                    .tuple => |tuple| blk: {
+                        if (constIndexValue(binary.right)) |k| {
+                            if (k >= 0 and k < tuple.elements.len) break :blk tuple.elements[@intCast(k)].*;
+                        }
+                        break :blk .global(.void);
+                    },
+                    else => return Error.UnsupportedBinaryOperation,
+                };
                 const left_ref = try self.newRef(source, "array_access_left_ref");
                 try self.set(source, left_ref, left.source);
                 // The index may be a function call whose result is delivered as a
@@ -9564,18 +9900,63 @@ pub const IRCompiler = struct {
         try self.set(source, .initAbs(.{ .register = .r }, .{ .dereference = true }), .fromValue(.{ .integer = @as(i64, @intCast(array.elements.len)) }));
         const array_ref = try self.newRef(source, "array");
         try self.set(source, array_ref, .fromLocation(.initRegister(.r)));
-        var element_type: ?ast.TypeExpr = null;
-        for (array.elements, 1..) |element, i| {
+        // Record each element's static type by position. A `.{ … }` literal is a
+        // tuple; it is tagged as an array `[]T` only when every element shares the
+        // type T (the common case), and as a tuple otherwise — so a heterogeneous
+        // literal keeps per-position types (needed to destructure it later with
+        // the right per-element struct layout). The runtime value is identical.
+        // An empty `.{}` has no element type: it is an empty struct — a value you
+        // can pass around but not operate on. An appendable empty array must name
+        // its element type with an annotation (`var xs: []T = .{}`), which then
+        // drives the binding type. The runtime value is a length-0 slice either way.
+        if (array.elements.len == 0) {
+            return .from(array_ref.dereference().typed(.{ .struct_type = .{
+                .fields = &.{},
+                .decls = &.{},
+                .span = array.span,
+            } }));
+        }
+
+        const element_types = try self.allocator.alloc(?ast.TypeExpr, array.elements.len);
+        for (array.elements, 0..) |element, idx| {
             const result = try self.compileExpressionWithCapture(source, element);
             // Literals carry no type on their Result; fall back to the element
             // expression's static type so `.{ 1, 2, 3 }` infers `[]Int`.
-            element_type = result.typeExpr() orelse self.argTypeExpr(element);
+            element_types[idx] = result.typeExpr() orelse self.argTypeExpr(element);
             try self.set(source, .initRegister(.r2), .from(array_ref.dereference()));
-            try self.set(source, .initAdd(.{ .register = .r2 }, i, .{ .dereference = true }), result.source);
+            try self.set(source, .initAdd(.{ .register = .r2 }, idx + 1, .{ .dereference = true }), result.source);
         }
-        const resolved_element_type = try self.allocator.create(ast.TypeExpr);
-        resolved_element_type.* = element_type orelse .global(.void);
-        return .from(array_ref.dereference().typed(array_type(resolved_element_type)));
+
+        if (try self.elementTypesUniform(element_types)) {
+            const resolved_element_type = try self.allocator.create(ast.TypeExpr);
+            resolved_element_type.* = if (element_types.len > 0) (element_types[0] orelse .global(.void)) else .global(.void);
+            return .from(array_ref.dereference().typed(array_type(resolved_element_type)));
+        }
+
+        const elements = try self.allocator.alloc(*const ast.TypeExpr, element_types.len);
+        for (element_types, elements) |maybe, *dst| {
+            const p = try self.allocator.create(ast.TypeExpr);
+            p.* = maybe orelse .global(.void);
+            dst.* = p;
+        }
+        return .from(array_ref.dereference().typed(.{ .tuple = .{ .elements = elements, .span = array.span } }));
+    }
+
+    /// Whether every element type is present and structurally identical (compared
+    /// by rendered form, which ignores spans). An empty or single-element literal
+    /// is uniform. A uniform literal is tagged `[]T`; a non-uniform one a tuple.
+    fn elementTypesUniform(self: *IRCompiler, element_types: []const ?ast.TypeExpr) Error!bool {
+        var first: ?[]const u8 = null;
+        for (element_types) |maybe| {
+            const t = maybe orelse return false;
+            const rendered = try std.fmt.allocPrint(self.allocator, "{f}", .{t});
+            if (first) |f| {
+                if (!std.mem.eql(u8, f, rendered)) return false;
+            } else {
+                first = rendered;
+            }
+        }
+        return true;
     }
 
     const ForSource = struct {
@@ -9643,7 +10024,13 @@ pub const IRCompiler = struct {
                 };
             },
             else => {
-                const source_result = try self.compileExpression(for_source);
+                // Iterating a call result (`for (mk)` where `mk` yields an array)
+                // needs the array value, so value-capture a source that would
+                // otherwise fork into a thread/exec-result handle.
+                const source_result = if (self.memberObjectForks(for_source))
+                    try self.compileExpressionWithCapture(source, for_source)
+                else
+                    try self.compileExpression(for_source);
 
                 if (source_result.source != .location or source_result.source.location.options.type_expr != .array) {
                     try self.reportSourceError(source, Error.NotImplemented, .@"error", "for loops with source type \"{t}\" not yet implemented", .{for_source.*});
@@ -10338,6 +10725,8 @@ pub const IRCompiler = struct {
 
         const after_label = try self.newLabel("for_after", .unknown);
         const for_label = try self.newLabel("for", .abs);
+        // `continue` jumps to the increment + re-test, not the loop top.
+        const continue_label = try self.newLabel("for_continue", .unknown);
 
         try self.cmp(source, .less, .from(counter_ref.dereference()), .from(iterations_ref.dereference()), .initRegister(.r2));
         try self.jmp(source, .fromLocation(.initRegister(.r2)), false, after_label);
@@ -10374,7 +10763,16 @@ pub const IRCompiler = struct {
         // 4. Compile for body as statement
 
         const stack_before_body = self.currentFrame().rel_stack_counter;
+        // Captures write to pre-allocated per-source refs (no per-iteration push),
+        // so both break and continue pop the body back to stack_before_body.
+        try self.loop_contexts.append(self.allocator, .{
+            .break_label = after_label,
+            .continue_label = continue_label,
+            .break_base = stack_before_body,
+            .continue_base = stack_before_body,
+        });
         const fallback_for_body_result = try self.compileExpressionAsStatement(source, for_expr.body);
+        _ = self.loop_contexts.pop();
 
         if (isWaitable(fallback_for_body_result)) |loc| {
             try self.wait(source, loc);
@@ -10392,6 +10790,7 @@ pub const IRCompiler = struct {
 
         self.scopes.pop();
 
+        try self.setLabel(continue_label.local_addr.label, .abs);
         try self.ath(
             source,
             .add,
@@ -10405,6 +10804,80 @@ pub const IRCompiler = struct {
 
         // TODO: return something like the block compilation is doing
         return .fromValue(.void);
+    }
+
+    /// Compiles a `break` (to the loop's exit) or `continue` (to its re-test /
+    /// increment). Pops this iteration's body slots down to the target label's
+    /// stack base, then jumps — but restores the compile-time stack counter
+    /// afterward, since any statements following `break`/`continue` in the same
+    /// block are unreachable yet still compiled at the pre-jump depth.
+    fn compileLoopControl(self: *IRCompiler, source: *ast.Statement, is_break: bool) Error!Result {
+        if (self.loop_contexts.items.len == 0) {
+            try self.reportSourceError(
+                source,
+                Error.UnsupportedExpression,
+                .@"error",
+                "'{s}' outside of a loop",
+                .{if (is_break) "break" else "continue"},
+            );
+            return .fromValue(.void);
+        }
+        const ctx = self.loop_contexts.items[self.loop_contexts.items.len - 1];
+        const target_label = if (is_break) ctx.break_label else ctx.continue_label;
+        const target_base = if (is_break) ctx.break_base else ctx.continue_base;
+
+        const saved = self.currentFrame().rel_stack_counter;
+        try self.popToStackBase(source, target_base);
+        try self.jmp(source, null, true, target_label);
+        self.currentFrame().rel_stack_counter = saved;
+        return .fromValue(.void);
+    }
+
+    /// Whether a loop body contains a `break`/`continue` bound to *this* loop —
+    /// i.e. not nested inside another `for`/`while` (which owns its own). Used to
+    /// keep such a body off the atomic `counted_loop` path (whose runner cannot
+    /// follow a jump out of the body set) and onto the label-based path where
+    /// `break`/`continue` resolve. Conservative by construction: if it ever
+    /// under-reports, the counted-loop body compiles with no loop context pushed,
+    /// so `compileLoopControl` reports a clean "outside a loop" error rather than
+    /// miscompiling.
+    fn bodyHasLoopControl(expr: *const ast.Expression) bool {
+        return switch (expr.*) {
+            .block => |b| {
+                for (b.statements) |s| if (stmtHasLoopControl(s)) return true;
+                return false;
+            },
+            .if_expr => |ife| ifHasLoopControl(ife),
+            .match_expr => |m| {
+                for (m.cases) |c| for (c.body.statements) |s| if (stmtHasLoopControl(s)) return true;
+                return false;
+            },
+            // A nested loop owns its own break/continue — a barrier.
+            .for_expr => false,
+            else => false,
+        };
+    }
+
+    fn ifHasLoopControl(ife: ast.IfExpr) bool {
+        if (bodyHasLoopControl(ife.then_expr)) return true;
+        if (ife.else_branch) |eb| return switch (eb) {
+            .expr => |ex| bodyHasLoopControl(ex),
+            .if_expr => |ip| ifHasLoopControl(ip.*),
+            .condition => false,
+        };
+        return false;
+    }
+
+    fn stmtHasLoopControl(stmt: *const ast.Statement) bool {
+        return switch (stmt.*) {
+            .break_stmt, .continue_stmt => true,
+            .expression => |e| bodyHasLoopControl(e.expression),
+            .binding_decl => |b| bodyHasLoopControl(b.initializer),
+            .yield_stmt => |y| bodyHasLoopControl(y.value),
+            .exit_stmt => |e| if (e.value) |v| bodyHasLoopControl(v) else false,
+            // A nested while owns its own break/continue.
+            .while_stmt, .type_binding_decl, .bash_block => false,
+        };
     }
 
     /// Lowers `while (condition) { body }`: re-evaluate the condition at the top
@@ -10520,6 +10993,15 @@ pub const IRCompiler = struct {
             },
         };
 
+        // `break` exits to after_label, `continue` re-tests at while_label; both
+        // targets expect the stack at loop_stack_base (== stack_before_body).
+        try self.loop_contexts.append(self.allocator, .{
+            .break_label = after_label,
+            .continue_label = while_label,
+            .break_base = loop_stack_base,
+            .continue_base = loop_stack_base,
+        });
+
         var body_result: Result = .fromValue(.void);
         for (while_stmt.body.statements) |body_stmt| {
             body_result = try self.compileStatement(body_stmt);
@@ -10527,6 +11009,8 @@ pub const IRCompiler = struct {
         if (isWaitable(body_result)) |loc| {
             try self.wait(source, loc);
         }
+
+        _ = self.loop_contexts.pop();
 
         try self.popToStackBase(source, stack_before_body);
         self.scopes.pop();
@@ -10610,7 +11094,16 @@ pub const IRCompiler = struct {
         }
 
         const stack_before_body = self.currentFrame().rel_stack_counter;
+        // `continue` returns to for_label, whose `collect_stdin` reads the next
+        // value (there is no separate increment); `break` exits to after_label.
+        try self.loop_contexts.append(self.allocator, .{
+            .break_label = after_label,
+            .continue_label = for_label,
+            .break_base = stack_before_body,
+            .continue_base = stack_before_body,
+        });
         const body_result = try self.compileExpressionAsStatement(source, for_expr.body);
+        _ = self.loop_contexts.pop();
         if (isWaitable(body_result)) |loc| try self.wait(source, loc);
 
         const body_extra_refs = self.currentFrame().rel_stack_counter - stack_before_body;
@@ -10640,6 +11133,12 @@ pub const IRCompiler = struct {
         }
 
         const frame_before_body = self.currentFrame().rel_stack_counter;
+
+        // A break/continue bound to this loop can't run as an atomic counted_loop
+        // (its runner cannot follow a jump out of the body set), so it forces the
+        // label-based path below.
+        const has_control = bodyHasLoopControl(for_expr.body);
+
         const body_set = try self.addInstructionSet();
         const prev_set = self.current_instruction_set;
         self.current_instruction_set = body_set;
@@ -10681,13 +11180,15 @@ pub const IRCompiler = struct {
         }
 
         const counted_loop_stack_before_body = self.currentFrame().rel_stack_counter;
-        const for_body_result = try self.compileExpressionAsStatement(source, for_expr.body);
-        const body_extra_refs = self.currentFrame().rel_stack_counter - counted_loop_stack_before_body;
-        for (0..body_extra_refs) |_| {
-            _ = try self.pop(source);
+        var can_use_counted_loop = false;
+        if (!has_control) {
+            const for_body_result = try self.compileExpressionAsStatement(source, for_expr.body);
+            const body_extra_refs = self.currentFrame().rel_stack_counter - counted_loop_stack_before_body;
+            for (0..body_extra_refs) |_| {
+                _ = try self.pop(source);
+            }
+            can_use_counted_loop = isWaitable(for_body_result) == null and self.instructionSetIsCountedLoopSafe(body_set);
         }
-
-        const can_use_counted_loop = isWaitable(for_body_result) == null and self.instructionSetIsCountedLoopSafe(body_set);
         self.currentFrame().rel_stack_counter = frame_before_body;
 
         self.current_instruction_set = prev_set;
@@ -10702,6 +11203,9 @@ pub const IRCompiler = struct {
 
         const after_label = try self.newLabel("for_after", .unknown);
         const for_label = try self.newLabel("for", .abs);
+        // `continue` jumps here — the increment + re-test, not the loop top —
+        // so it advances the counter (a plain jump to for_label would spin).
+        const continue_label = try self.newLabel("for_continue", .unknown);
 
         try self.cmp(source, .less, .from(iter_ref.dereference()), .from(for_source.range_limit_ref.?.dereference()), .initRegister(.r2));
         try self.jmp(source, .fromLocation(.initRegister(.r2)), false, after_label);
@@ -10731,7 +11235,17 @@ pub const IRCompiler = struct {
         }
 
         const stack_before_body = self.currentFrame().rel_stack_counter;
+        // break → after_label (stack at frame_before_body == stack_before_body,
+        // the capture aliases the counter and pushes no slot); continue →
+        // continue_label after popping the body back to stack_before_body.
+        try self.loop_contexts.append(self.allocator, .{
+            .break_label = after_label,
+            .continue_label = continue_label,
+            .break_base = stack_before_body,
+            .continue_base = stack_before_body,
+        });
         const fallback_for_body_result = try self.compileExpressionAsStatement(source, for_expr.body);
+        _ = self.loop_contexts.pop();
 
         if (isWaitable(fallback_for_body_result)) |loc| {
             try self.wait(source, loc);
@@ -10744,6 +11258,7 @@ pub const IRCompiler = struct {
 
         self.scopes.pop();
 
+        try self.setLabel(continue_label.local_addr.label, .abs);
         try self.ath(
             source,
             .add,

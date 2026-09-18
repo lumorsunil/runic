@@ -115,7 +115,7 @@ const Collector = struct {
                 try self.expr(w.condition);
                 for (w.body.statements) |bs| try self.stmt(bs);
             },
-            .type_binding_decl, .bash_block => {},
+            .type_binding_decl, .bash_block, .break_stmt, .continue_stmt => {},
         }
     }
 
@@ -420,7 +420,7 @@ fn walkStmt(w: *Walk, s: *const ast.Statement, in_loop: bool) void {
             for (wh.body.statements) |bs| walkStmt(w, bs, true);
         },
         .bash_block => w.threaded = true,
-        .type_binding_decl => {},
+        .type_binding_decl, .break_stmt, .continue_stmt => {},
     }
 }
 

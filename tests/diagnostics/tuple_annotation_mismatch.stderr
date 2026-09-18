@@ -1,0 +1,7 @@
+[error]: tests/diagnostics/tuple_annotation_mismatch.rn:5:35: expected type String, actual: Int
+   3:# has the wrong type is a compile error — even when the literal's own elements
+   4:# happen to be uniform.
+   5:const t: struct { Int, String } = [41m[30m.{ 1, 2 }[0m
+   6:echo "${t}"
+   7:
+

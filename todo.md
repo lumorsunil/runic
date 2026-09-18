@@ -125,6 +125,39 @@
       nested_if_pipeline_logical_regression.
 - [x] recursive functions (add function def to closure?)
 - [x] exit/return statement
+- [x] inferred struct literals (`const v: Vector = .{ .x = 3, .y = 5 }`) — type
+      taken from context; anonymous literal with no context errors
+  - [x] infer from a call argument's parameter type (`moveEntity e .{ … }`,
+        including UFCS method calls where the receiver fills parameter 0)
+  - [x] infer from a function's declared return type (`yield .{ … }`)
+  - [x] infer from a struct field's type in a construction (`Line{ .from = .{ … } }`)
+  - [x] infer from an array element type (`const p: []Vector = .{ .{ … } }`), nesting
+- [x] tuple/record destructuring bindings (`const a, b = …`, `const { x, y } = …`,
+      nested, heterogeneous array-literal tuples)
+  - [x] heterogeneous destructuring from a *non-literal* source (a `var` holding
+        mixed types) — a heterogeneous `.{ … }` literal is now a tuple type that
+        carries per-position types through a variable, so a struct element keeps
+        its fields. A homogeneous literal stays an array `[]T`.
+- [x] tuple type *annotation* syntax `struct { Int, String }` (positional struct
+      body) — annotate a binding, parameter, or return type; checked position by
+      position. (Parens `(T)` stay grouping; a final tuple syntax is still open.)
+- [x] precise element typing for a *constant* index into a tuple (`t[1]` → its
+      2nd position's type); a runtime index stays permissive
+- [x] the empty literal `.{}` is an empty struct (pass-around, not operable);
+      an appendable empty array must annotate its element type (`var xs: []T =
+      .{}`); empty coerces to an array in an array context (annotation, struct
+      field, concat operand)
+  - [x] error quality: indexing and member access (`.len`, a field) on an
+        unannotated empty struct report the directed "annotate the element type"
+        hint. (`.push`/`.with`/`.slice` are name-resolved array methods that stay
+        permissive on the receiver, so the hint fires at the next read instead.)
+- [ ] tuples: remaining follow-up
+  - [ ] make *every* `.{ … }` a tuple (even homogeneous), coercing to `[]T` in
+        array contexts — deferred: it broke the empty/homogeneous accumulator
+        idiom (`var xs = .{}; xs = xs.push …`) and yields to `[]T`, which would
+        need tuple→array coercion wired through the yield/pipe/push paths. The
+        current homogeneous→array / heterogeneous→tuple split delivers the same
+        user-facing behavior without that churn.
 - [ ] blocks as anonymous functions?
 - [ ] value references `const my_function = &module.some_function`
   - [ ] partial applications
@@ -187,8 +220,15 @@
 - [x] completions for executables found on $PATH
 - [x] hover
   - [x] basic hover implementation, identifier lookup
+  - [x] member access, including nested (`a.b.c`) via the same object-chain type
+        walk as go-to-definition, and struct-literal field names
+        (`Vector{ .x = … }`, including nested literals)
 - [x] go to definition
   - [x] struct field / decl member access resolves to the declaration
+  - [x] nested member access (`a.b.c`) descends each segment's type, not just
+        the first level (named field types are resolved to their struct)
+  - [x] struct-literal field names (`Vector{ .x = … }`, including nested
+        literals) resolve to the field declaration
 - [x] workspace-wide go to definition for symbols not present in currently tracked documents
   - via the workspace index (loads all .rn files under a client-provided root)
 - [x] completions for keywords
@@ -221,10 +261,10 @@
 - [x] workspace symbol search
 - [x] add support for document links
 - [x] `.sym_link` entries in module-path completion (follows the link's target)
-- [ ] document symbols for destructuring patterns — BLOCKED: the parser does
-      not support tuple/record binding destructuring yet (parseBindingPattern
-      only accepts a single identifier or `_`); bash blocks / while statements
-      declare no top-level symbols, so nothing to add there
+- [x] document symbols for destructuring patterns — the outline now surfaces
+      each name a tuple (`const a, b = …`) or record (`const { x, y } = …`)
+      binding introduces, recursing through nested patterns and rebindings, and
+      skipping `_` discards
 - [x] inlay hints: inferred types after un-annotated bindings (`const x«: Int»`)
 - [x] inlay hints: parameter-name hints before call arguments (top-level and
       binding-initializer calls to same-file functions)
@@ -233,11 +273,46 @@
 - [x] inlay parameter hints for imported-module functions (`m.f x`)
 - [x] folding ranges (multi-line statements: functions, structs, control flow)
 - [x] code action: add an inferred type annotation to an un-annotated binding
-- [ ] more code actions / quick fixes (add missing import, remove unused, etc.)
+- [x] code action: remove an unused top-level binding/import (offered only when
+      the name is lexically unreferenced — conservative, never a false positive),
+      plus a source action to remove all unused bindings at once
+- [x] code action: wrap a bare undeclared uppercase type as `|T|` — a
+      diagnostic-linked quick fix; this also wired up `context.diagnostics` on
+      code-action requests (the reliable source, since the server's own
+      diagnostics are cleared after each publish)
+- [x] code action: change a lowercase type name to its suggested capitalized
+      form (`x: int` → `x: Int`) — driven off the "did you mean …?" diagnostic,
+      and works even when the parse error left no AST (fixes run before the
+      AST-dependent actions). Diagnostic-fix plumbing factored into
+      `appendDiagnosticFixes`.
+  - [ ] the empty-literal "annotate the element type" hint is not offered as a
+        fix: the element type is unknown, so there's nothing complete to insert
 - [x] prepare-rename (validates the target, pre-fills the identifier)
 - [x] completion-resolve: promotes a completion's detail to documentation on focus
-- [ ] call hierarchy
-- [ ] richer/robust formatting (current formatter is minimal)
+- [x] signature help: shows the callee's `name(p0: T0, …)` signature with the
+      parameter being entered highlighted (same-file top-level functions and
+      imported-module functions; innermost call at the cursor)
+- [x] call hierarchy (top-level functions): prepare, incoming calls, and
+      outgoing calls (same-file functions + imported-module `m.f`).
+  - [x] cross-file incoming calls: a `m.f` caller in an importing file, resolved
+        by type-checking each indexed importer on demand and matching the alias's
+        module path to the queried function's file
+- [x] semantic tokens (`textDocument/semanticTokens/full`): lexer-driven
+      classification into keyword / type / variable / number / string / operator,
+      delta-encoded per the LSP legend (interpolated `${…}` code inside strings is
+      typed as code, not string).
+  - [x] AST-based refinement: function declarations and call sites (calls with
+        arguments) are `function`, parameter declarations are `parameter`, and
+        binding/parameter/capture declarations carry a `declaration` modifier
+        (`const` bindings also `readonly`). Reference sites beyond call callees
+        keep the lexical classification (a precise per-reference resolution would
+        need scope-aware classification)
+- [x] richer/robust formatting: re-indents by structural nesting depth (four
+      spaces), string/comment-aware so braces inside strings or comments never
+      shift indentation, and multi-line strings and block comments are left
+      verbatim. Line interiors are preserved (command-argument spacing is
+      significant, so it is never reflowed); blank runs collapse to one; the
+      result is idempotent and run-equivalent on the example scripts.
 
 ## imports
 

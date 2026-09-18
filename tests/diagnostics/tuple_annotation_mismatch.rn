@@ -1,0 +1,6 @@
+# A tuple type is written `struct { T0, T1, … }` (positional, no field names). It
+# is checked position by position, so a literal whose element at some position
+# has the wrong type is a compile error — even when the literal's own elements
+# happen to be uniform.
+const t: struct { Int, String } = .{ 1, 2 }
+echo "${t}"

@@ -1,0 +1,40 @@
+// A field access directly on a call result — an explicit call `(f x).field`, a
+// UFCS method call `recv.method.field`, or a chain of them — reads the produced
+// struct's field. Such a receiver is value-captured (not forked), so the field
+// read sees the value instead of a thread/exec-result handle. Plain field chains
+// and string builtins are unaffected.
+fn Void @() Void
+
+const V = struct { x: Int }
+fn Void dbl(self: V) V { yield V{ .x = self.x * 2 } }
+fn Void inc(self: V) V { yield V{ .x = self.x + 1 } }
+fn Void add(self: V, n: Int) V { yield V{ .x = self.x + n } }
+
+const v = V{ .x = 5 }
+
+# Explicit call result.
+echo "call=${(dbl v).x}"
+
+# UFCS nullary method call result.
+echo "ufcs=${v.dbl.x}"
+
+# Chained method calls.
+echo "chain=${v.inc.inc.x}"
+
+# Method call with an argument.
+echo "arg=${(v.add 10).x}"
+
+# A plain struct-field chain is NOT captured (no fork) and still works.
+const A = struct { n: Int }
+const B = struct { a: A }
+const b = B{ .a = A{ .n = 42 } }
+echo "field=${b.a.n}"
+
+# String builtins chain as before.
+const s = "  hi  "
+echo "str=${s.trim.upper}"
+
+# Indexing and slicing a call result also value-capture the receiver.
+fn Void nums() []Int { yield .{ 10, 20, 30, 40 } }
+echo "idx=${(nums)[2]}"
+echo "slice=${(nums)[1..3][0]}"

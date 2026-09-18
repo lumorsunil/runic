@@ -1,0 +1,5 @@
+# An empty `.{}` is an empty struct, not an array — indexing it is the classic
+# "forgot to annotate an empty array" mistake. Give the element type an
+# annotation (`var xs: []Int = .{}`) to build an appendable/indexable array.
+var xs = .{ }
+echo "${xs[0]}"

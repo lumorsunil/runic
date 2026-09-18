@@ -1,0 +1,16 @@
+// A negative array index must not crash the interpreter. Indexing is not yet
+// bounds-checked, so the value read is unspecified — the point of this test is
+// that a negative index degrades gracefully instead of panicking with "integer
+// does not fit in destination type" (a `@intCast` of the negative offset to a
+// pointer width). Execution continues past the read.
+fn Void @() Void
+
+var a = .{ 10, 20, 30 }
+
+// A valid index still reads the right element.
+echo "a1=${a[1]}"
+
+// A negative index does not crash; bind and discard the unspecified value, then
+// keep running.
+const _neg = a[0 - 1]
+echo "survived-negative-index"

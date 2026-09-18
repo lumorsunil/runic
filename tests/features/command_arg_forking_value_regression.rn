@@ -9,7 +9,7 @@ fn Void @() Void
 
 # A forked (loop-bodied) value-returning function as a bare command arg.
 fn Void buildLen() Int {
-  var a = .{ }
+  var a: []Int = .{ }
   for (0..5) |i| {
     a = a.push (i * 2)
   }
@@ -19,7 +19,7 @@ echo (buildLen)
 
 # Its result also composes with a literal arg and with the array contents.
 fn Void sumTo() Int {
-  var a = .{ }
+  var a: []Int = .{ }
   for (0..4) |i| {
     a = a.push i
   }

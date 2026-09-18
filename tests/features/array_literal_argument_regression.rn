@@ -1,0 +1,28 @@
+// An array literal `.{ … }` can be passed directly as a function/command
+// argument (`f .{ 1, 2 }`), not only when parenthesized (`f (.{ 1, 2 })`).
+// Previously a bare `.{` ended argument parsing, so `f .{ … }` was misparsed as
+// a nullary call `f` followed by a separate, dangling array.
+fn Void @() Void
+
+fn Void count(xs: []Int) Int {
+  var n = 0
+  for (xs) |x| { n += 1 }
+  yield n
+}
+
+# As a bound-binding argument.
+const c = count .{ 10, 20, 30, 40 }
+echo "count=${c}"
+
+# Directly inside string interpolation.
+fn Void first(xs: []Int) Int { yield xs[0] }
+echo "first=${first .{ 7, 8, 9 }}"
+
+# Passed to a stdlib higher-order function alongside another argument.
+const l = import "std/list.rn"
+fn Void dbl(n: Int) Int { yield n * 2 }
+const doubled = l.map .{ 1, 2, 3 } dbl
+echo "mapped=${doubled[0]},${doubled[2]}"
+
+# As a command argument.
+echo .{ 1, 2, 3 }

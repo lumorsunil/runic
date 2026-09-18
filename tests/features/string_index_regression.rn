@@ -1,0 +1,24 @@
+// A string can be indexed by a single position, `s[i]`, yielding a one-character
+// String (lowered to a one-char slice `s[i .. i+1]`, reusing the string slice
+// op). Complements string slicing (`s[a..b]`). Out-of-range and negative indices
+// clamp to the empty string like a slice, never crashing.
+fn Void @() Void
+
+const s = "hello"
+
+# Constant, variable, and computed indices.
+echo "first=${s[0]}"
+echo "last=${s[s.len - 1]}"
+var i = 1
+echo "at_i=${s[i]}"
+
+# A literal indexed directly.
+echo "lit=${"world"[2]}"
+
+# Iterate characters by index.
+const w = "abc"
+for (0..w.len) |k| echo "c=${w[k]}"
+
+# Out-of-range and negative indices clamp to the empty string (no crash).
+echo "oob=[${s[99]}]"
+echo "neg=[${s[0 - 1]}]"

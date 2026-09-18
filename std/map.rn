@@ -43,8 +43,8 @@ fn Void bucketFor(key: |K|, count: Int) Int {
 }
 
 // An empty map with 16 buckets.
-pub fn Void empty() Map(K, V) {
-  var bs = .{ }
+pub fn Void empty() Map(|K|, |V|) {
+  var bs: []Bucket(K, V) = .{ }
   var i = 0
   while (i < 16) {
     bs = bs.push Bucket(K, V){ .entries = .{ } }
@@ -90,7 +90,7 @@ pub fn Void set(m: Map(|K|, |V|), key: K, value: V) Map(K, V) {
 // reference, so the caller's map sees the change) and returns nothing. Use it
 // when you hold a `var` map and don't want to reassign — `std.map.setIn m k v`
 // instead of `m = std.map.set m k v`. Same replace-or-append semantics.
-pub fn Void setIn(m: Map(|K|, |V|), key: K, value: V) Void {
+pub fn Void setIn(var m: Map(|K|, |V|), key: K, value: V) Void {
   const nb = m.buckets.len
   const idx = bucketFor key nb
   const bucket = m.buckets[idx]
@@ -140,12 +140,12 @@ pub fn Void has(m: Map(|K|, |V|), key: K) Bool {
 pub fn Void remove(m: Map(|K|, |V|), key: K) Map(K, V) {
   const idx = bucketFor key m.buckets.len
   const bucket = m.buckets[idx]
-  var ents = .{ }
+  var ents: []Entry(K, V) = .{ }
   for (bucket.entries) |e| {
     if (e.key == key) { } else { ents = ents.push e }
   }
   const newBuckets = m.buckets.with idx Bucket(K, V){ .entries = ents }
-  var newOrder = .{ }
+  var newOrder: []Entry(K, V) = .{ }
   for (m.order) |e| {
     if (e.key == key) { } else { newOrder = newOrder.push e }
   }
@@ -153,15 +153,15 @@ pub fn Void remove(m: Map(|K|, |V|), key: K) Map(K, V) {
 }
 
 // Mutable variant of `remove`: deletes `key` from `m` in place (no return).
-pub fn Void removeIn(m: Map(|K|, |V|), key: K) Void {
+pub fn Void removeIn(var m: Map(|K|, |V|), key: K) Void {
   const idx = bucketFor key m.buckets.len
   const bucket = m.buckets[idx]
-  var ents = .{ }
+  var ents: []Entry(K, V) = .{ }
   for (bucket.entries) |e| {
     if (e.key == key) { } else { ents = ents.push e }
   }
   m.buckets = m.buckets.with idx Bucket(K, V){ .entries = ents }
-  var newOrder = .{ }
+  var newOrder: []Entry(K, V) = .{ }
   for (m.order) |e| {
     if (e.key == key) { } else { newOrder = newOrder.push e }
   }
@@ -170,14 +170,14 @@ pub fn Void removeIn(m: Map(|K|, |V|), key: K) Void {
 
 // The keys, in insertion order.
 pub fn Void keys(m: Map(|K|, |V|)) []K {
-  var out = .{ }
+  var out: []K = .{ }
   for (m.order) |e| { out = out.push e.key }
   yield out
 }
 
 // The values, in insertion order.
 pub fn Void values(m: Map(|K|, |V|)) []V {
-  var out = .{ }
+  var out: []V = .{ }
   for (m.order) |e| { out = out.push e.value }
   yield out
 }

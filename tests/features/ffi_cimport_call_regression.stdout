@@ -5,3 +5,6 @@ abs=5
 strlen=5
 pid_positive=0
 abs_call_arg=7
+3232
+cstr_return=hello len=5
+cstr_null_len=0

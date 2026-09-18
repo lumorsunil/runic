@@ -1,0 +1,64 @@
+// `break` exits the innermost enclosing loop; `continue` skips to its next
+// iteration. Both work in every loop form (counted range, array, multi-source,
+// `while`, and a `for (&0)` stream), bind to the innermost loop when nested, and
+// correctly clean up body-local bindings on the jump.
+fn Void @() Void
+
+// Counted range: break.
+for (0..10) |i| {
+  if (i == 3) break
+  echo "range-break=${i}"
+}
+
+// Counted range: continue (skips 2).
+for (0..5) |i| {
+  if (i == 2) continue
+  echo "range-continue=${i}"
+}
+
+// Body-local binding is cleaned up on break (no stack corruption): the value
+// after the break still reads correctly.
+for (0..10) |i| {
+  const doubled = i * 2
+  if (doubled > 6) break
+  echo "slot=${doubled}"
+}
+
+// Array iteration.
+for (.{ 10, 20, 30, 40 }) |v| {
+  if (v == 30) break
+  echo "arr=${v}"
+}
+
+// `while` with break and a body-local binding.
+var n = 0
+while (n < 100) {
+  const sq = n * n
+  if (sq > 15) break
+  echo "while=${sq}"
+  n += 1
+}
+
+// Nested loops: the inner break only exits the inner loop.
+for (0..3) |i| {
+  for (0..3) |j| {
+    if (j == 1) break
+    echo "nested=${i}.${j}"
+  }
+}
+
+// A continue in the outer loop skips the whole inner loop for that iteration.
+for (0..3) |i| {
+  if (i == 1) continue
+  for (0..2) |j| echo "outer-cont=${i}:${j}"
+}
+
+// A `for (&0)` stream consumer can break.
+fn Void produce() Int { yield 1; yield 2; yield 3; yield 4 }
+fn Int take() Void {
+  for (&0) |x| {
+    if (x == 3) break
+    echo "stream=${x}"
+  }
+}
+produce | take

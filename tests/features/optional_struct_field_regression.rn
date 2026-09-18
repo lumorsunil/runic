@@ -1,0 +1,31 @@
+// A struct field declared optional (`x: ?Int`) stays optional in a constructed
+// value even when given a bare non-null value, so `orelse` and `if` capture work
+// on it. Previously the field was re-typed to the supplied value's concrete type
+// (`Int`), which dropped the optional and made `p.x orelse …` a compile error
+// ("left side of orelse must be an optional"). Generic fields still specialize
+// to their value's type.
+fn Void @() Void
+
+const P = struct { x: ?Int, y: Int }
+
+# Non-null value: the field is still optional, so orelse yields the value.
+const a = P{ .x = 5, .y = 1 }
+echo "a=${a.x orelse 0}"
+
+# Null value: orelse yields the fallback.
+const b = P{ .x = null, .y = 2 }
+echo "b=${b.x orelse 99}"
+
+# `if` capture on the optional field.
+const c = P{ .x = 7, .y = 3 }
+if (c.x) |v| { echo "c=got ${v}" } else { echo "c=none" }
+
+# Optional string field.
+const S = struct { name: ?String }
+const s = S{ .name = "hi" }
+echo "s=${s.name orelse "none"}"
+
+# A generic field still binds to the concrete value type.
+const Box(T) = struct { value: T }
+const box = Box{ .value = 42 }
+echo "box=${box.value + 1}"

@@ -1,0 +1,5 @@
+# An anonymous struct literal `.{ .field = … }` needs a type from context. With
+# no annotation to infer from, that is an error (with a directed hint), not a
+# lookup of an empty type name.
+const v = .{ .x = 3 }
+echo "${v.x}"

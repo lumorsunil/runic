@@ -1,0 +1,16 @@
+[error]: tests/diagnostics/duplicate_struct_field.rn:4:40: duplicate field 'x' in struct type
+   2:# types were previously not validated at all, so a duplicate field silently
+   3:# shadowed the earlier one.
+   4:const Point = struct { x: Int, y: Int, [41m[30mx[0m: Float }
+   5:const p = Point{ .x = 1, .y = 2 }
+   6:echo "${p.x}"
+   7:
+
+[error]: tests/diagnostics/duplicate_struct_field.rn:4:40: duplicate field 'x' in struct type
+   2:# types were previously not validated at all, so a duplicate field silently
+   3:# shadowed the earlier one.
+   4:const Point = struct { x: Int, y: Int, [41m[30mx[0m: Float }
+   5:const p = Point{ .x = 1, .y = 2 }
+   6:echo "${p.x}"
+   7:
+
