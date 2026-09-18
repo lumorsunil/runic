@@ -11,6 +11,11 @@ const runic = @import("runic");
 const Allocator = std.mem.Allocator;
 
 /// Shared state threaded through the recursive parameter-hint walk.
+/// The semantic-token type legend (the index of each is the `tokenType` emitted
+/// for a token). Standard LSP names, so a client applies its theme colors.
+const semantic_token_types = [_][]const u8{ "keyword", "string", "number", "operator", "type", "variable" };
+const SemanticTokenType = enum(u32) { keyword = 0, string = 1, number = 2, operator = 3, type = 4, variable = 5 };
+
 const CallHintCtx = struct {
     arena: Allocator,
     hints: *std.ArrayList(types.InlayHint),
@@ -202,6 +207,10 @@ pub const Server = struct {
             },
             .@"callHierarchy/outgoingCalls" => |params| {
                 if (request.id) |id| try self.handleOutgoingCalls(id, params);
+                return true;
+            },
+            .@"textDocument/semanticTokens/full" => |params| {
+                if (request.id) |id| try self.handleSemanticTokensFull(id, params);
                 return true;
             },
             .@"textDocument/hover" => |params| {
@@ -1955,6 +1964,99 @@ pub const Server = struct {
         return fnItem(fn_decl, doc_uri);
     }
 
+    // --- Semantic tokens --------------------------------------------------
+
+    /// Maps a lexer token to its semantic-token type, or null to skip it
+    /// (delimiters, comments — which the lexer drops — and stream/interpolation
+    /// markers, all left to the client's grammar). An identifier is a `type` when
+    /// it starts uppercase, else a `variable`.
+    fn semanticType(tag: runic.token.Tag, lexeme: []const u8) ?SemanticTokenType {
+        if (tag.toKeyword() != null) return .keyword;
+        return switch (tag) {
+            .identifier => if (lexeme.len > 0 and std.ascii.isUpper(lexeme[0])) .type else .variable,
+            .int_literal, .float_literal => .number,
+            .string_start, .string_end, .string_text => .string,
+            .plus,
+            .minus,
+            .star,
+            .star_star,
+            .slash,
+            .percent,
+            .dollar,
+            .caret,
+            .plus_assign,
+            .minus_assign,
+            .mul_assign,
+            .div_assign,
+            .rem_assign,
+            .or_assign,
+            .and_assign,
+            .assign,
+            .equal_equal,
+            .bang_equal,
+            .greater,
+            .greater_equal,
+            .less,
+            .less_equal,
+            .shift_left,
+            .bang,
+            .question,
+            .amp,
+            .amp_amp,
+            .pipe,
+            .pipe_pipe,
+            .arrow,
+            .fat_arrow,
+            .range,
+            .ellipsis,
+            => .operator,
+            else => null,
+        };
+    }
+
+    /// Full-document semantic tokens: the lexer's token stream mapped to types
+    /// and delta-encoded (five ints per token). Positions/lengths are byte-based,
+    /// which matches UTF-16 for the ASCII that Runic source is in practice.
+    fn handleSemanticTokensFull(self: *Server, id: types.RequestId, params: types.SemanticTokensParams) !void {
+        const empty = types.response(id, types.SemanticTokens{ .data = &.{} });
+        const doc = self.documents.get(params.textDocument.uri) orelse return self.sendJson(empty);
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        var data = std.ArrayList(u32).empty;
+
+        var lexer = runic.lexer.Lexer.init(self.io, self.allocator, self.env_map, "", doc.text) catch return self.sendJson(empty);
+        defer lexer.deinit();
+
+        var prev_line: u32 = 0;
+        var prev_char: u32 = 0;
+        while (true) {
+            // A byte the lexer rejects stops the stream; the tokens so far are
+            // still valid semantic highlighting.
+            const tok = lexer.next() catch break;
+            if (tok.tag == .eof) break;
+            const token_type = semanticType(tok.tag, tok.lexeme) orelse continue;
+
+            const range = types.Range.fromSpan(tok.span);
+            // Tokens are single-line; the length is the char span on that line.
+            if (range.end.line != range.start.line) continue;
+            const length = range.end.character -| range.start.character;
+            if (length == 0) continue;
+
+            const delta_line = range.start.line -| prev_line;
+            const delta_char = if (delta_line == 0) range.start.character -| prev_char else range.start.character;
+            try data.append(arena.allocator(), delta_line);
+            try data.append(arena.allocator(), delta_char);
+            try data.append(arena.allocator(), length);
+            try data.append(arena.allocator(), @intFromEnum(token_type));
+            try data.append(arena.allocator(), 0);
+            prev_line = range.start.line;
+            prev_char = range.start.character;
+        }
+
+        try self.sendJson(types.response(id, types.SemanticTokens{ .data = data.items }));
+    }
+
     fn handleFoldingRange(
         self: *Server,
         id: types.RequestId,
@@ -2562,6 +2664,11 @@ pub const Server = struct {
                     .retriggerCharacters = &.{ " ", "," },
                 },
                 .callHierarchyProvider = .{ .payload = .{ .bool = true } },
+                .semanticTokensProvider = .{ .payload = .{ .semanticTokensOptions = .{
+                    .legend = .{ .tokenTypes = &semantic_token_types, .tokenModifiers = &.{} },
+                    .range = false,
+                    .full = .{ .payload = .{ .bool = true } },
+                } } },
                 .definitionProvider = .{ .payload = .{
                     .definitionOptions = .{
                         .workDoneProgress = false,

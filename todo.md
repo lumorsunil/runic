@@ -289,6 +289,12 @@
       callers), and outgoing calls (same-file functions + imported-module `m.f`).
   - [ ] cross-file incoming calls (a `m.f` caller in an importing file) — needs
         the import graph to resolve which module `m` refers to this file
+- [x] semantic tokens (`textDocument/semanticTokens/full`): lexer-driven
+      classification into keyword / type / variable / number / string / operator,
+      delta-encoded per the LSP legend (interpolated `${…}` code inside strings is
+      typed as code, not string).
+  - [ ] AST-based refinement: distinguish function names and parameters from
+        plain variables, and mark declarations vs. references via token modifiers
 - [ ] richer/robust formatting (current formatter is minimal)
 
 ## imports

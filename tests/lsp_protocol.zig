@@ -403,6 +403,89 @@ test "lsp call hierarchy resolves callers and callees" {
     }
 }
 
+test "lsp semantic tokens classify keywords, types, numbers and strings" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\const x = 5
+        \\fn Void greet(name: String) Void { echo "${name}" }
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeSemanticTokensRequest(allocator, 2, uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 2);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const data = parsed.value.object.get("result").?.object.get("data").?.array.items;
+    // Five ints per token; at least the tokens we assert below.
+    try std.testing.expect(data.len % 5 == 0);
+    try std.testing.expect(data.len >= 5 * 10);
+
+    // Decode the delta-encoded stream into absolute (line, char, type) tuples.
+    const Tok = struct { line: i64, char: i64, ttype: i64 };
+    var toks = std.ArrayList(Tok).empty;
+    defer toks.deinit(allocator);
+    var line: i64 = 0;
+    var char: i64 = 0;
+    var i: usize = 0;
+    while (i < data.len) : (i += 5) {
+        const dline = data[i].integer;
+        const dchar = data[i + 1].integer;
+        const ttype = data[i + 3].integer;
+        line += dline;
+        if (dline != 0) char = 0;
+        char += dchar;
+        try toks.append(allocator, .{ .line = line, .char = char, .ttype = ttype });
+    }
+
+    // Token type codes from server.zig: keyword=0, string=1, number=2, type=4, variable=5.
+    const keyword = 0;
+    const string = 1;
+    const number = 2;
+    const typ = 4;
+    const variable = 5;
+
+    // Find a token at a given position and assert its type.
+    const findType = struct {
+        fn at(list: []const Tok, l: i64, c: i64) ?i64 {
+            for (list) |t| if (t.line == l and t.char == c) return t.ttype;
+            return null;
+        }
+    }.at;
+
+    // `const` keyword at (0,0).
+    try std.testing.expectEqual(@as(?i64, keyword), findType(toks.items, 0, 0));
+    // `x` variable at (0,6).
+    try std.testing.expectEqual(@as(?i64, variable), findType(toks.items, 0, 6));
+    // `5` number at (0,10).
+    try std.testing.expectEqual(@as(?i64, number), findType(toks.items, 0, 10));
+    // `fn` keyword at (1,0).
+    try std.testing.expectEqual(@as(?i64, keyword), findType(toks.items, 1, 0));
+    // `Void` type at (1,3).
+    try std.testing.expectEqual(@as(?i64, typ), findType(toks.items, 1, 3));
+    // `String` type at (1,20).
+    try std.testing.expectEqual(@as(?i64, typ), findType(toks.items, 1, 20));
+    // The interpolated `name` inside `${name}` is code (variable), not string.
+    try std.testing.expectEqual(@as(?i64, variable), findType(toks.items, 1, 43));
+    // The opening quote of the string is a string token.
+    try std.testing.expectEqual(@as(?i64, string), findType(toks.items, 1, 40));
+}
+
 test "lsp document symbols nest struct fields and function parameters" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
@@ -4129,6 +4212,21 @@ fn makeCallHierarchyItemRequest(
             .range = zero,
             .selectionRange = zero,
         } },
+    });
+}
+
+fn makeSemanticTokensRequest(
+    allocator: Allocator,
+    id: i64,
+    uri: []const u8,
+) ![]u8 {
+    return toJsonAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .id = id,
+        .method = "textDocument/semanticTokens/full",
+        .params = .{
+            .textDocument = .{ .uri = uri },
+        },
     });
 }
 

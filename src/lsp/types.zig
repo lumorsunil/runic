@@ -114,6 +114,7 @@ pub const ClientRequestPayload = union(enum) {
     @"textDocument/prepareCallHierarchy": CallHierarchyPrepareParams,
     @"callHierarchy/incomingCalls": CallHierarchyIncomingCallsParams,
     @"callHierarchy/outgoingCalls": CallHierarchyOutgoingCallsParams,
+    @"textDocument/semanticTokens/full": SemanticTokensParams,
     @"textDocument/definition": DefinitionParams,
     @"textDocument/references": ReferenceParams,
     @"textDocument/documentHighlight": DocumentHighlightParams,
@@ -1285,6 +1286,16 @@ pub const SemanticTokensLegend = struct {
 
     /// The token modifiers a server uses.
     tokenModifiers: []const []const u8,
+};
+
+pub const SemanticTokensParams = struct {
+    textDocument: TextDocumentIdentifier,
+};
+
+/// The flat, delta-encoded token stream — five integers per token
+/// (deltaLine, deltaStartChar, length, tokenType, tokenModifiers).
+pub const SemanticTokens = struct {
+    data: []const u32,
 };
 
 pub const MonikerOptions = struct {
