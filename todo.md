@@ -295,7 +295,12 @@
       typed as code, not string).
   - [ ] AST-based refinement: distinguish function names and parameters from
         plain variables, and mark declarations vs. references via token modifiers
-- [ ] richer/robust formatting (current formatter is minimal)
+- [x] richer/robust formatting: re-indents by structural nesting depth (four
+      spaces), string/comment-aware so braces inside strings or comments never
+      shift indentation, and multi-line strings and block comments are left
+      verbatim. Line interiors are preserved (command-argument spacing is
+      significant, so it is never reflowed); blank runs collapse to one; the
+      result is idempotent and run-equivalent on the example scripts.
 
 ## imports
 

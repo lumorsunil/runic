@@ -2545,95 +2545,26 @@ pub const Server = struct {
         };
 
         const text = doc.text;
-        var formatted = std.ArrayList(u8).empty;
-        defer formatted.deinit(self.allocator);
+        const formatted = try formatSource(self.allocator, text);
+        defer self.allocator.free(formatted);
 
-        var i: usize = 0;
-        var indent_level: usize = 0;
-        var in_string = false;
-        var string_char: u8 = '"';
-
-        while (i < text.len) : (i += 1) {
-            const ch = text[i];
-
-            if (!in_string and (ch == '"' or ch == '\'')) {
-                in_string = true;
-                string_char = ch;
-                try formatted.append(self.allocator, ch);
-                continue;
-            }
-
-            if (in_string and ch == string_char and (i == 0 or text[i - 1] != '\\')) {
-                in_string = false;
-                try formatted.append(self.allocator, ch);
-                continue;
-            }
-
-            if (in_string) {
-                try formatted.append(self.allocator, ch);
-                continue;
-            }
-
-            if (ch == '#') {
-                try formatted.append(self.allocator, ch);
-                while (i + 1 < text.len and text[i + 1] != '\n') : (i += 1) {
-                    try formatted.append(self.allocator, text[i + 1]);
-                }
-                if (i + 1 < text.len and text[i + 1] == '\n') {
-                    i += 1;
-                    try formatted.append(self.allocator, '\n');
-                    var j: usize = 0;
-                    while (j < indent_level) : (j += 1) {
-                        try formatted.append(self.allocator, ' ');
-                        try formatted.append(self.allocator, ' ');
-                    }
-                }
-                continue;
-            }
-
-            if (ch == '{') {
-                try formatted.append(self.allocator, ch);
-                try formatted.append(self.allocator, ' ');
-                indent_level += 1;
-                continue;
-            }
-
-            if (ch == '}') {
-                indent_level -= 1;
-                if (formatted.items.len > 1 and formatted.items[formatted.items.len - 1] == ' ') {
-                    _ = formatted.pop();
-                }
-                try formatted.append(self.allocator, ch);
-                continue;
-            }
-
-            if (ch == '\n') {
-                try formatted.append(self.allocator, ch);
-                var j: usize = 0;
-                while (j < indent_level) : (j += 1) {
-                    try formatted.append(self.allocator, ' ');
-                    try formatted.append(self.allocator, ' ');
-                }
-                continue;
-            }
-
-            if (ch == ' ' or ch == '\t') {
-                if (formatted.items.len == 0 or formatted.items[formatted.items.len - 1] == ' ' or formatted.items[formatted.items.len - 1] == '\n' or formatted.items[formatted.items.len - 1] == '{') {
-                    continue;
-                }
-                try formatted.append(self.allocator, ch);
-                continue;
-            }
-
-            try formatted.append(self.allocator, ch);
-        }
+        // Replace the whole document. The end position is the last line index
+        // and the byte length of that last line (columns are byte-based here,
+        // matching the rest of the server), so trailing content on a file with
+        // no final newline is still covered.
+        const last_newline = std.mem.lastIndexOfScalar(u8, text, '\n');
+        const end_line: u32 = @intCast(std.mem.count(u8, text, "\n"));
+        const end_char: u32 = if (last_newline) |idx|
+            @intCast(text.len - (idx + 1))
+        else
+            @intCast(text.len);
 
         const text_edit = types.TextEdit{
             .range = types.Range{
                 .start = .{ .line = 0, .character = 0 },
-                .end = .{ .line = @intCast(std.mem.count(u8, text, "\n")), .character = 0 },
+                .end = .{ .line = end_line, .character = end_char },
             },
-            .newText = formatted.items,
+            .newText = formatted,
         };
 
         try self.sendJson(types.response(id, &.{text_edit}));
@@ -2853,6 +2784,188 @@ pub const Server = struct {
         return try self.allocator.dupe(u8, real);
     }
 };
+
+/// One indentation level. Runic code in the examples and stdlib is written with
+/// four-space indents (matching the host language), so the formatter normalizes
+/// to that.
+const format_indent_unit = "    ";
+
+/// A lexical context the formatter is inside while scanning. Structural
+/// delimiters (`{}`, `()`, `[]`) do not push frames — they only move the indent
+/// depth; frames exist so the scanner can tell string/interpolation text apart
+/// from code and leave it untouched.
+const FormatFrame = union(enum) {
+    /// Inside a string literal opened with this delimiter (`"` or `'`).
+    string: u8,
+    /// Inside a `${ … }` interpolation within a string; the payload is the
+    /// structural brace depth inside the interpolation, so the closing `}` is
+    /// told apart from a `{ … }` written in the interpolated expression.
+    interp: usize,
+};
+
+const FormatState = struct {
+    frames: std.ArrayList(FormatFrame) = .empty,
+    /// Structural indent depth (net open `{`/`(`/`[` at top level).
+    depth: usize = 0,
+    /// Nesting depth of `/* … */` block comments (they nest, per the lexer).
+    block_comment_depth: usize = 0,
+
+    fn deinit(self: *FormatState, allocator: Allocator) void {
+        self.frames.deinit(allocator);
+    }
+
+    /// True when a string or block comment is open across the line boundary, so
+    /// the next line must be emitted verbatim rather than re-indented.
+    fn straddling(self: *const FormatState) bool {
+        return self.block_comment_depth > 0 or self.frames.items.len != 0;
+    }
+};
+
+/// Number of structural closing delimiters at the very start of a line — they
+/// dedent the line itself (e.g. a lone `}` or a `} else {`). Only meaningful in
+/// code mode (the caller guarantees the line does not start mid-string).
+fn formatLeadingClosers(trimmed: []const u8) usize {
+    var count: usize = 0;
+    for (trimmed) |c| switch (c) {
+        ')', ']', '}' => count += 1,
+        ' ', '\t' => {},
+        else => break,
+    };
+    return count;
+}
+
+/// Advance the scanner state over one line of content (no trailing newline),
+/// updating string/comment frames and the structural indent depth.
+fn formatAdvanceLine(state: *FormatState, allocator: Allocator, line: []const u8) !void {
+    var i: usize = 0;
+    while (i < line.len) {
+        const c = line[i];
+        const next: ?u8 = if (i + 1 < line.len) line[i + 1] else null;
+
+        if (state.block_comment_depth > 0) {
+            if (c == '/' and next == '*') {
+                state.block_comment_depth += 1;
+                i += 2;
+            } else if (c == '*' and next == '/') {
+                state.block_comment_depth -= 1;
+                i += 2;
+            } else i += 1;
+            continue;
+        }
+
+        // Inside a string literal: only the closing delimiter, an escape, or the
+        // start of an interpolation are significant.
+        if (state.frames.items.len > 0 and state.frames.items[state.frames.items.len - 1] == .string) {
+            const delim = state.frames.items[state.frames.items.len - 1].string;
+            if (c == '\\') {
+                i += 2;
+            } else if (c == delim) {
+                _ = state.frames.pop();
+                i += 1;
+            } else if (c == '$' and next == '{') {
+                try state.frames.append(allocator, .{ .interp = 0 });
+                i += 2;
+            } else i += 1;
+            continue;
+        }
+
+        // Code mode: either top level, or inside a `${ … }` interpolation.
+        const in_interp = state.frames.items.len > 0;
+        switch (c) {
+            '"', '\'' => {
+                try state.frames.append(allocator, .{ .string = c });
+                i += 1;
+            },
+            '#' => return, // line comment runs to end of line
+            '/' => {
+                if (next == '/') return; // line comment
+                if (next == '*') {
+                    state.block_comment_depth = 1;
+                    i += 2;
+                } else i += 1;
+            },
+            '{' => {
+                if (in_interp) {
+                    state.frames.items[state.frames.items.len - 1].interp += 1;
+                } else state.depth += 1;
+                i += 1;
+            },
+            '(', '[' => {
+                if (!in_interp) state.depth += 1;
+                i += 1;
+            },
+            '}' => {
+                if (in_interp) {
+                    const idx = state.frames.items.len - 1;
+                    if (state.frames.items[idx].interp == 0) {
+                        _ = state.frames.pop(); // end interpolation
+                    } else state.frames.items[idx].interp -= 1;
+                } else if (state.depth > 0) state.depth -= 1;
+                i += 1;
+            },
+            ')', ']' => {
+                if (!in_interp and state.depth > 0) state.depth -= 1;
+                i += 1;
+            },
+            else => i += 1,
+        }
+    }
+}
+
+/// Re-indent a document by structural nesting depth while preserving each line's
+/// interior verbatim (Runic is command-oriented, so inter-argument spacing is
+/// significant and must not be reflowed). Comments and string contents are left
+/// untouched, blank runs are collapsed to a single blank line, trailing
+/// whitespace is trimmed, and the result ends in exactly one newline.
+fn formatSource(allocator: Allocator, text: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+
+    var state = FormatState{};
+    defer state.deinit(allocator);
+
+    var pending_blank = false;
+    var wrote_any = false;
+
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw_line| {
+        // Drop a trailing '\r' so CRLF input is normalized to LF.
+        var line = raw_line;
+        if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+
+        // A line that begins inside a multi-line string or block comment is part
+        // of that literal — emit it exactly as written.
+        if (state.straddling()) {
+            try out.appendSlice(allocator, line);
+            try out.append(allocator, '\n');
+            wrote_any = true;
+            pending_blank = false;
+            try formatAdvanceLine(&state, allocator, line);
+            continue;
+        }
+
+        const trimmed = std.mem.trim(u8, line, " \t");
+        if (trimmed.len == 0) {
+            if (wrote_any) pending_blank = true;
+            continue;
+        }
+
+        if (pending_blank) try out.append(allocator, '\n');
+        pending_blank = false;
+
+        const closers = formatLeadingClosers(trimmed);
+        const indent = if (state.depth > closers) state.depth - closers else 0;
+        var k: usize = 0;
+        while (k < indent) : (k += 1) try out.appendSlice(allocator, format_indent_unit);
+        try out.appendSlice(allocator, trimmed);
+        try out.append(allocator, '\n');
+        wrote_any = true;
+
+        try formatAdvanceLine(&state, allocator, trimmed);
+    }
+
+    return out.toOwnedSlice(allocator);
+}
 
 fn readLine(allocator: Allocator, reader: *std.Io.Reader) ![]u8 {
     // `takeDelimiterInclusive` consumes and returns the trailing '\n'; drop it so

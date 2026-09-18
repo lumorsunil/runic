@@ -60,7 +60,59 @@ test "lsp formatting preserves comments" {
     const edits = parsed.value.object.get("result").?.array.items;
     try std.testing.expect(edits.len > 0);
     const new_text = edits[0].object.get("newText").?.string;
+    // The trailing comment survives verbatim.
     try std.testing.expect(std.mem.indexOf(u8, new_text, "# keep") != null);
+    // The body of the `if` block is indented one level (four spaces).
+    try std.testing.expect(std.mem.indexOf(u8, new_text, "\n    echo foo\n") != null);
+    // The closing brace returns to column zero.
+    try std.testing.expect(std.mem.indexOf(u8, new_text, "\n}\n") != null);
+}
+
+test "lsp formatting is indentation-only and string/comment safe" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    // Braces inside a string and a comment must not shift indentation, and
+    // command-argument spacing inside a line must be preserved verbatim.
+    const source =
+        \\fn Void run() Void {
+        \\echo "a { brace } in a string"   "two   spaces"
+        \\const arr = .{
+        \\"x",
+        \\}
+        \\}
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeFormattingRequest(allocator, 1, uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 1);
+    defer allocator.free(response.body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const edits = parsed.value.object.get("result").?.array.items;
+    try std.testing.expect(edits.len > 0);
+    const new_text = edits[0].object.get("newText").?.string;
+
+    // The `echo` line sits at one level; the brace inside the string did not
+    // push a further level (the array element `"x"` is still at two levels).
+    try std.testing.expect(std.mem.indexOf(u8, new_text, "\n    echo \"a { brace } in a string\"   \"two   spaces\"\n") != null);
+    // The `.{` array literal indents its element one level deeper.
+    try std.testing.expect(std.mem.indexOf(u8, new_text, "\n        \"x\",\n") != null);
+    // Interior command-argument spacing is preserved (not reflowed).
+    try std.testing.expect(std.mem.indexOf(u8, new_text, "\"two   spaces\"") != null);
 }
 
 test "lsp document symbols include real ranges" {

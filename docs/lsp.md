@@ -35,7 +35,17 @@ Today it provides:
   module functions)
 - folding ranges (multi-line statements: functions, structs, control flow)
 - prepare-rename (validates the rename target and pre-fills the identifier)
-- code actions (quick fix: add an inferred type annotation to a binding)
+- code actions — add an inferred type annotation, remove unused bindings
+  (individually and all at once), and diagnostic-linked quick fixes (wrap a bare
+  uppercase type as `|T|`, capitalize a lowercase type name)
+- signature help (the callee's parameter list with the active argument
+  highlighted, for same-file and imported-module functions)
+- call hierarchy for top-level functions (prepare, incoming and outgoing calls)
+- semantic tokens (`textDocument/semanticTokens/full`) classifying keywords,
+  types, variables, numbers, strings, and operators
+- document formatting — re-indents by structural nesting depth while preserving
+  each line's interior verbatim (command-argument spacing is significant), leaves
+  comments and string contents untouched, and collapses blank runs
 - workspace symbol search across all indexed files
 - a workspace index: the first workspace-wide request (symbol search,
   references, rename, cross-file definition) with a client-provided root loads
@@ -177,8 +187,8 @@ That means:
 
 These may happen later, but they are not the immediate focus:
 
-- formatting support
-- semantic tokens beyond basic highlighting support outside the server
+- AST-driven semantic tokens (function/parameter classification, declaration vs.
+  reference modifiers) beyond the current lexer-driven highlighting
 - a wide LSP feature matrix for every editor capability
 - TCP-first workflows for normal development
 
