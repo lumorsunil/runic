@@ -638,6 +638,49 @@ interpreter's depth limit — the program fails to compile with a clear error
 rather than silently falling back to a runtime computation. (Without the
 keyword, `fib 10` is an ordinary runtime call.)
 
+### Comptime type parameters and `type`
+
+A parameter marked `comptime` must be known at compile time, and `type` is a
+first-class comptime value — so a function can take a type, compare it, and
+select a branch during compilation (the untaken branch is discarded):
+
+```rn
+fn Void describe(comptime T: type) String {
+  if (T == Int) { yield "integer" } else { yield "other" }
+}
+echo "${describe Int}"      // integer
+echo "${describe Bool}"     // other
+```
+
+A `comptime T: type` parameter is usable both as a value (`T == Int`) and as a
+type (`x: T`, `[]T`, the return type):
+
+```rn
+fn Void firstOf(comptime T: type, xs: []T) T { yield xs[0] }
+```
+
+### Generic types as comptime functions
+
+A function whose parameters are `comptime` types and whose body `yield`s a type
+is a **generic-type constructor** — the same idea as a generic function, but it
+produces a type:
+
+```rn
+fn Box(comptime T: type) type { yield struct { value: T } }
+const IntBox = Box Int
+const b = IntBox{ .value = 5 }        // b.value : Int
+
+fn Entry(comptime K: type, comptime V: type) type {
+  yield struct { key: K, value: V }
+}
+```
+
+The type it produces resolves like any other: as an annotation and construction
+name in application form (`Box(Int)`, `Box{ … }`, `Box(|T|)` to capture the
+argument), or bound with a value call (`const IntBox = Box Int`). A type written
+in value position (`yield struct { … }`) is compile-time only — it is erased
+before the program runs.
+
 ### Type captures with `|T|`
 
 A type capture `|T|` binds `T` to the type occupying that position, and `T` is

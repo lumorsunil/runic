@@ -240,14 +240,18 @@ Likely near- to mid-term candidates:
 - first-class / anonymous blocks — bare `{ … }` is already an eager
   expression-block, so a lambda form needs distinct syntax; a design decision
 - better user-defined struct/type support
-- **comptime functions returning types** (Zig-style) to supersede the current
-  generic type-constructor form. Today a parameterized type is written
-  `const Box(T) = struct { value: T }`; the intended long-term replacement is a
-  comptime function that returns a type —
-  `fn Box(comptime T: type) type { return struct { value: T } }` — unifying
-  generic types with ordinary functions and comptime evaluation. (Generic type
-  *variables* in signatures are now introduced explicitly with `|T|`; a bare
-  unknown uppercase type name is an error rather than a silent generic.)
+- ~~**comptime functions returning types** (Zig-style) to supersede the current
+  generic type-constructor form~~ — landed: a `comptime` parameter is
+  compile-time known, `type` is a first-class comptime value (comparable, usable
+  in `if`/`match` control flow), and a function that yields a type is a
+  generic-type constructor: `fn Box(comptime T: type) type { yield struct { value:
+  T } }`, then `const IntBox = Box Int; IntBox{ .value = 5 }`. It also resolves in
+  application position (`Box(Int)`), so it is a drop-in for `const Box(T) = …`;
+  `std/map` was migrated to it. The old `const Box(T) = …` form is kept for now
+  (its generic-application type serialization has no new-form equivalent yet);
+  removing it, and type-serializing the new form, is the remaining follow-up.
+  (Generic type *variables* in signatures are introduced explicitly with `|T|`; a
+  bare unknown uppercase type name is an error rather than a silent generic.)
 - support escaping whitespace in bareword executable/identifier syntax so
   commands or names containing spaces can be represented without immediately
   collapsing to quoted-string behavior

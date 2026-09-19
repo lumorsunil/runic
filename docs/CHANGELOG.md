@@ -10,6 +10,37 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **Comptime type parameters and type logic.** A parameter marked `comptime` is
+  known at compile time, and `type` is a first-class comptime value, so an
+  ordinary function can take a type, compare it, and branch on it at compile
+  time — the untaken branch is discarded:
+  ```runic
+  fn Void describe(comptime T: type) String {
+      if (T == Int) { yield "integer" } else { yield "other" }
+  }
+  ```
+  A `comptime T: type` parameter is usable both as a value (`T == Int`) and as a
+  type (`x: T`, `[]T`, the return type).
+- **Type-returning comptime functions (generic types).** A function that takes
+  `comptime` type parameters and `yield`s a type is a generic-type constructor —
+  the Zig-style replacement for the `const Box(T) = struct { … }` form:
+  ```runic
+  fn Box(comptime T: type) type { yield struct { value: T } }
+  const IntBox = Box Int
+  const b = IntBox{ .value = 5 }
+  ```
+  A comptime type function also resolves in application position (`Box(Int)` as an
+  annotation, `Box{ … }` inferred construction, `Box(|T|)` capture), so it is a
+  drop-in for the old constructor form; the standard library's `std/map` generic
+  types were migrated to it. The `const Box(T) = …` form still works (retained
+  for its generic-application type serialization). A type written in value
+  position (`yield struct { … }`) is a compile-time-only *type value*, erased
+  before the runtime.
+
 ## [0.11.0] - 2026-09-18
 
 ### Added
