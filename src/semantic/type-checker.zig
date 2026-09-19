@@ -1969,10 +1969,13 @@ pub const TypeChecker = struct {
         const fn_scope = try self.arena.allocator().create(Scope);
         fn_scope.* = .initWithParent(scope, fn_decl.span);
         try self.declareSignatureTypeVars(scope, fn_scope, fn_decl);
-        // A type-returning comptime function acts as a generic-type constructor:
-        // register it so a `Box Int` call resolves to the yielded type.
+        // A type-returning comptime function acts as a generic-type constructor.
+        // Register it under `comptime_type_fns` so a `Box Int` value call resolves,
+        // and under `generic_type_ctors` so a `Box(Int)` application in a type
+        // position (e.g. a struct field `entries: []Entry(K, V)`) also resolves.
         if (try self.comptimeTypeCtor(fn_decl)) |ctor| {
             try self.comptime_type_fns.put(self.arena.allocator(), identifier.name, ctor);
+            try self.generic_type_ctors.put(self.arena.allocator(), identifier.name, ctor);
         }
 
         const raw_fn_type = try self.resolveExprType(fn_scope, fn_decl);

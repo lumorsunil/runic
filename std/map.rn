@@ -24,9 +24,9 @@
 // makes every `set` slower — see future/maps-plan.md.
 fn Void @() Void
 
-const Entry(K, V) = struct { key: K, value: V }
-const Bucket(K, V) = struct { entries: []Entry(K, V) }
-const Map(K, V) = struct { buckets: []Bucket(K, V), order: []Entry(K, V) }
+fn Entry(comptime K: type, comptime V: type) type { yield struct { key: K, value: V } }
+fn Bucket(comptime K: type, comptime V: type) type { yield struct { entries: []Entry(K, V) } }
+fn Map(comptime K: type, comptime V: type) type { yield struct { buckets: []Bucket(K, V), order: []Entry(K, V) } }
 
 // The bucket a key falls into for a map of `count` buckets: an Int in
 // [0, count). Strings are hashed over their bytes with a polynomial rolling hash
