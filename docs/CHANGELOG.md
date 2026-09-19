@@ -24,7 +24,18 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   }
   ```
   A `comptime T: type` parameter is usable both as a value (`T == Int`) and as a
-  type (`x: T`, `[]T`, the return type).
+  type (`x: T`, `[]T`, the return type). A function with comptime type parameters
+  is **monomorphized** — compiled once per distinct type argument, with the type
+  known at compile time — so the comparison genuinely selects a branch at compile
+  time rather than at runtime.
+- **Comptime type predicates with captures.** A comparison against a type pattern
+  binds a `|capture|` to the matched type argument, usable in the taken branch:
+  ```runic
+  if (T == Box(|E|)) { echo "a box of ${E}" }
+  ```
+  `Box(|E|)` matches any `Box(X)` at compile time, binding `E` to `X` (itself a
+  comptime type, so it can feed further comptime logic like `E == Int`). Patterns
+  nest (`Box(Box(|E|))`) and take multiple captures (`Pair(|A|)(|B|)`).
 - **Type-returning comptime functions (generic types).** A function that takes
   `comptime` type parameters and `yield`s a type is a generic-type constructor —
   the Zig-style replacement for the `const Box(T) = struct { … }` form:

@@ -1,0 +1,7 @@
+box of Int
+box of String
+box of Box(Int)
+pair of Int and Bool
+scalar Int
+box of int
+box of Bool

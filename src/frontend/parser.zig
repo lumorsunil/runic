@@ -3088,6 +3088,21 @@ pub const Parser = struct {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
+        // A type-pattern application carrying a capture (`Box(|B|)`) — used in a
+        // comptime predicate `T == Box(|B|)` to match and bind. The leading `|`
+        // marks it; parse the whole thing as a type value.
+        const lead = try self.peekSlice(2);
+        if (lead.len >= 2 and lead[0].tag == .l_paren and lead[1].tag == .pipe) {
+            var type_args = try self.collectCurriedTypeArgs(callee_id.name);
+            defer type_args.deinit(self.allocator);
+            const app = try self.allocTypeExpression(.{ .type_application = .{
+                .name = callee_id,
+                .args = try self.copyToArena(*const ast.TypeExpr, type_args.items),
+                .span = callee_id.span.endAt(type_args.items[type_args.items.len - 1].span()),
+            } });
+            return self.allocExpression(.{ .type_value = .{ .type_expr = app, .span = app.span() } });
+        }
+
         // Curried, one argument per parenthesis: `Box(Int)`, `HashMap(Key)(Value)`.
         // A comma-separated argument list is not the application syntax.
         var args = std.ArrayList(*ast.Expression).empty;

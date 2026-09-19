@@ -2463,6 +2463,9 @@ pub const IRCompiler = struct {
         return switch (expr.*) {
             .literal => |literal| try self.evalComptimeLiteral(literal),
             .identifier => |identifier| blk: {
+                // A comptime type reference (`T` bound by monomorphization, or a
+                // type name) folds to its serialized name, so `T == Int` reduces.
+                if (try self.comptimeTypeString(expr)) |ts| break :blk .fromValue(ts);
                 const binding = self.lookup(identifier.name, .{ .shallow = false }) orelse break :blk null;
                 if (binding.is_mutable or binding.result.source != .value) break :blk null;
                 break :blk binding.result;
@@ -2491,6 +2494,18 @@ pub const IRCompiler = struct {
                         null;
                 }
                 if (binary.op.isComparison()) {
+                    // A comptime type-pattern predicate: `T == Box(|B|)` matches the
+                    // left type's name against the right pattern, binding `|B|` on a
+                    // hit so the taken branch can use it (`echo "${B}"`).
+                    if ((binary.op == .equal or binary.op == .not_equal) and
+                        binary.right.* == .type_value and hasTypeCapture(binary.right.type_value.type_expr.*))
+                    {
+                        if (try self.comptimeTypeName(binary.left)) |subject| {
+                            defer self.allocator.free(subject);
+                            const matched = try self.matchTypeStringPattern(binary.right.type_value.type_expr.*, subject);
+                            break :blk .fromValue(.fromBoolean(if (binary.op == .equal) matched else !matched));
+                        }
+                    }
                     const left = (try self.evalComptimeExpression(binary.left)) orelse break :blk null;
                     const right = (try self.evalComptimeExpression(binary.right)) orelse break :blk null;
                     if (evaluateCompare(.from(binary.op), left.source, right.source)) |result| {
@@ -2561,12 +2576,71 @@ pub const IRCompiler = struct {
                 defer self.comptime_forcing -= 1;
                 break :blk try self.evalComptimeExpression(comptime_expr.operand);
             },
-            .call => |call| if (self.comptime_forcing > 0)
-                try self.evalComptimeCall(call)
-            else
-                null,
+            .call => |call| blk: {
+                // A comptime type reference (`Box(Int)`, or a bare `T`) folds to
+                // its serialized name.
+                if (try self.comptimeTypeString(expr)) |ts| break :blk .fromValue(ts);
+                break :blk if (self.comptime_forcing > 0) try self.evalComptimeCall(call) else null;
+            },
             else => null,
         };
+    }
+
+    /// A comptime type reference resolved to its serialized name value — a bound
+    /// type param (`T` → `Box(Int)`), a named type (`Int`), a `type_value`, or a
+    /// type application (`Box(Int)`). Null when `expr` is not a comptime type.
+    fn comptimeTypeString(self: *IRCompiler, expr: *const ast.Expression) Error!?ir.Value {
+        // The owned name backs the `zig_string` (compared by value in the folder);
+        // comptime type names are few and small, so keeping them alive is fine.
+        const name = (try self.comptimeTypeName(expr)) orelse return null;
+        return ir.Value{ .zig_string = name };
+    }
+
+    /// The serialized name of a comptime type reference as an owned string (caller
+    /// frees), or null when `expr` is not a comptime type.
+    fn comptimeTypeName(self: *IRCompiler, expr: *const ast.Expression) Error!?[]const u8 {
+        switch (expr.*) {
+            .identifier => |id| {
+                if (self.type_captures.get(id.name)) |t| {
+                    var w = std.Io.Writer.Allocating.init(self.allocator);
+                    defer w.deinit();
+                    try self.writeTypeName(&w.writer, t);
+                    return try self.allocator.dupe(u8, w.written());
+                }
+                if (isPrimitiveTypeName(id.name) or self.isTypeName(id.name)) {
+                    return try self.allocator.dupe(u8, id.name);
+                }
+                return null;
+            },
+            .type_value => |tv| {
+                var w = std.Io.Writer.Allocating.init(self.allocator);
+                defer w.deinit();
+                try self.writeTypeName(&w.writer, tv.type_expr.*);
+                return try self.allocator.dupe(u8, w.written());
+            },
+            .call => |call| {
+                if (call.arguments.len == 0) return try self.comptimeTypeName(call.callee);
+                if (call.callee.* != .identifier or !self.isTypeName(call.callee.identifier.name)) return null;
+                var w = std.Io.Writer.Allocating.init(self.allocator);
+                defer w.deinit();
+                try w.writer.writeAll(call.callee.identifier.name);
+                for (call.arguments) |arg| {
+                    try w.writer.writeByte('(');
+                    const an = (try self.comptimeTypeName(arg)) orelse return null;
+                    defer self.allocator.free(an);
+                    try w.writer.writeAll(an);
+                    try w.writer.writeByte(')');
+                }
+                return try self.allocator.dupe(u8, w.written());
+            },
+            else => return null,
+        }
+    }
+
+    fn isPrimitiveTypeName(name: []const u8) bool {
+        const names = [_][]const u8{ "Int", "String", "Bool", "Float", "Void", "Byte" };
+        for (names) |n| if (std.mem.eql(u8, name, n)) return true;
+        return false;
     }
 
     /// Comptime-evaluates a pure function call (`comptime fib 10`). Resolves the
@@ -5772,6 +5846,34 @@ pub const IRCompiler = struct {
     /// argument types, and return its instruction set. Returns null (use the
     /// generic function) when the callee isn't a specializable candidate or the
     /// type arguments can't be determined.
+    /// The type a comptime type argument denotes, in its written form: a bare
+    /// name (`Int`), a `type_value`, or a generic application kept unresolved
+    /// (`Box(Int)`, so it still serializes as `Box(Int)` and matches structurally
+    /// on demand). Null when the argument is not a type.
+    fn comptimeArgType(self: *IRCompiler, arg: *const ast.Expression) ?ast.TypeExpr {
+        switch (arg.*) {
+            .type_value => |tv| return tv.type_expr.*,
+            .identifier => |id| {
+                const seg = self.allocator.alloc(ast.Identifier, 1) catch return null;
+                seg[0] = id;
+                return ast.TypeExpr{ .identifier = .{ .path = .{ .segments = seg, .span = id.span }, .span = id.span } };
+            },
+            .call => |call| {
+                // A bare type name (`Int`) parses as a zero-argument call.
+                if (call.arguments.len == 0) return self.comptimeArgType(call.callee);
+                if (call.callee.* != .identifier) return null;
+                const args = self.allocator.alloc(*const ast.TypeExpr, call.arguments.len) catch return null;
+                for (call.arguments, args) |a, *dst| {
+                    const t = self.allocator.create(ast.TypeExpr) catch return null;
+                    t.* = self.comptimeArgType(a) orelse return null;
+                    dst.* = t;
+                }
+                return ast.TypeExpr{ .type_application = .{ .name = call.callee.identifier, .args = args, .span = call.callee.identifier.span } };
+            },
+            else => return null,
+        }
+    }
+
     fn maybeSpecialize(
         self: *IRCompiler,
         instr_set: usize,
@@ -5790,7 +5892,13 @@ pub const IRCompiler = struct {
         var capture_names = std.ArrayList([]const u8).empty;
         defer capture_names.deinit(self.allocator);
         for (params) |param| {
-            if (param.type_annotation) |ann| try collectCapturesInType(ann.*, &capture_names, self.allocator);
+            // A `comptime T: type` param monomorphizes the body per type argument:
+            // `T` is bound to that concrete type so `T == …` folds at compile time.
+            if (comptimeTypeParamName(param)) |name| {
+                try capture_names.append(self.allocator, name);
+            } else if (param.type_annotation) |ann| {
+                try collectCapturesInType(ann.*, &capture_names, self.allocator);
+            }
         }
         if (capture_names.items.len == 0) return null;
 
@@ -5806,6 +5914,14 @@ pub const IRCompiler = struct {
 
         // Bind each capture to its argument's concrete type.
         for (params, arguments) |param, arg| {
+            // A `comptime T: type` param binds `T` directly to the type the
+            // argument denotes (`Box(Int)` → the type `Box(Int)`), kept in its
+            // written application form so `${T}` serializes as `Box(Int)`.
+            if (comptimeTypeParamName(param)) |name| {
+                const denoted = self.comptimeArgType(arg) orelse return null;
+                self.type_captures.put(self.allocator, name, denoted) catch {};
+                continue;
+            }
             const ann = param.type_annotation orelse continue;
             if (!hasTypeCapture(ann.*)) continue;
             const arg_type = self.argTypeExpr(arg) orelse return null;
@@ -5948,6 +6064,88 @@ pub const IRCompiler = struct {
         };
     }
 
+    /// One segment of a serialized type pattern: literal text, or a `|capture|`
+    /// hole that binds a (balanced) slice of the subject.
+    const PatternSeg = union(enum) { literal: []const u8, capture: []const u8 };
+
+    /// Serializes a type pattern (`Box(|B|)`) into literal/capture segments —
+    /// `["Box(", capture B, ")"]` — matching the surface form a type serializes
+    /// to, with each `|capture|` left as a hole.
+    fn buildPatternSegs(self: *IRCompiler, t: ast.TypeExpr, segs: *std.ArrayList(PatternSeg), lit: *std.ArrayList(u8)) Error!void {
+        switch (t) {
+            .type_capture => |capture| {
+                if (lit.items.len > 0) {
+                    try segs.append(self.allocator, .{ .literal = try self.allocator.dupe(u8, lit.items) });
+                    lit.clearRetainingCapacity();
+                }
+                try segs.append(self.allocator, .{ .capture = capture.name });
+            },
+            .type_application => |app| {
+                try lit.appendSlice(self.allocator, app.name.name);
+                for (app.args) |arg| {
+                    try lit.append(self.allocator, '(');
+                    try self.buildPatternSegs(arg.*, segs, lit);
+                    try lit.append(self.allocator, ')');
+                }
+            },
+            else => {
+                var w = std.Io.Writer.Allocating.init(self.allocator);
+                defer w.deinit();
+                self.writeTypeName(&w.writer, t) catch {};
+                try lit.appendSlice(self.allocator, w.written());
+            },
+        }
+    }
+
+    /// Matches a serialized type string (the subject, e.g. `"Box(Int)"`) against a
+    /// type pattern, binding each `|capture|` to a balanced slice of the subject
+    /// (in `type_captures`, so `${B}` in the taken branch resolves). Returns
+    /// whether it matched.
+    fn matchTypeStringPattern(self: *IRCompiler, pattern: ast.TypeExpr, subject: []const u8) Error!bool {
+        var segs = std.ArrayList(PatternSeg).empty;
+        defer segs.deinit(self.allocator);
+        var lit = std.ArrayList(u8).empty;
+        defer lit.deinit(self.allocator);
+        try self.buildPatternSegs(pattern, &segs, &lit);
+        if (lit.items.len > 0) try segs.append(self.allocator, .{ .literal = try self.allocator.dupe(u8, lit.items) });
+
+        var bindings = std.ArrayList(struct { name: []const u8, value: []const u8 }).empty;
+        defer bindings.deinit(self.allocator);
+        var pos: usize = 0;
+        for (segs.items, 0..) |seg, i| switch (seg) {
+            .literal => |text| {
+                if (!std.mem.startsWith(u8, subject[pos..], text)) return false;
+                pos += text.len;
+            },
+            .capture => |name| {
+                // Capture a balanced slice up to the parenthesis that closes it.
+                const start = pos;
+                var depth: usize = 0;
+                while (pos < subject.len) : (pos += 1) {
+                    const c = subject[pos];
+                    if (c == '(') depth += 1 else if (c == ')') {
+                        if (depth == 0) break;
+                        depth -= 1;
+                    }
+                }
+                if (i + 1 >= segs.items.len) pos = subject.len;
+                try bindings.append(self.allocator, .{ .name = name, .value = subject[start..pos] });
+            },
+        };
+        if (pos != subject.len) return false;
+
+        // Bind each capture as a type value (an identifier for a bare name, else a
+        // marker) so `${B}` serializes it and `B == …` compares it.
+        for (bindings.items) |b| {
+            const value_name = try self.allocator.dupe(u8, b.value);
+            const seg = try self.allocator.alloc(ast.Identifier, 1);
+            seg[0] = .{ .name = value_name, .span = .global };
+            const t = ast.TypeExpr{ .identifier = .{ .path = .{ .segments = seg, .span = .global }, .span = .global } };
+            self.type_captures.put(self.allocator, b.name, t) catch {};
+        }
+        return true;
+    }
+
     fn bindTypeCaptures(self: *IRCompiler, pattern: ast.TypeExpr, subject: ast.TypeExpr) void {
         switch (pattern) {
             .type_capture => |capture| {
@@ -6014,13 +6212,13 @@ pub const IRCompiler = struct {
             .alias => |al| try self.writeTypeName(w, al.type_expr.*),
             .type_var => |tv| try w.writeAll(tv.name),
             .type_application => |app| {
+                // Curried, one argument per parenthesis: `HashMap(Key)(Value)`.
                 try w.writeAll(app.name.name);
-                try w.writeByte('(');
-                for (app.args, 0..) |arg, i| {
-                    if (i > 0) try w.writeAll(", ");
+                for (app.args) |arg| {
+                    try w.writeByte('(');
                     try self.writeTypeName(w, arg.*);
+                    try w.writeByte(')');
                 }
-                try w.writeByte(')');
             },
             .struct_type => |st| {
                 try w.writeAll("struct { ");
@@ -8850,9 +9048,16 @@ pub const IRCompiler = struct {
     fn fnDeclIsGeneric(fn_decl: ast.FunctionDecl) bool {
         switch (fn_decl.params) {
             ._non_variadic => |ps| for (ps) |p| {
+                // A `comptime T: type` param monomorphizes the body per type
+                // argument (so `T == …` folds and captures bind at compile time),
+                // just like a `|T|` capture.
+                if (comptimeTypeParamName(p) != null) return true;
                 if (p.type_annotation) |ta| if (hasTypeCapture(ta.*)) return true;
             },
-            ._variadic => |p| if (p.type_annotation) |ta| if (hasTypeCapture(ta.*)) return true,
+            ._variadic => |p| {
+                if (comptimeTypeParamName(p) != null) return true;
+                if (p.type_annotation) |ta| if (hasTypeCapture(ta.*)) return true;
+            },
         }
         if (fn_decl.return_type) |rt| if (hasTypeCapture(rt.*)) return true;
         if (fn_decl.stdin_type) |st| if (hasTypeCapture(st.*)) return true;

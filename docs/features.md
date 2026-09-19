@@ -659,6 +659,27 @@ type (`x: T`, `[]T`, the return type):
 fn Void firstOf(comptime T: type, xs: []T) T { yield xs[0] }
 ```
 
+A function with comptime type parameters is **monomorphized** — compiled once per
+distinct type argument, with the type known at compile time — so the branch is
+selected at compile time, not at runtime.
+
+#### Type predicates with captures
+
+A comparison against a type *pattern* binds a `|capture|` to the matched type
+argument, usable in the taken branch:
+
+```rn
+fn Void describe(comptime T: type) String {
+  if (T == Box(|E|)) { yield "box of ${E}" } else { yield "scalar ${T}" }
+}
+echo "${describe Box(Int)}"    // box of Int
+echo "${describe Int}"         // scalar Int
+```
+
+`Box(|E|)` matches any `Box(X)` and binds `E` to `X`. The bound capture is itself
+a comptime type, so it can feed further comptime logic (`E == Int`). Patterns
+nest (`Box(Box(|E|))`) and take multiple captures (`Pair(|A|)(|B|)`).
+
 ### Generic types as comptime functions
 
 A function whose parameters are `comptime` types and whose body `yield`s a type
