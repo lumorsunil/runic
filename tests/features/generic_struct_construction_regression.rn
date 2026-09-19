@@ -1,5 +1,5 @@
-// Explicit-type-argument construction of a generic struct: `Name(A, B){ … }`,
-// symmetric with the type position (`Name(A, B)`). The type arguments don't
+// Explicit-type-argument construction of a generic struct: `Name(A)(B){ … }`,
+// symmetric with the type position (`Name(A)(B)`). The type arguments don't
 // affect the runtime layout; the compiler infers field types from the values.
 // Covers construction at top level, inside a generic function (with |T| capture
 // params), member access on a captured generic struct return, and that a plain
@@ -8,12 +8,12 @@ fn Entry(comptime K: type, comptime V: type) type { yield struct { key: K, value
 fn Pair(comptime A: type, comptime B: type) type { yield struct { first: A, second: B } }
 
 // Top-level explicit-arg construction.
-const p = Pair(Int, String){ .first = 1, .second = "hi" }
+const p = Pair(Int)(String){ .first = 1, .second = "hi" }
 echo "p ${p.first} ${p.second}"
 
 // Inside a generic function, constructing the declared generic return.
-fn Void wrap(k: |K|, v: |V|) Entry(K, V) {
-  yield Entry(K, V){ .key = k, .value = v }
+fn Void wrap(k: |K|, v: |V|) Entry(K)(V) {
+  yield Entry(K)(V){ .key = k, .value = v }
 }
 
 // Member access on a captured generic struct return (const binding).
@@ -21,4 +21,4 @@ const e = wrap "x" 5
 echo "e ${e.key}=${e.value}"
 
 // A plain value type application (no braces) still serializes.
-echo "type=${Pair(Int, String)}"
+echo "type=${Pair(Int)(String)}"

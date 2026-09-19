@@ -36,8 +36,11 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   A comptime type function also resolves in application position (`Box(Int)` as an
   annotation, `Box{ … }` inferred construction, `Box(|T|)` capture) and serializes
   as a type (`${Box}` → `Box`, `${Box(Int)}` → `Box(Int)`), so it is a drop-in for
-  the old constructor form. A type written in value position (`yield struct { … }`)
-  is a compile-time-only *type value*, erased before the runtime.
+  the old constructor form. Multiple type arguments are applied like any call —
+  `HashMap Key Value` (space) or curried `HashMap(Key)(Value)`, one argument per
+  parenthesis — not `HashMap(Key, Value)`, which reports a directed error. A type
+  written in value position (`yield struct { … }`) is a compile-time-only *type
+  value*, erased before the runtime.
 
 ### Changed
 

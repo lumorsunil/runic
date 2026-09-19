@@ -210,12 +210,13 @@ pub const TypeExpr = union(enum) {
         span: Span,
 
         pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
-            try writer.print("{s}(", .{self.name.name});
-            for (self.args, 0..) |arg, i| {
-                if (i > 0) try writer.writeAll(", ");
+            // Curried, one argument per parenthesis: `HashMap(Key)(Value)`.
+            try writer.print("{s}", .{self.name.name});
+            for (self.args) |arg| {
+                try writer.writeAll("(");
                 try arg.format(writer);
+                try writer.writeAll(")");
             }
-            try writer.writeAll(")");
         }
     };
 

@@ -19,8 +19,8 @@ echo "int=${unwrap bi} str=${unwrap bs}"
 
 // A multi-parameter constructor, capturing one of two arguments.
 fn Pair(comptime A: type, comptime B: type) type { yield struct { first: A, second: B } }
-fn Void firstOf(p: Pair(|X|, |Y|)) X { yield p.first }
-const pr: Pair(Int, String) = Pair{ .first = 7, .second = "world" }
+fn Void firstOf(p: Pair(|X|)(|Y|)) X { yield p.first }
+const pr: Pair(Int)(String) = Pair{ .first = 7, .second = "world" }
 echo "first=${firstOf pr} second=${pr.second}"
 
 // Capture the type argument in a binding, then reuse it.

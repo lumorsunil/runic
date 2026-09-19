@@ -677,9 +677,12 @@ fn Entry(comptime K: type, comptime V: type) type {
 
 The type it produces resolves like any other: as an annotation and construction
 name in application form (`Box(Int)`, `Box{ … }`, `Box(|T|)` to capture the
-argument), or bound with a value call (`const IntBox = Box Int`). A type written
-in value position (`yield struct { … }`) is compile-time only — it is erased
-before the program runs.
+argument), or bound with a value call (`const IntBox = Box Int`). A generic type
+is applied like any call, so multiple arguments are written `Entry Key Value`
+(space) or curried `Entry(Key)(Value)` — one argument per parenthesis — **not**
+`Entry(Key, Value)`, which is a compile error. A type written in value position
+(`yield struct { … }`) is compile-time only — it is erased before the program
+runs.
 
 ### Type captures with `|T|`
 

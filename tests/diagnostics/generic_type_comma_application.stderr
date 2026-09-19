@@ -1,0 +1,5 @@
+[error]: tests/diagnostics/generic_type_comma_application.rn:2:25: type arguments are applied one per parenthesis: write `HashMap(A)(B)`, not `HashMap(A, B)`
+   1:fn HashMap(comptime K: type, comptime V: type) type { yield struct { k: K, v: V } }
+   2:const M = HashMap(String, Int)
+   3:
+

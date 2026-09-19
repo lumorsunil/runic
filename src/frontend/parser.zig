@@ -3088,16 +3088,34 @@ pub const Parser = struct {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
-        _ = try self.expect(.l_paren);
-        const args = try self.parseList(.comma, parseExpression, .{});
-        const close = try self.expect(.r_paren);
+        // Curried, one argument per parenthesis: `Box(Int)`, `HashMap(Key)(Value)`.
+        // A comma-separated argument list is not the application syntax.
+        var args = std.ArrayList(*ast.Expression).empty;
+        defer args.deinit(self.allocator);
+        var end = callee_id.span;
+        while ((try self.peekToken()).tag == .l_paren) {
+            _ = try self.expect(.l_paren);
+            try args.append(self.allocator, try self.parseExpression());
+            if ((try self.peekToken()).tag == .comma) {
+                const comma = try self.peekToken();
+                try self.reportParseError(
+                    Error.UnexpectedToken,
+                    comma.span,
+                    "type arguments are applied one per parenthesis: write `{s}(A)(B)`, not `{s}(A, B)`",
+                    .{ callee_id.name, callee_id.name },
+                );
+                return Error.UnexpectedToken;
+            }
+            const close = try self.expect(.r_paren);
+            end = close.span;
+        }
 
         return self.allocExpression(.{ .call = .{
             .callee = try self.allocExpression(.{ .identifier = callee_id }),
-            .arguments = args.payload,
+            .arguments = try self.copyToArena(*ast.Expression, args.items),
             .redirects = &.{},
             .background = false,
-            .span = callee_id.span.endAt(close.span),
+            .span = callee_id.span.endAt(end),
         } });
     }
 
@@ -4068,15 +4086,16 @@ pub const Parser = struct {
             return Error.ExpectedTypeIdentifier;
         }
 
-        // A generic type application `Name(args…)` — e.g. `Box(Int)`, `Box(|T|)`.
+        // A generic type application, curried one argument per parenthesis:
+        // `Box(Int)`, `HashMap(Key)(Value)`. A comma-separated `HashMap(Key, Value)`
+        // is not the application syntax — a generic type is applied like any call.
         if ((try self.peekToken()).tag == .l_paren) {
-            _ = try self.expectTokenTag(.l_paren);
-            const args = try self.parseList(.comma, parseTypeExprArg, .{});
-            const close = try self.expectTokenTag(.r_paren);
+            var args = try self.collectCurriedTypeArgs(last_segment.name);
+            defer args.deinit(self.allocator);
             return self.allocTypeExpression(.{ .type_application = .{
                 .name = last_segment,
-                .args = args.payload,
-                .span = spanned_path.span.endAt(close.span),
+                .args = try self.copyToArena(*const ast.TypeExpr, args.items),
+                .span = spanned_path.span.endAt(args.items[args.items.len - 1].span()),
             } });
         }
 
@@ -4088,6 +4107,33 @@ pub const Parser = struct {
 
     /// A single type argument inside a `Name(args…)` application. Wraps
     /// `parseTypeExpr` for use with `parseList` (which expects a `*const` result).
+    /// Collects the curried type arguments of a generic application —
+    /// `(A)(B)(C)` → `[A, B, C]`, one argument per parenthesis. A comma inside a
+    /// parenthesis (`Name(A, B)`) is rejected with a directed error, since a
+    /// generic type is applied like any call, not with a parenthesized argument
+    /// list. Caller owns the returned list.
+    fn collectCurriedTypeArgs(self: *Self, name: []const u8) Error!std.ArrayList(*const ast.TypeExpr) {
+        var args = std.ArrayList(*const ast.TypeExpr).empty;
+        errdefer args.deinit(self.allocator);
+        while ((try self.peekToken()).tag == .l_paren) {
+            _ = try self.expectTokenTag(.l_paren);
+            const arg = try self.parseTypeExprArg();
+            try args.append(self.allocator, arg);
+            if ((try self.peekToken()).tag == .comma) {
+                const comma = try self.peekToken();
+                try self.reportParseError(
+                    Error.UnexpectedToken,
+                    comma.span,
+                    "type arguments are applied one per parenthesis: write `{s}(A)(B)`, not `{s}(A, B)`",
+                    .{ name, name },
+                );
+                return Error.UnexpectedToken;
+            }
+            _ = try self.expectTokenTag(.r_paren);
+        }
+        return args;
+    }
+
     fn parseTypeExprArg(self: *Self) Error!*const ast.TypeExpr {
         return self.parseTypeExpr();
     }

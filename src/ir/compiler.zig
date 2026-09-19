@@ -6079,13 +6079,11 @@ pub const IRCompiler = struct {
         var alloc_writer = std.Io.Writer.Allocating.init(self.allocator);
         defer alloc_writer.deinit();
         const w = &alloc_writer.writer;
+        // Curried, one argument per parenthesis: `HashMap(Key)(Value)`.
         try w.writeAll(name);
-        if (call.arguments.len > 0) {
+        for (call.arguments) |arg| {
             try w.writeByte('(');
-            for (call.arguments, 0..) |arg, i| {
-                if (i > 0) try w.writeAll(", ");
-                try self.writeArgTypeName(w, arg);
-            }
+            try self.writeArgTypeName(w, arg);
             try w.writeByte(')');
         }
         return try self.addSlice(1, alloc_writer.written());

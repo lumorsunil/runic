@@ -47,8 +47,8 @@ echo "${Box(Int)}"
 echo "${Box(String)}"
 echo "${Box(Box(Int))}"
 fn Pair(comptime A: type, comptime B: type) type { yield struct { first: A, second: B } }
-echo "${Pair(Int, String)}"
-echo "${Pair(Box(Int), Bool)}"
+echo "${Pair(Int)(String)}"
+echo "${Pair(Box(Int))(Bool)}"
 
 // An array literal infers its element type, so a capture over it is concrete.
 const nums: |N| = .{ 1, 2, 3 }
