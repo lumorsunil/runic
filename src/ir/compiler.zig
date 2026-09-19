@@ -692,6 +692,11 @@ pub const IRCompiler = struct {
     /// A generic type constructor's type parameters, by name — so an application
     /// `Box(Int)` can substitute its arguments into the registered struct body.
     generic_ctor_params: std.StringHashMapUnmanaged([]const ast.Identifier) = .empty,
+    /// Names of comptime type functions (`fn Box(comptime T: type) type { … }`)
+    /// and their result bindings (`const IntBox = Box Int`). Both are compile-time
+    /// only — they resolve to types and emit no runtime code, so they are erased
+    /// when compiled as statements.
+    comptime_type_names: std.StringHashMapUnmanaged(void) = .empty,
     /// Recursion-depth cap for comptime call interpretation. Kept well below the
     /// point where the interpreter's own (native) call stack would overflow, so
     /// a non-terminating `comptime` recursion fails to compile instead of
@@ -1302,20 +1307,132 @@ pub const IRCompiler = struct {
     /// construction, member access, and applications resolve.
     fn registerTypeDecls(self: *IRCompiler, statements: []const *ast.Statement) Allocator.Error!void {
         for (statements) |stmt| {
-            if (stmt.* != .type_binding_decl) continue;
-            const decl = stmt.type_binding_decl;
-            switch (decl.type_expr.*) {
-                .error_set => |es| try self.error_sets.put(self.allocator, decl.identifier.name, es),
-                .struct_type => |st| {
-                    try self.user_struct_types.put(self.allocator, decl.identifier.name, st);
-                    // Record a generic constructor's type parameters so an
-                    // application (`Box(Int)`) can substitute the arguments.
-                    if (decl.params.len > 0) {
-                        try self.generic_ctor_params.put(self.allocator, decl.identifier.name, decl.params);
+            switch (stmt.*) {
+                .type_binding_decl => |decl| switch (decl.type_expr.*) {
+                    .error_set => |es| try self.error_sets.put(self.allocator, decl.identifier.name, es),
+                    .struct_type => |st| {
+                        try self.user_struct_types.put(self.allocator, decl.identifier.name, st);
+                        // Record a generic constructor's type parameters so an
+                        // application (`Box(Int)`) can substitute the arguments.
+                        if (decl.params.len > 0) {
+                            try self.generic_ctor_params.put(self.allocator, decl.identifier.name, decl.params);
+                        }
+                    },
+                    else => {},
+                },
+                // A comptime type function (`fn Box(comptime T: type) type { yield
+                // struct { … } }`) is a generic-type constructor: register its
+                // yielded struct body and type params so a `Box Int` call resolves.
+                .expression => |es| if (es.expression.* == .fn_decl) {
+                    const fn_decl = es.expression.fn_decl;
+                    if (fn_decl.name) |name| if (self.comptimeTypeCtorBody(fn_decl)) |body| {
+                        try self.user_struct_types.put(self.allocator, name.name, body.struct_type);
+                        try self.generic_ctor_params.put(self.allocator, name.name, body.params);
+                        try self.comptime_type_names.put(self.allocator, name.name, {});
+                    };
+                },
+                // A comptime type-function call bound to a name (`const IntBox =
+                // Box Int`) resolves to a concrete struct — register it so a later
+                // `IntBox{ … }` construction uses that struct.
+                .binding_decl => |bd| if (bd.pattern.* == .identifier) {
+                    if (self.evalComptimeTypeCall(bd.initializer)) |resolved| {
+                        if (resolved == .struct_type) {
+                            try self.user_struct_types.put(self.allocator, bd.pattern.identifier.name, resolved.struct_type);
+                            try self.comptime_type_names.put(self.allocator, bd.pattern.identifier.name, {});
+                        }
                     }
                 },
                 else => {},
             }
+        }
+    }
+
+    /// A comptime type function's yielded struct body and type parameters, or null
+    /// when `fn_decl` is not one (mirrors the type checker's `comptimeTypeCtor`).
+    fn comptimeTypeCtorBody(self: *IRCompiler, fn_decl: ast.FunctionDecl) ?struct { struct_type: ast.TypeExpr.StructType, params: []const ast.Identifier } {
+        const return_type = fn_decl.return_type orelse return null;
+        if (return_type.* != .type_type) return null;
+        const body = yieldedStructType(fn_decl.body) orelse return null;
+        var names = std.ArrayList(ast.Identifier).empty;
+        switch (fn_decl.params) {
+            ._non_variadic => |params| for (params) |param| {
+                if (comptimeTypeParamName(param)) |name| names.append(self.allocator, .{ .name = name, .span = param.span }) catch return null;
+            },
+            ._variadic => |param| if (comptimeTypeParamName(param)) |name| names.append(self.allocator, .{ .name = name, .span = param.span }) catch return null,
+        }
+        if (names.items.len == 0) return null;
+        return .{ .struct_type = body, .params = names.toOwnedSlice(self.allocator) catch return null };
+    }
+
+    /// The struct type a `fn … type` body yields (a bare or block `yield struct {
+    /// … }`), or null.
+    fn yieldedStructType(body: *const ast.Expression) ?ast.TypeExpr.StructType {
+        const type_expr = switch (body.*) {
+            .type_value => |tv| tv.type_expr,
+            .block => |block| blk: {
+                var found: ?*const ast.TypeExpr = null;
+                for (block.statements) |stmt| {
+                    if (stmt.* == .yield_stmt and stmt.yield_stmt.value.* == .type_value) {
+                        found = stmt.yield_stmt.value.type_value.type_expr;
+                    }
+                }
+                break :blk found orelse return null;
+            },
+            else => return null,
+        };
+        return if (type_expr.* == .struct_type) type_expr.struct_type else null;
+    }
+
+    /// The bound name of a `comptime T: type` parameter, or null.
+    fn comptimeTypeParamName(param: *const ast.Parameter) ?[]const u8 {
+        if (!param.is_comptime) return null;
+        const annotation = param.type_annotation orelse return null;
+        if (annotation.* != .type_type) return null;
+        return switch (param.pattern.*) {
+            .identifier => |id| id.name,
+            else => null,
+        };
+    }
+
+    /// Evaluates a comptime type-function call (`Box Int`) to the concrete struct
+    /// type it produces, or null when `expr` is not such a call.
+    fn evalComptimeTypeCall(self: *IRCompiler, expr: *const ast.Expression) ?ast.TypeExpr {
+        if (expr.* != .call) return null;
+        const call = expr.call;
+        if (call.callee.* != .identifier) return null;
+        const body_st = self.user_struct_types.get(call.callee.identifier.name) orelse return null;
+        if (!self.comptime_type_names.contains(call.callee.identifier.name)) return null;
+        const params = self.generic_ctor_params.get(call.callee.identifier.name) orelse &[_]ast.Identifier{};
+        if (call.arguments.len != params.len) return null;
+        const args = self.allocator.alloc(*const ast.TypeExpr, call.arguments.len) catch return null;
+        for (call.arguments, args) |arg, *dst| {
+            dst.* = self.argToTypeExpr(arg) orelse return null;
+        }
+        return self.substituteTypeParams(.{ .struct_type = body_st }, params, args) catch null;
+    }
+
+    /// The type a comptime call argument denotes (`Int` → the type Int). Bare type
+    /// names parse as zero-arg calls, which are unwrapped to their callee.
+    fn argToTypeExpr(self: *IRCompiler, arg: *const ast.Expression) ?*const ast.TypeExpr {
+        switch (arg.*) {
+            .type_value => |tv| return tv.type_expr,
+            .identifier => |id| {
+                const segments = self.allocator.alloc(ast.Identifier, 1) catch return null;
+                segments[0] = id;
+                const t = self.allocator.create(ast.TypeExpr) catch return null;
+                t.* = .{ .identifier = .{ .path = .{ .segments = segments, .span = id.span }, .span = id.span } };
+                return t;
+            },
+            .call => |call| {
+                if (call.arguments.len == 0) return self.argToTypeExpr(call.callee);
+                if (self.evalComptimeTypeCall(arg)) |resolved| {
+                    const t = self.allocator.create(ast.TypeExpr) catch return null;
+                    t.* = resolved;
+                    return t;
+                }
+                return null;
+            },
+            else => return null,
         }
     }
 
@@ -1501,11 +1618,28 @@ pub const IRCompiler = struct {
         // try self.addInstruction(.{ .type = .{ .comment = comment_message } });
     }
 
+    /// Whether a statement declares a comptime type function or binds the result
+    /// of a comptime type call — both erased at compile time.
+    fn isComptimeTypeStatement(self: *IRCompiler, stmt: *const ast.Statement) bool {
+        return switch (stmt.*) {
+            .expression => |es| es.expression.* == .fn_decl and
+                es.expression.fn_decl.name != null and
+                self.comptime_type_names.contains(es.expression.fn_decl.name.?.name),
+            .binding_decl => |bd| bd.pattern.* == .identifier and
+                self.comptime_type_names.contains(bd.pattern.identifier.name),
+            else => false,
+        };
+    }
+
     fn compileStatement(
         self: *IRCompiler,
         stmt: *ast.Statement,
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(stmt.span()), @src().fn_name });
+
+        // A comptime type function (`fn Box(…) type`) or its result binding
+        // (`const IntBox = Box Int`) is compile-time only — erase it.
+        if (self.isComptimeTypeStatement(stmt)) return Result.fromValue(.void);
 
         return switch (stmt.*) {
             .type_binding_decl => Result.fromValue(.void),
@@ -2212,6 +2346,10 @@ pub const IRCompiler = struct {
             .comptime_expr => |comptime_expr| self.compileComptimeExpr(expr, comptime_expr),
             .subshell => |subshell| self.compileSubshell(expr, subshell),
             .fd => |fd_expr| self.compileFd(expr, fd_expr),
+            // A type written in value position is compile-time only; it produces
+            // no runtime value (a type-returning comptime function is never
+            // actually invoked at runtime — its calls resolve to types).
+            .type_value => .fromValue(.void),
             else => {
                 try self.reportSourceError(expr, Error.UnsupportedExpression, .@"error", "expression type \"{t}\" not yet supported", .{expr.*});
                 return .fromValue(.void);

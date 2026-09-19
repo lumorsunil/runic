@@ -659,6 +659,16 @@ pub const Parser = struct {
         return result;
     }
 
+    /// Parses a type written in value position (`struct { … }`) into a
+    /// `type_value` expression — a type produced as a value.
+    fn parseTypeValueExpression(self: *Self) Error!*ast.Expression {
+        const type_expr = try self.parseTypeExpr();
+        return self.allocExpression(.{ .type_value = .{
+            .type_expr = type_expr,
+            .span = type_expr.span(),
+        } });
+    }
+
     fn parseExpressionInner(self: *Self) Error!*ast.Expression {
         self.clearExpectedTokens();
 
@@ -675,6 +685,9 @@ pub const Parser = struct {
             .kw_comptime => self.parseComptimeExpression(),
             .kw_match => self.parseMatchExpression(),
             .kw_try => self.parseTryExpression(),
+            // A type written in value position (`yield struct { … }`) is a type
+            // value — the result of a type-returning comptime function.
+            .kw_struct => self.parseTypeValueExpression(),
             else => {
                 if (try self.parseMaybeUnaryExpression()) |unary_expr| return unary_expr;
                 if (try self.parseMaybeBinaryExpression()) |binary_expr| return binary_expr;
@@ -2704,6 +2717,19 @@ pub const Parser = struct {
         const next = try self.peekToken();
         if (next.tag != .kw_fn) return null;
 
+        // A regular named function `fn name(…)` (an identifier other than `@`
+        // directly followed by `(`) is not a script signature (`fn [stdin] @(…)`).
+        // Bail before speculatively parsing a stdin type, which would hard-error
+        // on a lowercase name (`fn greet(…)`) instead of rolling back.
+        const lookahead = try self.peekSlice(3);
+        if (lookahead.len >= 3 and
+            lookahead[1].tag == .identifier and
+            !std.mem.eql(u8, lookahead[1].lexeme, "@") and
+            lookahead[2].tag == .l_paren)
+        {
+            return null;
+        }
+
         var snapshot = try self.takeSnapshot();
         defer snapshot.deinit();
 
@@ -3347,6 +3373,16 @@ pub const Parser = struct {
         _ = try self.expectTokenTag(.assign);
         const type_expr = try self.parseTypeExpr();
 
+        // The type must be the whole right-hand side. Trailing tokens mean this
+        // is not a plain type binding but a value binding whose initializer is a
+        // call — e.g. `const IntBox = Box Int` (a comptime type-function call).
+        // Fail (without reporting) so `parseTry` rolls back and it is re-parsed
+        // as a value binding.
+        switch ((try self.peekToken()).tag) {
+            .newline, .semicolon, .eof, .r_brace => {},
+            else => return Error.UnexpectedToken,
+        }
+
         return .{
             .span = start.span.endAt(type_expr.span()),
             .identifier = identifier,
@@ -3534,7 +3570,15 @@ pub const Parser = struct {
 
         const fn_token = try self.expectTokenTag(.kw_fn);
         const start = pub_token orelse fn_token;
-        const stdinType = try self.parseMaybeTypeExpr();
+
+        // Disambiguate `fn name(…)` (no stdin type) from `fn StdinType name(…)`.
+        // When `fn` is directly followed by `<identifier> (`, that identifier is
+        // the function name and there is no stdin type — otherwise `fn Box(…)`
+        // would be misread as a `Box(…)` type application in stdin-type position.
+        const lookahead = try self.peekSlice(2);
+        const name_first = lookahead.len >= 2 and
+            lookahead[0].tag == .identifier and lookahead[1].tag == .l_paren;
+        const stdinType = if (name_first) null else try self.parseMaybeTypeExpr();
         const identifier = try self.expectTokenTag(.identifier);
         _ = try self.expectTokenTag(.l_paren);
         const params = try self.parseList(.comma, parseParam, .{

@@ -717,6 +717,8 @@ pub const TypeExpr = union(enum) {
     const executableReturnType = TypeExpr{
         .execution = .{ .span = .global },
     };
+    /// The meta-type `type` — the type of a type value.
+    pub const typeType = TypeExpr{ .type_type = .{ .span = .global } };
     pub const executableType = TypeExpr{
         .function = .{
             .params = .variadic(&executableParameterType),
@@ -909,6 +911,7 @@ pub const Expression = union(enum) {
     builtin: BuiltinExpr,
     subshell: SubshellExpr,
     fd: FdExpr,
+    type_value: TypeValueExpr,
 
     pub fn span(self: Expression) Span {
         return switch (self) {
@@ -2101,6 +2104,24 @@ pub const ExecutableExpr = struct {
         _: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
         return &TypeExpr.executableType;
+    }
+};
+
+/// A type written in value position — `struct { … }`, `error { … }`, etc. — so a
+/// type can be produced as a value (`yield struct { value: T }` in a
+/// type-returning comptime function). Its value is the wrapped type; its own
+/// type is the meta-type `type`. Compile-time only (erased before the IR).
+pub const TypeValueExpr = struct {
+    type_expr: *const TypeExpr,
+    span: Span,
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.Io,
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*const TypeExpr {
+        return &TypeExpr.typeType;
     }
 };
 

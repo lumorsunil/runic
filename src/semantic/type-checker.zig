@@ -23,6 +23,12 @@ pub const TypeChecker = struct {
     /// User-defined generic type constructors (`const Box(T) = struct { … }`),
     /// keyed by name. A `Box(Int)` application substitutes the args into `body`.
     generic_type_ctors: std.StringHashMapUnmanaged(GenericTypeCtor) = .empty,
+    /// Comptime type functions — an ordinary function whose comptime type params
+    /// and `yield`ed type make it a generic-type constructor
+    /// (`fn Box(comptime T: type) type { yield struct { value: T } }`). Keyed by
+    /// name; a `Box Int` call substitutes the args into the yielded type. The
+    /// Zig-native replacement for `generic_type_ctors`.
+    comptime_type_fns: std.StringHashMapUnmanaged(GenericTypeCtor) = .empty,
     env: ?*std.process.Environ.Map = null,
     /// Strict mode (`--strict`): also require handling of command failures
     /// (`ExecutableError`), which are otherwise exempt (bash-like exit-code
@@ -165,6 +171,7 @@ pub const TypeChecker = struct {
         self.modules = .empty;
         self.diagnostics = .empty;
         self.generic_type_ctors = .empty;
+        self.comptime_type_fns = .empty;
         // These collections are arena-backed, so `reset(.free_all)` just freed
         // their storage: clear the now-dangling headers too, otherwise the next
         // pass appends into freed memory (a segfault the moment a function body
@@ -1239,6 +1246,15 @@ pub const TypeChecker = struct {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, binding_decl.span);
 
+        // A comptime type-function call (`const IntBox = Box Int`) evaluates to a
+        // concrete type at compile time; bind the name as that type, so a later
+        // `IntBox{ … }` construction resolves it like any other type binding.
+        if (try self.evalComptimeTypeCall(scope, binding_decl.initializer)) |type_result| {
+            try self.runTypeExpression(scope, type_result);
+            try self.runBindingPattern(scope, binding_decl.pattern, type_result, binding_decl.is_pub, binding_decl.is_mutable);
+            return;
+        }
+
         // Inferred struct literal: `const v: Vector = .{ .x = 3 }` parses as an
         // anonymous struct literal (empty name); take its type from the binding's
         // annotation by stamping the annotation's type name onto the literal, so
@@ -1819,6 +1835,94 @@ pub const TypeChecker = struct {
         };
     }
 
+    /// The type a `yield`ed type-value expression denotes — the body of a
+    /// type-returning function. Handles a bare `yield <type>` and a block whose
+    /// last `yield` produces a type. Null when the body does not simply yield a
+    /// type (a more complex comptime body is not reduced to a constructor).
+    fn yieldedType(body: *const ast.Expression) ?*const ast.TypeExpr {
+        switch (body.*) {
+            .type_value => |tv| return tv.type_expr,
+            .block => |block| {
+                var found: ?*const ast.TypeExpr = null;
+                for (block.statements) |stmt| {
+                    if (stmt.* == .yield_stmt and stmt.yield_stmt.value.* == .type_value) {
+                        found = stmt.yield_stmt.value.type_value.type_expr;
+                    }
+                }
+                return found;
+            },
+            else => return null,
+        }
+    }
+
+    /// If `fn_decl` is a comptime type function — returns `type`, has one or more
+    /// `comptime T: type` params, and `yield`s a type — the generic-type
+    /// constructor it is equivalent to (params + yielded body). Null otherwise.
+    fn comptimeTypeCtor(self: *TypeChecker, fn_decl: *const ast.FunctionDecl) Error!?GenericTypeCtor {
+        const return_type = fn_decl.return_type orelse return null;
+        if (return_type.* != .type_type) return null;
+        const body_type = yieldedType(fn_decl.body) orelse return null;
+
+        var names: std.ArrayListUnmanaged(ast.Identifier) = .empty;
+        switch (fn_decl.params) {
+            ._non_variadic => |params| for (params) |param| {
+                if (comptimeTypeParamName(param)) |name| {
+                    try names.append(self.arena.allocator(), .{ .name = name, .span = param.span });
+                }
+            },
+            ._variadic => |param| if (comptimeTypeParamName(param)) |name| {
+                try names.append(self.arena.allocator(), .{ .name = name, .span = param.span });
+            },
+        }
+        if (names.items.len == 0) return null;
+        return .{ .params = try names.toOwnedSlice(self.arena.allocator()), .body = body_type };
+    }
+
+    /// The type a comptime call argument denotes (`Int` → the type Int, a nested
+    /// `Box Int` → its result type). Null when the argument is not a type.
+    fn argToType(self: *TypeChecker, scope: *Scope, arg: *const ast.Expression) Error!?*const ast.TypeExpr {
+        switch (arg.*) {
+            .type_value => |tv| return tv.type_expr,
+            .identifier => |id| {
+                const segments = try self.arena.allocator().alloc(ast.Identifier, 1);
+                segments[0] = id;
+                const named = try self.allocTypeExpression(.{ .identifier = .{
+                    .path = .{ .segments = segments, .span = id.span },
+                    .span = id.span,
+                } });
+                return try self.resolveTypeExpr(scope, named);
+            },
+            .call => |call| {
+                // A bare type name (`Int`) parses as a zero-argument call; unwrap
+                // it to its callee. A call with arguments is a nested comptime type
+                // call (`Box (Box Int)`).
+                if (call.arguments.len == 0) return try self.argToType(scope, call.callee);
+                return try self.evalComptimeTypeCall(scope, arg);
+            },
+            else => return null,
+        }
+    }
+
+    /// Evaluates a call to a comptime type function (`Box Int`) to the concrete
+    /// type it produces, substituting the type arguments into the yielded body.
+    /// Null when `expr` is not such a call.
+    fn evalComptimeTypeCall(self: *TypeChecker, scope: *Scope, expr: *const ast.Expression) Error!?*const ast.TypeExpr {
+        if (expr.* != .call) return null;
+        const call = expr.call;
+        if (call.callee.* != .identifier) return null;
+        const ctor = self.comptime_type_fns.get(call.callee.identifier.name) orelse {
+            return null;
+        };
+        if (call.arguments.len != ctor.params.len) {
+            return null;
+        }
+        const args = try self.arena.allocator().alloc(*const ast.TypeExpr, call.arguments.len);
+        for (call.arguments, args) |arg, *dst| {
+            dst.* = (try self.argToType(scope, arg)) orelse return null;
+        }
+        return try self.substituteTypeParams(ctor.body, ctor.params, args);
+    }
+
     fn declareSignatureTypeVars(
         self: *TypeChecker,
         scope: *Scope,
@@ -1865,6 +1969,12 @@ pub const TypeChecker = struct {
         const fn_scope = try self.arena.allocator().create(Scope);
         fn_scope.* = .initWithParent(scope, fn_decl.span);
         try self.declareSignatureTypeVars(scope, fn_scope, fn_decl);
+        // A type-returning comptime function acts as a generic-type constructor:
+        // register it so a `Box Int` call resolves to the yielded type.
+        if (try self.comptimeTypeCtor(fn_decl)) |ctor| {
+            try self.comptime_type_fns.put(self.arena.allocator(), identifier.name, ctor);
+        }
+
         const raw_fn_type = try self.resolveExprType(fn_scope, fn_decl);
         const resolved_fn_type = if (raw_fn_type) |t| try self.resolveTypeExpr(fn_scope, t) else null;
         try scope.declare(self.arena.allocator(), identifier, resolved_fn_type, fn_decl.is_pub, false);
@@ -2099,7 +2209,7 @@ pub const TypeChecker = struct {
             .struct_literal => |struct_literal| for (struct_literal.fields) |field| {
                 try self.validateFunctionBodyStdin(scope, field.value, enclosing_stdin);
             },
-            .fn_decl, .identifier, .env_var, .path, .literal, .pipeline_deprecated, .import_expr, .cimport_expr, .executable, .builtin, .fd => {},
+            .fn_decl, .identifier, .env_var, .path, .literal, .pipeline_deprecated, .import_expr, .cimport_expr, .executable, .builtin, .fd, .type_value => {},
         }
     }
 
@@ -2347,6 +2457,9 @@ pub const TypeChecker = struct {
             .comptime_expr => |*comptime_expr| self.runExpression(scope, comptime_expr.operand),
             .subshell => |*subshell| self.runExpression(scope, subshell.child),
             .fd => |*fd_expr| self.runFd(scope, fd_expr),
+            // A type written in value position: validate the type it denotes so
+            // its parts (a struct field's type, a `comptime T` reference) resolve.
+            .type_value => |*type_value| self.runTypeExpression(scope, type_value.type_expr),
             else => return error.UnsupportedExpression,
         };
     }
@@ -4115,7 +4228,7 @@ pub const TypeChecker = struct {
                 }
                 break :blk true;
             },
-            .void, .integer, .float, .boolean, .byte, .null, .execution, .thread => true,
+            .void, .integer, .float, .boolean, .byte, .null, .execution, .thread, .type_type => true,
             else => std.meta.eql(resolved_left.*, resolved_right.*),
         };
     }
