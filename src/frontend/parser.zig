@@ -3347,10 +3347,23 @@ pub const Parser = struct {
         defer breadcrumb.end();
 
         const next = try self.peekToken();
-        return switch (next.tag) {
-            .kw_const => try self.parseTry(parseTypeBinding),
-            else => null,
-        };
+        if (next.tag != .kw_const) return null;
+
+        // The generic type-constructor form `const Box(T) = …` is superseded by a
+        // comptime type function. Detect `const <Name>(` and report the migration
+        // directly, rather than letting it fail as a confusing downstream error.
+        const look = try self.peekSlice(3);
+        if (look.len >= 3 and look[1].tag == .identifier and look[2].tag == .l_paren) {
+            try self.reportParseError(
+                Error.UnexpectedToken,
+                look[2].span,
+                "generic types are comptime type functions now: write `fn {s}(comptime T: type) type {{ yield <type> }}` (then use `{s}(Int)` / `{s} Int`)",
+                .{ look[1].lexeme, look[1].lexeme, look[1].lexeme },
+            );
+            return Error.UnexpectedToken;
+        }
+
+        return try self.parseTry(parseTypeBinding);
     }
 
     fn parseTypeBinding(self: *Self) Error!ast.TypeBindingDecl {
@@ -3360,15 +3373,11 @@ pub const Parser = struct {
         const start = try self.expectTokenTag(.kw_const);
         const identifier = try self.parseTypeIdentifier();
 
-        // Optional type parameters for a generic type constructor:
-        // `const Box(T) = struct { value: T }`.
-        var params: []const ast.Identifier = &.{};
-        if ((try self.peekToken()).tag == .l_paren) {
-            _ = try self.expectTokenTag(.l_paren);
-            const list = try self.parseList(.comma, parseTypeIdentifier, .{});
-            _ = try self.expectTokenTag(.r_paren);
-            params = list.payload;
-        }
+        // Generic type parameters (`const Box(T) = …`) are no longer part of this
+        // form — they are written as comptime type functions and are rejected in
+        // `parseMaybeTypeBinding` before reaching here. A plain type binding
+        // (`const Point = struct { … }`) has no parameters.
+        const params: []const ast.Identifier = &.{};
 
         _ = try self.expectTokenTag(.assign);
         const type_expr = try self.parseTypeExpr();

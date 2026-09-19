@@ -34,12 +34,20 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   const b = IntBox{ .value = 5 }
   ```
   A comptime type function also resolves in application position (`Box(Int)` as an
-  annotation, `Box{ … }` inferred construction, `Box(|T|)` capture), so it is a
-  drop-in for the old constructor form; the standard library's `std/map` generic
-  types were migrated to it. The `const Box(T) = …` form still works (retained
-  for its generic-application type serialization). A type written in value
-  position (`yield struct { … }`) is a compile-time-only *type value*, erased
-  before the runtime.
+  annotation, `Box{ … }` inferred construction, `Box(|T|)` capture) and serializes
+  as a type (`${Box}` → `Box`, `${Box(Int)}` → `Box(Int)`), so it is a drop-in for
+  the old constructor form. A type written in value position (`yield struct { … }`)
+  is a compile-time-only *type value*, erased before the runtime.
+
+### Changed
+
+- **The `const Box(T) = struct { … }` generic type-constructor form is removed**,
+  superseded by comptime type functions (`fn Box(comptime T: type) type { … }`).
+  The two are equivalent at every use site (application, construction, capture,
+  serialization), so migrating a declaration is a one-line change; the standard
+  library's `std/map` types and the generic-type regression suite were migrated.
+  Writing the old form now reports a directed error pointing at the new one. Plain
+  (non-generic) type bindings — `const Point = struct { … }` — are unaffected.
 
 ## [0.11.0] - 2026-09-18
 

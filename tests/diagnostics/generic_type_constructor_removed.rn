@@ -1,0 +1,1 @@
+const Box(T) = struct { value: T }

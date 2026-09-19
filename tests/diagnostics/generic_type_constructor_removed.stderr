@@ -1,0 +1,4 @@
+[error]: tests/diagnostics/generic_type_constructor_removed.rn:1:10: generic types are comptime type functions now: write `fn Box(comptime T: type) type { yield <type> }` (then use `Box(Int)` / `Box Int`)
+   1:const Box(T) = struct { value: T }
+   2:
+

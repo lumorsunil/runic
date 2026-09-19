@@ -1,2 +1,2 @@
-const Box(T) = struct { value: T }
+fn Box(comptime T: type) type { yield struct { value: T } }
 echo (Box{ .value = 5 })

@@ -8869,6 +8869,10 @@ pub const IRCompiler = struct {
             if (expr.* != .fn_decl) continue;
             const name = expr.fn_decl.name orelse continue;
             if (self.lookup(name.name, .{ .shallow = true }) != null) continue;
+            // A comptime type function (`fn Box(comptime T: type) type`) is erased
+            // and resolves as a *type*, not a runtime value — leave it unbound so a
+            // `${Box}` / `${Box(Int)}` serializes to its type name.
+            if (self.comptime_type_names.contains(name.name)) continue;
             // A generic function (`|T|` captures) is monomorphized per call site,
             // not called through one shared binding — leave it on that path.
             if (fnDeclIsGeneric(expr.fn_decl)) continue;

@@ -4,8 +4,8 @@
 // Covers construction at top level, inside a generic function (with |T| capture
 // params), member access on a captured generic struct return, and that a plain
 // value type application (no braces) still resolves. Deterministic output.
-const Entry(K, V) = struct { key: K, value: V }
-const Pair(A, B) = struct { first: A, second: B }
+fn Entry(comptime K: type, comptime V: type) type { yield struct { key: K, value: V } }
+fn Pair(comptime A: type, comptime B: type) type { yield struct { first: A, second: B } }
 
 // Top-level explicit-arg construction.
 const p = Pair(Int, String){ .first = 1, .second = "hi" }

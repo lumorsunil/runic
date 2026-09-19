@@ -245,13 +245,13 @@ Likely near- to mid-term candidates:
   compile-time known, `type` is a first-class comptime value (comparable, usable
   in `if`/`match` control flow), and a function that yields a type is a
   generic-type constructor: `fn Box(comptime T: type) type { yield struct { value:
-  T } }`, then `const IntBox = Box Int; IntBox{ .value = 5 }`. It also resolves in
-  application position (`Box(Int)`), so it is a drop-in for `const Box(T) = …`;
-  `std/map` was migrated to it. The old `const Box(T) = …` form is kept for now
-  (its generic-application type serialization has no new-form equivalent yet);
-  removing it, and type-serializing the new form, is the remaining follow-up.
-  (Generic type *variables* in signatures are introduced explicitly with `|T|`; a
-  bare unknown uppercase type name is an error rather than a silent generic.)
+  T } }`, then `const IntBox = Box Int; IntBox{ .value = 5 }`. It resolves in
+  application position (`Box(Int)`), serializes as a type (`${Box(Int)}` →
+  `Box(Int)`), and is a drop-in for `const Box(T) = …`, which is now **removed** —
+  `std/map` and the generic-type tests were migrated, and the old form reports a
+  directed error. (Generic type *variables* in signatures are introduced
+  explicitly with `|T|`; a bare unknown uppercase type name is an error rather than
+  a silent generic.)
 - support escaping whitespace in bareword executable/identifier syntax so
   commands or names containing spaces can be represented without immediately
   collapsing to quoted-string behavior

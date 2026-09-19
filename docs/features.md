@@ -719,17 +719,20 @@ and reference it bare thereafter (`fn Void first(xs: []|T|) T`).
 
 ### Generic type constructors
 
-A type binding can take type parameters, defining a generic type constructor:
+A generic type is a comptime type function — a function whose parameters are
+`comptime` types and whose body `yield`s a type (see *Generic types as comptime
+functions* above):
 
 ```rn
-const Box(T) = struct { value: T }
+fn Box(comptime T: type) type { yield struct { value: T } }
 
 const b: Box(Int) = Box{ .value = 5 }   // apply with Int
 echo "${b.value}"
 ```
 
-`Box(Int)` applies the constructor by substituting the argument. Combined with a
-`|T|` capture, a signature **destructures** an application to recover its type
+`Box(Int)` applies the constructor by substituting the argument, and
+`const IntBox = Box Int` binds the produced type directly. Combined with a `|T|`
+capture, a signature **destructures** an application to recover its type
 argument — so one function serves every instantiation:
 
 ```rn
@@ -737,14 +740,14 @@ fn Void unwrap(box: Box(|T|)) T { yield box.value }   // T = the element type
 unwrap b   // → 5
 ```
 
-Multiple parameters (`const Pair(A, B) = struct { first: A, second: B }`) and
-composition (`[]Box(Int)`) work too.
+Multiple parameters (`fn Pair(comptime A: type, comptime B: type) type { yield
+struct { first: A, second: B } }`) and composition (`[]Box(Int)`) work too.
 
 **Result:** reusable container and wrapper types without repetition. Because the
 runtime is dynamically typed, `Box(Int)` and `Box(String)` share a single layout
 — there is no monomorphization; the type arguments exist only for compile-time
-checking and capture. (Construction is currently the explicit `Box{ … }` form;
-an inferred `.{ … }` literal typed by its target is a planned addition.)
+checking and capture. (The older `const Box(T) = struct { … }` type-constructor
+form has been superseded by this comptime type function form.)
 
 ### Serializing type identifiers
 
