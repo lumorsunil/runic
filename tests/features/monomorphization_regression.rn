@@ -27,7 +27,7 @@ pair true 0
 
 // A capture nested in a generic application (`Box(|T|)`) also monomorphizes:
 // the argument's concrete type flows through the constructor to the capture.
-const Box(T) = struct { value: T }
+fn Box(comptime T: type) type { yield struct { value: T } }
 fn Void unwrapType(b: Box(|T|)) Void {
     echo "unwrapped ${b.value} of type ${T}"
 }

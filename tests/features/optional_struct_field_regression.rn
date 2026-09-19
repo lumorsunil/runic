@@ -26,6 +26,6 @@ const s = S{ .name = "hi" }
 echo "s=${s.name orelse "none"}"
 
 # A generic field still binds to the concrete value type.
-const Box(T) = struct { value: T }
+fn Box(comptime T: type) type { yield struct { value: T } }
 const box = Box{ .value = 42 }
 echo "box=${box.value + 1}"

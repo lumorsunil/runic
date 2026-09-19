@@ -4,8 +4,8 @@
 // entirely in Runic, with the types resolved at comptime and the data at
 // runtime.
 
-const Entry(K, V) = struct { key: K, value: V }
-const Map(K, V) = struct { entries: []Entry(K, V) }
+fn Entry(comptime K: type, comptime V: type) type { yield struct { key: K, value: V } }
+fn Map(comptime K: type, comptime V: type) type { yield struct { entries: []Entry(K, V) } }
 
 fn Void mapSet(m: Map(|K|, |V|), key: K, value: V) Map(K, V) {
     var out: []Entry(K, V) = .{ }
