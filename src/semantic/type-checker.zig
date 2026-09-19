@@ -1805,6 +1805,20 @@ pub const TypeChecker = struct {
     /// resolve (no "type T not declared") and — resolved *in the function scope* —
     /// bakes them into the stored function type as `.type_var`, so a call site
     /// never re-resolves a raw `T`/`U`.
+    /// The bound name of a `comptime T: type` parameter — one that carries a
+    /// type value, usable as a type variable inside the body (`x: T`, `[]T`) and
+    /// compared as a value (`T == Int`). Null for any other parameter (including
+    /// a comptime *value* param such as `comptime n: Int`).
+    fn comptimeTypeParamName(param: *const ast.Parameter) ?[]const u8 {
+        if (!param.is_comptime) return null;
+        const annotation = param.type_annotation orelse return null;
+        if (annotation.* != .type_type) return null;
+        return switch (param.pattern.*) {
+            .identifier => |id| id.name,
+            else => null,
+        };
+    }
+
     fn declareSignatureTypeVars(
         self: *TypeChecker,
         scope: *Scope,
@@ -1816,9 +1830,15 @@ pub const TypeChecker = struct {
         if (fn_decl.stdin_type) |st| try self.collectTypeVars(scope, st, &type_vars);
         switch (fn_decl.params) {
             ._non_variadic => |params| for (params) |param| {
+                // A `comptime T: type` param introduces `T` as a type variable, so
+                // a later param annotation (`x: T`) and the return type resolve it.
+                if (comptimeTypeParamName(param)) |name| try type_vars.put(self.arena.allocator(), name, {});
                 if (param.type_annotation) |ta| try self.collectTypeVars(scope, ta, &type_vars);
             },
-            ._variadic => |param| if (param.type_annotation) |ta| try self.collectTypeVars(scope, ta, &type_vars),
+            ._variadic => |param| {
+                if (comptimeTypeParamName(param)) |name| try type_vars.put(self.arena.allocator(), name, {});
+                if (param.type_annotation) |ta| try self.collectTypeVars(scope, ta, &type_vars);
+            },
         }
         if (fn_decl.return_type) |rt| try self.collectTypeVars(scope, rt, &type_vars);
         var it = type_vars.keyIterator();
@@ -1914,6 +1934,10 @@ pub const TypeChecker = struct {
 
         switch (fn_decl.params) {
             ._non_variadic => |params| for (params) |param| {
+                // A `comptime T: type` param is already declared as a type variable
+                // by `declareSignatureTypeVars`; declaring it again as a value here
+                // would shadow that, so `x: T` would no longer resolve as a type.
+                if (comptimeTypeParamName(param) != null) continue;
                 try self.checkParamAnnotated(param);
                 // Resolve the param's declared type (like the stdin/fn types
                 // above), so a primitive annotation such as `Int` — parsed as a
@@ -1932,16 +1956,18 @@ pub const TypeChecker = struct {
                 );
             },
             ._variadic => |param| {
-                try self.checkParamAnnotated(param);
-                const raw = try self.resolveExprType(fn_scope, param);
-                const param_type = if (raw) |t| try self.resolveTypeExpr(fn_scope, t) else null;
-                try self.runBindingPattern(
-                    fn_scope,
-                    param.pattern,
-                    param_type,
-                    false,
-                    param.is_mutable,
-                );
+                if (comptimeTypeParamName(param) == null) {
+                    try self.checkParamAnnotated(param);
+                    const raw = try self.resolveExprType(fn_scope, param);
+                    const param_type = if (raw) |t| try self.resolveTypeExpr(fn_scope, t) else null;
+                    try self.runBindingPattern(
+                        fn_scope,
+                        param.pattern,
+                        param_type,
+                        false,
+                        param.is_mutable,
+                    );
+                }
             },
         }
 
@@ -2368,7 +2394,7 @@ pub const TypeChecker = struct {
             .alias => |*alias| self.runTypeAlias(alias),
             .failed => {},
             .type_var => {},
-            .void, .integer, .float, .boolean, .byte, .null, .execution, .thread => {},
+            .void, .integer, .float, .boolean, .byte, .null, .execution, .thread, .type_type => {},
             .optional, .promise => |prefix| try self.runTypeExpression(scope, prefix.child),
             .error_union => |error_union| {
                 try self.runTypeExpression(scope, error_union.err_set);
@@ -3685,7 +3711,7 @@ pub const TypeChecker = struct {
             .thread => try self.runThreadMemberAccess(&member.member),
             .struct_type => |struct_type| try self.runStructMemberAccess(struct_type, &member.member),
             .error_set => |error_set| try self.runErrorSetMemberAccess(error_set, &member.member),
-            .null, .promise, .error_union, .err, .function, .fn_ref_type, .integer, .float, .boolean, .byte, .alias, .void, .type_merge, .sum, .type_capture, .type_application => return error.UnsupportedMemberAccess,
+            .null, .promise, .error_union, .err, .function, .fn_ref_type, .integer, .float, .boolean, .byte, .alias, .void, .type_merge, .sum, .type_capture, .type_application, .type_type => return error.UnsupportedMemberAccess,
             .module => |module| try self.runModuleMemberAccess(module, &member.member),
             .execution => |execution| try self.runExecutionMemberAccess(execution, &member.member),
             // .lazy => {
@@ -5184,6 +5210,10 @@ pub const TypeChecker = struct {
             // A `||` merge is resolved to a concrete `error_set` or `sum` before
             // it is stored as a binding type, so a raw merge should not reach here.
             .type_merge => {},
+            // Assigning to a `type`-typed target (a `comptime T: type` param, a
+            // type-returning result): the value is a type. Permissive for now;
+            // type-value typing is refined as comptime evaluation lands.
+            .type_type => {},
             .sum => |*sum| self.validateTypeAssignmentSum(
                 sum,
                 assignment_type,
@@ -5710,6 +5740,7 @@ const GlobalTypes = struct {
     pub const Float = ast.TypeExpr{ .float = .{ .span = .global } };
     pub const Boole = ast.TypeExpr{ .boolean = .{ .span = .global } };
     pub const Byte = ast.TypeExpr{ .byte = .{ .span = .global } };
+    pub const TypeType = ast.TypeExpr{ .type_type = .{ .span = .global } };
     pub fn Array(comptime element: ast.TypeExpr) ast.TypeExpr {
         return .{ .array = .{ .element = &element, .span = .global } };
     }
@@ -5762,6 +5793,7 @@ const global_scope_definitions = [_]Definition{
     .init("Boole", GlobalTypes.Boole),
     .init("Boolean", GlobalTypes.Boole),
     .init("Byte", GlobalTypes.Byte),
+    .init("type", GlobalTypes.TypeType),
     .init("String", GlobalTypes.Array(GlobalTypes.Byte)),
     .init("ExecutableError", ast.TypeExpr.executableErrorType),
     .init("ParseError", ast.TypeExpr.parseErrorType),

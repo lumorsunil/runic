@@ -3559,16 +3559,25 @@ pub const Parser = struct {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
-        // A leading `var` marks the parameter mutable, so the body may reassign it
-        // or mutate its fields (`fn f(var e: T) …` then `e.x += 1`) without a
-        // `var copy = e` shim. Parameters are immutable (const) otherwise; an
-        // explicit `const` is accepted as a no-op for symmetry.
+        // A leading `comptime` marks the parameter as compile-time known (a
+        // `type` argument, or another comptime constant). A leading `var` marks
+        // the parameter mutable, so the body may reassign it or mutate its fields
+        // (`fn f(var e: T) …` then `e.x += 1`) without a `var copy = e` shim.
+        // Parameters are immutable (const) otherwise; an explicit `const` is
+        // accepted as a no-op for symmetry. `comptime` may precede `var`/`const`.
         const start = try self.peekToken();
+        var is_comptime = false;
+        if (start.tag == .kw_comptime) {
+            _ = try self.nextToken();
+            is_comptime = true;
+        }
+
         var is_mutable = false;
-        if (start.tag == .kw_var) {
+        const mutability = try self.peekToken();
+        if (mutability.tag == .kw_var) {
             _ = try self.nextToken();
             is_mutable = true;
-        } else if (start.tag == .kw_const) {
+        } else if (mutability.tag == .kw_const) {
             _ = try self.nextToken();
         }
 
@@ -3584,6 +3593,7 @@ pub const Parser = struct {
             .type_annotation = annotation,
             .default_value = default_value,
             .is_mutable = is_mutable,
+            .is_comptime = is_comptime,
             .span = pattern.span().endAt(end),
         };
 
@@ -3981,6 +3991,13 @@ pub const Parser = struct {
 
             return Error.ExpectedTypeIdentifier;
         };
+
+        // `type` is the meta-type — the type of a type value (a `comptime T: type`
+        // param, a type-returning function's return type). It is the one
+        // lowercase type keyword, so recognize it before the uppercase check.
+        if (spanned_path.payload.len == 1 and std.mem.eql(u8, last_segment.name, "type")) {
+            return self.allocTypeExpression(.{ .type_type = .{ .span = spanned_path.span } });
+        }
 
         if (std.ascii.isLower(last_segment.name[0])) {
             const identifier_capitalized = try self.arena.allocator().dupe(

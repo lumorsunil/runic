@@ -176,6 +176,12 @@ pub const TypeExpr = union(enum) {
     execution: PrimitiveType,
     thread: PrimitiveType,
     failed: FailedType,
+    /// The meta-type `type` — the type of a type value. Written as the annotation
+    /// of a `comptime T: type` parameter or the return type of a type-returning
+    /// function. A *type value* itself is represented by the `TypeExpr` it denotes
+    /// (e.g. `Int` is `.integer`); this variant is that value's own type. Fully
+    /// compile-time — it is erased before the IR/runtime.
+    type_type: PrimitiveType,
     /// An implicit generic type variable (an uppercase name in a function
     /// signature that isn't a declared type, e.g. `T`/`U` in `map`). Since the
     /// runtime is dynamically typed, a generic function compiles once; a type
@@ -644,6 +650,7 @@ pub const TypeExpr = union(enum) {
             .type_var,
             .type_capture,
             .type_application,
+            .type_type,
             => 1,
             .struct_type => |struct_type| blk: {
                 if (struct_type.by_reference_fields) break :blk struct_type.fields.len;
@@ -2002,6 +2009,10 @@ pub const Parameter = struct {
     type_annotation: ?*const TypeExpr,
     default_value: ?*Expression,
     is_mutable: bool,
+    /// A `comptime` parameter: its argument must be known at compile time (a
+    /// `type`, or another comptime-constant value). Marks a function that is
+    /// specialized/evaluated at comptime per distinct argument at each call site.
+    is_comptime: bool = false,
     span: Span,
 
     pub fn resolveType(
