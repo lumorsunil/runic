@@ -697,6 +697,11 @@ pub const IRCompiler = struct {
     /// only — they resolve to types and emit no runtime code, so they are erased
     /// when compiled as statements.
     comptime_type_names: std.StringHashMapUnmanaged(void) = .empty,
+    /// Comptime *value* parameter constants for the specialization currently being
+    /// compiled (`comptime n: Int` → the folded argument). `compileFnDecl` binds
+    /// the parameter to this constant so `n == 3` folds. Set by `maybeSpecialize`
+    /// around the body compilation, empty otherwise.
+    pending_comptime_values: std.StringHashMapUnmanaged(Result) = .empty,
     /// Recursion-depth cap for comptime call interpretation. Kept well below the
     /// point where the interpreter's own (native) call stack would overflow, so
     /// a non-terminating `comptime` recursion fails to compile instead of
@@ -1388,6 +1393,18 @@ pub const IRCompiler = struct {
         if (!param.is_comptime) return null;
         const annotation = param.type_annotation orelse return null;
         if (annotation.* != .type_type) return null;
+        return switch (param.pattern.*) {
+            .identifier => |id| id.name,
+            else => null,
+        };
+    }
+
+    /// The name of a comptime *value* parameter (`comptime n: Int`) — a
+    /// `comptime` param that is not a `type` param, so its argument is a
+    /// compile-time constant the body is monomorphized on. Null otherwise.
+    fn comptimeValueParamName(param: *const ast.Parameter) ?[]const u8 {
+        if (!param.is_comptime) return null;
+        if (param.type_annotation) |ann| if (ann.* == .type_type) return null;
         return switch (param.pattern.*) {
             .identifier => |id| id.name,
             else => null,
@@ -5813,6 +5830,19 @@ pub const IRCompiler = struct {
         }
     }
 
+    /// Serializes a comptime constant into a specialization cache key.
+    fn writeComptimeValueKey(w: *std.Io.Writer, value: Result) std.Io.Writer.Error!void {
+        if (value.source != .value) return w.writeAll("?");
+        switch (value.source.value) {
+            .integer => |i| try w.print("i{d}", .{i}),
+            .float => |f| try w.print("f{d}", .{f}),
+            .exit_code => |e| try w.print("b{}", .{e.toBoolean()}),
+            .zig_string => |s| try w.print("s{s}", .{s}),
+            .null => try w.writeAll("n"),
+            else => try w.writeAll("?"),
+        }
+    }
+
     /// Whether a tracked type is still unknown — absent, `Void`, or an array
     /// whose element type hasn't been determined (`var xs = .{ }` → `[]Void`).
     /// Such a type may be refined when a concretely-typed value is assigned.
@@ -5891,16 +5921,21 @@ pub const IRCompiler = struct {
 
         var capture_names = std.ArrayList([]const u8).empty;
         defer capture_names.deinit(self.allocator);
+        var value_param_names = std.ArrayList([]const u8).empty;
+        defer value_param_names.deinit(self.allocator);
         for (params) |param| {
             // A `comptime T: type` param monomorphizes the body per type argument:
             // `T` is bound to that concrete type so `T == …` folds at compile time.
             if (comptimeTypeParamName(param)) |name| {
                 try capture_names.append(self.allocator, name);
+            } else if (comptimeValueParamName(param)) |name| {
+                // A `comptime n: Int` param monomorphizes per constant value.
+                try value_param_names.append(self.allocator, name);
             } else if (param.type_annotation) |ann| {
                 try collectCapturesInType(ann.*, &capture_names, self.allocator);
             }
         }
-        if (capture_names.items.len == 0) return null;
+        if (capture_names.items.len == 0 and value_param_names.items.len == 0) return null;
 
         // Save any prior bindings for these names so the caller's context is
         // restored after the specialization is compiled.
@@ -5933,13 +5968,28 @@ pub const IRCompiler = struct {
             if (bound == .type_var) return null;
         }
 
-        // Build a cache key from the bound type arguments.
+        // Evaluate each comptime value param's argument to a compile-time constant;
+        // bail (use the generic body) if any argument isn't comptime-known.
+        var value_results = std.StringHashMapUnmanaged(Result).empty;
+        defer value_results.deinit(self.allocator);
+        for (params, arguments) |param, arg| {
+            const name = comptimeValueParamName(param) orelse continue;
+            const val = (try self.evalComptimeExpression(arg)) orelse return null;
+            if (val.source != .value) return null;
+            try value_results.put(self.allocator, name, val);
+        }
+
+        // Build a cache key from the bound type and value arguments.
         var key_writer = std.Io.Writer.Allocating.init(self.allocator);
         defer key_writer.deinit();
         try key_writer.writer.print("{}", .{instr_set});
         for (capture_names.items) |name| {
             try key_writer.writer.print("|{s}=", .{name});
             try self.writeTypeName(&key_writer.writer, self.type_captures.get(name).?);
+        }
+        for (value_param_names.items) |name| {
+            try key_writer.writer.print("|{s}#", .{name});
+            try writeComptimeValueKey(&key_writer.writer, value_results.get(name).?);
         }
         const key = key_writer.written();
 
@@ -5955,6 +6005,12 @@ pub const IRCompiler = struct {
         self.specializing = true;
         self.specializing_generic = instr_set;
         self.specialization_depth += 1;
+        // Hand the comptime value constants to `compileFnDecl` (consumed while
+        // setting up parameters, before any nested call can clobber them).
+        self.pending_comptime_values.clearRetainingCapacity();
+        for (value_param_names.items) |name| {
+            self.pending_comptime_values.put(self.allocator, name, value_results.get(name).?) catch {};
+        }
         const result = self.compileFnDecl(fn_source, fn_decl) catch |err| {
             self.specializing = prev_specializing;
             self.specializing_generic = prev_generic;
@@ -9230,12 +9286,25 @@ pub const IRCompiler = struct {
             switch (param.pattern.*) {
                 .discard => {},
                 .identifier => |identifier| {
-                    _ = try self.declareClosureValue(
+                    // Still allocate the runtime slot (keeps arg/slot indices in
+                    // step), but a comptime value param resolves to its constant,
+                    // so `n == 3` folds and `${n}` is the value.
+                    const loc = try self.declareClosureValue(
                         .mutable(identifier, .normal),
                         0,
                         false,
                         if (param.type_annotation) |type_annotation| self.normalizeStringTypes(type_annotation.*) else null,
                     );
+                    _ = loc;
+                    if (comptimeValueParamName(param) != null) {
+                        if (self.pending_comptime_values.get(identifier.name)) |constant| {
+                            const frame = try self.scopes.getFrame(0);
+                            if (frame.bindings.getPtr(identifier.name)) |b| {
+                                b.result = constant;
+                                b.is_mutable = false;
+                            }
+                        }
+                    }
                 },
                 .tuple, .record => {
                     try self.reportSourceError(
