@@ -36,6 +36,31 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   `Box(|E|)` matches any `Box(X)` at compile time, binding `E` to `X` (itself a
   comptime type, so it can feed further comptime logic like `E == Int`). Patterns
   nest (`Box(Box(|E|))`) and take multiple captures (`Pair(|A|)(|B|)`).
+- **Comptime value parameters.** A `comptime` parameter whose type is *not* `type`
+  (`comptime n: Int`, `comptime s: String`) is a compile-time constant: the
+  function is monomorphized per distinct value, so a test on it folds and `${n}`
+  is the constant:
+  ```runic
+  fn Void rep(comptime n: Int) String {
+      if (n == 1) { yield "once" } else { yield "${n} times" }
+  }
+  ```
+- **Comptime `match` on a type.** A `match` whose subject is a comptime type
+  selects an arm at compile time. Each arm is a type pattern — a bare name, or an
+  application with captures — and a matched capture is bound in the arm body:
+  ```runic
+  fn Void classify(comptime T: type) String {
+      match (T) {
+          Int      => { yield "an int" }
+          Box(|E|) => { yield "a box of ${E}" }
+          _        => { yield "other" }
+      }
+  }
+  ```
+  Captures nest and curry exactly as in a type predicate (`Pair(|X|)(|Y|)`,
+  `Box(Box(|E|))`), and the bound capture is itself a comptime type — a nested
+  `match (E)` folds again. A `match` on a comptime *value* likewise prunes to the
+  arm whose literal equals the value.
 - **Type-returning comptime functions (generic types).** A function that takes
   `comptime` type parameters and `yield`s a type is a generic-type constructor —
   the Zig-style replacement for the `const Box(T) = struct { … }` form:

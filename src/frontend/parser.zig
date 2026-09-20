@@ -2266,6 +2266,18 @@ pub const Parser = struct {
                 }
 
                 if (segments.items.len == 1) {
+                    // A type application (`Box(Int)`, `Box(|E|)`, `Pair(|K|)(|V|)`)
+                    // in pattern position — a comptime type pattern.
+                    if ((try self.peekToken()).tag == .l_paren) {
+                        var type_args = try self.collectCurriedTypeArgs(first.name);
+                        defer type_args.deinit(self.allocator);
+                        const app = try self.allocTypeExpression(.{ .type_application = .{
+                            .name = first,
+                            .args = try self.copyToArena(*const ast.TypeExpr, type_args.items),
+                            .span = first.span.endAt(type_args.items[type_args.items.len - 1].span()),
+                        } });
+                        break :blk .{ .type_pattern = app };
+                    }
                     break :blk .{ .binding = segments.items[0] };
                 }
 

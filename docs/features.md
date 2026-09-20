@@ -680,6 +680,44 @@ echo "${describe Int}"         // scalar Int
 a comptime type, so it can feed further comptime logic (`E == Int`). Patterns
 nest (`Box(Box(|E|))`) and take multiple captures (`Pair(|A|)(|B|)`).
 
+#### Comptime value parameters
+
+A `comptime` parameter whose type is *not* `type` is a compile-time constant. The
+function is monomorphized per distinct value, so a test on it folds and `${n}` is
+that constant:
+
+```rn
+fn Void rep(comptime n: Int) String {
+  if (n == 1) { yield "once" } else { yield "${n} times" }
+}
+echo "${rep 1}"   // once
+echo "${rep 3}"   // 3 times
+```
+
+#### Matching on a type
+
+A `match` whose subject is a comptime type selects an arm at compile time. Each
+arm is a type pattern — a bare name (`Int`) or an application that may carry
+captures (`Box(|E|)`, `Pair(|X|)(|Y|)`) — and a matched capture is bound in that
+arm's body, exactly as in a type predicate:
+
+```rn
+fn Void classify(comptime T: type) String {
+  match (T) {
+    Int      => { yield "an int" }
+    Box(|E|) => { yield "a box of ${E}" }
+    _        => { yield "other" }
+  }
+}
+echo "${classify Box(Int)}"   // a box of Int
+echo "${classify Int}"        // an int
+echo "${classify Bool}"       // other
+```
+
+The bound capture is itself a comptime type, so a nested `match (E)` folds again.
+A `match` on a comptime *value* likewise prunes to the arm whose literal equals
+the value.
+
 ### Generic types as comptime functions
 
 A function whose parameters are `comptime` types and whose body `yield`s a type

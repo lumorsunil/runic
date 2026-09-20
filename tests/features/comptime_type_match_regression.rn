@@ -1,0 +1,45 @@
+# Comptime `match` on a type. The subject is a `comptime T: type` param, so the
+# match is resolved at compile time (the function is monomorphized per type):
+# each arm is a type pattern — a bare name (`Int`), or an application that may
+# carry captures (`Box(|E|)`, `Pair(|X|)(|Y|)`). The taken arm is selected, and
+# its captures bound, during compilation, so `${E}` is the concrete type and a
+# nested `match (E)` folds again.
+
+fn Box(comptime T: type) type { yield struct { value: T } }
+fn Pair(comptime A: type, comptime B: type) type { yield struct { a: A, b: B } }
+
+fn Void classify(comptime T: type) String {
+    match (T) {
+        Int => { yield "scalar int" }
+        String => { yield "scalar string" }
+        Box(|E|) => {
+            match (E) {
+                Int => { yield "box of int" }
+                _ => { yield "box of ${E}" }
+            }
+        }
+        Pair(|X|)(|Y|) => { yield "pair ${X}/${Y}" }
+        _ => { yield "other ${T}" }
+    }
+}
+
+echo "${classify Int}"
+echo "${classify String}"
+echo "${classify Box(Int)}"
+echo "${classify Box(Bool)}"
+echo "${classify Box(Box(Int))}"
+echo "${classify Pair(Int)(String)}"
+echo "${classify Bool}"
+
+# A comptime *value* subject still matches by value (monomorphized per constant).
+fn Void rank(comptime n: Int) String {
+    match (n) {
+        0 => { yield "zero" }
+        1 => { yield "one" }
+        _ => { yield "many (${n})" }
+    }
+}
+
+echo "${rank 0}"
+echo "${rank 1}"
+echo "${rank 5}"

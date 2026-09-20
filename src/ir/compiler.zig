@@ -7470,6 +7470,36 @@ pub const IRCompiler = struct {
             return .fromValue(.void);
         }
 
+        // A comptime type subject (`match (T) { Int => …, Box(|E|) => … }`):
+        // resolve `T` to its serialized name and prune to the arm whose type
+        // pattern matches, binding that pattern's captures for the arm body.
+        if (try self.comptimeTypeName(match_expr.subject)) |subject_name| {
+            defer self.allocator.free(subject_name);
+            for (match_expr.cases) |case| {
+                switch (case.pattern) {
+                    .wildcard => return self.compileBlock(source, case.body),
+                    .type_pattern => |type_expr| {
+                        if (try self.matchTypeStringPattern(type_expr.*, subject_name)) {
+                            return self.compileBlock(source, case.body);
+                        }
+                    },
+                    // A bare type name (`Int`, `Box`) matches the subject string.
+                    .binding => |binding| if (std.mem.eql(u8, binding.name, subject_name)) {
+                        return self.compileBlock(source, case.body);
+                    },
+                    else => {},
+                }
+            }
+            try self.reportSourceError(
+                source,
+                Error.UnsupportedExpression,
+                .@"error",
+                "no match arm handles type '{s}' (add it or a `_` case)",
+                .{subject_name},
+            );
+            return .fromValue(.void);
+        }
+
         if (try self.evalComptimeExpression(match_expr.subject)) |subject| {
             for (match_expr.cases) |case| {
                 if (case.capture != null) break;
@@ -7569,6 +7599,12 @@ pub const IRCompiler = struct {
                         try self.jmp(source, predicate, false, next_case_addr);
                     }
                 },
+                // A type pattern only resolves against a comptime type subject,
+                // which the comptime path above prunes fully. Reaching here means
+                // the subject wasn't comptime-known (the unspecialized template
+                // body, never executed once every call monomorphizes): make the
+                // arm never-taken, mirroring how a comptime type `if` degrades.
+                .type_pattern => try self.jmp(source, null, false, next_case_addr),
                 else => unreachable,
             }
 
@@ -9006,6 +9042,10 @@ pub const IRCompiler = struct {
                 for (ps) |p| {
                     if (p.pattern.* != .identifier) break :blk false;
                     if (p.is_mutable) break :blk false;
+                    // A `comptime` parameter (type or value) is monomorphized per
+                    // call through the fork path (`maybeSpecialize`); the sync call
+                    // bypasses that, so such a function must stay on the fork path.
+                    if (p.is_comptime) break :blk false;
                     if (p.type_annotation) |ta| if (hasTypeCapture(ta.*)) break :blk false;
                 }
                 break :blk true;

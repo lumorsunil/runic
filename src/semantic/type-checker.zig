@@ -2914,6 +2914,14 @@ pub const TypeChecker = struct {
             return;
         }
 
+        // Matching on a comptime type (`match (T) { Int => …, Box(|E|) => … }`):
+        // the subject is a type, each case is a type pattern, and any `|capture|`
+        // in a pattern binds as a type variable in that arm's body.
+        if (try self.isComptimeTypeSubject(scope, match_expr.subject)) {
+            try self.runComptimeTypeMatch(scope, match_expr);
+            return;
+        }
+
         for (match_expr.cases) |case| {
             if (case.capture != null) {
                 try self.reportSpanError(
@@ -2955,6 +2963,60 @@ pub const TypeChecker = struct {
             };
 
             try self.runBlockInNewScope(scope, @constCast(&case.body));
+        }
+    }
+
+    /// Whether a match subject is a comptime type value — a `comptime T: type`
+    /// param (its type resolves to a `.type_var`/`.type_type` marker) or a
+    /// literal type value (`match (Box(Int))`).
+    fn isComptimeTypeSubject(self: *TypeChecker, scope: *Scope, subject: *ast.Expression) Error!bool {
+        if (subject.* == .type_value) return true;
+        const t = (try self.resolveExprType(scope, subject)) orelse return false;
+        const u = self.unaliasType(t);
+        return u.* == .type_var or u.* == .type_type;
+    }
+
+    /// Type-checks `match (T) { Int => …, Box(|E|) => …, _ => … }`. Each arm is a
+    /// type pattern; a pattern's `|capture|` binds as a type variable visible in
+    /// that arm's body. The actual pruning/binding happens at comptime in the IR
+    /// compiler — here we only validate the arms and scope the captures.
+    fn runComptimeTypeMatch(self: *TypeChecker, scope: *Scope, match_expr: *ast.MatchExpr) Error!void {
+        for (match_expr.cases) |case| {
+            const case_scope = try scope.addChild(self.arena.allocator(), case.span);
+            switch (case.pattern) {
+                // `_` and a bare type name (`Int`, `Box`) bind nothing.
+                .wildcard, .binding => {},
+                .type_pattern => |type_expr| {
+                    // Declare each `|capture|` as a type variable so the arm body
+                    // can reference it (`${E}`, `E == Int`).
+                    var captures: std.StringHashMapUnmanaged(void) = .empty;
+                    defer captures.deinit(self.arena.allocator());
+                    try self.collectTypeVars(case_scope, type_expr, &captures);
+                    var it = captures.keyIterator();
+                    while (it.next()) |name| {
+                        if (case_scope.lookup(name.*) != null) continue;
+                        const marker = try self.allocTypeExpression(.{ .type_var = .{ .name = name.*, .span = type_expr.span() } });
+                        try case_scope.declareType(self.arena.allocator(), ast.Identifier.global(name.*), marker, false);
+                    }
+                },
+                else => try self.reportSpanError(
+                    case.pattern.span(),
+                    Error.UnsupportedExpression,
+                    .@"error",
+                    "matching on a type expects a type pattern (`Int`, `Box(|E|)`) or `_`",
+                    .{},
+                ),
+            }
+            if (case.capture) |capture| {
+                try self.reportSpanError(
+                    capture.span,
+                    Error.UnsupportedExpression,
+                    .@"error",
+                    "a type match arm binds through its pattern (`Box(|E|)`), not a `=> |x|` clause",
+                    .{},
+                );
+            }
+            try self.runBlockInNewScope(case_scope, @constCast(&case.body));
         }
     }
 

@@ -1590,6 +1590,9 @@ pub const MatchPattern = union(enum) {
     path: Path,
     binding: Identifier,
     destructure: *BindingPattern,
+    // A comptime type pattern (`Int`, `Box(|E|)`, `Pair(|K|)(|V|)`) — matched
+    // against a comptime type subject, binding any `|capture|` in the arm body.
+    type_pattern: *const TypeExpr,
 
     pub fn span(self: MatchPattern) Span {
         return switch (self) {
@@ -1598,6 +1601,7 @@ pub const MatchPattern = union(enum) {
             .path => |path| path.span,
             .binding => |binding| binding.span,
             .destructure => |pattern| pattern.span(),
+            .type_pattern => |type_expr| type_expr.span(),
         };
     }
 };
