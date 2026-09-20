@@ -1110,8 +1110,31 @@ pub const Parser = struct {
                             });
                             continue;
                         },
+                        .l_bracket => {
+                            // A leading `[]T` in value position is a *type value*
+                            // (compile-time only) — e.g. `@elem([]Int)`. In the
+                            // `.expr` state there is no operand to index, so `[`
+                            // is unambiguously a type, not a postfix subscript.
+                            const breadcrumbInner = try self.createBreadcrumb("PBE:type_value");
+                            defer breadcrumbInner.end();
+                            try components.append(self.allocator, .{
+                                .expr = try self.parseTypeValueExpression(),
+                            });
+                            continue;
+                        },
                         .question => {
-                            if (components.items.len == 0 or components.items[components.items.len - 1] != .op or components.items[components.items.len - 1].op.payload != .member) {
+                            // A leading `?T` in value position is a type value
+                            // (`@child(?Int)`); after a member it is the optional
+                            // access marker.
+                            if (components.items.len == 0) {
+                                const breadcrumbInner = try self.createBreadcrumb("PBE:type_value");
+                                defer breadcrumbInner.end();
+                                try components.append(self.allocator, .{
+                                    .expr = try self.parseTypeValueExpression(),
+                                });
+                                continue;
+                            }
+                            if (components.items[components.items.len - 1] != .op or components.items[components.items.len - 1].op.payload != .member) {
                                 try self.reportParseError(Error.UnexpectedToken, next.span, "expected value, actual: {t}", .{next.tag});
                                 return Error.UnexpectedToken;
                             }

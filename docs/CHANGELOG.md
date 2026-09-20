@@ -61,6 +61,21 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   `Box(Box(|E|))`), and the bound capture is itself a comptime type — a nested
   `match (E)` folds again. A `match` on a comptime *value* likewise prunes to the
   arm whose literal equals the value.
+- **Type-introspection builtins.** A comptime type can be inspected at compile
+  time — each fold to a constant:
+  ```runic
+  fn Void describe(comptime T: type) String {
+      if (@kind(T) == "struct" && @hasField(T)("value")) {
+          yield "a box of ${@fieldCount(T)} field(s)"
+      } else { yield "a ${@kind(T)}" }
+  }
+  ```
+  `@kind(T)` is the type's category (`"int"`, `"struct"`, `"array"`,
+  `"optional"`, …); `@fieldCount(T)` and `@hasField(T)("name")` query a struct's
+  fields; `@elem(T)` and `@child(T)` unwrap an array's element and an optional's
+  child. A leading `[]T` / `?T` is now a value-position **type value**, so a
+  composite type can be passed directly (`@elem([]Int)` → `Int`). A builtin used
+  on a concrete type of the wrong kind is a compile error.
 - **Type-returning comptime functions (generic types).** A function that takes
   `comptime` type parameters and `yield`s a type is a generic-type constructor —
   the Zig-style replacement for the `const Box(T) = struct { … }` form:

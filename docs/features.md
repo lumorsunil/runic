@@ -718,6 +718,35 @@ The bound capture is itself a comptime type, so a nested `match (E)` folds again
 A `match` on a comptime *value* likewise prunes to the arm whose literal equals
 the value.
 
+#### Type introspection
+
+A comptime type can be inspected at compile time. Each builtin folds to a
+constant:
+
+| Builtin | Result | Notes |
+| --- | --- | --- |
+| `@kind(T)` | `String` | `"int"`, `"float"`, `"bool"`, `"string"`, `"struct"`, `"array"`, `"optional"`, … |
+| `@fieldCount(T)` | `Int` | number of fields of a struct type |
+| `@hasField(T)("name")` | `Bool` | whether a struct type has that field |
+| `@elem(T)` | type | element type of an array type (`[]X` → `X`) |
+| `@child(T)` | type | child type of an optional type (`?X` → `X`) |
+
+```rn
+fn Void describe(comptime T: type) String {
+  if (@kind(T) == "struct") {
+    yield "struct(${@fieldCount(T)}) hasValue=${@hasField(T)("value")}"
+  } else {
+    yield "a ${@kind(T)}"
+  }
+}
+```
+
+A leading `[]T` / `?T` is a value-position **type value** (like `struct { … }`
+or `Box(Int)`), so a composite type can be passed to a builtin directly:
+`@elem([]Int)` → `Int`, `@child(?Bool)` → `Bool`, `@kind([]Int)` → `"array"`.
+Using a builtin on a concrete type of the wrong kind (`@elem(Int)`) is a compile
+error.
+
 ### Generic types as comptime functions
 
 A function whose parameters are `comptime` types and whose body `yield`s a type

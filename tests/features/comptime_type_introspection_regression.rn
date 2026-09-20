@@ -1,0 +1,41 @@
+# Comptime type introspection builtins. A `comptime T: type` function is
+# monomorphized per type, so these builtins fold at compile time:
+#   @kind(T)          -> the type's category ("int", "struct", "array", …)
+#   @elem(T)          -> the element type of an array type
+#   @child(T)         -> the child type of an optional type
+#   @fieldCount(T)    -> a struct type's field count (Int)
+#   @hasField(T)("f") -> whether a struct type has field "f" (Bool)
+# A leading `[]T` / `?T` is a value-position type value, so a composite type can
+# be passed directly (`@elem([]Int)`).
+
+fn Box(comptime T: type) type { yield struct { value: T } }
+fn Pair(comptime A: type, comptime B: type) type { yield struct { a: A, b: B } }
+
+# @kind over primitives, composites, and structs.
+fn Void kind(comptime T: type) String { yield "${@kind(T)}" }
+echo "${kind Int}"
+echo "${kind Bool}"
+echo "${kind String}"
+echo "${kind Box(Int)}"
+echo "${kind ([]Int)}"
+echo "${kind (?Bool)}"
+
+# @elem / @child on value-position composite type values.
+echo "elem ${@elem([]Int)} / ${@elem([]Box(Int))} / ${@elem([][]Bool)}"
+echo "child ${@child(?Int)} / ${@child(?String)}"
+
+# @fieldCount / @hasField, and folding in control flow + arithmetic.
+fn Void describe(comptime T: type) String {
+    if (@kind(T) == "struct") {
+        if (@hasField(T)("value")) {
+            yield "struct(${@fieldCount(T)}) with value; +1 = ${@fieldCount(T) + 1}"
+        } else {
+            yield "struct(${@fieldCount(T)}) without value"
+        }
+    } else {
+        yield "non-struct ${@kind(T)}"
+    }
+}
+echo "${describe Box(Int)}"
+echo "${describe Pair(Int)(Bool)}"
+echo "${describe Int}"

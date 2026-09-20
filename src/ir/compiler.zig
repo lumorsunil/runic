@@ -2594,6 +2594,9 @@ pub const IRCompiler = struct {
                 break :blk try self.evalComptimeExpression(comptime_expr.operand);
             },
             .call => |call| blk: {
+                // A type-introspection builtin (`@kind(T)`, `@fieldCount(T)`, …)
+                // folds to its comptime value.
+                if (try self.evalComptimeBuiltinValue(call)) |v| break :blk .fromValue(v);
                 // A comptime type reference (`Box(Int)`, or a bare `T`) folds to
                 // its serialized name.
                 if (try self.comptimeTypeString(expr)) |ts| break :blk .fromValue(ts);
@@ -2658,6 +2661,207 @@ pub const IRCompiler = struct {
         const names = [_][]const u8{ "Int", "String", "Bool", "Float", "Void", "Byte" };
         for (names) |n| if (std.mem.eql(u8, name, n)) return true;
         return false;
+    }
+
+    /// The `TypeExpr` a primitive type name denotes (`Int` → `.integer`,
+    /// `String` → `[]Byte`), or null for a non-primitive name.
+    fn primitiveTypeExpr(name: []const u8) ?ast.TypeExpr {
+        const p = ast.TypeExpr.PrimitiveType{ .span = .global };
+        if (std.mem.eql(u8, name, "Int")) return .{ .integer = p };
+        if (std.mem.eql(u8, name, "Float")) return .{ .float = p };
+        if (std.mem.eql(u8, name, "Bool")) return .{ .boolean = p };
+        if (std.mem.eql(u8, name, "Void")) return .{ .void = p };
+        if (std.mem.eql(u8, name, "Byte")) return .{ .byte = p };
+        if (std.mem.eql(u8, name, "String")) return string_type;
+        return null;
+    }
+
+    /// Resolves a comptime type-argument expression to a normalized `TypeExpr`:
+    /// follows a bound type parameter (`T` → its bound type), a named struct or
+    /// primitive, and resolves a generic application (`Box(Int)`) to its struct
+    /// body. The backbone of the type-introspection builtins.
+    fn resolveComptimeType(self: *IRCompiler, expr: *const ast.Expression) Error!?ast.TypeExpr {
+        const written = self.comptimeArgType(expr) orelse return null;
+        return self.normalizeComptimeType(written, 0);
+    }
+
+    fn normalizeComptimeType(self: *IRCompiler, t: ast.TypeExpr, depth: usize) ?ast.TypeExpr {
+        if (depth > 32) return t;
+        switch (t) {
+            .identifier => |id| {
+                if (id.path.segments.len != 1) return t;
+                const name = id.path.segments[0].name;
+                if (self.type_captures.get(name)) |bound| {
+                    if (!isBareName(bound, name)) return self.normalizeComptimeType(bound, depth + 1);
+                }
+                if (self.user_struct_types.get(name)) |st| return .{ .struct_type = st };
+                if (primitiveTypeExpr(name)) |p| return p;
+                return t;
+            },
+            .type_application => |app| {
+                if (self.resolveTypeApplication(app)) |resolved| return self.normalizeComptimeType(resolved, depth + 1);
+                return t;
+            },
+            .alias => |a| return self.normalizeComptimeType(a.type_expr.*, depth + 1),
+            else => return t,
+        }
+    }
+
+    /// The introspection *kind* name of a resolved type — the string `@kind(T)`
+    /// yields.
+    fn comptimeKindName(t: ast.TypeExpr) []const u8 {
+        return switch (t) {
+            .integer => "int",
+            .float => "float",
+            .boolean => "bool",
+            .byte => "byte",
+            .void => "void",
+            .null => "null",
+            .optional => "optional",
+            .array => |a| if (a.element.* == .byte) "string" else "array",
+            .struct_type => "struct",
+            .type_application => "struct",
+            .tuple => "tuple",
+            .sum => "sum",
+            .function => "function",
+            else => "unknown",
+        };
+    }
+
+    /// The struct a resolved type introspects as (`@fields`/`@fieldCount`/
+    /// `@hasField`), or null when it is not a struct.
+    fn comptimeStructOf(t: ast.TypeExpr) ?ast.TypeExpr.StructType {
+        return switch (t) {
+            .struct_type => |st| st,
+            else => null,
+        };
+    }
+
+    const ComptimeBuiltin = enum { kind, elem, child, field_count, has_field, fields, none };
+
+    fn comptimeBuiltinKind(name: []const u8) ComptimeBuiltin {
+        if (std.mem.eql(u8, name, "@kind")) return .kind;
+        if (std.mem.eql(u8, name, "@elem")) return .elem;
+        if (std.mem.eql(u8, name, "@child")) return .child;
+        if (std.mem.eql(u8, name, "@fieldCount")) return .field_count;
+        if (std.mem.eql(u8, name, "@hasField")) return .has_field;
+        if (std.mem.eql(u8, name, "@fields")) return .fields;
+        return .none;
+    }
+
+    /// The serialized name of a type, as an owned string (kept alive for the
+    /// backing `zig_string`; introspection names are few and small).
+    fn ownedTypeName(self: *IRCompiler, t: ast.TypeExpr) Error![]const u8 {
+        var w = std.Io.Writer.Allocating.init(self.allocator);
+        defer w.deinit();
+        try self.writeTypeName(&w.writer, t);
+        return try self.allocator.dupe(u8, w.written());
+    }
+
+    /// Evaluates a scalar type-introspection builtin (`@kind`/`@elem`/`@child`/
+    /// `@fieldCount`/`@hasField`) to its comptime value form (`.zig_string` for a
+    /// string/type name, `.integer`, or `.exit_code` for a bool). Returns null
+    /// when the callee is not such a builtin, an argument is not a comptime type,
+    /// or the builtin does not apply to the argument's kind (a misuse the caller
+    /// reports). `@fields` is not scalar and returns null here.
+    fn evalComptimeBuiltinValue(self: *IRCompiler, call: ast.CallExpr) Error!?ir.Value {
+        if (call.callee.* != .identifier) return null;
+        const which = comptimeBuiltinKind(call.callee.identifier.name);
+        if (which == .none or which == .fields) return null;
+        if (call.arguments.len == 0) return null;
+        const t = (try self.resolveComptimeType(call.arguments[0])) orelse return null;
+        switch (which) {
+            .kind => return ir.Value{ .zig_string = comptimeKindName(t) },
+            .elem => {
+                if (t != .array) return null;
+                return ir.Value{ .zig_string = try self.ownedTypeName(t.array.element.*) };
+            },
+            .child => {
+                if (t != .optional) return null;
+                return ir.Value{ .zig_string = try self.ownedTypeName(t.optional.child.*) };
+            },
+            .field_count => {
+                const st = comptimeStructOf(t) orelse return null;
+                return ir.Value{ .integer = @intCast(st.fields.len) };
+            },
+            .has_field => {
+                const st = comptimeStructOf(t) orelse return null;
+                if (call.arguments.len < 2) return null;
+                const field_name = (try self.comptimeStringArg(call.arguments[1])) orelse return null;
+                var found = false;
+                for (st.fields) |f| {
+                    if (std.mem.eql(u8, f.name.name, field_name)) found = true;
+                }
+                return ir.Value{ .exit_code = .fromBoolean(found) };
+            },
+            else => return null,
+        }
+    }
+
+    /// Folds an argument expected to be a compile-time string literal to its
+    /// bytes (`@hasField(T)("name")`), or null when it is not comptime-known.
+    fn comptimeStringArg(self: *IRCompiler, arg: *ast.Expression) Error!?[]const u8 {
+        const folded = (try self.evalComptimeExpression(arg)) orelse return null;
+        if (folded.source != .value) return null;
+        return switch (folded.source.value) {
+            .zig_string => |s| s,
+            else => null,
+        };
+    }
+
+    /// Compiles a type-introspection builtin call in value position. Returns null
+    /// when the callee is not a recognized introspection builtin (so ordinary
+    /// call compilation proceeds). A scalar builtin folds to a constant; a misuse
+    /// (wrong argument kind, or a non-comptime argument) is a compile error.
+    fn compileComptimeBuiltin(self: *IRCompiler, source: *ast.Expression, call: ast.CallExpr) Error!?Result {
+        const which = comptimeBuiltinKind(call.callee.identifier.name);
+        if (which == .none) return null;
+        if (which == .fields) {
+            try self.reportSourceError(
+                source,
+                Error.UnsupportedExpression,
+                .@"error",
+                "@fields(T) is only usable as the source of a comptime `for` loop",
+                .{},
+            );
+            return .fromValue(.void);
+        }
+        if (try self.evalComptimeBuiltinValue(call)) |value| {
+            return switch (value) {
+                .zig_string => |s| .fromValue(try self.addSlice(1, s)),
+                else => .fromValue(value),
+            };
+        }
+        // The builtin didn't produce a value. If the argument resolves to a
+        // *concrete* type, this is a genuine misuse (e.g. `@elem` on a struct).
+        // If it's still an unbound type variable, we're compiling the
+        // unspecialized template body (never executed once every call
+        // monomorphizes): emit a harmless fallback, mirroring `@kind`/`if`.
+        const resolved = if (call.arguments.len > 0) try self.resolveComptimeType(call.arguments[0]) else null;
+        if (resolved) |t| if (isConcreteComptimeType(t)) {
+            try self.reportSourceError(
+                source,
+                Error.UnsupportedExpression,
+                .@"error",
+                "{s} does not apply to a '{s}' type",
+                .{ call.callee.identifier.name, comptimeKindName(t) },
+            );
+            return .fromValue(.void);
+        };
+        return switch (which) {
+            .field_count => .fromValue(.{ .integer = 0 }),
+            .has_field => .fromValue(.{ .exit_code = .fromBoolean(false) }),
+            else => .fromValue(try self.addSlice(1, "")),
+        };
+    }
+
+    /// Whether a resolved type is a concrete type rather than an unresolved name
+    /// or type variable (an unbound `comptime T: type` in a template body).
+    fn isConcreteComptimeType(t: ast.TypeExpr) bool {
+        return switch (t) {
+            .identifier, .type_var, .type_capture => false,
+            else => true,
+        };
     }
 
     /// Comptime-evaluates a pure function call (`comptime fib 10`). Resolves the
@@ -4773,6 +4977,13 @@ pub const IRCompiler = struct {
             }
             if (std.mem.eql(u8, name, "@src")) {
                 return self.compileIdentifier(source, call.callee.identifier);
+            }
+            // Type-introspection builtins (`@kind`, `@elem`, `@child`,
+            // `@fieldCount`, `@hasField`) fold to a compile-time constant.
+            if (name.len > 0 and name[0] == '@' and
+                self.lookup(name, .{ .shallow = false }) == null)
+            {
+                if (try self.compileComptimeBuiltin(source, call)) |result| return result;
             }
             if (std.mem.eql(u8, name, "cd") and self.lookup(name, .{ .shallow = false }) == null) {
                 return self.compileBuiltinCd(source, call.arguments);
