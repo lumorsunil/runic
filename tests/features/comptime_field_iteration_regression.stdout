@@ -1,0 +1,17 @@
+2 fields:
+  a: Int
+  b: String
+empty ->
+0 fields:
+classify Rec(Bool):
+  id: int
+  label: string
+  items: array of Bool
+  boxed: box of Bool
+deep Wrap(String):
+first: Pair(Int)(String)
+    a: Int
+    b: String
+second: Pair(String)(Bool)
+    a: String
+    b: Bool

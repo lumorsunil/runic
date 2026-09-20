@@ -702,6 +702,11 @@ pub const IRCompiler = struct {
     /// the parameter to this constant so `n == 3` folds. Set by `maybeSpecialize`
     /// around the body compilation, empty otherwise.
     pending_comptime_values: std.StringHashMapUnmanaged(Result) = .empty,
+    /// The struct field currently bound to a comptime `for (@fields(T)) |f|`
+    /// loop variable, by variable name. During the compile-time unroll of one
+    /// iteration, `f.name` folds to the field's name and `f.type` to its type.
+    /// Nested field loops keep one entry per (distinct) variable name.
+    comptime_field_vars: std.StringHashMapUnmanaged(ast.TypeExpr.StructField) = .empty,
     /// Recursion-depth cap for comptime call interpretation. Kept well below the
     /// point where the interpreter's own (native) call stack would overflow, so
     /// a non-terminating `comptime` recursion fails to compile instead of
@@ -2477,6 +2482,13 @@ pub const IRCompiler = struct {
         self: *IRCompiler,
         expr: *ast.Expression,
     ) Error!?Result {
+        // `f.name`/`f.type` of a comptime field-loop variable fold to the field's
+        // name and to its type's serialized name.
+        if (self.comptimeFieldMember(expr)) |fm| {
+            if (std.mem.eql(u8, fm.member, "name")) return .fromValue(.{ .zig_string = fm.field.name.name });
+            if (std.mem.eql(u8, fm.member, "type")) return .fromValue(.{ .zig_string = try self.ownedTypeName(fm.field.type_expr.*) });
+            return null;
+        }
         return switch (expr.*) {
             .literal => |literal| try self.evalComptimeLiteral(literal),
             .identifier => |identifier| blk: {
@@ -2619,6 +2631,11 @@ pub const IRCompiler = struct {
     /// The serialized name of a comptime type reference as an owned string (caller
     /// frees), or null when `expr` is not a comptime type.
     fn comptimeTypeName(self: *IRCompiler, expr: *const ast.Expression) Error!?[]const u8 {
+        // `f.type` of a comptime field-loop variable is a comptime type.
+        if (self.comptimeFieldMember(expr)) |fm| {
+            if (std.mem.eql(u8, fm.member, "type")) return try self.ownedTypeName(fm.field.type_expr.*);
+            return null;
+        }
         switch (expr.*) {
             .identifier => |id| {
                 if (self.type_captures.get(id.name)) |t| {
@@ -2862,6 +2879,53 @@ pub const IRCompiler = struct {
             .identifier, .type_var, .type_capture => false,
             else => true,
         };
+    }
+
+    /// The struct field a comptime field-loop variable is currently bound to, for
+    /// the object of an `f.name` / `f.type` access (`f`, or its zero-arg-call
+    /// spelling). Null when the object is not such a variable.
+    fn comptimeFieldOf(self: *IRCompiler, object: *const ast.Expression) ?ast.TypeExpr.StructField {
+        const name = switch (object.*) {
+            .identifier => |id| id.name,
+            .call => |c| if (c.arguments.len == 0 and c.callee.* == .identifier)
+                c.callee.identifier.name
+            else
+                return null,
+            else => return null,
+        };
+        return self.comptime_field_vars.get(name);
+    }
+
+    const MemberAccess = struct { object: *const ast.Expression, member: []const u8 };
+
+    /// Normalizes a member access. The general expression parser encodes `a.b` as
+    /// a `.binary` with the `.member` op; the interpolation parser uses a
+    /// `.member` node. Returns the object and member name for either form.
+    fn asMemberAccess(expr: *const ast.Expression) ?MemberAccess {
+        switch (expr.*) {
+            .member => |m| return .{ .object = m.object, .member = m.member.name },
+            .binary => |b| {
+                if (b.op != .member) return null;
+                const name = switch (b.right.*) {
+                    .identifier => |id| id.name,
+                    .call => |c| if (c.arguments.len == 0 and c.callee.* == .identifier)
+                        c.callee.identifier.name
+                    else
+                        return null,
+                    else => return null,
+                };
+                return .{ .object = b.left, .member = name };
+            },
+            else => return null,
+        }
+    }
+
+    /// The field and accessed member (`name`/`type`) when `expr` is an `f.name` /
+    /// `f.type` access on a comptime field-loop variable; null otherwise.
+    fn comptimeFieldMember(self: *IRCompiler, expr: *const ast.Expression) ?struct { field: ast.TypeExpr.StructField, member: []const u8 } {
+        const ma = asMemberAccess(expr) orelse return null;
+        const field = self.comptimeFieldOf(ma.object) orelse return null;
+        return .{ .field = field, .member = ma.member };
     }
 
     /// Comptime-evaluates a pure function call (`comptime fib 10`). Resolves the
@@ -4140,6 +4204,19 @@ pub const IRCompiler = struct {
 
         if (std.mem.eql(u8, member.member.name, "wait")) {
             return self.compileWaitMember(source, member.object);
+        }
+
+        // `f.name`/`f.type` of a comptime field-loop variable — a compile-time
+        // constant: the field's name, or its type's serialized name.
+        if (self.comptimeFieldOf(member.object)) |field| {
+            if (std.mem.eql(u8, member.member.name, "name")) {
+                return .fromValue(try self.addSlice(1, field.name.name));
+            }
+            if (std.mem.eql(u8, member.member.name, "type")) {
+                const type_name = try self.ownedTypeName(field.type_expr.*);
+                defer self.allocator.free(type_name);
+                return .fromValue(try self.addSlice(1, type_name));
+            }
         }
 
         // `MyError.Variant` — construct a (payload-less) error value when the
@@ -6092,6 +6169,10 @@ pub const IRCompiler = struct {
     /// (`Box(Int)`, so it still serializes as `Box(Int)` and matches structurally
     /// on demand). Null when the argument is not a type.
     fn comptimeArgType(self: *IRCompiler, arg: *const ast.Expression) ?ast.TypeExpr {
+        // `f.type` of a comptime field-loop variable denotes that field's type.
+        if (self.comptimeFieldMember(arg)) |fm| {
+            return if (std.mem.eql(u8, fm.member, "type")) fm.field.type_expr.* else null;
+        }
         switch (arg.*) {
             .type_value => |tv| return tv.type_expr.*,
             .identifier => |id| {
@@ -11335,6 +11416,73 @@ pub const IRCompiler = struct {
         return .fromValue(.void);
     }
 
+    /// The type argument of a `@fields(T)` call expression, or null when `expr`
+    /// is not such a call.
+    fn comptimeFieldsArg(expr: *const ast.Expression) ?*ast.Expression {
+        if (expr.* != .call) return null;
+        const call = expr.call;
+        if (call.callee.* != .identifier) return null;
+        if (comptimeBuiltinKind(call.callee.identifier.name) != .fields) return null;
+        if (call.arguments.len == 0) return null;
+        return call.arguments[0];
+    }
+
+    /// Compiles `for (@fields(T)) |f| { … }` by unrolling the body once per field
+    /// of the struct `T` resolves to, binding `f` to that field for the body
+    /// (so `f.name`/`f.type` fold). An unresolved `T` (the unspecialized template
+    /// body, never executed) unrolls zero times; a concrete non-struct is an
+    /// error.
+    fn compileComptimeFieldsForLoop(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        for_expr: ast.ForExpr,
+    ) Error!Result {
+        const arg = comptimeFieldsArg(for_expr.sources[0]).?;
+        const resolved = try self.resolveComptimeType(arg);
+        const st = blk: {
+            const t = resolved orelse break :blk null;
+            if (comptimeStructOf(t)) |st| break :blk st;
+            if (isConcreteComptimeType(t)) {
+                try self.reportSourceError(
+                    source,
+                    Error.UnsupportedExpression,
+                    .@"error",
+                    "@fields expects a struct type, got a '{s}'",
+                    .{comptimeKindName(t)},
+                );
+                return .fromValue(.void);
+            }
+            break :blk null;
+        };
+        // Unresolved (template) — the loop compiles to nothing; each real
+        // specialization re-runs this with `T` bound and unrolls.
+        const fields = if (st) |s| s.fields else return .fromValue(.void);
+
+        const var_name: ?[]const u8 = switch (for_expr.capture.bindings[0].*) {
+            .identifier => |id| id.name,
+            else => null,
+        };
+
+        for (fields) |field| {
+            try self.scopes.push(self.allocator, .lexical);
+            const had_prev = var_name != null and self.comptime_field_vars.contains(var_name.?);
+            const prev = if (had_prev) self.comptime_field_vars.get(var_name.?) else null;
+            if (var_name) |vn| try self.comptime_field_vars.put(self.allocator, vn, field);
+
+            const stack_before = self.currentFrame().rel_stack_counter;
+            const body_result = try self.compileExpressionAsStatement(source, for_expr.body);
+            if (isWaitable(body_result)) |loc| try self.wait(source, loc);
+            const extra = self.currentFrame().rel_stack_counter - stack_before;
+            for (0..extra) |_| _ = try self.pop(source);
+
+            if (var_name) |vn| {
+                if (prev) |p| self.comptime_field_vars.put(self.allocator, vn, p) catch {} else _ = self.comptime_field_vars.remove(vn);
+            }
+            self.scopes.pop();
+        }
+        return .fromValue(.void);
+    }
+
     fn compileForLoop(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -11347,6 +11495,13 @@ pub const IRCompiler = struct {
         // half of multi-value typed pipes (`producer | for (&0) |v| { ... }`).
         if (for_expr.sources.len == 1 and for_expr.sources[0].* == .fd) {
             return self.compileFdForLoop(source, for_expr);
+        }
+
+        // `for (@fields(T)) |f| { … }` — a comptime iteration over a struct
+        // type's fields, unrolled at compile time (one body copy per field, with
+        // `f.name`/`f.type` folded to that field's name and type).
+        if (for_expr.sources.len == 1 and comptimeFieldsArg(for_expr.sources[0]) != null) {
+            return self.compileComptimeFieldsForLoop(source, for_expr);
         }
 
         const for_sources = try self.allocator.alloc(ForSource, for_expr.sources.len);

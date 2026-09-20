@@ -29,6 +29,10 @@ pub const TypeChecker = struct {
     /// name; a `Box Int` call substitutes the args into the yielded type. The
     /// Zig-native replacement for `generic_type_ctors`.
     comptime_type_fns: std.StringHashMapUnmanaged(GenericTypeCtor) = .empty,
+    /// Names currently bound by a comptime `for (@fields(T)) |f|` loop. Within the
+    /// loop body, `f.type` is a comptime type (a valid `match`/introspection
+    /// subject) and `f.name` a string. Saved/restored around each such loop.
+    comptime_field_vars: std.StringHashMapUnmanaged(void) = .empty,
     env: ?*std.process.Environ.Map = null,
     /// Strict mode (`--strict`): also require handling of command failures
     /// (`ExecutableError`), which are otherwise exempt (bash-like exit-code
@@ -2641,6 +2645,27 @@ pub const TypeChecker = struct {
 
         const for_scope = try scope.addChild(self.arena.allocator(), for_expr.span);
 
+        // `for (@fields(T)) |f| { … }` — comptime iteration over a struct type's
+        // fields. `f` is bound permissively; within the body `f.type` is a
+        // comptime type and `f.name` a string. The IR compiler unrolls it.
+        if (for_expr.sources.len == 1 and comptimeFieldsCallArg(for_expr.sources[0]) != null) {
+            const arg = comptimeFieldsCallArg(for_expr.sources[0]).?;
+            try self.runExpression(scope, arg);
+            const binding = for_expr.capture.bindings[0];
+            try self.runBindingPattern(for_scope, binding, null, false, false);
+            const var_name: ?[]const u8 = switch (binding.*) {
+                .identifier => |id| id.name,
+                else => null,
+            };
+            const had_prev = var_name != null and self.comptime_field_vars.contains(var_name.?);
+            if (var_name) |vn| try self.comptime_field_vars.put(self.arena.allocator(), vn, {});
+            defer if (var_name) |vn| {
+                if (!had_prev) _ = self.comptime_field_vars.remove(vn);
+            };
+            try self.runExpression(for_scope, for_expr.body);
+            return;
+        }
+
         for (for_expr.sources, for_expr.capture.bindings) |source, pattern| {
             try self.runExpression(scope, source);
             const source_type = try self.resolveExprType(scope, source);
@@ -2971,9 +2996,64 @@ pub const TypeChecker = struct {
     /// literal type value (`match (Box(Int))`).
     fn isComptimeTypeSubject(self: *TypeChecker, scope: *Scope, subject: *ast.Expression) Error!bool {
         if (subject.* == .type_value) return true;
+        // `f.type` of a comptime `@fields` loop variable is a comptime type.
+        if (memberAccessParts(subject)) |ma| {
+            if (std.mem.eql(u8, ma.member, "type")) {
+                if (comptimeFieldVarName(ma.object)) |name| {
+                    if (self.comptime_field_vars.contains(name)) return true;
+                }
+            }
+        }
         const t = (try self.resolveExprType(scope, subject)) orelse return false;
         const u = self.unaliasType(t);
         return u.* == .type_var or u.* == .type_type;
+    }
+
+    const MemberParts = struct { object: *ast.Expression, member: []const u8 };
+
+    /// Normalizes a member access, which the general expression parser encodes as
+    /// a `.binary` with the `.member` op while the interpolation parser uses a
+    /// `.member` node. Returns the object and member name for either form.
+    fn memberAccessParts(expr: *ast.Expression) ?MemberParts {
+        switch (expr.*) {
+            .member => |m| return .{ .object = m.object, .member = m.member.name },
+            .binary => |b| {
+                if (b.op != .member) return null;
+                const name = switch (b.right.*) {
+                    .identifier => |id| id.name,
+                    .call => |c| if (c.arguments.len == 0 and c.callee.* == .identifier)
+                        c.callee.identifier.name
+                    else
+                        return null,
+                    else => return null,
+                };
+                return .{ .object = b.left, .member = name };
+            },
+            else => return null,
+        }
+    }
+
+    /// The identifier name of a comptime field-loop variable used as the object
+    /// of an `f.name`/`f.type` access (`f`, or its zero-arg-call spelling).
+    fn comptimeFieldVarName(object: *const ast.Expression) ?[]const u8 {
+        return switch (object.*) {
+            .identifier => |id| id.name,
+            .call => |c| if (c.arguments.len == 0 and c.callee.* == .identifier)
+                c.callee.identifier.name
+            else
+                null,
+            else => null,
+        };
+    }
+
+    /// The type argument of a `@fields(T)` call, or null when `expr` is not one.
+    fn comptimeFieldsCallArg(expr: *const ast.Expression) ?*ast.Expression {
+        if (expr.* != .call) return null;
+        const call = expr.call;
+        if (call.callee.* != .identifier) return null;
+        if (!std.mem.eql(u8, call.callee.identifier.name, "@fields")) return null;
+        if (call.arguments.len == 0) return null;
+        return call.arguments[0];
     }
 
     /// Type-checks `match (T) { Int => …, Box(|E|) => …, _ => … }`. Each arm is a

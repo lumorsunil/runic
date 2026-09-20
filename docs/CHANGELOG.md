@@ -76,6 +76,20 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   child. A leading `[]T` / `?T` is now a value-position **type value**, so a
   composite type can be passed directly (`@elem([]Int)` → `Int`). A builtin used
   on a concrete type of the wrong kind is a compile error.
+- **Comptime field iteration.** `for (@fields(T)) |f| { … }` unrolls at compile
+  time — one body copy per field of the struct type `T` — binding `f.name` (the
+  field name) and `f.type` (the field's type, itself a comptime type):
+  ```runic
+  fn Void dump(comptime T: type) Void {
+      for (@fields(T)) |f| {
+          if (f.type == Int) { echo "${f.name}: an int" }
+          else { echo "${f.name}: ${@kind(f.type)}" }
+      }
+  }
+  ```
+  `f.type` composes with everything else: `@kind(f.type)`, `@elem(f.type)`,
+  `f.type == Box(|E|)`, `match (f.type) { … }`, and a nested
+  `for (@fields(f.type))` when the field is itself a struct.
 - **Type-returning comptime functions (generic types).** A function that takes
   `comptime` type parameters and `yield`s a type is a generic-type constructor —
   the Zig-style replacement for the `const Box(T) = struct { … }` form:

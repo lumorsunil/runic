@@ -747,6 +747,26 @@ or `Box(Int)`), so a composite type can be passed to a builtin directly:
 Using a builtin on a concrete type of the wrong kind (`@elem(Int)`) is a compile
 error.
 
+#### Iterating a struct's fields
+
+`for (@fields(T)) |f| { … }` iterates a struct type's fields at compile time —
+the loop is **unrolled**, one body copy per field, with `f.name` bound to the
+field name and `f.type` to the field's type (itself a comptime type):
+
+```rn
+fn Void dump(comptime T: type) Void {
+  for (@fields(T)) |f| {
+    if (f.type == Int) { echo "${f.name}: an int" }
+    else { echo "${f.name}: ${@kind(f.type)}" }
+  }
+}
+```
+
+`f.type` composes with the rest of the comptime surface: `@kind(f.type)`,
+`@elem(f.type)`, `f.type == Box(|E|)`, `match (f.type) { … }`, and even a nested
+`for (@fields(f.type))` when a field is itself a struct. An empty struct iterates
+zero times.
+
 ### Generic types as comptime functions
 
 A function whose parameters are `comptime` types and whose body `yield`s a type
