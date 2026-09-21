@@ -6363,9 +6363,43 @@ pub const IRCompiler = struct {
                 .string => string_type,
                 .null => null,
             },
-            .identifier, .call => self.resolveStaticType(arg),
+            .identifier, .call => self.argFunctionType(arg) orelse self.resolveStaticType(arg),
             else => null,
         };
+    }
+
+    /// The full function type of a function-valued argument (`double` →
+    /// `fn (Int) Int`), reconstructed from the referenced function's declaration.
+    /// A hoisted fn binding's stored type carries only its return type (its param
+    /// slot is left empty at hoist time), so binding a `fn (|A|) |B|` parameter's
+    /// captures from such an argument needs the real parameter types. Null when
+    /// the argument does not name a plain function.
+    fn argFunctionType(self: *IRCompiler, arg: *ast.Expression) ?ast.TypeExpr {
+        const name = switch (arg.*) {
+            .identifier => |id| id.name,
+            .call => |call| if (call.arguments.len == 0 and call.callee.* == .identifier)
+                call.callee.identifier.name
+            else
+                return null,
+            else => return null,
+        };
+        const binding = self.lookup(name, .{ .shallow = false }) orelse return null;
+        if (!binding.result.isFunctionRef()) return null;
+        const instr_set = binding.result.source.value.fn_ref.fn_addr.instr_set;
+        const decl_ptr = self.comptime_fn_decls.get(instr_set) orelse return null;
+        const decl = decl_ptr.*;
+        const decl_params = switch (decl.params) {
+            ._non_variadic => |ps| ps,
+            else => return null,
+        };
+        const param_types = self.allocator.alloc(?*const ast.TypeExpr, decl_params.len) catch return null;
+        for (decl_params, param_types) |p, *pt| pt.* = p.type_annotation;
+        return ast.TypeExpr{ .function = .{
+            .params = .{ ._non_variadic = param_types },
+            .stdin_type = decl.stdin_type,
+            .return_type = decl.return_type,
+            .span = decl.span,
+        } };
     }
 
     /// Monomorphization: for a direct call to a top-level, non-recursive generic
@@ -7374,7 +7408,12 @@ pub const IRCompiler = struct {
         // Monomorphization: for a non-recursive direct call, redirect to a
         // per-type specialization when the callee's `|T|` captures resolve to
         // concrete argument types (so `${T}` folds to the concrete type name).
-        if (!is_self_recursive and stdout_override == null) {
+        // Specialization is orthogonal to where the callee's output goes: a typed
+        // value capture (`stdout_override` set) still benefits from monomorphizing
+        // the callee, so a `|T|`/`|M|` capture used as a comptime value in the body
+        // (`@hasMethod(M)(…)`, `${T}`) folds. Only recursion is excluded (the call
+        // already targets the active specialization).
+        if (!is_self_recursive) {
             if (try self.maybeSpecialize(fn_addr.instr_set, arguments)) |spec_instr_set| {
                 fn_addr = ir.InstructionAddr.initAbs(spec_instr_set, 0);
             }
@@ -10185,8 +10224,16 @@ pub const IRCompiler = struct {
         // forward on demand (`ensureFnBodyCompiled`) the enclosing scope is the
         // *caller's* frame, so a re-declare would leak the name into it.
         const already_hoist_declared = self.hoisted_set_sources.contains(instr_set);
+        // The specialized function itself is called directly by instruction set,
+        // so it must not re-declare its name in the enclosing scope. But a *nested*
+        // function declared inside a specialized body (`fn aux …` whose sibling
+        // `bind ma aux` references it) is not the specialization target — it still
+        // needs its name in scope. `pushed_active_specialization` is true only for
+        // the outermost specialized function (it consumed `specializing_generic`);
+        // nested decls leave it false, so they declare normally.
+        const is_specialization_target = self.specializing and pushed_active_specialization;
         if (fn_decl.name) |name| {
-            if (!self.specializing and !already_hoist_declared) {
+            if (!is_specialization_target and !already_hoist_declared) {
                 const fn_type = ast.TypeExpr{ .function = .{
                     .params = .nonVariadic(&.{}),
                     .stdin_type = fn_decl.stdin_type,

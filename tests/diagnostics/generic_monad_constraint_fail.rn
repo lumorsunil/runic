@@ -1,0 +1,22 @@
+# A fully generic `gmap` guards its body with `@hasMethod(M)("bind")` and a
+# directed `@compileError` for a constructor that is not a monad. `Box` has no
+# `bind`, so specializing `gmap` for `M = Box` takes the else arm and fails
+# compilation with the constructor named in the message.
+fn Maybe(comptime T: type) type { yield struct { x: ?T } }
+fn Box(comptime T: type) type { yield struct { v: T } }
+fn pure(x: |A|) Maybe(A) { yield .{ .x = x } }
+fn bind(ma: Maybe(|A|), f: fn (|A|) Maybe(|B|)) Maybe(B) {
+  if (ma.x) |x| yield f x else yield .{ .x = null }
+}
+fn gmap(f: fn (|A|) |B|, ma: |M|(A)) M(B) {
+  if (@hasMethod(M)("bind")) {
+    fn aux(a: A) M(B) { yield pure (f a) }
+    yield bind ma aux
+  } else {
+    @compileError "${M} is not a monad"
+  }
+}
+fn double(n: Int) Int { yield n * 2 }
+const b: Box(Int) = Box{ .v = 21 }
+const r: Box(Int) = gmap double b
+echo "${r.v}"

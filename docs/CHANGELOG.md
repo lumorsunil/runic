@@ -136,6 +136,27 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   written in value position (`yield struct { … }`) is a compile-time-only *type
   value*, erased before the runtime.
 
+### Fixed
+
+- **A generic function is now monomorphized even when its result is captured by
+  value.** A call whose result is bound with a type (`const r: Maybe(Int) = gmap
+  double some`) takes the typed-pipe capture path, which previously skipped
+  specialization — so a higher-kinded capture (`M`) stayed unbound in the body and
+  a constraint over it (`@hasMethod(M)("bind")`) could not fold. Specialization now
+  runs on that path too, so a *fully generic* monad `map` — written over any
+  constructor `M`, guarded by `@hasMethod(M)`/`@compileError`, and returning
+  `M(B)` — works end to end, and a non-monad argument fails compilation with a
+  directed error naming the constructor.
+- **A nested function declared inside a monomorphized body is visible to its
+  siblings.** `fn map(…) { fn aux(a) { … } yield bind ma aux }` used to lose the
+  `aux` binding when `map` was specialized (`command not found: 'aux'`); the nested
+  declaration now registers its name in the specialized body.
+- **A `fn (|A|) |B|` parameter binds its captures from a plain function argument.**
+  The captures `A`/`B` are now recovered from the passed function's real signature
+  (a hoisted function value's stored type carries only its return type), so a
+  generic parameter that depends solely on a function argument for a capture
+  (`ma: |M|(A)` where `A` comes from `f: fn (|A|) |B|`) specializes correctly.
+
 ### Changed
 
 - **The `const Box(T) = struct { … }` generic type-constructor form is removed**,
