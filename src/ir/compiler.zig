@@ -7239,6 +7239,57 @@ pub const IRCompiler = struct {
     /// callee location, passing the arguments in the closure, and captures the
     /// yielded value. Closure size is the argument count — valid for a
     /// capture-free (top-level) function, which is what a HOF receives.
+    /// If `expr` names a nested function that captures its enclosing scope,
+    /// materializes a *closure-carrying* function value: a heap block holding the
+    /// captured variables (at the callee's capture slots, its parameter slots left
+    /// empty) plus an `fn_ref` pointing at it via `closure_addr`. This lets the
+    /// closure be passed as a value and called indirectly elsewhere (`bind ma
+    /// aux`), where the caller has no access to the captured variables. Returns
+    /// null when `expr` is not such a closure (a plain top-level function needs no
+    /// environment and is passed as its bare `fn_ref`).
+    fn tryCompileClosureFnValue(self: *IRCompiler, source: anytype, expr: *ast.Expression) Error!?Result {
+        const name = switch (expr.*) {
+            .identifier => |id| id.name,
+            .call => |c| if (c.arguments.len == 0 and c.callee.* == .identifier)
+                c.callee.identifier.name
+            else
+                return null,
+            else => return null,
+        };
+        const binding = self.lookup(name, .{ .shallow = false }) orelse return null;
+        if (!binding.result.isFunctionRef()) return null;
+        const fn_addr = binding.result.source.value.fn_ref.fn_addr;
+        const instr_set = fn_addr.instr_set;
+        try self.ensureFnBodyCompiled(instr_set);
+        const captures = self.instruction_sets.items[instr_set].closure_captures;
+        if (captures.len == 0) return null;
+        const slot_count = self.instruction_sets.items[instr_set].closure_slot_count;
+
+        try self.alloc(source, slot_count);
+        const env_ref = try self.newRef(source, "closure_fn_env");
+        try self.set(source, env_ref, .fromLocation(.initRegister(.r)));
+        for (captures) |capture| {
+            const cap_binding = self.lookup(capture.identifier.name, .{ .shallow = false }) orelse continue;
+            const identifier_result = try self.compileIdentifier(source, capture.identifier);
+            try self.set(source, .initRegister(.r), .from(env_ref.dereference()));
+            const dst = ir.Location.initAdd(.{ .register = .r }, capture.slot, .{ .dereference = true });
+            if (identifier_result.source == .location and self.bindingTypeIsCImport(cap_binding.type_expr)) {
+                try self.set(source, dst, identifier_result.source);
+            } else if (identifier_result.source == .location) {
+                try self.set(source, dst, identifier_result.source.undereference());
+            } else {
+                try self.set(source, dst, identifier_result.source);
+            }
+        }
+        const result_ref = try self.newRef(source, "closure_fn");
+        try self.addInstruction(.init(.from(source), .{ .make_closure_fn = .{
+            .fn_addr = fn_addr,
+            .closure = env_ref.dereference(),
+            .result = result_ref.dereference(),
+        } }));
+        return .fromLocation(result_ref.dereference().typed(binding.type_expr));
+    }
+
     fn compileIndirectCall(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -7256,7 +7307,8 @@ pub const IRCompiler = struct {
         const arg_refs = try self.allocator.alloc(ir.Location, args.len);
         defer self.allocator.free(arg_refs);
         for (args, arg_refs) |arg, *ar| {
-            const arg_value = try self.compileExpression(arg);
+            const closure_fn = try self.tryCompileClosureFnValue(source, arg);
+            const arg_value = closure_fn orelse try self.compileExpression(arg);
             const r = try self.newRef(source, "indirect_arg");
             try self.set(source, r, stableResultSource(arg_value));
             ar.* = r.dereference();
@@ -7270,15 +7322,20 @@ pub const IRCompiler = struct {
             try self.set(source, .initAdd(.{ .register = .r }, i, .{ .dereference = true }), .from(ar));
         }
 
-        try self.addInstruction(.init(.from(source), .{ .fork = .{
-            .dest = ir.InstructionAddr.initAbs(0, 0),
-            .dest_from = fn_ref_ref.dereference(),
-            .stdin = self.threadStdin(),
-            .stdout = pipe_ref.dereference(),
-            .stderr = self.threadStderr(),
-            .closure = closure_ref.dereference(),
-            .subshell = .inherit,
-        } }));
+        try self.addInstruction(.init(.from(source), .{
+            .fork = .{
+                .dest = ir.InstructionAddr.initAbs(0, 0),
+                .dest_from = fn_ref_ref.dereference(),
+                .stdin = self.threadStdin(),
+                .stdout = pipe_ref.dereference(),
+                .stderr = self.threadStderr(),
+                .closure = closure_ref.dereference(),
+                .subshell = .inherit,
+                // If the fn value carries a captured environment, merge these
+                // argument slots into it (see the fork evaluator).
+                .merge_args = args.len,
+            },
+        }));
         const thread_ref = try self.newRef(source, "indirect_thread");
         try self.set(source, thread_ref, .fromLocation(.initRegister(.r)));
         try self.wait(source, thread_ref.dereference().typed(thread_type));
@@ -7393,7 +7450,8 @@ pub const IRCompiler = struct {
             // *borrowed* stack slot, not a temp we own — popping it corrupts the
             // stack. Only pop when the arg compilation actually grew the frame.
             const stack_before_arg = self.currentFrame().rel_stack_counter;
-            const arg_result = try self.compileResultSaveR(source, try self.compileExpression(arg));
+            const closure_fn = try self.tryCompileClosureFnValue(source, arg);
+            const arg_result = try self.compileResultSaveR(source, closure_fn orelse try self.compileExpression(arg));
             try self.set(source, .initRegister(.r), .from(closure_ref.dereference()));
             try self.set(
                 source,

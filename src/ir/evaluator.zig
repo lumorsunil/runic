@@ -1590,6 +1590,15 @@ pub const IREvaluator = struct {
                 try self.setLocation(thread, is_type.result, .fromBoolean(matches));
                 return .cont;
             },
+            .make_closure_fn => |mcf| {
+                const closure_val = try self.resolveLocation(thread, mcf.closure);
+                const closure_addr: usize = switch (closure_val) {
+                    .addr => |a| a,
+                    else => 0,
+                };
+                try self.setLocation(thread, mcf.result, .{ .fn_ref = .{ .fn_addr = mcf.fn_addr, .closure_addr = closure_addr } });
+                return .cont;
+            },
             .str_op => |str_op| {
                 // `join`'s receiver is an array of strings, not a string, so it
                 // is handled before materializing the operand.
@@ -2244,14 +2253,33 @@ pub const IREvaluator = struct {
                     return Error.MissingSpawnedThreadContext;
                 };
 
+                var fn_closure_addr: usize = 0;
                 const dest_addr: ir.ResolvedInstructionAddr = if (fork.dest_from) |loc| blk: {
                     const fn_val = try self.resolveLocation(thread, loc);
                     if (fn_val != .fn_ref) return Error.UnsupportedInstruction;
+                    fn_closure_addr = fn_val.fn_ref.closure_addr;
                     break :blk .init(fn_val.fn_ref.fn_addr.instr_set, 0);
                 } else try self.resolveAddr(thread, fork.dest);
                 new_thread.setInstructionCounter(dest_addr);
 
                 thread.private.result_register = .{ .thread = new_thread_handle };
+
+                // The callee's closure: when the fn value carries a captured
+                // environment (a nested closure passed as a value), copy this
+                // call's argument slots into that block and use it, so the callee
+                // sees both its arguments and its captures.
+                const closure_value: ir.Value = if (fn_closure_addr != 0 and fork.merge_args > 0) blk: {
+                    const provided = try self.resolveLocation(thread, fork.closure);
+                    const provided_addr: usize = switch (provided) {
+                        .addr => |a| a,
+                        else => 0,
+                    };
+                    for (0..fork.merge_args) |i| {
+                        const src = self.context.shared.heapGet(provided_addr + i) orelse continue;
+                        if (self.context.shared.heapGetPtr(fn_closure_addr + i)) |dst| dst.* = src;
+                    }
+                    break :blk .{ .addr = fn_closure_addr };
+                } else try self.resolveLocation(thread, fork.closure);
 
                 try new_thread.private.stack.append(
                     self.allocator,
@@ -2267,7 +2295,7 @@ pub const IREvaluator = struct {
                 );
                 try new_thread.private.stack.append(
                     self.allocator,
-                    try self.resolveLocation(thread, fork.closure),
+                    closure_value,
                 );
 
                 return .cont;

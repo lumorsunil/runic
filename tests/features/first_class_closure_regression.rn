@@ -1,0 +1,39 @@
+# A closure that captures a *runtime* value (a parameter, or a function value)
+# can be passed as an argument and called indirectly, with its environment
+# intact. The function value carries its captured environment (see the
+# `make_closure_fn` instruction and the fork's arg-merge), so a caller that has
+# no access to the captured variables can still invoke it.
+
+fn apply(f: fn (Int) Int, x: Int) Int { yield f x }
+
+# Capture a runtime parameter into a nested closure passed as an argument.
+fn addN(k: Int) Int {
+  fn add(n: Int) Int { yield n + k }
+  yield apply add 5
+}
+echo "runtime capture: ${addN 100}"
+
+# Capture a function value into a nested closure passed as an argument.
+fn dbl(n: Int) Int { yield n * 2 }
+fn composeApply(g: fn (Int) Int) Int {
+  fn viaG(n: Int) Int { yield g n }
+  yield apply viaG 7
+}
+echo "fn-value capture: ${composeApply dbl}"
+
+# The concrete Maybe monad: `map` builds a nested closure `aux` that captures the
+# mapped function `f`, passes it to `bind`, which calls it indirectly.
+fn Maybe(comptime T: type) type { yield struct { x: ?T } }
+fn pure(x: |A|) Maybe(A) { yield .{ .x = x } }
+fn bind(ma: Maybe(|A|), f: fn (|A|) Maybe(|B|)) Maybe(B) {
+  if (ma.x) |x| yield f x else yield .{ .x = null }
+}
+fn map(f: fn (|A|) |B|, ma: Maybe(|A|)) Maybe(B) {
+  fn aux(a: A) Maybe(B) { yield pure (f a) }
+  yield bind ma aux
+}
+fn triple(n: Int) Int { yield n * 3 }
+const some: Maybe(Int) = Maybe{ .x = 14 }
+const none: Maybe(Int) = Maybe{ .x = null }
+echo "map triple some: ${(map triple some).x orelse -1}"
+echo "map triple none: ${(map triple none).x orelse -1}"

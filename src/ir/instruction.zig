@@ -121,6 +121,11 @@ pub const Instruction = struct {
         /// sets result to a boolean: whether operand's runtime value is of the
         /// given type tag (the `x is T` operator / sum narrowing)
         is_type: IsType,
+        /// builds a closure-carrying function value: an `fn_ref` whose `fn_addr`
+        /// is `fn_addr` and whose `closure_addr` is the runtime address held in
+        /// `closure`. Used to capture a nested closure's environment into the fn
+        /// value so an indirect call can restore it.
+        make_closure_fn: MakeClosureFn,
         /// applies a string builtin (`s.len`, `s.upper`, `s.contains "x"`, …) to
         /// the operand string, with up to two arguments, storing the result.
         str_op: StrOp,
@@ -420,6 +425,12 @@ pub const Instruction = struct {
     pub const IsType = struct {
         operand: Location,
         tag: TypeTag,
+        result: Location,
+    };
+
+    pub const MakeClosureFn = struct {
+        fn_addr: InstructionAddr,
+        closure: Location,
         result: Location,
     };
 
@@ -753,6 +764,12 @@ pub const Instruction = struct {
         stderr: Location,
         closure: Location,
         subshell: Subshell = .inherit,
+        /// For an indirect call whose `dest_from` fn value carries a closure
+        /// (`closure_addr != 0`): the number of leading argument slots to copy
+        /// from `closure` into the fn value's captured-environment block, which
+        /// is then used as the callee's closure. Zero (the default) uses
+        /// `closure` directly.
+        merge_args: usize = 0,
 
         pub const Subshell = enum {
             /// New thread shares the parent's SubshellContext (cwd, env).
