@@ -14,6 +14,33 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Added
 
+- **Function overloading.** A name declared more than once is an overload set;
+  a call resolves to one candidate by the argument types and — when several match
+  (they differ only in return type) — the expected type from context (a binding
+  annotation or the enclosing `yield`). This gives return-type polymorphism:
+  ```runic
+  fn Void pure(x: |A|) Maybe(A) { yield .{ .x = x } }
+  fn Void pure(x: |A|) []A     { yield .{ x } }
+  const m: Maybe(Int) = pure 42   # Maybe overload
+  const l: []Int      = pure 7    # [] overload
+  ```
+  An unresolved ambiguity (no expected type) is reported and asks for an
+  annotation.
+- **Higher-kinded capture.** A parameter type `|M|(A)` captures the type
+  *constructor* `M` (not just a type) along with `A`: from an argument of type
+  `Maybe(Int)` it binds `M = Maybe`, `A = Int`, so a function can be generic over
+  any single-argument constructor and use `M`/`A` as types in its body (`${M}`,
+  `A == Int`, `@kind(A)`). (Returning `M(...)` is a follow-up.)
+- **Constraint-checking builtins.** `@hasMethod(M)("name")` folds to whether a
+  function `name` mentions the constructor `M(…)` at its head (a first-parameter
+  `M(A)` or a return `M(A)`); `@compileError "msg"` fails compilation from a
+  taken comptime branch (with `${T}`-style interpolation). Together with `|M|(A)`
+  they express a type-class-lite constraint with a directed error:
+  ```runic
+  fn Void map(m: |M|(|A|)) String {
+      if (@hasMethod(M)("bind")) { … } else { @compileError "${M} lacks bind" }
+  }
+  ```
 - **Comptime type parameters and type logic.** A parameter marked `comptime` is
   known at compile time, and `type` is a first-class comptime value, so an
   ordinary function can take a type, compare it, and branch on it at compile
