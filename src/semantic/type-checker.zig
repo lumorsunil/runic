@@ -4313,6 +4313,12 @@ pub const TypeChecker = struct {
         // (declared) even though the two `T`s are distinct nodes.
         if (resolved_left.* == .type_var or resolved_right.* == .type_var) return true;
 
+        // `null` inhabits any optional (`?T`), including nested in a struct field
+        // (`{ x: null }` satisfying `{ x: ?T }`) — the same coercion the top-level
+        // optional-yield check allows, applied structurally.
+        if (resolved_left.* == .null and resolved_right.* == .optional) return true;
+        if (resolved_left.* == .optional and resolved_right.* == .null) return true;
+
         if (std.meta.activeTag(resolved_left.*) != std.meta.activeTag(resolved_right.*)) return false;
 
         return switch (resolved_left.*) {
