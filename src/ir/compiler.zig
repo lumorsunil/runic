@@ -1961,7 +1961,9 @@ pub const IRCompiler = struct {
         return switch (ty.*) {
             .struct_type, .optional => true,
             .array => |a| a.element.* != .byte,
-            .type_application => |app| self.user_struct_types.contains(app.name.name),
+            // Any generic application (`Box(Int)`, or `M(A)` re-applying a
+            // captured constructor) yields a struct — materialize by value.
+            .type_application => true,
             .identifier => |named| self.user_struct_types.contains(named.path.segments[named.path.segments.len - 1].name),
             else => false,
         };
@@ -3307,9 +3309,11 @@ pub const IRCompiler = struct {
             // as the array itself; a String (`[]Byte`) stays on the byte path.
             .type_var => true,
             .array => |a| a.element.* != .byte,
-            // A generic struct application (`Box(Int)`) is captured by value like
-            // any struct, so it isn't byte-serialized (which would misread it).
-            .type_application => |app| self.user_struct_types.contains(app.name.name),
+            // A generic application (`Box(Int)`, or `M(A)` re-applying a captured
+            // constructor) is captured by value like any struct, so it isn't
+            // byte-serialized (which would misread it): every generic type
+            // constructor yields a struct.
+            .type_application => true,
             .identifier => |named| blk: {
                 const name = named.path.segments[named.path.segments.len - 1].name;
                 if (self.user_struct_types.contains(name)) break :blk true;
@@ -6295,6 +6299,18 @@ pub const IRCompiler = struct {
                 if (app.ctor_is_capture) try out.append(allocator, app.name.name);
                 for (app.args) |arg| try collectCapturesInType(arg.*, out, allocator);
             },
+            // A function-type parameter (`fn (|A|) |B|`) captures through its
+            // parameter and return types.
+            .function => |f| {
+                if (f.return_type) |rt| try collectCapturesInType(rt.*, out, allocator);
+                if (f.stdin_type) |st| try collectCapturesInType(st.*, out, allocator);
+                switch (f.params) {
+                    ._non_variadic => |ps| for (ps) |p| {
+                        if (p) |pt| try collectCapturesInType(pt.*, out, allocator);
+                    },
+                    ._variadic => |p| if (p) |pt| try collectCapturesInType(pt.*, out, allocator),
+                }
+            },
             else => {},
         }
     }
@@ -6577,8 +6593,18 @@ pub const IRCompiler = struct {
     /// body with the arguments substituted, or null when the constructor isn't a
     /// registered generic struct.
     fn resolveTypeApplication(self: *IRCompiler, app: ast.TypeExpr.TypeApplication) ?ast.TypeExpr {
-        const body_st = self.user_struct_types.get(app.name.name) orelse return null;
-        const params = self.generic_ctor_params.get(app.name.name) orelse &[_]ast.Identifier{};
+        // A higher-kinded application `M(A)` whose constructor `M` was captured
+        // (bound in `type_captures` to a concrete constructor like `Maybe`):
+        // resolve it as that constructor applied to the arguments.
+        var name = app.name.name;
+        if (self.type_captures.get(name)) |bound| {
+            if (bound == .identifier and bound.identifier.path.segments.len == 1) {
+                const ctor = bound.identifier.path.segments[0].name;
+                if (!std.mem.eql(u8, ctor, name)) name = ctor;
+            }
+        }
+        const body_st = self.user_struct_types.get(name) orelse return null;
+        const params = self.generic_ctor_params.get(name) orelse &[_]ast.Identifier{};
         return self.substituteTypeParams(.{ .struct_type = body_st }, params, app.args) catch null;
     }
 
@@ -6795,6 +6821,23 @@ pub const IRCompiler = struct {
                     }
                 }
             },
+            // A function-type parameter (`fn (|A|) |B|`) binds its captures from
+            // the passed function's concrete signature (`fn (Int) Int`).
+            .function => |pf| {
+                if (subject != .function) return;
+                const sf = subject.function;
+                if (pf.return_type) |prt| if (sf.return_type) |srt| self.bindTypeCaptures(prt.*, srt.*);
+                switch (pf.params) {
+                    ._non_variadic => |pps| switch (sf.params) {
+                        ._non_variadic => |sps| {
+                            const n = @min(pps.len, sps.len);
+                            for (0..n) |i| if (pps[i]) |ppt| if (sps[i]) |spt| self.bindTypeCaptures(ppt.*, spt.*);
+                        },
+                        else => {},
+                    },
+                    else => {},
+                }
+            },
             else => {},
         }
     }
@@ -6936,9 +6979,26 @@ pub const IRCompiler = struct {
             .array => |a| hasTypeCapture(a.element.*),
             .optional => |o| hasTypeCapture(o.child.*),
             .promise => |p| hasTypeCapture(p.child.*),
-            .type_application => |app| for (app.args) |arg| {
-                if (hasTypeCapture(arg.*)) break true;
-            } else false,
+            .type_application => |app| blk: {
+                // `|M|(…)` — a higher-kinded constructor capture.
+                if (app.ctor_is_capture) break :blk true;
+                for (app.args) |arg| if (hasTypeCapture(arg.*)) break :blk true;
+                break :blk false;
+            },
+            // A function type parameter (`fn (|A|) |B|`) carries captures too.
+            .function => |f| blk: {
+                if (f.return_type) |rt| if (hasTypeCapture(rt.*)) break :blk true;
+                if (f.stdin_type) |st| if (hasTypeCapture(st.*)) break :blk true;
+                switch (f.params) {
+                    ._non_variadic => |ps| for (ps) |p| {
+                        if (p) |pt| if (hasTypeCapture(pt.*)) break :blk true;
+                    },
+                    ._variadic => |p| if (p) |pt| {
+                        if (hasTypeCapture(pt.*)) break :blk true;
+                    },
+                }
+                break :blk false;
+            },
             else => false,
         };
     }

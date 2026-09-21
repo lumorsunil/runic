@@ -2,8 +2,8 @@
 # *constructor* `M` (not just a type), alongside the argument type `A`. Both are
 # bound by monomorphization from the argument's concrete type (`Maybe(Int)` →
 # M = Maybe, A = Int), recovering the constructor from the resolved struct, and
-# are usable as types in the body (`${M}`, `${A}`, and `A` as a type). Returning
-# `M(...)` is a separate follow-up and is rejected for now.
+# are usable as types in the body (`${M}`, `${A}`, and `A` as a type). The
+# captured constructor can also be re-applied in the return type (`M(A)`).
 
 fn Maybe(comptime T: type) type { yield struct { x: ?T } }
 fn Box(comptime T: type) type { yield struct { v: T } }
@@ -26,3 +26,11 @@ echo "${describe bs}"
 # A multi-argument constructor still captures the first argument as A.
 const pib: Pair(Int)(Bool) = Pair{ .a = 1, .b = true }
 echo "${nameOf pib}"
+
+# The captured constructor `M` re-applied in the return type `M(A)`: a container
+# passed through generically, then read back at its concrete type.
+fn Void idM(m: |M|(|A|)) M(A) { yield m }
+const back: Maybe(Int) = idM mi
+echo "idM mi: ${back.x orelse -1}"
+const backB: Box(String) = idM bs
+echo "idM bs: ${backB.v}"

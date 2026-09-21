@@ -30,7 +30,9 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   *constructor* `M` (not just a type) along with `A`: from an argument of type
   `Maybe(Int)` it binds `M = Maybe`, `A = Int`, so a function can be generic over
   any single-argument constructor and use `M`/`A` as types in its body (`${M}`,
-  `A == Int`, `@kind(A)`). (Returning `M(...)` is a follow-up.)
+  `A == Int`, `@kind(A)`). The captured constructor can also be re-applied in the
+  return type — `fn idM(m: |M|(|A|)) M(A) { yield m }` passes any container
+  through generically and reads it back at its concrete type.
 - **Constraint-checking builtins.** `@hasMethod(M)("name")` folds to whether a
   function `name` mentions the constructor `M(…)` at its head (a first-parameter
   `M(A)` or a return `M(A)`); `@compileError "msg"` fails compilation from a

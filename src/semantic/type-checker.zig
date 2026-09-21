@@ -1037,18 +1037,6 @@ pub const TypeChecker = struct {
 
     /// Resolves a `Name(args…)` application against a registered generic
     /// constructor: substitutes the args into its body, then resolves the result.
-    /// Whether a type expression is (or contains at its head) a higher-kinded
-    /// application `M(...)` whose constructor `M` is a captured type variable.
-    fn isHigherKindedApplication(self: *TypeChecker, scope: *Scope, t: *const ast.TypeExpr) bool {
-        return switch (t.*) {
-            .type_application => |app| app.ctor_is_capture or self.nameIsTypeVar(scope, app.name.name),
-            .optional => |o| self.isHigherKindedApplication(scope, o.child),
-            .array => |a| self.isHigherKindedApplication(scope, a.element),
-            .promise => |p| self.isHigherKindedApplication(scope, p.child),
-            else => false,
-        };
-    }
-
     /// Whether `name` is bound in scope to a type variable (a `|T|`/`|M|` capture
     /// introduced by the enclosing signature), rather than a concrete type.
     fn nameIsTypeVar(self: *TypeChecker, scope: *Scope, name: []const u8) bool {
@@ -2352,21 +2340,6 @@ pub const TypeChecker = struct {
                     );
                 }
             },
-        }
-
-        // A higher-kinded *return* type (`M(B)` re-applying a captured
-        // constructor) is not yet supported — a function may capture `|M|(A)` in a
-        // parameter, but re-applying `M` in the return position is a follow-up.
-        if (fn_decl.return_type) |rt| {
-            if (self.isHigherKindedApplication(fn_scope, rt)) {
-                try self.reportSpanError(
-                    rt.span(),
-                    Error.UnsupportedExpression,
-                    .@"error",
-                    "higher-kinded return types are not yet supported; a function may capture `|M|(A)` in a parameter but cannot yet return `M(...)`",
-                    .{},
-                );
-            }
         }
 
         // Make the declared stdout type visible to every `yield` in the body
