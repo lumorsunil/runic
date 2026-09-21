@@ -45,6 +45,12 @@ pub const TypeChecker = struct {
     /// loop's child scope). A null entry means the enclosing function declared
     /// no stdout type, so its yields are unconstrained.
     stdout_type_stack: std.ArrayListUnmanaged(?*const ast.TypeExpr) = .empty,
+    /// Parallel to `stdout_type_stack`, but holding each function's *raw*
+    /// (unresolved) declared return type. `runYield` uses it to name an anonymous
+    /// struct literal (`yield .{ … }`) from the return type — the raw form keeps
+    /// a constructor name (`Maybe(B)`) that resolution erases into a nameless
+    /// struct. Pushed/popped together with `stdout_type_stack`.
+    stdout_return_raw_stack: std.ArrayListUnmanaged(?*const ast.TypeExpr) = .empty,
 
     /// Concrete variants inferred for each leading-`!T` (inferred) error set,
     /// keyed by the placeholder `error_set` node (shared by pointer between the
@@ -181,6 +187,7 @@ pub const TypeChecker = struct {
         // pass appends into freed memory (a segfault the moment a function body
         // is type-checked). This is why re-checking after an edit crashed.
         self.stdout_type_stack = .empty;
+        self.stdout_return_raw_stack = .empty;
         self.inferred_error_sets = .empty;
         self.inferred_collector_stack = .empty;
     }
@@ -680,9 +687,9 @@ pub const TypeChecker = struct {
         // type from the enclosing function's declared stdout (return) type. Only a
         // yield to stdout (&1) carries that type.
         if (yield_stmt.fd == 1 and exprMayNeedStructInference(yield_stmt.value) and
-            self.stdout_type_stack.items.len > 0)
+            self.stdout_return_raw_stack.items.len > 0)
         {
-            self.stampInferredLiteral(yield_stmt.value, self.stdout_type_stack.items[self.stdout_type_stack.items.len - 1]);
+            self.stampInferredLiteral(yield_stmt.value, self.stdout_return_raw_stack.items[self.stdout_return_raw_stack.items.len - 1]);
         }
 
         try self.runExpression(scope, yield_stmt.value);
@@ -1108,6 +1115,9 @@ pub const TypeChecker = struct {
                 if (self.unaliasType(t).* != .struct_type) return null;
                 return .{ .name = alias.name, .span = alias.span };
             },
+            // A generic application (`Maybe(B)`): stamp the constructor name, so
+            // `yield .{ … }` against a `Maybe(B)` return infers `Maybe{ … }`.
+            .type_application => |app| return app.name,
             else => return null,
         }
     }
@@ -2097,6 +2107,8 @@ pub const TypeChecker = struct {
             null;
         try self.stdout_type_stack.append(self.arena.allocator(), resolved_return);
         defer _ = self.stdout_type_stack.pop();
+        try self.stdout_return_raw_stack.append(self.arena.allocator(), fn_decl.return_type);
+        defer _ = self.stdout_return_raw_stack.pop();
 
         // If the return type is a leading-`!T` (inferred) error union, set up a
         // collector so the body's yielded/propagated errors become the concrete
