@@ -663,6 +663,12 @@ pub const IRCompiler = struct {
     /// the set the forward call sites already point at.
     hoisted_fn_sets: std.AutoHashMapUnmanaged(*const ast.Expression, usize) = .empty,
 
+    /// Names of top-level generic functions (`|T|` captures / comptime params) —
+    /// they are monomorphized per call through the fork path, never sync-called.
+    /// A call to one is therefore not sync-lowerable: the sync yield path would
+    /// return the fork's unwaited handle instead of the materialized value.
+    generic_fn_names: std.StringHashMapUnmanaged(void) = .empty,
+
     /// Reverse of `hoisted_fn_sets`: a hoisted function's instruction set → its
     /// `fn …` expression, so a call/fork site can compile the callee's body
     /// on demand (see `ensureFnBodyCompiled`) when it is forward-referenced.
@@ -1918,6 +1924,42 @@ pub const IRCompiler = struct {
     /// `yield expr` writes the value of `expr` to the thread's stdout stream
     /// (the program stdout, or the inter-stage pipe when used as a pipeline
     /// stage). Unlike `return`, it does not exit the function.
+    /// Whether a yielded call's result must be captured by value before being
+    /// written, rather than streamed: a generic call (always forks to
+    /// monomorphize), or any call to a user function returning an aggregate value
+    /// (a struct, optional, generic application, or non-byte array) — which forks
+    /// and returns a reference the caller must materialize. A `sync` call is
+    /// handled earlier (`tryCompileSyncCall`); a scalar/String/command yield keeps
+    /// streaming.
+    fn yieldNeedsValueCapture(self: *IRCompiler, expr: *const ast.Expression) bool {
+        if (expr.* != .call) return false;
+        const c = expr.call;
+        if (c.callee.* != .identifier) return false;
+        const name = c.callee.identifier.name;
+        if (self.generic_fn_names.contains(name)) return true;
+        const binding = self.lookup(name, .{ .shallow = false }) orelse return false;
+        if (!binding.result.isFunctionRef()) return false;
+        const ft = binding.type_expr orelse return false;
+        if (ft != .function) return false;
+        const rt = ft.function.return_type orelse return false;
+        return self.returnNeedsMaterialization(rt);
+    }
+
+    /// Whether a return type is an aggregate whose forked result must be
+    /// materialized by value (not byte-streamed): a struct, optional, non-byte
+    /// array, or a user generic application / named struct.
+    fn returnNeedsMaterialization(self: *IRCompiler, t: *const ast.TypeExpr) bool {
+        var ty = t;
+        while (ty.* == .alias) ty = ty.alias.type_expr;
+        return switch (ty.*) {
+            .struct_type, .optional => true,
+            .array => |a| a.element.* != .byte,
+            .type_application => |app| self.user_struct_types.contains(app.name.name),
+            .identifier => |named| self.user_struct_types.contains(named.path.segments[named.path.segments.len - 1].name),
+            else => false,
+        };
+    }
+
     fn compileYield(
         self: *IRCompiler,
         source: *ast.Statement,
@@ -1931,8 +1973,15 @@ pub const IRCompiler = struct {
         // this branch handles all of a sync function's yields.
         if (self.sync_mode and y.fd == 1) {
             // A yielded fork-free sync call (`yield (f n)`) resolves to its
-            // `call`/`ret` entry rather than forking; its value lands in `%r`.
-            const value = (try self.tryCompileSyncCall(y.value, y.value)) orelse try self.compileExpression(y.value);
+            // `call`/`ret` entry rather than forking; its value lands in `%r`. A
+            // yielded call that forks and returns an aggregate (a generic result,
+            // or a non-sync struct-returner) is captured by value first, so the
+            // materialized value is returned in `%r` rather than the fork's handle.
+            const value = (try self.tryCompileSyncCall(y.value, y.value)) orelse
+                (if (self.yieldNeedsValueCapture(y.value))
+                    try self.compileExpressionWithCapture(y.value, y.value)
+                else
+                    try self.compileExpression(y.value));
             try self.set(source, .initRegister(.r), stableResultSource(value));
             try self.addInstruction(.init(.from(source), .ret));
             return .fromValue(.void);
@@ -1958,7 +2007,17 @@ pub const IRCompiler = struct {
         const stack_before_value = self.currentFrame().rel_stack_counter;
         // A yielded fork-free sync call resolves to its entry (fork-free); its
         // value (`%r`) is then written to the stdout/stderr stream like any yield.
-        const raw_value = (try self.tryCompileSyncCall(y.value, y.value)) orelse try self.compileExpression(y.value);
+        // A yielded call to a *generic* function is captured by value first (as a
+        // `const t = …; yield t` binding does), so its materialized result — e.g.
+        // a monomorphized `Maybe(A)` struct — is written; piping the raw fork
+        // result would write a thread handle / dangling reference instead. Only
+        // generic calls need this: an ordinary yield (a value, a command, a
+        // pipeline) must keep streaming, not be captured.
+        const raw_value = (try self.tryCompileSyncCall(y.value, y.value)) orelse
+            (if (y.fd == 1 and self.yieldNeedsValueCapture(y.value))
+                try self.compileExpressionWithCapture(source, y.value)
+            else
+                try self.compileExpression(y.value));
         const value = try self.compileResultSaveR(source, raw_value);
         try self.pipeWrite(source, target, value.source);
         const pushed = self.currentFrame().rel_stack_counter -| stack_before_value;
@@ -9264,6 +9323,9 @@ pub const IRCompiler = struct {
             .member => |m| self.syncBodyLowerable(m.object),
             .index => |i| self.syncBodyLowerable(i.target) and self.syncBodyLowerable(i.index),
             .call => |c| blk: {
+                // A call to a generic function forks (to monomorphize); the sync
+                // path can't sync-call it and would return its unwaited handle.
+                if (c.callee.* == .identifier and self.generic_fn_names.contains(c.callee.identifier.name)) break :blk false;
                 if (!self.syncBodyLowerable(c.callee)) break :blk false;
                 for (c.arguments) |a| if (!self.syncBodyLowerable(a)) break :blk false;
                 break :blk true;
@@ -9465,8 +9527,12 @@ pub const IRCompiler = struct {
             // `${Box}` / `${Box(Int)}` serializes to its type name.
             if (self.comptime_type_names.contains(name.name)) continue;
             // A generic function (`|T|` captures) is monomorphized per call site,
-            // not called through one shared binding — leave it on that path.
-            if (fnDeclIsGeneric(expr.fn_decl)) continue;
+            // not called through one shared binding — leave it on that path, and
+            // record its name so a *call* to it is kept off the sync path too.
+            if (fnDeclIsGeneric(expr.fn_decl)) {
+                try self.generic_fn_names.put(self.allocator, name.name, {});
+                continue;
+            }
 
             const instr_set = try self.addInstructionSet();
             // A forward call site is compiled before the body, so the callee's

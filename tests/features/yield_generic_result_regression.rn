@@ -1,0 +1,25 @@
+# Yielding the result of a generic (monomorphized) function returns the
+# materialized value, not the fork's handle. A generic function forks to
+# monomorphize; a `yield genericCall args` must capture that struct/array result
+# by value before writing it, or the caller reads a dangling reference. A
+# function that yields a generic call therefore stays off the sync path, and the
+# yield captures the value (as `const t = call; yield t` already did).
+
+fn Maybe(comptime T: type) type { yield struct { x: ?T } }
+fn pure(x: |A|) Maybe(A) { yield Maybe{ .x = x } }
+fn wrap(x: |A|) []A { yield .{ x } }
+
+# Re-yield a generic struct result through a non-generic wrapper.
+fn Void boxInt(n: Int) Maybe(Int) { yield pure n }
+fn Void boxStr(s: String) Maybe(String) { yield pure s }
+echo "boxInt: ${(boxInt 9).x orelse -1}"
+echo "boxStr: ${(boxStr "hi").x orelse "?"}"
+
+# Re-yield a generic array result.
+fn Void listInt(n: Int) []Int { yield wrap n }
+const li: []Int = listInt 5
+echo "listInt: ${li[0]} len=${li.len}"
+
+# Two hops: generic -> non-generic -> non-generic.
+fn Void reBox(n: Int) Maybe(Int) { yield boxInt n }
+echo "reBox: ${(reBox 7).x orelse -1}"
