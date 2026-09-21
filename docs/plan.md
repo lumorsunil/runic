@@ -251,7 +251,19 @@ Likely near- to mid-term candidates:
   `std/map` and the generic-type tests were migrated, and the old form reports a
   directed error. (Generic type *variables* in signatures are introduced
   explicitly with `|T|`; a bare unknown uppercase type name is an error rather than
-  a silent generic.)
+  a silent generic.) The comptime surface was then rounded out — all landed:
+  1. ~~**comptime value parameters**~~ — a `comptime n: Int` / `s: String`
+     parameter is a compile-time constant; the function is monomorphized per value
+     so `n == 3` folds and `${n}` is the constant.
+  2. ~~**`match` on a type**~~ — `match (T) { Int => …, Box(|E|) => …, _ => … }`
+     prunes to one arm at compile time, binding capture patterns (`|E|`) like a
+     type predicate; a `match` on a comptime value prunes by literal.
+  3. ~~**type introspection**~~ — `@kind(T)`, `@fieldCount(T)`,
+     `@hasField(T)("f")`, `@elem(T)`, `@child(T)` fold to constants; a leading
+     `[]T` / `?T` is a value-position type value (`@elem([]Int)` → `Int`).
+  4. ~~**comptime iteration**~~ — `for (@fields(T)) |f| { … }` unrolls per struct
+     field, binding `f.name` and `f.type` (a comptime type that composes with
+     `match`, the introspection builtins, and a nested `for (@fields(f.type))`).
 - support escaping whitespace in bareword executable/identifier syntax so
   commands or names containing spaces can be represented without immediately
   collapsing to quoted-string behavior
