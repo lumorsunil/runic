@@ -708,6 +708,9 @@ pub const TypeChecker = struct {
         const yielded = try self.resolveExprType(scope, yield_stmt.value) orelse return;
         const resolved = try self.resolvePipeType(scope, yielded) orelse return;
         if (self.pipeTypesEqual(resolved, declared_stdout)) return;
+        // A bare value (or `null`) widens into an optional, including nested in a
+        // struct field: `yield .{ .x = n }` satisfies a `Maybe(T)` return.
+        if (self.yieldCoercesToType(resolved, declared_stdout)) return;
 
         // Coerce into an error-union stdout type: a bare ok payload value (`T`)
         // or an error value both satisfy `E!T`.
@@ -789,6 +792,42 @@ pub const TypeChecker = struct {
     ) bool {
         if (self.unaliasType(yielded).* == .null) return true;
         return self.pipeTypesEqual(yielded, optional.child);
+    }
+
+    /// Whether a yielded value type *coerces* to a declared return type — a
+    /// directional widening the symmetric `pipeTypesEqual` can't express. On top
+    /// of exact equality it allows a bare value or `null` to satisfy an optional
+    /// (`T`/`null` → `?T`) and applies that structurally through struct fields and
+    /// array elements, so `{ x: Int }` (a `yield .{ .x = n }`) satisfies a
+    /// `{ x: ?Int }` return. The reverse — an optional where a bare value is
+    /// required — does not hold, which is why this stays out of `pipeTypesEqual`.
+    fn yieldCoercesToType(
+        self: *TypeChecker,
+        yielded: *const ast.TypeExpr,
+        declared: *const ast.TypeExpr,
+    ) bool {
+        if (self.pipeTypesEqual(yielded, declared)) return true;
+        const d = self.unaliasType(declared);
+        const y = self.unaliasType(yielded);
+        switch (d.*) {
+            .optional => {
+                if (y.* == .null) return true;
+                return self.yieldCoercesToType(yielded, d.optional.child);
+            },
+            .struct_type => {
+                if (y.* != .struct_type) return false;
+                const yf = y.struct_type.fields;
+                const df = d.struct_type.fields;
+                if (yf.len != df.len) return false;
+                for (yf, df) |ly, ld| {
+                    if (!std.mem.eql(u8, ly.name.name, ld.name.name)) return false;
+                    if (!self.yieldCoercesToType(ly.type_expr, ld.type_expr)) return false;
+                }
+                return true;
+            },
+            .array => return y.* == .array and self.yieldCoercesToType(y.array.element, d.array.element),
+            else => return false,
+        }
     }
 
     /// An empty error set marks an inferred set (produced by leading-`!T` return

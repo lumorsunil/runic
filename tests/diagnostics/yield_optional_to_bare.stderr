@@ -1,0 +1,8 @@
+[error]: tests/diagnostics/yield_optional_to_bare.rn:3:28: yield type mismatch: function yields ?Int, but declared stdout type is Int
+   1:# The yield optional-widening coercion is directional: a bare value (or null)
+   2:# widens INTO an optional, but an optional does NOT satisfy a bare-value return.
+   3:fn Void bad(o: ?Int) Int { yield o }
+   4:
+   5:bad 5
+   6:
+

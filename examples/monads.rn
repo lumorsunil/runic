@@ -13,17 +13,32 @@ fn Maybe(comptime T: type) type {
 }
 
 fn Void map(f: fn (|A|) |B|, ma: Maybe(A)) Maybe(B) {
-  if (ma.x) |x| yield Maybe{ .x = f(x) } else yield Maybe{ .x = null }
+  if (ma.x) |x| yield .{ .x = f x } else yield .{ .x = null }
+}
+
+fn Void bind(f: fn (|A|) Maybe(|B|), ma: Maybe(A)) Maybe(B) {
+  if (ma.x) |x| yield f x else yield .{ .x = null }
 }
 
 fn Void double(n: Int) Int { yield n * 2 }
 fn Void label(n: Int) String { yield "n=${n}" }
+fn Void validateIs42(n: Int) Maybe(Int) {
+  if (n == 42) {
+    yield .{ .x = n }
+  } else {
+    yield .{ .x = null }
+  }
+}
 
 const some: Maybe(Int) = Maybe{ .x = 21 }
+const some42: Maybe(Int) = Maybe{ .x = 42 }
 const none: Maybe(Int) = Maybe{ .x = null }
 
 # The captured return type B follows the mapped function: Int for `double`,
 # String for `label`.
-echo "double(some): ${(map double some).x orelse 0}"
-echo "label(some):  ${(map label some).x orelse "?"}"
-echo "double(none): ${(map double none).x orelse -1}"
+echo "double(some): ${(map double some).x}"
+echo "label(some):  ${(map label some).x}"
+echo "double(none): ${(map double none).x}"
+echo "validateIs42(some): ${(bind validateIs42 some).x}"
+echo "validateIs42(some42): ${(bind validateIs42 some42).x}"
+echo "validateIs42(none): ${(bind validateIs42 none).x}"
