@@ -1,0 +1,28 @@
+# Higher-kinded capture: `|M|(A)` in a parameter type captures the type
+# *constructor* `M` (not just a type), alongside the argument type `A`. Both are
+# bound by monomorphization from the argument's concrete type (`Maybe(Int)` →
+# M = Maybe, A = Int), recovering the constructor from the resolved struct, and
+# are usable as types in the body (`${M}`, `${A}`, and `A` as a type). Returning
+# `M(...)` is a separate follow-up and is rejected for now.
+
+fn Maybe(comptime T: type) type { yield struct { x: ?T } }
+fn Box(comptime T: type) type { yield struct { v: T } }
+fn Pair(comptime A: type, comptime B: type) type { yield struct { a: A, b: B } }
+
+# Serialize the captured constructor and argument.
+fn Void nameOf(m: |M|(|A|)) String { yield "${M} of ${A}" }
+const mi: Maybe(Int) = Maybe{ .x = 5 }
+const bs: Box(String) = Box{ .v = "hi" }
+echo "${nameOf mi}"
+echo "${nameOf bs}"
+
+# The captured `A` is a real type: introspect it and compare it.
+fn Void describe(m: |M|(|A|)) String {
+  if (A == Int) { yield "${M} holding an int" } else { yield "${M} holding a ${@kind(A)}" }
+}
+echo "${describe mi}"
+echo "${describe bs}"
+
+# A multi-argument constructor still captures the first argument as A.
+const pib: Pair(Int)(Bool) = Pair{ .a = 1, .b = true }
+echo "${nameOf pib}"

@@ -208,6 +208,11 @@ pub const TypeExpr = union(enum) {
         name: Identifier,
         args: []const *const TypeExpr,
         span: Span,
+        /// True when the constructor itself is a captured type variable — a
+        /// *higher-kinded* application `|M|(A)`: `name` holds the capture name
+        /// `M`, bound to a concrete constructor (e.g. `Maybe`) when this pattern
+        /// is unified against an argument's type, then re-applied as `M(B)`.
+        ctor_is_capture: bool = false,
 
         pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
             // Curried, one argument per parenthesis: `HashMap(Key)(Value)`.

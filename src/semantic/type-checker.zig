@@ -1037,11 +1037,42 @@ pub const TypeChecker = struct {
 
     /// Resolves a `Name(args…)` application against a registered generic
     /// constructor: substitutes the args into its body, then resolves the result.
+    /// Whether a type expression is (or contains at its head) a higher-kinded
+    /// application `M(...)` whose constructor `M` is a captured type variable.
+    fn isHigherKindedApplication(self: *TypeChecker, scope: *Scope, t: *const ast.TypeExpr) bool {
+        return switch (t.*) {
+            .type_application => |app| app.ctor_is_capture or self.nameIsTypeVar(scope, app.name.name),
+            .optional => |o| self.isHigherKindedApplication(scope, o.child),
+            .array => |a| self.isHigherKindedApplication(scope, a.element),
+            .promise => |p| self.isHigherKindedApplication(scope, p.child),
+            else => false,
+        };
+    }
+
+    /// Whether `name` is bound in scope to a type variable (a `|T|`/`|M|` capture
+    /// introduced by the enclosing signature), rather than a concrete type.
+    fn nameIsTypeVar(self: *TypeChecker, scope: *Scope, name: []const u8) bool {
+        const binding = scope.lookup(name) orelse return false;
+        const t = binding.type_expr orelse return false;
+        return self.unaliasType(t).* == .type_var;
+    }
+
     fn resolveTypeApplication(
         self: *TypeChecker,
         scope: *Scope,
         app: ast.TypeExpr.TypeApplication,
     ) Error!*const ast.TypeExpr {
+        // A higher-kinded application `M(A)` whose constructor is a captured type
+        // variable is permissive in the generic body — a type variable that
+        // unifies with anything. The concrete constructor is bound only by the IR
+        // compiler's monomorphization (per `M`), which resolves `M(B)` for real.
+        // `M(A)` where `M` is a captured constructor — either written `|M|(A)`
+        // (ctor_is_capture) or a later bare `M(B)` whose `M` is a type variable
+        // introduced by an earlier `|M|(…)`. Permissive in the generic body; the
+        // IR compiler binds `M` concretely at monomorphization.
+        if (app.ctor_is_capture or self.nameIsTypeVar(scope, app.name.name)) {
+            return self.allocTypeExpression(.{ .type_var = .{ .name = app.name.name, .span = app.span } });
+        }
         const ctor = self.generic_type_ctors.get(app.name.name) orelse {
             try self.reportSpanError(
                 app.span,
@@ -1686,7 +1717,12 @@ pub const TypeChecker = struct {
             // capture elsewhere in the signature) or a declared type; otherwise
             // it is an undeclared-type error (a typo), not a silent generic.
             .type_capture => |capture| try out.put(self.arena.allocator(), capture.name, {}),
-            .type_application => |app| for (app.args) |arg| try self.collectTypeVars(outer, arg, out),
+            .type_application => |app| {
+                // A higher-kinded application `|M|(A)` introduces the constructor
+                // capture `M` as a type variable too.
+                if (app.ctor_is_capture) try out.put(self.arena.allocator(), app.name.name, {});
+                for (app.args) |arg| try self.collectTypeVars(outer, arg, out);
+            },
             .array => |a| try self.collectTypeVars(outer, a.element, out),
             .optional => |o| try self.collectTypeVars(outer, o.child, out),
             .promise => |p| try self.collectTypeVars(outer, p.child, out),
@@ -2316,6 +2352,21 @@ pub const TypeChecker = struct {
                     );
                 }
             },
+        }
+
+        // A higher-kinded *return* type (`M(B)` re-applying a captured
+        // constructor) is not yet supported — a function may capture `|M|(A)` in a
+        // parameter, but re-applying `M` in the return position is a follow-up.
+        if (fn_decl.return_type) |rt| {
+            if (self.isHigherKindedApplication(fn_scope, rt)) {
+                try self.reportSpanError(
+                    rt.span(),
+                    Error.UnsupportedExpression,
+                    .@"error",
+                    "higher-kinded return types are not yet supported; a function may capture `|M|(A)` in a parameter but cannot yet return `M(...)`",
+                    .{},
+                );
+            }
         }
 
         // Make the declared stdout type visible to every `yield` in the body

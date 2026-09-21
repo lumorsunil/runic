@@ -4084,6 +4084,20 @@ pub const Parser = struct {
         const name = try self.parseTypeIdentifier();
         const close = try self.expectTokenTag(.pipe);
 
+        // A higher-kinded application `|M|(A)`: the captured `M` is a type
+        // *constructor*, applied to the following curried arguments. `M` is bound
+        // to a concrete constructor when this pattern is unified, then re-applied.
+        if ((try self.peekToken()).tag == .l_paren) {
+            var type_args = try self.collectCurriedTypeArgs(name.name);
+            defer type_args.deinit(self.allocator);
+            return self.allocTypeExpression(.{ .type_application = .{
+                .name = .{ .name = name.name, .span = open.span.endAt(close.span) },
+                .args = try self.copyToArena(*const ast.TypeExpr, type_args.items),
+                .span = open.span.endAt(type_args.items[type_args.items.len - 1].span()),
+                .ctor_is_capture = true,
+            } });
+        }
+
         return self.allocTypeExpression(.{
             .type_capture = .{
                 .name = name.name,

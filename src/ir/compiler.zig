@@ -6172,7 +6172,12 @@ pub const IRCompiler = struct {
             .array => |a| try collectCapturesInType(a.element.*, out, allocator),
             .optional => |o| try collectCapturesInType(o.child.*, out, allocator),
             .promise => |p| try collectCapturesInType(p.child.*, out, allocator),
-            .type_application => |app| for (app.args) |arg| try collectCapturesInType(arg.*, out, allocator),
+            .type_application => |app| {
+                // A higher-kinded application `|M|(A)` captures the constructor
+                // `M` in addition to any captures in its arguments.
+                if (app.ctor_is_capture) try out.append(allocator, app.name.name);
+                for (app.args) |arg| try collectCapturesInType(arg.*, out, allocator);
+            },
             else => {},
         }
     }
@@ -6553,6 +6558,72 @@ pub const IRCompiler = struct {
         return true;
     }
 
+    /// Recovers the generic constructor and type arguments that produce a struct,
+    /// by unifying it against each registered generic constructor's body
+    /// (`{ x: ?Int }` → `Maybe`, args `[Int]`). Used for higher-kinded capture,
+    /// where a resolved struct argument must be traced back to `M(A)`. Null when
+    /// no constructor matches.
+    const CtorApp = struct { name: ast.Identifier, args: []const *const ast.TypeExpr };
+
+    fn recoverCtorApplication(self: *IRCompiler, subject: ast.TypeExpr.StructType) ?CtorApp {
+        var it = self.user_struct_types.iterator();
+        while (it.next()) |entry| {
+            const ctor_name = entry.key_ptr.*;
+            const params = self.generic_ctor_params.get(ctor_name) orelse continue;
+            if (params.len == 0) continue;
+            var bindings: std.StringHashMapUnmanaged(ast.TypeExpr) = .empty;
+            defer bindings.deinit(self.allocator);
+            if (!self.unifyCtorTemplate(.{ .struct_type = entry.value_ptr.* }, .{ .struct_type = subject }, params, &bindings)) continue;
+            const args = self.allocator.alloc(*const ast.TypeExpr, params.len) catch continue;
+            var ok = true;
+            for (params, args) |p, *dst| {
+                const bound = bindings.get(p.name) orelse {
+                    ok = false;
+                    break;
+                };
+                const t = self.allocator.create(ast.TypeExpr) catch {
+                    ok = false;
+                    break;
+                };
+                t.* = bound;
+                dst.* = t;
+            }
+            if (!ok) continue;
+            return .{ .name = .{ .name = ctor_name, .span = .global }, .args = args };
+        }
+        return null;
+    }
+
+    /// Structural unification of a generic constructor's body `template` against a
+    /// concrete `subject`, binding each constructor parameter to the matched type.
+    fn unifyCtorTemplate(self: *IRCompiler, template: ast.TypeExpr, subject: ast.TypeExpr, params: []const ast.Identifier, bindings: *std.StringHashMapUnmanaged(ast.TypeExpr)) bool {
+        if (template == .identifier and template.identifier.path.segments.len == 1) {
+            const name = template.identifier.path.segments[0].name;
+            for (params) |p| if (std.mem.eql(u8, p.name, name)) {
+                bindings.put(self.allocator, name, subject) catch {};
+                return true;
+            };
+        }
+        if (std.meta.activeTag(template) != std.meta.activeTag(subject)) return false;
+        return switch (template) {
+            .integer, .float, .boolean, .byte, .void, .null => true,
+            .optional => |o| self.unifyCtorTemplate(o.child.*, subject.optional.child.*, params, bindings),
+            .array => |a| self.unifyCtorTemplate(a.element.*, subject.array.element.*, params, bindings),
+            .struct_type => |st| blk: {
+                const sub = subject.struct_type;
+                if (st.fields.len != sub.fields.len) break :blk false;
+                for (st.fields, sub.fields) |tf, sf| {
+                    if (!std.mem.eql(u8, tf.name.name, sf.name.name)) break :blk false;
+                    if (!self.unifyCtorTemplate(tf.type_expr.*, sf.type_expr.*, params, bindings)) break :blk false;
+                }
+                break :blk true;
+            },
+            .identifier => |id| subject == .identifier and
+                std.mem.eql(u8, id.path.segments[id.path.segments.len - 1].name, subject.identifier.path.segments[subject.identifier.path.segments.len - 1].name),
+            else => false,
+        };
+    }
+
     fn bindTypeCaptures(self: *IRCompiler, pattern: ast.TypeExpr, subject: ast.TypeExpr) void {
         switch (pattern) {
             .type_capture => |capture| {
@@ -6564,9 +6635,33 @@ pub const IRCompiler = struct {
             .array => |a| if (subject == .array) self.bindTypeCaptures(a.element.*, subject.array.element.*),
             .optional => |o| if (subject == .optional) self.bindTypeCaptures(o.child.*, subject.optional.child.*),
             .promise => |p| if (subject == .promise) self.bindTypeCaptures(p.child.*, subject.promise.child.*),
-            // `Box(|T|)` — substitute into the body (keeping the capture), then
-            // match structurally against the subject struct.
+            // `|M|(A)` — a higher-kinded pattern: bind the constructor `M` to the
+            // subject's constructor and each argument pattern to the subject's
+            // corresponding argument (`Maybe(Int)` → M = Maybe, A = Int).
             .type_application => |app| {
+                if (app.ctor_is_capture) {
+                    var subj = subject;
+                    while (subj == .alias) subj = subj.alias.type_expr.*;
+                    // The subject may still be in application form (`Maybe(Int)`)
+                    // or already resolved to its struct (`{ x: ?Int }`). Recover
+                    // the constructor and its arguments from either.
+                    const recovered: ?CtorApp = switch (subj) {
+                        .type_application => |sa| .{ .name = sa.name, .args = sa.args },
+                        .struct_type => |sst| self.recoverCtorApplication(sst),
+                        else => null,
+                    };
+                    if (recovered) |rec| {
+                        const seg = self.allocator.alloc(ast.Identifier, 1) catch return;
+                        seg[0] = rec.name;
+                        const ctor_type = ast.TypeExpr{ .identifier = .{ .path = .{ .segments = seg, .span = .global }, .span = .global } };
+                        self.type_captures.put(self.allocator, app.name.name, ctor_type) catch {};
+                        const n = @min(app.args.len, rec.args.len);
+                        for (0..n) |i| self.bindTypeCaptures(app.args[i].*, rec.args[i].*);
+                    }
+                    return;
+                }
+                // `Box(|T|)` — substitute into the body (keeping the capture), then
+                // match structurally against the subject struct.
                 if (self.resolveTypeApplication(app)) |resolved| self.bindTypeCaptures(resolved, subject);
             },
             .struct_type => |st| {
