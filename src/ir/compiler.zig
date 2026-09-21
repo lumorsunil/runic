@@ -669,6 +669,13 @@ pub const IRCompiler = struct {
     /// return the fork's unwaited handle instead of the materialized value.
     generic_fn_names: std.StringHashMapUnmanaged(void) = .empty,
 
+    /// Nonzero while compiling the *unspecialized template* body of a generic
+    /// function — where comptime branches are not pruned (type params unbound),
+    /// so both arms compile. `@compileError` is suppressed there (it fires only in
+    /// a real specialization, or in non-generic code), and never from a branch a
+    /// concrete monomorphization would prune away.
+    generic_template_depth: usize = 0,
+
     /// Reverse of `hoisted_fn_sets`: a hoisted function's instruction set → its
     /// `fn …` expression, so a call/fork site can compile the callee's body
     /// on demand (see `ensureFnBodyCompiled`) when it is forward-referenced.
@@ -2813,7 +2820,7 @@ pub const IRCompiler = struct {
         };
     }
 
-    const ComptimeBuiltin = enum { kind, elem, child, field_count, has_field, fields, none };
+    const ComptimeBuiltin = enum { kind, elem, child, field_count, has_field, has_method, fields, none };
 
     fn comptimeBuiltinKind(name: []const u8) ComptimeBuiltin {
         if (std.mem.eql(u8, name, "@kind")) return .kind;
@@ -2821,8 +2828,62 @@ pub const IRCompiler = struct {
         if (std.mem.eql(u8, name, "@child")) return .child;
         if (std.mem.eql(u8, name, "@fieldCount")) return .field_count;
         if (std.mem.eql(u8, name, "@hasField")) return .has_field;
+        if (std.mem.eql(u8, name, "@hasMethod")) return .has_method;
         if (std.mem.eql(u8, name, "@fields")) return .fields;
         return .none;
+    }
+
+    /// Whether a declared function name matches a method name, allowing an
+    /// overload-mangled form (`bind`, or `bind#0`).
+    fn methodNameMatches(decl_name: []const u8, method: []const u8) bool {
+        if (std.mem.eql(u8, decl_name, method)) return true;
+        return decl_name.len > method.len and
+            std.mem.startsWith(u8, decl_name, method) and
+            decl_name[method.len] == '#';
+    }
+
+    /// The head constructor name of a parameter type — `Maybe(Int)` → "Maybe";
+    /// unwraps optional/array wrappers. Returns "*" for a higher-kinded capture
+    /// `|M|(…)` (matches any constructor). Null when the type is not an
+    /// application.
+    fn headCtorName(t: ast.TypeExpr) ?[]const u8 {
+        return switch (t) {
+            .type_application => |app| if (app.ctor_is_capture) "*" else app.name.name,
+            .optional => |o| headCtorName(o.child.*),
+            .array => |a| headCtorName(a.element.*),
+            else => null,
+        };
+    }
+
+    /// Whether a top-level function named `method` exists whose first parameter is
+    /// an application of the constructor `ctor` (a UFCS-style "method on `M`"), or
+    /// a higher-kinded `|M|(…)` that accepts any constructor. Backs `@hasMethod`.
+    fn hasMethodForCtor(self: *IRCompiler, ctor: []const u8, method: []const u8) bool {
+        var it = self.comptime_fn_decls.valueIterator();
+        while (it.next()) |dp| {
+            const decl = dp.*;
+            const dn = (decl.name orelse continue).name;
+            if (!methodNameMatches(dn, method)) continue;
+            // A "method on M" is a function that mentions `M(…)` at its head — in
+            // its first parameter (`bind : M(A) -> …`, arg-dispatched) or its
+            // return type (`pure : A -> M(A)`, return-dispatched). A higher-kinded
+            // `|M|(…)` matches any constructor.
+            if (headCtorMatches(decl.return_type, ctor)) return true;
+            const params = switch (decl.params) {
+                ._non_variadic => |ps| ps,
+                else => continue,
+            };
+            if (params.len > 0) {
+                if (headCtorMatches(params[0].type_annotation, ctor)) return true;
+            }
+        }
+        return false;
+    }
+
+    fn headCtorMatches(maybe_type: ?*const ast.TypeExpr, ctor: []const u8) bool {
+        const t = maybe_type orelse return false;
+        const head = headCtorName(t.*) orelse return false;
+        return std.mem.eql(u8, head, "*") or std.mem.eql(u8, head, ctor);
     }
 
     /// The serialized name of a type, as an owned string (kept alive for the
@@ -2845,6 +2906,15 @@ pub const IRCompiler = struct {
         const which = comptimeBuiltinKind(call.callee.identifier.name);
         if (which == .none or which == .fields) return null;
         if (call.arguments.len == 0) return null;
+        // `@hasMethod(M, "name")` needs `M`'s constructor *name*, not its resolved
+        // struct — whether a UFCS function `name` takes an `M(…)` first argument.
+        if (which == .has_method) {
+            if (call.arguments.len < 2) return null;
+            const ctor = (try self.comptimeTypeName(call.arguments[0])) orelse return null;
+            defer self.allocator.free(ctor);
+            const method = (try self.comptimeStringArg(call.arguments[1])) orelse return null;
+            return ir.Value{ .exit_code = .fromBoolean(self.hasMethodForCtor(ctor, method)) };
+        }
         const t = (try self.resolveComptimeType(call.arguments[0])) orelse return null;
         switch (which) {
             .kind => return ir.Value{ .zig_string = comptimeKindName(t) },
@@ -2883,6 +2953,39 @@ pub const IRCompiler = struct {
             .zig_string => |s| s,
             else => null,
         };
+    }
+
+    /// Folds a message string at compile time, including interpolations that name
+    /// comptime types (`${T}`) or fold to comptime values (`${n}`). Used by
+    /// `@compileError`. Owned result.
+    fn comptimeMessage(self: *IRCompiler, arg: *ast.Expression) Error!?[]const u8 {
+        if (arg.* != .literal or arg.literal != .string) {
+            if (try self.comptimeStringArg(arg)) |s| return try self.allocator.dupe(u8, s);
+            return null;
+        }
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(self.allocator);
+        for (arg.literal.string.segments) |seg| switch (seg) {
+            .text => |t| try buf.appendSlice(self.allocator, t.payload),
+            .interpolation => |ie| {
+                if (try self.comptimeTypeName(ie)) |tn| {
+                    defer self.allocator.free(tn);
+                    try buf.appendSlice(self.allocator, tn);
+                } else if (try self.evalComptimeExpression(ie)) |v| {
+                    if (v.source == .value) switch (v.source.value) {
+                        .zig_string => |s| try buf.appendSlice(self.allocator, s),
+                        .integer => |n| {
+                            const s = try std.fmt.allocPrint(self.allocator, "{d}", .{n});
+                            defer self.allocator.free(s);
+                            try buf.appendSlice(self.allocator, s);
+                        },
+                        .exit_code => |e| try buf.appendSlice(self.allocator, if (e.toBoolean()) "0" else "1"),
+                        else => {},
+                    };
+                }
+            },
+        };
+        return try self.allocator.dupe(u8, buf.items);
     }
 
     /// Compiles a type-introspection builtin call in value position. Returns null
@@ -5113,6 +5216,20 @@ pub const IRCompiler = struct {
             }
             if (std.mem.eql(u8, name, "@src")) {
                 return self.compileIdentifier(source, call.callee.identifier);
+            }
+            // `@compileError "msg"` — a compile-time failure. Reached only when its
+            // branch is actually compiled: a comptime `if`/`match` prunes the
+            // untaken arm, so it fires for exactly the specializations that select
+            // it. Suppressed in the unspecialized template (both arms compile).
+            if (std.mem.eql(u8, name, "@compileError")) {
+                if (self.generic_template_depth == 0) {
+                    const msg = if (call.arguments.len > 0)
+                        (try self.comptimeMessage(call.arguments[0])) orelse "compile error"
+                    else
+                        "compile error";
+                    try self.reportSourceError(source, Error.UnsupportedExpression, .@"error", "{s}", .{msg});
+                }
+                return .fromValue(.void);
             }
             // Type-introspection builtins (`@kind`, `@elem`, `@child`,
             // `@fieldCount`, `@hasField`) fold to a compile-time constant.
@@ -9825,6 +9942,16 @@ pub const IRCompiler = struct {
         // Compile the function body directly in the closure scope (no extra lexical push/pop)
         // so that top-level `pub` bindings land in the closure frame and are visible to the
         // pub-export epilogue below.  For non-block bodies fall back to compileExpression.
+        // The unspecialized template body of a generic function compiles every
+        // comptime branch (nothing is bound to prune them), so `@compileError`
+        // must not fire here — only in a concrete specialization or in
+        // non-generic code.
+        const is_generic_template = !self.specializing and fnDeclIsGeneric(fn_decl);
+        if (is_generic_template) self.generic_template_depth += 1;
+        defer if (is_generic_template) {
+            self.generic_template_depth -= 1;
+        };
+
         const result = if (fn_decl.body.* == .block) blk: {
             const block = fn_decl.body.block;
             // Identify this body's linear-buffer vars (grown in place). Saved and
