@@ -29,6 +29,20 @@ pub const TypeChecker = struct {
     /// name; a `Box Int` call substitutes the args into the yielded type. The
     /// Zig-native replacement for `generic_type_ctors`.
     comptime_type_fns: std.StringHashMapUnmanaged(GenericTypeCtor) = .empty,
+    /// Function overload sets: an original name declared more than once maps to
+    /// its candidates, each renamed to a unique mangled name in the AST (so the
+    /// compiler sees distinct functions). A call to the original name is resolved
+    /// to one candidate by argument types and the expected return type, then its
+    /// callee is rewritten to that mangled name. Keyed by original name.
+    overload_sets: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(OverloadEntry)) = .empty,
+    /// The expected type of the expression currently being checked, when known
+    /// from context (a binding annotation, a `yield`'s return type, a call
+    /// argument's parameter type). Consulted to disambiguate a return-type-only
+    /// overload (`pure` → `Maybe(Int)` vs `[]Int`). A stack for nesting.
+    expected_type_stack: std.ArrayListUnmanaged(?*const ast.TypeExpr) = .empty,
+    /// Overloaded call nodes already resolved (rewritten or reported), so a call
+    /// visited from several sites (walk, type resolution) is handled exactly once.
+    overload_resolved: std.AutoHashMapUnmanaged(*const ast.CallExpr, void) = .empty,
     /// Names currently bound by a comptime `for (@fields(T)) |f|` loop. Within the
     /// loop body, `f.type` is a comptime type (a valid `match`/introspection
     /// subject) and `f.name` a string. Saved/restored around each such loop.
@@ -188,6 +202,9 @@ pub const TypeChecker = struct {
         // is type-checked). This is why re-checking after an edit crashed.
         self.stdout_type_stack = .empty;
         self.stdout_return_raw_stack = .empty;
+        self.overload_sets = .empty;
+        self.expected_type_stack = .empty;
+        self.overload_resolved = .empty;
         self.inferred_error_sets = .empty;
         self.inferred_collector_stack = .empty;
     }
@@ -565,6 +582,10 @@ pub const TypeChecker = struct {
     /// the type checker never accepts a forward reference the IR compiler (which
     /// hoists only top-level functions) would fail to compile.
     fn runTopLevelBlock(self: *TypeChecker, scope: *Scope, block: *ast.Block) Error!void {
+        // Pass 0: collect overload sets and mangle their declarations, so pass 1
+        // declares each candidate under a distinct name and calls can resolve.
+        try self.collectOverloads(block);
+
         // Pass 1 (source order): bindings/type declarations are checked normally,
         // and a function only has its *signature* declared. Declarations come
         // before the signatures that reference them, so a signature still resolves
@@ -691,6 +712,15 @@ pub const TypeChecker = struct {
         {
             self.stampInferredLiteral(yield_stmt.value, self.stdout_return_raw_stack.items[self.stdout_return_raw_stack.items.len - 1]);
         }
+
+        // The enclosing function's declared return type is the yielded value's
+        // expected type — used to pick a return-type-only overload (`yield pure x`).
+        const yield_expected: ?*const ast.TypeExpr = if (yield_stmt.fd == 1 and self.stdout_type_stack.items.len > 0)
+            self.stdout_type_stack.items[self.stdout_type_stack.items.len - 1]
+        else
+            null;
+        try self.expected_type_stack.append(self.arena.allocator(), yield_expected);
+        defer _ = self.expected_type_stack.pop();
 
         try self.runExpression(scope, yield_stmt.value);
 
@@ -905,6 +935,13 @@ pub const TypeChecker = struct {
     pub const GenericTypeCtor = struct {
         params: []const ast.Identifier,
         body: *const ast.TypeExpr,
+    };
+
+    /// One candidate of a function overload set: its mangled (unique) name and
+    /// the declaration it was renamed from.
+    pub const OverloadEntry = struct {
+        mangled: []const u8,
+        decl: *ast.FunctionDecl,
     };
 
     /// Returns a copy of `type_expr` with each identifier that names one of
@@ -1315,6 +1352,13 @@ pub const TypeChecker = struct {
         if (binding_decl.annotation != null and exprMayNeedStructInference(binding_decl.initializer)) {
             self.stampInferredLiteral(binding_decl.initializer, binding_decl.annotation);
         }
+
+        // The annotation is the initializer's expected type — used to pick a
+        // return-type-only overload (`const b: []Int = pure 42`). Pushed raw and
+        // resolved lazily only when an overload actually needs it, so a normal
+        // binding never re-resolves (and never re-reports) its annotation here.
+        try self.expected_type_stack.append(self.arena.allocator(), binding_decl.annotation);
+        defer _ = self.expected_type_stack.pop();
 
         try self.runExpression(scope, binding_decl.initializer);
 
@@ -2012,6 +2056,143 @@ pub const TypeChecker = struct {
     /// already declared in this scope (a re-run, or a later `runFnDecl`). Builds a
     /// throwaway function scope only to bake in any signature type variables; the
     /// body is checked later by `runFnDecl` in its own scope.
+    /// Pass 0 of top-level checking: any function name declared more than once is
+    /// an overload set. Each such declaration is renamed to a unique mangled name
+    /// (`name#0`, `name#1`, …) — mutating the AST, which the IR compiler then sees
+    /// as distinct functions — and recorded so a call to the original name can be
+    /// resolved to one candidate (`resolveOverloadedCall`). The `#` separator can
+    /// never appear in a source identifier, so a mangled name cannot collide.
+    fn collectOverloads(self: *TypeChecker, block: *ast.Block) Error!void {
+        const a = self.arena.allocator();
+        var counts: std.StringHashMapUnmanaged(usize) = .empty;
+        defer counts.deinit(a);
+        for (block.statements) |statement| {
+            const fn_decl = fnDeclStatement(statement) orelse continue;
+            const name = (fn_decl.name orelse continue).name;
+            const gop = try counts.getOrPut(a, name);
+            gop.value_ptr.* = (if (gop.found_existing) gop.value_ptr.* else 0) + 1;
+        }
+
+        var indices: std.StringHashMapUnmanaged(usize) = .empty;
+        defer indices.deinit(a);
+        for (block.statements) |statement| {
+            const fn_decl = fnDeclStatement(statement) orelse continue;
+            const original = (fn_decl.name orelse continue).name;
+            if ((counts.get(original) orelse 0) < 2) continue;
+
+            const idx_gop = try indices.getOrPut(a, original);
+            const idx = if (idx_gop.found_existing) idx_gop.value_ptr.* else 0;
+            idx_gop.value_ptr.* = idx + 1;
+            const mangled = try std.fmt.allocPrint(a, "{s}#{d}", .{ original, idx });
+
+            const set_gop = try self.overload_sets.getOrPut(a, original);
+            if (!set_gop.found_existing) set_gop.value_ptr.* = .empty;
+            try set_gop.value_ptr.append(a, .{ .mangled = mangled, .decl = fn_decl });
+
+            fn_decl.name.?.name = mangled;
+        }
+    }
+
+    fn currentExpectedType(self: *TypeChecker) ?*const ast.TypeExpr {
+        if (self.expected_type_stack.items.len == 0) return null;
+        return self.expected_type_stack.items[self.expected_type_stack.items.len - 1];
+    }
+
+    /// Permissive type match for overload selection: a generic parameter/return
+    /// (type variable or capture) accepts anything; otherwise the types must be
+    /// equal or coerce (a value widening into an optional, either direction — the
+    /// candidate's declared shape is what matters, not the yield direction).
+    fn overloadTypeMatches(self: *TypeChecker, a_type: *const ast.TypeExpr, b_type: *const ast.TypeExpr) bool {
+        const a = self.unaliasType(a_type);
+        const b = self.unaliasType(b_type);
+        if (a.* == .type_var or a.* == .type_capture) return true;
+        if (b.* == .type_var or b.* == .type_capture) return true;
+        return self.pipeTypesEqual(a, b) or self.yieldCoercesToType(a, b) or self.yieldCoercesToType(b, a);
+    }
+
+    /// Whether an overload candidate can accept the given call arguments: same
+    /// arity, and each argument's type matches the parameter's (a captured or
+    /// untyped parameter accepts anything; an argument whose type can't be
+    /// resolved here is treated permissively).
+    fn overloadAcceptsArgs(self: *TypeChecker, scope: *Scope, decl: *ast.FunctionDecl, args: []const *ast.Expression) bool {
+        const params = switch (decl.params) {
+            ._non_variadic => |ps| ps,
+            ._variadic => return true,
+        };
+        if (params.len != args.len) return false;
+        for (params, args) |param, arg| {
+            const ann = param.type_annotation orelse continue;
+            if (typeExprHasCapture(ann)) continue;
+            const param_type = self.resolveTypeExpr(scope, ann) catch continue;
+            if (self.unaliasType(param_type).* == .type_var) continue;
+            const arg_raw = (self.resolveExprType(scope, arg) catch continue) orelse continue;
+            const arg_type = self.resolveTypeExpr(scope, arg_raw) catch arg_raw;
+            if (!self.overloadTypeMatches(arg_type, param_type)) return false;
+        }
+        return true;
+    }
+
+    /// Whether an overload candidate's declared return type matches `expected`.
+    /// The return type is resolved in a signature scope so its own type variables
+    /// (`Maybe(A)`) resolve.
+    fn overloadReturnMatches(self: *TypeChecker, scope: *Scope, decl: *ast.FunctionDecl, expected_raw: *const ast.TypeExpr) bool {
+        const fn_scope = self.arena.allocator().create(Scope) catch return false;
+        fn_scope.* = .initWithParent(scope, decl.span);
+        self.declareSignatureTypeVars(scope, fn_scope, decl) catch {};
+        // Resolve the expected type here (lazily) rather than at the push site, so
+        // an ordinary binding never re-resolves its annotation.
+        const expected = self.resolveTypeExpr(fn_scope, expected_raw) catch return false;
+        const rt = decl.return_type orelse return self.unaliasType(expected).* == .void;
+        const resolved_rt = self.resolveTypeExpr(fn_scope, rt) catch return false;
+        return self.overloadTypeMatches(resolved_rt, expected);
+    }
+
+    /// Resolves an overloaded call in place. If the callee names an overload set,
+    /// picks the candidate matching the argument types — and, when several match,
+    /// the expected return type from context — then rewrites the callee to that
+    /// candidate's mangled name. Idempotent (each call node is resolved once).
+    /// Reports an error on no match or an unresolved ambiguity.
+    fn resolveOverloadedCall(self: *TypeChecker, scope: *Scope, call: *ast.CallExpr) Error!void {
+        if (call.callee.* != .identifier) return;
+        const set = self.overload_sets.getPtr(call.callee.identifier.name) orelse return;
+        if (self.overload_resolved.contains(call)) return;
+        try self.overload_resolved.put(self.arena.allocator(), call, {});
+        const name = call.callee.identifier.name;
+
+        var matches: std.ArrayListUnmanaged(OverloadEntry) = .empty;
+        defer matches.deinit(self.arena.allocator());
+        for (set.items) |cand| {
+            if (self.overloadAcceptsArgs(scope, cand.decl, call.arguments)) {
+                try matches.append(self.arena.allocator(), cand);
+            }
+        }
+
+        if (matches.items.len == 0) {
+            try self.reportSpanError(call.span, Error.UnsupportedExpression, .@"error", "no overload of '{s}' matches the given arguments", .{name});
+            return;
+        }
+
+        var chosen: ?OverloadEntry = if (matches.items.len == 1) matches.items[0] else null;
+        if (chosen == null) {
+            if (self.currentExpectedType()) |expected| {
+                var count: usize = 0;
+                for (matches.items) |cand| {
+                    if (self.overloadReturnMatches(scope, cand.decl, expected)) {
+                        chosen = cand;
+                        count += 1;
+                    }
+                }
+                if (count != 1) chosen = null;
+            }
+        }
+
+        if (chosen) |c| {
+            call.callee.identifier.name = c.mangled;
+        } else {
+            try self.reportSpanError(call.span, Error.UnsupportedExpression, .@"error", "ambiguous call to overloaded '{s}'; annotate the expected type to select an overload", .{name});
+        }
+    }
+
     fn declareFunctionSignature(self: *TypeChecker, scope: *Scope, fn_decl: *ast.FunctionDecl) Error!void {
         const identifier = fn_decl.name orelse return;
         if (scope.bindings.contains(identifier.name)) return;
@@ -2344,6 +2525,10 @@ pub const TypeChecker = struct {
     }
 
     fn runCall(self: *TypeChecker, scope: *Scope, call: *ast.CallExpr) Error!void {
+        // Resolve an overloaded callee to a concrete candidate first: the original
+        // (overloaded) name is not bound as a value, so running the callee before
+        // rewriting it would fail to resolve.
+        try self.resolveOverloadedCall(scope, call);
         try self.runExpression(scope, call.callee);
 
         // Inferred struct-literal arguments: `f entity .{ .x = 3 }` takes each
@@ -5315,6 +5500,12 @@ pub const TypeChecker = struct {
         // from the module scope — including non-`pub` bindings, so an alias to a
         // `cimport` constant (`const rlf = rl.raylib`) is typed as that cimport
         // value (a struct of its externs) rather than null.
+        if (T == *ast.Expression and expr.* == .call) {
+            // Resolve an overloaded callee before its type (the return type) is
+            // read from the — otherwise unbound — original name.
+            try self.resolveOverloadedCall(scope, &expr.call);
+        }
+
         if (T == *ast.Expression) {
             const member_access: ?struct { object: *ast.Expression, name: []const u8 } = switch (expr.*) {
                 .member => |*m| .{ .object = m.object, .name = m.member.name },

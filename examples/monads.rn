@@ -12,9 +12,34 @@ fn Maybe(comptime T: type) type {
   yield struct { x: ?T }
 }
 
-fn Void map(f: fn (|A|) |B|, ma: Maybe(A)) Maybe(B) {
-  if (ma.x) |x| yield .{ .x = f x } else yield .{ .x = null }
+fn Void pure(x: |A|) Maybe(A) {
+  yield .{ .x = x }
 }
+
+fn Void pure(x: |A|) []A {
+  yield .{x}
+}
+
+# `pure` is overloaded on its *return type*: the two definitions share a name and
+# argument list and differ only in what they produce. The overload is selected by
+# the expected type at the call site (here a binding annotation). A `pure 42` with
+# no expected type is ambiguous and reported as such.
+const pureMaybe: Maybe(Int) = pure 42
+const pureList: []Int = pure 42
+echo "pure -> Maybe: ${pureMaybe.x orelse 0}"
+echo "pure -> []:    ${pureList[0]}"
+
+// fn Void map(f: fn (|A|) |B|, ma: |M|(A)) M(B) {
+//   if (@hasMethod M "bind" and @hasMethod M "pure") {
+//     fn Void aux(a: A) M(B) {
+//       yield pure (f a)
+//     }
+//
+//     yield bind aux
+//   } else {
+//     @compileError "type needs to implement bind and pure"
+//   }
+// }
 
 fn Void bind(f: fn (|A|) Maybe(|B|), ma: Maybe(A)) Maybe(B) {
   if (ma.x) |x| yield f x else yield .{ .x = null }
@@ -36,9 +61,9 @@ const none: Maybe(Int) = Maybe{ .x = null }
 
 # The captured return type B follows the mapped function: Int for `double`,
 # String for `label`.
-echo "double(some): ${(map double some).x}"
-echo "label(some):  ${(map label some).x}"
-echo "double(none): ${(map double none).x}"
+// echo "double(some): ${(map double some).x}"
+// echo "label(some):  ${(map label some).x}"
+// echo "double(none): ${(map double none).x}"
 echo "validateIs42(some): ${(bind validateIs42 some).x}"
 echo "validateIs42(some42): ${(bind validateIs42 some42).x}"
 echo "validateIs42(none): ${(bind validateIs42 none).x}"

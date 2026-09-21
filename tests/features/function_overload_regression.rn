@@ -1,0 +1,25 @@
+# Function overloading. A name declared more than once is an overload set; a call
+# is resolved to one candidate by the argument types and — when several match —
+# the expected return type from context (a binding annotation or a yield). Each
+# candidate is compiled as a distinct function.
+
+# Argument-based overloading: the candidates differ by parameter type.
+fn Void kind(n: Int) String { yield "int ${n}" }
+fn Void kind(s: String) String { yield "str ${s}" }
+fn Void kind(b: Bool) String { yield "bool ${b}" }
+echo "${kind 7}"
+echo "${kind "hi"}"
+echo "${kind true}"
+
+# Return-type overloading: the candidates share a name and argument list and
+# differ only in the return type; the expected type selects one.
+fn Maybe(comptime T: type) type { yield struct { x: ?T } }
+fn Void pure(x: |A|) Maybe(A) { yield .{ .x = x } }
+fn Void pure(x: |A|) []A { yield .{ x } }
+
+const m: Maybe(Int) = pure 42
+const l: []Int = pure 7
+const ms: Maybe(String) = pure "hey"
+echo "pure->Maybe: ${m.x orelse -1}"
+echo "pure->[]: ${l[0]}"
+echo "pure->Maybe(String): ${ms.x orelse "?"}"
