@@ -1,0 +1,37 @@
+# A function's yielded result survives being returned through other function
+# calls, and a function value (including a nested closure) can be passed as an
+# argument and called indirectly.
+#
+# Both hinged on a fork/capture bug: `yield <call-to-a-fn>` returned the fork's
+# handle (and leaked its output) instead of the materialized value when the
+# yielding function was itself called by another — for a scalar result too, not
+# just a struct. So a nested/indirect call lost its value at 2+ levels of
+# nesting.
+
+fn dbl(n: Int) Int { yield n * 2 }
+
+# A call whose result is re-yielded through intermediate functions.
+fn u() Int { yield dbl 5 }
+fn t() Int { yield u }
+echo "nested: ${t}"
+
+# A function value passed as an argument and called indirectly.
+fn apply(f: fn (Int) Int, x: Int) Int { yield f x }
+fn viaApply() Int { yield apply dbl 7 }
+echo "indirect via param: ${viaApply}"
+
+# A nested closure capturing an enclosing variable, passed as an argument.
+fn withClosure() Int {
+  const k = 100
+  fn addK(n: Int) Int { yield n + k }
+  yield apply addK 5
+}
+echo "closure as arg: ${withClosure}"
+
+# An indirect call through a local function-typed binding, nested.
+fn viaLocal() Int {
+  const g: fn (Int) Int = dbl
+  yield g 9
+}
+fn wrap() Int { yield viaLocal }
+echo "indirect via local, nested: ${wrap}"

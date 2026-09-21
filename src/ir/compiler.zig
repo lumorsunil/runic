@@ -1960,11 +1960,19 @@ pub const IRCompiler = struct {
         while (ty.* == .alias) ty = ty.alias.type_expr;
         return switch (ty.*) {
             .struct_type, .optional => true,
+            // A scalar value return is materialized too: yielding a (forked)
+            // user-function call must return its value, not the fork's handle —
+            // `fn u() Int { … }` yielded by another function.
+            .integer, .float, .boolean => true,
             .array => |a| a.element.* != .byte,
             // Any generic application (`Box(Int)`, or `M(A)` re-applying a
             // captured constructor) yields a struct — materialize by value.
             .type_application => true,
-            .identifier => |named| self.user_struct_types.contains(named.path.segments[named.path.segments.len - 1].name),
+            .identifier => |named| blk: {
+                const name = named.path.segments[named.path.segments.len - 1].name;
+                if (self.user_struct_types.contains(name)) break :blk true;
+                break :blk std.mem.eql(u8, name, "Int") or std.mem.eql(u8, name, "Float") or std.mem.eql(u8, name, "Bool");
+            },
             else => false,
         };
     }
@@ -1986,6 +1994,11 @@ pub const IRCompiler = struct {
             // yielded call that forks and returns an aggregate (a generic result,
             // or a non-sync struct-returner) is captured by value first, so the
             // materialized value is returned in `%r` rather than the fork's handle.
+            // Any call reaching here is not sync-callable (`tryCompileSyncCall`
+            // returned null), so it forks; a sync entry must return a value in
+            // `%r`, so its result is captured by value rather than forked with the
+            // caller's stdout (which would leak the callee's output and return an
+            // unwaited handle — even for a scalar result).
             const value = (try self.tryCompileSyncCall(y.value, y.value)) orelse
                 (if (self.yieldNeedsValueCapture(y.value))
                     try self.compileExpressionWithCapture(y.value, y.value)
