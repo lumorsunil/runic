@@ -1131,9 +1131,27 @@ pub const TypeChecker = struct {
             .array => |a| typeExprHasCapture(a.element),
             .optional => |o| typeExprHasCapture(o.child),
             .promise => |p| typeExprHasCapture(p.child),
-            .type_application => |app| for (app.args) |arg| {
-                if (typeExprHasCapture(arg)) break true;
-            } else false,
+            .type_application => |app| blk: {
+                // A higher-kinded application `|M|(…)` captures the constructor `M`.
+                if (app.ctor_is_capture) break :blk true;
+                for (app.args) |arg| if (typeExprHasCapture(arg)) break :blk true;
+                break :blk false;
+            },
+            // A function-type parameter (`fn (|A|) |B|`) captures through its
+            // parameter and return types.
+            .function => |f| blk: {
+                if (f.return_type) |rt| if (typeExprHasCapture(rt)) break :blk true;
+                if (f.stdin_type) |st| if (typeExprHasCapture(st)) break :blk true;
+                switch (f.params) {
+                    ._non_variadic => |ps| for (ps) |p| {
+                        if (p) |pt| if (typeExprHasCapture(pt)) break :blk true;
+                    },
+                    ._variadic => |p| if (p) |pt| {
+                        if (typeExprHasCapture(pt)) break :blk true;
+                    },
+                }
+                break :blk false;
+            },
             else => false,
         };
     }
@@ -2148,16 +2166,46 @@ pub const TypeChecker = struct {
             ._variadic => return true,
         };
         if (params.len != args.len) return false;
+        // Resolve each parameter annotation in the candidate's *own* signature
+        // scope, so a bare type-variable reference (`ma: []A`, where `A` is
+        // introduced by another parameter's `|A|`) resolves to a permissive type
+        // variable instead of being reported "not declared" — probing a candidate
+        // must not emit errors. Arguments stay in the caller's `scope`.
+        const fn_scope = self.arena.allocator().create(Scope) catch return true;
+        fn_scope.* = .initWithParent(scope, decl.span);
+        self.declareSignatureTypeVars(scope, fn_scope, decl) catch {};
         for (params, args) |param, arg| {
             const ann = param.type_annotation orelse continue;
+            // A higher-kinded parameter `|M|(…)` binds `M` to the argument's type
+            // *constructor* — which is always a named type (a struct / generic
+            // constructor application), never the built-in array or a primitive.
+            // So it accepts a constructor-like argument and rejects the rest; this
+            // is what lets a `map(…, |M|(A))` monad overload and a `map(…, []A)`
+            // list overload dispatch on the same call.
+            if (ann.* == .type_application and ann.type_application.ctor_is_capture) {
+                const arg_raw = (self.resolveExprType(scope, arg) catch continue) orelse continue;
+                const arg_type = self.resolveTypeExpr(scope, arg_raw) catch arg_raw;
+                if (!self.typeIsConstructorLike(arg_type)) return false;
+                continue;
+            }
             if (typeExprHasCapture(ann)) continue;
-            const param_type = self.resolveTypeExpr(scope, ann) catch continue;
+            const param_type = self.resolveTypeExpr(fn_scope, ann) catch continue;
             if (self.unaliasType(param_type).* == .type_var) continue;
             const arg_raw = (self.resolveExprType(scope, arg) catch continue) orelse continue;
             const arg_type = self.resolveTypeExpr(scope, arg_raw) catch arg_raw;
             if (!self.overloadTypeMatches(arg_type, param_type)) return false;
         }
         return true;
+    }
+
+    /// Whether a type has a named constructor `M(…)` can bind to — a struct or a
+    /// generic-constructor application. An array, optional, primitive, or function
+    /// has no such constructor, so a higher-kinded `|M|(…)` parameter rejects it.
+    fn typeIsConstructorLike(self: *TypeChecker, t: *const ast.TypeExpr) bool {
+        return switch (self.unaliasType(t).*) {
+            .struct_type, .type_application => true,
+            else => false,
+        };
     }
 
     /// Whether an overload candidate's declared return type matches `expected`.
