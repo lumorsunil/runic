@@ -1,0 +1,31 @@
+# Member access directly on a generic higher-kinded call result, with no binding
+# annotation to supply the type: `${(gmap double some).x}`. The callee's declared
+# return is `M(B)` — `M`/`B` are unbound at the call site — so the result value is
+# typed by binding the captures from the arguments (`M = Maybe`, `B` follows the
+# mapped function), giving a concrete `Maybe(...)` whose `.x` field resolves.
+# The captured return type follows the function: `Int` for `double`, `String`
+# for `label`.
+
+fn Maybe(comptime T: type) type { yield struct { x: ?T } }
+fn pure(x: |A|) Maybe(A) { yield .{ .x = x } }
+fn bind(ma: Maybe(|A|), f: fn (|A|) Maybe(|B|)) Maybe(B) {
+  if (ma.x) |x| yield f x else yield .{ .x = null }
+}
+fn gmap(f: fn (|A|) |B|, ma: |M|(A)) M(B) {
+  if (@hasMethod(M)("bind")) {
+    fn aux(a: A) M(B) { yield pure (f a) }
+    yield bind ma aux
+  } else {
+    @compileError "${M} is not a monad"
+  }
+}
+fn double(n: Int) Int { yield n * 2 }
+fn label(n: Int) String { yield "n=${n}" }
+
+const some: Maybe(Int) = Maybe{ .x = 21 }
+const none: Maybe(Int) = Maybe{ .x = null }
+
+# Inline field access on the call — no intermediate binding.
+echo "double some: ${(gmap double some).x orelse -1}"
+echo "double none: ${(gmap double none).x orelse -1}"
+echo "label some:  ${(gmap label some).x orelse "none"}"

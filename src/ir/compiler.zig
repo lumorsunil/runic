@@ -3494,7 +3494,12 @@ pub const IRCompiler = struct {
 
         // Dequeue the single yielded value (the error union) into %r.
         try self.addInstruction(.init(.from(source), .{ .pipe_dequeue = pipe_ref.dereference() }));
-        return try .from(ir.Location.initRegister(.r).typed(return_type_ptr.*));
+        // A generic callee's declared return may be a capture application (`M(B)`)
+        // whose variables are unbound at the call site; type the result with the
+        // concrete type bound from the arguments (`Maybe(Int)`) so member access on
+        // the value resolves its struct layout. Falls back to the declared return.
+        const result_type = self.callConcreteReturnType(fn_ref_value.fn_ref.fn_addr.instr_set, arguments) orelse return_type_ptr.*;
+        return try .from(ir.Location.initRegister(.r).typed(result_type));
     }
 
     const ModuleMemberFnRef = struct {
@@ -6653,6 +6658,135 @@ pub const IRCompiler = struct {
         const body_st = self.user_struct_types.get(name) orelse return null;
         const params = self.generic_ctor_params.get(name) orelse &[_]ast.Identifier{};
         return self.substituteTypeParams(.{ .struct_type = body_st }, params, app.args) catch null;
+    }
+
+    /// The concrete return type of a call to a generic function, obtained by
+    /// binding the callee's `|T|`/`|M|` captures from the argument types (as
+    /// `maybeSpecialize` does) and substituting them into the declared return
+    /// type: `gmap double some` → `Maybe(Int)`. Used to type a generic call's
+    /// *result value* so member access on it (`(gmap double some).x`) resolves the
+    /// struct layout — the raw generic return `M(B)` leaves `M`/`B` unbound at the
+    /// call site. Restores `type_captures` before returning. Null when the callee
+    /// isn't a generic candidate, its captures don't fully bind, or the return
+    /// mentions no captured variable (it is already concrete).
+    fn callConcreteReturnType(self: *IRCompiler, instr_set: usize, arguments: []const *ast.Expression) ?ast.TypeExpr {
+        const decl_ptr = self.comptime_fn_decls.get(instr_set) orelse return null;
+        const fn_decl = decl_ptr.*;
+        const params = switch (fn_decl.params) {
+            ._non_variadic => |ps| ps,
+            else => return null,
+        };
+        if (params.len != arguments.len) return null;
+        const raw_return = (fn_decl.return_type orelse return null).*;
+
+        var capture_names = std.ArrayList([]const u8).empty;
+        defer capture_names.deinit(self.allocator);
+        for (params) |param| {
+            if (param.type_annotation) |ann| collectCapturesInType(ann.*, &capture_names, self.allocator) catch return null;
+        }
+        if (capture_names.items.len == 0) return null;
+        if (!typeMentionsAny(raw_return, capture_names.items)) return null;
+
+        // Save + rebind captures, resolve the return, then restore — the call site
+        // must not keep these bindings (they belong to the callee's body).
+        var saved = std.ArrayList(?ast.TypeExpr).empty;
+        defer saved.deinit(self.allocator);
+        for (capture_names.items) |name| saved.append(self.allocator, self.type_captures.get(name)) catch return null;
+        defer for (capture_names.items, saved.items) |name, prior| {
+            if (prior) |p| self.type_captures.put(self.allocator, name, p) catch {} else _ = self.type_captures.remove(name);
+        };
+        for (capture_names.items) |name| _ = self.type_captures.remove(name);
+        for (params, arguments) |param, arg| {
+            const ann = param.type_annotation orelse continue;
+            if (!hasTypeCapture(ann.*)) continue;
+            const arg_type = self.argTypeExpr(arg) orelse return null;
+            self.bindTypeCaptures(ann.*, arg_type);
+        }
+        for (capture_names.items) |name| {
+            const bound = self.type_captures.get(name) orelse return null;
+            if (bound == .type_var) return null;
+        }
+        return self.substituteCapturedType(raw_return) catch null;
+    }
+
+    /// Whether a type expression references any of `names` as a bare type variable
+    /// (an identifier `T`, a `type_var`, a `|T|` capture, or a constructor `M(…)`).
+    fn typeMentionsAny(t: ast.TypeExpr, names: []const []const u8) bool {
+        const has = struct {
+            fn f(n: []const u8, ns: []const []const u8) bool {
+                for (ns) |name| if (std.mem.eql(u8, n, name)) return true;
+                return false;
+            }
+        }.f;
+        return switch (t) {
+            .identifier => |named| named.path.segments.len == 1 and has(named.path.segments[0].name, names),
+            .type_var => |v| has(v.name, names),
+            .type_capture => |c| has(c.name, names),
+            .array => |a| typeMentionsAny(a.element.*, names),
+            .optional => |o| typeMentionsAny(o.child.*, names),
+            .promise => |p| typeMentionsAny(p.child.*, names),
+            .type_application => |app| blk: {
+                if (has(app.name.name, names)) break :blk true;
+                for (app.args) |arg| if (typeMentionsAny(arg.*, names)) break :blk true;
+                break :blk false;
+            },
+            else => false,
+        };
+    }
+
+    /// Rewrites a type by replacing every captured type variable with its bound
+    /// type from `type_captures`: `M(B)` (with `M`→`Maybe`, `B`→`Int`) becomes
+    /// `Maybe(Int)`. A name with no binding is left as-is.
+    fn substituteCapturedType(self: *IRCompiler, t: ast.TypeExpr) Error!ast.TypeExpr {
+        switch (t) {
+            .identifier => |named| {
+                if (named.path.segments.len == 1) {
+                    if (self.type_captures.get(named.path.segments[0].name)) |bound| {
+                        return try self.substituteCapturedType(bound);
+                    }
+                }
+                return t;
+            },
+            .type_var => |v| {
+                if (self.type_captures.get(v.name)) |bound| return try self.substituteCapturedType(bound);
+                return t;
+            },
+            .type_capture => |c| {
+                if (self.type_captures.get(c.name)) |bound| return try self.substituteCapturedType(bound);
+                return t;
+            },
+            .array => |a| {
+                const el = try self.allocator.create(ast.TypeExpr);
+                el.* = try self.substituteCapturedType(a.element.*);
+                return .{ .array = .{ .element = el, .span = a.span } };
+            },
+            .optional => |o| {
+                const ch = try self.allocator.create(ast.TypeExpr);
+                ch.* = try self.substituteCapturedType(o.child.*);
+                return .{ .optional = .{ .child = ch, .span = o.span } };
+            },
+            .promise => |p| {
+                const ch = try self.allocator.create(ast.TypeExpr);
+                ch.* = try self.substituteCapturedType(p.child.*);
+                return .{ .promise = .{ .child = ch, .span = p.span } };
+            },
+            .type_application => |app| {
+                var name = app.name;
+                if (self.type_captures.get(app.name.name)) |bound| {
+                    if (bound == .identifier and bound.identifier.path.segments.len == 1) {
+                        name = bound.identifier.path.segments[0];
+                    }
+                }
+                const new_args = try self.allocator.alloc(*const ast.TypeExpr, app.args.len);
+                for (app.args, new_args) |arg, *dst| {
+                    const na = try self.allocator.create(ast.TypeExpr);
+                    na.* = try self.substituteCapturedType(arg.*);
+                    dst.* = na;
+                }
+                return .{ .type_application = .{ .name = name, .args = new_args, .span = app.span } };
+            },
+            else => return t,
+        }
     }
 
     /// Whether a type is the bare single-segment name `name` — a capture `T`
