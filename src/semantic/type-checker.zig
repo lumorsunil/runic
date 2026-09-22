@@ -715,8 +715,12 @@ pub const TypeChecker = struct {
 
         // The enclosing function's declared return type is the yielded value's
         // expected type — used to pick a return-type-only overload (`yield pure x`).
-        const yield_expected: ?*const ast.TypeExpr = if (yield_stmt.fd == 1 and self.stdout_type_stack.items.len > 0)
-            self.stdout_type_stack.items[self.stdout_type_stack.items.len - 1]
+        // Push the *raw* return type (resolved lazily in `overloadReturnMatches`,
+        // like a binding annotation): a higher-kinded `M(B)` resolves to a bare
+        // type variable, which loses the structure needed to disambiguate an
+        // overload by its return constructor.
+        const yield_expected: ?*const ast.TypeExpr = if (yield_stmt.fd == 1 and self.stdout_return_raw_stack.items.len > 0)
+            self.stdout_return_raw_stack.items[self.stdout_return_raw_stack.items.len - 1]
         else
             null;
         try self.expected_type_stack.append(self.arena.allocator(), yield_expected);
@@ -2163,12 +2167,42 @@ pub const TypeChecker = struct {
         const fn_scope = self.arena.allocator().create(Scope) catch return false;
         fn_scope.* = .initWithParent(scope, decl.span);
         self.declareSignatureTypeVars(scope, fn_scope, decl) catch {};
+        // A higher-kinded expected type `M(B)` — the captured constructor `M`
+        // applied — resolves to a bare type variable, against which *every*
+        // candidate matches permissively. But a captured constructor can only ever
+        // be a named type constructor, so only a candidate that itself returns a
+        // named constructor application (`Maybe(A)`, not `[]A`/`Int`) can produce
+        // an `M(B)`. Match structurally on that, so the sole constructor-returning
+        // overload is selected (`yield pure x` inside a generic `map`); the caller
+        // stays ambiguous only if several candidates qualify. `M` is a type
+        // variable in the call-site `scope`; the candidate's return constructor is
+        // checked in its own signature scope.
+        if (self.isHigherKindedApp(scope, expected_raw)) {
+            const rt0 = decl.return_type orelse return false;
+            return self.returnIsConstructorApp(fn_scope, rt0);
+        }
         // Resolve the expected type here (lazily) rather than at the push site, so
         // an ordinary binding never re-resolves its annotation.
         const expected = self.resolveTypeExpr(fn_scope, expected_raw) catch return false;
         const rt = decl.return_type orelse return self.unaliasType(expected).* == .void;
         const resolved_rt = self.resolveTypeExpr(fn_scope, rt) catch return false;
         return self.overloadTypeMatches(resolved_rt, expected);
+    }
+
+    /// Whether `t` is a higher-kinded application `M(…)` whose constructor is a
+    /// captured/generic type variable — its concrete constructor is unknown in
+    /// this generic body (only monomorphization binds it).
+    fn isHigherKindedApp(self: *TypeChecker, scope: *Scope, t: *const ast.TypeExpr) bool {
+        return t.* == .type_application and
+            (t.type_application.ctor_is_capture or self.nameIsTypeVar(scope, t.type_application.name.name));
+    }
+
+    /// Whether a declared return type is a *named* constructor application
+    /// (`Maybe(A)`), rather than a capture, array, optional, or primitive. Only
+    /// such an overload can satisfy a higher-kinded `M(B)`.
+    fn returnIsConstructorApp(self: *TypeChecker, scope: *Scope, t: *const ast.TypeExpr) bool {
+        return t.* == .type_application and !t.type_application.ctor_is_capture and
+            !self.nameIsTypeVar(scope, t.type_application.name.name);
     }
 
     /// Resolves an overloaded call in place. If the callee names an overload set,

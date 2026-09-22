@@ -1,0 +1,35 @@
+# An overload set resolved by a *higher-kinded* expected return type. `pure` is
+# overloaded on its return type (`Maybe(A)` vs `[]A`). Inside a generic `map`,
+# the nested `aux` yields `pure (f a)` with expected type `M(B)` — the captured
+# constructor `M` applied. `M(B)` resolves to a bare type variable, against which
+# both overloads would match permissively; but a captured constructor can only be
+# a named type constructor, so only the `Maybe(A)` overload (a constructor
+# application, not an array) can produce an `M(B)`. It is selected without an
+# annotation, and the array overload stays available at a concrete call site.
+
+fn Maybe(comptime T: type) type { yield struct { x: ?T } }
+fn Void pure(x: |A|) Maybe(A) { yield .{ .x = x } }
+fn Void pure(x: |A|) []A { yield .{x} }
+fn bind(ma: Maybe(|A|), f: fn (|A|) Maybe(|B|)) Maybe(B) {
+  if (ma.x) |x| yield f x else yield .{ .x = null }
+}
+fn map(f: fn (|A|) |B|, ma: |M|(A)) M(B) {
+  if (@hasMethod(M)("bind")) {
+    fn aux(a: A) M(B) { yield pure (f a) }
+    yield bind ma aux
+  } else {
+    @compileError "${M} is not a monad"
+  }
+}
+fn double(n: Int) Int { yield n * 2 }
+
+# The two overloads still resolve by a concrete expected type.
+const pm: Maybe(Int) = pure 7
+const pl: []Int = pure 7
+echo "pure -> Maybe: ${pm.x orelse -1}"
+echo "pure -> []: ${pl[0]}"
+
+# The generic map selects the Maybe overload from the higher-kinded return type.
+const some: Maybe(Int) = Maybe{ .x = 21 }
+const r: Maybe(Int) = map double some
+echo "map double some: ${r.x orelse -1}"

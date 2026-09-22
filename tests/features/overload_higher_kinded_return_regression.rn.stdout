@@ -1,0 +1,3 @@
+pure -> Maybe: 7
+pure -> []: 7
+map double some: 42
