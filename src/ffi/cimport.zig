@@ -3,24 +3,29 @@
 //! `Closeable` so the library is `dlclose`d at script exit, like any other
 //! process resource (see `future/c-ffi.md`).
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 const CType = @import("ctype.zig").CType;
 const CSig = @import("ctype.zig").CSig;
 const ExitCode = @import("../runtime/exit_code.zig").ExitCode;
 const Closeable = @import("../closeable.zig").Closeable;
+const DynLib = @import("libffi.zig").CrossDynLib.DynLib;
 
 /// One resolved extern function: its symbol name, runtime address, and the C
 /// signature used to marshal a call. `symbol`/`params` borrow the IR
 /// instruction's memory (which outlives execution); `addr` comes from `dlsym`.
 pub const ResolvedExtern = struct {
     symbol: []const u8,
-    addr: *anyopaque,
+    addr: switch (@import("builtin").os.tag) {
+        .windows => std.os.windows.FARPROC,
+        else => *anyopaque,
+    },
     params: []const CSig,
     ret: CSig,
 };
 
 pub const CImportCloseable = struct {
-    allocator: std.mem.Allocator,
-    lib: std.DynLib,
+    allocator: Allocator,
+    lib: DynLib,
     externs: []ResolvedExtern,
     label: []const u8,
     result: ?ExitCode = null,

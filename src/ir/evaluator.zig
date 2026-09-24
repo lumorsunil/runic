@@ -1126,31 +1126,7 @@ pub const IREvaluator = struct {
         return switch (instruction.type) {
             .comment => return .skip,
             .cimport_open => |op| {
-                var lib = std.DynLib.open(op.library_name) catch {
-                    std.log.err("could not load C library '{s}'", .{op.library_name});
-                    return Error.CImportLoadFailed;
-                };
-                errdefer lib.close();
-
-                const resolved = try self.allocator.alloc(ResolvedExtern, op.externs.len);
-                errdefer self.allocator.free(resolved);
-                for (op.externs, resolved) |ext, *dst| {
-                    const symbol_z = try self.allocator.dupeZ(u8, ext.symbol);
-                    defer self.allocator.free(symbol_z);
-                    const addr = lib.lookup(*anyopaque, symbol_z) orelse {
-                        std.log.err("C library '{s}' has no symbol '{s}'", .{ op.library_name, ext.symbol });
-                        return Error.CImportSymbolNotFound;
-                    };
-                    dst.* = .{ .symbol = ext.symbol, .addr = addr, .params = ext.params, .ret = ext.ret };
-                }
-
-                const cc = try self.allocator.create(CImportCloseable);
-                cc.* = .{
-                    .allocator = self.allocator,
-                    .lib = lib,
-                    .externs = resolved,
-                    .label = op.library_name,
-                };
+                const cc = try ffiLibOpen(self.allocator, op);
                 const handle = try self.context.addCloseable(&cc.closeable);
                 try self.context.addCImport(handle, cc);
                 try self.setLocation(thread, op.result, .{ .closeable = handle });
@@ -3631,4 +3607,34 @@ fn ffiArgPtr(v: ir.Value) Error!usize {
         .integer => |x| @bitCast(x),
         else => Error.CImportUnsupportedType,
     };
+}
+
+fn ffiLibOpen(allocator: Allocator, op: ir.Instruction.CImportOpen) !*CImportCloseable {
+    var lib = ffi.CrossDynLib.DynLib.open(allocator, op.library_name) catch {
+        std.log.err("could not load C library '{s}'", .{op.library_name});
+        return Error.CImportLoadFailed;
+    };
+    errdefer lib.close();
+
+    const resolved = try allocator.alloc(ResolvedExtern, op.externs.len);
+    errdefer allocator.free(resolved);
+    for (op.externs, resolved) |ext, *dst| {
+        const symbol_z = try allocator.dupeZ(u8, ext.symbol);
+        defer allocator.free(symbol_z);
+        const addr = try lib.lookup(symbol_z) orelse {
+            std.log.err("C library '{s}' has no symbol '{s}'", .{ op.library_name, ext.symbol });
+            return Error.CImportSymbolNotFound;
+        };
+        dst.* = .{ .symbol = ext.symbol, .addr = addr, .params = ext.params, .ret = ext.ret };
+    }
+
+    const cc = try allocator.create(CImportCloseable);
+    cc.* = .{
+        .allocator = allocator,
+        .lib = lib,
+        .externs = resolved,
+        .label = op.library_name,
+    };
+
+    return cc;
 }

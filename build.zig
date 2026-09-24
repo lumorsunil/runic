@@ -23,6 +23,10 @@ pub fn build(b: *std.Build) void {
     // vendored build; tracked in the design doc.)
     runtime.link_libc = true;
     runtime.linkSystemLibrary("ffi", .{ .preferred_link_mode = .static });
+    if (target.result.os.tag == .windows) {
+        runtime.addLibraryPath(b.path("libffi-windows"));
+        runtime.addIncludePath(b.path("libffi-windows"));
+    }
 
     // Embed the bundled standard-library sources (repo-root `std/`) so
     // `src/frontend/std_modules.zig` can `@embedFile` them by these names. Keep

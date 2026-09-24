@@ -7,15 +7,15 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
 
     const args = init.minimal.args;
-    const args_len = args.vector.len;
 
     const Mode = enum { stdio, tcp };
     var mode: Mode = .stdio;
     var tcp_port: ?u16 = null;
 
-    var i: usize = 1;
-    while (i < args_len) {
-        const arg = std.mem.span(args.vector[i]);
+    var args_it = try args.iterateAllocator(allocator);
+    defer args_it.deinit();
+    _ = args_it.next();
+    while (args_it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--version")) {
             try printVersion(io);
             return;
@@ -23,15 +23,12 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, arg, "--stdio")) {
             std.log.err("stdio mode", .{});
             mode = .stdio;
-            i += 1;
             continue;
         }
         if (std.mem.eql(u8, arg, "--tcp")) {
-            if (i + 1 >= args_len) return error.MissingTcpPort;
-            const port_arg = std.mem.span(args.vector[i + 1]);
+            const port_arg = args_it.next() orelse return error.MissingTcpPort;
             tcp_port = try std.fmt.parseInt(u16, port_arg, 10);
             mode = .tcp;
-            i += 2;
             continue;
         }
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {

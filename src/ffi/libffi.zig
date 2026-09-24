@@ -9,6 +9,7 @@
 //! module exposes the raw `libffi` symbols and proves the mechanism links and
 //! runs in-tree.
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 
 /// The raw libffi C API (`ffi_cif`, `ffi_type`, `ffi_prep_cif`, `ffi_call`, and
 /// the `ffi_type_*` globals). Resolved from the system header at build time;
@@ -16,6 +17,72 @@ const std = @import("std");
 pub const c = @cImport({
     @cInclude("ffi.h");
 });
+
+pub extern "kernel32" fn LoadLibraryW(lpLibFileName: [*:0]const u16) callconv(.winapi) ?std.os.windows.HMODULE;
+pub extern "kernel32" fn FreeLibrary(hLibModule: std.os.windows.HMODULE) callconv(.winapi) i32;
+pub extern "kernel32" fn GetProcAddress(hModule: std.os.windows.HMODULE, lpProcName: [*:0]const u8) callconv(.winapi) ?std.os.windows.FARPROC;
+
+pub const CrossDynLib = struct {
+    const os = @import("builtin").os.tag;
+
+    pub const DynLib = switch (os) {
+        .windows => DynLibWindows,
+        else => DynLibLinux,
+    };
+
+    pub const Error = error{
+        DynLibLoadFailed,
+    };
+
+    pub const DynLibWindows = struct {
+        allocator: Allocator,
+        handle: std.os.windows.HMODULE,
+
+        pub fn open(allocator: Allocator, path: []const u8) !@This() {
+            var path_w_buffer: [1024]u16 = undefined;
+            const len = try std.os.windows.wtf8ToWtf16Le(&path_w_buffer, path);
+            const path_w: [:0]u16 = @ptrCast(path_w_buffer[0..len]);
+            path_w_buffer[len] = 0;
+
+            return .{
+                .allocator = allocator,
+                .handle = LoadLibraryW(path_w) orelse return CrossDynLib.Error.DynLibLoadFailed,
+            };
+        }
+
+        pub fn close(self: *@This()) void {
+            _ = FreeLibrary(self.handle);
+        }
+
+        pub fn lookup(self: *@This(), symbol: []const u8) !?std.os.windows.FARPROC {
+            const symbol_z = try self.allocator.dupeZ(u8, symbol);
+            defer self.allocator.free(symbol_z);
+            return GetProcAddress(self.handle, symbol_z);
+        }
+    };
+
+    pub const DynLibLinux = struct {
+        allocator: Allocator,
+        lib: std.DynLib,
+
+        pub fn open(allocator: Allocator, path: []const u8) !@This() {
+            return .{
+                .allocator = allocator,
+                .lib = try .open(path),
+            };
+        }
+
+        pub fn close(self: *@This()) void {
+            self.lib.close();
+        }
+
+        pub fn lookup(self: *@This(), symbol: []const u8) !?*anyopaque {
+            const symbol_z = try self.allocator.dupeZ(u8, symbol);
+            defer self.allocator.free(symbol_z);
+            return self.lib.lookup(*anyopaque, symbol_z);
+        }
+    };
+};
 
 test "libffi calls a C function through a runtime-built cif" {
     const S = struct {

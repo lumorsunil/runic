@@ -101,7 +101,9 @@ pub const IRDebugger = struct {
     }
 
     pub fn cont(self: *IRDebugger) Error!RunningEvent {
-        signals.trap(@intFromEnum(std.posix.SIG.INT));
+        if (comptime @import("builtin").os.tag != .windows) {
+            signals.trap(@intFromEnum(std.posix.SIG.INT));
+        }
         self.is_continuing = true;
         return .cont;
     }
@@ -173,11 +175,13 @@ pub const IRDebugger = struct {
         try self.updateCommand("");
 
         if (self.is_continuing) {
-            if (signals.consume(@intFromEnum(std.posix.SIG.INT))) {
-                try self.writeAll("\nReceived interrupt signal.\n\n");
-                signals.untrap(@intFromEnum(std.posix.SIG.INT));
-                self.is_continuing = false;
-                return .cont;
+            if (comptime @import("builtin").os.tag != .windows) {
+                if (signals.consume(@intFromEnum(std.posix.SIG.INT))) {
+                    try self.writeAll("\nReceived interrupt signal.\n\n");
+                    signals.untrap(@intFromEnum(std.posix.SIG.INT));
+                    self.is_continuing = false;
+                    return .cont;
+                }
             }
             const result = try self.step();
             const thread = self.evaluator.context.getCurrentThread();

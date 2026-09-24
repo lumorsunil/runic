@@ -148,8 +148,8 @@ pub const ProcessCloseable = struct {
         log(@typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{parent.label});
         return parent.closeable.getResult() orelse parent.stdin_term orelse {
             if (parent.process.stdin) |stdin| {
-                const revents = poll(stdin, std.posix.POLL.OUT, parent.tracer);
-                if (revents & std.posix.POLL.ERR > 0) {
+                const revents = poll(stdin, POLL.OUT, parent.tracer);
+                if (revents.ERR) {
                     parent.stdin_term = .success;
                     parent.stdin_term = parent.check_close_parent() orelse .success;
                 }
@@ -183,8 +183,8 @@ pub const ProcessCloseable = struct {
         log(@typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{parent.label});
         return parent.closeable.getResult() orelse parent.stdout_term orelse {
             if (parent.process.stdout) |stdout| {
-                const revents = poll(stdout, std.posix.POLL.IN, parent.tracer);
-                if (revents & std.posix.POLL.IN == 0 and revents & std.posix.POLL.HUP > 0) {
+                const revents = poll(stdout, POLL.IN, parent.tracer);
+                if (!revents.IN and revents.HUP) {
                     parent.stdout_term = .success;
                     parent.stdout_term = parent.check_close_parent() orelse .success;
                 }
@@ -218,8 +218,8 @@ pub const ProcessCloseable = struct {
         log(@typeName(@This()) ++ "." ++ @src().fn_name ++ "({s})", .{parent.label});
         return parent.closeable.getResult() orelse parent.stderr_term orelse {
             if (parent.process.stderr) |stderr| {
-                const revents = poll(stderr, std.posix.POLL.IN, parent.tracer);
-                if (revents & std.posix.POLL.IN == 0 and revents & std.posix.POLL.HUP > 0) {
+                const revents = poll(stderr, POLL.IN, parent.tracer);
+                if (!revents.IN and revents.HUP) {
                     parent.stderr_term = .success;
                     parent.stderr_term = parent.check_close_parent() orelse .success;
                 }
@@ -235,26 +235,145 @@ pub const ProcessCloseable = struct {
     }
 };
 
-fn poll(file: std.Io.File, events: i16, tracer: *Tracer) i16 {
+fn poll(file: std.Io.File, events: POLL, tracer: *Tracer) LINUXPOLLEVENTS {
+    if (comptime @import("builtin").os.tag == .windows) {
+        return poll_windows(file, events, tracer);
+    } else {
+        return poll_posix(file, events, tracer);
+    }
+}
+
+fn poll_posix(file: std.Io.File, events: LINUXPOLL, tracer: *Tracer) LINUXPOLLEVENTS {
     var poll_fds = [_]std.posix.pollfd{
         .{
             .fd = file.handle,
-            .events = events,
+            .events = @intFromEnum(events),
             .revents = 0,
         },
     };
     const poll_fd = &poll_fds[0];
 
-    const result = std.posix.errno(std.posix.poll(&poll_fds, 0) catch return std.posix.POLL.ERR);
+    const result = std.posix.errno(std.posix.poll(&poll_fds, 0) catch return .err);
     switch (result) {
         .SUCCESS => {
-            tracer.trace(.information, &.{ "process", @src().fn_name }, null, "revents: {x}", .{poll_fd.revents});
-            tracer.trace(.information, &.{ "process", @src().fn_name }, null, "POLLHUP: {}", .{poll_fd.revents & std.posix.POLL.HUP});
-            tracer.trace(.information, &.{ "process", @src().fn_name }, null, "POLLNVAL: {}", .{poll_fd.revents & std.posix.POLL.NVAL});
-            tracer.trace(.information, &.{ "process", @src().fn_name }, null, "POLLERR: {}", .{poll_fd.revents & std.posix.POLL.ERR});
-            return poll_fd.revents;
+            const revents: LINUXPOLLEVENTS = @bitCast(poll_fd.revents);
+            tracer.trace(.information, &.{ "process", @src().fn_name }, null, "revents: {x}", .{revents.asInt()});
+            tracer.trace(.information, &.{ "process", @src().fn_name }, null, "POLLHUP: {}", .{revents.HUP});
+            tracer.trace(.information, &.{ "process", @src().fn_name }, null, "POLLNVAL: {}", .{revents.NVAL});
+            tracer.trace(.information, &.{ "process", @src().fn_name }, null, "POLLERR: {}", .{revents.ERR});
+            return revents;
         },
-        else => return std.posix.POLL.ERR,
+        else => return .err,
+    }
+}
+
+const POLL = switch (@import("builtin").os.tag) {
+    .windows => WSAPOLL,
+    else => LINUXPOLL,
+};
+
+const POLLEVENTS = switch (@import("builtin").os.tag) {
+    .windows => WSAPOLLEVENTS,
+    else => LINUXPOLLEVENTS,
+};
+
+pub const WSAPOLL = enum(i16) {
+    IN = 512 + 256,
+    OUT = 16,
+};
+
+pub const LINUXPOLL = enum(i16) {
+    IN = 1,
+    OUT = 4,
+};
+
+pub const WSAPOLLEVENTS = packed struct(u16) {
+    ERR: bool = false, // 1
+    HUP: bool = false, // 2
+    NVAL: bool = false, // 4
+    _: bool = false, // _
+    OUT: bool = false, // 16
+    __: u3 = 0, // _
+    // _
+    // _
+    IN: u2 = 3, // 256,512
+    ___: u6 = 0,
+
+    pub const empty: @This() = .{};
+    pub const full: @This() = .{
+        .ERR = true,
+        .HUP = true,
+        .NVAL = true,
+        .OUT = true,
+        .IN = std.math.maxInt(@TypeOf(std.meta.fieldInfo(WSAPOLLEVENTS, .IN).type)),
+    };
+
+    pub fn toLinux(e: @This()) LINUXPOLLEVENTS {
+        return .{
+            .IN = e.IN != 0,
+            .OUT = e.OUT,
+            .ERR = e.ERR,
+            .HUP = e.HUP,
+            .NVAL = e.NVAL,
+        };
+    }
+};
+
+pub const LINUXPOLLEVENTS = packed struct(u16) {
+    IN: bool = true, // 1
+    __: bool = true, // _
+    OUT: bool = true, // 4
+    ERR: bool = false, // 8
+    HUP: bool = false, // 0x10
+    NVAL: bool = false, // 0x20
+    ___: u10 = 0,
+
+    pub const empty: @This() = .{};
+    pub const err: @This() = .{
+        .ERR = true,
+    };
+
+    pub fn asInt(self: @This()) u16 {
+        return @bitCast(self);
+    }
+};
+
+const WSAPollfd = struct {
+    fd: std.os.windows.HANDLE,
+    events: WSAPOLL,
+    revents: WSAPOLLEVENTS,
+};
+
+pub extern "ws2_32" fn WSAPoll(
+    fdArray: [*]WSAPollfd,
+    fds: std.os.windows.ULONG,
+    timeout: std.os.windows.INT,
+) callconv(.winapi) c_int;
+
+pub extern "ws2_32" fn WSAGetLastError() callconv(.winapi) c_int;
+
+fn poll_windows(file: std.Io.File, events: WSAPOLL, tracer: *Tracer) LINUXPOLLEVENTS {
+    var poll_fds = [_]WSAPollfd{
+        .{
+            .fd = file.handle,
+            .events = events,
+            .revents = .empty,
+        },
+    };
+    const poll_fd = &poll_fds[0];
+
+    const result = WSAPoll(&poll_fds, 1, 0);
+
+    if (result <= 0) {
+        return .err;
+    } else {
+        const revents = poll_fd.revents.toLinux();
+
+        tracer.trace(.information, &.{ "process", @src().fn_name }, null, "revents: {x}", .{revents.asInt()});
+        tracer.trace(.information, &.{ "process", @src().fn_name }, null, "POLLHUP: {}", .{revents.HUP});
+        tracer.trace(.information, &.{ "process", @src().fn_name }, null, "POLLNVAL: {}", .{revents.NVAL});
+        tracer.trace(.information, &.{ "process", @src().fn_name }, null, "POLLERR: {}", .{revents.ERR});
+        return revents;
     }
 }
 
@@ -360,12 +479,12 @@ const PipeWriter = struct {
         if (parent.file_writer == null) return 0;
         const writer = &parent.trace_file_writer.writer;
 
-        const revents = poll(file, std.posix.POLL.OUT, parent.tracer);
-        parent.tracer.trace(.information, &.{ "process", @typeName(@This()), @src().fn_name }, null, "[{*}]: " ++ @src().fn_name ++ ": poll {x}", .{ w, revents });
-        if (revents & std.posix.POLL.ERR > 0) {
+        const revents = poll(file, POLL.OUT, parent.tracer);
+        parent.tracer.trace(.information, &.{ "process", @typeName(@This()), @src().fn_name }, null, "[{*}]: " ++ @src().fn_name ++ ": poll {x}", .{ w, revents.asInt() });
+        if (revents.ERR) {
             parent.tracer.trace(.information, &.{ "process", @typeName(@This()), @src().fn_name }, null, "[{*}]: " ++ @src().fn_name ++ ": POLLERR", .{w});
             return error.WriteFailed;
-        } else if (revents & std.posix.POLL.OUT > 0) {
+        } else if (revents.OUT) {
             parent.tracer.trace(.information, &.{ "process", @typeName(@This()), @src().fn_name }, null, "[{*}]: " ++ @src().fn_name ++ ": POLLOUT", .{w});
             var bytes_written: usize = 0;
             if (w.buffered().len > 0) {
@@ -376,7 +495,7 @@ const PipeWriter = struct {
             }
             try writer.flush();
             return bytes_written;
-        } else if (revents & (std.posix.POLL.HUP | std.posix.POLL.NVAL) > 0) {
+        } else if (revents.HUP or revents.NVAL) {
             parent.tracer.trace(.information, &.{ "process", @typeName(@This()), @src().fn_name }, null, "[{*}]: " ++ @src().fn_name ++ ": POLLHUP | POLLNVAL", .{w});
             return error.WriteFailed;
         }
@@ -415,31 +534,43 @@ pub const PipeReader = struct {
         const parent = getParent(r);
         const file = parent.file orelse return 0;
 
-        var revents = poll(file, std.posix.POLL.IN, parent.tracer);
+        var revents = poll(file, POLL.IN, parent.tracer);
 
-        if (revents & std.posix.POLL.ERR > 0) {
+        if (revents.ERR) {
             return error.EndOfStream;
-        } else if (revents & (std.posix.POLL.IN | std.posix.POLL.HUP) > 0) {
+        } else if (revents.IN or revents.HUP) {
             var buffer: [256]u8 = undefined;
             var bytes_read: usize = 0;
             while (bytes_read < buffer.len) {
-                const n = std.posix.read(file.handle, buffer[bytes_read .. bytes_read + 1]) catch return error.ReadFailed;
-                if (n == 0) {
-                    if (bytes_read == 0) return error.EndOfStream;
-                    break;
+                switch (@import("builtin").os.tag) {
+                    .windows => {
+                        var lr = r.limited(.limited(2), buffer[bytes_read .. bytes_read + 1]);
+                        buffer[bytes_read] = (lr.interface.take(1) catch |err| switch (err) {
+                            error.EndOfStream => if (bytes_read == 0) return error.EndOfStream else break,
+                            else => return err,
+                        })[0];
+                        bytes_read += 1;
+                    },
+                    else => {
+                        const n = std.posix.read(file.handle, buffer[bytes_read .. bytes_read + 1]) catch return error.ReadFailed;
+                        if (n == 0) {
+                            if (bytes_read == 0) return error.EndOfStream;
+                            break;
+                        }
+                        bytes_read += n;
+                    },
                 }
-                bytes_read += n;
 
                 if (buffer[bytes_read - 1] == '\n') break;
 
-                revents = poll(file, std.posix.POLL.IN, parent.tracer);
-                if (revents & std.posix.POLL.ERR > 0) return error.EndOfStream;
-                if (revents & std.posix.POLL.IN == 0) break;
+                revents = poll(file, POLL.IN, parent.tracer);
+                if (revents.ERR) return error.EndOfStream;
+                if (!revents.IN) break;
             }
 
             try w.writeAll(buffer[0..bytes_read]);
             return bytes_read;
-        } else if (revents & std.posix.POLL.NVAL > 0) {
+        } else if (revents.NVAL) {
             return error.EndOfStream;
         }
 
