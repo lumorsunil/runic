@@ -313,7 +313,8 @@ Likely near- to mid-term candidates:
        per element of a comptime list. Jai's `#insert`/data-layout transforms and
        Mox's AST building do this. Would need a way to assemble a field list at
        comptime (a bounded analog of Zig's `@Type(.{ .Struct = … })`), not full
-       AST splicing.
+       AST splicing — the Jai/Mox "generate the source, re-parse it" way.
+       Design note: `future/comptime-type-construction.md`.
      - **Arbitrary compile-time execution (`#run`).** Jai/Mox run *any* function
        at compile time — I/O, `os_get_env`, exec, even a whole program — and bake
        the result in; the build script itself is ordinary code (no Makefiles).
