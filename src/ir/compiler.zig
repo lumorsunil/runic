@@ -5253,6 +5253,26 @@ pub const IRCompiler = struct {
                 }
                 return .fromValue(.void);
             }
+            // `@log msg` — a runtime debug print to the process's *real* stdout,
+            // bypassing the current thread's stdout pipe (which, inside a captured
+            // call, is a capture pipe — echoing there would pollute or deadlock the
+            // capture). The message is any value; it is rendered and newline-
+            // terminated. Suppressed in an unspecialized generic template (its body
+            // compiles every comptime branch), like `@compileError`.
+            if (std.mem.eql(u8, name, "@log") and
+                self.lookup(name, .{ .shallow = false }) == null)
+            {
+                if (self.generic_template_depth == 0) {
+                    const msg: ir.ValueSource = if (call.arguments.len > 0) blk: {
+                        const compiled = try self.compileExpression(call.arguments[0]);
+                        const ref = try self.newRef(source, "log_msg");
+                        try self.set(source, ref, stableResultSource(compiled));
+                        break :blk .fromLocation(ref.dereference());
+                    } else .fromValue(.{ .slice = ir.Value.Slice.empty(1) });
+                    try self.addInstruction(.init(.from(source), .{ .debug_log = msg }));
+                }
+                return .fromValue(.void);
+            }
             // Type-introspection builtins (`@kind`, `@elem`, `@child`,
             // `@fieldCount`, `@hasField`) fold to a compile-time constant.
             if (name.len > 0 and name[0] == '@' and

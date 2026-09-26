@@ -14,6 +14,19 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Added
 
+- **`@log msg` — a debug print to the real stdout.** Writes its (rendered,
+  interpolated) argument, newline-terminated, straight to the process's stdout,
+  bypassing the current function's stdout pipe. Inside a function whose result is
+  captured by value (`const r = f x`, `${(f x)}`), the stdout pipe is a capture
+  transport — an `echo` there pollutes or deadlocks the capture — so `@log` is the
+  way to trace such a function:
+  ```runic
+  fn map(f: fn (|A|) |B|, xs: []A) []B {
+      @log "mapping ${xs.len} elements"
+      …
+  }
+  ```
+
 - **Function overloading.** A name declared more than once is an overload set;
   a call resolves to one candidate by the argument types and — when several match
   (they differ only in return type) — the expected type from context (a binding

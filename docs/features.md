@@ -1102,6 +1102,32 @@ fn Int tee() Int {
 }
 ```
 
+### `@log` — debug output to the real stdout
+
+`@log msg` prints its argument (rendered, with interpolation) followed by a
+newline, straight to the process's **real** stdout — independent of the current
+function's `&1` stream. It is for debugging.
+
+This matters because a function whose result is captured by value — bound
+(`const r = f x`) or interpolated (`${(f x)}`) — runs with its stdout wired to a
+capture transport, not the terminal. Writing to `&1` there (an `echo`, a bare
+command) feeds the capture, so it corrupts or stalls the captured value. `@log`
+side-steps that stream entirely:
+
+```rn
+fn map(f: fn (|A|) |B|, xs: []A) []B {
+    @log "map: ${xs.len} elements"   // reaches the terminal even when captured
+    var out: []B = .{ }
+    for (xs) |x| out = out.push (f x)
+    yield out
+}
+
+const doubled = map dbl .{ 1, 2, 3 }   // stdout is a capture; @log still prints
+```
+
+Use `yield &2 …` for diagnostics that belong on stderr, and `@log` for a quick
+trace that must appear on stdout regardless of how the function is called.
+
 A stage that `yield`s more than once emits each value as it happens (streamed,
 not buffered to the end), so one input value can produce several outputs:
 

@@ -2196,6 +2196,17 @@ pub const IREvaluator = struct {
                 try w.flush();
                 return .cont;
             },
+            .debug_log => |source| {
+                // Write straight to the process's real stdout stream, not the
+                // thread's stdout pipe (a forked/captured call's stdout is a
+                // capture pipe). This is out-of-band debug output.
+                const value = try self.resolveValueSource(thread, source);
+                var w = self.config.stdout.closeableWriter().writer;
+                try self.materializeString(thread, value, w);
+                try w.writeAll("\n");
+                try w.flush();
+                return .cont;
+            },
             .pipe_fwd => |pipe_fwd| {
                 const source_handle = (try self.resolveLocation(thread, pipe_fwd.source)).pipe;
                 const destination_handle = (try self.resolveLocation(thread, pipe_fwd.destination)).pipe;

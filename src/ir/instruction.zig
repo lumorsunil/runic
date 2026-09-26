@@ -173,6 +173,10 @@ pub const Instruction = struct {
         pipe_file: PipeFile,
         /// materializes a value directly into a pipe destination
         pipe_write: PipeWrite,
+        /// `@log msg` — writes the value to the process's *real* stdout (not the
+        /// current thread's stdout pipe, which may be a capture), for debugging.
+        /// Newline-terminated.
+        debug_log: ValueSource,
         /// forwards a pipe to another pipe
         pipe_fwd: Forward,
         /// executes an instruction atomically (all instructions executed at once)
