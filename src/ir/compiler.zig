@@ -2293,7 +2293,7 @@ pub const IRCompiler = struct {
         } else null;
         const needs_annotated_storage = if (annotated_type) |annotation_type|
             if (result.typeExpr()) |result_type|
-                !std.meta.eql(result_type, annotation_type)
+                !(try self.typeRendersEqual(result_type, annotation_type))
             else
                 true
         else
@@ -11303,6 +11303,19 @@ pub const IRCompiler = struct {
             }
         }
         return true;
+    }
+
+    /// Structural type equality by rendered form. Preferred over `std.meta.eql`
+    /// for comparing two `ast.TypeExpr`s: `std.meta.eql` recursively dereferences
+    /// every pointer/slice a type carries, so an aliased or transient sub-type
+    /// pointer anywhere makes it read stale memory; rendering walks each type
+    /// through its own `format`, ignoring spans and pointer identity.
+    fn typeRendersEqual(self: *IRCompiler, a: ast.TypeExpr, b: ast.TypeExpr) Error!bool {
+        const ra = try std.fmt.allocPrint(self.allocator, "{f}", .{a});
+        defer self.allocator.free(ra);
+        const rb = try std.fmt.allocPrint(self.allocator, "{f}", .{b});
+        defer self.allocator.free(rb);
+        return std.mem.eql(u8, ra, rb);
     }
 
     const ForSource = struct {

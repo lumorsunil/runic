@@ -2183,6 +2183,11 @@ pub const TypeChecker = struct {
             // is what lets a `map(…, |M|(A))` monad overload and a `map(…, []A)`
             // list overload dispatch on the same call.
             if (ann.* == .type_application and ann.type_application.ctor_is_capture) {
+                // An array literal (`.{ 1, 2, 3 }`) is array-like, never a named
+                // constructor — reject it outright. A homogeneous one has no
+                // resolved type here (it flows permissively), so the type check
+                // below can't catch it.
+                if (arg.* == .array) return false;
                 const arg_raw = (self.resolveExprType(scope, arg) catch continue) orelse continue;
                 const arg_type = self.resolveTypeExpr(scope, arg_raw) catch arg_raw;
                 if (!self.typeIsConstructorLike(arg_type)) return false;
