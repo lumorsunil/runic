@@ -1,0 +1,27 @@
+# `@insert "<field decls>"` in a struct body is a compile-time code insertion:
+# the static string is re-parsed as a `name: Type[, …]` field list and grafted
+# into the struct. The generated field types may name the enclosing type's
+# parameters (`value: T`), which the usual generic substitution resolves at
+# instantiation. Inserted fields can sit alongside ordinary ones.
+
+fn Wrap(comptime T: type) type {
+  yield struct {
+    @insert "value: T"
+    tag: String
+  }
+}
+const w: Wrap(Int) = Wrap{ .value = 42, .tag = "n" }
+echo "wrap: ${w.value} ${w.tag}"
+
+fn Pair(comptime T: type) type {
+  yield struct { @insert "a: T, b: T" }
+}
+const p: Pair(Int) = Pair{ .a = 1, .b = 2 }
+echo "pair: ${p.a} ${p.b}"
+
+# A field before the insert, and an inserted concrete-typed field.
+fn Tagged(comptime T: type) type {
+  yield struct { inner: T @insert "id: Int" }
+}
+const t: Tagged(String) = Tagged{ .inner = "hi", .id = 7 }
+echo "tagged: ${t.inner} ${t.id}"

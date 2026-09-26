@@ -7,10 +7,16 @@ computation. This is item #2 of the comptime "possible next directions" in
 comptime type function; it cannot yet *build* one whose shape is decided at
 compile time.
 
-Status: **exploratory, not started.** No branch yet. This note captures the
-approach we want to pursue (the Jai/Mox "code is text/AST" model, deliberately
-*not* Zig's `@Type`), the one new mechanism it needs, and the open questions to
-resolve before writing code.
+Status: **increment 1 landed** (`comptime-functions` branch) — `@insert "…"` in a
+struct body re-parses a *static* string as a field list and grafts the fields
+(parser re-entry). The generated field types may name the enclosing type's
+parameters (`@insert "value: T"`), resolved by the existing generic substitution,
+so no type-checker/compiler materialization was needed. **Next:** increment 2 —
+`@insert` of an interpolated / loop-built string, which needs instantiation-time
+comptime evaluation at both `substituteTypeParams` sites; increment 3 — `@code`
+(AST as a first-class value). This note captures the approach (the Jai/Mox "code
+is text/AST" model, deliberately *not* Zig's `@Type`), the mechanism, and the
+open questions.
 
 ## The two models, and why we prefer the Jai/Mox one
 

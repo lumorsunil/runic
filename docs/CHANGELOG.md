@@ -23,6 +23,21 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Added
 
+- **`@insert "…"` — compile-time struct field generation (first increment).** In
+  a struct body, `@insert` re-parses a static string as a `name: Type[, …]` field
+  list and grafts the fields in — the Jai/Mox "generate the source, re-parse it"
+  model of building a type, rather than a `@Type`-style structured builtin. The
+  generated field types may name the enclosing type's parameters, resolved by the
+  usual generic substitution:
+  ```runic
+  fn Wrap(comptime T: type) type {
+      yield struct { @insert "value: T"  tag: String }
+  }
+  const w: Wrap(Int) = Wrap{ .value = 42, .tag = "n" }
+  ```
+  Inserted fields sit alongside ordinary ones. This increment takes a *static*
+  string; interpolation/loop-built strings and `@code` (AST as a value) are the
+  next increments — see `future/comptime-type-construction.md`.
 - **`@log msg` — a debug print to the real stdout.** Writes its (rendered,
   interpolated) argument, newline-terminated, straight to the process's stdout,
   bypassing the current function's stdout pipe. Inside a function whose result is

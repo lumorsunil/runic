@@ -3968,7 +3968,8 @@ pub const Parser = struct {
         // `struct {}` stays a named (empty) struct.
         const ahead = try self.peekSlice(2);
         const is_named = (ahead.len >= 1 and ahead[0].tag == .r_brace) or
-            (ahead.len >= 2 and ahead[0].tag == .identifier and ahead[1].tag == .colon);
+            (ahead.len >= 2 and ahead[0].tag == .identifier and ahead[1].tag == .colon) or
+            (ahead.len >= 1 and isInsertToken(ahead[0]));
         if (!is_named) return self.parseTupleTypeBody(start);
 
         var fields = std.ArrayList(ast.TypeExpr.StructField).empty;
@@ -3978,6 +3979,20 @@ pub const Parser = struct {
             self.skipNewlines();
             const next = try self.peekToken();
             if (next.tag == .r_brace) break;
+
+            // `@insert "<field decls>"` — a compile-time code insertion in field
+            // position: the string is re-parsed as a field list and grafted in.
+            // (Increment 1: a static string literal only; the generated fields may
+            // reference the enclosing type's parameters by name, which the normal
+            // generic substitution then resolves. Interpolation/loops come later.)
+            if (isInsertToken(next)) {
+                _ = try self.nextToken();
+                try self.parseInsertedFields(&fields);
+                self.skipNewlines();
+                const delimiter = try self.peekToken();
+                if (delimiter.tag == .comma) _ = try self.nextToken();
+                continue;
+            }
 
             const name = try self.parseIdentifier();
             _ = try self.expectTokenTag(.colon);
@@ -4005,6 +4020,74 @@ pub const Parser = struct {
                 .span = start.span.endAt(close.span),
             },
         });
+    }
+
+    /// Whether `tok` is the `@insert` compile-time code-insertion directive.
+    fn isInsertToken(tok: token.Token) bool {
+        return tok.tag == .identifier and std.mem.eql(u8, tok.lexeme, "@insert");
+    }
+
+    /// Parses an `@insert "<field decls>"` directive in struct-field position and
+    /// appends the generated fields to `fields`. The operand is a static string
+    /// literal; its contents are re-lexed and parsed as a `name: Type[, …]` field
+    /// list (parser re-entry on a fresh stream), so a metaprogram can compute a
+    /// struct's shape as text. The generated field types may name the enclosing
+    /// type's parameters (`@insert "value: T"`), which the usual generic
+    /// substitution resolves at instantiation. Interpolation (`${…}`) and loops
+    /// are deferred to a later increment.
+    fn parseInsertedFields(self: *Self, fields: *std.ArrayList(ast.TypeExpr.StructField)) Error!void {
+        const literal = try self.parseStringLiteral();
+        // Static string only, for now: reject interpolation with a directed error.
+        var text = std.ArrayList(u8).empty;
+        defer text.deinit(self.allocator);
+        for (literal.segments) |segment| switch (segment) {
+            .text => |t| try text.appendSlice(self.allocator, t.payload),
+            .interpolation => {
+                try self.reportParseError(
+                    Error.UnexpectedToken,
+                    literal.span,
+                    "@insert with string interpolation is not supported yet; use a static field list (the field types may name type parameters, e.g. `@insert \"value: T\"`)",
+                    .{},
+                );
+                return Error.UnexpectedToken;
+            },
+        };
+
+        // Re-enter the parser on the inserted text with a fresh stream, then
+        // restore the outer stream. The generated source is field declarations
+        // with no surrounding braces, so parse until end-of-stream.
+        const insert_source = try self.arena.allocator().dupe(u8, text.items);
+        const saved_stream = self.stream;
+        const saved_source = self.source;
+        self.stream = try .init(
+            self.io,
+            self.arena.allocator(),
+            self.environ_map,
+            "<@insert>",
+            insert_source,
+        );
+        errdefer self.stream = saved_stream;
+        self.source = insert_source;
+
+        while (true) {
+            self.skipNewlines();
+            const next = try self.peekToken();
+            if (next.tag == .eof) break;
+            const name = try self.parseIdentifier();
+            _ = try self.expectTokenTag(.colon);
+            const field_type = try self.parseTypeExpr();
+            try fields.append(self.allocator, .{
+                .name = name,
+                .type_expr = field_type,
+                .span = name.span.endAt(field_type.span()),
+            });
+            self.skipNewlines();
+            const delimiter = try self.peekToken();
+            if (delimiter.tag == .comma) _ = try self.nextToken();
+        }
+
+        self.stream = saved_stream;
+        self.source = saved_source;
     }
 
     /// Parses the positional body of a tuple type — `struct { T0, T1, … }` (the
