@@ -2794,16 +2794,17 @@ pub const IREvaluator = struct {
         thread: ir.context.IRThreadContext,
         heap_addr: usize,
         len: usize,
-        separator: ?u8,
+        separator: []const u8,
+        brackets: bool,
         w: *std.Io.Writer,
     ) MaterializeStringError!void {
+        if (brackets) try w.writeAll("[");
         for (0..len) |i| {
-            if (separator) |sep| {
-                if (i > 0) try w.writeByte(sep);
-            }
+            if (i > 0) try w.writeAll(separator);
             const element = try self.heapValueAt(heap_addr + i + 1);
             try self.materializeString(thread, element, w);
         }
+        if (brackets) try w.writeAll("]");
     }
 
     /// Duplicates `s` and applies a per-byte map, returning an owned zig_string.
@@ -2938,7 +2939,9 @@ pub const IREvaluator = struct {
             inline .integer, .float => |t| try w.print("{}", .{t}),
             .addr => |addr| {
                 if (try self.maybeHeapSequenceLen(addr)) |seq| {
-                    try self.materializeHeapSequence(thread, seq.heap_addr, seq.len, null, w);
+                    // Default array→string coercion renders bracketed and
+                    // comma-separated: `[1, 2, 3]`.
+                    try self.materializeHeapSequence(thread, seq.heap_addr, seq.len, ", ", true, w);
                 } else {
                     const loc = self.context.mapAddr(addr);
                     switch (loc.abs) {
@@ -2981,7 +2984,9 @@ pub const IREvaluator = struct {
     ) MaterializeStringError!void {
         if (value == .addr) {
             if (try self.maybeHeapSequenceLen(value.addr)) |seq| {
-                try self.materializeHeapSequence(thread, seq.heap_addr, seq.len, ' ', w);
+                // Pipeline input splits an array into space-separated tokens
+                // (unbracketed), so a downstream stage reads one element per token.
+                try self.materializeHeapSequence(thread, seq.heap_addr, seq.len, " ", false, w);
                 return;
             }
         }

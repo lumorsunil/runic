@@ -12,6 +12,15 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ## [Unreleased]
 
+### Changed
+
+- **An array coerces to a string as `[1, 2, 3]`**, bracketed and comma-separated,
+  instead of its elements run together (`123`). This applies wherever an array is
+  rendered to text — string interpolation (`"${xs}"`), a command argument, `@log`
+  — and nests (`[[1, 2], [3, 4]]`); an empty array is `[]`. Feeding an array into
+  a **pipeline** (`xs | …`) is unchanged: it still splits into space-separated
+  tokens so a downstream stage reads one element per token.
+
 ### Added
 
 - **`@log msg` — a debug print to the real stdout.** Writes its (rendered,
