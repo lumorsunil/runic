@@ -1,4 +1,4 @@
-[error]: tests/diagnostics/command_stdout_type_mismatch.rn:6:3: 'echo' writes text to stdout, but this function's stdout type is '[]B'; bind the result (const x = …), redirect it (>&2 or > "file"), or use @log for debug output
+[error]: tests/diagnostics/command_stdout_type_mismatch.rn:6:3: 'echo' writes 'String' to stdout, but this function's stdout type is '[]B'; bind the result (const x = …), redirect it (>&2 or > "file"), or use @log for debug output
    4:# mismatch. Bind the result, redirect it, or use `@log` for debug output.
    5:fn map(f: fn (|A|) |B|, ma: []A) []B {
    6:  echo "hello from map"

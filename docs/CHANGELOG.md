@@ -26,14 +26,17 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
       …
   }
   ```
-- **A bare command in a typed-value-stdout function is now a compile error.** A
-  command statement (`echo "x"`) writes to the enclosing function's stdout; when
-  that stdout carries a typed value (`Int`, `[]T`, `Maybe(T)`, a struct — anything
-  but the byte channels `Void`/`String`/`Byte`), the command's text corrupts the
-  yielded value (and previously deadlocked on the capture path). It now reports a
-  stdout type mismatch pointing at the fixes: bind the result, redirect it (`>&2`,
-  `> "file"`), or use `@log`. A command whose result is bound, or whose stdout is
-  redirected, is unaffected — as are `Void`/`String` functions.
+- **A bare statement whose stdout doesn't match the function's is now a compile
+  error.** A bare command (`echo "x"` → `String`) or a bare call to a function
+  (which forwards that function's own stdout) writes to the enclosing function's
+  stdout; its output type must match the function's stdout type. When it doesn't —
+  the stdout carries a typed value (`Int`, `[]T`, `Maybe(T)`, a struct — anything
+  but the byte channels `Void`/`String`/`Byte`) that the output would corrupt (and
+  previously deadlocked on the capture path) — it reports a stdout type mismatch
+  naming both types and pointing at the fixes: bind the result, redirect it (`>&2`,
+  `> "file"`), or use `@log`. A statement whose result is bound, whose stdout is
+  redirected, or whose type matches is unaffected, as are `Void`/`String`
+  functions and a call to a `Void` function.
 
 - **Function overloading.** A name declared more than once is an overload set;
   a call resolves to one candidate by the argument types and — when several match

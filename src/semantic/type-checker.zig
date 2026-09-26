@@ -2701,7 +2701,7 @@ pub const TypeChecker = struct {
 
         try self.runExpression(scope, expr_stmt.expression);
 
-        try self.checkBareCommandStdout(scope, expr_stmt.expression);
+        try self.checkBareStatementStdout(scope, expr_stmt.expression);
 
         // Enforce error handling: a bare statement whose result is an error
         // (a value, a call, or a pipeline whose final stage yields an error
@@ -2726,38 +2726,67 @@ pub const TypeChecker = struct {
         }
     }
 
-    /// A bare command statement (`echo "x"`, `ls …`) writes its output to the
-    /// enclosing function's stdout (`&1`). When that function's stdout carries a
-    /// *typed value* — anything other than a byte channel (`Void`, `String`,
-    /// `Byte`, a command `execution`) — the command's text corrupts the yielded
-    /// value (and, on the capture path, deadlocks). Report it as a stdout type
-    /// mismatch, and point at the alternatives. A command whose result is *bound*
+    /// A bare statement that produces stdout output writes it to the enclosing
+    /// function's stdout (`&1`). Its output type must match the function's stdout
+    /// type; when it does not, the output corrupts the yielded value (and, on the
+    /// capture path, deadlocks). Two producers are checked:
+    ///
+    ///   - a command (`echo "x"`, `ls …`) — an identifier callee with no scope
+    ///     binding — writes text, i.e. `String`;
+    ///   - a bare call to a user function (`helper`, `g x`) forwards that
+    ///     function's own stdout (its declared return type).
+    ///
+    /// A byte-channel stdout (`Void` passthrough, `String`, `Byte`) accepts any
+    /// output, so it never mismatches. A command's result that is *bound*
     /// (`const x = echo …`) is a binding, not an expression statement, so it never
-    /// reaches here; one that redirects its stdout elsewhere (`>&2`, `> file`) is
-    /// conservatively skipped.
-    fn checkBareCommandStdout(self: *TypeChecker, scope: *Scope, expr: *ast.Expression) Error!void {
+    /// reaches here; one that redirects stdout elsewhere (`>&2`, `> file`) is
+    /// skipped, as is a call to a `Void` function (it produces no stdout).
+    fn checkBareStatementStdout(self: *TypeChecker, scope: *Scope, expr: *ast.Expression) Error!void {
         if (self.stdout_type_stack.items.len == 0) return; // top level: no stdout type
         const declared = self.stdout_type_stack.items[self.stdout_type_stack.items.len - 1] orelse return;
+        // A byte-channel stdout accepts any output — no mismatch is possible.
+        if (self.stdoutAcceptsCommandBytes(declared)) return;
         if (expr.* != .call) return;
         const call = expr.call;
-        // A command is an identifier callee with no scope binding (`echo`, `ls`);
-        // a user function or module member is not.
-        if (call.callee.* != .identifier) return;
-        if (scope.lookup(call.callee.identifier.name) != null) return;
-        // Builtins that don't write to stdout (`@log` goes to the real stdout by
-        // design, `cd`/`setenv` produce no output) are not stdout producers.
-        if (call.callee.identifier.name.len > 0 and call.callee.identifier.name[0] == '@') return;
+        if (call.callee.* != .identifier) return; // UFCS / pipelines: not handled here
+        const name = call.callee.identifier.name;
+        // Builtins that don't write to `&1` (`@log` goes to the real stdout by
+        // design, `cd`/`setenv` produce no output).
+        if (name.len > 0 and name[0] == '@') return;
         if (call.redirects.len != 0) return; // stdout may be redirected away — skip
-        if (self.stdoutAcceptsCommandBytes(declared)) return;
-        var w = std.Io.Writer.Allocating.init(self.arena.allocator());
-        defer w.deinit();
-        declared.format(&w.writer) catch {};
+
+        // The statement's stdout output type: `String` for a command (no binding),
+        // else the called function's declared return type.
+        const produced: *const ast.TypeExpr = if (scope.lookup(name)) |binding| blk: {
+            const t = binding.type_expr orelse return;
+            if (self.unaliasType(t).* != .function) return; // a value, not a call
+            const rt = self.unaliasType(t).function.return_type orelse return;
+            // A `Void` function produces no stdout output — nothing to mismatch.
+            if (self.unaliasType(rt).* == .void) return;
+            break :blk rt;
+        } else try self.allocStringType();
+
+        // Byte output (a command's `String`, or a `String`/`Byte`-returning call)
+        // into a stdout that is *not* a byte channel (we skipped those above) is a
+        // mismatch outright — never run it through the permissive unifier, which
+        // would wrongly match `String` (`[]Byte`) against a generic `[]T` because
+        // the element `T` is a type variable. For any other produced type, unify
+        // permissively so a type variable/capture never false-positives in a
+        // generic body; mismatch only on a concrete clash.
+        if (!self.stdoutAcceptsCommandBytes(produced) and self.overloadTypeMatches(produced, declared)) return;
+
+        var pw = std.Io.Writer.Allocating.init(self.arena.allocator());
+        defer pw.deinit();
+        produced.format(&pw.writer) catch {};
+        var dw = std.Io.Writer.Allocating.init(self.arena.allocator());
+        defer dw.deinit();
+        declared.format(&dw.writer) catch {};
         try self.reportSpanError(
             expr.span(),
             Error.TypeMismatch,
             .@"error",
-            "'{s}' writes text to stdout, but this function's stdout type is '{s}'; bind the result (const x = …), redirect it (>&2 or > \"file\"), or use @log for debug output",
-            .{ call.callee.identifier.name, w.written() },
+            "'{s}' writes '{s}' to stdout, but this function's stdout type is '{s}'; bind the result (const x = …), redirect it (>&2 or > \"file\"), or use @log for debug output",
+            .{ name, pw.written(), dw.written() },
         );
     }
 
@@ -2775,6 +2804,10 @@ pub const TypeChecker = struct {
         };
     }
 
+    /// Whether a function stdout type is a raw byte channel that a command's text
+    /// output is compatible with: `Void` (inherited/passthrough), `String`
+    /// (`[]Byte`), `Byte`, or a command `execution`. Any other type (`Int`,
+    /// `[]T`, `Maybe(T)`, an optional, a struct, …) carries a typed value.
     /// Whether a bare expression statement's result is an unhandled
     /// (non-`ExecutableError`) error — the error escapes as the statement's
     /// value (a bare error value, a call to an error-returning function, or a
