@@ -721,6 +721,70 @@ test "lsp survives incremental edits to a file with functions" {
     try std.testing.expect(saw_add);
 }
 
+test "lsp applies an incremental edit correctly past a string containing a newline escape" {
+    // A `\n` escape inside a string literal is two ordinary characters on one
+    // line, not a line break. A regression counted it as a newline when mapping
+    // an LSP position to a byte offset, so every edit after such a string landed
+    // one line too early — deleting/replacing the wrong line and corrupting the
+    // buffer. Delete a line that sits *after* a string with a `\n`, and confirm
+    // the *intended* line went away (not its neighbour).
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\fn Void note(n: Int) Void { echo "n=${n}\n" }
+        \\const a = 1
+        \\const b = 2
+        \\const c = 3
+        \\echo "${a}"
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        // Delete line 3 (`const c = 3`): range (3,0)–(4,0) → "". Under the bug the
+        // `\n` on line 0 shifted this to line 2, deleting `const b` instead.
+        try makeDidChangeIncremental(allocator, uri, 2, 3, 0, 4, 0, ""),
+        try makeDocumentSymbolRequest(allocator, 21, uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 21);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+    const syms = parsed.value.object.get("result").?.array.items;
+    var saw_b = false;
+    var saw_c = false;
+    var saw_note = false;
+    for (syms) |s| {
+        const nm = s.object.get("name").?.string;
+        if (std.mem.eql(u8, nm, "b")) saw_b = true;
+        if (std.mem.eql(u8, nm, "c")) saw_c = true;
+        if (std.mem.eql(u8, nm, "note")) saw_note = true;
+    }
+    // `c` was the deleted line; `b` and `note` remain. Under the off-by-one bug
+    // it was `b` that vanished and `c` that survived.
+    try std.testing.expect(saw_note);
+    try std.testing.expect(saw_b);
+    try std.testing.expect(!saw_c);
+
+    // The edit kept the document valid — no spurious diagnostics from a corrupted
+    // buffer.
+    const diag = try findLastMethodNotification(allocator, output, "textDocument/publishDiagnostics");
+    defer allocator.free(diag);
+    const diag_parsed = try std.json.parseFromSlice(std.json.Value, allocator, diag, .{});
+    defer diag_parsed.deinit();
+    const diags = diag_parsed.value.object.get("params").?.object.get("diagnostics").?.array.items;
+    try std.testing.expectEqual(@as(usize, 0), diags.len);
+}
+
 test "lsp document symbols nest struct fields and function parameters" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);

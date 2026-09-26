@@ -171,6 +171,14 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Fixed
 
+- **LSP: incremental edits no longer corrupt a file that contains a `\n` string
+  escape.** When mapping an editor position to a byte offset, the language server
+  treated a backslash-`n` in the document text (the two characters of a `\n`
+  escape *inside a string literal*) as a line break. Any file with such a string
+  miscounted every line after it, so an edit (deleting a line, pasting elsewhere)
+  landed at the wrong offset and scrambled the buffer — after which the parser
+  reported errors that made no sense. Line breaks are now only real newline bytes;
+  a backslash is an ordinary character.
 - **A generic function is now monomorphized even when its result is captured by
   value.** A call whose result is bound with a type (`const r: Maybe(Int) = gmap
   double some`) takes the typed-pipe capture path, which previously skipped
