@@ -1,0 +1,13 @@
+# A bare command writes its text to the enclosing function's stdout (&1). When
+# that stdout carries a typed value (here `[]B`, not a byte channel like String
+# or Void), the command's output would corrupt the yielded value — a stdout type
+# mismatch. Bind the result, redirect it, or use `@log` for debug output.
+fn map(f: fn (|A|) |B|, ma: []A) []B {
+  echo "hello from map"
+  var mb: []B = .{ }
+  for (ma) |a| mb = mb.push (f a)
+  yield mb
+}
+fn double(n: Int) Int { yield n * 2 }
+const ys = map double .{ 1, 2, 3 }
+echo "${ys[0]}"

@@ -26,6 +26,14 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
       …
   }
   ```
+- **A bare command in a typed-value-stdout function is now a compile error.** A
+  command statement (`echo "x"`) writes to the enclosing function's stdout; when
+  that stdout carries a typed value (`Int`, `[]T`, `Maybe(T)`, a struct — anything
+  but the byte channels `Void`/`String`/`Byte`), the command's text corrupts the
+  yielded value (and previously deadlocked on the capture path). It now reports a
+  stdout type mismatch pointing at the fixes: bind the result, redirect it (`>&2`,
+  `> "file"`), or use `@log`. A command whose result is bound, or whose stdout is
+  redirected, is unaffected — as are `Void`/`String` functions.
 
 - **Function overloading.** A name declared more than once is an overload set;
   a call resolves to one candidate by the argument types and — when several match
