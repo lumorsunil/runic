@@ -4024,6 +4024,18 @@ pub const TypeChecker = struct {
         };
     }
 
+    /// The struct operand of a `@field(value)(name)` assignment target, or null
+    /// when `expr` is not such a call. Used to enforce mutability of the value
+    /// being written through and to find its root binding.
+    fn fieldBuiltinTarget(expr: *const ast.Expression) ?*const ast.Expression {
+        if (expr.* != .call) return null;
+        const call = expr.call;
+        if (call.callee.* != .identifier) return null;
+        if (!std.mem.eql(u8, call.callee.identifier.name, "@field")) return null;
+        if (call.arguments.len == 0) return null;
+        return call.arguments[0];
+    }
+
     fn runIfCapture(
         self: *TypeChecker,
         then_scope: *Scope,
@@ -4384,6 +4396,36 @@ pub const TypeChecker = struct {
 
         try self.runExpression(scope, binary.left);
         try self.runExpression(scope, binary.right);
+
+        // `@field(p)(name) = v` — assignment through a comptime-named field. Handled
+        // before the type-resolution early-return below, because a `@field(…)` call
+        // has no resolvable value type here (so `left_type` would be null and the
+        // assignment checks skipped). Enforce that the value written through is
+        // mutable; the field's type often can't be resolved statically (a
+        // comptime-loop name doesn't fold in the checker), so value validation is
+        // deferred to the per-monomorphization member write in the IR compiler.
+        if (binary.op.isAssignment()) {
+            if (fieldBuiltinTarget(binary.left)) |object| {
+                // The object often parses as a bare command-style call (`p` → `p()`)
+                // in argument position; unwrap that to reach the root binding.
+                const obj = if (object.* == .call and object.call.arguments.len == 0)
+                    object.call.callee
+                else
+                    object;
+                if (rootBindingName(obj)) |root| {
+                    if (scope.lookup(root)) |binding| if (!binding.is_mutable) {
+                        try self.reportSpanError(
+                            binary.left.span(),
+                            Error.TypeMismatch,
+                            .@"error",
+                            "cannot assign to a field of immutable '{s}'; declare it with var",
+                            .{root},
+                        );
+                    };
+                }
+                return;
+            }
+        }
 
         const maybe_left_type = try self.resolveExprType(scope, binary.left);
         const maybe_right_type = try self.resolveExprType(scope, binary.right);

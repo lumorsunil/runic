@@ -44,8 +44,18 @@ value access by a comptime name. **Landed: `@field(value)(name)`** — the analo
 Zig's `@field(x, name)`. `name` folds at compile time (usually `f.name` from the
 unrolled loop) and the call lowers to an ordinary member access `value.<name>`
 (reusing `compileMember`), so a comptime loop can now touch each field's *value*
-(serialize, compare, print), not just its metadata. Read-only for now (no
-`@field(x)(name) = v` lvalue). `@code`/`Code` (quote a block and splice/reuse it —
+(serialize, compare, print), not just its metadata. **Lvalue also landed** —
+`@field(value)(name) = v` writes the slot (obeying mutability), so a loop can *set*
+each field. Two supporting fixes fell out: (a) `compileMember` now suppresses
+unresolved member access in an *unspecialized generic template* (a `T`-typed value
+has no layout until `T` binds), so reading/writing `@field` on a generic value works
+outside a `for (@fields)` loop, not only inside one where the template unrolls to
+nothing; (b) the struct field-assign path no longer panics when the lvalue doesn't
+resolve. **Found, not fixed:** returning a whole struct *value* from a
+`comptime T: type` function corrupts (even `fn f(comptime T,v:T) T { yield v }`) — a
+pre-existing generic-struct-return bug, independent of `@field`, that blocks the
+generic build-and-return-a-struct pattern. Until it's fixed, mutate structs with
+`@field` at concrete/top-level sites. `@code`/`Code` (quote a block and splice/reuse it —
 Jai's macro-lite "bucket 1") remains genuinely useful but is a *separate, larger*
 feature (needs statement-position insertion + hygiene rules) to be scoped on its
 own merits later. This note captures the approach (the Jai/Mox "code is text/AST"

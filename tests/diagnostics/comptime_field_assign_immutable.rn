@@ -1,0 +1,6 @@
+# `@field(p)(name) = v` requires `p` to be mutable, just like `p.x = v`. Assigning
+# through a comptime-named field of an immutable binding is a compile error.
+fn Point(comptime E: type) type { yield struct { x: E, y: E } }
+const p: Point(Int) = Point{ .x = 1, .y = 2 }
+@field(p)("x") = 5
+echo "done"

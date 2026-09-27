@@ -4393,10 +4393,19 @@ pub const IRCompiler = struct {
         return binding.result.isFunctionRef();
     }
 
-    /// `@field(value, name)` — read the field named by the comptime string `name`
-    /// off the struct `value`, lowering to an ordinary member access
-    /// `value.<name>` once the name folds. See the dispatch in `compileCall`.
-    fn compileFieldBuiltin(self: *IRCompiler, source: *ast.Expression, call: ast.CallExpr) Error!Result {
+    /// Whether `call` is a `@field(…)(…)` builtin call (not a shadowing binding).
+    fn isFieldBuiltinCall(self: *IRCompiler, call: ast.CallExpr) bool {
+        return call.callee.* == .identifier and
+            std.mem.eql(u8, call.callee.identifier.name, "@field") and
+            self.lookup(call.callee.identifier.name, .{ .shallow = false }) == null;
+    }
+
+    /// `@field(value)(name)` — access the field named by the comptime string
+    /// `name` off the struct `value`, lowering to an ordinary member access
+    /// `value.<name>` once the name folds. `.read` yields the field's value;
+    /// `.lvalue` yields its slot (for `@field(value)(name) = v`). See the dispatch
+    /// in `compileCall` (read) and the assignment handling in `compileBinary`.
+    fn compileFieldBuiltin(self: *IRCompiler, source: *ast.Expression, call: ast.CallExpr, mode: MemberMode) Error!Result {
         if (call.arguments.len != 2) {
             try self.reportSourceError(
                 source,
@@ -4426,7 +4435,7 @@ pub const IRCompiler = struct {
             .member = .{ .name = try self.allocator.dupe(u8, raw), .span = source.span() },
             .span = source.span(),
         };
-        return self.compileMember(source, member, .read);
+        return self.compileMember(source, member, mode);
     }
 
     fn compileMember(
@@ -4526,6 +4535,18 @@ pub const IRCompiler = struct {
             return .fromValue(.void);
         };
 
+        // While compiling an unspecialized generic template (`comptime T: type`
+        // with `T` still unbound), a value typed by a type variable (`v: T`) has no
+        // concrete struct layout yet — `v.x` / `@field(v)("x")` can't resolve. This
+        // template body is never executed (each real call monomorphizes with `T`
+        // bound); emit a harmless placeholder instead of a spurious error, the way
+        // `@log`/`@compileError` suppress in a template. Inside a comptime loop over
+        // `@fields(T)` this never arises (the template unrolls it to nothing), but a
+        // member access *outside* such a loop would otherwise mis-report here.
+        if (self.generic_template_depth > 0 and !self.objectTypeHasStructLayout(object_type)) {
+            return .fromValue(.void);
+        }
+
         const struct_type = switch (object_type) {
             .array => {
                 if (!std.mem.eql(u8, member.member.name, "len")) {
@@ -4565,8 +4586,16 @@ pub const IRCompiler = struct {
             },
             .struct_type => |struct_type| struct_type,
             // A binding annotated with a user struct's name carries the type as
-            // an identifier; resolve it to the struct's layout.
-            .identifier => |named| self.user_struct_types.get(named.path.segments[named.path.segments.len - 1].name) orelse {
+            // an identifier; resolve it to the struct's layout. It may also be a
+            // *type variable* bound during specialization (a `comptime T: type`
+            // param where `T` → `Vec(Int)`): resolve it through `type_captures`
+            // (to a concrete struct name or a `Box(Int)` application) so member
+            // access on a `T`-typed value works anywhere in the body, not only
+            // inside a `for (@fields(T))` loop.
+            .identifier => |named| blk: {
+                const nm = named.path.segments[named.path.segments.len - 1].name;
+                if (self.user_struct_types.get(nm)) |st| break :blk st;
+                if (self.structTypeOfCapturedName(nm)) |st| break :blk st;
                 try self.reportSourceError(
                     source,
                     Error.NotImplemented,
@@ -5337,7 +5366,7 @@ pub const IRCompiler = struct {
             if (std.mem.eql(u8, name, "@field") and
                 self.lookup(name, .{ .shallow = false }) == null)
             {
-                return self.compileFieldBuiltin(source, call);
+                return self.compileFieldBuiltin(source, call, .read);
             }
             // Type-introspection builtins (`@kind`, `@elem`, `@child`,
             // `@fieldCount`, `@hasField`) fold to a compile-time constant.
@@ -6725,6 +6754,45 @@ pub const IRCompiler = struct {
             },
             else => return t,
         }
+    }
+
+    /// Whether `object_type` resolves to a layout `compileMember` can address (a
+    /// struct, an array, or a resolvable struct name/application). Used to decide
+    /// whether an unresolved member access in a generic *template* is a real error
+    /// or just a not-yet-bound type variable to skip over.
+    fn objectTypeHasStructLayout(self: *IRCompiler, object_type: ast.TypeExpr) bool {
+        return switch (object_type) {
+            .struct_type, .array => true,
+            .identifier => |named| blk: {
+                const nm = named.path.segments[named.path.segments.len - 1].name;
+                break :blk self.user_struct_types.contains(nm) or self.structTypeOfCapturedName(nm) != null;
+            },
+            .type_application => |app| if (self.resolveTypeApplication(app)) |r| r == .struct_type else false,
+            else => false,
+        };
+    }
+
+    /// The struct layout a type-variable name resolves to when it was bound during
+    /// specialization (a `comptime T: type` param). `T` is bound in `type_captures`
+    /// to its denoted type — a concrete struct name (`Point`) or an application
+    /// (`Box(Int)`); resolve either to the struct. Null when the name isn't a bound
+    /// capture or doesn't denote a struct.
+    fn structTypeOfCapturedName(self: *IRCompiler, name: []const u8) ?ast.TypeExpr.StructType {
+        const bound = self.type_captures.get(name) orelse return null;
+        return switch (bound) {
+            .struct_type => |st| st,
+            .type_application => |app| blk: {
+                const resolved = self.resolveTypeApplication(app) orelse break :blk null;
+                break :blk if (resolved == .struct_type) resolved.struct_type else null;
+            },
+            .identifier => |id| blk: {
+                const nm = id.path.segments[id.path.segments.len - 1].name;
+                // Guard against a self-referential capture (`T` → `T`).
+                if (std.mem.eql(u8, nm, name)) break :blk null;
+                break :blk self.user_struct_types.get(nm) orelse self.structTypeOfCapturedName(nm);
+            },
+            else => null,
+        };
     }
 
     /// Resolves a generic application (`Box(Int)`) to the constructor's struct
@@ -11162,6 +11230,21 @@ pub const IRCompiler = struct {
                     return .from(result_ref.dereference().typed(optional_string_type));
                 }
 
+                // `@field(p)(name) = v` — assignment through a comptime-named field.
+                // Same discipline as `p.x = v` below: value into a stable ref first,
+                // then the lvalue slot (`@field` lowers to the member slot), then
+                // write immediately. A folding/lookup failure reports and yields a
+                // non-location result, so bail without writing.
+                if (binary.left.* == .call and self.isFieldBuiltinCall(binary.left.call)) {
+                    const value = try self.compileExpression(binary.right);
+                    const value_ref = try self.newRef(source, "field_assign_value");
+                    try self.set(source, value_ref, stableResultSource(value));
+                    const slot = try self.compileFieldBuiltin(binary.left, binary.left.call, .lvalue);
+                    if (slot.source != .location) return .from(value_ref.dereference().typed(value.typeExpr()));
+                    try self.set(source, slot.source.location, .from(value_ref.dereference()));
+                    return .from(value_ref.dereference().typed(value.typeExpr()));
+                }
+
                 // Struct field assignment `p.x = v`: compile the value into a
                 // stable ref first (so evaluating it can't clobber the base
                 // register), then compile the target as an lvalue (raw slot) and
@@ -11171,6 +11254,12 @@ pub const IRCompiler = struct {
                     const value_ref = try self.newRef(source, "field_assign_value");
                     try self.set(source, value_ref, stableResultSource(value));
                     const slot = try self.compileMemberBinary(source, binary.left.binary, .lvalue);
+                    // The lvalue may not resolve to a slot — e.g. in a generic
+                    // template body where the object's type is still an unbound type
+                    // variable (`out.x` where `out: T`). That body never runs (each
+                    // real call monomorphizes), so skip the write rather than deref a
+                    // non-location result.
+                    if (slot.source != .location) return .from(value_ref.dereference().typed(value.typeExpr()));
                     try self.set(source, slot.source.location, .from(value_ref.dereference()));
                     return .from(value_ref.dereference().typed(value.typeExpr()));
                 }

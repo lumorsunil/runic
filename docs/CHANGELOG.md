@@ -40,6 +40,13 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   A non-comptime name is a compile error (it can't resolve to a static field), and
   an unknown field name is reported like any other bad member access. This extends
   Runic's comptime story from generating *types* to generating *implementations*.
+  `@field` is also an **assignable place** — `@field(value)(name) = v` writes the
+  named field (obeying mutability, like `value.field = v`), so an unrolled loop can
+  *set* each field, not only read it. Reading `@field` now also works outside a
+  comptime `for (@fields)` loop in a generic body (a `T`-typed value's layout
+  resolves per specialization; the unspecialized template no longer mis-reports).
+  (Returning a whole struct *value* from a `comptime T: type` function is subject to
+  a separate, pre-existing generic-struct-return limitation.)
 - **`@insert "…"` — compile-time struct field generation.** In a struct body,
   `@insert` re-parses a string as a `name: Type[, …]` field list and grafts the
   fields in — the Jai/Mox "generate the source, re-parse it" model of building a

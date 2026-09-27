@@ -786,9 +786,25 @@ fn String show(comptime T: type, x: T) String {
 }
 ```
 
+`@field` is also an **assignable place**: `@field(value)(name) = v` writes the
+named field (it lowers to `value.<name> = v`), so an unrolled loop can *set* each
+field, not only read it — e.g. a generic "reset" or field-wise transform:
+
+```rn
+var g: Vec = Vec{ .x = 1, .y = 2, .z = 3 }
+for (@fields(Vec)) |f| @field(g)(f.name) = 0     # zero every field
+```
+
 The `name` must be compile-time known — a runtime string is a compile error, and
-an unknown field name is reported like any other bad member access. (Reading a
-field's value; assigning through `@field` is not supported yet.)
+an unknown field name is reported like any other bad member access. Assigning
+through `@field` obeys mutability: the target must be a `var` (or a field of one),
+exactly like `value.field = v`.
+
+> Note: returning a whole struct *value* from a `comptime T: type` function
+> (`fn f(comptime T: type, v: T) T { … yield out }`) is subject to a separate,
+> pre-existing limitation in generic struct returns; until that is fixed, build
+> and mutate structs with `@field` at a concrete (non-generic) call site or top
+> level, or have the generic function yield a non-struct result.
 
 ### Generic types as comptime functions
 

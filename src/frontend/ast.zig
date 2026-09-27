@@ -984,6 +984,11 @@ pub const Expression = union(enum) {
                 },
                 else => false,
             },
+            // `@field(value)(name)` is an assignable place — it lowers to the
+            // member slot `value.<name>`. (`@`-names can't be user identifiers, so
+            // a name check alone identifies the builtin.)
+            .call => |call| call.callee.* == .identifier and
+                std.mem.eql(u8, call.callee.identifier.name, "@field"),
             else => false,
         };
     }
