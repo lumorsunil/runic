@@ -767,6 +767,29 @@ fn Void dump(comptime T: type) Void {
 `for (@fields(f.type))` when a field is itself a struct. An empty struct iterates
 zero times.
 
+#### Accessing a field's value by a comptime name — `@field`
+
+`f.name`/`f.type` give a field's *metadata*; `@field(value)(name)` gives its
+**value** — the field named by the compile-time string `name`, read off the
+struct `value`. It lowers to an ordinary member access `value.<name>`, so once
+`name` folds (typically `f.name` inside an unrolled loop) it is a plain field
+read. This is the analog of Zig's `@field(x, name)`, and it is what turns a
+comptime-unrolled loop from *inspecting* a type into *generating an
+implementation* over its values:
+
+```rn
+# A generic key=value dump for any struct.
+fn String show(comptime T: type, x: T) String {
+  var out = ""
+  for (@fields(T)) |f| out = "${out}${f.name}=${@field(x)(f.name)} "
+  yield out
+}
+```
+
+The `name` must be compile-time known — a runtime string is a compile error, and
+an unknown field name is reported like any other bad member access. (Reading a
+field's value; assigning through `@field` is not supported yet.)
+
 ### Generic types as comptime functions
 
 A function whose parameters are `comptime` types and whose body `yield`s a type

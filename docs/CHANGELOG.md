@@ -23,6 +23,23 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Added
 
+- **`@field(value)(name)` — access a struct field by a compile-time name.** The
+  analog of Zig's `@field(x, name)`: `name` is a compile-time string (typically
+  `f.name` from an unrolled `for (@fields(T)) |f|`), and the access lowers to an
+  ordinary member read `value.<name>`. This is what lets a comptime-unrolled loop
+  touch each field's *value* — not just its `f.name`/`f.type` metadata — so
+  implementations can be generated at compile time (a serializer, a pretty-printer,
+  a comparison), the way Zig's `inline for` does:
+  ```runic
+  fn String show(comptime T: type, x: T) String {
+      var out = ""
+      for (@fields(T)) |f| out = "${out}${f.name}=${@field(x)(f.name)} "
+      yield out
+  }
+  ```
+  A non-comptime name is a compile error (it can't resolve to a static field), and
+  an unknown field name is reported like any other bad member access. This extends
+  Runic's comptime story from generating *types* to generating *implementations*.
 - **`@insert "…"` — compile-time struct field generation.** In a struct body,
   `@insert` re-parses a string as a `name: Type[, …]` field list and grafts the
   fields in — the Jai/Mox "generate the source, re-parse it" model of building a

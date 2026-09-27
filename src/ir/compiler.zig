@@ -4393,6 +4393,42 @@ pub const IRCompiler = struct {
         return binding.result.isFunctionRef();
     }
 
+    /// `@field(value, name)` — read the field named by the comptime string `name`
+    /// off the struct `value`, lowering to an ordinary member access
+    /// `value.<name>` once the name folds. See the dispatch in `compileCall`.
+    fn compileFieldBuiltin(self: *IRCompiler, source: *ast.Expression, call: ast.CallExpr) Error!Result {
+        if (call.arguments.len != 2) {
+            try self.reportSourceError(
+                source,
+                Error.UnsupportedExpression,
+                .@"error",
+                "@field expects two arguments: @field(value, name)",
+                .{},
+            );
+            return .fromValue(.void);
+        }
+        const raw = (try self.comptimeStringArg(call.arguments[1])) orelse {
+            // In an unspecialized generic template the name may not fold yet — the
+            // loop that binds it (`for (@fields(T)) |f|`) unrolls to nothing there,
+            // so this body is never really executed; emit a harmless placeholder.
+            if (self.generic_template_depth > 0) return .fromValue(.void);
+            try self.reportSourceError(
+                source,
+                Error.UnsupportedExpression,
+                .@"error",
+                "@field's name argument must be a compile-time string",
+                .{},
+            );
+            return .fromValue(.void);
+        };
+        const member: ast.MemberExpr = .{
+            .object = call.arguments[0],
+            .member = .{ .name = try self.allocator.dupe(u8, raw), .span = source.span() },
+            .span = source.span(),
+        };
+        return self.compileMember(source, member, .read);
+    }
+
     fn compileMember(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -5291,6 +5327,17 @@ pub const IRCompiler = struct {
                     try self.addInstruction(.init(.from(source), .{ .debug_log = msg }));
                 }
                 return .fromValue(.void);
+            }
+            // `@field(value, name)` — read the field named by the comptime string
+            // `name` off the struct `value`. The name folds at compile time
+            // (typically `f.name` from an unrolled `for (@fields(T)) |f|`), so this
+            // lowers to an ordinary member access `value.<name>`. This is what lets
+            // a comptime-unrolled loop touch each field's *value*, not just its
+            // metadata (the analog of Zig's `@field`).
+            if (std.mem.eql(u8, name, "@field") and
+                self.lookup(name, .{ .shallow = false }) == null)
+            {
+                return self.compileFieldBuiltin(source, call);
             }
             // Type-introspection builtins (`@kind`, `@elem`, `@child`,
             // `@fieldCount`, `@hasField`) fold to a compile-time constant.

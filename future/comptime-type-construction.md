@@ -33,10 +33,23 @@ expected type (`Partial(Rec(Int))`) off the expected-type stack, resolves it thr
 `Partial{ .zzz = 1 }` reports the unknown field, the missing field, and a wrong
 value type — resolving points 1 & 3 below for the annotation-driven case. The one
 residual gap is a **bare literal with no annotation** to name the instantiation,
-which still falls back to the permissive ctor-body check. **Next:** increment 3 —
-`@code` (AST as a first-class value). This note captures the approach (the
-Jai/Mox "code is text/AST" model, deliberately *not* Zig's `@Type`), the
-mechanism, and the open questions.
+which still falls back to the permissive ctor-body check.
+
+**Increment 3 — reframed from `@code` to *comptime statement generation*.** The
+original increment 3 was `@code` (AST as a first-class value). On review, the
+higher-value move is to let comptime *generate implementations*, not only types —
+Zig's `inline for` story. Runic already unrolls `for (@fields(T)) |f| { … }` in a
+function body (`compileComptimeFieldsForLoop`), so the missing primitive was
+value access by a comptime name. **Landed: `@field(value)(name)`** — the analog of
+Zig's `@field(x, name)`. `name` folds at compile time (usually `f.name` from the
+unrolled loop) and the call lowers to an ordinary member access `value.<name>`
+(reusing `compileMember`), so a comptime loop can now touch each field's *value*
+(serialize, compare, print), not just its metadata. Read-only for now (no
+`@field(x)(name) = v` lvalue). `@code`/`Code` (quote a block and splice/reuse it —
+Jai's macro-lite "bucket 1") remains genuinely useful but is a *separate, larger*
+feature (needs statement-position insertion + hygiene rules) to be scoped on its
+own merits later. This note captures the approach (the Jai/Mox "code is text/AST"
+model, deliberately *not* Zig's `@Type`), the mechanism, and the open questions.
 
 ## Increment 2 — attempted, and what it actually requires (findings)
 

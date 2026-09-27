@@ -2864,8 +2864,12 @@ pub const TypeChecker = struct {
         // A bare command (an identifier callee with no scope binding — `echo`,
         // `ls`, …) serializes each argument to a string, so a whole struct has
         // no valid form. User functions (which have a binding) and module calls
-        // (member callees) may legitimately take struct arguments.
-        const is_command = call.callee.* == .identifier and scope.lookup(call.callee.identifier.name) == null;
+        // (member callees) may legitimately take struct arguments. `@`-builtins
+        // (`@field(x)(name)`, `@fields(T)`, …) are not commands and take types /
+        // struct values by design, so they are exempt.
+        const is_command = call.callee.* == .identifier and
+            scope.lookup(call.callee.identifier.name) == null and
+            !(call.callee.identifier.name.len > 0 and call.callee.identifier.name[0] == '@');
         if (is_command) {
             for (call.arguments) |arg| {
                 // A struct-typed argument, or a generic struct literal (`Box{ … }`)

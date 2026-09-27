@@ -1,0 +1,7 @@
+# `@field(value)(name)` requires `name` to be a *compile-time* string (it lowers to
+# a static member access `value.<name>`). A runtime variable as the name can't be
+# resolved at compile time, so it is a compile error rather than a runtime lookup.
+fn Point(comptime E: type) type { yield struct { x: E, y: E } }
+const p: Point(Int) = Point{ .x = 1, .y = 2 }
+var name = "x"
+echo "${@field(p)(name)}"
