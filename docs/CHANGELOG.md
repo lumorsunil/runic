@@ -23,21 +23,25 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Added
 
-- **`@insert "…"` — compile-time struct field generation (first increment).** In
-  a struct body, `@insert` re-parses a static string as a `name: Type[, …]` field
-  list and grafts the fields in — the Jai/Mox "generate the source, re-parse it"
-  model of building a type, rather than a `@Type`-style structured builtin. The
-  generated field types may name the enclosing type's parameters, resolved by the
-  usual generic substitution:
+- **`@insert "…"` — compile-time struct field generation.** In a struct body,
+  `@insert` re-parses a string as a `name: Type[, …]` field list and grafts the
+  fields in — the Jai/Mox "generate the source, re-parse it" model of building a
+  type, rather than a `@Type`-style structured builtin. The string may be static
+  or interpolated (`${T}`), and a comptime `for (@fields(T)) |f| @insert "…"`
+  derives a struct's shape from another type's fields, one field per iteration —
+  so you can write "mapped types" like a partial (every field of `T`, optional):
   ```runic
-  fn Wrap(comptime T: type) type {
-      yield struct { @insert "value: T"  tag: String }
+  fn Partial(comptime T: type) type {
+      yield struct { for (@fields(T)) |f| @insert "${f.name}: ?${f.type}" }
   }
-  const w: Wrap(Int) = Wrap{ .value = 42, .tag = "n" }
+  const p: Partial(Point) = Partial{ .x = 1, .y = 2 }   // struct { x: ?Int, y: ?Int }
   ```
-  Inserted fields sit alongside ordinary ones. This increment takes a *static*
-  string; interpolation/loop-built strings and `@code` (AST as a value) are the
-  next increments — see `future/comptime-type-construction.md`.
+  Inserted fields sit alongside ordinary ones (order preserved). The recipe is
+  materialized per instantiation by the compiler (folding `${…}`/`@fields`,
+  re-parsing the field list); the type checker validates such a struct
+  permissively (its fields aren't known statically), so field-existence checking
+  on a generated struct is deferred to the compiler. `@code` (AST as a first-class
+  value) is a later increment — see `future/comptime-type-construction.md`.
 - **`@log msg` — a debug print to the real stdout.** Writes its (rendered,
   interpolated) argument, newline-terminated, straight to the process's stdout,
   bypassing the current function's stdout pipe. Inside a function whose result is

@@ -11,12 +11,18 @@ Status: **increment 1 landed** (`comptime-functions` branch) — `@insert "…"`
 struct body re-parses a *static* string as a field list and grafts the fields
 (parser re-entry). The generated field types may name the enclosing type's
 parameters (`@insert "value: T"`), resolved by the existing generic substitution,
-so no type-checker/compiler materialization was needed. **Increment 2 attempted
-(reverted):** comptime `for … @insert` inside a struct body — the parser/AST and a
-compiler-side materializer worked, but full support needs materialization at four
-resolution points across both stages (see *findings* below), so it was reverted to
-keep the tree green pending a proper shared-materializer implementation.
-Increment 3 — `@code` (AST as a first-class value). This note captures the approach (the
+so no type-checker/compiler materialization was needed. **Increment 2 landed:**
+dynamic `@insert "${…}"` and comptime `for (@fields(T)) |f| @insert "…"` inside a
+struct body. The compiler materializes the recipe at instantiation — folding the
+operand with `comptimeMessage`, resolving `@fields(T)` via `resolveComptimeType`,
+re-parsing via a compiler-lifetime sub-parser — reached from both `resolveType­
+Application` (member access, annotations) and struct construction (which pulls the
+type args from the binding's annotation). The type checker validates a recipe
+struct *permissively* (it has no comptime string folder), so field-existence
+checking on a generated struct is deferred to the compiler — the one accepted
+lag. **Next:** increment 3 — `@code` (AST as a first-class value); and, if wanted,
+full static field-checking (a shared folder/materializer the type checker can call
+too — see *findings*). This note captures the approach (the
 Jai/Mox "code is text/AST" model, deliberately *not* Zig's `@Type`), the
 mechanism, and the open questions.
 

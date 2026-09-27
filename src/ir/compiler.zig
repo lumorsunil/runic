@@ -9,6 +9,7 @@ const DocumentStore = @import("../document_store.zig").DocumentStore;
 const Stream = @import("../stream.zig").Stream;
 const RCError = @import("../mem/rc.zig").RCError;
 const FrontendDocumentStore = @import("../frontend/document_store.zig").FrontendDocumentStore;
+const Parser = @import("../frontend/parser.zig").Parser;
 const resolveModulePath = @import("../frontend/document_store.zig").resolveModulePath;
 const CType = @import("../ffi/ctype.zig").CType;
 const CSig = @import("../ffi/ctype.zig").CSig;
@@ -607,6 +608,10 @@ pub const IRCompiler = struct {
     /// `compileStructLiteral` can build a struct value with the right layout.
     user_struct_types: std.StringHashMapUnmanaged(ast.TypeExpr.StructType) = .empty,
     document_store: *DocumentStore,
+    /// Lazily-created parser used to re-parse a folded `@insert` string into
+    /// struct fields at instantiation. Kept for the compiler's lifetime because
+    /// the parsed field ASTs live in its arena.
+    insert_parser: ?Parser = null,
     logging_enabled: bool,
     diagnostics: std.ArrayList(Diagnostic) = .empty,
     result_counter: usize = 0,
@@ -2107,6 +2112,20 @@ pub const IRCompiler = struct {
                 return .fromValue(.void);
             },
             .identifier => |identifier| {
+                // Constructing a struct whose type is built by an `@insert` recipe
+                // (`const p: Partial(T) = Partial{ … }`): the bare `Partial{…}` has
+                // no fields on its own, so materialize the layout from the binding's
+                // annotation (which carries the type args) and construct against it.
+                if (annotation) |ann| construct: {
+                    if (expr.* != .struct_literal or ann.* != .type_application) break :construct;
+                    const raw = self.user_struct_types.get(expr.struct_literal.name.name) orelse break :construct;
+                    if (raw.body_items.len == 0) break :construct;
+                    const materialized = self.resolveTypeApplication(ann.type_application) orelse break :construct;
+                    if (materialized != .struct_type) break :construct;
+                    const result = try self.compileStructValueLiteral(expr, materialized.struct_type, expr.struct_literal);
+                    try self.compileIdentifierBinding(source, identifier, result.source, annotation, is_mutable, .normal);
+                    return .fromValue(.void);
+                }
                 var result = try self.compileExpressionWithCapture(source, expr);
                 // A command bound where an error union is expected becomes
                 // `ExecutableError!String`: exit 0 → output, else an error.
@@ -6677,7 +6696,93 @@ pub const IRCompiler = struct {
         }
         const body_st = self.user_struct_types.get(name) orelse return null;
         const params = self.generic_ctor_params.get(name) orelse &[_]ast.Identifier{};
-        return self.substituteTypeParams(.{ .struct_type = body_st }, params, app.args) catch null;
+        const substituted = self.substituteTypeParams(.{ .struct_type = body_st }, params, app.args) catch return null;
+        if (substituted == .struct_type and substituted.struct_type.body_items.len > 0) {
+            const fields = self.materializeStructRecipe(substituted.struct_type, params, app.args) catch |err| {
+                self.log("@insert materialization failed: {}", .{err}) catch {};
+                return substituted;
+            };
+            var st = substituted.struct_type;
+            st.fields = fields;
+            st.body_items = &.{};
+            return .{ .struct_type = st };
+        }
+        return substituted;
+    }
+
+    /// Expands a struct body recipe (`@insert` / comptime `for … @insert`) to a
+    /// concrete field list, with the constructor's type parameters bound to `args`
+    /// (so `${T}`, `@fields(T)`, `f.name`/`f.type` fold). Runs at instantiation.
+    fn materializeStructRecipe(
+        self: *IRCompiler,
+        st: ast.TypeExpr.StructType,
+        params: []const ast.Identifier,
+        args: []const *const ast.TypeExpr,
+    ) Error![]const ast.TypeExpr.StructField {
+        var saved = std.ArrayList(?ast.TypeExpr).empty;
+        defer saved.deinit(self.allocator);
+        for (params, 0..) |param, i| {
+            try saved.append(self.allocator, self.type_captures.get(param.name));
+            if (i < args.len) try self.type_captures.put(self.allocator, param.name, args[i].*);
+        }
+        defer for (params, saved.items) |param, prior| {
+            if (prior) |p| self.type_captures.put(self.allocator, param.name, p) catch {} else _ = self.type_captures.remove(param.name);
+        };
+
+        var fields = std.ArrayList(ast.TypeExpr.StructField).empty;
+        defer fields.deinit(self.allocator);
+
+        for (st.body_items) |item| switch (item) {
+            .field => |f| {
+                const ft = try self.allocator.create(ast.TypeExpr);
+                ft.* = try self.substituteTypeParams(f.type_expr.*, params, args);
+                try fields.append(self.allocator, .{ .name = f.name, .type_expr = ft, .span = f.span });
+            },
+            .insert => |operand| try self.expandInsert(&fields, operand, params, args),
+            .for_insert => |fi| {
+                const arg = comptimeFieldsArg(fi.source) orelse return Error.UnsupportedExpression;
+                const resolved = (try self.resolveComptimeType(arg)) orelse return fields.toOwnedSlice(self.allocator);
+                const src_st = comptimeStructOf(resolved) orelse return Error.UnsupportedExpression;
+                const var_name = fi.var_name.name;
+                for (src_st.fields) |field| {
+                    const had_prev = self.comptime_field_vars.contains(var_name);
+                    const prev = if (had_prev) self.comptime_field_vars.get(var_name) else null;
+                    try self.comptime_field_vars.put(self.allocator, var_name, field);
+                    try self.expandInsert(&fields, fi.operand, params, args);
+                    if (prev) |p| self.comptime_field_vars.put(self.allocator, var_name, p) catch {} else _ = self.comptime_field_vars.remove(var_name);
+                }
+            },
+        };
+
+        return fields.toOwnedSlice(self.allocator);
+    }
+
+    /// Folds one `@insert` operand to a string (via `comptimeMessage`), re-parses
+    /// it as a field list, and appends the fields (types substituted so a literal
+    /// type parameter in the generated text also resolves).
+    fn expandInsert(
+        self: *IRCompiler,
+        fields: *std.ArrayList(ast.TypeExpr.StructField),
+        operand: *const ast.Expression,
+        params: []const ast.Identifier,
+        args: []const *const ast.TypeExpr,
+    ) Error!void {
+        const text = (try self.comptimeMessage(@constCast(operand))) orelse return Error.UnsupportedExpression;
+        const parsed = try self.reparseInsertFields(text);
+        for (parsed) |pf| {
+            const ft = try self.allocator.create(ast.TypeExpr);
+            ft.* = try self.substituteTypeParams(pf.type_expr.*, params, args);
+            try fields.append(self.allocator, .{ .name = pf.name, .type_expr = ft, .span = pf.span });
+        }
+    }
+
+    /// Re-parses a folded `@insert` string as a field list, using a lazily-created,
+    /// compiler-lifetime parser (the field ASTs live in its arena).
+    fn reparseInsertFields(self: *IRCompiler, text: []const u8) Error![]const ast.TypeExpr.StructField {
+        if (self.insert_parser == null) {
+            self.insert_parser = Parser.init(self.io, self.allocator, self.env_map, self.document_store);
+        }
+        return self.insert_parser.?.reparseFieldString(text) catch return Error.UnsupportedExpression;
     }
 
     /// The concrete return type of a call to a generic function, obtained by

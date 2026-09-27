@@ -3969,57 +3969,130 @@ pub const Parser = struct {
         const ahead = try self.peekSlice(2);
         const is_named = (ahead.len >= 1 and ahead[0].tag == .r_brace) or
             (ahead.len >= 2 and ahead[0].tag == .identifier and ahead[1].tag == .colon) or
-            (ahead.len >= 1 and isInsertToken(ahead[0]));
+            (ahead.len >= 1 and (isInsertToken(ahead[0]) or ahead[0].tag == .kw_for));
         if (!is_named) return self.parseTupleTypeBody(start);
 
-        var fields = std.ArrayList(ast.TypeExpr.StructField).empty;
-        defer fields.deinit(self.allocator);
+        // Parse the body as an ordered item list — ordinary fields interleaved
+        // with `@insert` / comptime `for … @insert` generators (order preserved).
+        var items = std.ArrayList(ast.TypeExpr.StructBodyItem).empty;
+        defer items.deinit(self.allocator);
 
         while (true) {
             self.skipNewlines();
             const next = try self.peekToken();
             if (next.tag == .r_brace) break;
 
-            // `@insert "<field decls>"` — a compile-time code insertion in field
-            // position: the string is re-parsed as a field list and grafted in.
-            // (Increment 1: a static string literal only; the generated fields may
-            // reference the enclosing type's parameters by name, which the normal
-            // generic substitution then resolves. Interpolation/loops come later.)
             if (isInsertToken(next)) {
                 _ = try self.nextToken();
-                try self.parseInsertedFields(&fields);
-                self.skipNewlines();
-                const delimiter = try self.peekToken();
-                if (delimiter.tag == .comma) _ = try self.nextToken();
-                continue;
+                try self.parseInsertItem(&items);
+            } else if (next.tag == .kw_for) {
+                try self.parseForInsertItem(&items);
+            } else {
+                const name = try self.parseIdentifier();
+                _ = try self.expectTokenTag(.colon);
+                const field_type = try self.parseTypeExpr();
+                try items.append(self.allocator, .{ .field = .{
+                    .name = name,
+                    .type_expr = field_type,
+                    .span = name.span.endAt(field_type.span()),
+                } });
             }
-
-            const name = try self.parseIdentifier();
-            _ = try self.expectTokenTag(.colon);
-            const field_type = try self.parseTypeExpr();
-
-            try fields.append(self.allocator, .{
-                .name = name,
-                .type_expr = field_type,
-                .span = name.span.endAt(field_type.span()),
-            });
 
             self.skipNewlines();
             const delimiter = try self.peekToken();
-            if (delimiter.tag == .comma) {
-                _ = try self.nextToken();
-            }
+            if (delimiter.tag == .comma) _ = try self.nextToken();
         }
 
         const close = try self.expectTokenTag(.r_brace);
+        return self.finishStructType(items.items, start.span.endAt(close.span));
+    }
 
-        return self.allocTypeExpression(.{
-            .struct_type = .{
+    /// Builds the struct `TypeExpr` from a parsed body item list. With no
+    /// generators (every item a plain field), flatten to a `fields` slice. With an
+    /// `@insert`/`for … @insert`, keep the ordered recipe in `body_items` for
+    /// instantiation-time materialization (`fields` empty until then).
+    fn finishStructType(self: *Self, items: []const ast.TypeExpr.StructBodyItem, span: ast.Span) Error!*const ast.TypeExpr {
+        var has_generator = false;
+        for (items) |item| if (item != .field) {
+            has_generator = true;
+            break;
+        };
+        if (!has_generator) {
+            var fields = std.ArrayList(ast.TypeExpr.StructField).empty;
+            defer fields.deinit(self.allocator);
+            for (items) |item| try fields.append(self.allocator, item.field);
+            return self.allocTypeExpression(.{ .struct_type = .{
                 .fields = try self.copyToArena(ast.TypeExpr.StructField, fields.items),
                 .decls = &.{},
-                .span = start.span.endAt(close.span),
-            },
-        });
+                .span = span,
+            } });
+        }
+        return self.allocTypeExpression(.{ .struct_type = .{
+            .fields = &.{},
+            .decls = &.{},
+            .body_items = try self.copyToArena(ast.TypeExpr.StructBodyItem, items),
+            .span = span,
+        } });
+    }
+
+    /// Parses the operand of an `@insert` (the `@insert` token consumed). A static
+    /// string literal is re-parsed into fields immediately (increment 1); a dynamic
+    /// operand (interpolated literal / other expression) becomes an `.insert`
+    /// recipe item folded at instantiation.
+    fn parseInsertItem(self: *Self, items: *std.ArrayList(ast.TypeExpr.StructBodyItem)) Error!void {
+        const next = try self.peekToken();
+        if (next.tag == .string_start) {
+            const literal = try self.parseStringLiteral();
+            var static = true;
+            for (literal.segments) |segment| if (segment == .interpolation) {
+                static = false;
+                break;
+            };
+            if (static) {
+                var text = std.ArrayList(u8).empty;
+                defer text.deinit(self.allocator);
+                for (literal.segments) |segment| switch (segment) {
+                    .text => |t| try text.appendSlice(self.allocator, t.payload),
+                    .interpolation => unreachable,
+                };
+                const fields = try self.reparseFieldString(text.items);
+                for (fields) |f| try items.append(self.allocator, .{ .field = f });
+                return;
+            }
+            const operand = try self.allocExpression(.{ .literal = .{ .string = literal } });
+            try items.append(self.allocator, .{ .insert = operand });
+            return;
+        }
+        const operand = try self.parseExpression();
+        try items.append(self.allocator, .{ .insert = operand });
+    }
+
+    /// Parses `for (<source>) |<var>| @insert <operand>` in struct-field position.
+    fn parseForInsertItem(self: *Self, items: *std.ArrayList(ast.TypeExpr.StructBodyItem)) Error!void {
+        const for_tok = try self.expect(.kw_for);
+        _ = try self.expect(.l_paren);
+        const source = try self.parseForSource();
+        _ = try self.expect(.r_paren);
+        const capture = try self.parseCaptureClause();
+        if (capture.bindings.len != 1 or capture.bindings[0].* != .identifier) {
+            try self.reportParseError(Error.UnexpectedToken, capture.span, "a `for … @insert` in a struct body takes exactly one capture, e.g. `for (@fields(T)) |f| @insert \"…\"`", .{});
+            return Error.UnexpectedToken;
+        }
+        const var_name = capture.bindings[0].identifier;
+        self.skipNewlines();
+        const insert_tok = try self.peekToken();
+        if (!isInsertToken(insert_tok)) {
+            try self.reportParseError(Error.UnexpectedToken, insert_tok.span, "a `for` in a struct body must have an `@insert` body: `for (…) |f| @insert \"…\"`", .{});
+            return Error.UnexpectedToken;
+        }
+        _ = try self.nextToken(); // @insert
+        const operand = try self.parseExpression();
+        try items.append(self.allocator, .{ .for_insert = .{
+            .var_name = var_name,
+            .source = source,
+            .operand = operand,
+            .span = for_tok.span.endAt(operand.span()),
+        } });
     }
 
     /// Whether `tok` is the `@insert` compile-time code-insertion directive.
@@ -4027,36 +4100,13 @@ pub const Parser = struct {
         return tok.tag == .identifier and std.mem.eql(u8, tok.lexeme, "@insert");
     }
 
-    /// Parses an `@insert "<field decls>"` directive in struct-field position and
-    /// appends the generated fields to `fields`. The operand is a static string
-    /// literal; its contents are re-lexed and parsed as a `name: Type[, …]` field
-    /// list (parser re-entry on a fresh stream), so a metaprogram can compute a
-    /// struct's shape as text. The generated field types may name the enclosing
-    /// type's parameters (`@insert "value: T"`), which the usual generic
-    /// substitution resolves at instantiation. Interpolation (`${…}`) and loops
-    /// are deferred to a later increment.
-    fn parseInsertedFields(self: *Self, fields: *std.ArrayList(ast.TypeExpr.StructField)) Error!void {
-        const literal = try self.parseStringLiteral();
-        // Static string only, for now: reject interpolation with a directed error.
-        var text = std.ArrayList(u8).empty;
-        defer text.deinit(self.allocator);
-        for (literal.segments) |segment| switch (segment) {
-            .text => |t| try text.appendSlice(self.allocator, t.payload),
-            .interpolation => {
-                try self.reportParseError(
-                    Error.UnexpectedToken,
-                    literal.span,
-                    "@insert with string interpolation is not supported yet; use a static field list (the field types may name type parameters, e.g. `@insert \"value: T\"`)",
-                    .{},
-                );
-                return Error.UnexpectedToken;
-            },
-        };
-
-        // Re-enter the parser on the inserted text with a fresh stream, then
-        // restore the outer stream. The generated source is field declarations
-        // with no surrounding braces, so parse until end-of-stream.
-        const insert_source = try self.arena.allocator().dupe(u8, text.items);
+    /// Re-lexes and parses `text` as a `name: Type[, …]` field list on a fresh
+    /// stream (parser re-entry), returning the fields; the outer stream is saved
+    /// and restored. Public so instantiation-time materialization (the IR
+    /// compiler) can re-parse a folded `@insert` string; the returned fields live
+    /// in this parser's arena, so the caller must keep the parser alive.
+    pub fn reparseFieldString(self: *Self, text: []const u8) Error![]const ast.TypeExpr.StructField {
+        const insert_source = try self.arena.allocator().dupe(u8, text);
         const saved_stream = self.stream;
         const saved_source = self.source;
         self.stream = try .init(
@@ -4069,6 +4119,8 @@ pub const Parser = struct {
         errdefer self.stream = saved_stream;
         self.source = insert_source;
 
+        var fields = std.ArrayList(ast.TypeExpr.StructField).empty;
+        defer fields.deinit(self.allocator);
         while (true) {
             self.skipNewlines();
             const next = try self.peekToken();
@@ -4088,6 +4140,7 @@ pub const Parser = struct {
 
         self.stream = saved_stream;
         self.source = saved_source;
+        return self.copyToArena(ast.TypeExpr.StructField, fields.items);
     }
 
     /// Parses the positional body of a tuple type — `struct { T0, T1, … }` (the

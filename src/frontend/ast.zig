@@ -392,6 +392,10 @@ pub const TypeExpr = union(enum) {
         fields: []const StructField,
         decls: []const StructDecl,
         span: Span,
+        /// Ordered compile-time recipe (`@insert` / comptime `for … @insert`).
+        /// Empty for an ordinary struct (fields in `fields`); non-empty only inside
+        /// a comptime type function, expanded to `fields` at instantiation.
+        body_items: []const StructBodyItem = &.{},
         /// When true, every field occupies exactly one slot — a struct-typed
         /// field holds an *address* to its sub-struct rather than being inlined.
         /// Used for the dynamically-built module result struct, whose pub-export
@@ -474,6 +478,28 @@ pub const TypeExpr = union(enum) {
         pub fn format(_: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
             try writer.writeAll("<struct_field>");
         }
+    };
+
+    /// One item in a struct body that still needs compile-time expansion — an
+    /// `@insert` or a comptime `for … @insert`, interleaved with ordinary fields
+    /// so source order is preserved. A struct with none of these has an empty
+    /// `body_items`; one with a generator carries the ordered recipe here, which
+    /// the compiler expands to concrete fields at instantiation.
+    pub const StructBodyItem = union(enum) {
+        field: StructField,
+        /// `@insert <operand>` — `operand` (a string literal) folds to a comptime
+        /// string, re-parsed as a `name: Type[, …]` field list.
+        insert: *const Expression,
+        /// `for (<source>) |<var>| @insert <operand>` — unroll over a comptime
+        /// source (`@fields(T)`), binding `<var>` per element.
+        for_insert: ForInsert,
+
+        pub const ForInsert = struct {
+            var_name: Identifier,
+            source: *const Expression,
+            operand: *const Expression,
+            span: Span,
+        };
     };
 
     pub const StructDecl = struct {

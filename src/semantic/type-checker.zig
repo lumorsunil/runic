@@ -4453,6 +4453,9 @@ pub const TypeChecker = struct {
         try self.logTypeCheckTrace(@src().fn_name, identifier.span);
 
         if (struct_type.memberType(identifier.name) != null) return;
+        // An unexpanded `@insert` recipe struct has no resolved fields yet — accept
+        // any member permissively; the IR compiler resolves the real layout.
+        if (struct_type.body_items.len > 0) return;
 
         return error.MemberNotFound;
     }
@@ -5076,6 +5079,14 @@ pub const TypeChecker = struct {
         struct_type: ast.TypeExpr.StructType,
         struct_literal: *ast.StructLiteral,
     ) Error!void {
+        // A struct carrying an unexpanded `@insert`/`for … @insert` recipe has no
+        // resolved fields yet — the IR compiler materializes them per instantiation.
+        // The type checker can't fold the recipe, so it validates permissively:
+        // check each value expression, but not against field names/count.
+        if (struct_type.body_items.len > 0) {
+            for (struct_literal.fields) |field| try self.runExpression(scope, field.value);
+            return;
+        }
         for (struct_literal.fields, 0..) |field, i| {
             // Duplicate field.
             for (struct_literal.fields[0..i]) |prev| {

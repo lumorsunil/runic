@@ -1,0 +1,31 @@
+# `@insert` with a dynamic (interpolated) string, and a comptime
+# `for (@fields(T)) |f| @insert "…"` that derives one struct's shape from another
+# type's fields — the Jai/Mox "generate the source, re-parse it" model. The recipe
+# is materialized per instantiation by the compiler (folding `${T}`/`${f.name}`/
+# `${f.type}`, re-parsing the field list); construction and member access resolve
+# the materialized layout via the binding's type argument.
+
+fn Maybe(comptime T: type) type { yield struct { x: ?T } }
+
+# A single interpolated insert: the field type follows the type argument.
+fn Wrap(comptime T: type) type { yield struct { @insert "value: ${T}" } }
+const w: Wrap(Int) = Wrap{ .value = 42 }
+echo "wrap: ${w.value}"
+
+# A "partial" — every field of T, made optional — derived by looping its fields.
+fn Rec(comptime T: type) type { yield struct { a: T, b: T, c: T } }
+fn Partial(comptime T: type) type {
+  yield struct { for (@fields(T)) |f| @insert "${f.name}: ?${f.type}" }
+}
+const p: Partial(Rec(Int)) = Partial{ .a = 1, .b = 2, .c = 3 }
+echo "partial: ${p.a orelse -1} ${p.b orelse -1} ${p.c orelse -1}"
+
+# An explicit field alongside a generated one (order preserved).
+fn Tagged(comptime T: type) type {
+  yield struct {
+    tag: String
+    for (@fields(T)) |f| @insert "${f.name}: ${f.type}"
+  }
+}
+const t: Tagged(Rec(Int)) = Tagged{ .tag = "r", .a = 7, .b = 8, .c = 9 }
+echo "tagged: ${t.tag} ${t.a} ${t.b} ${t.c}"

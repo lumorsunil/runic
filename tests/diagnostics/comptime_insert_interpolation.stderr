@@ -1,8 +1,0 @@
-[error]: tests/diagnostics/comptime_insert_interpolation.rn:3:57: @insert with string interpolation is not supported yet; use a static field list (the field types may name type parameters, e.g. `@insert "value: T"`)
-   1:# `@insert` currently takes a static string only. Interpolation (`${…}`) inside
-   2:# the inserted field list is not supported yet and reports a directed error.
-   3:fn Wrap(comptime T: type) type { yield struct { @insert "value: ${T}" } }
-   4:const w: Wrap(Int) = Wrap{ .value = 1 }
-   5:echo "${w.value}"
-   6:
-

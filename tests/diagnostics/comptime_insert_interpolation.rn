@@ -1,5 +1,0 @@
-# `@insert` currently takes a static string only. Interpolation (`${…}`) inside
-# the inserted field list is not supported yet and reports a directed error.
-fn Wrap(comptime T: type) type { yield struct { @insert "value: ${T}" } }
-const w: Wrap(Int) = Wrap{ .value = 1 }
-echo "${w.value}"
