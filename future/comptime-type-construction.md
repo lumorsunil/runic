@@ -11,12 +11,53 @@ Status: **increment 1 landed** (`comptime-functions` branch) — `@insert "…"`
 struct body re-parses a *static* string as a field list and grafts the fields
 (parser re-entry). The generated field types may name the enclosing type's
 parameters (`@insert "value: T"`), resolved by the existing generic substitution,
-so no type-checker/compiler materialization was needed. **Next:** increment 2 —
-comptime control flow (`for`/`if`) *inside* a struct body, each iteration/arm
-calling `@insert`, so a struct's shape follows another type's fields; increment 3
-— `@code` (AST as a first-class value). This note captures the approach (the
+so no type-checker/compiler materialization was needed. **Increment 2 attempted
+(reverted):** comptime `for … @insert` inside a struct body — the parser/AST and a
+compiler-side materializer worked, but full support needs materialization at four
+resolution points across both stages (see *findings* below), so it was reverted to
+keep the tree green pending a proper shared-materializer implementation.
+Increment 3 — `@code` (AST as a first-class value). This note captures the approach (the
 Jai/Mox "code is text/AST" model, deliberately *not* Zig's `@Type`), the
 mechanism, and the open questions.
+
+## Increment 2 — attempted, and what it actually requires (findings)
+
+I built 2a (the ordered-recipe AST + parser for `for (@fields(T)) |f| @insert "…"`)
+and a working compiler-side materializer hooked into `resolveTypeApplication`
+(binds the type params, resolves `@fields(T)` to the argument struct's fields via
+the existing `resolveComptimeType`/`comptimeStructOf`, folds each `@insert`
+operand with the existing `comptimeMessage`, re-parses via a compiler-lifetime
+sub-parser — `Parser.reparseFieldString`, reachable because the compiler and
+parser share the same `DocumentStore` type). That much compiled.
+
+Then testing `Partial(Point(Int))` exposed that materialization at
+`resolveTypeApplication` alone is **not enough** — the feature needs the concrete
+fields at *four* points, and the two stages don't share them:
+
+1. **Type-checker, construction** (`runStructLiteral`, ~:5099) — `Partial{ .x = 1 }`
+   validates field names against the resolved struct, which is the *empty* recipe,
+   so it errors "struct has no field 'x'" before the compiler ever runs.
+2. **Type-checker, member access** — `p.x` needs `x` to exist on the type.
+3. **Compiler, construction** (`compileStructLiteral`, ~:3980) — resolves the field
+   layout from `user_struct_types[<bare name>]` (the raw recipe), *not* from the
+   binding's annotation type, so it doesn't reach `resolveTypeApplication`'s
+   materialization. A bare `Partial{…}` also carries no type args (they live on the
+   annotation), so construction must consult the expected/annotation type.
+4. **Compiler, member access** — `p.x` uses `p`'s annotated type, which *does* go
+   through `resolveTypeApplication` (materialized), so this one likely works.
+
+And the **type checker has no comptime string folder**: its `comptime_field_vars`
+is a name *set* (it only type-checks `f.name`/`f.type`, doesn't fold them to
+values), and its `@fields` loop doesn't unroll. So full static field-checking of a
+generated struct needs either a folder there or a shared materializer both stages
+call — plus caching so `Partial(Point(Int))` yields one identity across stages.
+
+**Recommended shape for the real implementation:** a single shared materializer
+(operating on `ast.TypeExpr` + a small stage context: resolve-type, type-name,
+parse-fields, param-bindings), memoized per `(ctor, args)`, invoked at every point
+that resolves a comptime-ctor application to its struct — annotation resolution,
+construction, and member access — in both stages. That is the clean version; the
+piecemeal `resolveTypeApplication`-only hook is not sufficient.
 
 ## Decisions (locked)
 
