@@ -12,11 +12,47 @@ struct body re-parses a *static* string as a field list and grafts the fields
 (parser re-entry). The generated field types may name the enclosing type's
 parameters (`@insert "value: T"`), resolved by the existing generic substitution,
 so no type-checker/compiler materialization was needed. **Next:** increment 2 —
-`@insert` of an interpolated / loop-built string, which needs instantiation-time
-comptime evaluation at both `substituteTypeParams` sites; increment 3 — `@code`
-(AST as a first-class value). This note captures the approach (the Jai/Mox "code
-is text/AST" model, deliberately *not* Zig's `@Type`), the mechanism, and the
-open questions.
+comptime control flow (`for`/`if`) *inside* a struct body, each iteration/arm
+calling `@insert`, so a struct's shape follows another type's fields; increment 3
+— `@code` (AST as a first-class value). This note captures the approach (the
+Jai/Mox "code is text/AST" model, deliberately *not* Zig's `@Type`), the
+mechanism, and the open questions.
+
+## Decisions (locked)
+
+- **`@insert` is `String → field(s)`, nothing more.** No `emit` keyword, no `+`
+  operator. All dynamism comes from ordinary comptime constructs feeding it a
+  string. The end-state spelling is a comptime `for` *inside* the struct body,
+  `@insert`-ing one field per iteration:
+  ```runic
+  fn Partial(comptime T: type) type {
+    yield struct {
+      for (@fields(T)) |f| @insert "${f.name}: ?${f.type}"
+    }
+  }
+  ```
+  This fits Runic's model better than accumulating a string before the `yield`:
+  `comptimeTypeCtor` extracts the *yielded* struct type and ignores preceding
+  statements, so putting the loop *inside* the struct keeps the generation logic
+  where materialization already looks.
+
+- **Comptime evaluation is a universal principle, not a struct feature.** Wherever
+  the inputs are comptime-known, evaluate at compile time and emit IR only for the
+  runtime remainder — everywhere, not just inside structs:
+  1. a comptime-known `if`/`match` predicate keeps only the taken arm; the untaken
+     arm emits *no* IR (this is already why an `@compileError` in a dead arm never
+     fires);
+  2. a loop over a comptime-known source (`@fields(T)`, a constant range, a
+     comptime array) is unrolled with the loop variable bound per iteration;
+  3. a taken/unrolled body that is itself pure-comptime is folded to a constant
+     rather than lowered to IR.
+  Rule 3 only erases *pure* work: a comptime-selected/unrolled body that still has
+  runtime effects (`echo`, a command, a runtime `yield`) still lowers to IR — we
+  prune the dead arm, unroll, and fold the pure parts, but real side effects
+  remain. Runic already does each of these per-construct (comptime `if`/`match`
+  pruning, `for (@fields)` unrolling, value/type folding); the goal is to make it
+  uniform so `@insert` rides the same fold path a function body uses and works
+  everywhere for free.
 
 ## The two models, and why we prefer the Jai/Mox one
 
