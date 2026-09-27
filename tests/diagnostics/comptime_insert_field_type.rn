@@ -1,0 +1,11 @@
+# The type checker materializes a `for (@fields(T)) |f| @insert "…"` recipe into
+# concrete fields with their *real* types, so a generated field's type is enforced
+# statically. Here `Partial(Rec(Int))` makes each field `?Int`, so binding `p.a`
+# (an `?Int`) to a `String` is a type error caught before the IR compiler runs.
+fn Rec(comptime T: type) type { yield struct { a: T, b: T } }
+fn Partial(comptime T: type) type {
+  yield struct { for (@fields(T)) |f| @insert "${f.name}: ?${f.type}" }
+}
+const p: Partial(Rec(Int)) = Partial{ .a = 1, .b = 2 }
+const s: String = p.a
+echo "${s}"

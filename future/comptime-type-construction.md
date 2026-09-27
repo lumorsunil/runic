@@ -17,12 +17,21 @@ struct body. The compiler materializes the recipe at instantiation — folding t
 operand with `comptimeMessage`, resolving `@fields(T)` via `resolveComptimeType`,
 re-parsing via a compiler-lifetime sub-parser — reached from both `resolveType­
 Application` (member access, annotations) and struct construction (which pulls the
-type args from the binding's annotation). The type checker validates a recipe
-struct *permissively* (it has no comptime string folder), so field-existence
-checking on a generated struct is deferred to the compiler — the one accepted
-lag. **Next:** increment 3 — `@code` (AST as a first-class value); and, if wanted,
-full static field-checking (a shared folder/materializer the type checker can call
-too — see *findings*). This note captures the approach (the
+type args from the binding's annotation). **Tightening landed:** the type checker
+now materializes a recipe at `resolveTypeApplication` too — it re-parses each
+`@insert` operand into concrete fields (folding `${f.name}` to the literal name and
+every type interpolation to a placeholder it substitutes back with the real
+`TypeExpr`, via its own checker-lifetime sub-parser). So an *annotation* type
+(`const p: Partial(Point)`) resolves to a struct with **real field types**: member
+access is typed precisely (`p.a orelse …` sees `?Int`; `const s: String = p.a` is a
+static error), not permissively. Recipes it can't fold statically — a dynamic field
+*name*, or an unresolvable `@fields(…)` source — stay permissive for the compiler.
+The remaining lag is **construction via a bare literal** (`Partial{…}`): the literal
+carries no type args (they live on the annotation), so points 1 & 3 below still need
+expected-type-driven materialization to catch a wrong field name at construction.
+**Next:** increment 3 — `@code` (AST as a first-class value); and, if wanted,
+full static field-checking at construction (a shared folder/materializer both stages
+call — see *findings*). This note captures the approach (the
 Jai/Mox "code is text/AST" model, deliberately *not* Zig's `@Type`), the
 mechanism, and the open questions.
 

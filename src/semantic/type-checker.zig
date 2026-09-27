@@ -3,6 +3,7 @@ const ast = @import("../frontend/ast.zig");
 const builtins = @import("../builtins.zig");
 const rainbow = @import("../rainbow.zig");
 const DocumentStore = @import("../document_store.zig").DocumentStore;
+const Parser = @import("../frontend/parser.zig").Parser;
 const token = @import("../frontend/token.zig");
 const CType = @import("../ffi/ctype.zig").CType;
 
@@ -48,6 +49,11 @@ pub const TypeChecker = struct {
     /// subject) and `f.name` a string. Saved/restored around each such loop.
     comptime_field_vars: std.StringHashMapUnmanaged(void) = .empty,
     env: ?*std.process.Environ.Map = null,
+    /// Lazily-created parser used to re-parse `@insert` operand strings into real
+    /// struct fields when materializing a recipe struct (mirrors the IR compiler's
+    /// `insert_parser`). Kept for the checker's lifetime so its arena outlives the
+    /// fields it produces.
+    insert_parser: ?Parser = null,
     /// Strict mode (`--strict`): also require handling of command failures
     /// (`ExecutableError`), which are otherwise exempt (bash-like exit-code
     /// model). A `set -e`-style opt-in — off by default.
@@ -1080,7 +1086,188 @@ pub const TypeChecker = struct {
         const resolved_args = try self.arena.allocator().alloc(*const ast.TypeExpr, app.args.len);
         for (app.args, resolved_args) |arg, *dst| dst.* = try self.resolveTypeExpr(scope, arg);
         const substituted = try self.substituteTypeParams(ctor.body, ctor.params, resolved_args);
+        // A comptime type constructor whose body uses `@insert` / `for … @insert`
+        // carries an unexpanded recipe. The type checker can't fold the operand
+        // strings to full types (no comptime string folder), but it can materialize
+        // the field *names* — so member access and (annotation-driven) construction
+        // catch typos statically; the field types stay permissive and the IR
+        // compiler resolves the real layout.
+        if (substituted.* == .struct_type and substituted.struct_type.body_items.len > 0) {
+            if (try self.materializeRecipeFields(scope, substituted.struct_type, ctor.params, resolved_args)) |fields| {
+                var st = substituted.struct_type;
+                st.fields = fields;
+                st.body_items = &.{};
+                return self.allocTypeExpression(.{ .struct_type = st });
+            }
+            // Couldn't statically resolve the recipe (e.g. a dynamic field *name*):
+            // keep it permissive and let the IR compiler materialize the layout.
+            return substituted;
+        }
         return self.resolveTypeExpr(scope, substituted);
+    }
+
+    /// Materializes a struct recipe (`@insert` / `for (@fields(T)) |f| @insert …`)
+    /// into concrete fields for static checking — the same layout the IR compiler
+    /// produces, so member access and (annotation-driven) construction catch typos
+    /// and get real field types. An explicit (`.field`) item keeps its substituted
+    /// type; a generated field's name and type come from folding the operand string
+    /// and re-parsing it. Returns null when the recipe can't be statically resolved
+    /// (a dynamic field *name*, an unresolvable `@fields(…)` source, or a malformed
+    /// operand) — the caller then keeps it permissive for the compiler to handle.
+    fn materializeRecipeFields(
+        self: *TypeChecker,
+        scope: *Scope,
+        st: ast.TypeExpr.StructType,
+        params: []const ast.Identifier,
+        args: []const *const ast.TypeExpr,
+    ) Error!?[]const ast.TypeExpr.StructField {
+        const gpa = self.arena.allocator();
+        var fields = std.ArrayList(ast.TypeExpr.StructField).empty;
+        defer fields.deinit(gpa);
+        for (st.body_items) |item| switch (item) {
+            .field => |f| {
+                const subbed = try self.substituteTypeParams(f.type_expr, params, args);
+                try fields.append(gpa, .{ .name = f.name, .type_expr = subbed, .span = f.span });
+            },
+            .insert => |operand| {
+                if (!try self.expandInsert(&fields, operand, null, params, args)) return null;
+            },
+            .for_insert => |fi| {
+                const arg = comptimeFieldsCallArg(fi.source) orelse return null;
+                // The `@fields(…)` argument is usually the constructor's own type
+                // parameter (`@fields(T)`), which maps to the bound argument here —
+                // not something resolvable in the use-site scope.
+                const arg_type = self.insertSourceType(scope, arg, params, args) orelse return null;
+                const src = self.unaliasType(arg_type);
+                if (src.* != .struct_type) return null;
+                for (src.struct_type.fields) |ff| {
+                    if (!try self.expandInsert(&fields, fi.operand, ff, params, args)) return null;
+                }
+            },
+        };
+        return try gpa.dupe(ast.TypeExpr.StructField, fields.items);
+    }
+
+    /// Resolves the argument of a recipe's `@fields(<arg>)` source: a bare
+    /// identifier matching a constructor type parameter maps to its bound argument
+    /// (`@fields(T)` → the concrete arg); anything else is resolved in `scope`.
+    fn insertSourceType(
+        self: *TypeChecker,
+        scope: *Scope,
+        arg: *const ast.Expression,
+        params: []const ast.Identifier,
+        args: []const *const ast.TypeExpr,
+    ) ?*const ast.TypeExpr {
+        const name: ?[]const u8 = switch (arg.*) {
+            .identifier => |id| id.name,
+            .call => |c| if (c.arguments.len == 0 and c.callee.* == .identifier) c.callee.identifier.name else null,
+            else => null,
+        };
+        if (name) |n| for (params, 0..) |param, i| {
+            if (i < args.len and std.mem.eql(u8, param.name, n)) return args[i];
+        };
+        return self.argToType(scope, arg) catch null orelse null;
+    }
+
+    /// Expands one `@insert` operand into concrete fields (appended to `fields`).
+    /// The operand string is folded into a re-parseable `name: Type[, …]` list:
+    /// `${f.name}` becomes the bound field's literal name, and every other
+    /// interpolation (`${T}`, `${f.type}`, …) a fresh placeholder type identifier
+    /// whose real type is recorded and substituted back after re-parsing — so the
+    /// generated fields carry their true types (`?Int` supports `orelse`, etc.).
+    /// Returns false when the recipe can't be resolved statically (no re-parser, a
+    /// malformed operand, or an interpolation landing in field-*name* position), so
+    /// the caller can keep the whole struct permissive.
+    fn expandInsert(
+        self: *TypeChecker,
+        fields: *std.ArrayList(ast.TypeExpr.StructField),
+        operand: *const ast.Expression,
+        field_var: ?ast.TypeExpr.StructField,
+        params: []const ast.Identifier,
+        args: []const *const ast.TypeExpr,
+    ) Error!bool {
+        if (operand.* != .literal or operand.literal != .string) return false;
+        const gpa = self.arena.allocator();
+
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(gpa);
+        var ph_params = std.ArrayList(ast.Identifier).empty;
+        defer ph_params.deinit(gpa);
+        var ph_args = std.ArrayList(*const ast.TypeExpr).empty;
+        defer ph_args.deinit(gpa);
+
+        for (operand.literal.string.segments) |segment| switch (segment) {
+            .text => |t| try buf.appendSlice(gpa, t.payload),
+            .interpolation => |ie| {
+                // `${f.name}` is the generated field's name — emit it as literal text.
+                if (field_var) |fv| {
+                    if (memberAccessParts(ie)) |ma| {
+                        if (std.mem.eql(u8, ma.member, "name")) {
+                            try buf.appendSlice(gpa, fv.name.name);
+                            continue;
+                        }
+                    }
+                }
+                // Anything else fills a type position: record its resolved type and
+                // emit a placeholder identifier to swap back in after re-parsing.
+                const ty = self.interpType(ie, field_var, params, args) orelse
+                    try self.allocTypeExpression(.{ .failed = .{ .span = operand.span() } });
+                const placeholder = try std.fmt.allocPrint(gpa, "__ins_{d}", .{ph_args.items.len});
+                try ph_params.append(gpa, .{ .name = placeholder, .span = operand.span() });
+                try ph_args.append(gpa, ty);
+                try buf.appendSlice(gpa, placeholder);
+            },
+        };
+
+        const raw = self.reparseInsertFields(buf.items) orelse return false;
+        for (raw) |rf| {
+            // A placeholder in *name* position means the field name itself was
+            // dynamic — we don't know the real shape, so bail to permissive.
+            if (std.mem.startsWith(u8, rf.name.name, "__ins_")) return false;
+            const resolved = try self.substituteTypeParams(rf.type_expr, ph_params.items, ph_args.items);
+            try fields.append(gpa, .{ .name = rf.name, .type_expr = resolved, .span = rf.span });
+        }
+        return true;
+    }
+
+    /// The type an `@insert` interpolation stands for: `${f.type}` → the bound
+    /// field's type; a bare `${T}` naming a constructor type parameter → its bound
+    /// argument. Null when it names neither (a dynamic type the checker can't fold).
+    fn interpType(
+        self: *TypeChecker,
+        ie: *ast.Expression,
+        field_var: ?ast.TypeExpr.StructField,
+        params: []const ast.Identifier,
+        args: []const *const ast.TypeExpr,
+    ) ?*const ast.TypeExpr {
+        _ = self;
+        if (memberAccessParts(ie)) |ma| {
+            if (field_var) |fv| if (std.mem.eql(u8, ma.member, "type")) return fv.type_expr;
+            return null;
+        }
+        const name: ?[]const u8 = switch (ie.*) {
+            .identifier => |id| id.name,
+            .call => |c| if (c.arguments.len == 0 and c.callee.* == .identifier)
+                c.callee.identifier.name
+            else
+                null,
+            else => null,
+        };
+        if (name) |n| for (params, 0..) |param, i| {
+            if (i < args.len and std.mem.eql(u8, param.name, n)) return args[i];
+        };
+        return null;
+    }
+
+    /// Re-parses a folded `@insert` field-list string into struct fields, using a
+    /// lazily-created checker-lifetime parser. Null when there's no environment to
+    /// build one or the string doesn't parse as a field list.
+    fn reparseInsertFields(self: *TypeChecker, text: []const u8) ?[]const ast.TypeExpr.StructField {
+        const env = self.env orelse return null;
+        if (self.insert_parser == null) {
+            self.insert_parser = Parser.init(self.io, self.arena.allocator(), env, self.document_store);
+        }
+        return self.insert_parser.?.reparseFieldString(text) catch null;
     }
 
     fn runTypeBindingDecl(
@@ -4226,6 +4413,9 @@ pub const TypeChecker = struct {
                     .{ .span = right_type.span() },
                 ),
                 .null => {},
+                // A type that failed to resolve already produced its own error;
+                // don't cascade an orelse mismatch on top of it.
+                .failed => {},
                 else => {
                     try self.reportSpanError(
                         binary.left.span(),

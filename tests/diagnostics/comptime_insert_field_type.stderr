@@ -1,0 +1,7 @@
+[error]: tests/diagnostics/comptime_insert_field_type.rn:10:19: expected type String, actual: ?Int
+   8:}
+   9:const p: Partial(Rec(Int)) = Partial{ .a = 1, .b = 2 }
+  10:const s: String = p.a
+  11:echo "${s}"
+  12:
+
