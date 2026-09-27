@@ -26,12 +26,15 @@ every type interpolation to a placeholder it substitutes back with the real
 access is typed precisely (`p.a orelse …` sees `?Int`; `const s: String = p.a` is a
 static error), not permissively. Recipes it can't fold statically — a dynamic field
 *name*, or an unresolvable `@fields(…)` source — stay permissive for the compiler.
-The remaining lag is **construction via a bare literal** (`Partial{…}`): the literal
-carries no type args (they live on the annotation), so points 1 & 3 below still need
-expected-type-driven materialization to catch a wrong field name at construction.
-**Next:** increment 3 — `@code` (AST as a first-class value); and, if wanted,
-full static field-checking at construction (a shared folder/materializer both stages
-call — see *findings*). This note captures the approach (the
+**Construction typos are now caught too:** a `Ctor{…}` literal validates against the
+concrete struct its *annotation* materializes — `runStructLiteral` pulls the
+expected type (`Partial(Rec(Int))`) off the expected-type stack, resolves it through
+`resolveTypeApplication` (real fields), and checks the literal against that. So
+`Partial{ .zzz = 1 }` reports the unknown field, the missing field, and a wrong
+value type — resolving points 1 & 3 below for the annotation-driven case. The one
+residual gap is a **bare literal with no annotation** to name the instantiation,
+which still falls back to the permissive ctor-body check. **Next:** increment 3 —
+`@code` (AST as a first-class value). This note captures the approach (the
 Jai/Mox "code is text/AST" model, deliberately *not* Zig's `@Type`), the
 mechanism, and the open questions.
 

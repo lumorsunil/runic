@@ -1,0 +1,10 @@
+# Construction against an `@insert` recipe struct is validated using the concrete
+# layout the *annotation* materializes (`Partial(Rec(Int))` → `struct { a: ?Int,
+# b: ?Int }`), so a misspelled field name at construction is caught statically:
+# `.zzz` isn't a field, and required `.b` is missing.
+fn Rec(comptime T: type) type { yield struct { a: T, b: T } }
+fn Partial(comptime T: type) type {
+  yield struct { for (@fields(T)) |f| @insert "${f.name}: ?${f.type}" }
+}
+const p: Partial(Rec(Int)) = Partial{ .a = 1, .zzz = 2 }
+echo "done"

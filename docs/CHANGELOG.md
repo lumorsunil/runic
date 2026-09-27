@@ -40,12 +40,16 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   materialized per instantiation — the compiler folds `${…}`/`@fields` and
   re-parses the field list, and the **type checker does the same** when it
   resolves an application (`Partial(Point)`): it re-parses the operand into
-  concrete fields with their *real* types (so a generated `?Int` supports
-  `orelse`, and `p.a` bound to a `String` is a static type error). A recipe whose
-  field *names* are dynamic (or whose `@fields(…)` source can't be resolved
-  statically) stays permissive for the compiler to materialize. `@code` (AST as a
-  first-class value) is a later increment — see
-  `future/comptime-type-construction.md`.
+  concrete fields with their *real* types. So member access is typed precisely (a
+  generated `?Int` supports `orelse`; `p.a` bound to a `String` is a static type
+  error), and **construction is validated against the annotation's materialized
+  layout** — `Partial{ .zzz = 1 }` reports the unknown field `zzz` and the missing
+  field, and a wrong field value type is caught, all before the IR compiler runs.
+  A recipe whose field *names* are dynamic (or whose `@fields(…)` source can't be
+  resolved statically) stays permissive for the compiler to materialize; a bare
+  `Partial{…}` with no annotation to name the instantiation likewise falls back to
+  the permissive check. `@code` (AST as a first-class value) is a later increment —
+  see `future/comptime-type-construction.md`.
 - **`@log msg` — a debug print to the real stdout.** Writes its (rendered,
   interpolated) argument, newline-terminated, straight to the process's stdout,
   bypassing the current function's stdout pipe. Inside a function whose result is

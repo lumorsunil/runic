@@ -2331,6 +2331,30 @@ pub const TypeChecker = struct {
         return self.expected_type_stack.items[self.expected_type_stack.items.len - 1];
     }
 
+    /// The concrete struct that the current expected type resolves to when it is an
+    /// application of `ctor_name` (`const p: Partial(Point) = …`) that materialized
+    /// into real fields — the layout to validate a `Ctor{ … }` literal against, so
+    /// construction catches field typos. Null when there's no such expected type,
+    /// it names a different constructor, or the recipe stayed permissive (a dynamic
+    /// field name), in which case the caller keeps the permissive ctor-body check.
+    fn expectedMaterializedStruct(
+        self: *TypeChecker,
+        scope: *Scope,
+        ctor_name: []const u8,
+    ) Error!?ast.TypeExpr.StructType {
+        const expected = self.currentExpectedType() orelse return null;
+        // Only trust an expected type that is an application of the same
+        // constructor, so we validate `Partial{…}` against a `Partial(…)`
+        // annotation — never against an unrelated struct that happens to be
+        // expected here.
+        if (expected.* != .type_application) return null;
+        if (!std.mem.eql(u8, expected.type_application.name.name, ctor_name)) return null;
+        const resolved = self.unaliasType(try self.resolveTypeExpr(scope, expected));
+        if (resolved.* != .struct_type) return null;
+        if (resolved.struct_type.body_items.len > 0) return null; // stayed permissive
+        return resolved.struct_type;
+    }
+
     /// Permissive type match for overload selection: a generic parameter/return
     /// (type variable or capture) accepts anything; otherwise the types must be
     /// equal or coerce (a value widening into an optional, either direction — the
@@ -5227,9 +5251,19 @@ pub const TypeChecker = struct {
             return;
         }
 
-        // A generic constructor (`Box{ … }` for `const Box(T) = struct { … }`):
-        // validate against the body struct with its type parameters permissive.
+        // A generic constructor (`Box{ … }` for `const Box(T) = struct { … }`, or a
+        // comptime type function `Partial{ … }`): validate against the body struct.
         if (self.generic_type_ctors.get(struct_literal.name.name)) |ctor| {
+            // Prefer the concrete layout from the *expected* type — the annotation
+            // `Partial(Point)`, which `resolveTypeApplication` materializes into
+            // real fields (including an `@insert` recipe). This is what lets a
+            // `Partial{ .zzz = 1 }` field typo be caught at construction. Fall back
+            // to the (parameter-permissive) ctor body when there's no matching
+            // annotation to take the instantiation from.
+            if (try self.expectedMaterializedStruct(scope, struct_literal.name.name)) |st| {
+                try self.runStructValueLiteral(scope, st, struct_literal);
+                return;
+            }
             const resolved = self.unaliasType(try self.resolveGenericCtorBody(scope, ctor));
             if (resolved.* == .struct_type) try self.runStructValueLiteral(scope, resolved.struct_type, struct_literal);
             return;
