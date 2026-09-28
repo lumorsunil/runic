@@ -323,9 +323,13 @@ Likely near- to mid-term candidates:
        comptime interpreter, sandboxing, build-time effects); likely *not* wanted
        wholesale, but a narrow, pure `#run`-for-constants (bake a computed literal)
        could be worth it.
-     - **Code generation / AST as data (`#insert`, `__compiler_parse`).** Neither
-       the AST nor a string→AST path is exposed. Powerful but the biggest
-       complexity/safety cost; least aligned with Runic's "small, legible" bias.
+     - **Code generation / AST as data (`#insert`, `__compiler_parse`).** Partly
+       shipped: `@insert "…"` generates struct fields from a comptime string
+       (re-parsed and grafted), and `@field(value)(name)` + `for (@fields(T))`
+       generate *implementations* over values. A first-class AST value (`@code`)
+       is deferred indefinitely — its value collapsed once `@field`/`@fields`
+       shipped, and the reuse cases it seemed to unlock are better served by
+       trailing-block closures. See `future/comptime-type-construction.md`.
      A genuine place Runic is *ahead* of both: constraint-checked, return-type
      polymorphic **overloading** approaching type classes — Jai/Mox lean on `$T`
      polymorphism + reflection instead. Worth keeping that as the distinguishing
