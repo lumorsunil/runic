@@ -60,11 +60,55 @@ the declared return against the call's arguments (`callConcreteReturnType`, exte
 to bind `comptime T: type` params, not only `|T|` captures) before deciding — so a
 return that denotes a struct/application is captured by value. Generic field-wise
 builders (`copy`, `doubled`, `reset`) now work end to end with `@field`.
-`@code`/`Code` (quote a block and splice/reuse it —
-Jai's macro-lite "bucket 1") remains genuinely useful but is a *separate, larger*
-feature (needs statement-position insertion + hygiene rules) to be scoped on its
-own merits later. This note captures the approach (the Jai/Mox "code is text/AST"
-model, deliberately *not* Zig's `@Type`), the mechanism, and the open questions.
+
+## `@code` — deferred indefinitely (and why)
+
+`@code`/`Code` (a first-class AST fragment, spliced by `@insert`) was the planned
+increment 3. After building out the rest of the comptime surface and surveying
+where it would actually be used, we **deferred it indefinitely**. The reasoning:
+
+- **It's comptime-only** (like Jai's `#code`/`#insert`: an AST is grafted at
+  compile time and gone before runtime), so there's no fields-vs-statements or
+  comptime-vs-runtime barrier — splicing a `Code` block at a statement position is
+  mechanically the same as grafting a field list into a struct. That part is fine.
+- **But its value is now small.** `@field` + `for (@fields(T))` + comptime `if`/
+  `match` pruning already generate *implementations* over values, and Runic
+  evaluates comptime control flow **inline** (unroll/prune), so within a scope you
+  rarely need an explicit quote+splice — you just write the control flow. `@code`'s
+  remaining, genuinely-additive roles are hygienic/reusable `@insert` *fragments*
+  and cross-scope block reuse.
+- **A stdlib survey found no home for it.** Nothing in `std/` generates struct
+  *shapes*; the codegen that *does* fit the stdlib is the `@field`/`@fields`
+  implementation-generation we shipped (used in the new `std.meta`). `@insert`/
+  `@code` field generation would only pay off with "mapped type" utilities
+  (`Partial`/`Pick`/`Omit`), which read as a type-system library, not a scripting
+  stdlib.
+- **The reuse/control-flow cases it seemed to unlock are better served by
+  *closures*.** A trailing block bound to a `fn () Void` parameter — a nullary
+  closure capturing its environment — gives `withTimer { … }` / `retry { … }` with
+  caller locals working, using machinery Runic already has, no metaprogramming.
+  That is the direction we're taking instead.
+
+So: `@code` is parked, not killed — revisit only if a concrete need for structured,
+reusable AST fragments shows up. This note stays as the record of the approach (the
+Jai/Mox "code is text/AST" model, deliberately *not* Zig's `@Type`) and why the
+value collapsed once `@field`/`@fields` shipped.
+
+## Found along the way (pre-existing bugs, not addressed here)
+
+Building the stdlib codegen surfaced two pre-existing compiler bugs in the
+"use a call result as an operand/argument" area, independent of the comptime work:
+
+- `h = h + (someCall)` (a reassignment whose RHS reads the target and has a call
+  operand) crashes with "could not dereference value of type thread" — the call
+  isn't captured to its value. `const r = (someCall) + 1` is fine, so it's specific
+  to the read-modify-write shape.
+- `f (@field(v)(name))` — a `@field` (or call) result passed as a parenthesized
+  argument — mis-derefs similarly.
+
+These block *recursive* comptime codegen (e.g. a field-wise `hash` that recurses on
+struct fields), which is why `std.map` struct-key support is deferred; the
+non-recursive `std.meta` (`show`, `eq`) is unaffected.
 
 ## Increment 2 — attempted, and what it actually requires (findings)
 

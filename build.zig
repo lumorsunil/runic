@@ -41,6 +41,7 @@ pub fn build(b: *std.Build) void {
         "std/env.rn",
         "std/testing.rn",
         "std/map.rn",
+        "std/meta.rn",
         "std/ffi.rn",
     };
     for (std_module_files) |rel| {

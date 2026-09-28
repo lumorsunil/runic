@@ -76,6 +76,7 @@ surfaces that will churn.
 | `std.math`    | Numeric helpers (`abs`/`min`/`max`/`clamp` + Float `sqrt`/`floor`/…).      |
 | `std.testing` | Assertions for `.rn` module and CLI smoke tests.                          |
 | `std.map`     | A generic hashed key/value map (immutable + mutable APIs).                 |
+| `std.meta`    | Comptime-derived structural operations over any value (`show`, `eq`).      |
 
 **Conventions.** Functions use the space-call form (`std.list.map xs f`), camelCase
 names, and explicit input/output types. A fallible operation returns an **error
@@ -230,6 +231,31 @@ const v = std.map.get m "a" orelse 0   // 1
 var counts = std.map.empty              // mutable style
 for (xs) |x| { std.map.setIn counts x ((std.map.get counts x orelse 0) + 1) }
 ```
+
+### `std.meta`
+
+Generic operations derived at **compile time** from the field-introspection
+surface (`@kind`, `@fields`, `@field`) — the "derived" helpers a hand-written
+generic can't express without looking *inside* a value's fields. Each function is
+monomorphized per argument type: `@kind(T)` folds (the untaken branch is never
+emitted) and `for (@fields(T))` unrolls one copy per field.
+
+| Signature | Result |
+| --- | --- |
+| `show(v: T) String` | a struct as `{ name=value … }`, a scalar/string as itself |
+| `eq(a: T, b: T) Bool` | structural equality (a struct field-by-field, else `==`) |
+
+```rn
+fn Point(comptime E: type) type { yield struct { x: E, y: E } }
+const p: Point(Int) = Point{ .x = 3, .y = 7 }
+echo "${std.meta.show p}"        // { x=3 y=7 }
+echo "${std.meta.eq p p}"        // 0  (true)
+```
+
+Both are **one level** — `show` doesn't recurse into struct-typed fields, and
+`eq` compares them with `!=`'s own semantics — which is exact for structs of
+scalar/string fields. (A recursive `hash` over struct fields is blocked on a
+pre-existing call-capture bug; see `future/comptime-type-construction.md`.)
 
 ## Language prerequisites for Phase 3
 

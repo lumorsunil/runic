@@ -23,6 +23,13 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Added
 
+- **`std.meta` — comptime-derived structural operations.** `std.meta.show v`
+  renders any value (a struct as `{ name=value … }`, a scalar/string as itself);
+  `std.meta.eq a b` is structural equality (a struct compared field-by-field, else
+  `==`). Both are built on `@kind`/`@fields`/`@field` and monomorphize per type —
+  the first stdlib use of the comptime implementation-generation surface. (One
+  level deep; a recursive `hash` for struct map keys awaits a pre-existing
+  call-capture fix — see `future/comptime-type-construction.md`.)
 - **`@field(value)(name)` — access a struct field by a compile-time name.** The
   analog of Zig's `@field(x, name)`: `name` is a compile-time string (typically
   `f.name` from an unrolled `for (@fields(T)) |f|`), and the access lowers to an
@@ -222,6 +229,12 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Fixed
 
+- **Feature-test stdout fixtures named `*.rn.stdout` are now `*.stdout`.** The CLI
+  smoke runner derives the expected-output fixture by stripping `.rn` (so `foo.rn`
+  → `foo.stdout`) and only diffs stdout when that file exists. Twelve fixtures were
+  misnamed `foo.rn.stdout`, so their stdout was silently never checked (the tests
+  only verified a clean exit). Renamed to the matched form; their output is now
+  validated (all still pass).
 - **A `comptime T: type` function can now return a struct *value* without
   corrupting it.** When a generic function's declared return was a bare type
   parameter (`fn f(comptime T: type, v: T) T`), the call site couldn't classify the

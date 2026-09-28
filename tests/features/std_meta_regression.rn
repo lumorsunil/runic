@@ -1,0 +1,18 @@
+// std.meta — generic structural show/eq over any struct or scalar, derived at
+// compile time from @kind/@fields/@field. Deterministic output.
+const std = import "std"
+
+fn Point(comptime E: type) type { yield struct { x: E, y: E } }
+fn User(comptime N: type) type { yield struct { name: N, age: Int } }
+
+const p: Point(Int) = Point{ .x = 3, .y = 7 }
+const u: User(String) = User{ .name = "ada", .age = 36 }
+
+echo "${std.meta.show p}"
+echo "${std.meta.show u}"
+echo "scalar: ${std.meta.show 42}"
+
+const q: Point(Int) = Point{ .x = 3, .y = 7 }
+const r: Point(Int) = Point{ .x = 3, .y = 9 }
+echo "eq pq=${std.meta.eq p q} pr=${std.meta.eq p r}"
+echo "eq scalars: ${std.meta.eq 5 5} ${std.meta.eq 5 6}"
