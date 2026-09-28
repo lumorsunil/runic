@@ -3381,8 +3381,16 @@ pub const IRCompiler = struct {
         const fn_type = binding.type_expr orelse return null;
         if (fn_type != .function) return null;
         const return_type_ptr = fn_type.function.return_type orelse return null;
-        if (!self.isTypedCaptureReturn(return_type_ptr)) return null;
         const fn_ref_value = binding.result.source.value;
+        // Decide typed-value vs byte capture on the *concrete* return type. A
+        // generic callee's declared return can be a bare type parameter (`T`), which
+        // `isTypedCaptureReturn` can't classify on its own — but resolved against the
+        // call's arguments it becomes e.g. `Vec(Int)` (a struct), which must be
+        // captured by value. Byte-capturing a struct round-trips it through stdout
+        // text and misreads it. Falls back to the declared return when unresolved.
+        const concrete_return = self.callConcreteReturnType(fn_ref_value.fn_ref.fn_addr.instr_set, info.arguments);
+        const decide_ptr: *const ast.TypeExpr = if (concrete_return) |*c| c else return_type_ptr;
+        if (!self.isTypedCaptureReturn(decide_ptr)) return null;
         // A zero-arg reference to a function that declares parameters is a
         // function *value* (`const f = dbl`), not a call to capture.
         if (info.arguments.len == 0 and
@@ -6922,7 +6930,15 @@ pub const IRCompiler = struct {
         var capture_names = std.ArrayList([]const u8).empty;
         defer capture_names.deinit(self.allocator);
         for (params) |param| {
-            if (param.type_annotation) |ann| collectCapturesInType(ann.*, &capture_names, self.allocator) catch return null;
+            // A `comptime T: type` param introduces the type variable `T` (a bare
+            // identifier in annotations/return), bound from the type its argument
+            // denotes. Collect it alongside `|T|`-style captures so a return of `T`
+            // resolves to the concrete type.
+            if (comptimeTypeParamName(param)) |name| {
+                capture_names.append(self.allocator, name) catch return null;
+            } else if (param.type_annotation) |ann| {
+                collectCapturesInType(ann.*, &capture_names, self.allocator) catch return null;
+            }
         }
         if (capture_names.items.len == 0) return null;
         if (!typeMentionsAny(raw_return, capture_names.items)) return null;
@@ -6937,6 +6953,11 @@ pub const IRCompiler = struct {
         };
         for (capture_names.items) |name| _ = self.type_captures.remove(name);
         for (params, arguments) |param, arg| {
+            if (comptimeTypeParamName(param)) |name| {
+                const denoted = self.comptimeArgType(arg) orelse return null;
+                self.type_captures.put(self.allocator, name, denoted) catch return null;
+                continue;
+            }
             const ann = param.type_annotation orelse continue;
             if (!hasTypeCapture(ann.*)) continue;
             const arg_type = self.argTypeExpr(arg) orelse return null;

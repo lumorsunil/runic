@@ -45,8 +45,8 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   *set* each field, not only read it. Reading `@field` now also works outside a
   comptime `for (@fields)` loop in a generic body (a `T`-typed value's layout
   resolves per specialization; the unspecialized template no longer mis-reports).
-  (Returning a whole struct *value* from a `comptime T: type` function is subject to
-  a separate, pre-existing generic-struct-return limitation.)
+  Combined with the generic-struct-return fix below, this makes field-wise
+  implementations (copy, transform, reset) work end to end.
 - **`@insert "…"` — compile-time struct field generation.** In a struct body,
   `@insert` re-parses a string as a `name: Type[, …]` field list and grafts the
   fields in — the Jai/Mox "generate the source, re-parse it" model of building a
@@ -222,6 +222,16 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Fixed
 
+- **A `comptime T: type` function can now return a struct *value* without
+  corrupting it.** When a generic function's declared return was a bare type
+  parameter (`fn f(comptime T: type, v: T) T`), the call site couldn't classify the
+  return as a by-value capture, so the struct was byte-captured — round-tripped
+  through stdout text and misread on the way back (a `Vec` came out looking like an
+  array). The typed-vs-byte capture decision now resolves the declared return
+  against the call's arguments first (binding the comptime type params), so a return
+  that denotes a struct/application is captured by value. This is what makes generic,
+  field-wise builders — `copy`, `doubled`, a `reset` — work end to end with
+  `@field(value)(name)`.
 - **LSP: incremental edits no longer corrupt a file that contains a `\n` string
   escape.** When mapping an editor position to a byte offset, the language server
   treated a backslash-`n` in the document text (the two characters of a `\n`

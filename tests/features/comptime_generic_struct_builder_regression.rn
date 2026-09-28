@@ -1,0 +1,34 @@
+# A `comptime T: type` function can now build and return a struct *value*: the
+# result is captured by value (typed), not byte-serialized through stdout (which
+# used to misread a struct). Combined with `@field(value)(name)` this makes generic,
+# field-wise implementations — copy, transform, reset — work end to end.
+
+fn Vec(comptime E: type) type { yield struct { x: E, y: E, z: E } }
+
+# Passthrough: return the struct argument unchanged.
+fn ident(comptime T: type, v: T) T { yield v }
+
+# Field-wise copy: build a fresh struct, set each field from the source by name.
+fn copy(comptime T: type, v: T) T {
+  var out = v
+  for (@fields(T)) |f| @field(out)(f.name) = @field(v)(f.name)
+  yield out
+}
+
+# Field-wise transform: double every field.
+fn doubled(comptime T: type, v: T) T {
+  var out = v
+  for (@fields(T)) |f| @field(out)(f.name) = @field(v)(f.name) * 2
+  yield out
+}
+
+const v: Vec(Int) = Vec{ .x = 1, .y = 2, .z = 3 }
+
+const a: Vec(Int) = ident Vec(Int) v
+echo "ident: ${a.x} ${a.y} ${a.z}"
+
+const b: Vec(Int) = copy Vec(Int) v
+echo "copy: ${b.x} ${b.y} ${b.z}"
+
+const d: Vec(Int) = doubled Vec(Int) v
+echo "doubled: ${d.x} ${d.y} ${d.z}"

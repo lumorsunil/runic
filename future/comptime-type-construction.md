@@ -51,11 +51,16 @@ unresolved member access in an *unspecialized generic template* (a `T`-typed val
 has no layout until `T` binds), so reading/writing `@field` on a generic value works
 outside a `for (@fields)` loop, not only inside one where the template unrolls to
 nothing; (b) the struct field-assign path no longer panics when the lvalue doesn't
-resolve. **Found, not fixed:** returning a whole struct *value* from a
-`comptime T: type` function corrupts (even `fn f(comptime T,v:T) T { yield v }`) — a
-pre-existing generic-struct-return bug, independent of `@field`, that blocks the
-generic build-and-return-a-struct pattern. Until it's fixed, mutate structs with
-`@field` at concrete/top-level sites. `@code`/`Code` (quote a block and splice/reuse it —
+resolve. **Generic struct return — fixed.** Returning a whole struct *value* from a
+`comptime T: type` function used to corrupt (even `fn f(comptime T,v:T) T { yield v }`):
+the declared return was a bare type parameter (`T`), which the call site couldn't
+classify as a by-value capture, so the struct went down the byte-capture path
+(stdout text round-trip) and was misread. The typed-vs-byte decision now resolves
+the declared return against the call's arguments (`callConcreteReturnType`, extended
+to bind `comptime T: type` params, not only `|T|` captures) before deciding — so a
+return that denotes a struct/application is captured by value. Generic field-wise
+builders (`copy`, `doubled`, `reset`) now work end to end with `@field`.
+`@code`/`Code` (quote a block and splice/reuse it —
 Jai's macro-lite "bucket 1") remains genuinely useful but is a *separate, larger*
 feature (needs statement-position insertion + hygiene rules) to be scoped on its
 own merits later. This note captures the approach (the Jai/Mox "code is text/AST"

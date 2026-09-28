@@ -800,11 +800,16 @@ an unknown field name is reported like any other bad member access. Assigning
 through `@field` obeys mutability: the target must be a `var` (or a field of one),
 exactly like `value.field = v`.
 
-> Note: returning a whole struct *value* from a `comptime T: type` function
-> (`fn f(comptime T: type, v: T) T { … yield out }`) is subject to a separate,
-> pre-existing limitation in generic struct returns; until that is fixed, build
-> and mutate structs with `@field` at a concrete (non-generic) call site or top
-> level, or have the generic function yield a non-struct result.
+Together with generic struct *returns*, this makes field-wise implementations work
+end to end — a `comptime T: type` function can build and return a `T`:
+
+```rn
+fn doubled(comptime T: type, v: T) T {
+  var out = v
+  for (@fields(T)) |f| @field(out)(f.name) = @field(v)(f.name) * 2
+  yield out
+}
+```
 
 ### Generic types as comptime functions
 
