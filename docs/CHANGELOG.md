@@ -248,13 +248,14 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   empty.** A trailing-block / anonymous-fn closure that referenced an outer `var`
   used to render it empty: a `var` lives in a frame-relative closure cell the
   running closure can't reach, and the closure value built for a `fn`-expression
-  argument carried no populated environment. Now such an argument materializes its
-  capture environment (`make_closure_fn`), a mutable capture is snapshotted by
-  value, and a fork uses a nullary closure's captured environment (previously only
-  used when arguments were passed). A closure-slot fast path also falls back to the
-  full resolver instead of unwrapping null. (A *value-returning nullary* closure
-  capturing a `var` for arithmetic remains limited — the value/interpolation read
-  paths disagree on that slot; it now errors cleanly rather than crashing.)
+  argument carried no populated environment. Now an inline `fn` expression (a
+  trailing block, an anonymous `fn`, or a named `fn … { … }` in argument position)
+  materializes its capture environment in `compileFnDecl` (`make_closure_fn`), a
+  mutable capture is snapshotted by value, and a fork uses a nullary closure's
+  captured environment (previously used only when arguments were passed). This
+  covers both `Void`/effectful and value-returning closures (`get { yield n + 5 }`),
+  for `const` and `var` captures alike. A closure-slot fast path also falls back to
+  the full resolver instead of unwrapping null.
 - **Feature-test stdout fixtures named `*.rn.stdout` are now `*.stdout`.** The CLI
   smoke runner derives the expected-output fixture by stripping `.rn` (so `foo.rn`
   → `foo.stdout`) and only diffs stdout when that file exists. Twelve fixtures were

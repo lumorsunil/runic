@@ -7686,22 +7686,6 @@ pub const IRCompiler = struct {
     /// null when `expr` is not such a closure (a plain top-level function needs no
     /// environment and is passed as its bare `fn_ref`).
     fn tryCompileClosureFnValue(self: *IRCompiler, source: anytype, expr: *ast.Expression) Error!?Result {
-        // An anonymous/nested function *expression* argument — an inline `fn … { … }`
-        // or a trailing-block closure — must have its capture environment built
-        // here: compiling it yields a bare fn_ref that carries no captured values,
-        // so an outer `var` it reads (a frame-relative closure cell) would resolve
-        // to nothing when the closure runs. Compile it, then materialize the env.
-        if (expr.* == .fn_decl) {
-            const fn_result = try self.compileFnDecl(expr, expr.fn_decl);
-            if (fn_result.source == .value and fn_result.source.value == .fn_ref) {
-                const fn_addr = fn_result.source.value.fn_ref.fn_addr;
-                if (try self.buildClosureFnEnv(source, fn_addr, fn_result.typeExpr())) |closure| {
-                    return closure;
-                }
-            }
-            // Captureless (or non-fn) — the bare fn value is the argument.
-            return fn_result;
-        }
         const name = switch (expr.*) {
             .identifier => |id| id.name,
             .call => |c| if (c.arguments.len == 0 and c.callee.* == .identifier)
@@ -10736,6 +10720,19 @@ pub const IRCompiler = struct {
             }
         }
 
+        // An inline fn *expression* — a trailing block, an anonymous `fn`, or a
+        // named `fn … { … }` used in argument position — must have its closure
+        // environment materialized here so the fn value it yields carries its
+        // captures (an outer `var` is snapshotted by value). Whichever call path
+        // compiles the argument then sees a populated closure. A *hoisted*
+        // top-level declaration and a *specialization target* are not inline
+        // values (they are referenced by name / called by set), so they keep the
+        // bare fn_ref and build their env at each reference (`tryCompileClosureFnValue`).
+        if (!already_hoist_declared and !is_specialization_target) {
+            if (try self.buildClosureFnEnv(source, fn_ref.fn_ref.fn_addr, null)) |closure| {
+                return closure;
+            }
+        }
         return .from(fn_ref);
     }
 
