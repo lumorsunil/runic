@@ -757,7 +757,11 @@ pub const IREvaluator = struct {
                     thread.getRefPtr(ref, loc.mod).*,
                 .closure => {
                     const closure_base = thread.private.stack.items[3].addr;
-                    const closure_slot = thread.shared.heapGetPtr(loc.applyMod(closure_base)).?;
+                    // Fall back to the slow path when the slot is out of the
+                    // allocated closure block (rather than unwrapping null): a
+                    // captured value whose slot the fast path can't resolve is
+                    // handled by the full resolver.
+                    const closure_slot = thread.shared.heapGetPtr(loc.applyMod(closure_base)) orelse return null;
                     if (!loc.options.dereference) {
                         return closure_slot.*;
                     }
@@ -2252,18 +2256,23 @@ pub const IREvaluator = struct {
                 thread.private.result_register = .{ .thread = new_thread_handle };
 
                 // The callee's closure: when the fn value carries a captured
-                // environment (a nested closure passed as a value), copy this
-                // call's argument slots into that block and use it, so the callee
-                // sees both its arguments and its captures.
-                const closure_value: ir.Value = if (fn_closure_addr != 0 and fork.merge_args > 0) blk: {
-                    const provided = try self.resolveLocation(thread, fork.closure);
-                    const provided_addr: usize = switch (provided) {
-                        .addr => |a| a,
-                        else => 0,
-                    };
-                    for (0..fork.merge_args) |i| {
-                        const src = self.context.shared.heapGet(provided_addr + i) orelse continue;
-                        if (self.context.shared.heapGetPtr(fn_closure_addr + i)) |dst| dst.* = src;
+                // environment (a nested closure passed as a value), use that block
+                // so the callee sees its captures — including for a *nullary* call
+                // (`merge_args == 0`), where the captures are the whole point (a
+                // trailing-block/`fn () …` closure reading an outer binding). When
+                // there are call arguments, copy their slots into the captured block
+                // first, so the callee sees both.
+                const closure_value: ir.Value = if (fn_closure_addr != 0) blk: {
+                    if (fork.merge_args > 0) {
+                        const provided = try self.resolveLocation(thread, fork.closure);
+                        const provided_addr: usize = switch (provided) {
+                            .addr => |a| a,
+                            else => 0,
+                        };
+                        for (0..fork.merge_args) |i| {
+                            const src = self.context.shared.heapGet(provided_addr + i) orelse continue;
+                            if (self.context.shared.heapGetPtr(fn_closure_addr + i)) |dst| dst.* = src;
+                        }
                     }
                     break :blk .{ .addr = fn_closure_addr };
                 } else try self.resolveLocation(thread, fork.closure);

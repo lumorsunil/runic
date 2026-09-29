@@ -573,9 +573,9 @@ The block may also yield a value (`twice { yield 21 }`), and the sugar is exactl
 equivalent to passing an anonymous function: `withBrackets (fn Void () Void { … })`.
 Disambiguation follows the existing rule — an **uppercase** name before `{` is a
 struct literal (`Point { .x = 1 }`), a **lowercase** call is a trailing block; a
-`match subject { … }`'s arms are never mistaken for a block. (Capturing a mutable
-`var` into a closure is a separate, pre-existing limitation; capture `const`
-values, or pass state explicitly.)
+`match subject { … }`'s arms are never mistaken for a block. The block captures
+both `const` and mutable `var` bindings from its scope (by value, at the point the
+closure is created).
 
 ## Native iteration constructs
 

@@ -7686,6 +7686,22 @@ pub const IRCompiler = struct {
     /// null when `expr` is not such a closure (a plain top-level function needs no
     /// environment and is passed as its bare `fn_ref`).
     fn tryCompileClosureFnValue(self: *IRCompiler, source: anytype, expr: *ast.Expression) Error!?Result {
+        // An anonymous/nested function *expression* argument — an inline `fn … { … }`
+        // or a trailing-block closure — must have its capture environment built
+        // here: compiling it yields a bare fn_ref that carries no captured values,
+        // so an outer `var` it reads (a frame-relative closure cell) would resolve
+        // to nothing when the closure runs. Compile it, then materialize the env.
+        if (expr.* == .fn_decl) {
+            const fn_result = try self.compileFnDecl(expr, expr.fn_decl);
+            if (fn_result.source == .value and fn_result.source.value == .fn_ref) {
+                const fn_addr = fn_result.source.value.fn_ref.fn_addr;
+                if (try self.buildClosureFnEnv(source, fn_addr, fn_result.typeExpr())) |closure| {
+                    return closure;
+                }
+            }
+            // Captureless (or non-fn) — the bare fn value is the argument.
+            return fn_result;
+        }
         const name = switch (expr.*) {
             .identifier => |id| id.name,
             .call => |c| if (c.arguments.len == 0 and c.callee.* == .identifier)
@@ -7697,8 +7713,15 @@ pub const IRCompiler = struct {
         const binding = self.lookup(name, .{ .shallow = false }) orelse return null;
         if (!binding.result.isFunctionRef()) return null;
         const fn_addr = binding.result.source.value.fn_ref.fn_addr;
+        try self.ensureFnBodyCompiled(fn_addr.instr_set);
+        return try self.buildClosureFnEnv(source, fn_addr, binding.type_expr);
+    }
+
+    /// Materializes a closure fn value: allocates the capture environment, copies
+    /// each captured binding into it, and emits `make_closure_fn`. Returns null
+    /// when the function captures nothing (the bare fn_ref is then the value).
+    fn buildClosureFnEnv(self: *IRCompiler, source: anytype, fn_addr: ir.InstructionAddr, type_expr: ?ast.TypeExpr) Error!?Result {
         const instr_set = fn_addr.instr_set;
-        try self.ensureFnBodyCompiled(instr_set);
         const captures = self.instruction_sets.items[instr_set].closure_captures;
         if (captures.len == 0) return null;
         const slot_count = self.instruction_sets.items[instr_set].closure_slot_count;
@@ -7711,7 +7734,13 @@ pub const IRCompiler = struct {
             const identifier_result = try self.compileIdentifier(source, capture.identifier);
             try self.set(source, .initRegister(.r), .from(env_ref.dereference()));
             const dst = ir.Location.initAdd(.{ .register = .r }, capture.slot, .{ .dereference = true });
-            if (identifier_result.source == .location and self.bindingTypeIsCImport(cap_binding.type_expr)) {
+            // Capture by value for a `cimport` handle (a by-reference slot address
+            // can't be resolved as a library) and for a mutable `var` (whose
+            // frame-relative closure cell would resolve against the running
+            // closure's own frame, reading empty); by reference otherwise.
+            if (identifier_result.source == .location and
+                (self.bindingTypeIsCImport(cap_binding.type_expr) or cap_binding.is_mutable))
+            {
                 try self.set(source, dst, identifier_result.source);
             } else if (identifier_result.source == .location) {
                 try self.set(source, dst, identifier_result.source.undereference());
@@ -7725,7 +7754,7 @@ pub const IRCompiler = struct {
             .closure = env_ref.dereference(),
             .result = result_ref.dereference(),
         } }));
-        return .fromLocation(result_ref.dereference().typed(binding.type_expr));
+        return .fromLocation(result_ref.dereference().typed(type_expr));
     }
 
     fn compileIndirectCall(

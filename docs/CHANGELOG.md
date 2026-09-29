@@ -37,8 +37,7 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   call is a trailing block. Supporting compiler work: a **nullary function *value*
   is now invocable** — a bare `body` (a `fn()`-typed binding) auto-calls like a
   nullary named function, for both value-returning and `Void` (effectful) closures.
-  (Capturing a mutable `var` into a closure remains a separate, pre-existing
-  limitation; capture `const` values or pass state explicitly.)
+  The block captures both `const` and mutable `var` bindings from its scope.
 - **`std.meta` — comptime-derived structural operations.** `std.meta.show v`
   renders any value (a struct as `{ name=value … }`, a scalar/string as itself);
   `std.meta.eq a b` is structural equality (a struct compared field-by-field, else
@@ -245,6 +244,17 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Fixed
 
+- **A closure now captures a mutable `var` from its scope instead of reading
+  empty.** A trailing-block / anonymous-fn closure that referenced an outer `var`
+  used to render it empty: a `var` lives in a frame-relative closure cell the
+  running closure can't reach, and the closure value built for a `fn`-expression
+  argument carried no populated environment. Now such an argument materializes its
+  capture environment (`make_closure_fn`), a mutable capture is snapshotted by
+  value, and a fork uses a nullary closure's captured environment (previously only
+  used when arguments were passed). A closure-slot fast path also falls back to the
+  full resolver instead of unwrapping null. (A *value-returning nullary* closure
+  capturing a `var` for arithmetic remains limited — the value/interpolation read
+  paths disagree on that slot; it now errors cleanly rather than crashing.)
 - **Feature-test stdout fixtures named `*.rn.stdout` are now `*.stdout`.** The CLI
   smoke runner derives the expected-output fixture by stripping `.rn` (so `foo.rn`
   → `foo.stdout`) and only diffs stdout when that file exists. Twelve fixtures were
