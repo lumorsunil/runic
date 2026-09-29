@@ -249,6 +249,14 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Fixed
 
+- **A bare module-member call now works inside a closure.** A statement like
+  `std.testing.assertEq …` or `std.fs.mkdirp …` inside a trailing-block / anonymous
+  closure failed (`could not dereference address …`): compiling the module-object
+  receiver read the *captured* module binding's runtime value, which resolves to a
+  bad address in the closure. The call now resolves its fn_ref statically and forks
+  it directly (as the value-position path already did), so a closure body can call
+  module functions — the foundation for library control-flow blocks that contain
+  real assertions.
 - **A recipe-ctor struct literal passed as a call argument is now type-checked
   against the parameter.** `f Partial{ .zzz = 1 }` where `f` takes a
   `Partial(Rec(Int))` now reports the unknown/missing field statically (the

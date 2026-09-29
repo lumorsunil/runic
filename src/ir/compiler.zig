@@ -5515,6 +5515,18 @@ pub const IRCompiler = struct {
             if (try self.tryUfcsRewrite(source, call.callee.binary.left, call.callee.binary.right.identifier.name, call.arguments, call.redirects)) |r| return r;
         }
 
+        // A module-member function call (`std.math.max 3 7`, `m.fn args`): resolve
+        // the fn_ref statically and fork it directly, instead of compiling the
+        // module-object receiver. Compiling the receiver reads the module binding's
+        // runtime value — inside a closure that binding is a *captured* module whose
+        // value resolves to a bad address, so a bare module call statement would
+        // fail there. The typed-value-capture path already resolves this statically.
+        if (call.redirects.len == 0) {
+            if (try self.moduleMemberFnRef(source)) |mm| {
+                return self.compileFunctionCall(source, mm.fn_ref_value, mm.arguments, &.{}, null);
+            }
+        }
+
         const callee = try self.compileExpression(call.callee);
 
         // Indirect call: a function-valued location (a `fn(...)`-typed parameter)
