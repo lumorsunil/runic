@@ -31,9 +31,18 @@ concrete struct its *annotation* materializes — `runStructLiteral` pulls the
 expected type (`Partial(Rec(Int))`) off the expected-type stack, resolves it through
 `resolveTypeApplication` (real fields), and checks the literal against that. So
 `Partial{ .zzz = 1 }` reports the unknown field, the missing field, and a wrong
-value type — resolving points 1 & 3 below for the annotation-driven case. The one
-residual gap is a **bare literal with no annotation** to name the instantiation,
-which still falls back to the permissive ctor-body check.
+value type — resolving points 1 & 3 below for the annotation-driven case. This now
+extends to a recipe-ctor literal passed as a **call argument** (`f Partial{ … }`):
+the parameter's materialized type is pushed as the expected type, so the literal is
+validated the same way (`expectedMaterializedStruct` also accepts an
+already-resolved parameter struct, not only a written `Partial(…)` application).
+The remaining gaps are a **bare literal with no annotation *and* no context**
+(genuinely unresolvable — there are no type arguments to materialize from), and the
+*runtime* construction of a bare recipe literal in argument position, which the IR
+compiler still materializes only from a binding annotation (a separate, pre-existing
+gap — the static check catches typos, but a valid recipe-literal argument should be
+constructed via an annotated binding until the compiler materializes it in argument
+context too).
 
 **Increment 3 — reframed from `@code` to *comptime statement generation*.** The
 original increment 3 was `@code` (AST as a first-class value). On review, the

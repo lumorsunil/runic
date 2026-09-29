@@ -2343,12 +2343,13 @@ pub const TypeChecker = struct {
         ctor_name: []const u8,
     ) Error!?ast.TypeExpr.StructType {
         const expected = self.currentExpectedType() orelse return null;
-        // Only trust an expected type that is an application of the same
-        // constructor, so we validate `Partial{…}` against a `Partial(…)`
-        // annotation — never against an unrelated struct that happens to be
-        // expected here.
-        if (expected.* != .type_application) return null;
-        if (!std.mem.eql(u8, expected.type_application.name.name, ctor_name)) return null;
+        // Trust the expected type as the layout to validate `Ctor{…}` against when
+        // it is an application of the *same* constructor (a `Partial(…)` annotation)
+        // — never an unrelated `Point(…)`. A parameter type comes in already
+        // resolved to its struct layout (the constructor name is gone); that is the
+        // declared type this argument must match, so it is trusted directly.
+        if (expected.* == .type_application and
+            !std.mem.eql(u8, expected.type_application.name.name, ctor_name)) return null;
         const resolved = self.unaliasType(try self.resolveTypeExpr(scope, expected));
         if (resolved.* != .struct_type) return null;
         if (resolved.struct_type.body_items.len > 0) return null; // stayed permissive
@@ -2859,7 +2860,34 @@ pub const TypeChecker = struct {
         // before checking the argument, so it validates like the named form.
         try self.stampInferredStructArgs(scope, call);
 
-        for (call.arguments) |arg| try self.runExpression(scope, arg);
+        // A recipe-ctor struct-literal argument (`f Partial{ … }`) is validated
+        // against the parameter's materialized type: push the parameter type as the
+        // expected type so `runStructLiteral` checks the fields (an unknown/missing
+        // field, a wrong value type) against the layout the parameter's annotation
+        // materializes — the same check a `const p: Partial(…) = Partial{ … }`
+        // binding gets. Only recipe-ctor literals opt in, to avoid disturbing
+        // return-type-overloaded arguments.
+        const arg_callee = try self.calleeFunctionForInference(scope, call.callee);
+        for (call.arguments, 0..) |arg, i| {
+            var pushed = false;
+            if (arg.* == .struct_literal and
+                self.generic_type_ctors.contains(arg.struct_literal.name.name))
+            {
+                if (arg_callee) |cf| {
+                    const param_index = i + cf.offset;
+                    const param_type: ?*const ast.TypeExpr = switch (cf.params) {
+                        ._non_variadic => |list| if (param_index < list.len) list[param_index] else null,
+                        ._variadic => |element| element,
+                    };
+                    if (param_type) |pt| {
+                        try self.expected_type_stack.append(self.arena.allocator(), pt);
+                        pushed = true;
+                    }
+                }
+            }
+            try self.runExpression(scope, arg);
+            if (pushed) _ = self.expected_type_stack.pop();
+        }
 
         // A bare command (an identifier callee with no scope binding — `echo`,
         // `ls`, …) serializes each argument to a string, so a whole struct has

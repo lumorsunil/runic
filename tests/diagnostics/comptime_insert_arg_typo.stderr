@@ -1,0 +1,18 @@
+[error]: tests/diagnostics/comptime_insert_arg_typo.rn:9:32: struct has no field 'zzz'
+   7:}
+   8:fn takesPartial(p: Partial(Rec(Int))) String { yield "got" }
+   9:echo "${takesPartial Partial{ .zzz = 1 }}"
+  10:
+
+[error]: tests/diagnostics/comptime_insert_arg_typo.rn:9:22: missing field 'a' in struct literal
+   7:}
+   8:fn takesPartial(p: Partial(Rec(Int))) String { yield "got" }
+   9:echo "${takesPartial Partial{ .zzz = 1 }}"
+  10:
+
+[error]: tests/diagnostics/comptime_insert_arg_typo.rn:9:22: missing field 'b' in struct literal
+   7:}
+   8:fn takesPartial(p: Partial(Rec(Int))) String { yield "got" }
+   9:echo "${takesPartial Partial{ .zzz = 1 }}"
+  10:
+

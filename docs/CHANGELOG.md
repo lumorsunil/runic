@@ -249,6 +249,13 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Fixed
 
+- **A recipe-ctor struct literal passed as a call argument is now type-checked
+  against the parameter.** `f Partial{ .zzz = 1 }` where `f` takes a
+  `Partial(Rec(Int))` now reports the unknown/missing field statically (the
+  parameter's materialized layout is pushed as the expected type), matching the
+  check a `const p: Partial(…) = Partial{ … }` binding already got. (Constructing a
+  bare recipe literal in argument position at *runtime* still requires an annotated
+  binding — a separate, pre-existing compiler-materialization gap.)
 - **A read-modify-write reassignment with a call operand — `h = h + (f x)` — no
   longer crashes.** The in-place `x = x <op> n` optimization compiled the operand
   `n` without value-capture, so a call/pipeline operand left a forked thread handle
