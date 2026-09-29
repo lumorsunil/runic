@@ -11465,7 +11465,10 @@ pub const IRCompiler = struct {
                     // never a command.
                     if (right_binary.op.isArithmetic() or right_binary.op.category() == .shift_or_append) {
                         if (expressionsStructurallyEqual(binary.left, right_binary.left)) {
-                            const right_operand = (try self.compileExpression(right_binary.right)).dereference();
+                            // Value-capture the operand: a call/pipeline operand
+                            // (`h = h + (f x)`) must yield its value, not a forked
+                            // thread handle (which `ath` cannot dereference).
+                            const right_operand = try self.compileArithmeticOperand(source, right_binary.right);
                             try self.ath(
                                 source,
                                 right_binary.op,

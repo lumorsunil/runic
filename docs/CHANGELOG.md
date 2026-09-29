@@ -244,6 +244,12 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Fixed
 
+- **A read-modify-write reassignment with a call operand — `h = h + (f x)` — no
+  longer crashes.** The in-place `x = x <op> n` optimization compiled the operand
+  `n` without value-capture, so a call/pipeline operand left a forked thread handle
+  that the arithmetic then failed to dereference (and the call's output leaked to
+  stdout). The operand is now captured to its value, matching every other
+  arithmetic operand. (Binding the call to a temp was the workaround.)
 - **A function passed by *name* to a `fn()`-typed parameter is passed as a value,
   not invoked at the call site.** `apply plain` (where `plain` is a nullary
   function and `apply` takes a `fn() Int`) eagerly *called* `plain`, so the
