@@ -192,7 +192,18 @@ Runic; the Float functions are backed by **new builtins** (see prerequisites).
 | `assert(cond: Bool, msg: String) Void` | abort (nonzero exit) with `msg` if false |
 | `assertEq(a: T, b: T, msg: String) Void` | abort if `a != b` |
 | `assertContains(s: String, sub: String) Void` | abort if `s` lacks `sub` |
+| `check(msg: String, cond: fn() Bool) Void` | abort unless the trailing block yields true |
 | `fail(msg: String) Void` | unconditional abort |
+
+`check` takes its condition as a **trailing block** (a `fn () Bool` closure), so a
+multi-step assertion reads like a built-in block construct and captures its scope:
+
+```rn
+std.testing.check "list stays sorted" {
+  const xs = std.list.sort ys lt
+  yield xs[0] <= xs[xs.len - 1]
+}
+```
 
 ### `std.map`
 

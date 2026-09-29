@@ -1,0 +1,21 @@
+// std.testing.check — a trailing-block assertion: `check "msg" { yield <cond> }`.
+// The condition is a value-returning closure, so a multi-step check reads like a
+// built-in block construct and captures its enclosing scope. Passing checks are
+// silent (a failing one would write to stderr and exit 1). Deterministic output.
+const std = import "std"
+
+std.testing.check "arithmetic" { yield (1 + 1) == 2 }
+std.testing.check "comparison" { yield (2 * 3) > 5 }
+std.testing.check "string" { yield "abc".contains "b" }
+
+// Multi-step: compute in the block, then yield the condition.
+std.testing.check "multi-step" {
+  const xs = .{ 3, 1, 2 }
+  yield xs.len == 3
+}
+
+// Captures an enclosing binding.
+const target = 42
+std.testing.check "captures" { yield (40 + 2) == target }
+
+echo "all checks passed"

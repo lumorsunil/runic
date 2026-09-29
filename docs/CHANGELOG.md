@@ -23,6 +23,11 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Added
 
+- **`std.testing.check "msg" { yield … }`** — a trailing-block assertion. The
+  condition is a `fn () Bool` closure, so a multi-step check reads like a built-in
+  block construct and captures its enclosing scope; it aborts (stderr + nonzero
+  exit) unless the block yields true. The first stdlib control-flow construct built
+  on trailing-block closures.
 - **Trailing-block closures.** A `{ … }` block written immediately after a
   command/function call is sugar for a **nullary closure argument**, so a function
   taking a `fn() T` parameter reads like a built-in block construct:
