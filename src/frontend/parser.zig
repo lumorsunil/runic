@@ -48,6 +48,10 @@ pub const Parser = struct {
     interp_counter: usize = 0,
     diagnostics: std.ArrayList(Diagnostic) = .empty,
     logging_enabled: bool = false,
+    /// Suppresses trailing-block-closure sugar (`call { … }`) while parsing a
+    /// context where a following `{` opens a body, not a block argument — chiefly
+    /// a paren-less `match subject { … }`. Saved/restored around such a parse.
+    suppress_trailing_block: bool = false,
 
     const Self = @This();
 
@@ -1329,6 +1333,31 @@ pub const Parser = struct {
         //     }
         // }
 
+        // Trailing-block closure sugar: a `{ … }` immediately following a
+        // command/function call (a lowercase-headed application — an uppercase head
+        // is a struct literal, consumed in the `.expr` state above) becomes a
+        // nullary-closure argument, so `withTimer { … }` reads like a built-in block
+        // construct. The block captures the enclosing scope like any nested fn value.
+        // A newline before `{` ends the call first (statement separator), so a block
+        // on its own line stays a separate statement.
+        if (!self.suppress_trailing_block and
+            components.items.len >= 1 and components.items[0] == .identifier and
+            (try self.peekToken()).tag == .l_brace)
+        {
+            const block_expr = try self.parseBlockExpression();
+            const closure = try self.allocExpression(.{ .fn_decl = .{
+                .is_pub = false,
+                .name = null,
+                .params = .none,
+                .stdin_type = null,
+                .return_type = null,
+                .body = block_expr,
+                .span = block_expr.span(),
+            } });
+            try components.append(self.allocator, .{ .op = .{ .payload = .apply, .span = block_expr.span() } });
+            try components.append(self.allocator, .{ .expr = closure });
+        }
+
         return self.parseBinaryExpression(components.items, null, .left);
     }
 
@@ -2203,7 +2232,12 @@ pub const Parser = struct {
         // The subject parentheses are optional: `match (x) { … }` or `match x { … }`.
         const has_paren = (try self.peekToken()).tag == .l_paren;
         if (has_paren) _ = try self.expect(.l_paren);
+        // Without parens (`match subject { … }`), the `{` opens the arms, not a
+        // trailing block — suppress the block sugar while reading the subject.
+        const saved_suppress = self.suppress_trailing_block;
+        self.suppress_trailing_block = !has_paren;
         const subject = try self.parseExpression();
+        self.suppress_trailing_block = saved_suppress;
         if (has_paren) _ = try self.expect(.r_paren);
         _ = try self.expect(.l_brace);
         self.skipNewlines();

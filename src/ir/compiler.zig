@@ -5512,12 +5512,21 @@ pub const IRCompiler = struct {
         const callee = try self.compileExpression(call.callee);
 
         // Indirect call: a function-valued location (a `fn(...)`-typed parameter)
-        // called with arguments. The target function is only known at runtime.
-        if (callee.source == .location and call.arguments.len > 0 and call.redirects.len == 0) {
+        // called with arguments — or a *nullary* one referenced bare (`body`),
+        // which auto-calls like a nullary named fn / module member. The target
+        // function is only known at runtime. A fn value with parameters referenced
+        // with no arguments stays a value (`const g = f`), so it isn't called here.
+        if (callee.source == .location and call.redirects.len == 0) {
             if (callee.typeExpr()) |t| {
                 if (t == .function) {
-                    const rt: ?ast.TypeExpr = if (t.function.return_type) |r| r.* else null;
-                    return self.compileIndirectCall(source, callee.source.location, rt, call.arguments);
+                    const nullary = switch (t.function.params) {
+                        ._non_variadic => |ps| ps.len == 0,
+                        ._variadic => false,
+                    };
+                    if (call.arguments.len > 0 or nullary) {
+                        const rt: ?ast.TypeExpr = if (t.function.return_type) |r| r.* else null;
+                        return self.compileIndirectCall(source, callee.source.location, rt, call.arguments);
+                    }
                 }
             }
         }
@@ -7726,12 +7735,24 @@ pub const IRCompiler = struct {
         return_type: ?ast.TypeExpr,
         args: []const *ast.Expression,
     ) Error!Result {
+        // A `Void`-returning fn value yields no value to capture — it runs for its
+        // effects (a control-flow block like `withTimer { … }`). It forwards its
+        // stdout to the caller's, like a bare command/function statement, and is
+        // not waited on here (the scheduler sequences its output in fork order); a
+        // typed capture pipe + dequeue would deadlock (nothing is ever enqueued) and
+        // divert the block's own `echo` output into the capture. A `Void` return may
+        // surface as the bare identifier `Void` rather than the `.void` type.
+        const is_void = returnTypeIsVoid(return_type);
+
         const fn_ref_ref = try self.newRef(source, "indirect_fn");
         try self.set(source, fn_ref_ref, .from(callee_loc));
 
-        const pipe_ref = try self.newRef(source, "indirect_pipe");
-        try self.pipe(source, pipe_ref.dereference());
-        try self.pipeOpt(source, pipe_ref.dereference(), .typed, .fromValue(.fromBoolean(true)));
+        const pipe_ref = if (is_void) null else blk: {
+            const p = try self.newRef(source, "indirect_pipe");
+            try self.pipe(source, p.dereference());
+            try self.pipeOpt(source, p.dereference(), .typed, .fromValue(.fromBoolean(true)));
+            break :blk p;
+        };
 
         const arg_refs = try self.allocator.alloc(ir.Location, args.len);
         defer self.allocator.free(arg_refs);
@@ -7756,7 +7777,7 @@ pub const IRCompiler = struct {
                 .dest = ir.InstructionAddr.initAbs(0, 0),
                 .dest_from = fn_ref_ref.dereference(),
                 .stdin = self.threadStdin(),
-                .stdout = pipe_ref.dereference(),
+                .stdout = if (pipe_ref) |p| p.dereference() else self.threadStdout(),
                 .stderr = self.threadStderr(),
                 .closure = closure_ref.dereference(),
                 .subshell = .inherit,
@@ -7767,10 +7788,28 @@ pub const IRCompiler = struct {
         }));
         const thread_ref = try self.newRef(source, "indirect_thread");
         try self.set(source, thread_ref, .fromLocation(.initRegister(.r)));
-        try self.wait(source, thread_ref.dereference().typed(thread_type));
 
-        try self.addInstruction(.init(.from(source), .{ .pipe_dequeue = pipe_ref.dereference() }));
-        return .fromLocation(ir.Location.initRegister(.r).typed(return_type orelse .global(.void)));
+        if (pipe_ref) |p| {
+            try self.wait(source, thread_ref.dereference().typed(thread_type));
+            try self.addInstruction(.init(.from(source), .{ .pipe_dequeue = p.dereference() }));
+            return .fromLocation(ir.Location.initRegister(.r).typed(return_type orelse .global(.void)));
+        }
+        // Void: hand back the running thread handle (like a bare statement call);
+        // the caller's statement finalizer streams/awaits it in order.
+        return .fromLocation(thread_ref.dereference().typed(thread_type));
+    }
+
+    /// Whether a function's declared return type denotes `Void` — either the
+    /// `.void` type or the bare identifier `Void` (how a `fn(…) Void` annotation
+    /// surfaces). A null return type (none declared) is also treated as void.
+    fn returnTypeIsVoid(rt: ?ast.TypeExpr) bool {
+        const t = rt orelse return true;
+        return switch (t) {
+            .void => true,
+            .identifier => |named| named.path.segments.len == 1 and
+                std.mem.eql(u8, named.path.segments[named.path.segments.len - 1].name, "Void"),
+            else => false,
+        };
     }
 
     fn compileFunctionCall(

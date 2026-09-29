@@ -23,6 +23,22 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Added
 
+- **Trailing-block closures.** A `{ … }` block written immediately after a
+  command/function call is sugar for a **nullary closure argument**, so a function
+  taking a `fn() T` parameter reads like a built-in block construct:
+  ```runic
+  fn withTimer(body: fn() Void) Void { const t = now; body; @log "${now - t}ms" }
+  withTimer { runJob }               # the block captures its scope and runs inside withTimer
+  ```
+  The block captures its enclosing scope like any nested function value. This lets
+  libraries define control-flow-style wrappers (timers, guards, retries) and, with
+  a `comptime` count, unrolled constructs (`repeat 3 { … }`). Disambiguation follows
+  the existing rule: an uppercase name before `{` is a struct literal, a lowercase
+  call is a trailing block. Supporting compiler work: a **nullary function *value*
+  is now invocable** — a bare `body` (a `fn()`-typed binding) auto-calls like a
+  nullary named function, for both value-returning and `Void` (effectful) closures.
+  (Capturing a mutable `var` into a closure remains a separate, pre-existing
+  limitation; capture `const` values or pass state explicitly.)
 - **`std.meta` — comptime-derived structural operations.** `std.meta.show v`
   renders any value (a struct as `{ name=value … }`, a scalar/string as itself);
   `std.meta.eq a b` is structural equality (a struct compared field-by-field, else

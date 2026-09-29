@@ -542,6 +542,41 @@ fn Void describe(count: Int) Void {
 
 **Result:** Functions and conditional branches behave predictably, returning explicit values and avoiding bash’s implicit status codes.
 
+### Trailing-block closures
+
+A `{ … }` block written immediately after a command or function call is sugar for
+a **nullary closure argument** — so a function that takes a `fn() T` parameter
+reads like a built-in block construct. The block captures its enclosing scope
+(like any nested function value) and runs when the callee invokes the parameter:
+
+```rn
+fn withBrackets(body: fn() Void) Void {
+  echo "["
+  body            # invoke the block
+  echo "]"
+}
+
+const label = "job"
+withBrackets { echo "running ${label}" }     # captures `label`
+```
+
+This lets libraries define control-flow-style wrappers — timers, guards, retries,
+repeats — in ordinary Runic. Combined with a `comptime` count, a block-taking
+function becomes an unrolled construct:
+
+```rn
+fn repeat(comptime n: Int, body: fn() Void) Void { for (0..n) |_| { body } }
+repeat 3 { echo "tick" }
+```
+
+The block may also yield a value (`twice { yield 21 }`), and the sugar is exactly
+equivalent to passing an anonymous function: `withBrackets (fn Void () Void { … })`.
+Disambiguation follows the existing rule — an **uppercase** name before `{` is a
+struct literal (`Point { .x = 1 }`), a **lowercase** call is a trailing block; a
+`match subject { … }`'s arms are never mistaken for a block. (Capturing a mutable
+`var` into a closure is a separate, pre-existing limitation; capture `const`
+values, or pass state explicitly.)
+
 ## Native iteration constructs
 
 `for` and `while` statements consume any iterator the runtime exposes, so streaming APIs and collections share the same loop syntax. Loops use Zig-style capture clauses to bind each yielded value (and optional index) to a local name.
