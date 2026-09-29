@@ -249,6 +249,20 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Fixed
 
+- **A generic function may now recurse polymorphically — at a different type each
+  level — without hanging.** A `@kind`-guarded self-call such as `f 0` inside `f`'s
+  `Box` specialization, or `depth v.value` peeling a nested `Box`, previously
+  spun forever (a runaway fork recursion at runtime). Inside a specialization body
+  the recursive callee resolves to the specialization currently being compiled, so
+  it was treated as a same-type self-recursion and never re-specialized for the new
+  type — the `struct` branch (folded true for `Box`) called itself unconditionally.
+  Each recursive call is now reconciled against the active specializations by its
+  argument-type key: a same-type call stays on the in-progress spec (fast
+  self-recursion), while a different-type call re-routes through the generic and
+  specializes anew (so `@kind`/`@fields` fold correctly at that type and the
+  recursion terminates). A field-access argument (`v.value`) now also resolves its
+  static type, so structural recursion over struct fields specializes per level.
+  This unblocks recursive comptime constructs such as structural hashing/printing.
 - **A bare module-member call now works inside a closure.** A statement like
   `std.testing.assertEq …` or `std.fs.mkdirp …` inside a trailing-block / anonymous
   closure failed (`could not dereference address …`): compiling the module-object

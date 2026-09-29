@@ -103,21 +103,27 @@ reusable AST fragments shows up. This note stays as the record of the approach (
 Jai/Mox "code is text/AST" model, deliberately *not* Zig's `@Type`) and why the
 value collapsed once `@field`/`@fields` shipped.
 
-## Found along the way (pre-existing bugs, not addressed here)
+## Found along the way (pre-existing bugs)
 
-Building the stdlib codegen surfaced two pre-existing compiler bugs in the
-"use a call result as an operand/argument" area, independent of the comptime work:
+Building the stdlib codegen surfaced pre-existing compiler bugs in the "use a call
+result as an operand/argument" area, independent of the comptime work — since
+fixed:
 
 - `h = h + (someCall)` (a reassignment whose RHS reads the target and has a call
-  operand) crashes with "could not dereference value of type thread" — the call
-  isn't captured to its value. `const r = (someCall) + 1` is fine, so it's specific
-  to the read-modify-write shape.
+  operand) crashed with "could not dereference value of type thread" — the call
+  wasn't captured to its value. **Fixed** (the in-place `x = x <op> n` path now
+  value-captures a call operand like every other arithmetic operand).
 - `f (@field(v)(name))` — a `@field` (or call) result passed as a parenthesized
-  argument — mis-derefs similarly.
+  argument — mis-derefed similarly.
 
-These block *recursive* comptime codegen (e.g. a field-wise `hash` that recurses on
-struct fields), which is why `std.map` struct-key support is deferred; the
-non-recursive `std.meta` (`show`, `eq`) is unaffected.
+A further, distinct blocker for *recursive* comptime codegen was that a generic
+function recursing at a **different type per level** (a field-wise `hash`/`show`
+that descends into struct-typed fields) hung forever: inside a specialization the
+recursive callee resolved to the in-progress spec and never re-specialized for the
+new type. **Fixed** — each recursive call is reconciled against the active
+specializations by its argument-type key, so a different-type call re-routes
+through the generic and specializes anew. Recursive `std.meta`/`std.map` struct-key
+support is no longer blocked on the language.
 
 ## Increment 2 — attempted, and what it actually requires (findings)
 

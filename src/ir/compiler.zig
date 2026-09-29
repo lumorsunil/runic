@@ -645,10 +645,18 @@ pub const IRCompiler = struct {
     /// `maybeSpecialize` to `compileFnDecl` so it can register the (generic →
     /// specialization) mapping once the specialization's set is created.
     specializing_generic: ?usize = null,
-    /// Stack of in-flight specializations; a self-recursive call inside a
-    /// specialization body (its callee resolves to the generic set) is
-    /// redirected to the specialization so it recurses at the same concrete type.
-    active_specializations: std.ArrayListUnmanaged(struct { generic: usize, spec: usize }) = .empty,
+    /// The specialization cache key of the in-flight specialization, passed from
+    /// `maybeSpecialize` to `compileFnDecl` alongside `specializing_generic` so the
+    /// active-specialization entry can record it (to distinguish a same-type
+    /// self-recursion from a polymorphic one).
+    specializing_key: ?[]const u8 = null,
+    /// Stack of in-flight specializations; a *same-type* self-recursive call inside
+    /// a specialization body (its callee resolves to the generic set and its
+    /// argument types produce the same cache `key`) is redirected to the
+    /// specialization so it recurses at the same concrete type. A recursion at a
+    /// *different* type (`f 0` inside `f`'s `Box` specialization) has a different
+    /// key and is specialized anew instead — otherwise it would loop forever.
+    active_specializations: std.ArrayListUnmanaged(struct { generic: usize, spec: usize, key: []const u8 }) = .empty,
 
     /// Synchrony analysis (see `semantic/effects.zig`), computed once at the top
     /// of `compile`. Drives the fork-free lowering of `sync` function calls.
@@ -6519,6 +6527,10 @@ pub const IRCompiler = struct {
                 .null => null,
             },
             .identifier, .call => self.argFunctionType(arg) orelse self.resolveStaticType(arg),
+            // A field access (`v.value`) parses as a `.binary` member expression;
+            // its static type is the accessed field's type (needed so a recursive
+            // call `f v.value` re-specializes at the field's concrete type).
+            .binary => self.resolveStaticType(arg),
             else => null,
         };
     }
@@ -6593,6 +6605,80 @@ pub const IRCompiler = struct {
             },
             else => return null,
         }
+    }
+
+    /// The specialization cache key a call to `instr_set` with `arguments` would
+    /// produce — mirrors `maybeSpecialize`'s key computation but leaves
+    /// `type_captures` unchanged (saved and restored). Used to tell whether a
+    /// recursive call is at the same concrete type as the specialization currently
+    /// being compiled. Null when the callee isn't a specialization candidate.
+    fn specializationCallKey(self: *IRCompiler, instr_set: usize, arguments: []const *ast.Expression) Error!?[]const u8 {
+        const decl_ptr = self.comptime_fn_decls.get(instr_set) orelse return null;
+        const fn_decl = decl_ptr.*;
+        if (fn_decl.params != ._non_variadic) return null;
+        const params = fn_decl.params._non_variadic;
+        if (params.len != arguments.len) return null;
+
+        var capture_names = std.ArrayList([]const u8).empty;
+        defer capture_names.deinit(self.allocator);
+        var value_param_names = std.ArrayList([]const u8).empty;
+        defer value_param_names.deinit(self.allocator);
+        for (params) |param| {
+            if (comptimeTypeParamName(param)) |name| {
+                try capture_names.append(self.allocator, name);
+            } else if (comptimeValueParamName(param)) |name| {
+                try value_param_names.append(self.allocator, name);
+            } else if (param.type_annotation) |ann| {
+                try collectCapturesInType(ann.*, &capture_names, self.allocator);
+            }
+        }
+        if (capture_names.items.len == 0 and value_param_names.items.len == 0) return null;
+
+        var saved = std.ArrayList(?ast.TypeExpr).empty;
+        defer saved.deinit(self.allocator);
+        for (capture_names.items) |name| try saved.append(self.allocator, self.type_captures.get(name));
+        defer for (capture_names.items, saved.items) |name, prior| {
+            if (prior) |p| self.type_captures.put(self.allocator, name, p) catch {} else _ = self.type_captures.remove(name);
+        };
+        for (capture_names.items) |name| _ = self.type_captures.remove(name);
+
+        for (params, arguments) |param, arg| {
+            if (comptimeTypeParamName(param)) |name| {
+                const denoted = self.comptimeArgType(arg) orelse return null;
+                self.type_captures.put(self.allocator, name, denoted) catch {};
+                continue;
+            }
+            const ann = param.type_annotation orelse continue;
+            if (!hasTypeCapture(ann.*)) continue;
+            const arg_type = self.argTypeExpr(arg) orelse return null;
+            self.bindTypeCaptures(ann.*, arg_type);
+        }
+        for (capture_names.items) |name| {
+            const bound = self.type_captures.get(name) orelse return null;
+            if (bound == .type_var) return null;
+        }
+
+        var value_results = std.StringHashMapUnmanaged(Result).empty;
+        defer value_results.deinit(self.allocator);
+        for (params, arguments) |param, arg| {
+            const name = comptimeValueParamName(param) orelse continue;
+            const val = (try self.evalComptimeExpression(arg)) orelse return null;
+            if (val.source != .value) return null;
+            try value_results.put(self.allocator, name, val);
+        }
+
+        var key_writer = std.Io.Writer.Allocating.init(self.allocator);
+        defer key_writer.deinit();
+        try key_writer.writer.print("{}", .{instr_set});
+        for (capture_names.items) |name| {
+            try key_writer.writer.print("|{s}=", .{name});
+            try self.writeTypeName(&key_writer.writer, self.type_captures.get(name).?);
+        }
+        for (value_param_names.items) |name| {
+            try key_writer.writer.print("|{s}#", .{name});
+            try writeComptimeValueKey(&key_writer.writer, value_results.get(name).?);
+        }
+        return try self.allocator.dupe(u8, key_writer.written());
     }
 
     fn maybeSpecialize(
@@ -6693,8 +6779,10 @@ pub const IRCompiler = struct {
         const owned_key = try self.allocator.dupe(u8, key);
         const prev_specializing = self.specializing;
         const prev_generic = self.specializing_generic;
+        const prev_key = self.specializing_key;
         self.specializing = true;
         self.specializing_generic = instr_set;
+        self.specializing_key = owned_key;
         self.specialization_depth += 1;
         // Hand the comptime value constants to `compileFnDecl` (consumed while
         // setting up parameters, before any nested call can clobber them).
@@ -6705,11 +6793,13 @@ pub const IRCompiler = struct {
         const result = self.compileFnDecl(fn_source, fn_decl) catch |err| {
             self.specializing = prev_specializing;
             self.specializing_generic = prev_generic;
+            self.specializing_key = prev_key;
             self.specialization_depth -= 1;
             return err;
         };
         self.specializing = prev_specializing;
         self.specializing_generic = prev_generic;
+        self.specializing_key = prev_key;
         self.specialization_depth -= 1;
         const spec_instr_set = result.source.value.fn_ref.fn_addr.instr_set;
         try self.specializations.put(self.allocator, owned_key, spec_instr_set);
@@ -7895,12 +7985,29 @@ pub const IRCompiler = struct {
         const fn_ref = fn_ref_value.fn_ref;
         var fn_addr = fn_ref.fn_addr;
 
-        // A self-recursive call inside a specialization body: its callee resolves
-        // to the generic set, so redirect it to the specialization being compiled
-        // (it then recurses at the same concrete type).
+        // Reconcile a recursive call inside a specialization body with the active
+        // specializations. The callee resolves either to the generic set (an
+        // `again`/forward reference) or directly to the in-progress specialization
+        // (its own in-scope self binding). Either way the call must land on the set
+        // whose bound type matches the call's argument types:
+        //   * same-type recursion  → the active specialization (fast self-recurse);
+        //   * polymorphic recursion (a call to the same generic at a *different*
+        //     type, e.g. `f 0` at `Int` inside `f`'s `Box` body) → the generic set,
+        //     so `maybeSpecialize` below builds a fresh spec for that type. Left on
+        //     the current spec it would self-recurse forever at the wrong type.
+        // The in-progress spec isn't in the `specializations` cache yet, so this is
+        // the only place that can route a same-type recursion to it.
         for (self.active_specializations.items) |as| {
-            if (fn_addr.instr_set == as.generic) {
+            const resolves_to_generic = fn_addr.instr_set == as.generic;
+            const resolves_to_spec = fn_addr.instr_set == as.spec;
+            if (!resolves_to_generic and !resolves_to_spec) continue;
+            const call_key = (try self.specializationCallKey(as.generic, arguments)) orelse continue;
+            const same_type = std.mem.eql(u8, call_key, as.key);
+            if (resolves_to_generic and same_type) {
                 fn_addr = ir.InstructionAddr.initAbs(as.spec, 0);
+                break;
+            } else if (resolves_to_spec and !same_type) {
+                fn_addr = ir.InstructionAddr.initAbs(as.generic, 0);
                 break;
             }
         }
@@ -10522,7 +10629,7 @@ pub const IRCompiler = struct {
         // callee resolves to the generic set) recurses into this specialization.
         var pushed_active_specialization = false;
         if (self.specializing_generic) |generic| {
-            try self.active_specializations.append(self.allocator, .{ .generic = generic, .spec = instr_set });
+            try self.active_specializations.append(self.allocator, .{ .generic = generic, .spec = instr_set, .key = self.specializing_key orelse "" });
             self.specializing_generic = null;
             pushed_active_specialization = true;
         }

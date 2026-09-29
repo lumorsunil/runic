@@ -265,8 +265,10 @@ echo "${std.meta.eq p p}"        // 0  (true)
 
 Both are **one level** — `show` doesn't recurse into struct-typed fields, and
 `eq` compares them with `!=`'s own semantics — which is exact for structs of
-scalar/string fields. (A recursive `hash` over struct fields is blocked on a
-pre-existing call-capture bug; see `future/comptime-type-construction.md`.)
+scalar/string fields. A **recursive** variant (a `hash`/`show` that descends into
+struct-typed fields) is now unblocked: polymorphic recursion — a generic that
+calls itself at a different type per level, e.g. `f v.value` peeling a nested
+struct — specializes correctly per level instead of hanging.
 
 ## Language prerequisites for Phase 3
 
