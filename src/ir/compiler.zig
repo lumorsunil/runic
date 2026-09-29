@@ -3666,7 +3666,13 @@ pub const IRCompiler = struct {
         const arg_refs = try self.allocator.alloc(ir.Location, info.arguments.len);
         defer self.allocator.free(arg_refs);
         for (info.arguments, 0..) |arg, i| {
-            const r = try self.compileExpressionWithCapture(source, arg);
+            // A fn-typed parameter takes a function *value*: pass a bare
+            // fn-reference argument as its fn_ref rather than invoking it (a
+            // nullary reference would otherwise be called by the capture path).
+            const r = if (self.paramExpectsFnValue(forked_set, i))
+                (try self.compileFnValueArg(source, arg)) orelse try self.compileExpressionWithCapture(source, arg)
+            else
+                try self.compileExpressionWithCapture(source, arg);
             const ref = try self.newRef(source, "sync_arg");
             try self.set(source, ref, stableResultSource(r));
             arg_refs[i] = ref;
@@ -7701,6 +7707,43 @@ pub const IRCompiler = struct {
         return try self.buildClosureFnEnv(source, fn_addr, binding.type_expr);
     }
 
+    /// Whether the callee's parameter `i` is declared with a function type — so a
+    /// bare fn-reference argument there is a function *value*, not a call to
+    /// invoke. Reads the callee's recorded declaration.
+    fn paramExpectsFnValue(self: *IRCompiler, instr_set: usize, i: usize) bool {
+        const decl = self.comptime_fn_decls.get(instr_set) orelse return false;
+        const params = switch (decl.*.params) {
+            ._non_variadic => |p| p,
+            else => return false,
+        };
+        if (i >= params.len) return false;
+        const ann = (params[i].type_annotation) orelse return false;
+        return ann.* == .function;
+    }
+
+    /// Compiles an argument that names a function (`plain`, a nullary or paramful
+    /// fn reference) as a function *value* — its fn_ref, with a capture environment
+    /// when it has captures — without invoking it. For a fn-typed parameter this is
+    /// what's wanted (`apply plain`), where the plain call path would instead invoke
+    /// a nullary reference. Returns null when the argument doesn't name a function
+    /// (an inline `fn`/block expression is handled by the normal path).
+    fn compileFnValueArg(self: *IRCompiler, source: anytype, arg: *ast.Expression) Error!?Result {
+        const name = switch (arg.*) {
+            .identifier => |id| id.name,
+            .call => |c| if (c.arguments.len == 0 and c.callee.* == .identifier)
+                c.callee.identifier.name
+            else
+                return null,
+            else => return null,
+        };
+        const binding = self.lookup(name, .{ .shallow = false }) orelse return null;
+        if (!binding.result.isFunctionRef()) return null;
+        const fn_addr = binding.result.source.value.fn_ref.fn_addr;
+        try self.ensureFnBodyCompiled(fn_addr.instr_set);
+        if (try self.buildClosureFnEnv(source, fn_addr, binding.type_expr)) |closure| return closure;
+        return binding.result;
+    }
+
     /// Materializes a closure fn value: allocates the capture environment, copies
     /// each captured binding into it, and emits `make_closure_fn`. Returns null
     /// when the function captures nothing (the bare fn_ref is then the value).
@@ -7910,6 +7953,17 @@ pub const IRCompiler = struct {
         const captured_args = try self.allocator.alloc(?Result, arguments.len);
         defer self.allocator.free(captured_args);
         for (arguments, 0..) |arg, i| {
+            // A fn-typed parameter takes a function *value*: pass a bare
+            // fn-reference argument (`apply plain`) as its fn_ref instead of
+            // invoking it (a nullary reference would otherwise be called).
+            if (self.paramExpectsFnValue(fn_addr.instr_set, i)) {
+                if (try self.compileFnValueArg(source, arg)) |v| {
+                    const arg_ref = try self.newRef(source, "call_arg");
+                    try self.set(source, arg_ref, stableResultSource(v));
+                    captured_args[i] = .fromLocation(arg_ref.dereference().typed(v.typeExpr()));
+                    continue;
+                }
+            }
             if (self.argNeedsValueCapture(arg)) {
                 const captured = try self.compileExpressionWithCapture(source, arg);
                 const arg_ref = try self.newRef(source, "call_arg");

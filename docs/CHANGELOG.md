@@ -244,6 +244,15 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Fixed
 
+- **A function passed by *name* to a `fn()`-typed parameter is passed as a value,
+  not invoked at the call site.** `apply plain` (where `plain` is a nullary
+  function and `apply` takes a `fn() Int`) eagerly *called* `plain`, so the
+  parameter held the result (an `Int`) instead of the function — and the callee's
+  `yield f` then tried to invoke a non-function and failed (`UnsupportedInstruction`).
+  Both call paths (the fork-free sync call and the general fork call) now pass a
+  bare fn-reference argument as its fn value when the parameter's declared type is
+  a function, building a capture environment when it has one. Fixes passing a named
+  nested closure — capturing a `const` or `var` — to a higher-order function.
 - **A closure now captures a mutable `var` from its scope instead of reading
   empty.** A trailing-block / anonymous-fn closure that referenced an outer `var`
   used to render it empty: a `var` lives in a frame-relative closure cell the
