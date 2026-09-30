@@ -249,6 +249,19 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Fixed
 
+- **A recipe-typed struct literal can now be constructed directly in argument
+  position.** `f Partial{ … }` (a `@insert` / `for (@fields)` recipe struct built
+  inline as a call argument, with no annotated binding) previously arrived with
+  blank fields: a recipe struct declares no fields of its own, and the IR compiler
+  materialized its concrete layout only from a binding annotation
+  (`const p: Partial(T) = Partial{ … }`). A recipe struct argument is now
+  materialized against its **parameter type** — the argument-position analog of the
+  annotation path — so it builds the real layout on both call paths (the sync
+  fast-path and the fork path, including a generic callee). The static typo check
+  for such arguments already shipped; this closes the runtime side. (A recipe
+  parameter type that names a sibling `comptime T: type` param still can't
+  materialize inside the function body — a separate limitation; see
+  `future/comptime-type-construction.md`.)
 - **A generic function may now recurse polymorphically — at a different type each
   level — without hanging.** A `@kind`-guarded self-call such as `f 0` inside `f`'s
   `Box` specialization, or `depth v.value` peeling a nested `Box`, previously

@@ -1,0 +1,40 @@
+// A recipe-typed struct literal (`@insert` / `for (@fields)`) constructed
+// directly in *argument position* — `f Partial{ … }` with no annotated binding.
+// A recipe struct declares no fields of its own; its layout is materialized per
+// instantiation from its type arguments. Construction used to materialize only
+// from a binding annotation (`const p: Partial(T) = Partial{ … }`), so a bare
+// recipe literal passed as an argument built against the empty raw layout and
+// arrived with blank fields. The argument is now materialized against its
+// parameter type, exactly like the annotated-binding path — on both the sync
+// fast-path and the fork path (a generic callee).
+
+fn Pair(comptime T: type) type {
+  yield struct { @insert "a: T, b: T" }
+}
+
+fn Rec(comptime T: type) type { yield struct { a: T, b: T, c: T } }
+fn Partial(comptime T: type) type {
+  yield struct { for (@fields(T)) |f| @insert "${f.name}: ?${f.type}" }
+}
+
+// Sync fast-path callee (plain struct parameter).
+fn Void showPair(p: Pair(Int)) Void {
+  echo "pair: ${p.a} ${p.b}"
+}
+fn Void showPartial(p: Partial(Rec(Int))) Void {
+  echo "partial: ${p.a orelse -1} ${p.b orelse -1} ${p.c orelse -1}"
+}
+
+// Fork-path callee (a `|X|` capture keeps it off the sync fast-path).
+fn Void labelled(p: Partial(Rec(Int)), label: |X|) Void {
+  echo "${label}: ${p.a orelse -1} ${p.b orelse -1} ${p.c orelse -1}"
+}
+
+// Control: the annotated-binding path already worked.
+const bound: Partial(Rec(Int)) = Partial{ .a = 1, .b = 2, .c = 3 }
+showPartial bound
+
+// The fix: bare recipe literals built in argument position.
+showPair Pair{ .a = 10, .b = 20 }
+showPartial Partial{ .a = 4, .b = 5, .c = 6 }
+labelled Partial{ .a = 7, .b = 8, .c = 9 } "forked"

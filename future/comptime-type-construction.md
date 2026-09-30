@@ -36,13 +36,24 @@ extends to a recipe-ctor literal passed as a **call argument** (`f Partial{ … 
 the parameter's materialized type is pushed as the expected type, so the literal is
 validated the same way (`expectedMaterializedStruct` also accepts an
 already-resolved parameter struct, not only a written `Partial(…)` application).
-The remaining gaps are a **bare literal with no annotation *and* no context**
-(genuinely unresolvable — there are no type arguments to materialize from), and the
-*runtime* construction of a bare recipe literal in argument position, which the IR
-compiler still materializes only from a binding annotation (a separate, pre-existing
-gap — the static check catches typos, but a valid recipe-literal argument should be
-constructed via an annotated binding until the compiler materializes it in argument
-context too).
+**Runtime construction in argument position now works too.** A bare recipe literal
+passed as an argument (`f Partial{ … }`, no annotated binding) used to build against
+the empty raw recipe layout and arrive with blank fields — the IR compiler
+materialized a recipe only from a binding annotation. The argument is now
+materialized against its *parameter* type (`compileRecipeStructArg`, the
+argument-position analog of `compileBinding`'s annotation path), resolving the
+parameter's `type_application` through `resolveTypeApplication` and constructing
+against the concrete layout. This applies on both call paths — the sync fast-path
+and the fork path (a generic callee; the parameter annotations are read from the
+callee's *declared* set, since a recipe param type is concrete regardless of any
+specialization). The one remaining gap for argument construction is a **bare
+literal with no annotation *and* no context** (genuinely unresolvable — there are
+no type arguments to materialize from). Separately, a parameter whose recipe type
+names a `comptime T: type` param (`f(comptime T: type, p: Partial(T))`) still can't
+materialize *inside the function body* — `Partial(T)` has no concrete layout while
+`T` is an unbound type variable — so `p.a` there sees an empty struct; that is a
+body-side materialization limitation, independent of argument-position
+construction.
 
 **Increment 3 — reframed from `@code` to *comptime statement generation*.** The
 original increment 3 was `@code` (AST as a first-class value). On review, the

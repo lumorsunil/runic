@@ -3677,7 +3677,11 @@ pub const IRCompiler = struct {
             // A fn-typed parameter takes a function *value*: pass a bare
             // fn-reference argument as its fn_ref rather than invoking it (a
             // nullary reference would otherwise be called by the capture path).
-            const r = if (self.paramExpectsFnValue(forked_set, i))
+            // A recipe-typed struct literal is materialized against its parameter
+            // type first, so it builds the concrete layout, not the empty recipe.
+            const r = if (try self.compileRecipeStructArg(arg, forked_set, i)) |rec|
+                rec
+            else if (self.paramExpectsFnValue(forked_set, i))
                 (try self.compileFnValueArg(source, arg)) orelse try self.compileExpressionWithCapture(source, arg)
             else
                 try self.compileExpressionWithCapture(source, arg);
@@ -7823,6 +7827,38 @@ pub const IRCompiler = struct {
         return ann.* == .function;
     }
 
+    /// The declared type annotation of a callee's parameter `i`, or null when the
+    /// callee has no fixed-arity declaration or `i` is past its parameters.
+    fn paramDeclType(self: *IRCompiler, instr_set: usize, i: usize) ?*const ast.TypeExpr {
+        const decl = self.comptime_fn_decls.get(instr_set) orelse return null;
+        const params = switch (decl.*.params) {
+            ._non_variadic => |p| p,
+            else => return null,
+        };
+        if (i >= params.len) return null;
+        return params[i].type_annotation;
+    }
+
+    /// Constructs a recipe-typed struct literal passed as an argument
+    /// (`f Partial{ … }`) against the concrete layout its *parameter* type
+    /// materializes — the argument-position analog of the annotation-driven
+    /// materialization a `const p: Partial(T) = Partial{ … }` binding gets
+    /// (`compileBinding`). A recipe struct (`@insert` / `for (@fields)`) declares
+    /// no fields of its own, so without this the literal builds against the empty
+    /// raw layout and yields blank fields. Returns null when the argument is not a
+    /// recipe struct literal, or its parameter type does not materialize to a
+    /// struct (the normal argument path then applies).
+    fn compileRecipeStructArg(self: *IRCompiler, arg: *ast.Expression, instr_set: usize, i: usize) Error!?Result {
+        if (arg.* != .struct_literal) return null;
+        const raw = self.user_struct_types.get(arg.struct_literal.name.name) orelse return null;
+        if (raw.body_items.len == 0) return null;
+        const ann = self.paramDeclType(instr_set, i) orelse return null;
+        if (ann.* != .type_application) return null;
+        const materialized = self.resolveTypeApplication(ann.type_application) orelse return null;
+        if (materialized != .struct_type) return null;
+        return try self.compileStructValueLiteral(arg, materialized.struct_type, arg.struct_literal);
+    }
+
     /// Compiles an argument that names a function (`plain`, a nullary or paramful
     /// fn reference) as a function *value* — its fn_ref, with a capture environment
     /// when it has captures — without invoking it. For a fn-typed parameter this is
@@ -8072,6 +8108,19 @@ pub const IRCompiler = struct {
         const captured_args = try self.allocator.alloc(?Result, arguments.len);
         defer self.allocator.free(captured_args);
         for (arguments, 0..) |arg, i| {
+            // A recipe-typed struct literal argument (`f Partial{ … }`) is
+            // materialized against its parameter type, so it builds the concrete
+            // layout rather than the empty raw recipe (the argument-position analog
+            // of the annotation-driven materialization a binding gets). The
+            // parameter annotations live on the callee's *declared* set (its
+            // recipe params are concrete, independent of any specialization), so
+            // resolve against `fn_ref`'s set, not the post-specialization address.
+            if (try self.compileRecipeStructArg(arg, fn_ref.fn_addr.instr_set, i)) |rec| {
+                const arg_ref = try self.newRef(source, "call_arg");
+                try self.set(source, arg_ref, stableResultSource(rec));
+                captured_args[i] = .fromLocation(arg_ref.dereference().typed(rec.typeExpr()));
+                continue;
+            }
             // A fn-typed parameter takes a function *value*: pass a bare
             // fn-reference argument (`apply plain`) as its fn_ref instead of
             // invoking it (a nullary reference would otherwise be called).
