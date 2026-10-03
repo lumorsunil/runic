@@ -252,10 +252,14 @@ lookups are O(1) on average; a parallel ordered list preserves **insertion
 order** for `keys`/`values` (and `set` on an existing key keeps its position).
 Types resolve at comptime (generic constructors + monomorphization); the data
 operations run at runtime. Keys are compared with `==` and hashed by value, so
-`Int` and `String` keys work — a `String` is hashed over its bytes, so an
-interpolated key hashes identically to the same literal. The API is
-**immutable**, mirroring `arr.push`: `set`/`remove` return a new map. (The bucket
-count is fixed for now; resize-on-load-factor is a future refinement.)
+`Int`, `String`, and **one-level struct** keys work — a `String` is hashed over
+its bytes (an interpolated key hashes identically to the same literal), and a
+struct key is hashed structurally via `std.meta.hash` and matched with struct
+`==`, so two equal records are the same key (a coordinate `{ x, y }`, a small
+composite id, …). A struct key whose fields are themselves structs is not yet
+supported — keep struct keys one level deep. The API is **immutable**, mirroring
+`arr.push`: `set`/`remove` return a new map. (The bucket count is fixed for now;
+resize-on-load-factor is a future refinement.)
 
 | Signature | Result |
 | --- | --- |
@@ -294,6 +298,7 @@ emitted) and `for (@fields(T))` unrolls one copy per field.
 | --- | --- |
 | `show(v: T) String` | a struct as `{ name=value … }`, a scalar/string as itself |
 | `eq(a: T, b: T) Bool` | structural equality (a struct field-by-field, else `==`) |
+| `hash(v: T) Int` | a structural hash (a struct combines its fields', else the bytes of `${v}`) |
 
 ```rn
 fn Point(comptime E: type) type { yield struct { x: E, y: E } }
@@ -302,12 +307,19 @@ echo "${std.meta.show p}"        // { x=3 y=7 }
 echo "${std.meta.eq p p}"        // 0  (true)
 ```
 
-Both are **one level** — `show` doesn't recurse into struct-typed fields, and
-`eq` compares them with `!=`'s own semantics — which is exact for structs of
-scalar/string fields. A **recursive** variant (a `hash`/`show` that descends into
-struct-typed fields) is now unblocked: polymorphic recursion — a generic that
-calls itself at a different type per level, e.g. `f v.value` peeling a nested
-struct — specializes correctly per level instead of hanging.
+All three **recurse into struct-typed fields** — a struct-typed field is dumped,
+compared, or hashed by a recursive call at the field's own type (a polymorphic
+recursion that specializes per level, terminating at a scalar/string). So a nested
+struct shows its own bracketed form, compares deeply, and hashes deeply:
+
+```rn
+const Line = struct { from: Point(Int), to: Point(Int) }
+const l: Line = Line{ .from = Point{ .x = 1, .y = 2 }, .to = Point{ .x = 3, .y = 4 } }
+echo "${std.meta.show l}"        // { from={ x=1 y=2 } to={ x=3 y=4 } }
+```
+
+`hash` makes equal values (by `eq`) hash equal, which is what lets `std.map` take a
+struct key (see below).
 
 ## Language prerequisites for Phase 3
 

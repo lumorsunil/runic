@@ -3,8 +3,11 @@
 // association list scanned on collision. Iteration (`keys`/`values`) preserves
 // insertion order via a parallel ordered list; `set` on an existing key keeps
 // its original position. Keys are compared with `==` and hashed by value, so
-// `Int` and `String` keys work (a String is hashed over its bytes, so an
-// interpolated key hashes identically to the same literal).
+// `Int`, `String`, and **one-level struct** keys work — a String is hashed over
+// its bytes (an interpolated key hashes identically to the same literal), and a
+// struct key is hashed structurally via `std.meta.hash` and matched with struct
+// `==`, so two equal records are the same key. (A struct key whose fields are
+// themselves structs is not yet supported — see `bucketFor`.)
 //
 // Updates copy once with `arr.with` (O(n)) rather than rebuilding via a push
 // loop (O(n²)), so `set` stays O(buckets + n).
@@ -24,16 +27,29 @@
 // makes every `set` slower — see future/maps-plan.md.
 fn Void @() Void
 
+const meta = import "std/meta"
+
 fn Entry(comptime K: type, comptime V: type) type { yield struct { key: K, value: V } }
 fn Bucket(comptime K: type, comptime V: type) type { yield struct { entries: []Entry(K)(V) } }
 fn Map(comptime K: type, comptime V: type) type { yield struct { buckets: []Bucket(K)(V), order: []Entry(K)(V) } }
 
-// The bucket a key falls into for a map of `count` buckets: an Int in
-// [0, count). Strings are hashed over their bytes with a polynomial rolling hash
+// The bucket a key falls into for a map of `count` buckets: an Int in [0, count).
+// A **struct** key is hashed structurally with `std.meta.hash`, so a composite
+// key (a record of scalars/strings — e.g. a coordinate `{ x, y }`) works and two
+// `==`-equal structs land in the same bucket. The `@kind(K)` test folds at compile
+// time, so a struct key never reaches the `key % count` branch (invalid on a
+// struct). Strings are hashed over their bytes with a polynomial rolling hash
 // (Runic has no bitwise ops, so `*`/`+`/`%` only); Ints hash to themselves. `%`
 // with a positive divisor is non-negative.
+//
+// LIMITATION: a key whose fields are *themselves* structs (a deeply nested struct
+// key) is not yet supported — such a key currently fails to specialize this
+// function and falls through to `key % count`. Keep struct keys one level deep
+// (fields are scalars/strings). See future/maps-plan.md.
 fn Void bucketFor(key: |K|, count: Int) Int {
-  if (key is String) {
+  if (@kind(K) == "struct") {
+    yield (meta.hash key) % count
+  } else if (key is String) {
     var h = 0
     for (key.bytes) |b| { h = h * 31 + b; h = h % 1000000007 }
     yield h % count

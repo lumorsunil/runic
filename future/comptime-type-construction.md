@@ -133,8 +133,20 @@ that descends into struct-typed fields) hung forever: inside a specialization th
 recursive callee resolved to the in-progress spec and never re-specialized for the
 new type. **Fixed** — each recursive call is reconciled against the active
 specializations by its argument-type key, so a different-type call re-routes
-through the generic and specializes anew. Recursive `std.meta`/`std.map` struct-key
-support is no longer blocked on the language.
+through the generic and specializes anew. On that fix, `std.meta.show`/`eq`/`hash`
+now **recurse** into struct-typed fields (deep dump/equality/hash), and `std.map`
+takes a **one-level** struct key (hashed via `std.meta.hash`, matched with struct
+`==`).
+
+A **deeper** case remains open: a struct key whose fields are *themselves* structs.
+Through `std.map.set` the inner `bucketFor` generic then fails to specialize for the
+nested key type and falls through to `key % count` (an error on a struct); and a
+sibling formulation that calls the hash unconditionally instead corrupts a
+struct-keyed entry array on the *second* `set` (a stack overflow materializing a
+heap sequence). Both point at a remaining instability specializing a generic whose
+body recursively specializes *another* generic (`bucketFor` → `std.meta.hash` →
+itself) within a surrounding specialization (`std.map.set`) — narrower than the
+original recursion hang, but not yet root-caused. See future/maps-plan.md.
 
 ## Increment 2 — attempted, and what it actually requires (findings)
 

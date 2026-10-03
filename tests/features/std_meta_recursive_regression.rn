@@ -1,0 +1,28 @@
+// std.meta.show / eq / hash recursing into struct-typed fields. Each is a
+// generic monomorphized per type; a struct-typed field recurses at the field's
+// own type (a polymorphic recursion that specializes per level) while a
+// scalar/string field terminates. This exercises the generic polymorphic
+// recursion the compiler now supports.
+const std = import "std"
+
+const Point = struct { x: Int, y: Int }
+const Line = struct { from: Point, to: Point, label: String }
+
+const p = Point{ .x = 1, .y = 2 }
+const l = Line{ .from = Point{ .x = 1, .y = 2 }, .to = Point{ .x = 3, .y = 4 }, .label = "seg" }
+
+// show: nested structs render their own bracketed form.
+echo "show p: ${std.meta.show p}"
+echo "show l: ${std.meta.show l}"
+echo "show scalar: ${std.meta.show 42}"
+
+// eq: deep structural equality.
+const l2 = Line{ .from = Point{ .x = 1, .y = 2 }, .to = Point{ .x = 3, .y = 4 }, .label = "seg" }
+const l3 = Line{ .from = Point{ .x = 1, .y = 2 }, .to = Point{ .x = 9, .y = 4 }, .label = "seg" }
+echo "eq l l2: ${std.meta.eq l l2}"
+echo "eq l l3: ${std.meta.eq l l3}"
+echo "eq scalars: ${std.meta.eq 5 5}"
+
+// hash: equal values hash equal; different values (usually) differ.
+echo "hash eq: ${std.meta.hash l == std.meta.hash l2}"
+echo "hash ne: ${std.meta.hash l == std.meta.hash l3}"

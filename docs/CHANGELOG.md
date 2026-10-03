@@ -23,6 +23,17 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Added
 
+- **`std.meta.hash(v) Int`** — a structural hash: a struct combines its fields'
+  hashes, a scalar/string hashes the bytes of its textual form. Recurses into
+  struct-typed fields, so it is a deep hash (equal values by `std.meta.eq` hash
+  equal). `std.meta.show` and `std.meta.eq` now **recurse** into struct-typed
+  fields too (a nested struct shows its own bracketed form and compares deeply),
+  via the polymorphic generic recursion the compiler now supports.
+- **`std.map` one-level struct keys.** A map key may now be a struct whose fields
+  are scalars/strings (a coordinate `{ x, y }`, a small composite id): it is hashed
+  structurally with `std.meta.hash` and matched with struct `==`. (`Int`/`String`
+  keys are unchanged.) A key whose fields are *themselves* structs is not yet
+  supported — it fails to specialize the bucket-hash path; see future/maps-plan.md.
 - **`std.control`** — control-flow combinators that take a trailing block:
   `retry(times, body: fn() Bool) Bool` runs the body until it yields true (stopping
   early on success) and reports whether it eventually succeeded;

@@ -224,7 +224,16 @@ A prototype (`Entry`/`Map` + `set`/`get`) compiles down to one concrete gap:
 ## Open questions
 
 - **Key types beyond `Int`/`String`:** how far to push generic equality (structs,
-  arrays). Start with what `==` supports; document the limit.
+  arrays). Start with what `==` supports; document the limit. **Update:** a
+  **one-level** struct key now works — `bucketFor` hashes it with `std.meta.hash`
+  (a deep structural hash) and `set`/`get` match with struct `==` (which is
+  structural). A struct key whose fields are *themselves* structs is **not yet
+  supported**: through `std.map.set`, the `bucketFor` generic fails to specialize
+  for the nested key type and falls through to `key % count` (an error on a
+  struct). A variant that hashes unconditionally (no `@kind` guard) instead stack-
+  overflows materializing a struct-keyed entry array on the second `set`. Both are
+  the nested-generic-within-specialization instability noted in
+  future/comptime-type-construction.md — the remaining blocker for deep struct keys.
 - ~~**Immutable vs mutable API** (or both).~~ Resolved: both — immutable
   `set`/`remove` and mutable `setIn`/`removeIn`.
 - **Iteration order:** insertion order (an association list preserves it for free).
