@@ -63,3 +63,26 @@ pub fn Void cwd() String {
   const d: String = "${pwd}"
   yield d.trim
 }
+
+// Create a fresh temporary directory, run `body` with it as the working
+// directory (a *trailing block* capturing its enclosing scope), then restore the
+// previous directory and delete the temp tree — even the clean-up path always
+// runs after the block. Use it to scope throwaway work:
+//   std.fs.withTempDir {
+//     mkdir "sub"; touch "sub/a.txt"
+//     echo "made ${ls "sub"}"
+//   }
+// The block operates in the temp dir via the process working directory, so
+// child-process commands (`mkdir`, `touch`, `cp`, `git`, …) land there. NOTE: a
+// shell redirect (`echo "x" > f`) currently writes relative to the process's
+// original directory, not the temp dir — create files with commands inside the
+// block, or use an absolute path.
+pub fn Void withTempDir(body: fn() Void) Void {
+  const made: String = "${mktemp "-d"}"
+  const dir = made.trim
+  const prev = cwd
+  cd dir
+  body
+  cd prev
+  rm "-rf" dir
+}

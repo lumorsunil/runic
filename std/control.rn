@@ -1,0 +1,41 @@
+// std.control — control-flow combinators that take a *trailing block* (a nullary
+// closure capturing its enclosing scope), so a common loop/retry pattern reads
+// like a built-in:
+//
+//   const ok = std.control.retry 3 { yield (fetch url).exit_code == 0 }
+//   std.control.repeat 3 { echo "tick" }
+//
+// The block runs when the combinator invokes it; it sees the variables in scope
+// where the `{ … }` is written.
+fn Void @() Void
+
+// Run `body` up to `times` times, stopping once it yields true; yield whether it
+// eventually succeeded. The body is a `fn () Bool` closure — a flaky step whose
+// success it reports:
+//   const ok = std.control.retry 5 { yield (curl "-fsS" url).exit_code == 0 }
+// Once a run succeeds the body is not invoked again (the remaining iterations are
+// skipped). `times <= 0` runs it zero times and yields false.
+pub fn Void retry(times: Int, body: fn() Bool) Bool {
+  var ok = false
+  var i = 0
+  while (i < times) {
+    if (ok) {
+      // already succeeded — do not run the body again
+    } else {
+      ok = body
+    }
+    i = i + 1
+  }
+  yield ok
+}
+
+// Run `body` exactly `n` times (a `fn () Void` closure). `n <= 0` runs it zero
+// times. Unlike a bare `for (0..n)`, the count is an ordinary value and the body
+// is a closure, so it composes where a loop header cannot.
+pub fn Void repeat(n: Int, body: fn() Void) Void {
+  var i = 0
+  while (i < n) {
+    body
+    i = i + 1
+  }
+}

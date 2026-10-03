@@ -77,6 +77,7 @@ surfaces that will churn.
 | `std.testing` | Assertions for `.rn` module and CLI smoke tests.                          |
 | `std.map`     | A generic hashed key/value map (immutable + mutable APIs).                 |
 | `std.meta`    | Comptime-derived structural operations over any value (`show`, `eq`).      |
+| `std.control` | Control-flow combinators that take a trailing block (`retry`, `repeat`).   |
 
 **Conventions.** Functions use the space-call form (`std.list.map xs f`), camelCase
 names, and explicit input/output types. A fallible operation returns an **error
@@ -162,6 +163,14 @@ return `ExecutableError!…` so callers use `catch`/`try`.
 | `mkdirp(p: String) ExecutableError!Void` | `mkdir -p` | create dirs |
 | `remove(p: String) ExecutableError!Void` | `rm -rf` | delete |
 | `cwd() String` | builtin `pwd` | current directory |
+| `withTempDir(body: fn() Void) Void` | `mktemp -d` + `cd` + `rm -rf` | run the trailing block in a throwaway directory |
+
+`withTempDir` runs its trailing block with a fresh temp directory as the working
+directory, then restores the previous directory and deletes the tree. The block
+operates there via the process working directory, so **child-process commands**
+(`mkdir`, `touch`, `cp`, `git`, …) land in the temp dir. A shell redirect
+(`echo "x" > f`) currently writes relative to the process's original directory,
+not the temp dir — create files with commands inside the block, or an absolute path.
 
 > **Note.** An earlier `std.process` module (helpers around a command's
 > `ExecutableError!String` value view) was **dropped** pending a rethink of the
@@ -193,6 +202,7 @@ Runic; the Float functions are backed by **new builtins** (see prerequisites).
 | `assertEq(a: T, b: T, msg: String) Void` | abort if `a != b` |
 | `assertContains(s: String, sub: String) Void` | abort if `s` lacks `sub` |
 | `check(msg: String, cond: fn() Bool) Void` | abort unless the trailing block yields true |
+| `group(label: String, body: fn() Void) Void` | print a header, then run the trailing block of checks |
 | `fail(msg: String) Void` | unconditional abort |
 
 `check` takes its condition as a **trailing block** (a `fn () Bool` closure), so a
@@ -204,6 +214,35 @@ std.testing.check "list stays sorted" {
   yield xs[0] <= xs[xs.len - 1]
 }
 ```
+
+`group` wraps a set of assertions in a labeled section — a header then the block
+(a `fn () Void`). It is organizational: a failing assertion inside still aborts the
+run; it does not catch or count failures.
+
+```rn
+std.testing.group "arithmetic" {
+  std.testing.assertEq (add 2 3) 5 "sum"
+  std.testing.assert (10 > 5) "greater"
+}
+```
+
+### `std.control`
+
+Control-flow combinators that take a **trailing block** (a nullary closure
+capturing its enclosing scope), so a loop/retry pattern reads like a built-in.
+
+| Signature | Behavior |
+| --- | --- |
+| `retry(times: Int, body: fn() Bool) Bool` | run `body` up to `times` times, stopping once it yields true; yield whether it eventually succeeded |
+| `repeat(n: Int, body: fn() Void) Void` | run `body` exactly `n` times |
+
+```rn
+const ok = std.control.retry 5 { yield (curl "-fsS" url).exit_code == 0 }
+std.control.repeat 3 { echo "tick" }
+```
+
+Once `retry`'s body succeeds it is not invoked again. Both treat a non-positive
+count as zero runs (`retry` then yields false).
 
 ### `std.map`
 

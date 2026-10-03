@@ -23,6 +23,19 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Added
 
+- **`std.control`** — control-flow combinators that take a trailing block:
+  `retry(times, body: fn() Bool) Bool` runs the body until it yields true (stopping
+  early on success) and reports whether it eventually succeeded;
+  `repeat(n, body: fn() Void)` runs the body a fixed number of times. Both read like
+  built-in loop/retry constructs and capture the enclosing scope.
+- **`std.testing.group "label" { … }`** — a labeled section wrapping a block of
+  assertions (a `fn () Void` trailing closure): it prints a header then runs the
+  block. Organizational only — a failing assertion inside still aborts the run.
+- **`std.fs.withTempDir { … }`** — runs the trailing block with a fresh temporary
+  directory as the working directory, then restores the previous directory and
+  deletes the tree. Child-process commands inside the block (`mkdir`, `touch`, `git`,
+  …) operate in the temp dir; a shell redirect still targets the original directory
+  (documented caveat).
 - **`std.testing.check "msg" { yield … }`** — a trailing-block assertion. The
   condition is a `fn () Bool` closure, so a multi-step check reads like a built-in
   block construct and captures its enclosing scope; it aborts (stderr + nonzero

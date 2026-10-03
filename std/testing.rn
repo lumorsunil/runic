@@ -37,6 +37,20 @@ pub fn Void check(msg: String, cond: fn() Bool) Void {
   }
 }
 
+// Run a labeled group of checks as a *trailing block*, printing a header first,
+// so related assertions read as a titled section:
+//   std.testing.group "arithmetic" {
+//     std.testing.assertEq (add 2 3) 5 "sum"
+//     std.testing.assert (10 > 5) "greater"
+//   }
+// The block is a `fn () Void` closure capturing its enclosing scope; a failing
+// assertion inside it still aborts the whole run. Purely organizational — it
+// adds a header and runs the block, it does not catch or count failures.
+pub fn Void group(label: String, body: fn() Void) Void {
+  echo "── ${label}"
+  body
+}
+
 // Abort with `msg` unless `a` equals `b` (scalar/string equality).
 pub fn Void assertEq(a: |T|, b: T, msg: String) Void {
   if (a == b) {

@@ -1,0 +1,31 @@
+// Standard-library control-flow constructs built on trailing-block closures:
+// std.testing.group (a labeled section), std.control.retry / std.control.repeat
+// (flow combinators), and std.fs.withTempDir (a scoped working directory). Each
+// takes a `{ … }` block that captures its enclosing scope and runs when the
+// construct invokes it.
+const std = import "std"
+
+// A labeled group of assertions — header then the block (a `fn () Void`).
+std.testing.group "math" {
+  std.testing.assertEq (std.math.max 3 7) 7 "max"
+  std.testing.assert (std.math.min 3 7 == 3) "min"
+  echo "  ok"
+}
+
+// retry yields whether the body eventually succeeds (true → exit code 0).
+const win = std.control.retry 3 { yield true }
+echo "retry win=${win}"
+const lose = std.control.retry 2 { yield false }
+echo "retry lose=${lose}"
+
+// repeat runs the body a fixed number of times.
+std.control.repeat 3 { echo "tick" }
+
+// withTempDir runs the block inside a throwaway directory (child-process
+// commands land there), then restores the prior directory and deletes the tree.
+std.fs.withTempDir {
+  mkdir "d"
+  touch "d/f.txt"
+  echo "temp: ${ls "d"}"
+}
+echo "done"

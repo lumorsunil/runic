@@ -28,6 +28,7 @@ pub const modules = [_]Module{
     .{ .path = ":std/testing", .source = @embedFile("std/testing.rn") },
     .{ .path = ":std/map", .source = @embedFile("std/map.rn") },
     .{ .path = ":std/meta", .source = @embedFile("std/meta.rn") },
+    .{ .path = ":std/control", .source = @embedFile("std/control.rn") },
     .{ .path = ":std/ffi", .source = @embedFile("std/ffi.rn") },
 };
 
