@@ -741,18 +741,55 @@ pub const IREvaluator = struct {
         };
     }
 
+    /// A sequence-length header read out of its heap cell behaves as an ordinary
+    /// `Int` everywhere except `maybeHeapSequenceLen` (which reads the raw cell
+    /// directly). Normalizing `.seq_len` → `.integer` on every *location* read
+    /// keeps the distinct tag confined to the heap: `.len`, arithmetic, indexing
+    /// and comparison all see a plain integer. A `.value` source is never
+    /// normalized — that is how the header is first written.
+    inline fn normSeqLen(v: ir.Value) ir.Value {
+        return switch (v) {
+            .seq_len => |n| .{ .integer = n },
+            else => v,
+        };
+    }
+
+    /// Reads an array's length header, accepting either the `.seq_len` tag (the
+    /// canonical form) or a plain `.integer` (headers written by an internal path
+    /// not yet migrated to `.seq_len`). Array ops and `join` know their operand is
+    /// an array, so they accept both; only `maybeHeapSequenceLen` — which must
+    /// *distinguish* an array from a struct — insists on the `.seq_len` tag.
+    inline fn seqLen(v: ir.Value) i64 {
+        return switch (v) {
+            .seq_len, .integer => |n| n,
+            else => unreachable,
+        };
+    }
+
     fn resolveValueSource(
         self: IREvaluator,
         thread: ir.context.IRThreadContext,
         value_source: ir.ValueSource,
     ) ResolveLocationError!ir.Value {
         return switch (value_source) {
-            .location => |loc| self.resolveLocation(thread, loc),
+            .location => |loc| normSeqLen(try self.resolveLocation(thread, loc)),
             .value => |value| value,
         };
     }
 
     fn tryResolveFastValueSource(
+        self: *IREvaluator,
+        thread: ir.context.IRThreadContext,
+        value_source: ir.ValueSource,
+    ) ResolveLocationError!?ir.Value {
+        const raw = (try self.tryResolveFastValueSourceRaw(thread, value_source)) orelse return null;
+        return switch (value_source) {
+            .location => normSeqLen(raw),
+            .value => raw,
+        };
+    }
+
+    fn tryResolveFastValueSourceRaw(
         self: *IREvaluator,
         thread: ir.context.IRThreadContext,
         value_source: ir.ValueSource,
@@ -1597,7 +1634,7 @@ pub const IREvaluator = struct {
                 if (str_op.op == .join) {
                     const arr = try self.resolveValueSource(thread, str_op.operand);
                     const base = arr.addr;
-                    const count: usize = @intCast(thread.shared.heapGet(base).?.integer);
+                    const count: usize = @intCast(seqLen(thread.shared.heapGet(base).?));
                     var jsep = std.Io.Writer.Allocating.init(self.allocator);
                     defer jsep.deinit();
                     try self.materializeString(thread, try self.resolveValueSource(thread, str_op.arg0), &jsep.writer);
@@ -1687,7 +1724,7 @@ pub const IREvaluator = struct {
                         // (owned) string parts.
                         const base_val = try thread.shared.alloc(self.allocator, parts.items.len + 1);
                         const base = base_val.addr;
-                        thread.shared.heapGetPtr(base).?.* = .{ .integer = @intCast(parts.items.len) };
+                        thread.shared.heapGetPtr(base).?.* = .{ .seq_len = @intCast(parts.items.len) };
                         for (parts.items, 0..) |part, i| {
                             thread.shared.heapGetPtr(base + 1 + i).?.* = .{ .zig_string = try self.allocator.dupe(u8, part) };
                         }
@@ -1699,7 +1736,7 @@ pub const IREvaluator = struct {
                         // Runic (e.g. a string hash) without char indexing.
                         const base_val = try thread.shared.alloc(self.allocator, s.len + 1);
                         const base = base_val.addr;
-                        thread.shared.heapGetPtr(base).?.* = .{ .integer = @intCast(s.len) };
+                        thread.shared.heapGetPtr(base).?.* = .{ .seq_len = @intCast(s.len) };
                         for (s, 0..) |byte, i| {
                             thread.shared.heapGetPtr(base + 1 + i).?.* = .{ .integer = @intCast(byte) };
                         }
@@ -1715,12 +1752,12 @@ pub const IREvaluator = struct {
                 const value = try self.resolveValueSource(thread, ap.value);
                 // An empty/absent array (`.void`) starts a fresh one.
                 const len: usize = if (arr == .addr)
-                    @intCast(thread.shared.heapGet(arr.addr).?.integer)
+                    @intCast(seqLen(thread.shared.heapGet(arr.addr).?))
                 else
                     0;
                 const new_base = try thread.shared.alloc(self.allocator, len + 2);
                 const nb = new_base.addr;
-                thread.shared.heapGetPtr(nb).?.* = .{ .integer = @intCast(len + 1) };
+                thread.shared.heapGetPtr(nb).?.* = .{ .seq_len = @intCast(len + 1) };
                 if (arr == .addr) {
                     for (0..len) |i| thread.shared.heapGetPtr(nb + 1 + i).?.* = thread.shared.heapGet(arr.addr + 1 + i).?;
                 }
@@ -1732,7 +1769,7 @@ pub const IREvaluator = struct {
                 const arr = try self.resolveValueSource(thread, ap.array);
                 const value = try self.resolveValueSource(thread, ap.value);
                 const len: usize = if (arr == .addr)
-                    @intCast(thread.shared.heapGet(arr.addr).?.integer)
+                    @intCast(seqLen(thread.shared.heapGet(arr.addr).?))
                 else
                     0;
                 const cap: usize = if (arr == .addr)
@@ -1743,7 +1780,7 @@ pub const IREvaluator = struct {
                     // Spare capacity: append in place (O(1)). The array is linear,
                     // so no other reference observes the mutation.
                     thread.shared.heapGetPtr(arr.addr + 1 + len).?.* = value;
-                    thread.shared.heapGetPtr(arr.addr).?.* = .{ .integer = @intCast(len + 1) };
+                    thread.shared.heapGetPtr(arr.addr).?.* = .{ .seq_len = @intCast(len + 1) };
                     try self.setLocation(thread, ap.result, arr);
                     return .cont;
                 }
@@ -1752,7 +1789,7 @@ pub const IREvaluator = struct {
                 const new_cap = if (cap < 4) @as(usize, 4) else cap * 2;
                 const new_base = try thread.shared.alloc(self.allocator, new_cap + 1);
                 const nb = new_base.addr;
-                thread.shared.heapGetPtr(nb).?.* = .{ .integer = @intCast(len + 1) };
+                thread.shared.heapGetPtr(nb).?.* = .{ .seq_len = @intCast(len + 1) };
                 if (arr == .addr) {
                     for (0..len) |i| thread.shared.heapGetPtr(nb + 1 + i).?.* = thread.shared.heapGet(arr.addr + 1 + i).?;
                 }
@@ -1766,13 +1803,13 @@ pub const IREvaluator = struct {
                 const index = try self.resolveValueSource(thread, as.index);
                 const value = try self.resolveValueSource(thread, as.value);
                 const len: usize = if (arr == .addr)
-                    @intCast(thread.shared.heapGet(arr.addr).?.integer)
+                    @intCast(seqLen(thread.shared.heapGet(arr.addr).?))
                 else
                     0;
                 // Copy the array once, then overwrite the one element (if in range).
                 const new_base = try thread.shared.alloc(self.allocator, len + 1);
                 const nb = new_base.addr;
-                thread.shared.heapGetPtr(nb).?.* = .{ .integer = @intCast(len) };
+                thread.shared.heapGetPtr(nb).?.* = .{ .seq_len = @intCast(len) };
                 if (arr == .addr) {
                     for (0..len) |i| thread.shared.heapGetPtr(nb + 1 + i).?.* = thread.shared.heapGet(arr.addr + 1 + i).?;
                 }
@@ -1785,7 +1822,7 @@ pub const IREvaluator = struct {
             .array_slice => |sl| {
                 const arr = try self.resolveValueSource(thread, sl.array);
                 const len: i64 = if (arr == .addr)
-                    thread.shared.heapGet(arr.addr).?.integer
+                    seqLen(thread.shared.heapGet(arr.addr).?)
                 else
                     0;
                 const start_raw = (try self.resolveValueSource(thread, sl.start)).integer;
@@ -1796,7 +1833,7 @@ pub const IREvaluator = struct {
                 const out_len: usize = @intCast(hi - lo);
                 const new_base = try thread.shared.alloc(self.allocator, out_len + 1);
                 const nb = new_base.addr;
-                thread.shared.heapGetPtr(nb).?.* = .{ .integer = @intCast(out_len) };
+                thread.shared.heapGetPtr(nb).?.* = .{ .seq_len = @intCast(out_len) };
                 if (arr == .addr) {
                     for (0..out_len) |i| {
                         thread.shared.heapGetPtr(nb + 1 + i).?.* =
@@ -1809,11 +1846,11 @@ pub const IREvaluator = struct {
             .array_concat => |cc| {
                 const a = try self.resolveValueSource(thread, cc.left);
                 const b = try self.resolveValueSource(thread, cc.right);
-                const a_len: usize = if (a == .addr) @intCast(thread.shared.heapGet(a.addr).?.integer) else 0;
-                const b_len: usize = if (b == .addr) @intCast(thread.shared.heapGet(b.addr).?.integer) else 0;
+                const a_len: usize = if (a == .addr) @intCast(seqLen(thread.shared.heapGet(a.addr).?)) else 0;
+                const b_len: usize = if (b == .addr) @intCast(seqLen(thread.shared.heapGet(b.addr).?)) else 0;
                 const new_base = try thread.shared.alloc(self.allocator, a_len + b_len + 1);
                 const nb = new_base.addr;
-                thread.shared.heapGetPtr(nb).?.* = .{ .integer = @intCast(a_len + b_len) };
+                thread.shared.heapGetPtr(nb).?.* = .{ .seq_len = @intCast(a_len + b_len) };
                 if (a == .addr) for (0..a_len) |i| {
                     thread.shared.heapGetPtr(nb + 1 + i).?.* = thread.shared.heapGet(a.addr + 1 + i).?;
                 };
@@ -1828,7 +1865,7 @@ pub const IREvaluator = struct {
                 const index = try self.resolveValueSource(thread, as.index);
                 const value = try self.resolveValueSource(thread, as.value);
                 if (arr == .addr and index == .integer and index.integer >= 0) {
-                    const len: usize = @intCast(thread.shared.heapGet(arr.addr).?.integer);
+                    const len: usize = @intCast(seqLen(thread.shared.heapGet(arr.addr).?));
                     if (index.integer < len) {
                         // Linear array: write the element in place (O(1)).
                         thread.shared.heapGetPtr(arr.addr + 1 + @as(usize, @intCast(index.integer))).?.* = value;
@@ -2805,7 +2842,10 @@ pub const IREvaluator = struct {
         };
         const heap_value = try self.heapValueAt(heap_addr);
         return switch (heap_value) {
-            .integer => |len| .{ .heap_addr = heap_addr, .len = @intCast(len) },
+            // Only a `.seq_len` header marks an actual array. A struct whose first
+            // field is a plain `.integer` is NOT a sequence (that ambiguity used to
+            // make a struct render — and hash — as a bogus array).
+            .seq_len => |len| .{ .heap_addr = heap_addr, .len = @intCast(len) },
             else => null,
         };
     }
@@ -2963,7 +3003,7 @@ pub const IREvaluator = struct {
                 const string = try self.getSlice(slice);
                 try w.writeAll(string);
             },
-            inline .integer, .float => |t| try w.print("{}", .{t}),
+            inline .integer, .seq_len, .float => |t| try w.print("{}", .{t}),
             .addr => |addr| {
                 if (try self.maybeHeapSequenceLen(addr)) |seq| {
                     // Default array→string coercion renders bracketed and

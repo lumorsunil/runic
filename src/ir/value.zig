@@ -16,6 +16,14 @@ pub const Value = union(enum) {
     /// The language `Int` — a signed 64-bit integer. (Addresses/handles use the
     /// dedicated `.addr`/`.pipe`/… arms; this is the numeric value type.)
     integer: i64,
+    /// A heap *sequence* (array) length header, stored in the array's first heap
+    /// cell. Semantically an integer length, but a *distinct* tag so the string
+    /// materializer can tell an array (`[len, e0, …]`) apart from a struct
+    /// (`[f0, …]`), which is otherwise byte-identical when the first field is an
+    /// integer. Normalized to `.integer` whenever read through a location (so it
+    /// behaves as a plain `Int` for `.len`, arithmetic, indexing, …); only the
+    /// direct heap reads in the array ops and `maybeHeapSequenceLen` see the tag.
+    seq_len: i64,
     // TODO: decide on f32 or f64?
     float: f64,
     slice: Slice,

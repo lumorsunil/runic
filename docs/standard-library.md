@@ -252,14 +252,14 @@ lookups are O(1) on average; a parallel ordered list preserves **insertion
 order** for `keys`/`values` (and `set` on an existing key keeps its position).
 Types resolve at comptime (generic constructors + monomorphization); the data
 operations run at runtime. Keys are compared with `==` and hashed by value, so
-`Int`, `String`, and **one-level struct** keys work — a `String` is hashed over
-its bytes (an interpolated key hashes identically to the same literal), and a
-struct key is hashed structurally via `std.meta.hash` and matched with struct
-`==`, so two equal records are the same key (a coordinate `{ x, y }`, a small
-composite id, …). A struct key whose fields are themselves structs is not yet
-supported — keep struct keys one level deep. The API is **immutable**, mirroring
-`arr.push`: `set`/`remove` return a new map. (The bucket count is fixed for now;
-resize-on-load-factor is a future refinement.)
+`Int`, `String`, and **struct** keys (at any nesting depth) work — a `String` is
+hashed over its bytes (an interpolated key hashes identically to the same
+literal), and a struct key is hashed structurally via `std.meta.hash` (which
+recurses into struct-typed fields) and matched with struct `==`, so two equal
+records are the same key (a coordinate `{ x, y }`, a nested `{ a: Point, b: Point }`,
+…). The API is **immutable**, mirroring `arr.push`: `set`/`remove` return a new
+map. (The bucket count is fixed for now; resize-on-load-factor is a future
+refinement.)
 
 | Signature | Result |
 | --- | --- |

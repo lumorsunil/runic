@@ -4,7 +4,7 @@ a.len=2 b.len=3
 str=xyz
 empty=2:7
 struct=2
-acc=4:1
+acc=4:3
 iter=10
 iter=20
 iter=30

@@ -5,4 +5,8 @@ has (3,4): 0
 has (9,9): 1
 len: 2
 named: first
+edge e1: e1b
+edge e2: e2
+edge miss: ?
+edge len: 2
 int key: seven

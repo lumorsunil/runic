@@ -223,23 +223,15 @@ A prototype (`Entry`/`Map` + `set`/`get`) compiles down to one concrete gap:
 
 ## Open questions
 
-- **Key types beyond `Int`/`String`:** how far to push generic equality (structs,
-  arrays). Start with what `==` supports; document the limit. **Update:** a
-  **one-level** struct key now works — `bucketFor` hashes it with `std.meta.hash`
-  (a deep structural hash) and `set`/`get` match with struct `==` (which is
-  structural). A struct key whose fields are *themselves* structs is **not yet
-  supported**: through `std.map.set`, the `bucketFor` generic fails to specialize
-  for the nested key type and falls through to `key % count` (an error on a
-  struct). A variant that hashes unconditionally (no `@kind` guard) instead failed
-  on the second `set`. **Root-caused** (see future/comptime-type-construction.md):
-  a struct field read back via `@field` surfaces as a *boxed scalar* (`addr → int
-  cell`) rather than an inline integer in the specialized-generic + nested-store
-  path, and the string materializer can't tell a boxed scalar from an array, so it
-  walks it as a bogus sequence. The materializer now bounds that traversal (a depth
-  cap — a crash became a clean error), but the real fix is in the value
-  representation / `@field` read (keep scalar field reads inline, or tag array
-  heap headers). Deep struct keys stay blocked on that; one-level keys ship because
-  their fields stay inline.
+- **Key types beyond `Int`/`String`:** **Resolved — struct keys at any nesting
+  depth work.** `bucketFor` hashes every key unconditionally with `std.meta.hash`
+  (a deep structural hash) and `set`/`get` match with struct `==` (structural), so
+  a coordinate `{ x, y }` or a nested `{ a: Point, b: Point }` is a usable key. The
+  blocker was a value-model ambiguity (a struct and an array were both a bare heap
+  `.addr`, so the string materializer mistook a struct for an array); fixed by
+  tagging array length headers `.seq_len` distinctly from a plain integer. See the
+  "struct-map-key crash — root-caused and fixed" section in
+  future/comptime-type-construction.md.
 - ~~**Immutable vs mutable API** (or both).~~ Resolved: both — immutable
   `set`/`remove` and mutable `setIn`/`removeIn`.
 - **Iteration order:** insertion order (an association list preserves it for free).

@@ -29,11 +29,11 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   equal). `std.meta.show` and `std.meta.eq` now **recurse** into struct-typed
   fields too (a nested struct shows its own bracketed form and compares deeply),
   via the polymorphic generic recursion the compiler now supports.
-- **`std.map` one-level struct keys.** A map key may now be a struct whose fields
-  are scalars/strings (a coordinate `{ x, y }`, a small composite id): it is hashed
-  structurally with `std.meta.hash` and matched with struct `==`. (`Int`/`String`
-  keys are unchanged.) A key whose fields are *themselves* structs is not yet
-  supported — it fails to specialize the bucket-hash path; see future/maps-plan.md.
+- **`std.map` struct keys (any nesting depth).** A map key may now be a struct —
+  a coordinate `{ x, y }`, or a nested `{ a: Point, b: Point }`: it is hashed
+  structurally with `std.meta.hash` (which recurses into struct-typed fields) and
+  matched with struct `==`, so two equal records are the same key. (`Int`/`String`
+  keys are unchanged.)
 - **`std.control`** — control-flow combinators that take a trailing block:
   `retry(times, body: fn() Bool) Bool` runs the body until it yields true (stopping
   early on success) and reports whether it eventually succeeded;
@@ -71,9 +71,9 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   renders any value (a struct as `{ name=value … }`, a scalar/string as itself);
   `std.meta.eq a b` is structural equality (a struct compared field-by-field, else
   `==`). Both are built on `@kind`/`@fields`/`@field` and monomorphize per type —
-  the first stdlib use of the comptime implementation-generation surface. (One
-  level deep; a recursive `hash` for struct map keys awaits a pre-existing
-  call-capture fix — see `future/comptime-type-construction.md`.)
+  the first stdlib use of the comptime implementation-generation surface. (Now
+  recurse into struct-typed fields, along with `std.meta.hash` — see the recursive
+  `std.meta` entry above.)
 - **`@field(value)(name)` — access a struct field by a compile-time name.** The
   analog of Zig's `@field(x, name)`: `name` is a compile-time string (typically
   `f.name` from an unrolled `for (@fields(T)) |f|`), and the access lowers to an
@@ -273,13 +273,24 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Fixed
 
-- **String materialization of a cyclic/corrupt heap value no longer crashes the
-  interpreter.** `materializeString` now bounds its recursion depth: a pathological
-  heap value (e.g. a boxed scalar the renderer mistakes for an array and walks
-  endlessly) yields a recoverable error instead of overflowing the native stack.
-  Runic values are normally acyclic, so this never triggers for real data; it is a
-  safety net against a representational edge hit by deep struct map keys (see
-  `future/comptime-type-construction.md` for the root-cause analysis).
+- **A struct value is no longer mistaken for an array when rendered.** An array's
+  heap length header now carries a distinct `.seq_len` tag (not a plain integer),
+  so the string materializer can tell an array (`[len, e0, …]`) apart from a struct
+  (`[f0, …]`) — previously byte-identical when the first field was an integer, which
+  made a struct hash and render as a bogus array. This is what lets `std.map` take
+  a **struct key at any nesting depth** (hashing a struct key no longer derails).
+  The tag reads back as an ordinary `Int` everywhere except the materializer, so
+  `.len`, indexing, iteration and arithmetic are unaffected.
+- **`x = x + y` on an array now concatenates** instead of silently misbehaving. The
+  in-place `x = x <op> n` reassignment optimization (meant for scalar accumulation)
+  wrongly applied to arrays, emitting an `ath` that "worked" only by reading the
+  length headers as integers; it now excludes array/sequence operands so array `+`
+  goes through `array_concat`. (`acc = acc + .{ i }` in a loop builds the array
+  correctly.)
+- **String materialization is also bounded** as a backstop: `materializeString`
+  caps its recursion depth, so any pathological/cyclic heap value yields a
+  recoverable error instead of overflowing the native stack. Normal (acyclic) data
+  never reaches the cap.
 - **A recipe-typed struct literal can now be constructed directly in argument
   position.** `f Partial{ … }` (a `@insert` / `for (@fields)` recipe struct built
   inline as a call argument, with no annotated binding) previously arrived with

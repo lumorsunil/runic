@@ -5572,7 +5572,7 @@ pub const IRCompiler = struct {
                     .from(v)
                 else
                     self.compileFunctionCall(source, v, call.arguments, call.redirects, null),
-                .slice, .stream, .addr, .void, .null, .integer, .float, .strct, .exit_code, .pipe, .thread, .closeable, .err => .from(v),
+                .slice, .stream, .addr, .void, .null, .integer, .seq_len, .float, .strct, .exit_code, .pipe, .thread, .closeable, .err => .from(v),
                 .zig_string => Error.UnsupportedValueType,
             },
             .location => |loc| .from(loc),
@@ -11631,7 +11631,13 @@ pub const IRCompiler = struct {
                     // `x = x <arith> n` in place. `.shift_or_append` here is
                     // `x = x >> n` (shift-right): the left is a mutable binding,
                     // never a command.
-                    if (right_binary.op.isArithmetic() or right_binary.op.category() == .shift_or_append) {
+                    // `x = x + y` on an *array* is concatenation, not scalar
+                    // arithmetic — it must fall through to `array_concat` (below),
+                    // not an in-place `ath`. (An `ath` on arrays only ever
+                    // "worked" by reading the length headers as integers, which was
+                    // wrong; guard it out explicitly.)
+                    const left_is_seq = if (left.typeExpr()) |t| (t == .array or isEmptyStructType(t)) else false;
+                    if (!left_is_seq and (right_binary.op.isArithmetic() or right_binary.op.category() == .shift_or_append)) {
                         if (expressionsStructurallyEqual(binary.left, right_binary.left)) {
                             // Value-capture the operand: a call/pipeline operand
                             // (`h = h + (f x)`) must yield its value, not a forked
@@ -11815,7 +11821,11 @@ pub const IRCompiler = struct {
         array: ast.ArrayLiteral,
     ) Error!Result {
         try self.alloc(source, array.elements.len + 1);
-        try self.set(source, .initAbs(.{ .register = .r }, .{ .dereference = true }), .fromValue(.{ .integer = @as(i64, @intCast(array.elements.len)) }));
+        // Slot 0 is the sequence length, tagged `.seq_len` (not a plain integer) so
+        // the string materializer can tell this array apart from a struct whose
+        // first field happens to be an integer. It reads back as an ordinary `Int`
+        // (normalized on any location read — see `resolveLocation`).
+        try self.set(source, .initAbs(.{ .register = .r }, .{ .dereference = true }), .fromValue(.{ .seq_len = @as(i64, @intCast(array.elements.len)) }));
         const array_ref = try self.newRef(source, "array");
         try self.set(source, array_ref, .fromLocation(.initRegister(.r)));
         // Record each element's static type by position. A `.{ … }` literal is a

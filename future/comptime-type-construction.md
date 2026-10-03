@@ -135,51 +135,38 @@ new type. **Fixed** — each recursive call is reconciled against the active
 specializations by its argument-type key, so a different-type call re-routes
 through the generic and specializes anew. On that fix, `std.meta.show`/`eq`/`hash`
 now **recurse** into struct-typed fields (deep dump/equality/hash), and `std.map`
-takes a **one-level** struct key (hashed via `std.meta.hash`, matched with struct
-`==`).
+takes a **struct key at any nesting depth** (hashed via `std.meta.hash`, matched
+with struct `==`).
 
-### Root cause of the remaining struct-map-key crash (investigated)
+### The struct-map-key crash — root-caused and fixed
 
-A **deeper** case still fails: a struct map key stored, then read back by a
-generic that introspects it with `@field`. The surface symptom was a stack
-overflow; it is now a clean, recoverable error (a depth cap in `materializeString`,
-`src/ir/evaluator.zig`), but the underlying defect remains. A reduced, std-free
-repro (no `@insert`, no recursion) crashes on the **second** `set`:
+A struct map key used to hash/render as a bogus array and (through `std.map`) blow
+the native stack. The chased-down mechanism and the fix:
 
-```
-fn hashOf(v: |T|) Int { for (@fields(T)) |f| { const fv = @field(v)(f.name); … "${fv}" … } }
-fn setM(m: MapT(|K|)(|V|), key: K, value: V) MapT(K)(V) {
-  const idx = (hashOf key) % m.buckets.len     // reads key via @field
-  const entry = Entry(K)(V){ .key = key, … }   // also stores key
-  … push entry into BOTH a nested bucket array AND the flat order array …
-}
-```
-
-What the investigation established:
-- **Not** heap-slot reuse — the value heap is monotonic (`IRProgramContext.alloc`
-  only bumps `current_heap_addr`, never frees/reuses).
-- **Not** `array_push_inplace` — forcing `analyzeLinearBuffers` to return empty
-  (disabling in-place growth) does not change the crash.
-- **Not** the recursion fix — a *non-recursive* `hashOf` (fields hashed inline)
-  crashes identically.
-- It needs the **confluence**: `@field`-reading the key *and* storing it in a
-  **two-level** nested collection (`[]Bucket{ []Entry }` + flat `[]Entry`), across
-  a **repeated** `set`. Any one alone is fine (hashing a struct in a loop with no
-  map works; storing a struct key with no `@field` works; a map with only `order`
-  or only `buckets` works).
-- **Mechanism:** in the failing path a struct field read back via `@field` is a
-  **boxed scalar** (`addr → cell holding the int`) rather than an inline `.integer`.
-  `materializeString` → `maybeHeapSequenceLen` cannot tell a boxed scalar from an
-  array (both are `addr →` a cell whose first value is an integer), so it treats
-  the boxed int as "an array of length N" and walks adjacent heap cells as
-  elements, which runs away. So there are two coupled defects: **(A)** a struct
-  field surfaces boxed instead of inline in this specialized-generic + nested-store
-  path, and **(B)** the string materializer's array-vs-boxed-scalar ambiguity turns
-  (A) into an unbounded traversal. (B) is now guarded (no crash); (A) — the real
-  correctness bug — lives in the value representation / `@field` read path and
-  needs either a heap tag distinguishing array headers from other cells, or a
-  guarantee that a scalar field read is always dereferenced to an inline value.
-  One-level keys avoid it (their fields stay inline), which is why they ship.
+- **Root cause (one defect, not two).** A struct value and an array are *both* a
+  bare heap `.addr`: an array is laid out `[len, e0, …]`, a struct `[f0, …]`. The
+  string materializer (`maybeHeapSequenceLen`) decided "this `.addr` is an array of
+  length N" purely from the first heap cell being an integer — so a struct whose
+  first field is an integer was walked as an N-element array (running off into
+  adjacent cells). Ruled out along the way: heap-slot reuse (the value heap is
+  monotonic — `IRProgramContext.alloc` only bumps `current_heap_addr`); in-place
+  array growth (disabling `analyzeLinearBuffers` changed nothing); and the
+  recursion fix (a non-recursive hash broke identically). The "boxed scalar" the
+  field read produced is just this same ambiguity seen from the value side.
+- **Fix.** Array length headers now carry a distinct `ir.Value.seq_len` tag instead
+  of a plain `.integer` (`src/ir/value.zig`). `maybeHeapSequenceLen` treats *only*
+  a `.seq_len` cell as a sequence, so a struct is never misread. The tag is written
+  by `compileArray` and every runtime array op, read leniently (either tag) by the
+  array ops and `join`, and **normalized back to `.integer` on every location read**
+  (`resolveValueSource`/`tryResolveFastValueSource`), so `.len`, indexing,
+  iteration and arithmetic see a plain `Int` — the tag never escapes the heap. With
+  the ambiguity gone, `std.map.bucketFor` hashes every key unconditionally through
+  `std.meta.hash`, and struct keys of any depth work. A depth cap in
+  `materializeString` remains as a backstop against any future cyclic value.
+- **Bonus fix.** The in-place `x = x <op> n` reassignment optimization (for scalar
+  accumulation) wrongly applied to arrays — `acc = acc + .{ i }` emitted an `ath`
+  that only "worked" by reading length headers as integers. It now excludes
+  array/sequence operands, so array `+` reassignment concatenates correctly.
 
 ## Increment 2 — attempted, and what it actually requires (findings)
 
