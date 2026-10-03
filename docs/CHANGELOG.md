@@ -273,6 +273,18 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Fixed
 
+- **A value-returning trailing-block / anonymous-fn body is now stdout-type-checked
+  like a named function.** A `fn () Bool` (or `fn () Int`, …) block whose body wrote
+  to stdout — e.g. `check "msg" { echo "dbg"; yield cond }` — used to slip through
+  the checker and then **deadlock the scheduler** at runtime (the stray output was
+  diverted into the result-capture pipe, so the dequeue never completed). The body
+  now adopts its parameter's stdout type, so a stray `echo` is the same clean
+  compile error a named function gets (redirect it, bind it, or use `@log`); a
+  `fn () Void` block still writes freely. The block's expected stdout type is
+  threaded from the `fn (…) T` parameter at the call site. (A *different* route to
+  the same runtime hang — calling a `Void` function that itself `echo`es from
+  inside a value-returning body — is a pre-existing, statically-uncatchable gap
+  that affects named functions identically; it is not newly introduced here.)
 - **A struct value is no longer mistaken for an array when rendered.** An array's
   heap length header now carries a distinct `.seq_len` tag (not a plain integer),
   so the string materializer can tell an array (`[len, e0, …]`) apart from a struct

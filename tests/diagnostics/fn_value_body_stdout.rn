@@ -1,0 +1,12 @@
+# A trailing-block / anonymous `fn() T` body is checked against its parameter's
+# stdout type, exactly like a named function. Here the body is a `fn() Bool`
+# (from `check`'s parameter), so writing a `String` to stdout with `echo` is a
+# mismatch — the yielded Bool is the stdout channel. (Redirecting the echo with
+# `1>&2` / `> "file"`, or using `@log`, is the fix; a Void body accepts output.)
+# Without this check the stray output corrupted the captured value and deadlocked
+# the scheduler at runtime.
+fn Void check(cond: fn() Bool) Bool {
+  yield cond
+}
+const ok = check { echo "debug"; yield true }
+echo "ok=${ok}"

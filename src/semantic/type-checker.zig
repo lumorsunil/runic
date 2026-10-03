@@ -41,6 +41,15 @@ pub const TypeChecker = struct {
     /// argument's parameter type). Consulted to disambiguate a return-type-only
     /// overload (`pure` → `Maybe(Int)` vs `[]Int`). A stack for nesting.
     expected_type_stack: std.ArrayListUnmanaged(?*const ast.TypeExpr) = .empty,
+    /// The stdout (return) type expected of the next anonymous fn body about to be
+    /// checked — the parameter type when a trailing block / anonymous `fn(…) T` is
+    /// passed to a `fn(…) T` parameter (`check "m" { … }`, `retry n { … }`). A bare
+    /// trailing block declares no return type of its own, so `runFnDecl` adopts
+    /// this as the body's stdout type, making a `fn() Bool` body's stray `echo` the
+    /// same error a named function gets (and avoiding the capture-pipe deadlock it
+    /// would otherwise cause at runtime). Set by `runCall` around the argument and
+    /// consumed (cleared) by `runFnDecl` at entry, so nested fns don't inherit it.
+    pending_fn_body_stdout: ?*const ast.TypeExpr = null,
     /// Overloaded call nodes already resolved (rewritten or reported), so a call
     /// visited from several sites (walk, type resolution) is handled exactly once.
     overload_resolved: std.AutoHashMapUnmanaged(*const ast.CallExpr, void) = .empty,
@@ -210,6 +219,7 @@ pub const TypeChecker = struct {
         self.stdout_return_raw_stack = .empty;
         self.overload_sets = .empty;
         self.expected_type_stack = .empty;
+        self.pending_fn_body_stdout = null;
         self.overload_resolved = .empty;
         self.inferred_error_sets = .empty;
         self.inferred_collector_stack = .empty;
@@ -2644,8 +2654,16 @@ pub const TypeChecker = struct {
         // Make the declared stdout type visible to every `yield` in the body
         // (including yields nested in loops/blocks/matches) via the stack. Each
         // `runYield` validates against the top entry in the scope it runs in.
+        // A bare trailing block / anonymous fn declares no return type; adopt the
+        // stdout type its parameter context expects (`pending_fn_body_stdout`, set
+        // by `runCall`), so a `fn() Bool` body's stray `echo` is the same error a
+        // named `fn … Bool` gets. Consume it immediately so nested fns don't inherit.
+        const pending_stdout = self.pending_fn_body_stdout;
+        self.pending_fn_body_stdout = null;
         const resolved_return: ?*const ast.TypeExpr = if (fn_decl.return_type) |return_type|
             try self.resolveTypeExpr(fn_scope, return_type)
+        else if (pending_stdout) |p|
+            try self.resolveTypeExpr(fn_scope, p)
         else
             null;
         try self.stdout_type_stack.append(self.arena.allocator(), resolved_return);
@@ -2885,7 +2903,27 @@ pub const TypeChecker = struct {
                     }
                 }
             }
+            // A trailing block / anonymous fn argument adopts its `fn(…) T`
+            // parameter's return type `T` as the body's stdout type (so a `fn() Bool`
+            // body's stray `echo` is caught, like a named function's). `runFnDecl`
+            // reads and clears `pending_fn_body_stdout` at entry.
+            if (arg.* == .fn_decl and arg.fn_decl.return_type == null) {
+                if (arg_callee) |cf| {
+                    const param_index = i + cf.offset;
+                    const param_type: ?*const ast.TypeExpr = switch (cf.params) {
+                        ._non_variadic => |list| if (param_index < list.len) list[param_index] else null,
+                        ._variadic => |element| element,
+                    };
+                    if (param_type) |pt| {
+                        const unaliased = self.unaliasType(pt);
+                        if (unaliased.* == .function) {
+                            self.pending_fn_body_stdout = unaliased.function.return_type;
+                        }
+                    }
+                }
+            }
             try self.runExpression(scope, arg);
+            self.pending_fn_body_stdout = null;
             if (pushed) _ = self.expected_type_stack.pop();
         }
 

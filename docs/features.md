@@ -577,14 +577,16 @@ struct literal (`Point { .x = 1 }`), a **lowercase** call is a trailing block; a
 both `const` and mutable `var` bindings from its scope (by value, at the point the
 closure is created).
 
-**Known limitation.** A block-taking function must not `yield` out of a *loop that
-has already invoked the block in that iteration* — invoking a `fn () Bool` block
-whose body runs a command, then early-`yield`ing from inside the loop, currently
-deadlocks the runtime scheduler. Restructure to yield once after the loop instead
-(accumulate into a `var` and guard re-invocation) — this is how `std.control.retry`
-preserves its stop-on-success behavior without the early return. A captured `var`
-is snapshotted by value, so a block mutating an outer `var` does not accumulate
-across repeated invocations either.
+**Stdout typing.** A block's body is checked against its parameter's stdout type,
+exactly like a named function. A `fn () Void` block may write to stdout freely
+(`group { echo … }`); a value-returning block (`fn () Bool`, `fn () Int`, …) must
+not — its stdout *is* the yielded-value channel, so a stray `echo` is a compile
+error (redirect it with `1>&2` / `> "file"`, bind it, or use `@log`). This mirrors
+the rule for named functions and prevents a stray write from corrupting the
+captured value. **Note:** a captured `var` is snapshotted by value, so a block
+mutating an outer `var` does not accumulate across repeated invocations —
+`std.control.retry` therefore accumulates success into its own local and yields
+once after the loop.
 
 ## Native iteration constructs
 
