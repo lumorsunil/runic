@@ -95,6 +95,18 @@ pub const IREvaluator = struct {
     allocator: Allocator,
     config: Config,
     context: *ir.context.IRProgramContext,
+    /// Current `materializeString` recursion depth, to bound rendering of a
+    /// pathological heap value. Runic values are normally acyclic, so a cycle is
+    /// always a bug; without this a self-referential heap region (e.g. a corrupted
+    /// struct whose field points back at itself) would recurse until the native
+    /// stack overflows and the process crashes. Capping it turns that into a
+    /// recoverable `MaterializeStringError` instead. The limit is far deeper than
+    /// any real value nests.
+    materialize_depth: usize = 0,
+
+    /// Maximum `materializeString` nesting before it bails with an error rather
+    /// than overflow the native stack on a cyclic/corrupt heap value.
+    const max_materialize_depth: usize = 256;
 
     pub const Config = struct {
         io: std.Io,
@@ -2929,6 +2941,12 @@ pub const IREvaluator = struct {
         w: *std.Io.Writer,
     ) MaterializeStringError!void {
         // const resolvedValue = try self.dereferenceValue(thread, value);
+
+        // Guard against a cyclic/corrupt heap value (normally impossible — Runic
+        // values are acyclic): bail with an error instead of overflowing the stack.
+        if (self.materialize_depth >= max_materialize_depth) return MaterializeStringError.UnsupportedType;
+        self.materialize_depth += 1;
+        defer self.materialize_depth -= 1;
 
         switch (value) {
             .stream => |stream| for (0..stream.len) |i| {

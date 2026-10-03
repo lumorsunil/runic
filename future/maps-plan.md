@@ -230,10 +230,16 @@ A prototype (`Entry`/`Map` + `set`/`get`) compiles down to one concrete gap:
   structural). A struct key whose fields are *themselves* structs is **not yet
   supported**: through `std.map.set`, the `bucketFor` generic fails to specialize
   for the nested key type and falls through to `key % count` (an error on a
-  struct). A variant that hashes unconditionally (no `@kind` guard) instead stack-
-  overflows materializing a struct-keyed entry array on the second `set`. Both are
-  the nested-generic-within-specialization instability noted in
-  future/comptime-type-construction.md — the remaining blocker for deep struct keys.
+  struct). A variant that hashes unconditionally (no `@kind` guard) instead failed
+  on the second `set`. **Root-caused** (see future/comptime-type-construction.md):
+  a struct field read back via `@field` surfaces as a *boxed scalar* (`addr → int
+  cell`) rather than an inline integer in the specialized-generic + nested-store
+  path, and the string materializer can't tell a boxed scalar from an array, so it
+  walks it as a bogus sequence. The materializer now bounds that traversal (a depth
+  cap — a crash became a clean error), but the real fix is in the value
+  representation / `@field` read (keep scalar field reads inline, or tag array
+  heap headers). Deep struct keys stay blocked on that; one-level keys ship because
+  their fields stay inline.
 - ~~**Immutable vs mutable API** (or both).~~ Resolved: both — immutable
   `set`/`remove` and mutable `setIn`/`removeIn`.
 - **Iteration order:** insertion order (an association list preserves it for free).

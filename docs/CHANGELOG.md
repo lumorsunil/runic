@@ -273,6 +273,13 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Fixed
 
+- **String materialization of a cyclic/corrupt heap value no longer crashes the
+  interpreter.** `materializeString` now bounds its recursion depth: a pathological
+  heap value (e.g. a boxed scalar the renderer mistakes for an array and walks
+  endlessly) yields a recoverable error instead of overflowing the native stack.
+  Runic values are normally acyclic, so this never triggers for real data; it is a
+  safety net against a representational edge hit by deep struct map keys (see
+  `future/comptime-type-construction.md` for the root-cause analysis).
 - **A recipe-typed struct literal can now be constructed directly in argument
   position.** `f Partial{ … }` (a `@insert` / `for (@fields)` recipe struct built
   inline as a call argument, with no annotated binding) previously arrived with

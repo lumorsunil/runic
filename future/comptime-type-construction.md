@@ -138,15 +138,48 @@ now **recurse** into struct-typed fields (deep dump/equality/hash), and `std.map
 takes a **one-level** struct key (hashed via `std.meta.hash`, matched with struct
 `==`).
 
-A **deeper** case remains open: a struct key whose fields are *themselves* structs.
-Through `std.map.set` the inner `bucketFor` generic then fails to specialize for the
-nested key type and falls through to `key % count` (an error on a struct); and a
-sibling formulation that calls the hash unconditionally instead corrupts a
-struct-keyed entry array on the *second* `set` (a stack overflow materializing a
-heap sequence). Both point at a remaining instability specializing a generic whose
-body recursively specializes *another* generic (`bucketFor` → `std.meta.hash` →
-itself) within a surrounding specialization (`std.map.set`) — narrower than the
-original recursion hang, but not yet root-caused. See future/maps-plan.md.
+### Root cause of the remaining struct-map-key crash (investigated)
+
+A **deeper** case still fails: a struct map key stored, then read back by a
+generic that introspects it with `@field`. The surface symptom was a stack
+overflow; it is now a clean, recoverable error (a depth cap in `materializeString`,
+`src/ir/evaluator.zig`), but the underlying defect remains. A reduced, std-free
+repro (no `@insert`, no recursion) crashes on the **second** `set`:
+
+```
+fn hashOf(v: |T|) Int { for (@fields(T)) |f| { const fv = @field(v)(f.name); … "${fv}" … } }
+fn setM(m: MapT(|K|)(|V|), key: K, value: V) MapT(K)(V) {
+  const idx = (hashOf key) % m.buckets.len     // reads key via @field
+  const entry = Entry(K)(V){ .key = key, … }   // also stores key
+  … push entry into BOTH a nested bucket array AND the flat order array …
+}
+```
+
+What the investigation established:
+- **Not** heap-slot reuse — the value heap is monotonic (`IRProgramContext.alloc`
+  only bumps `current_heap_addr`, never frees/reuses).
+- **Not** `array_push_inplace` — forcing `analyzeLinearBuffers` to return empty
+  (disabling in-place growth) does not change the crash.
+- **Not** the recursion fix — a *non-recursive* `hashOf` (fields hashed inline)
+  crashes identically.
+- It needs the **confluence**: `@field`-reading the key *and* storing it in a
+  **two-level** nested collection (`[]Bucket{ []Entry }` + flat `[]Entry`), across
+  a **repeated** `set`. Any one alone is fine (hashing a struct in a loop with no
+  map works; storing a struct key with no `@field` works; a map with only `order`
+  or only `buckets` works).
+- **Mechanism:** in the failing path a struct field read back via `@field` is a
+  **boxed scalar** (`addr → cell holding the int`) rather than an inline `.integer`.
+  `materializeString` → `maybeHeapSequenceLen` cannot tell a boxed scalar from an
+  array (both are `addr →` a cell whose first value is an integer), so it treats
+  the boxed int as "an array of length N" and walks adjacent heap cells as
+  elements, which runs away. So there are two coupled defects: **(A)** a struct
+  field surfaces boxed instead of inline in this specialized-generic + nested-store
+  path, and **(B)** the string materializer's array-vs-boxed-scalar ambiguity turns
+  (A) into an unbounded traversal. (B) is now guarded (no crash); (A) — the real
+  correctness bug — lives in the value representation / `@field` read path and
+  needs either a heap tag distinguishing array headers from other cells, or a
+  guarantee that a scalar field read is always dereferenced to an inline value.
+  One-level keys avoid it (their fields stay inline), which is why they ship.
 
 ## Increment 2 — attempted, and what it actually requires (findings)
 
