@@ -285,6 +285,20 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Fixed
 
+- **A pipeline producer that runs several command-statements no longer drops its
+  last line under load.** `{ echo a; echo b } | consumer` (or any multi-command
+  producer stage) occasionally delivered only `a` and signalled EOF early, so a
+  downstream `grep`/`cat` saw a truncated stream — a timing-dependent flake
+  (~1-in-20 under scheduler pressure; it was the long-standing intermittent miss in
+  `runtime_regression`). An inter-stage pipe closed a source — and with it EOF'd the
+  consumer — the moment the source's *process* exited, without first draining the
+  OS-pipe bytes still buffered behind it. The second `echo`'s output, still in
+  flight when the consumer attached, was stranded and discarded on close.
+  `connectDestination` no longer force-closes the consumer on an already-closed
+  source; it leaves sources for `forward()`, which drains a closed source's buffered
+  tail before removing it and propagating EOF. Covered by
+  `pipeline_producer_drain_regression` (runs the pattern many times so a reintroduced
+  race shows up as a missing line).
 - **Binding a command result inside a trailing-block / anonymous-fn body works.**
   `apply { const _ = mkdir "d"; … }` — running a command for its effect inside a
   block, as `std.fs.withTempDir`'s body does — crashed at runtime with *"Could not
