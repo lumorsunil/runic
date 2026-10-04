@@ -60,7 +60,7 @@ const mp2 = makePair
 const mi, ms = mp2
 echo "ret=${mi},${ms}"
 
-fn Void showPair(pr: struct { Int, String }) Void {
+fn Void showPair(pr: struct { Int, String }) String {
     const pi, ps = pr
     echo "param=${pi},${ps}"
 }

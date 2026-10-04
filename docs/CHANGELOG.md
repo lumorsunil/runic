@@ -14,6 +14,18 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Changed
 
+- **A `Void` stdout type now means the function produces *nothing* on `&1`** — it
+  no longer acts as a byte "passthrough". A function that writes to stdout (an
+  `echo`, or a bare command, which is typed `ExecutableError!String`) must declare
+  a `String` (or command) stdout type; to run a command for its *effect* inside a
+  `Void` function, bind its result (`const _ = mkdir …`), redirect it (`>&2`,
+  `> "file"`), or use `@log`. (`cd`/`setenv` are exempt — they change process state
+  and produce no output.) This makes a function's stdout type an honest statement
+  of what it writes, and in particular guarantees a `Void` function is silent — so
+  a bare `Void` call inside a value-returning body can't leak bytes into the
+  captured value (the last route to the trailing-block capture deadlock). The
+  stdlib's command helpers (`std.fs.mkdirp`/`remove`/`withTempDir`) bind their
+  command results; `std.testing.group` writes its header to stderr.
 - **An array coerces to a string as `[1, 2, 3]`**, bracketed and comma-separated,
   instead of its elements run together (`123`). This applies wherever an array is
   rendered to text — string interpolation (`"${xs}"`), a command argument, `@log`
@@ -273,6 +285,17 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Fixed
 
+- **Binding a command result inside a trailing-block / anonymous-fn body works.**
+  `apply { const _ = mkdir "d"; … }` — running a command for its effect inside a
+  block, as `std.fs.withTempDir`'s body does — crashed at runtime with *"Could not
+  dereference value of type thread"*. The indirect-call path sized the block's heap
+  closure environment to its *argument* count (zero, for a nullary block), but the
+  command-capture protocol allocates scratch closure cells in the body; those writes
+  overflowed the undersized environment and aliased an adjacent heap value (a thread
+  handle), which the next dereference rejected. A fn value now always carries a
+  closure environment sized to its body's full closure-slot count — not only when it
+  captures an outer binding — so the scratch cells land in bounds (a block's
+  parameter slots still come first, where call arguments are merged).
 - **A value-returning trailing-block / anonymous-fn body is now stdout-type-checked
   like a named function.** A `fn () Bool` (or `fn () Int`, …) block whose body wrote
   to stdout — e.g. `check "msg" { echo "dbg"; yield cond }` — used to slip through
@@ -281,10 +304,10 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   now adopts its parameter's stdout type, so a stray `echo` is the same clean
   compile error a named function gets (redirect it, bind it, or use `@log`); a
   `fn () Void` block still writes freely. The block's expected stdout type is
-  threaded from the `fn (…) T` parameter at the call site. (A *different* route to
-  the same runtime hang — calling a `Void` function that itself `echo`es from
-  inside a value-returning body — is a pre-existing, statically-uncatchable gap
-  that affects named functions identically; it is not newly introduced here.)
+  threaded from the `fn (…) T` parameter at the call site. (The other route to the
+  same hang — a bare call to a `Void` function that itself `echo`es — is now closed
+  too: a `Void` stdout no longer accepts stray output, so a `Void` function is
+  guaranteed silent. See the `Void` stdout change above.)
 - **A struct value is no longer mistaken for an array when rendered.** An array's
   heap length header now carries a distinct `.seq_len` tag (not a plain integer),
   so the string materializer can tell an array (`[len, e0, …]`) apart from a struct

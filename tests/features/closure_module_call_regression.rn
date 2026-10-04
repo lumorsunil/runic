@@ -6,7 +6,7 @@
 // control-flow blocks contain real assertions.
 const std = import "std"
 
-fn group(name: String, body: fn() Void) Void {
+fn group(name: String, body: fn() String) String {
   echo "── ${name}"
   body
 }

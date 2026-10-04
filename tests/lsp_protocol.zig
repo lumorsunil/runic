@@ -733,7 +733,7 @@ test "lsp applies an incremental edit correctly past a string containing a newli
     defer fixture.deinit();
 
     const source =
-        \\fn Void note(n: Int) Void { echo "n=${n}\n" }
+        \\fn Void note(n: Int) String { echo "n=${n}\n" }
         \\const a = 1
         \\const b = 2
         \\const c = 3

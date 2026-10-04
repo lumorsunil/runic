@@ -6,7 +6,7 @@ fn Void @() Void
 
 fn Void stopHere(stop: Bool) Void {
   if (stop) {
-    echo "stopping"
+    echo "stopping" 1>&2
     exit 0
   }
 }

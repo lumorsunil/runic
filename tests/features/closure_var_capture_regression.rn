@@ -4,7 +4,7 @@
 # running closure couldn't reach; the closure value carried no populated env).
 # Regression for that "mutable empty" bug. `const` capture is exercised alongside.
 
-fn run(body: fn() Void) Void { body }
+fn run(body: fn() String) String { body }
 
 var n = 3
 const label = "job"
@@ -14,7 +14,7 @@ n = 7
 run { echo "after n=${n}" }             # captures the updated value at creation time
 
 # The explicit anonymous-fn form captures identically.
-run (fn Void () Void { echo "explicit n=${n}" })
+run (fn Void () String { echo "explicit n=${n}" })
 
 # Multiple vars.
 var a = 1

@@ -3026,14 +3026,23 @@ pub const TypeChecker = struct {
         if (self.stdout_type_stack.items.len == 0) return; // top level: no stdout type
         const declared = self.stdout_type_stack.items[self.stdout_type_stack.items.len - 1] orelse return;
         // A byte-channel stdout accepts any output — no mismatch is possible.
-        if (self.stdoutAcceptsCommandBytes(declared)) return;
+        // A `Void` stdout means the function produces *nothing* on `&1`: unlike a
+        // byte channel (`String`/`Byte`/a command `execution`), it does not accept a
+        // bare command's or `echo`'s output. (Run the command for effect by binding
+        // its result — `const _ = mkdir …` — redirecting it, or `@log`; a function
+        // that genuinely produces text declares a `String` stdout.) This guarantee —
+        // a `Void` function is silent — is what makes a bare `Void` call safe inside
+        // a value-returning body (no stray bytes corrupt the captured value).
+        if (self.stdoutAcceptsCommandBytes(declared) and self.unaliasType(declared).* != .void) return;
         if (expr.* != .call) return;
         const call = expr.call;
         if (call.callee.* != .identifier) return; // UFCS / pipelines: not handled here
         const name = call.callee.identifier.name;
-        // Builtins that don't write to `&1` (`@log` goes to the real stdout by
-        // design, `cd`/`setenv` produce no output).
+        // Builtins that don't write to `&1`: `@…` builtins (`@log` goes to the real
+        // stdout by design), and `cd`/`setenv`, which change process state and
+        // produce no output — so they are allowed in a `Void` function.
         if (name.len > 0 and name[0] == '@') return;
+        if (std.mem.eql(u8, name, "cd") or std.mem.eql(u8, name, "setenv")) return;
         if (call.redirects.len != 0) return; // stdout may be redirected away — skip
 
         // The statement's stdout output type: `String` for a command (no binding),

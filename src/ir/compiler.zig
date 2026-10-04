@@ -7888,8 +7888,19 @@ pub const IRCompiler = struct {
     fn buildClosureFnEnv(self: *IRCompiler, source: anytype, fn_addr: ir.InstructionAddr, type_expr: ?ast.TypeExpr) Error!?Result {
         const instr_set = fn_addr.instr_set;
         const captures = self.instruction_sets.items[instr_set].closure_captures;
-        if (captures.len == 0) return null;
         const slot_count = self.instruction_sets.items[instr_set].closure_slot_count;
+        const param_count = self.instruction_sets.items[instr_set].param_count;
+        // A fn value needs a heap closure environment when it captures outer
+        // bindings, OR when its body uses closure cells beyond its parameter
+        // slots — e.g. a trailing-block/anonymous body that binds a command
+        // result (the command-capture protocol allocates scratch closure cells).
+        // Without one, the indirect-call path sizes the closure base to the
+        // argument count alone (`alloc args.len`), so those scratch-cell writes
+        // overflow it and alias adjacent heap (a thread handle → a dereference
+        // crash). Routing through a `slot_count`-sized env fixes that; `params`
+        // occupy the first slots (where `merge_args` copies the arguments), the
+        // scratch cells follow, so the two never collide.
+        if (captures.len == 0 and slot_count <= param_count) return null;
 
         try self.alloc(source, slot_count);
         const env_ref = try self.newRef(source, "closure_fn_env");
@@ -7929,19 +7940,20 @@ pub const IRCompiler = struct {
         return_type: ?ast.TypeExpr,
         args: []const *ast.Expression,
     ) Error!Result {
-        // A `Void`-returning fn value yields no value to capture — it runs for its
-        // effects (a control-flow block like `withTimer { … }`). It forwards its
-        // stdout to the caller's, like a bare command/function statement, and is
-        // not waited on here (the scheduler sequences its output in fork order); a
-        // typed capture pipe + dequeue would deadlock (nothing is ever enqueued) and
-        // divert the block's own `echo` output into the capture. A `Void` return may
-        // surface as the bare identifier `Void` rather than the `.void` type.
-        const is_void = returnTypeIsVoid(return_type);
+        // A fn value whose stdout is a *byte channel* — `Void` (no output), or
+        // `String`/`Byte`/a command `execution` (raw bytes) — forwards its stdout to
+        // the caller's, like a bare command/function statement, and is not waited on
+        // here (the scheduler sequences its output in fork order). A typed capture
+        // pipe + dequeue is only for a *typed value* return (`Bool`/`Int`/a struct):
+        // for a byte channel it would deadlock, diverting the block's own `echo`
+        // output into the capture. (`Void` may surface as the bare identifier
+        // `Void`; `String` likewise as its name.)
+        const is_byte_channel = returnTypeIsByteChannel(return_type);
 
         const fn_ref_ref = try self.newRef(source, "indirect_fn");
         try self.set(source, fn_ref_ref, .from(callee_loc));
 
-        const pipe_ref = if (is_void) null else blk: {
+        const pipe_ref = if (is_byte_channel) null else blk: {
             const p = try self.newRef(source, "indirect_pipe");
             try self.pipe(source, p.dereference());
             try self.pipeOpt(source, p.dereference(), .typed, .fromValue(.fromBoolean(true)));
@@ -8002,6 +8014,27 @@ pub const IRCompiler = struct {
             .void => true,
             .identifier => |named| named.path.segments.len == 1 and
                 std.mem.eql(u8, named.path.segments[named.path.segments.len - 1].name, "Void"),
+            else => false,
+        };
+    }
+
+    /// Whether a fn value's declared stdout is a *byte channel* — `Void` (no
+    /// output), `String`/`Byte` (raw bytes), a `[]Byte` array, or a command
+    /// `execution` / its error union. Such a return is forwarded as bytes by
+    /// `compileIndirectCall` (no typed-value capture pipe), so a block that writes
+    /// to stdout doesn't deadlock. A *typed value* return (`Bool`/`Int`/a struct)
+    /// returns false and takes the enqueue/dequeue path.
+    fn returnTypeIsByteChannel(rt: ?ast.TypeExpr) bool {
+        const t = rt orelse return true;
+        return switch (t) {
+            .void, .byte, .execution => true,
+            .array => |a| a.element.* == .byte,
+            .err => true,
+            .error_union => |eu| returnTypeIsByteChannel(eu.payload.*),
+            .identifier => |named| named.path.segments.len == 1 and blk: {
+                const n = named.path.segments[named.path.segments.len - 1].name;
+                break :blk std.mem.eql(u8, n, "Void") or std.mem.eql(u8, n, "String") or std.mem.eql(u8, n, "Byte");
+            },
             else => false,
         };
     }

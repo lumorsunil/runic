@@ -18,15 +18,15 @@ fn Partial(comptime T: type) type {
 }
 
 // Sync fast-path callee (plain struct parameter).
-fn Void showPair(p: Pair(Int)) Void {
+fn Void showPair(p: Pair(Int)) String {
   echo "pair: ${p.a} ${p.b}"
 }
-fn Void showPartial(p: Partial(Rec(Int))) Void {
+fn Void showPartial(p: Partial(Rec(Int))) String {
   echo "partial: ${p.a orelse -1} ${p.b orelse -1} ${p.c orelse -1}"
 }
 
 // Fork-path callee (a `|X|` capture keeps it off the sync fast-path).
-fn Void labelled(p: Partial(Rec(Int)), label: |X|) Void {
+fn Void labelled(p: Partial(Rec(Int)), label: |X|) String {
   echo "${label}: ${p.a orelse -1} ${p.b orelse -1} ${p.c orelse -1}"
 }
 

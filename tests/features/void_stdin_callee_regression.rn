@@ -9,7 +9,7 @@ fn Void @() Void
 
 fn Void dbl(n: Int) Int { yield n * 2 }
 
-fn Int report() Void {
+fn Int report() String {
   const d = dbl 21
   echo "dbl=${d}"
 }

@@ -10,7 +10,7 @@ fn Empty(comptime T: type) type { yield struct { } }
 fn Rec(comptime T: type) type { yield struct { id: Int, label: String, items: []T, boxed: Box(T) } }
 
 # name/type/@fieldCount, and a plain field walk.
-fn Void walk(comptime T: type) Void {
+fn Void walk(comptime T: type) String {
     echo "${@fieldCount(T)} fields:"
     for (@fields(T)) |f| { echo "  ${f.name}: ${f.type}" }
 }
@@ -19,7 +19,7 @@ echo "empty ->"
 walk Empty(Int)
 
 # f.type in comparisons, match with captures, and introspection builtins.
-fn Void classify(comptime T: type) Void {
+fn Void classify(comptime T: type) String {
     for (@fields(T)) |f| {
         if (f.type == Int) {
             echo "  ${f.name}: int"
@@ -37,7 +37,7 @@ classify Rec(Bool)
 
 # Nested field iteration: walk each field's own (struct) type.
 fn Wrap(comptime T: type) type { yield struct { first: Pair(Int)(T), second: Pair(T)(Bool) } }
-fn Void deep(comptime T: type) Void {
+fn Void deep(comptime T: type) String {
     for (@fields(T)) |outer| {
         echo "${outer.name}: ${outer.type}"
         for (@fields(outer.type)) |inner| {

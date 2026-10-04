@@ -5,7 +5,7 @@
 # define control-flow-style wrappers — timers, guards, repeats — in plain Runic.
 
 # Void block, run for effects, with a captured `const`.
-fn withBrackets(body: fn() Void) Void {
+fn withBrackets(body: fn() String) String {
   echo "["
   body
   echo "]"
@@ -14,7 +14,7 @@ const label = "job"
 withBrackets { echo "running ${label}" }
 
 # A comptime count + block: the loop unrolls and invokes the block each time.
-fn repeat(comptime n: Int, body: fn() Void) Void {
+fn repeat(comptime n: Int, body: fn() String) String {
   for (0..n) |_| { body }
 }
 repeat 3 { echo "tick" }
@@ -28,4 +28,4 @@ fn twice(body: fn() Int) Int {
 echo "sum: ${twice { yield 21 }}"
 
 # The explicit anonymous-fn form is equivalent to the block sugar.
-withBrackets (fn Void () Void { echo "explicit" })
+withBrackets (fn Void () String { echo "explicit" })

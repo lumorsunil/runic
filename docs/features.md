@@ -578,15 +578,16 @@ both `const` and mutable `var` bindings from its scope (by value, at the point t
 closure is created).
 
 **Stdout typing.** A block's body is checked against its parameter's stdout type,
-exactly like a named function. A `fn () Void` block may write to stdout freely
-(`group { echo … }`); a value-returning block (`fn () Bool`, `fn () Int`, …) must
-not — its stdout *is* the yielded-value channel, so a stray `echo` is a compile
-error (redirect it with `1>&2` / `> "file"`, bind it, or use `@log`). This mirrors
-the rule for named functions and prevents a stray write from corrupting the
-captured value. **Note:** a captured `var` is snapshotted by value, so a block
-mutating an outer `var` does not accumulate across repeated invocations —
-`std.control.retry` therefore accumulates success into its own local and yields
-once after the loop.
+exactly like a named function. A block that writes to `&1` — an `echo`, or a bare
+command — produces `String`, so it must be passed to a `fn () String` parameter; a
+value-returning block (`fn () Bool`, `fn () Int`, …) must *only* `yield` its value;
+and a `fn () Void` block must be silent (produce nothing on `&1`). A stray write of
+the wrong type is a compile error (redirect it with `1>&2` / `> "file"`, bind a
+command's result with `const _ = …`, or use `@log`). This mirrors the rule for
+named functions and prevents a stray write from corrupting the captured value.
+**Note:** a captured `var` is snapshotted by value, so a block mutating an outer
+`var` does not accumulate across repeated invocations — `std.control.retry`
+therefore accumulates success into its own local and yields once after the loop.
 
 ## Native iteration constructs
 
@@ -1169,9 +1170,13 @@ fn Int square() Int {
 echo "4" | parseInt | square   // prints 16
 ```
 
-The declared stdout type constrains what may be `yield`ed to `&1` — `yield "text"`
-in an `Int`-stdout function is a compile-time error. (`yield &2` carries untyped
-diagnostic output and is not constrained.) A function may `yield` zero or more
+The declared stdout type constrains everything written to `&1` — not only
+`yield "text"` in an `Int`-stdout function, but also a bare `echo` or command (a
+command's output is `ExecutableError!String`). So a `Void`-stdout function must be
+silent: run a command for its effect by binding the result (`const _ = mkdir …`),
+redirecting it (`>&2`, `> "file"`), or using `@log`; a function that genuinely
+writes text declares a `String` stdout. (`yield &2` / `>&2` carry untyped
+diagnostic output and are not constrained; `cd`/`setenv` produce no output.) A function may `yield` zero or more
 times; there is no `return` — output is carried solely by `yield`, and a
 function halts when it runs out of statements (use `exit` to halt early):
 

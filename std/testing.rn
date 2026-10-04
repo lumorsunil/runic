@@ -45,9 +45,11 @@ pub fn Void check(msg: String, cond: fn() Bool) Void {
 //   }
 // The block is a `fn () Void` closure capturing its enclosing scope; a failing
 // assertion inside it still aborts the whole run. Purely organizational — it
-// adds a header and runs the block, it does not catch or count failures.
+// adds a header and runs the block, it does not catch or count failures. The
+// header is diagnostic, so (like the assertions) it is written to stderr — which
+// also keeps `group` a `Void` (silent-on-`&1`) function.
 pub fn Void group(label: String, body: fn() Void) Void {
-  echo "── ${label}"
+  echo "── ${label}" 1>&2
   body
 }
 

@@ -3,7 +3,7 @@
 // concurrent drain to move the redirect pipe to the file while the command
 // runs — without it the inner command's stdout never reaches EOF and the call
 // hangs. `>` truncates and `>>` appends, matching command redirection.
-fn Void emit() Void {
+fn Void emit() String {
     echo "one"
     echo "two"
 }

@@ -48,14 +48,16 @@ pub fn Void listDir(p: String) []String {
   yield result
 }
 
-// `mkdir -p` — create the directory and any missing parents.
+// `mkdir -p` — create the directory and any missing parents. The command is run
+// for its effect; its (empty) output is bound and discarded so `mkdirp` stays a
+// `Void` (silent) function.
 pub fn Void mkdirp(p: String) Void {
-  mkdir "-p" p
+  const _ = mkdir "-p" p
 }
 
-// `rm -rf` — remove a file or directory tree.
+// `rm -rf` — remove a file or directory tree. Output bound/discarded (see mkdirp).
 pub fn Void remove(p: String) Void {
-  rm "-rf" p
+  const _ = rm "-rf" p
 }
 
 // `pwd` — the current working directory (trailing newline stripped).
@@ -84,5 +86,5 @@ pub fn Void withTempDir(body: fn() Void) Void {
   cd dir
   body
   cd prev
-  rm "-rf" dir
+  const _ = rm "-rf" dir
 }

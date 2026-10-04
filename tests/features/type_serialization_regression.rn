@@ -28,7 +28,7 @@ echo Int String Point
 // A generic function parameter's `|T|` serializes to the concrete per-call type:
 // the call is monomorphized (a specialization is compiled with the type variable
 // bound to the argument's type).
-fn Void describe(x: |E|) Void {
+fn Void describe(x: |E|) String {
     echo "generic type is ${E}"
 }
 describe 5

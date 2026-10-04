@@ -15,7 +15,7 @@ const greeting: S = "hello"
 echo "${greeting}"
 
 // Generic function parameter — one definition, any argument type.
-fn Void say(greeting: |G|) Void {
+fn Void say(greeting: |G|) String {
     echo "${greeting}"
 }
 say "hello"
