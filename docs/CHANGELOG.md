@@ -285,6 +285,15 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Fixed
 
+- **The language server no longer crashes after a few quick edits.** Rapidly
+  deleting/inserting lines in a file that uses compile-time field iteration
+  (`for (@fields(T)) |f|`) segfaulted the server. The type checker is reused across
+  re-checks, and its `reset()` frees the analysis arena and clears every
+  arena-backed collection back to empty — but it missed `comptime_field_vars`, so
+  that map's header kept pointing at freed storage and the next re-check wrote
+  through the dangling pointer. `reset()` now clears it too. Also fixes the
+  `zig build runic-lsp` step to re-install the binary (it previously compiled into
+  the cache but left a stale `zig-out/bin/runic-lsp` behind).
 - **A pipeline producer that runs several command-statements no longer drops its
   last line under load.** `{ echo a; echo b } | consumer` (or any multi-command
   producer stage) occasionally delivered only `a` and signalled EOF early, so a

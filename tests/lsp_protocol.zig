@@ -785,6 +785,58 @@ test "lsp applies an incremental edit correctly past a string containing a newli
     try std.testing.expectEqual(@as(usize, 0), diags.len);
 }
 
+test "lsp re-checks a comptime field iteration across edits without crashing" {
+    // The type checker is reused across LSP re-checks: `reset()` frees its arena
+    // and clears every arena-backed collection back to `.empty`. It missed
+    // `comptime_field_vars`, so that map's header kept pointing at freed storage.
+    // The next re-check of a `for (@fields(T)) |f|` body called
+    // `comptime_field_vars.put(...)` through the dangling header and segfaulted
+    // the server after an edit or two. Replay a short edit storm on such a
+    // document; before the fix the server crashed mid-stream and never answered
+    // the final request.
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\fn Box(comptime T: type) type { yield struct { value: T } }
+        \\fn Void walk(comptime T: type) String {
+        \\  for (@fields(T)) |f| { echo "${f.name}" }
+        \\}
+        \\walk Box(Int)
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    // Line 5 is the empty line after the trailing newline; each edit there drives
+    // another reset()+re-check, which is what used to crash.
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeDidChangeIncremental(allocator, uri, 2, 5, 0, 5, 0, "echo \"x\"\n"),
+        try makeDidChangeIncremental(allocator, uri, 3, 5, 0, 6, 0, ""),
+        try makeDidChangeIncremental(allocator, uri, 4, 5, 0, 5, 0, "echo \"y\"\n"),
+        try makeDocumentSymbolRequest(allocator, 42, uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    // The server survived the edit storm and still answers — a crash would have
+    // killed it before this response arrived.
+    const response = try findResponseById(allocator, output, 42);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+    const syms = parsed.value.object.get("result").?.array.items;
+    var saw_walk = false;
+    for (syms) |s| {
+        if (std.mem.eql(u8, s.object.get("name").?.string, "walk")) saw_walk = true;
+    }
+    try std.testing.expect(saw_walk);
+}
+
 test "lsp document symbols nest struct fields and function parameters" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);

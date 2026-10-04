@@ -223,6 +223,7 @@ pub const TypeChecker = struct {
         self.overload_resolved = .empty;
         self.inferred_error_sets = .empty;
         self.inferred_collector_stack = .empty;
+        self.comptime_field_vars = .empty;
     }
 
     fn reportSpanError(

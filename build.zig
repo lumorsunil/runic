@@ -94,10 +94,14 @@ pub fn build(b: *std.Build) void {
     });
     lsp_cli.root_module.addImport("runic_lsp", lsp);
     lsp_cli.root_module.addOptions("build_options", build_options);
-    b.installArtifact(lsp_cli);
+    const lsp_install = b.addInstallArtifact(lsp_cli, .{});
+    b.getInstallStep().dependOn(&lsp_install.step);
 
+    // Depend on the *install* (not just the compile) so `zig build runic-lsp`
+    // actually refreshes zig-out/bin/runic-lsp — otherwise it compiles into the
+    // cache and leaves a stale installed binary behind.
     const lsp_build = b.step("runic-lsp", "Build the Runic language server");
-    lsp_build.dependOn(&lsp_cli.step);
+    lsp_build.dependOn(&lsp_install.step);
 
     const lsp_tests = b.addTest(.{ .root_module = lsp });
     const lsp_runner = b.addRunArtifact(lsp_tests);
