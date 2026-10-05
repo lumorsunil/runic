@@ -17,12 +17,15 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 - **A struct type now renders with its name instead of `<struct>`.** A struct is
   named after the first binding it is bound to (`const Point = struct { … }` →
   `Point`), the way Zig names an otherwise-anonymous struct; a later alias
-  (`const P = Point`) does not take over the name. So hovering a value of that
-  type in the editor now shows `Point{ x: Int, y: Int }` rather than
-  `<struct>{ … }`. The name is display-only — it does not change type equality
-  (two structurally-identical structs with different names are still compatible).
-  A struct never bound to a name (a struct literal's inferred type, a type
-  function's result) still renders as `<struct>`.
+  (`const P = Point`) does not take over the name. A struct produced by a type
+  constructor function (`fn Maybe(comptime T: type) type { yield struct { … } }`)
+  is named after the written application, so `Maybe(Int)` and `Maybe(String)` each
+  carry their own name. So hovering a value of such a type in the editor now shows
+  `Point{ x: Int, y: Int }` or `Maybe(Int){ x: ?Int }` rather than `<struct>{ … }`.
+  The name is display-only — it does not change type equality (two
+  structurally-identical structs with different names are still compatible). A
+  struct never bound to a name (a struct literal's inferred type) still renders as
+  `<struct>`.
 
 - **A `Void` stdout type now means the function produces *nothing* on `&1`** — it
   no longer acts as a byte "passthrough". A function that writes to stdout (an

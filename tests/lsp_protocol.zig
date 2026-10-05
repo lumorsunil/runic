@@ -2723,6 +2723,42 @@ test "lsp hover shows a struct's bound name instead of <struct>" {
     try std.testing.expect(std.mem.indexOf(u8, value, "<struct>") == null);
 }
 
+test "lsp hover names a struct returned from a type constructor function" {
+    // A `fn Maybe(comptime T: type) type { yield struct { … } }` constructor:
+    // hovering a `Maybe(Int)` value should show the applied name `Maybe(Int){ … }`,
+    // not `<struct>{ … }`. Each instantiation carries its own written form.
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\fn Maybe(comptime T: type) type { yield struct { x: ?T } }
+        \\const m: Maybe(Int) = .{ .x = 7 }
+        \\echo "${m.x orelse 0}"
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        // Hover on `m` (line 1, char 6).
+        try makeHoverRequest(allocator, 10, uri, 1, 6),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 10);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+    const value = parsed.value.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, value, "Maybe(Int){") != null);
+    try std.testing.expect(std.mem.indexOf(u8, value, "<struct>") == null);
+}
+
 test "lsp hover shows execution result member type" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);

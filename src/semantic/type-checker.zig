@@ -1103,18 +1103,30 @@ pub const TypeChecker = struct {
         // the field *names* — so member access and (annotation-driven) construction
         // catch typos statically; the field types stay permissive and the IR
         // compiler resolves the real layout.
+        // Name the resulting struct after the written application (`Maybe(Int)`,
+        // `Pair(Int)(String)`) so hover shows `Maybe(Int){ … }` rather than
+        // `<struct>{ … }` — the type-function analog of a `const S = struct { … }`
+        // binding getting the name `S`. Display-only; each instantiation gets its
+        // own name, like Zig's `Maybe(i32)` vs `Maybe(bool)`.
         if (substituted.* == .struct_type and substituted.struct_type.body_items.len > 0) {
             if (try self.materializeRecipeFields(scope, substituted.struct_type, ctor.params, resolved_args)) |fields| {
                 var st = substituted.struct_type;
                 st.fields = fields;
                 st.body_items = &.{};
+                if (st.name == null) st.name = try std.fmt.allocPrint(self.arena.allocator(), "{f}", .{app});
                 return self.allocTypeExpression(.{ .struct_type = st });
             }
             // Couldn't statically resolve the recipe (e.g. a dynamic field *name*):
             // keep it permissive and let the IR compiler materialize the layout.
             return substituted;
         }
-        return self.resolveTypeExpr(scope, substituted);
+        const resolved = try self.resolveTypeExpr(scope, substituted);
+        if (resolved.* == .struct_type and resolved.struct_type.name == null) {
+            var st = resolved.struct_type;
+            st.name = try std.fmt.allocPrint(self.arena.allocator(), "{f}", .{app});
+            return self.allocTypeExpression(.{ .struct_type = st });
+        }
+        return resolved;
     }
 
     /// Materializes a struct recipe (`@insert` / `for (@fields(T)) |f| @insert …`)
