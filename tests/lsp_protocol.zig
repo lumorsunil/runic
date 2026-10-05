@@ -2759,6 +2759,47 @@ test "lsp hover names a struct returned from a type constructor function" {
     try std.testing.expect(std.mem.indexOf(u8, value, "<struct>") == null);
 }
 
+test "lsp hover lists every signature of an overloaded function" {
+    // An overloaded function (`pure` defined twice, differing by return type) is
+    // mangled per definition during type checking, so a plain lookup of `pure`
+    // finds nothing. Hover should fall back to the overload set and show each
+    // signature — with struct return types named, not `<struct>`.
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\fn Maybe(comptime T: type) type { yield struct { x: ?T } }
+        \\fn Void pure(x: |A|) Maybe(A) { yield .{ .x = x } }
+        \\fn Void pure(x: |A|) []A { yield .{x} }
+        \\const m: Maybe(Int) = pure 42
+        \\echo "${m.x orelse 0}"
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        // Hover on the `pure` call site (line 3, char 23).
+        try makeHoverRequest(allocator, 10, uri, 3, 23),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 10);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+    const value = parsed.value.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    // Both overloads shown, with the struct return type named.
+    try std.testing.expect(std.mem.indexOf(u8, value, "Maybe(A)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, value, "[]A") != null);
+    try std.testing.expect(std.mem.indexOf(u8, value, "<struct>") == null);
+}
+
 test "lsp hover shows execution result member type" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);

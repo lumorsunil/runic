@@ -26,6 +26,12 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   structurally-identical structs with different names are still compatible). A
   struct never bound to a name (a struct literal's inferred type) still renders as
   `<struct>`.
+- **Hover on an overloaded function now lists every signature.** An overloaded
+  function (two definitions sharing a name, differing by return type — `pure` in
+  `examples/monads.rn`) is mangled per definition during type checking, so a plain
+  lookup found nothing and hover came back empty. It now falls back to the overload
+  set and shows one `const name: <signature>` block per definition, each with its
+  struct return type named.
 
 - **A `Void` stdout type now means the function produces *nothing* on `&1`** — it
   no longer acts as a byte "passthrough". A function that writes to stdout (an

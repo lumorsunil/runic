@@ -672,9 +672,12 @@ pub const Server = struct {
             self.writeHoverMember(&alloc_writer, scope, f.object_type, f.member_name);
         } else if (binding) |b| {
             self.writeHoverBinding(&alloc_writer, b);
-        } else {
-            // alloc_writer.writer.writeAll("Something went wrong.") catch {};
-        }
+        } else if (scope) |s| if (extracted_identifier) |i| {
+            // An overloaded function is mangled per definition (`pure#0`, `pure#1`)
+            // and recorded under its original name, so a plain lookup of `pure`
+            // finds nothing. Fall back to its overload set and show each signature.
+            self.writeHoverOverloads(&alloc_writer, s, i.name);
+        };
 
         const result = types.Hover{
             .contents = .{
@@ -939,6 +942,30 @@ pub const Server = struct {
         }
         alloc_writer.writer.print("{?f}\n", .{binding.type_expr}) catch {};
         alloc_writer.writer.writeAll("```") catch {};
+    }
+
+    /// Writes hover for an overloaded function: one `const name: <signature>`
+    /// block per definition. The overloads are mangled (`pure#0`, …) during type
+    /// checking and recorded under the original name; the resolved signature for
+    /// each lives in the scope under its mangled name.
+    fn writeHoverOverloads(
+        self: *Server,
+        alloc_writer: *std.Io.Writer.Allocating,
+        scope: *runic.semantic.Scope,
+        name: []const u8,
+    ) void {
+        const set = self.workspace.type_checker.overload_sets.get(name) orelse return;
+        const w = &alloc_writer.writer;
+        var written: usize = 0;
+        for (set.items) |entry| {
+            const overload = scope.lookup(entry.mangled) orelse continue;
+            if (written > 0) w.writeAll("\n") catch {};
+            written += 1;
+            w.writeAll("```\n") catch {};
+            if (overload.is_mutable) w.writeAll("var ") catch {} else w.writeAll("const ") catch {};
+            w.print("{s}: {?f}\n", .{ name, overload.type_expr }) catch {};
+            w.writeAll("```") catch {};
+        }
     }
 
     /// Writes a `cimport` extern's C signature (`pow(base: c.Double, …) c.Double`)
