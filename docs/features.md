@@ -951,6 +951,47 @@ runtime is dynamically typed, `Box(Int)` and `Box(String)` share a single layout
 checking and capture. (The older `const Box(T) = struct { … }` type-constructor
 form has been superseded by this comptime type function form.)
 
+### Static declarations and decl literals
+
+A type constructor is **module-like**: a `pub const` written in its body becomes
+a *static declaration* of the produced type, reachable as a member of that type.
+The declaration's value is resolved with the type arguments bound, so a `?T`
+reads as `?Int` for `Maybe(Int)`:
+
+```rn
+fn Maybe(comptime T: type) type {
+  pub const nothing: ?T = null
+  pub const empty: Maybe(T) = .{ .x = null }
+  yield struct { x: ?T }
+}
+
+echo "${Maybe(Int).nothing orelse -1}"      // -1
+const e: Maybe(Int) = Maybe(Int).empty      // a full Maybe(Int) value
+```
+
+Where the expected type is already known — a binding annotation, a `yield`
+against the function's return type, or a call argument against the parameter
+type — the type name can be dropped: a leading-dot **decl literal** `.name`
+resolves against that *result-location* type (the same idea as Zig's `.foo`):
+
+```rn
+const none: Maybe(Int) = .nothing            // = Maybe(Int).nothing
+
+fn Void makeEmpty() Maybe(Int) { yield .empty }
+
+fn Void take(m: Maybe(Int)) String { echo "${m.x orelse -1}" }
+take (.empty)                                // parens: see below
+```
+
+A **bare** `take .empty` is parsed as member access on `take` (a space-form
+grammar ambiguity — the dot binds as a member), so the implicit form in call
+position takes parentheses, `take (.empty)`, the way Zig writes `take(.empty)`.
+The explicit `take Maybe(Int).empty` needs none.
+
+**Result:** named constants and sentinels (`nothing`, `empty`, …) live on the
+type that defines them, and read back without restating the type when context
+supplies it.
+
 ### Serializing type identifiers
 
 A type identifier used where a string is expected — in string interpolation or

@@ -100,7 +100,7 @@ A cycle of feature work and engineering-health work:
   member chains and struct-literal fields. Alongside: a batch of fuzz-found
   crash/leak fixes and a type-checker-reset segfault fix so editing a file with
   functions no longer takes the server down. See theme 5 below.
-- **Comptime → a type-class-lite layer (`comptime-functions` branch):** on top of
+- **Comptime → a type-class-lite layer (0.12.0):** on top of
   the comptime surface (below), a cluster of features that together give
   constraint-checked, return-type-directed generics without a full type-class
   system. **Function overloading** — a name declared more than once is an overload
@@ -117,8 +117,13 @@ A cycle of feature work and engineering-health work:
   closure that captures a runtime value can be passed as a value and called
   indirectly, its environment intact. Plus a generic call is monomorphized even
   when its result is captured by value or accessed inline (`(gmap f x).field`), so
-  a higher-kinded return resolves to a concrete struct at the use site.
-- **Runtime/diagnostics polish (same branch):** `@log msg` prints to the process's
+  a higher-kinded return resolves to a concrete struct at the use site. **Static
+  type declarations** — a type constructor is module-like: a `pub const` in its
+  body is a static member of the produced type (`Maybe(Int).nothing`), and where
+  the result-location type is known it reads as a leading-dot **decl literal**
+  (`const none: Maybe(Int) = .nothing`, also in `yield` and parenthesized call
+  arguments), Zig-style.
+- **Runtime/diagnostics polish (0.12.0):** `@log msg` prints to the process's
   *real* stdout for debugging, bypassing a captured function's stdout pipe (an
   `echo` there deadlocks the capture); a bare command or call whose stdout type
   doesn't match the enclosing function's is now a compile error (byte channels
@@ -126,7 +131,16 @@ A cycle of feature work and engineering-health work:
   binding; an array coerces to a string as `[1, 2, 3]` (bracketed, comma-joined,
   nesting) instead of its elements run together, while pipeline input stays
   space-separated; and an LSP off-by-one — a `\n` string escape miscounted as a
-  line break — that corrupted incremental edits is fixed.
+  line break — that corrupted incremental edits is fixed. The `Void`-is-silent
+  rule closed a long-standing trailing-block capture deadlock. Two more fixes:
+  a pipeline producer that runs several command-statements no longer drops its
+  last line under load, and a type-checker-reset use-after-free that crashed the
+  language server after a few quick edits is gone.
+- **Editor hover polish (0.12.0):** hover now names a struct after the binding or
+  type constructor it came from (`Point{ … }`, `Maybe(Int){ … }`) instead of
+  `<struct>`, lists every signature of an overloaded function, types a field of an
+  anonymous `.{ … }` literal from its context, and resolves an implicit `.name`
+  declaration access against the result-location type.
 
 A known constraint discovered this cycle: `compiler.zig` is large (~10k lines)
 but cannot be cleanly split in current Zig — `usingnamespace` was removed and

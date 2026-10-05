@@ -12,6 +12,19 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-05
+
+A large comptime and type-system release that layers constraint-checked,
+return-type-directed generics on top of the comptime surface — a "type-class
+lite" without a full type-class system. Highlights: type-returning comptime
+functions (generic types), function overloading, higher-kinded capture
+(`|M|(A)`), comptime type predicates/introspection and field iteration,
+`@insert`/`@field`/`@log`, a growing standard library (`std.meta`, `std.map`,
+`std.control`, `std.testing`), trailing-block closures, and static declarations
+on constructor-produced types with Zig-style decl literals (`.nothing`). The
+stdout type system is now honest — a `Void` function is guaranteed silent — and
+the language server gains richer hover plus several crash and concurrency fixes.
+
 ### Changed
 
 - **A struct type now renders with its name instead of `<struct>`.** A struct is
