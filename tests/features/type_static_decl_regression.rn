@@ -35,3 +35,12 @@ fn Void getEmpty() Maybe(Int) {
 }
 const g: Maybe(Int) = getEmpty
 echo "yield implicit x: ${g.x orelse -1}"
+
+// A declaration access as a call argument, resolved against the parameter type.
+// Explicit `Maybe(Int).empty`, or implicit `(.empty)` (parenthesized so the dot
+// is not read as member access on the callee).
+fn Void takeOne(m: Maybe(Int)) String {
+  echo "arg x: ${m.x orelse -1}"
+}
+takeOne Maybe(Int).empty
+takeOne (.empty)

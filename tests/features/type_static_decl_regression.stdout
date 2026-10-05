@@ -4,3 +4,5 @@ empty via explicit: -1
 empty via implicit: -1
 implicit matches explicit: 0
 yield implicit x: -1
+arg x: -1
+arg x: -1

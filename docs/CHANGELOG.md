@@ -71,8 +71,12 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   enclosing function's return type (`fn … Maybe(Int) { yield .empty }`), when that
   type is a type-constructor application; the explicit `Type.name` form works
   anywhere. A struct-literal declaration value resolves in these result-location
-  contexts too (it is built in the consuming frame so it stabilizes). Call-argument
-  positions are not wired yet. The type checker now also carries a type constructor's
+  contexts too (it is built in the consuming frame so it stabilizes). It also
+  resolves as a **call argument** against the parameter type — explicit
+  (`f Maybe(Int).empty`) or, parenthesized so the dot is not read as a member
+  access on the callee, implicit (`f (.empty)`). A bare `f .empty` remains a
+  member access on `f` (a space-form grammar ambiguity, as `f(.x)` resolves in
+  Zig); use parentheses. The type checker now also carries a type constructor's
   static decls on the produced type, so editor hover on either form (`.nothing`
   or `Maybe(Int).nothing`) shows the resolved declaration, typed concretely
   (`const nothing: ?Int`).

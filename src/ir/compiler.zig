@@ -2025,21 +2025,16 @@ pub const IRCompiler = struct {
         };
     }
 
-    /// `yield .name` — resolves the implicit member against the enclosing
-    /// function's declared return type and compiles the declaration's value in the
-    /// current (function body) frame, so a struct-literal value stabilizes. Null
-    /// when the value is not an implicit member or the return type is not a
-    /// type-constructor application carrying such a declaration.
+    /// `yield .name` (or `yield Maybe(Int).name`) — compiles the declaration value
+    /// in the function-body frame, with the implicit `.name` resolved against the
+    /// enclosing function's declared return type. Null when the value is not such
+    /// an access.
     fn tryCompileYieldImplicitMember(self: *IRCompiler, value: *const ast.Expression) Error!?Result {
-        if (value.* != .member) return null;
-        if (!isImplicitMemberObject(value.member.object)) return null;
-        if (self.fn_return_type_stack.items.len == 0) return null;
-        const rt = self.fn_return_type_stack.items[self.fn_return_type_stack.items.len - 1] orelse return null;
-        const app = switch (rt.*) {
-            .type_application => |a| a,
-            else => return null,
-        };
-        return self.compileTypeDeclValue(app.name.name, app.args, value.member.member.name, true);
+        const rt: ?*const ast.TypeExpr = if (self.fn_return_type_stack.items.len > 0)
+            self.fn_return_type_stack.items[self.fn_return_type_stack.items.len - 1]
+        else
+            null;
+        return self.tryCompileTypeDeclAccess(value, rt);
     }
 
     fn compileYield(
@@ -3746,6 +3741,8 @@ pub const IRCompiler = struct {
             // type first, so it builds the concrete layout, not the empty recipe.
             const r = if (try self.compileRecipeStructArg(arg, forked_set, i)) |rec|
                 rec
+            else if (try self.tryCompileTypeDeclAccess(arg, self.paramDeclType(forked_set, i))) |decl_val|
+                decl_val
             else if (self.paramExpectsFnValue(forked_set, i))
                 (try self.compileFnValueArg(source, arg)) orelse try self.compileExpressionWithCapture(source, arg)
             else
@@ -4613,24 +4610,15 @@ pub const IRCompiler = struct {
         return try self.compileExpressionWithCapture(bd.initializer, bd.initializer);
     }
 
-    /// For a binding whose initializer is a static type declaration access
-    /// (`const a: Maybe(Int) = Maybe(Int).nothing` or the implicit `= .nothing`),
-    /// compiles the declaration's initializer **in the binding's own frame** with
-    /// the constructor's type parameters bound. This is what lets a struct-literal
-    /// declaration value (`pub const nothing: Maybe(T) = .{ … }`) stabilize — the
-    /// same path a direct `const a: Maybe(Int) = .{ … }` takes. Returns false when
-    /// the initializer is not such an access (the caller then compiles normally).
-    fn compileTypeDeclBinding(
-        self: *IRCompiler,
-        source: anytype,
-        identifier: ast.Identifier,
-        expr: *ast.Expression,
-        annotation: ?*const ast.TypeExpr,
-        is_mutable: bool,
-    ) Error!bool {
+    /// Compiles a static type-declaration access as a value **in the current
+    /// frame** (so a struct-literal declaration value stabilizes), for either the
+    /// explicit `Maybe(Int).nothing` form or the implicit `.nothing` resolved
+    /// against `expected` (a binding annotation, a parameter type, …). Null when
+    /// `expr` is not such an access, or there is no matching declaration.
+    fn tryCompileTypeDeclAccess(self: *IRCompiler, expr: *const ast.Expression, expected: ?*const ast.TypeExpr) Error!?Result {
         // The general parser encodes `a.b` as a `.binary{.member}`; the implicit
         // `.name` form is a `.member` with the empty-identifier object. Normalize.
-        const ma = asMemberAccess(expr) orelse return false;
+        const ma = asMemberAccess(expr) orelse return null;
 
         // Resolve the constructor name and type arguments from either form.
         var ctor_name: []const u8 = undefined;
@@ -4638,10 +4626,9 @@ pub const IRCompiler = struct {
         var owned_args: ?[]*const ast.TypeExpr = null;
         defer if (owned_args) |a| self.allocator.free(a);
         if (isImplicitMemberObject(ma.object)) {
-            const ann = annotation orelse return false;
-            const app = switch (ann.*) {
+            const app = switch ((expected orelse return null).*) {
                 .type_application => |a| a,
-                else => return false,
+                else => return null,
             };
             ctor_name = app.name.name;
             arg_types = app.args;
@@ -4655,13 +4642,26 @@ pub const IRCompiler = struct {
             ctor_name = call.callee.identifier.name;
             const args = try self.allocator.alloc(*const ast.TypeExpr, call.arguments.len);
             owned_args = args;
-            for (call.arguments, args) |arg, *dst| dst.* = self.argToTypeExpr(arg) orelse return false;
+            for (call.arguments, args) |arg, *dst| dst.* = self.argToTypeExpr(arg) orelse return null;
             arg_types = args;
-        } else return false;
+        } else return null;
 
-        // Compile the declaration's value in this (the binding's) frame, so a
-        // struct literal stabilizes. `allow_struct = true` is safe here.
-        const result = (try self.compileTypeDeclValue(ctor_name, arg_types, ma.member, true)) orelse return false;
+        return self.compileTypeDeclValue(ctor_name, arg_types, ma.member, true);
+    }
+
+    /// For a binding whose initializer is a static type declaration access
+    /// (`const a: Maybe(Int) = Maybe(Int).nothing` or the implicit `= .nothing`),
+    /// compiles the value in the binding's own frame and binds it. Returns false
+    /// when the initializer is not such an access (compile normally then).
+    fn compileTypeDeclBinding(
+        self: *IRCompiler,
+        source: anytype,
+        identifier: ast.Identifier,
+        expr: *ast.Expression,
+        annotation: ?*const ast.TypeExpr,
+        is_mutable: bool,
+    ) Error!bool {
+        const result = (try self.tryCompileTypeDeclAccess(expr, annotation)) orelse return false;
         try self.compileIdentifierBinding(source, identifier, result.source, annotation, is_mutable, .normal);
         return true;
     }
@@ -8360,6 +8360,15 @@ pub const IRCompiler = struct {
                 const arg_ref = try self.newRef(source, "call_arg");
                 try self.set(source, arg_ref, stableResultSource(rec));
                 captured_args[i] = .fromLocation(arg_ref.dereference().typed(rec.typeExpr()));
+                continue;
+            }
+            // A static type-declaration access argument (`f .nothing`,
+            // `f Maybe(Int).empty`) resolved against the parameter type, built here
+            // in the caller's frame so a struct-literal value stabilizes.
+            if (try self.tryCompileTypeDeclAccess(arg, self.paramDeclType(fn_ref.fn_addr.instr_set, i))) |decl_val| {
+                const arg_ref = try self.newRef(source, "call_arg");
+                try self.set(source, arg_ref, stableResultSource(decl_val));
+                captured_args[i] = .fromLocation(arg_ref.dereference().typed(decl_val.typeExpr()));
                 continue;
             }
             // A fn-typed parameter takes a function *value*: pass a bare
