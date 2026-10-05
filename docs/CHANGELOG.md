@@ -66,9 +66,13 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 - **Implicit declaration access `.name` against the result-location type.** When
   the expected type is known, a leading-dot `.name` resolves to that type's static
   declaration — `const none: Maybe(Int) = .nothing` is `Maybe(Int).nothing` — the
-  way Zig resolves a decl literal. Currently wired for a binding's annotation when
-  it is a type-constructor application (`Maybe(Int)`); the explicit `Type.name`
-  form works anywhere. The type checker now also carries a type constructor's
+  way Zig resolves a decl literal. Wired for a binding's annotation
+  (`const none: Maybe(Int) = .nothing`) and for a `yield` value against the
+  enclosing function's return type (`fn … Maybe(Int) { yield .empty }`), when that
+  type is a type-constructor application; the explicit `Type.name` form works
+  anywhere. A struct-literal declaration value resolves in these result-location
+  contexts too (it is built in the consuming frame so it stabilizes). Call-argument
+  positions are not wired yet. The type checker now also carries a type constructor's
   static decls on the produced type, so editor hover on either form (`.nothing`
   or `Maybe(Int).nothing`) shows the resolved declaration, typed concretely
   (`const nothing: ?Int`).

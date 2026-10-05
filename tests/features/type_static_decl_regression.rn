@@ -27,3 +27,11 @@ echo "empty via implicit: ${e2.x orelse -1}"
 const explicit: Maybe(Int) = Maybe(Int).nothing
 const implicit: Maybe(Int) = .nothing
 echo "implicit matches explicit: ${explicit == implicit}"
+
+// Implicit `.name` also resolves against a function's declared return type, so a
+// `yield .nothing` in a `Maybe(Int)` function needs no explicit type.
+fn Void getEmpty() Maybe(Int) {
+  yield .empty
+}
+const g: Maybe(Int) = getEmpty
+echo "yield implicit x: ${g.x orelse -1}"

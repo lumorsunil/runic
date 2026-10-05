@@ -622,6 +622,10 @@ pub const IRCompiler = struct {
     /// typed correctly for coercions. Top is the innermost function.
     stdin_type_stack: std.ArrayList(?ast.TypeExpr) = .empty,
 
+    /// Stack of enclosing functions' declared return types; top is the innermost.
+    /// Used to supply a `yield`'s result-location type to an implicit `.name`.
+    fn_return_type_stack: std.ArrayList(?*const ast.TypeExpr) = .empty,
+
     /// Comptime evaluation state. `comptime_forcing > 0` while lowering a
     /// `comptime` expression, which enables the comptime folder to reduce pure
     /// function calls (off by default so ordinary calls stay runtime). Maps a
@@ -2021,12 +2025,35 @@ pub const IRCompiler = struct {
         };
     }
 
+    /// `yield .name` — resolves the implicit member against the enclosing
+    /// function's declared return type and compiles the declaration's value in the
+    /// current (function body) frame, so a struct-literal value stabilizes. Null
+    /// when the value is not an implicit member or the return type is not a
+    /// type-constructor application carrying such a declaration.
+    fn tryCompileYieldImplicitMember(self: *IRCompiler, value: *const ast.Expression) Error!?Result {
+        if (value.* != .member) return null;
+        if (!isImplicitMemberObject(value.member.object)) return null;
+        if (self.fn_return_type_stack.items.len == 0) return null;
+        const rt = self.fn_return_type_stack.items[self.fn_return_type_stack.items.len - 1] orelse return null;
+        const app = switch (rt.*) {
+            .type_application => |a| a,
+            else => return null,
+        };
+        return self.compileTypeDeclValue(app.name.name, app.args, value.member.member.name, true);
+    }
+
     fn compileYield(
         self: *IRCompiler,
         source: *ast.Statement,
         y: ast.YieldStmt,
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        // A `yield .name` resolves the implicit member against the enclosing
+        // function's declared return type and is built here, in the function's
+        // frame (so a struct-literal declaration value stabilizes). The resolved
+        // value then flows through the normal yield paths below.
+        const implicit_value: ?Result = if (y.fd == 1) try self.tryCompileYieldImplicitMember(y.value) else null;
 
         // In a `sync` entry the value is returned in `%r` and control returns to
         // the caller via `ret` — there is no stdout stream to yield to. The
@@ -2043,7 +2070,7 @@ pub const IRCompiler = struct {
             // `%r`, so its result is captured by value rather than forked with the
             // caller's stdout (which would leak the callee's output and return an
             // unwaited handle — even for a scalar result).
-            const value = (try self.tryCompileSyncCall(y.value, y.value)) orelse
+            const value = implicit_value orelse (try self.tryCompileSyncCall(y.value, y.value)) orelse
                 (if (self.yieldNeedsValueCapture(y.value))
                     try self.compileExpressionWithCapture(y.value, y.value)
                 else
@@ -2079,7 +2106,7 @@ pub const IRCompiler = struct {
         // result would write a thread handle / dangling reference instead. Only
         // generic calls need this: an ordinary yield (a value, a command, a
         // pipeline) must keep streaming, not be captured.
-        const raw_value = (try self.tryCompileSyncCall(y.value, y.value)) orelse
+        const raw_value = implicit_value orelse (try self.tryCompileSyncCall(y.value, y.value)) orelse
             (if (y.fd == 1 and self.yieldNeedsValueCapture(y.value))
                 try self.compileExpressionWithCapture(source, y.value)
             else
@@ -2158,17 +2185,6 @@ pub const IRCompiler = struct {
                 // helper handles that and returns true when it applied.
                 if (try self.compileTypeDeclBinding(source, identifier, expr, annotation, is_mutable))
                     return .fromValue(.void);
-
-                // Implicit member access `.name` against the binding's annotation
-                // for a non-struct declaration (`const none_2: Maybe(Int) =
-                // .nothing` where `nothing: ?T`): resolve it to the decl's value.
-                if (annotation) |ann| implicit: {
-                    if (expr.* != .member) break :implicit;
-                    if (!isImplicitMemberObject(expr.member.object)) break :implicit;
-                    const result = (try self.tryCompileImplicitMember(ann, expr.member.member.name)) orelse break :implicit;
-                    try self.compileIdentifierBinding(source, identifier, result.source, annotation, is_mutable, .normal);
-                    return .fromValue(.void);
-                }
                 // Constructing a struct whose type is built by an `@insert` recipe
                 // (`const p: Partial(T) = Partial{ … }`): the bare `Partial{…}` has
                 // no fields on its own, so materialize the layout from the binding's
@@ -4534,7 +4550,7 @@ pub const IRCompiler = struct {
         // `Maybe(Int)` written as a type value (`.type_value`) — e.g. a binding
         // initializer `= Maybe(Int).nothing`.
         if (memberObjectTypeApp(member.object)) |app| {
-            return self.compileTypeDeclValue(app.name.name, app.args, member.member.name);
+            return self.compileTypeDeclValue(app.name.name, app.args, member.member.name, false);
         }
         // `Maybe(Int)` parsed as a value call (bare interpolation form).
         if (member.object.* != .call) return null;
@@ -4544,7 +4560,7 @@ pub const IRCompiler = struct {
         const args = try self.allocator.alloc(*const ast.TypeExpr, call.arguments.len);
         defer self.allocator.free(args);
         for (call.arguments, args) |arg, *dst| dst.* = self.argToTypeExpr(arg) orelse return null;
-        return self.compileTypeDeclValue(call.callee.identifier.name, args, member.member.name);
+        return self.compileTypeDeclValue(call.callee.identifier.name, args, member.member.name, false);
     }
 
     /// Whether a member access's object is the empty-identifier sentinel the
@@ -4554,23 +4570,16 @@ pub const IRCompiler = struct {
         return object.* == .identifier and object.identifier.name.len == 0;
     }
 
-    /// Implicit member access `.name` resolved against a result-location type
-    /// (`const v: Maybe(Int) = .nothing`). When `type_expr` is a type-constructor
-    /// application (`Maybe(Int)`), this is the type's static `nothing` decl.
-    fn tryCompileImplicitMember(self: *IRCompiler, type_expr: *const ast.TypeExpr, member_name: []const u8) Error!?Result {
-        const app = switch (type_expr.*) {
-            .type_application => |a| a,
-            else => return null,
-        };
-        return self.compileTypeDeclValue(app.name.name, app.args, member_name);
-    }
-
     /// Compiles the value of a static `pub const` declaration `member_name` of the
     /// type `Ctor(arg_types…)`, with the constructor's type parameters bound to
     /// `arg_types` (so a `T` in the initializer resolves). Null when there is no
-    /// such constructor/decl, or the decl is a `pub fn` (not a value), or the decl
-    /// is a struct literal (not yet supported — see below).
-    fn compileTypeDeclValue(self: *IRCompiler, ctor_name: []const u8, arg_types: []const *const ast.TypeExpr, member_name: []const u8) Error!?Result {
+    /// such constructor/decl, or the decl is a `pub fn` (not a value).
+    ///
+    /// `allow_struct` must be true only when called from a context that compiles
+    /// in a stable frame (a binding or a `yield` value): a struct-literal value
+    /// built in a deeply-nested member-access context stores a closure-cell
+    /// reference that goes stale, so the deep path passes false and bails there.
+    fn compileTypeDeclValue(self: *IRCompiler, ctor_name: []const u8, arg_types: []const *const ast.TypeExpr, member_name: []const u8, allow_struct: bool) Error!?Result {
         if (!self.comptime_type_names.contains(ctor_name)) return null;
         const base_st = self.user_struct_types.get(ctor_name) orelse return null;
 
@@ -4599,14 +4608,9 @@ pub const IRCompiler = struct {
             if (prior) |p| self.type_captures.put(self.allocator, param.name, p) catch {} else _ = self.type_captures.remove(param.name);
         };
 
-        // A struct-literal value declaration needs to be built in the consuming
-        // binding's own frame to stabilize (building it here, nested in a member
-        // access, stores it as a closure-cell reference that goes stale). The
-        // binding path handles that directly (see `compileTypeDeclBinding`); bail
-        // so the caller falls back when that path isn't available.
-        if (bd.initializer.* == .struct_literal) return null;
+        if (bd.initializer.* == .struct_literal and !allow_struct) return null;
 
-        return try self.compileExpression(bd.initializer);
+        return try self.compileExpressionWithCapture(bd.initializer, bd.initializer);
     }
 
     /// For a binding whose initializer is a static type declaration access
@@ -4655,33 +4659,9 @@ pub const IRCompiler = struct {
             arg_types = args;
         } else return false;
 
-        if (!self.comptime_type_names.contains(ctor_name)) return false;
-        const base_st = self.user_struct_types.get(ctor_name) orelse return false;
-        const decl = for (base_st.decls) |d| {
-            if (std.mem.eql(u8, d.name.name, ma.member)) break d;
-        } else return false;
-        const bd = switch (decl.decl_source) {
-            .binding_decl => |b| b,
-            .fn_decl => return false,
-        };
-        // Only the struct-literal case needs the in-frame treatment; scalars go
-        // through the ordinary member-access path.
-        if (bd.initializer.* != .struct_literal) return false;
-
-        const params = self.generic_ctor_params.get(ctor_name) orelse &[_]ast.Identifier{};
-        if (arg_types.len != params.len) return false;
-
-        var saved = std.ArrayList(?ast.TypeExpr).empty;
-        defer saved.deinit(self.allocator);
-        for (params, 0..) |param, i| {
-            try saved.append(self.allocator, self.type_captures.get(param.name));
-            if (i < arg_types.len) try self.type_captures.put(self.allocator, param.name, arg_types[i].*);
-        }
-        defer for (params, saved.items) |param, prior| {
-            if (prior) |p| self.type_captures.put(self.allocator, param.name, p) catch {} else _ = self.type_captures.remove(param.name);
-        };
-
-        const result = try self.compileExpressionWithCapture(source, bd.initializer);
+        // Compile the declaration's value in this (the binding's) frame, so a
+        // struct literal stabilizes. `allow_struct = true` is safe here.
+        const result = (try self.compileTypeDeclValue(ctor_name, arg_types, ma.member, true)) orelse return false;
         try self.compileIdentifierBinding(source, identifier, result.source, annotation, is_mutable, .normal);
         return true;
     }
@@ -10989,6 +10969,10 @@ pub const IRCompiler = struct {
         // A stack handles nested function declarations.
         try self.stdin_type_stack.append(self.allocator, if (fn_decl.stdin_type) |st| st.* else null);
         defer _ = self.stdin_type_stack.pop();
+        // Track the declared return type so a `yield .name` in the body can
+        // resolve the implicit member against it.
+        try self.fn_return_type_stack.append(self.allocator, fn_decl.return_type);
+        defer _ = self.fn_return_type_stack.pop();
 
         self.instruction_sets.items[instr_set].param_count = fn_decl.params._non_variadic.len;
         for (fn_decl.params._non_variadic) |param| {
