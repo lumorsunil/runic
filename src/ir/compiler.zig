@@ -2151,6 +2151,17 @@ pub const IRCompiler = struct {
                 return .fromValue(.void);
             },
             .identifier => |identifier| {
+                // Implicit member access `.name` resolved against the binding's
+                // annotation (`const none_2: Maybe(Int) = .nothing`): the object is
+                // the empty-identifier sentinel, so the result-location type
+                // supplies the type whose static decl this names.
+                if (annotation) |ann| implicit: {
+                    if (expr.* != .member) break :implicit;
+                    if (!isImplicitMemberObject(expr.member.object)) break :implicit;
+                    const result = (try self.tryCompileImplicitMember(ann, expr.member.member.name)) orelse break :implicit;
+                    try self.compileIdentifierBinding(source, identifier, result.source, annotation, is_mutable, .normal);
+                    return .fromValue(.void);
+                }
                 // Constructing a struct whose type is built by an `@insert` recipe
                 // (`const p: Partial(T) = Partial{ … }`): the bare `Partial{…}` has
                 // no fields on its own, so materialize the layout from the binding's
@@ -4505,12 +4516,42 @@ pub const IRCompiler = struct {
         if (member.object.* != .call) return null;
         const call = member.object.call;
         if (call.callee.* != .identifier) return null;
-        const ctor_name = call.callee.identifier.name;
+        if (!self.comptime_type_names.contains(call.callee.identifier.name)) return null;
+        const args = try self.allocator.alloc(*const ast.TypeExpr, call.arguments.len);
+        defer self.allocator.free(args);
+        for (call.arguments, args) |arg, *dst| dst.* = self.argToTypeExpr(arg) orelse return null;
+        return self.compileTypeDeclValue(call.callee.identifier.name, args, member.member.name);
+    }
+
+    /// Whether a member access's object is the empty-identifier sentinel the
+    /// parser emits for an implicit `.name` access, resolved against the
+    /// result-location type.
+    fn isImplicitMemberObject(object: *const ast.Expression) bool {
+        return object.* == .identifier and object.identifier.name.len == 0;
+    }
+
+    /// Implicit member access `.name` resolved against a result-location type
+    /// (`const v: Maybe(Int) = .nothing`). When `type_expr` is a type-constructor
+    /// application (`Maybe(Int)`), this is the type's static `nothing` decl.
+    fn tryCompileImplicitMember(self: *IRCompiler, type_expr: *const ast.TypeExpr, member_name: []const u8) Error!?Result {
+        const app = switch (type_expr.*) {
+            .type_application => |a| a,
+            else => return null,
+        };
+        return self.compileTypeDeclValue(app.name.name, app.args, member_name);
+    }
+
+    /// Compiles the value of a static `pub const` declaration `member_name` of the
+    /// type `Ctor(arg_types…)`, with the constructor's type parameters bound to
+    /// `arg_types` (so a `T` in the initializer resolves). Null when there is no
+    /// such constructor/decl, or the decl is a `pub fn` (not a value), or the decl
+    /// is a struct literal (not yet supported — see below).
+    fn compileTypeDeclValue(self: *IRCompiler, ctor_name: []const u8, arg_types: []const *const ast.TypeExpr, member_name: []const u8) Error!?Result {
         if (!self.comptime_type_names.contains(ctor_name)) return null;
         const base_st = self.user_struct_types.get(ctor_name) orelse return null;
 
         const decl = for (base_st.decls) |d| {
-            if (std.mem.eql(u8, d.name.name, member.member.name)) break d;
+            if (std.mem.eql(u8, d.name.name, member_name)) break d;
         } else return null;
         const bd = switch (decl.decl_source) {
             .binding_decl => |b| b,
@@ -4518,20 +4559,17 @@ pub const IRCompiler = struct {
             .fn_decl => return null,
         };
 
+        const params = self.generic_ctor_params.get(ctor_name) orelse &[_]ast.Identifier{};
+        if (arg_types.len != params.len) return null;
+
         // Bind each type parameter to its argument for the duration of compiling
         // the initializer, so a `T` reference in it resolves (mirrors
         // `materializeStructRecipe`). Restored afterward.
-        const params = self.generic_ctor_params.get(ctor_name) orelse &[_]ast.Identifier{};
-        if (call.arguments.len != params.len) return null;
-        const args = try self.allocator.alloc(*const ast.TypeExpr, call.arguments.len);
-        defer self.allocator.free(args);
-        for (call.arguments, args) |arg, *dst| dst.* = self.argToTypeExpr(arg) orelse return null;
-
         var saved = std.ArrayList(?ast.TypeExpr).empty;
         defer saved.deinit(self.allocator);
         for (params, 0..) |param, i| {
             try saved.append(self.allocator, self.type_captures.get(param.name));
-            if (i < args.len) try self.type_captures.put(self.allocator, param.name, args[i].*);
+            if (i < arg_types.len) try self.type_captures.put(self.allocator, param.name, arg_types[i].*);
         }
         defer for (params, saved.items) |param, prior| {
             if (prior) |p| self.type_captures.put(self.allocator, param.name, p) catch {} else _ = self.type_captures.remove(param.name);

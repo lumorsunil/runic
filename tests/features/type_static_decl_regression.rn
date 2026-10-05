@@ -8,7 +8,14 @@ fn Maybe(comptime T: type) type {
   yield struct { x: ?T }
 }
 
+// Explicit access on the written type.
 echo "answer: ${Maybe(Int).answer}"
 
 const n: ?Int = Maybe(Int).nothing
 echo "nothing: ${n orelse -1}"
+
+// Implicit access (`.name`) resolved against the result-location type: `.nothing`
+// here means `Maybe(Int).nothing`, so it is the same value as the explicit form.
+const explicit: Maybe(Int) = Maybe(Int).nothing
+const implicit: Maybe(Int) = .nothing
+echo "implicit matches explicit: ${explicit == implicit}"

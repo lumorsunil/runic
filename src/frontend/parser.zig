@@ -1188,6 +1188,28 @@ pub const Parser = struct {
                             });
                             continue;
                         },
+                        .dot => {
+                            // `.name` in value position — implicit member access (a
+                            // decl literal) resolved against the result-location type,
+                            // e.g. `const v: Maybe(Int) = .nothing`. Represented as a
+                            // member access whose object is the empty-identifier
+                            // sentinel (the "no written type" marker anonymous `.{ }`
+                            // literals also use); the expected type supplies the object
+                            // later.
+                            const breadcrumbInner = try self.createBreadcrumb("PBE:implicit_member");
+                            defer breadcrumbInner.end();
+                            _ = try self.nextToken(); // consume the dot
+                            const name_tok = try self.expectTokenTag(.identifier);
+                            const obj = try self.allocExpression(.{ .identifier = .{ .name = "", .span = next.span } });
+                            try components.append(self.allocator, .{
+                                .expr = try self.allocExpression(.{ .member = .{
+                                    .object = obj,
+                                    .member = .fromToken(name_tok),
+                                    .span = next.span.endAt(name_tok.span),
+                                } }),
+                            });
+                            continue;
+                        },
                         .string_start => {
                             const breadcrumbInner = try self.createBreadcrumb("PBE:string");
                             defer breadcrumbInner.end();

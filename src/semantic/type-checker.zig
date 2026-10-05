@@ -4712,9 +4712,22 @@ pub const TypeChecker = struct {
         );
     }
 
+    /// Whether a member access's object is the empty-identifier sentinel the
+    /// parser emits for an implicit `.name` access (`const v: T = .name`), to be
+    /// resolved against the result-location type.
+    fn isImplicitMemberObject(object: *const ast.Expression) bool {
+        return object.* == .identifier and object.identifier.name.len == 0;
+    }
+
     pub fn runMember(self: *TypeChecker, scope: *Scope, member: *ast.MemberExpr) Error!void {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, member.span);
+
+        // Implicit member access `.name` (object is the empty-identifier sentinel):
+        // resolved against the result-location type by the IR compiler. Accept it
+        // permissively here, the same way the explicit `Type.name` form is at this
+        // stage — don't run the empty identifier as an expression.
+        if (isImplicitMemberObject(member.object)) return;
 
         try self.runExpression(scope, member.object);
         const raw_object_type = try self.resolveExprType(scope, member.object) orelse {
