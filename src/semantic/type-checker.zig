@@ -1301,7 +1301,18 @@ pub const TypeChecker = struct {
 
         try self.runTypeExpression(scope, type_binding_decl.type_expr);
 
-        const resolved_type_expr = try self.resolveTypeExpr(scope, type_binding_decl.type_expr);
+        var resolved_type_expr = try self.resolveTypeExpr(scope, type_binding_decl.type_expr);
+
+        // Name an otherwise-anonymous struct after the first binding it is bound
+        // to (`const S = struct { … }` → `S`), the way Zig does, so hover shows
+        // `S{ … }` rather than `<struct>{ … }`. A later alias (`const T = S`)
+        // resolves through `S` and does not overwrite the name (first binding
+        // wins); a struct that already carries a name keeps it.
+        if (resolved_type_expr.* == .struct_type and resolved_type_expr.struct_type.name == null) {
+            var named = resolved_type_expr.struct_type;
+            named.name = type_binding_decl.identifier.name;
+            resolved_type_expr = try self.allocTypeExpression(.{ .struct_type = named });
+        }
 
         scope.declareType(
             self.arena.allocator(),

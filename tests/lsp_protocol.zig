@@ -2687,6 +2687,42 @@ test "lsp hover shows execution result type for bound command" {
     try std.testing.expect(std.mem.indexOf(u8, value, "ExecutionResult") != null);
 }
 
+test "lsp hover shows a struct's bound name instead of <struct>" {
+    // A struct is named after the first binding it is bound to (`const Point =
+    // struct { … }`), the way Zig names an otherwise-anonymous struct. Hovering a
+    // value of that type should show `Point{ … }`, not the old `<struct>{ … }`.
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\const Point = struct { x: Int, y: Int }
+        \\const p = Point{ .x = 1, .y = 2 }
+        \\echo "${p.x}"
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        // Hover on `p` (line 1, char 6) — its inferred type is the struct.
+        try makeHoverRequest(allocator, 10, uri, 1, 6),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 10);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+    const value = parsed.value.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, value, "Point{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, value, "<struct>") == null);
+}
+
 test "lsp hover shows execution result member type" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);

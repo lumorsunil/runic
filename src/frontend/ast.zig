@@ -392,6 +392,12 @@ pub const TypeExpr = union(enum) {
         fields: []const StructField,
         decls: []const StructDecl,
         span: Span,
+        /// The struct's display name, after the first binding it was bound to
+        /// (`const S = struct { … }` names it `S`), the way Zig names an
+        /// otherwise-anonymous struct. Null for a struct never bound to a name
+        /// (a struct literal's inferred type, a type-function result), which
+        /// formats as `<struct>`. Set by the type checker, used only for display.
+        name: ?[]const u8 = null,
         /// Ordered compile-time recipe (`@insert` / comptime `for … @insert`).
         /// Empty for an ordinary struct (fields in `fields`); non-empty only inside
         /// a comptime type function, expanded to `fields` at instantiation.
@@ -453,7 +459,7 @@ pub const TypeExpr = union(enum) {
         }
 
         pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
-            try writer.writeAll("<struct>{\n");
+            try writer.print("{s}{{\n", .{self.name orelse "<struct>"});
             for (self.fields) |field| {
                 try writer.print("  {s}: {f},\n", .{ field.name.name, field.type_expr });
             }
