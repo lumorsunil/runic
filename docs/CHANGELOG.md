@@ -54,6 +54,15 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Added
 
+- **Static declarations on a type produced by a type constructor.** A comptime
+  type constructor is module-like: a `pub const` in its body becomes a static
+  member of the produced type, reachable the way a module's public member is —
+  `fn Maybe(comptime T: type) type { pub const nothing: ?T = null; yield struct { x: ?T } }`
+  then `Maybe(Int).nothing`. The declaration's value is compiled with the type
+  arguments bound, so a `?T` reads as `?Int` for `Maybe(Int)`. (A struct-*literal*
+  value declaration — `pub const nothing: Maybe(T) = .{ … }` — is not supported
+  yet; scalar/optional/other expression values are.) This is a step toward
+  implicit declaration access (`.nothing`) when the result-location type is known.
 - **`std.meta.hash(v) Int`** — a structural hash: a struct combines its fields'
   hashes, a scalar/string hashes the bytes of its textual form. Recurses into
   struct-typed fields, so it is a deep hash (equal values by `std.meta.eq` hash

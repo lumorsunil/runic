@@ -1397,7 +1397,38 @@ pub const IRCompiler = struct {
             ._variadic => |param| if (comptimeTypeParamName(param)) |name| names.append(self.allocator, .{ .name = name, .span = param.span }) catch return null,
         }
         if (names.items.len == 0) return null;
-        return .{ .struct_type = body, .params = names.toOwnedSlice(self.allocator) catch return null };
+        // Fold the body's `pub const` declarations into the yielded struct's decls
+        // (a type constructor is module-like: `pub const nothing = …` becomes a
+        // static member of the produced type, reachable as `Maybe(Int).nothing`).
+        const st = self.withTypeFnPubDecls(body, fn_decl.body);
+        return .{ .struct_type = st, .params = names.toOwnedSlice(self.allocator) catch return null };
+    }
+
+    /// Returns `base` with every `pub const` in a type function's body block
+    /// appended to its `decls`, so the produced type carries them as static
+    /// members. A bare (non-block) body has none.
+    fn withTypeFnPubDecls(self: *IRCompiler, base: ast.TypeExpr.StructType, body: *const ast.Expression) ast.TypeExpr.StructType {
+        if (body.* != .block) return base;
+        var decls = std.ArrayList(ast.TypeExpr.StructDecl).empty;
+        decls.appendSlice(self.allocator, base.decls) catch return base;
+        for (body.block.statements) |stmt| {
+            switch (stmt.*) {
+                .binding_decl => |*bd| {
+                    if (!bd.is_pub) continue;
+                    if (bd.pattern.* != .identifier) continue;
+                    decls.append(self.allocator, .{
+                        .name = bd.pattern.identifier,
+                        .type_expr = bd.annotation,
+                        .decl_source = .{ .binding_decl = bd },
+                        .span = bd.span,
+                    }) catch return base;
+                },
+                else => {},
+            }
+        }
+        var st = base;
+        st.decls = decls.toOwnedSlice(self.allocator) catch return base;
+        return st;
     }
 
     /// The struct type a `fn … type` body yields (a bare or block `yield struct {
@@ -4464,6 +4495,59 @@ pub const IRCompiler = struct {
         return self.compileMember(source, member, mode);
     }
 
+    /// `Maybe(Int).nothing` — accessing a static `pub const` declaration of a
+    /// type produced by a comptime type constructor (module-like). Resolves the
+    /// constructor, finds the named decl in the type's `decls`, and compiles the
+    /// decl's value with the constructor's type parameters bound to the call's
+    /// arguments (so a `T` in the initializer resolves). Returns null when the
+    /// object is not such a type, or has no matching `pub const` member.
+    fn tryCompileTypeDeclMember(self: *IRCompiler, member: ast.MemberExpr) Error!?Result {
+        if (member.object.* != .call) return null;
+        const call = member.object.call;
+        if (call.callee.* != .identifier) return null;
+        const ctor_name = call.callee.identifier.name;
+        if (!self.comptime_type_names.contains(ctor_name)) return null;
+        const base_st = self.user_struct_types.get(ctor_name) orelse return null;
+
+        const decl = for (base_st.decls) |d| {
+            if (std.mem.eql(u8, d.name.name, member.member.name)) break d;
+        } else return null;
+        const bd = switch (decl.decl_source) {
+            .binding_decl => |b| b,
+            // A `pub fn` member (a method/associated function) isn't a value here.
+            .fn_decl => return null,
+        };
+
+        // Bind each type parameter to its argument for the duration of compiling
+        // the initializer, so a `T` reference in it resolves (mirrors
+        // `materializeStructRecipe`). Restored afterward.
+        const params = self.generic_ctor_params.get(ctor_name) orelse &[_]ast.Identifier{};
+        if (call.arguments.len != params.len) return null;
+        const args = try self.allocator.alloc(*const ast.TypeExpr, call.arguments.len);
+        defer self.allocator.free(args);
+        for (call.arguments, args) |arg, *dst| dst.* = self.argToTypeExpr(arg) orelse return null;
+
+        var saved = std.ArrayList(?ast.TypeExpr).empty;
+        defer saved.deinit(self.allocator);
+        for (params, 0..) |param, i| {
+            try saved.append(self.allocator, self.type_captures.get(param.name));
+            if (i < args.len) try self.type_captures.put(self.allocator, param.name, args[i].*);
+        }
+        defer for (params, saved.items) |param, prior| {
+            if (prior) |p| self.type_captures.put(self.allocator, param.name, p) catch {} else _ = self.type_captures.remove(param.name);
+        };
+
+        // A struct-literal value declaration (`pub const nothing: Maybe(T) =
+        // .{ … }`) is not supported yet: the materialized struct would have to
+        // flow up out of this nested member-access context, which the value model
+        // doesn't carry cleanly here. Bail so the caller reports a normal
+        // unsupported-member error rather than miscompiling. Scalar/optional/other
+        // expression values (`?T = null`, `Int = 42`, …) compile directly.
+        if (bd.initializer.* == .struct_literal) return null;
+
+        return try self.compileExpression(bd.initializer);
+    }
+
     fn compileMember(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -4505,6 +4589,12 @@ pub const IRCompiler = struct {
                 );
             }
         }
+
+        // `Maybe(Int).nothing` — a static declaration of a type produced by a
+        // comptime type constructor. The constructor is module-like: its body's
+        // `pub const` decls are members of the type, so this compiles the decl's
+        // value with the type arguments bound (`T` → `Int`).
+        if (try self.tryCompileTypeDeclMember(member)) |result| return result;
 
         // A member access on a call/pipeline result (`(dbl v).x`, `v.method.x`
         // where `method` is a function) must value-capture the object — a plain

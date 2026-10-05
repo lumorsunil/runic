@@ -1,0 +1,14 @@
+// A comptime type constructor is module-like: a `pub const` in its body becomes
+// a static declaration of the produced type, reachable as `Maybe(Int).answer` —
+// the same shape as accessing a public member of an imported module. Resolves
+// with the type arguments bound, so a `?T` decl reads as `?Int` for `Maybe(Int)`.
+fn Maybe(comptime T: type) type {
+  pub const answer: Int = 42
+  pub const nothing: ?T = null
+  yield struct { x: ?T }
+}
+
+echo "answer: ${Maybe(Int).answer}"
+
+const n: ?Int = Maybe(Int).nothing
+echo "nothing: ${n orelse -1}"
