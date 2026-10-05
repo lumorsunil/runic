@@ -1,3 +1,5 @@
 answer: 42
 nothing: -1
+empty via explicit: -1
+empty via implicit: -1
 implicit matches explicit: 0

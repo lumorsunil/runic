@@ -5,6 +5,7 @@
 fn Maybe(comptime T: type) type {
   pub const answer: Int = 42
   pub const nothing: ?T = null
+  pub const empty: Maybe(T) = .{ .x = null }
   yield struct { x: ?T }
 }
 
@@ -14,8 +15,15 @@ echo "answer: ${Maybe(Int).answer}"
 const n: ?Int = Maybe(Int).nothing
 echo "nothing: ${n orelse -1}"
 
-// Implicit access (`.name`) resolved against the result-location type: `.nothing`
-// here means `Maybe(Int).nothing`, so it is the same value as the explicit form.
+// A struct-valued declaration: the constant is a full `Maybe(Int)` value, built
+// against the declaration's annotation. Works via both the explicit type and the
+// implicit `.name` form resolved against the binding's annotation.
+const e1: Maybe(Int) = Maybe(Int).empty
+const e2: Maybe(Int) = .empty
+echo "empty via explicit: ${e1.x orelse -1}"
+echo "empty via implicit: ${e2.x orelse -1}"
+
+// Implicit access (`.name`) resolved against the result-location type.
 const explicit: Maybe(Int) = Maybe(Int).nothing
 const implicit: Maybe(Int) = .nothing
 echo "implicit matches explicit: ${explicit == implicit}"

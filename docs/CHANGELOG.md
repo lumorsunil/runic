@@ -59,9 +59,10 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   member of the produced type, reachable the way a module's public member is —
   `fn Maybe(comptime T: type) type { pub const nothing: ?T = null; yield struct { x: ?T } }`
   then `Maybe(Int).nothing`. The declaration's value is compiled with the type
-  arguments bound, so a `?T` reads as `?Int` for `Maybe(Int)`. (A struct-*literal*
-  value declaration — `pub const nothing: Maybe(T) = .{ … }` — is not supported
-  yet; scalar/optional/other expression values are.)
+  arguments bound, so a `?T` reads as `?Int` for `Maybe(Int)`. Declaration values
+  may be scalars/optionals/other expressions, or a struct literal
+  (`pub const empty: Maybe(T) = .{ … }`) — the latter is built in the consuming
+  binding's frame so it stabilizes like a direct `const e: Maybe(Int) = .{ … }`.
 - **Implicit declaration access `.name` against the result-location type.** When
   the expected type is known, a leading-dot `.name` resolves to that type's static
   declaration — `const none: Maybe(Int) = .nothing` is `Maybe(Int).nothing` — the

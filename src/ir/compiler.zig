@@ -2151,10 +2151,17 @@ pub const IRCompiler = struct {
                 return .fromValue(.void);
             },
             .identifier => |identifier| {
-                // Implicit member access `.name` resolved against the binding's
-                // annotation (`const none_2: Maybe(Int) = .nothing`): the object is
-                // the empty-identifier sentinel, so the result-location type
-                // supplies the type whose static decl this names.
+                // A static type-declaration access as the initializer, either
+                // explicit (`= Maybe(Int).nothing`) or implicit against the
+                // annotation (`= .nothing`). A struct-literal declaration value is
+                // built here, in the binding's own frame, so it stabilizes; this
+                // helper handles that and returns true when it applied.
+                if (try self.compileTypeDeclBinding(source, identifier, expr, annotation, is_mutable))
+                    return .fromValue(.void);
+
+                // Implicit member access `.name` against the binding's annotation
+                // for a non-struct declaration (`const none_2: Maybe(Int) =
+                // .nothing` where `nothing: ?T`): resolve it to the decl's value.
                 if (annotation) |ann| implicit: {
                     if (expr.* != .member) break :implicit;
                     if (!isImplicitMemberObject(expr.member.object)) break :implicit;
@@ -4512,7 +4519,24 @@ pub const IRCompiler = struct {
     /// decl's value with the constructor's type parameters bound to the call's
     /// arguments (so a `T` in the initializer resolves). Returns null when the
     /// object is not such a type, or has no matching `pub const` member.
+    /// A member-access object that denotes a type-constructor application
+    /// `Maybe(Int)` written as a type value (`.type_value` wrapping a
+    /// `type_application`). Null for any other object shape.
+    fn memberObjectTypeApp(object: *const ast.Expression) ?ast.TypeExpr.TypeApplication {
+        if (object.* != .type_value) return null;
+        return switch (object.type_value.type_expr.*) {
+            .type_application => |app| app,
+            else => null,
+        };
+    }
+
     fn tryCompileTypeDeclMember(self: *IRCompiler, member: ast.MemberExpr) Error!?Result {
+        // `Maybe(Int)` written as a type value (`.type_value`) — e.g. a binding
+        // initializer `= Maybe(Int).nothing`.
+        if (memberObjectTypeApp(member.object)) |app| {
+            return self.compileTypeDeclValue(app.name.name, app.args, member.member.name);
+        }
+        // `Maybe(Int)` parsed as a value call (bare interpolation form).
         if (member.object.* != .call) return null;
         const call = member.object.call;
         if (call.callee.* != .identifier) return null;
@@ -4575,15 +4599,91 @@ pub const IRCompiler = struct {
             if (prior) |p| self.type_captures.put(self.allocator, param.name, p) catch {} else _ = self.type_captures.remove(param.name);
         };
 
-        // A struct-literal value declaration (`pub const nothing: Maybe(T) =
-        // .{ … }`) is not supported yet: the materialized struct would have to
-        // flow up out of this nested member-access context, which the value model
-        // doesn't carry cleanly here. Bail so the caller reports a normal
-        // unsupported-member error rather than miscompiling. Scalar/optional/other
-        // expression values (`?T = null`, `Int = 42`, …) compile directly.
+        // A struct-literal value declaration needs to be built in the consuming
+        // binding's own frame to stabilize (building it here, nested in a member
+        // access, stores it as a closure-cell reference that goes stale). The
+        // binding path handles that directly (see `compileTypeDeclBinding`); bail
+        // so the caller falls back when that path isn't available.
         if (bd.initializer.* == .struct_literal) return null;
 
         return try self.compileExpression(bd.initializer);
+    }
+
+    /// For a binding whose initializer is a static type declaration access
+    /// (`const a: Maybe(Int) = Maybe(Int).nothing` or the implicit `= .nothing`),
+    /// compiles the declaration's initializer **in the binding's own frame** with
+    /// the constructor's type parameters bound. This is what lets a struct-literal
+    /// declaration value (`pub const nothing: Maybe(T) = .{ … }`) stabilize — the
+    /// same path a direct `const a: Maybe(Int) = .{ … }` takes. Returns false when
+    /// the initializer is not such an access (the caller then compiles normally).
+    fn compileTypeDeclBinding(
+        self: *IRCompiler,
+        source: anytype,
+        identifier: ast.Identifier,
+        expr: *ast.Expression,
+        annotation: ?*const ast.TypeExpr,
+        is_mutable: bool,
+    ) Error!bool {
+        // The general parser encodes `a.b` as a `.binary{.member}`; the implicit
+        // `.name` form is a `.member` with the empty-identifier object. Normalize.
+        const ma = asMemberAccess(expr) orelse return false;
+
+        // Resolve the constructor name and type arguments from either form.
+        var ctor_name: []const u8 = undefined;
+        var arg_types: []const *const ast.TypeExpr = undefined;
+        var owned_args: ?[]*const ast.TypeExpr = null;
+        defer if (owned_args) |a| self.allocator.free(a);
+        if (isImplicitMemberObject(ma.object)) {
+            const ann = annotation orelse return false;
+            const app = switch (ann.*) {
+                .type_application => |a| a,
+                else => return false,
+            };
+            ctor_name = app.name.name;
+            arg_types = app.args;
+        } else if (memberObjectTypeApp(ma.object)) |app| {
+            // `Maybe(Int)` written as a type application (`.type_value`).
+            ctor_name = app.name.name;
+            arg_types = app.args;
+        } else if (ma.object.* == .call and ma.object.call.callee.* == .identifier) {
+            // `Maybe(Int)` parsed as a value call (bare interpolation form).
+            const call = ma.object.call;
+            ctor_name = call.callee.identifier.name;
+            const args = try self.allocator.alloc(*const ast.TypeExpr, call.arguments.len);
+            owned_args = args;
+            for (call.arguments, args) |arg, *dst| dst.* = self.argToTypeExpr(arg) orelse return false;
+            arg_types = args;
+        } else return false;
+
+        if (!self.comptime_type_names.contains(ctor_name)) return false;
+        const base_st = self.user_struct_types.get(ctor_name) orelse return false;
+        const decl = for (base_st.decls) |d| {
+            if (std.mem.eql(u8, d.name.name, ma.member)) break d;
+        } else return false;
+        const bd = switch (decl.decl_source) {
+            .binding_decl => |b| b,
+            .fn_decl => return false,
+        };
+        // Only the struct-literal case needs the in-frame treatment; scalars go
+        // through the ordinary member-access path.
+        if (bd.initializer.* != .struct_literal) return false;
+
+        const params = self.generic_ctor_params.get(ctor_name) orelse &[_]ast.Identifier{};
+        if (arg_types.len != params.len) return false;
+
+        var saved = std.ArrayList(?ast.TypeExpr).empty;
+        defer saved.deinit(self.allocator);
+        for (params, 0..) |param, i| {
+            try saved.append(self.allocator, self.type_captures.get(param.name));
+            if (i < arg_types.len) try self.type_captures.put(self.allocator, param.name, arg_types[i].*);
+        }
+        defer for (params, saved.items) |param, prior| {
+            if (prior) |p| self.type_captures.put(self.allocator, param.name, p) catch {} else _ = self.type_captures.remove(param.name);
+        };
+
+        const result = try self.compileExpressionWithCapture(source, bd.initializer);
+        try self.compileIdentifierBinding(source, identifier, result.source, annotation, is_mutable, .normal);
+        return true;
     }
 
     fn compileMember(
