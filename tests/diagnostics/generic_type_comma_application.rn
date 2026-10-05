@@ -1,0 +1,2 @@
+fn HashMap(comptime K: type, comptime V: type) type { yield struct { k: K, v: V } }
+const M = HashMap(String, Int)

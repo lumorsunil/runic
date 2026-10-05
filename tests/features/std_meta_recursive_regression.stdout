@@ -1,0 +1,8 @@
+show p: { x=1 y=2 }
+show l: { from={ x=1 y=2 } to={ x=3 y=4 } label=seg }
+show scalar: 42
+eq l l2: 0
+eq l l3: 1
+eq scalars: 0
+hash eq: 0
+hash ne: 1

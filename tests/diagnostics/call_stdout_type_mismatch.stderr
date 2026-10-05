@@ -1,0 +1,18 @@
+[error]: tests/diagnostics/call_stdout_type_mismatch.rn:7:3: 'namer' writes 'String' to stdout, but this function's stdout type is 'Int'; bind the result (const x = …), redirect it (>&2 or > "file"), or use @log for debug output
+   5:fn String namer() String { yield "hi" }
+   6:fn Int bad() Int {
+   7:  namer
+   8:  yield 5
+   9:}
+  10:echo "${bad}"
+  11:
+
+[error]: tests/diagnostics/call_stdout_type_mismatch.rn:7:3: function stdin type mismatch: enclosing stdin is Int, callee stdin expects String
+   5:fn String namer() String { yield "hi" }
+   6:fn Int bad() Int {
+   7:  namer
+   8:  yield 5
+   9:}
+  10:echo "${bad}"
+  11:
+

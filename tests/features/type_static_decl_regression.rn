@@ -1,0 +1,46 @@
+// A comptime type constructor is module-like: a `pub const` in its body becomes
+// a static declaration of the produced type, reachable as `Maybe(Int).answer` —
+// the same shape as accessing a public member of an imported module. Resolves
+// with the type arguments bound, so a `?T` decl reads as `?Int` for `Maybe(Int)`.
+fn Maybe(comptime T: type) type {
+  pub const answer: Int = 42
+  pub const nothing: ?T = null
+  pub const empty: Maybe(T) = .{ .x = null }
+  yield struct { x: ?T }
+}
+
+// Explicit access on the written type.
+echo "answer: ${Maybe(Int).answer}"
+
+const n: ?Int = Maybe(Int).nothing
+echo "nothing: ${n orelse -1}"
+
+// A struct-valued declaration: the constant is a full `Maybe(Int)` value, built
+// against the declaration's annotation. Works via both the explicit type and the
+// implicit `.name` form resolved against the binding's annotation.
+const e1: Maybe(Int) = Maybe(Int).empty
+const e2: Maybe(Int) = .empty
+echo "empty via explicit: ${e1.x orelse -1}"
+echo "empty via implicit: ${e2.x orelse -1}"
+
+// Implicit access (`.name`) resolved against the result-location type.
+const explicit: Maybe(Int) = Maybe(Int).nothing
+const implicit: Maybe(Int) = .nothing
+echo "implicit matches explicit: ${explicit == implicit}"
+
+// Implicit `.name` also resolves against a function's declared return type, so a
+// `yield .nothing` in a `Maybe(Int)` function needs no explicit type.
+fn Void getEmpty() Maybe(Int) {
+  yield .empty
+}
+const g: Maybe(Int) = getEmpty
+echo "yield implicit x: ${g.x orelse -1}"
+
+// A declaration access as a call argument, resolved against the parameter type.
+// Explicit `Maybe(Int).empty`, or implicit `(.empty)` (parenthesized so the dot
+// is not read as member access on the callee).
+fn Void takeOne(m: Maybe(Int)) String {
+  echo "arg x: ${m.x orelse -1}"
+}
+takeOne Maybe(Int).empty
+takeOne (.empty)

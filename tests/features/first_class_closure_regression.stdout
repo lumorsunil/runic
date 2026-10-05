@@ -1,0 +1,4 @@
+runtime capture: 105
+fn-value capture: 14
+map triple some: 42
+map triple none: -1

@@ -1,0 +1,14 @@
+[error]: tests/diagnostics/comptime_insert_construct_typo.rn:9:48: struct has no field 'zzz'
+   7:  yield struct { for (@fields(T)) |f| @insert "${f.name}: ?${f.type}" }
+   8:}
+   9:const p: Partial(Rec(Int)) = Partial{ .a = 1, .zzz = 2 }
+  10:echo "done"
+  11:
+
+[error]: tests/diagnostics/comptime_insert_construct_typo.rn:9:30: missing field 'b' in struct literal
+   7:  yield struct { for (@fields(T)) |f| @insert "${f.name}: ?${f.type}" }
+   8:}
+   9:const p: Partial(Rec(Int)) = Partial{ .a = 1, .zzz = 2 }
+  10:echo "done"
+  11:
+

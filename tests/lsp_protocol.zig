@@ -721,6 +721,122 @@ test "lsp survives incremental edits to a file with functions" {
     try std.testing.expect(saw_add);
 }
 
+test "lsp applies an incremental edit correctly past a string containing a newline escape" {
+    // A `\n` escape inside a string literal is two ordinary characters on one
+    // line, not a line break. A regression counted it as a newline when mapping
+    // an LSP position to a byte offset, so every edit after such a string landed
+    // one line too early — deleting/replacing the wrong line and corrupting the
+    // buffer. Delete a line that sits *after* a string with a `\n`, and confirm
+    // the *intended* line went away (not its neighbour).
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\fn Void note(n: Int) String { echo "n=${n}\n" }
+        \\const a = 1
+        \\const b = 2
+        \\const c = 3
+        \\echo "${a}"
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        // Delete line 3 (`const c = 3`): range (3,0)–(4,0) → "". Under the bug the
+        // `\n` on line 0 shifted this to line 2, deleting `const b` instead.
+        try makeDidChangeIncremental(allocator, uri, 2, 3, 0, 4, 0, ""),
+        try makeDocumentSymbolRequest(allocator, 21, uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 21);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+    const syms = parsed.value.object.get("result").?.array.items;
+    var saw_b = false;
+    var saw_c = false;
+    var saw_note = false;
+    for (syms) |s| {
+        const nm = s.object.get("name").?.string;
+        if (std.mem.eql(u8, nm, "b")) saw_b = true;
+        if (std.mem.eql(u8, nm, "c")) saw_c = true;
+        if (std.mem.eql(u8, nm, "note")) saw_note = true;
+    }
+    // `c` was the deleted line; `b` and `note` remain. Under the off-by-one bug
+    // it was `b` that vanished and `c` that survived.
+    try std.testing.expect(saw_note);
+    try std.testing.expect(saw_b);
+    try std.testing.expect(!saw_c);
+
+    // The edit kept the document valid — no spurious diagnostics from a corrupted
+    // buffer.
+    const diag = try findLastMethodNotification(allocator, output, "textDocument/publishDiagnostics");
+    defer allocator.free(diag);
+    const diag_parsed = try std.json.parseFromSlice(std.json.Value, allocator, diag, .{});
+    defer diag_parsed.deinit();
+    const diags = diag_parsed.value.object.get("params").?.object.get("diagnostics").?.array.items;
+    try std.testing.expectEqual(@as(usize, 0), diags.len);
+}
+
+test "lsp re-checks a comptime field iteration across edits without crashing" {
+    // The type checker is reused across LSP re-checks: `reset()` frees its arena
+    // and clears every arena-backed collection back to `.empty`. It missed
+    // `comptime_field_vars`, so that map's header kept pointing at freed storage.
+    // The next re-check of a `for (@fields(T)) |f|` body called
+    // `comptime_field_vars.put(...)` through the dangling header and segfaulted
+    // the server after an edit or two. Replay a short edit storm on such a
+    // document; before the fix the server crashed mid-stream and never answered
+    // the final request.
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\fn Box(comptime T: type) type { yield struct { value: T } }
+        \\fn Void walk(comptime T: type) String {
+        \\  for (@fields(T)) |f| { echo "${f.name}" }
+        \\}
+        \\walk Box(Int)
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    // Line 5 is the empty line after the trailing newline; each edit there drives
+    // another reset()+re-check, which is what used to crash.
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        try makeDidChangeIncremental(allocator, uri, 2, 5, 0, 5, 0, "echo \"x\"\n"),
+        try makeDidChangeIncremental(allocator, uri, 3, 5, 0, 6, 0, ""),
+        try makeDidChangeIncremental(allocator, uri, 4, 5, 0, 5, 0, "echo \"y\"\n"),
+        try makeDocumentSymbolRequest(allocator, 42, uri),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    // The server survived the edit storm and still answers — a crash would have
+    // killed it before this response arrived.
+    const response = try findResponseById(allocator, output, 42);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+    const syms = parsed.value.object.get("result").?.array.items;
+    var saw_walk = false;
+    for (syms) |s| {
+        if (std.mem.eql(u8, s.object.get("name").?.string, "walk")) saw_walk = true;
+    }
+    try std.testing.expect(saw_walk);
+}
+
 test "lsp document symbols nest struct fields and function parameters" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
@@ -2569,6 +2685,207 @@ test "lsp hover shows execution result type for bound command" {
     try std.testing.expect(std.mem.eql(u8, kind, "markdown") or std.mem.eql(u8, kind, "plaintext"));
     const value = contents.get("value").?.string;
     try std.testing.expect(std.mem.indexOf(u8, value, "ExecutionResult") != null);
+}
+
+test "lsp hover shows a struct's bound name instead of <struct>" {
+    // A struct is named after the first binding it is bound to (`const Point =
+    // struct { … }`), the way Zig names an otherwise-anonymous struct. Hovering a
+    // value of that type should show `Point{ … }`, not the old `<struct>{ … }`.
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\const Point = struct { x: Int, y: Int }
+        \\const p = Point{ .x = 1, .y = 2 }
+        \\echo "${p.x}"
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        // Hover on `p` (line 1, char 6) — its inferred type is the struct.
+        try makeHoverRequest(allocator, 10, uri, 1, 6),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 10);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+    const value = parsed.value.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, value, "Point{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, value, "<struct>") == null);
+}
+
+test "lsp hover names a struct returned from a type constructor function" {
+    // A `fn Maybe(comptime T: type) type { yield struct { … } }` constructor:
+    // hovering a `Maybe(Int)` value should show the applied name `Maybe(Int){ … }`,
+    // not `<struct>{ … }`. Each instantiation carries its own written form.
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\fn Maybe(comptime T: type) type { yield struct { x: ?T } }
+        \\const m: Maybe(Int) = .{ .x = 7 }
+        \\echo "${m.x orelse 0}"
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        // Hover on `m` (line 1, char 6).
+        try makeHoverRequest(allocator, 10, uri, 1, 6),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 10);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+    const value = parsed.value.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, value, "Maybe(Int){") != null);
+    try std.testing.expect(std.mem.indexOf(u8, value, "<struct>") == null);
+}
+
+test "lsp hover lists every signature of an overloaded function" {
+    // An overloaded function (`pure` defined twice, differing by return type) is
+    // mangled per definition during type checking, so a plain lookup of `pure`
+    // finds nothing. Hover should fall back to the overload set and show each
+    // signature — with struct return types named, not `<struct>`.
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\fn Maybe(comptime T: type) type { yield struct { x: ?T } }
+        \\fn Void pure(x: |A|) Maybe(A) { yield .{ .x = x } }
+        \\fn Void pure(x: |A|) []A { yield .{x} }
+        \\const m: Maybe(Int) = pure 42
+        \\echo "${m.x orelse 0}"
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        // Hover on the `pure` call site (line 3, char 23).
+        try makeHoverRequest(allocator, 10, uri, 3, 23),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 10);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+    const value = parsed.value.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    // Both overloads shown, with the struct return type named.
+    try std.testing.expect(std.mem.indexOf(u8, value, "Maybe(A)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, value, "[]A") != null);
+    try std.testing.expect(std.mem.indexOf(u8, value, "<struct>") == null);
+}
+
+test "lsp hover types an anonymous struct-literal field from its context" {
+    // `.x` in an anonymous `.{ .x = … }` literal has no name to look up; its type
+    // comes from the literal's context — a binding annotation, or (inside a
+    // function) the declared return type that its `yield` targets. Both should
+    // resolve the field type rather than coming back empty.
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\const Point = struct { x: Int, y: Int }
+        \\const v: Point = .{ .x = 1, .y = 2 }
+        \\fn Maybe(comptime T: type) type { yield struct { x: ?T } }
+        \\fn Void pure(x: |A|) Maybe(A) {
+        \\  yield .{ .x = x }
+        \\}
+        \\echo "${v.x}"
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        // `.x` in the annotated binding `const v: Point = .{ .x = 1, … }` (line 1).
+        try makeHoverRequest(allocator, 10, uri, 1, 21),
+        // `.x` in `pure`'s `yield .{ .x = x }` (line 4) — typed from the return type.
+        try makeHoverRequest(allocator, 11, uri, 4, 12),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const annotated = try findResponseById(allocator, output, 10);
+    defer allocator.free(annotated.body);
+    const annotated_parsed = try std.json.parseFromSlice(std.json.Value, allocator, annotated.body, .{});
+    defer annotated_parsed.deinit();
+    const annotated_value = annotated_parsed.value.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, annotated_value, "x: Int") != null);
+
+    const yielded = try findResponseById(allocator, output, 11);
+    defer allocator.free(yielded.body);
+    const yielded_parsed = try std.json.parseFromSlice(std.json.Value, allocator, yielded.body, .{});
+    defer yielded_parsed.deinit();
+    const yielded_value = yielded_parsed.value.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, yielded_value, "x: ?A") != null);
+}
+
+test "lsp hover resolves an implicit member against the result-location type" {
+    // `.nothing` with no written object resolves against the binding's annotation
+    // (`const none: Maybe(Int) = .nothing`), so hover shows the type's static
+    // `nothing` decl — typed concretely (`?Int`) for `Maybe(Int)`.
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\fn Maybe(comptime T: type) type {
+        \\  pub const nothing: ?T = null
+        \\  yield struct { x: ?T }
+        \\}
+        \\const none: Maybe(Int) = .nothing
+        \\echo "done"
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        // Hover on `.nothing` (line 4, char 28).
+        try makeHoverRequest(allocator, 10, uri, 4, 28),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 10);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+    const value = parsed.value.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, value, "nothing") != null);
+    try std.testing.expect(std.mem.indexOf(u8, value, "?Int") != null);
 }
 
 test "lsp hover shows execution result member type" {

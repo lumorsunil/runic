@@ -1,0 +1,25 @@
+# Comptime type predicates with capture patterns. `T == Box(|E|)` matches the
+# comptime type against a pattern at compile time and binds the capture `E` to
+# the matched type argument, usable in the taken branch (`${E}`). Because a
+# `comptime T: type` function is monomorphized per type argument, the branch is
+# selected — and the capture bound — at compile time.
+
+fn Box(comptime T: type) type { yield struct { value: T } }
+fn Pair(comptime A: type, comptime B: type) type { yield struct { a: A, b: B } }
+
+fn Void describe(comptime T: type) String {
+    if (T == Box(|E|)) { yield "box of ${E}" } else { if (T == Pair(|X|)(|Y|)) { yield "pair of ${X} and ${Y}" } else { yield "scalar ${T}" } }
+}
+
+echo "${describe Box(Int)}"
+echo "${describe Box(String)}"
+echo "${describe Box(Box(Int))}"
+echo "${describe Pair(Int)(Bool)}"
+echo "${describe Int}"
+
+# The bound capture is itself a comptime type, usable in a nested predicate.
+fn Void inner(comptime T: type) String {
+    if (T == Box(|E|)) { if (E == Int) { yield "box of int" } else { yield "box of ${E}" } } else { yield "not a box" }
+}
+echo "${inner Box(Int)}"
+echo "${inner Box(Bool)}"

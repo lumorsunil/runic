@@ -1,0 +1,43 @@
+// std.map with **struct keys** at any nesting depth. A struct key is hashed
+// structurally (std.meta.hash, which recurses into struct-typed fields) in
+// bucketFor and matched with struct `==`, so two equal records are the same key.
+const std = import "std"
+
+const Point = struct { x: Int, y: Int }
+
+var m = std.map.empty
+m = std.map.set m Point{ .x = 1, .y = 2 } "a"
+m = std.map.set m Point{ .x = 3, .y = 4 } "b"
+// An equal struct key replaces the existing entry (not a new one).
+m = std.map.set m Point{ .x = 1, .y = 2 } "a2"
+
+echo "get (1,2): ${std.map.get m Point{ .x = 1, .y = 2 } orelse "?"}"
+echo "get (3,4): ${std.map.get m Point{ .x = 3, .y = 4 } orelse "?"}"
+echo "get (9,9): ${std.map.get m Point{ .x = 9, .y = 9 } orelse "?"}"
+echo "has (3,4): ${std.map.has m Point{ .x = 3, .y = 4 }}"
+echo "has (9,9): ${std.map.has m Point{ .x = 9, .y = 9 }}"
+echo "len: ${std.map.len m}"
+
+// A struct key with a string field also works.
+const Named = struct { id: Int, tag: String }
+var n = std.map.empty
+n = std.map.set n Named{ .id = 1, .tag = "a" } "first"
+echo "named: ${std.map.get n Named{ .id = 1, .tag = "a" } orelse "?"}"
+
+// A **nested** struct key (fields are themselves structs): the hash recurses
+// through the inner structs, and `==` compares deeply.
+const Edge = struct { a: Point, b: Point }
+var g = std.map.empty
+g = std.map.set g Edge{ .a = Point{ .x = 0, .y = 0 }, .b = Point{ .x = 1, .y = 1 } } "e1"
+g = std.map.set g Edge{ .a = Point{ .x = 2, .y = 2 }, .b = Point{ .x = 3, .y = 3 } } "e2"
+// An equal nested key replaces (not appends).
+g = std.map.set g Edge{ .a = Point{ .x = 0, .y = 0 }, .b = Point{ .x = 1, .y = 1 } } "e1b"
+echo "edge e1: ${std.map.get g Edge{ .a = Point{ .x = 0, .y = 0 }, .b = Point{ .x = 1, .y = 1 } } orelse "?"}"
+echo "edge e2: ${std.map.get g Edge{ .a = Point{ .x = 2, .y = 2 }, .b = Point{ .x = 3, .y = 3 } } orelse "?"}"
+echo "edge miss: ${std.map.get g Edge{ .a = Point{ .x = 9, .y = 9 }, .b = Point{ .x = 9, .y = 9 } } orelse "?"}"
+echo "edge len: ${std.map.len g}"
+
+// Int keys still work unchanged.
+var k = std.map.empty
+k = std.map.set k 7 "seven"
+echo "int key: ${std.map.get k 7 orelse "?"}"

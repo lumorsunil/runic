@@ -1,0 +1,35 @@
+# A fully generic monad `map`, written over *any* constructor `M` and guarded by
+# a compile-time constraint — the "type-class-lite" payoff. Unlike a concrete
+# `map` (fixed to `Maybe`), `gmap` captures the constructor higher-kinded
+# (`ma: |M|(A)`) and its result is `M(B)`. It is monomorphized per call, so
+# inside the specialized body `M` is a bound comptime type: `@hasMethod(M)`
+# folds, the untaken `@compileError` arm is pruned, and the nested closure `aux`
+# (which captures the mapped `f`) is passed to `bind` and called indirectly.
+#
+# The call is a *typed value capture* (`const r: Maybe(Int) = gmap …`), which
+# takes the typed-pipe path — specialization must still happen there, or `M`
+# would stay unbound and the constraint could not fold.
+
+fn Maybe(comptime T: type) type { yield struct { x: ?T } }
+fn pure(x: |A|) Maybe(A) { yield .{ .x = x } }
+fn bind(ma: Maybe(|A|), f: fn (|A|) Maybe(|B|)) Maybe(B) {
+  if (ma.x) |x| yield f x else yield .{ .x = null }
+}
+fn gmap(f: fn (|A|) |B|, ma: |M|(A)) M(B) {
+  if (@hasMethod(M)("bind")) {
+    fn aux(a: A) M(B) { yield pure (f a) }
+    yield bind ma aux
+  } else {
+    @compileError "${M} is not a monad"
+  }
+}
+
+fn double(n: Int) Int { yield n * 2 }
+fn inc(n: Int) Int { yield n + 1 }
+
+const some: Maybe(Int) = Maybe{ .x = 21 }
+const none: Maybe(Int) = Maybe{ .x = null }
+const r1: Maybe(Int) = gmap double some
+const r2: Maybe(Int) = gmap inc none
+echo "gmap double some: ${r1.x orelse -1}"
+echo "gmap inc none: ${r2.x orelse -1}"

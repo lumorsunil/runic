@@ -1,0 +1,9 @@
+[error]: tests/diagnostics/generic_monad_constraint_fail.rn:16:5: Box is not a monad
+  14:    yield bind ma aux
+  15:  } else {
+  16:    @compileError "${M} is not a monad"
+  17:  }
+  18:}
+  19:fn double(n: Int) Int { yield n * 2 }
+  20:const b: Box(Int) = Box{ .v = 21 }
+

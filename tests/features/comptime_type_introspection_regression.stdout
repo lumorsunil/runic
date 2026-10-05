@@ -1,0 +1,11 @@
+int
+bool
+string
+struct
+array
+optional
+elem Int / Box(Int) / []Bool
+child Int / String
+struct(1) with value; +1 = 2
+struct(2) without value
+non-struct int

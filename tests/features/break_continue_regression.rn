@@ -55,7 +55,7 @@ for (0..3) |i| {
 
 // A `for (&0)` stream consumer can break.
 fn Void produce() Int { yield 1; yield 2; yield 3; yield 4 }
-fn Int take() Void {
+fn Int take() String {
   for (&0) |x| {
     if (x == 3) break
     echo "stream=${x}"

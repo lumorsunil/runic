@@ -1,0 +1,14 @@
+// A pipeline producer that runs several command-statements must deliver *all*
+// of its output to the consumer — including its final line. This used to race
+// under load: an inter-stage pipe closed a source as soon as the source's
+// process exited, without first draining the OS-pipe bytes still buffered
+// behind it, so a `{ echo a; echo b } | consumer` producer would hand the
+// consumer only `a` and signal EOF early — dropping the last line on a fraction
+// of runs. The loop runs the pattern many times so a reintroduced race surfaces
+// as a short/missing line rather than slipping through a single lucky run.
+for (0..40) |_| {
+  ({
+    echo "first"
+    echo "second"
+  }) | grep "-m" "1" "second"
+}

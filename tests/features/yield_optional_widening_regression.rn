@@ -1,0 +1,28 @@
+# A yielded value widens into an optional in the declared return type, including
+# nested in a struct field: `yield .{ .x = n }` (where n is Int) satisfies a
+# `Maybe(Int)` return whose field is `?Int` — the same coercion a bare `yield n`
+# already gets against a `?Int` return, now applied through struct fields. `null`
+# widens the same way. The reverse (an optional where a bare value is required)
+# stays an error (see tests/diagnostics).
+
+fn Maybe(comptime T: type) type { yield struct { x: ?T } }
+
+# Bare value and null both satisfy the ?T field of the applied return type.
+fn Void validateIs42(n: Int) Maybe(Int) {
+  if (n == 42) { yield .{ .x = n } } else { yield .{ .x = null } }
+}
+
+# Monadic bind: the function parameter returns Maybe(B) (a capture nested in a
+# type application), and the pass-through `yield f x` / `yield .{ .x = null }`
+# both type-check.
+fn Void bind(f: fn (|A|) Maybe(|B|), ma: Maybe(A)) Maybe(B) {
+  if (ma.x) |x| yield f x else yield .{ .x = null }
+}
+
+const some42: Maybe(Int) = Maybe{ .x = 42 }
+const some21: Maybe(Int) = Maybe{ .x = 21 }
+const none: Maybe(Int) = Maybe{ .x = null }
+
+echo "42:  ${(bind validateIs42 some42).x orelse -1}"
+echo "21:  ${(bind validateIs42 some21).x orelse -1}"
+echo "none:${(bind validateIs42 none).x orelse -1}"

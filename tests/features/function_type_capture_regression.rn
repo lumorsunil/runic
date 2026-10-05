@@ -1,0 +1,29 @@
+# Function type literals with captured argument/return types, plus `null`
+# satisfying an optional field of a captured type.
+#
+# A function type is `fn (ParamTypes...) ReturnType` — parameters are bare types
+# (no names, no stdin type). `|A|` / `|B|` capture the argument and return types,
+# so `fn (|A|) |B|` is any A -> B and binds A and B across the signature.
+
+fn Maybe(comptime T: type) type { yield struct { x: ?T } }
+
+fn Void map(f: fn (|A|) |B|, ma: Maybe(A)) Maybe(B) {
+  # `null` inhabits `?B` even though B is a captured type variable.
+  if (ma.x) |x| yield Maybe{ .x = f(x) } else yield Maybe{ .x = null }
+}
+
+fn Void double(n: Int) Int { yield n * 2 }
+fn Void label(n: Int) String { yield "n=${n}" }
+
+const some: Maybe(Int) = Maybe{ .x = 21 }
+const none: Maybe(Int) = Maybe{ .x = null }
+
+echo "${(map double some).x orelse 0}"
+echo "${(map label some).x orelse "?"}"
+echo "${(map double none).x orelse -1}"
+echo "${(map label none).x orelse "none"}"
+
+# A direct call through a function-typed parameter, capturing both ends.
+fn Void apply(f: fn (|A|) |B|, x: A) B { yield f(x) }
+echo "${apply double 20}"
+echo "${apply label 7}"

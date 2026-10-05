@@ -1,0 +1,27 @@
+# A function passed by *name* to a `fn()`-typed parameter is passed as a function
+# *value*, not invoked at the call site — so the callee can invoke it itself. A
+# bare nullary reference (`apply plain`) used to be called eagerly (the parameter
+# then held the *result*, not the function), which broke when the callee invoked
+# it. Covers a top-level fn, and a nested closure capturing a const / a var.
+
+fn apply(f: fn() Int) Int { yield f }
+
+# A top-level (captureless) named function, invoked by the callee via `yield f`.
+fn plain() Int { yield 42 }
+echo "plain: ${apply plain}"
+
+# A nested closure capturing a const, passed by name.
+fn withConst() Int {
+  const n = 5
+  fn inner() Int { yield n * 2 }
+  yield apply inner
+}
+echo "const capture: ${withConst}"
+
+# A nested closure capturing a var, passed by name.
+fn withVar() Int {
+  var m = 9
+  fn innerV() Int { yield m + 1 }
+  yield apply innerV
+}
+echo "var capture: ${withVar}"

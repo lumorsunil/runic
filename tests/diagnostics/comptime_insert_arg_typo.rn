@@ -1,0 +1,9 @@
+# A recipe-ctor struct literal passed as an argument is validated against the
+# parameter's materialized type, so a misspelled field is caught statically —
+# the same check a `const p: Partial(Rec(Int)) = Partial{ … }` binding gets.
+fn Rec(comptime T: type) type { yield struct { a: T, b: T } }
+fn Partial(comptime T: type) type {
+  yield struct { for (@fields(T)) |f| @insert "${f.name}: ?${f.type}" }
+}
+fn takesPartial(p: Partial(Rec(Int))) String { yield "got" }
+echo "${takesPartial Partial{ .zzz = 1 }}"

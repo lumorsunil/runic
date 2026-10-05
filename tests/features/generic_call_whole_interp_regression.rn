@@ -1,0 +1,19 @@
+# Interpolating a generic call's result *as a whole value* (`${(map double …)}`,
+# not a field or index). The result is typed with the concrete return bound from
+# the arguments (`[]Int`), which the string interpolation then renders. This used
+# to read stale memory while comparing the inferred and annotated types of a
+# binding in the callee's body (a deep `std.meta.eql` over type expressions);
+# types are now compared by rendered form, which never dereferences a transient
+# sub-type pointer.
+
+fn map(f: fn (|A|) |B|, ma: []A) []B {
+  var mb: []B = .{ }
+  for (ma) |a| mb = mb.push (f a)
+  yield mb
+}
+fn double(n: Int) Int { yield n * 2 }
+
+# Whole-array interpolation, both from a literal argument and a bound one.
+echo "literal: ${(map double .{ 1, 2, 3 })}"
+const xs: []Int = .{ 4, 5, 6 }
+echo "bound: ${(map double xs)}"

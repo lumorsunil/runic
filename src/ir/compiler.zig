@@ -9,6 +9,7 @@ const DocumentStore = @import("../document_store.zig").DocumentStore;
 const Stream = @import("../stream.zig").Stream;
 const RCError = @import("../mem/rc.zig").RCError;
 const FrontendDocumentStore = @import("../frontend/document_store.zig").FrontendDocumentStore;
+const Parser = @import("../frontend/parser.zig").Parser;
 const resolveModulePath = @import("../frontend/document_store.zig").resolveModulePath;
 const CType = @import("../ffi/ctype.zig").CType;
 const CSig = @import("../ffi/ctype.zig").CSig;
@@ -607,6 +608,10 @@ pub const IRCompiler = struct {
     /// `compileStructLiteral` can build a struct value with the right layout.
     user_struct_types: std.StringHashMapUnmanaged(ast.TypeExpr.StructType) = .empty,
     document_store: *DocumentStore,
+    /// Lazily-created parser used to re-parse a folded `@insert` string into
+    /// struct fields at instantiation. Kept for the compiler's lifetime because
+    /// the parsed field ASTs live in its arena.
+    insert_parser: ?Parser = null,
     logging_enabled: bool,
     diagnostics: std.ArrayList(Diagnostic) = .empty,
     result_counter: usize = 0,
@@ -616,6 +621,10 @@ pub const IRCompiler = struct {
     /// Stack of enclosing functions' declared stdin types, so `&0` can be
     /// typed correctly for coercions. Top is the innermost function.
     stdin_type_stack: std.ArrayList(?ast.TypeExpr) = .empty,
+
+    /// Stack of enclosing functions' declared return types; top is the innermost.
+    /// Used to supply a `yield`'s result-location type to an implicit `.name`.
+    fn_return_type_stack: std.ArrayList(?*const ast.TypeExpr) = .empty,
 
     /// Comptime evaluation state. `comptime_forcing > 0` while lowering a
     /// `comptime` expression, which enables the comptime folder to reduce pure
@@ -640,10 +649,18 @@ pub const IRCompiler = struct {
     /// `maybeSpecialize` to `compileFnDecl` so it can register the (generic →
     /// specialization) mapping once the specialization's set is created.
     specializing_generic: ?usize = null,
-    /// Stack of in-flight specializations; a self-recursive call inside a
-    /// specialization body (its callee resolves to the generic set) is
-    /// redirected to the specialization so it recurses at the same concrete type.
-    active_specializations: std.ArrayListUnmanaged(struct { generic: usize, spec: usize }) = .empty,
+    /// The specialization cache key of the in-flight specialization, passed from
+    /// `maybeSpecialize` to `compileFnDecl` alongside `specializing_generic` so the
+    /// active-specialization entry can record it (to distinguish a same-type
+    /// self-recursion from a polymorphic one).
+    specializing_key: ?[]const u8 = null,
+    /// Stack of in-flight specializations; a *same-type* self-recursive call inside
+    /// a specialization body (its callee resolves to the generic set and its
+    /// argument types produce the same cache `key`) is redirected to the
+    /// specialization so it recurses at the same concrete type. A recursion at a
+    /// *different* type (`f 0` inside `f`'s `Box` specialization) has a different
+    /// key and is specialized anew instead — otherwise it would loop forever.
+    active_specializations: std.ArrayListUnmanaged(struct { generic: usize, spec: usize, key: []const u8 }) = .empty,
 
     /// Synchrony analysis (see `semantic/effects.zig`), computed once at the top
     /// of `compile`. Drives the fork-free lowering of `sync` function calls.
@@ -662,6 +679,19 @@ pub const IRCompiler = struct {
     /// reuses this set rather than allocating a fresh one, so the body lands in
     /// the set the forward call sites already point at.
     hoisted_fn_sets: std.AutoHashMapUnmanaged(*const ast.Expression, usize) = .empty,
+
+    /// Names of top-level generic functions (`|T|` captures / comptime params) —
+    /// they are monomorphized per call through the fork path, never sync-called.
+    /// A call to one is therefore not sync-lowerable: the sync yield path would
+    /// return the fork's unwaited handle instead of the materialized value.
+    generic_fn_names: std.StringHashMapUnmanaged(void) = .empty,
+
+    /// Nonzero while compiling the *unspecialized template* body of a generic
+    /// function — where comptime branches are not pruned (type params unbound),
+    /// so both arms compile. `@compileError` is suppressed there (it fires only in
+    /// a real specialization, or in non-generic code), and never from a branch a
+    /// concrete monomorphization would prune away.
+    generic_template_depth: usize = 0,
 
     /// Reverse of `hoisted_fn_sets`: a hoisted function's instruction set → its
     /// `fn …` expression, so a call/fork site can compile the callee's body
@@ -692,6 +722,21 @@ pub const IRCompiler = struct {
     /// A generic type constructor's type parameters, by name — so an application
     /// `Box(Int)` can substitute its arguments into the registered struct body.
     generic_ctor_params: std.StringHashMapUnmanaged([]const ast.Identifier) = .empty,
+    /// Names of comptime type functions (`fn Box(comptime T: type) type { … }`)
+    /// and their result bindings (`const IntBox = Box Int`). Both are compile-time
+    /// only — they resolve to types and emit no runtime code, so they are erased
+    /// when compiled as statements.
+    comptime_type_names: std.StringHashMapUnmanaged(void) = .empty,
+    /// Comptime *value* parameter constants for the specialization currently being
+    /// compiled (`comptime n: Int` → the folded argument). `compileFnDecl` binds
+    /// the parameter to this constant so `n == 3` folds. Set by `maybeSpecialize`
+    /// around the body compilation, empty otherwise.
+    pending_comptime_values: std.StringHashMapUnmanaged(Result) = .empty,
+    /// The struct field currently bound to a comptime `for (@fields(T)) |f|`
+    /// loop variable, by variable name. During the compile-time unroll of one
+    /// iteration, `f.name` folds to the field's name and `f.type` to its type.
+    /// Nested field loops keep one entry per (distinct) variable name.
+    comptime_field_vars: std.StringHashMapUnmanaged(ast.TypeExpr.StructField) = .empty,
     /// Recursion-depth cap for comptime call interpretation. Kept well below the
     /// point where the interpreter's own (native) call stack would overflow, so
     /// a non-terminating `comptime` recursion fails to compile instead of
@@ -1302,20 +1347,175 @@ pub const IRCompiler = struct {
     /// construction, member access, and applications resolve.
     fn registerTypeDecls(self: *IRCompiler, statements: []const *ast.Statement) Allocator.Error!void {
         for (statements) |stmt| {
-            if (stmt.* != .type_binding_decl) continue;
-            const decl = stmt.type_binding_decl;
-            switch (decl.type_expr.*) {
-                .error_set => |es| try self.error_sets.put(self.allocator, decl.identifier.name, es),
-                .struct_type => |st| {
-                    try self.user_struct_types.put(self.allocator, decl.identifier.name, st);
-                    // Record a generic constructor's type parameters so an
-                    // application (`Box(Int)`) can substitute the arguments.
-                    if (decl.params.len > 0) {
-                        try self.generic_ctor_params.put(self.allocator, decl.identifier.name, decl.params);
+            switch (stmt.*) {
+                .type_binding_decl => |decl| switch (decl.type_expr.*) {
+                    .error_set => |es| try self.error_sets.put(self.allocator, decl.identifier.name, es),
+                    .struct_type => |st| {
+                        try self.user_struct_types.put(self.allocator, decl.identifier.name, st);
+                        // Record a generic constructor's type parameters so an
+                        // application (`Box(Int)`) can substitute the arguments.
+                        if (decl.params.len > 0) {
+                            try self.generic_ctor_params.put(self.allocator, decl.identifier.name, decl.params);
+                        }
+                    },
+                    else => {},
+                },
+                // A comptime type function (`fn Box(comptime T: type) type { yield
+                // struct { … } }`) is a generic-type constructor: register its
+                // yielded struct body and type params so a `Box Int` call resolves.
+                .expression => |es| if (es.expression.* == .fn_decl) {
+                    const fn_decl = es.expression.fn_decl;
+                    if (fn_decl.name) |name| if (self.comptimeTypeCtorBody(fn_decl)) |body| {
+                        try self.user_struct_types.put(self.allocator, name.name, body.struct_type);
+                        try self.generic_ctor_params.put(self.allocator, name.name, body.params);
+                        try self.comptime_type_names.put(self.allocator, name.name, {});
+                    };
+                },
+                // A comptime type-function call bound to a name (`const IntBox =
+                // Box Int`) resolves to a concrete struct — register it so a later
+                // `IntBox{ … }` construction uses that struct.
+                .binding_decl => |bd| if (bd.pattern.* == .identifier) {
+                    if (self.evalComptimeTypeCall(bd.initializer)) |resolved| {
+                        if (resolved == .struct_type) {
+                            try self.user_struct_types.put(self.allocator, bd.pattern.identifier.name, resolved.struct_type);
+                            try self.comptime_type_names.put(self.allocator, bd.pattern.identifier.name, {});
+                        }
                     }
                 },
                 else => {},
             }
+        }
+    }
+
+    /// A comptime type function's yielded struct body and type parameters, or null
+    /// when `fn_decl` is not one (mirrors the type checker's `comptimeTypeCtor`).
+    fn comptimeTypeCtorBody(self: *IRCompiler, fn_decl: ast.FunctionDecl) ?struct { struct_type: ast.TypeExpr.StructType, params: []const ast.Identifier } {
+        const return_type = fn_decl.return_type orelse return null;
+        if (return_type.* != .type_type) return null;
+        const body = yieldedStructType(fn_decl.body) orelse return null;
+        var names = std.ArrayList(ast.Identifier).empty;
+        switch (fn_decl.params) {
+            ._non_variadic => |params| for (params) |param| {
+                if (comptimeTypeParamName(param)) |name| names.append(self.allocator, .{ .name = name, .span = param.span }) catch return null;
+            },
+            ._variadic => |param| if (comptimeTypeParamName(param)) |name| names.append(self.allocator, .{ .name = name, .span = param.span }) catch return null,
+        }
+        if (names.items.len == 0) return null;
+        // Fold the body's `pub const` declarations into the yielded struct's decls
+        // (a type constructor is module-like: `pub const nothing = …` becomes a
+        // static member of the produced type, reachable as `Maybe(Int).nothing`).
+        const st = self.withTypeFnPubDecls(body, fn_decl.body);
+        return .{ .struct_type = st, .params = names.toOwnedSlice(self.allocator) catch return null };
+    }
+
+    /// Returns `base` with every `pub const` in a type function's body block
+    /// appended to its `decls`, so the produced type carries them as static
+    /// members. A bare (non-block) body has none.
+    fn withTypeFnPubDecls(self: *IRCompiler, base: ast.TypeExpr.StructType, body: *const ast.Expression) ast.TypeExpr.StructType {
+        if (body.* != .block) return base;
+        var decls = std.ArrayList(ast.TypeExpr.StructDecl).empty;
+        decls.appendSlice(self.allocator, base.decls) catch return base;
+        for (body.block.statements) |stmt| {
+            switch (stmt.*) {
+                .binding_decl => |*bd| {
+                    if (!bd.is_pub) continue;
+                    if (bd.pattern.* != .identifier) continue;
+                    decls.append(self.allocator, .{
+                        .name = bd.pattern.identifier,
+                        .type_expr = bd.annotation,
+                        .decl_source = .{ .binding_decl = bd },
+                        .span = bd.span,
+                    }) catch return base;
+                },
+                else => {},
+            }
+        }
+        var st = base;
+        st.decls = decls.toOwnedSlice(self.allocator) catch return base;
+        return st;
+    }
+
+    /// The struct type a `fn … type` body yields (a bare or block `yield struct {
+    /// … }`), or null.
+    fn yieldedStructType(body: *const ast.Expression) ?ast.TypeExpr.StructType {
+        const type_expr = switch (body.*) {
+            .type_value => |tv| tv.type_expr,
+            .block => |block| blk: {
+                var found: ?*const ast.TypeExpr = null;
+                for (block.statements) |stmt| {
+                    if (stmt.* == .yield_stmt and stmt.yield_stmt.value.* == .type_value) {
+                        found = stmt.yield_stmt.value.type_value.type_expr;
+                    }
+                }
+                break :blk found orelse return null;
+            },
+            else => return null,
+        };
+        return if (type_expr.* == .struct_type) type_expr.struct_type else null;
+    }
+
+    /// The bound name of a `comptime T: type` parameter, or null.
+    fn comptimeTypeParamName(param: *const ast.Parameter) ?[]const u8 {
+        if (!param.is_comptime) return null;
+        const annotation = param.type_annotation orelse return null;
+        if (annotation.* != .type_type) return null;
+        return switch (param.pattern.*) {
+            .identifier => |id| id.name,
+            else => null,
+        };
+    }
+
+    /// The name of a comptime *value* parameter (`comptime n: Int`) — a
+    /// `comptime` param that is not a `type` param, so its argument is a
+    /// compile-time constant the body is monomorphized on. Null otherwise.
+    fn comptimeValueParamName(param: *const ast.Parameter) ?[]const u8 {
+        if (!param.is_comptime) return null;
+        if (param.type_annotation) |ann| if (ann.* == .type_type) return null;
+        return switch (param.pattern.*) {
+            .identifier => |id| id.name,
+            else => null,
+        };
+    }
+
+    /// Evaluates a comptime type-function call (`Box Int`) to the concrete struct
+    /// type it produces, or null when `expr` is not such a call.
+    fn evalComptimeTypeCall(self: *IRCompiler, expr: *const ast.Expression) ?ast.TypeExpr {
+        if (expr.* != .call) return null;
+        const call = expr.call;
+        if (call.callee.* != .identifier) return null;
+        const body_st = self.user_struct_types.get(call.callee.identifier.name) orelse return null;
+        if (!self.comptime_type_names.contains(call.callee.identifier.name)) return null;
+        const params = self.generic_ctor_params.get(call.callee.identifier.name) orelse &[_]ast.Identifier{};
+        if (call.arguments.len != params.len) return null;
+        const args = self.allocator.alloc(*const ast.TypeExpr, call.arguments.len) catch return null;
+        for (call.arguments, args) |arg, *dst| {
+            dst.* = self.argToTypeExpr(arg) orelse return null;
+        }
+        return self.substituteTypeParams(.{ .struct_type = body_st }, params, args) catch null;
+    }
+
+    /// The type a comptime call argument denotes (`Int` → the type Int). Bare type
+    /// names parse as zero-arg calls, which are unwrapped to their callee.
+    fn argToTypeExpr(self: *IRCompiler, arg: *const ast.Expression) ?*const ast.TypeExpr {
+        switch (arg.*) {
+            .type_value => |tv| return tv.type_expr,
+            .identifier => |id| {
+                const segments = self.allocator.alloc(ast.Identifier, 1) catch return null;
+                segments[0] = id;
+                const t = self.allocator.create(ast.TypeExpr) catch return null;
+                t.* = .{ .identifier = .{ .path = .{ .segments = segments, .span = id.span }, .span = id.span } };
+                return t;
+            },
+            .call => |call| {
+                if (call.arguments.len == 0) return self.argToTypeExpr(call.callee);
+                if (self.evalComptimeTypeCall(arg)) |resolved| {
+                    const t = self.allocator.create(ast.TypeExpr) catch return null;
+                    t.* = resolved;
+                    return t;
+                }
+                return null;
+            },
+            else => return null,
         }
     }
 
@@ -1501,11 +1701,28 @@ pub const IRCompiler = struct {
         // try self.addInstruction(.{ .type = .{ .comment = comment_message } });
     }
 
+    /// Whether a statement declares a comptime type function or binds the result
+    /// of a comptime type call — both erased at compile time.
+    fn isComptimeTypeStatement(self: *IRCompiler, stmt: *const ast.Statement) bool {
+        return switch (stmt.*) {
+            .expression => |es| es.expression.* == .fn_decl and
+                es.expression.fn_decl.name != null and
+                self.comptime_type_names.contains(es.expression.fn_decl.name.?.name),
+            .binding_decl => |bd| bd.pattern.* == .identifier and
+                self.comptime_type_names.contains(bd.pattern.identifier.name),
+            else => false,
+        };
+    }
+
     fn compileStatement(
         self: *IRCompiler,
         stmt: *ast.Statement,
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(stmt.span()), @src().fn_name });
+
+        // A comptime type function (`fn Box(…) type`) or its result binding
+        // (`const IntBox = Box Int`) is compile-time only — erase it.
+        if (self.isComptimeTypeStatement(stmt)) return Result.fromValue(.void);
 
         return switch (stmt.*) {
             .type_binding_decl => Result.fromValue(.void),
@@ -1762,6 +1979,64 @@ pub const IRCompiler = struct {
     /// `yield expr` writes the value of `expr` to the thread's stdout stream
     /// (the program stdout, or the inter-stage pipe when used as a pipeline
     /// stage). Unlike `return`, it does not exit the function.
+    /// Whether a yielded call's result must be captured by value before being
+    /// written, rather than streamed: a generic call (always forks to
+    /// monomorphize), or any call to a user function returning an aggregate value
+    /// (a struct, optional, generic application, or non-byte array) — which forks
+    /// and returns a reference the caller must materialize. A `sync` call is
+    /// handled earlier (`tryCompileSyncCall`); a scalar/String/command yield keeps
+    /// streaming.
+    fn yieldNeedsValueCapture(self: *IRCompiler, expr: *const ast.Expression) bool {
+        if (expr.* != .call) return false;
+        const c = expr.call;
+        if (c.callee.* != .identifier) return false;
+        const name = c.callee.identifier.name;
+        if (self.generic_fn_names.contains(name)) return true;
+        const binding = self.lookup(name, .{ .shallow = false }) orelse return false;
+        if (!binding.result.isFunctionRef()) return false;
+        const ft = binding.type_expr orelse return false;
+        if (ft != .function) return false;
+        const rt = ft.function.return_type orelse return false;
+        return self.returnNeedsMaterialization(rt);
+    }
+
+    /// Whether a return type is an aggregate whose forked result must be
+    /// materialized by value (not byte-streamed): a struct, optional, non-byte
+    /// array, or a user generic application / named struct.
+    fn returnNeedsMaterialization(self: *IRCompiler, t: *const ast.TypeExpr) bool {
+        var ty = t;
+        while (ty.* == .alias) ty = ty.alias.type_expr;
+        return switch (ty.*) {
+            .struct_type, .optional => true,
+            // A scalar value return is materialized too: yielding a (forked)
+            // user-function call must return its value, not the fork's handle —
+            // `fn u() Int { … }` yielded by another function.
+            .integer, .float, .boolean => true,
+            .array => |a| a.element.* != .byte,
+            // Any generic application (`Box(Int)`, or `M(A)` re-applying a
+            // captured constructor) yields a struct — materialize by value.
+            .type_application => true,
+            .identifier => |named| blk: {
+                const name = named.path.segments[named.path.segments.len - 1].name;
+                if (self.user_struct_types.contains(name)) break :blk true;
+                break :blk std.mem.eql(u8, name, "Int") or std.mem.eql(u8, name, "Float") or std.mem.eql(u8, name, "Bool");
+            },
+            else => false,
+        };
+    }
+
+    /// `yield .name` (or `yield Maybe(Int).name`) — compiles the declaration value
+    /// in the function-body frame, with the implicit `.name` resolved against the
+    /// enclosing function's declared return type. Null when the value is not such
+    /// an access.
+    fn tryCompileYieldImplicitMember(self: *IRCompiler, value: *const ast.Expression) Error!?Result {
+        const rt: ?*const ast.TypeExpr = if (self.fn_return_type_stack.items.len > 0)
+            self.fn_return_type_stack.items[self.fn_return_type_stack.items.len - 1]
+        else
+            null;
+        return self.tryCompileTypeDeclAccess(value, rt);
+    }
+
     fn compileYield(
         self: *IRCompiler,
         source: *ast.Statement,
@@ -1769,14 +2044,32 @@ pub const IRCompiler = struct {
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
+        // A `yield .name` resolves the implicit member against the enclosing
+        // function's declared return type and is built here, in the function's
+        // frame (so a struct-literal declaration value stabilizes). The resolved
+        // value then flows through the normal yield paths below.
+        const implicit_value: ?Result = if (y.fd == 1) try self.tryCompileYieldImplicitMember(y.value) else null;
+
         // In a `sync` entry the value is returned in `%r` and control returns to
         // the caller via `ret` — there is no stdout stream to yield to. The
         // classifier only marks a function sync when every `yield` is to fd 1, so
         // this branch handles all of a sync function's yields.
         if (self.sync_mode and y.fd == 1) {
             // A yielded fork-free sync call (`yield (f n)`) resolves to its
-            // `call`/`ret` entry rather than forking; its value lands in `%r`.
-            const value = (try self.tryCompileSyncCall(y.value, y.value)) orelse try self.compileExpression(y.value);
+            // `call`/`ret` entry rather than forking; its value lands in `%r`. A
+            // yielded call that forks and returns an aggregate (a generic result,
+            // or a non-sync struct-returner) is captured by value first, so the
+            // materialized value is returned in `%r` rather than the fork's handle.
+            // Any call reaching here is not sync-callable (`tryCompileSyncCall`
+            // returned null), so it forks; a sync entry must return a value in
+            // `%r`, so its result is captured by value rather than forked with the
+            // caller's stdout (which would leak the callee's output and return an
+            // unwaited handle — even for a scalar result).
+            const value = implicit_value orelse (try self.tryCompileSyncCall(y.value, y.value)) orelse
+                (if (self.yieldNeedsValueCapture(y.value))
+                    try self.compileExpressionWithCapture(y.value, y.value)
+                else
+                    try self.compileExpression(y.value));
             try self.set(source, .initRegister(.r), stableResultSource(value));
             try self.addInstruction(.init(.from(source), .ret));
             return .fromValue(.void);
@@ -1802,7 +2095,17 @@ pub const IRCompiler = struct {
         const stack_before_value = self.currentFrame().rel_stack_counter;
         // A yielded fork-free sync call resolves to its entry (fork-free); its
         // value (`%r`) is then written to the stdout/stderr stream like any yield.
-        const raw_value = (try self.tryCompileSyncCall(y.value, y.value)) orelse try self.compileExpression(y.value);
+        // A yielded call to a *generic* function is captured by value first (as a
+        // `const t = …; yield t` binding does), so its materialized result — e.g.
+        // a monomorphized `Maybe(A)` struct — is written; piping the raw fork
+        // result would write a thread handle / dangling reference instead. Only
+        // generic calls need this: an ordinary yield (a value, a command, a
+        // pipeline) must keep streaming, not be captured.
+        const raw_value = implicit_value orelse (try self.tryCompileSyncCall(y.value, y.value)) orelse
+            (if (y.fd == 1 and self.yieldNeedsValueCapture(y.value))
+                try self.compileExpressionWithCapture(source, y.value)
+            else
+                try self.compileExpression(y.value));
         const value = try self.compileResultSaveR(source, raw_value);
         try self.pipeWrite(source, target, value.source);
         const pushed = self.currentFrame().rel_stack_counter -| stack_before_value;
@@ -1870,6 +2173,27 @@ pub const IRCompiler = struct {
                 return .fromValue(.void);
             },
             .identifier => |identifier| {
+                // A static type-declaration access as the initializer, either
+                // explicit (`= Maybe(Int).nothing`) or implicit against the
+                // annotation (`= .nothing`). A struct-literal declaration value is
+                // built here, in the binding's own frame, so it stabilizes; this
+                // helper handles that and returns true when it applied.
+                if (try self.compileTypeDeclBinding(source, identifier, expr, annotation, is_mutable))
+                    return .fromValue(.void);
+                // Constructing a struct whose type is built by an `@insert` recipe
+                // (`const p: Partial(T) = Partial{ … }`): the bare `Partial{…}` has
+                // no fields on its own, so materialize the layout from the binding's
+                // annotation (which carries the type args) and construct against it.
+                if (annotation) |ann| construct: {
+                    if (expr.* != .struct_literal or ann.* != .type_application) break :construct;
+                    const raw = self.user_struct_types.get(expr.struct_literal.name.name) orelse break :construct;
+                    if (raw.body_items.len == 0) break :construct;
+                    const materialized = self.resolveTypeApplication(ann.type_application) orelse break :construct;
+                    if (materialized != .struct_type) break :construct;
+                    const result = try self.compileStructValueLiteral(expr, materialized.struct_type, expr.struct_literal);
+                    try self.compileIdentifierBinding(source, identifier, result.source, annotation, is_mutable, .normal);
+                    return .fromValue(.void);
+                }
                 var result = try self.compileExpressionWithCapture(source, expr);
                 // A command bound where an error union is expected becomes
                 // `ExecutableError!String`: exit 0 → output, else an error.
@@ -2056,7 +2380,7 @@ pub const IRCompiler = struct {
         } else null;
         const needs_annotated_storage = if (annotated_type) |annotation_type|
             if (result.typeExpr()) |result_type|
-                !std.meta.eql(result_type, annotation_type)
+                !(try self.typeRendersEqual(result_type, annotation_type))
             else
                 true
         else
@@ -2212,6 +2536,10 @@ pub const IRCompiler = struct {
             .comptime_expr => |comptime_expr| self.compileComptimeExpr(expr, comptime_expr),
             .subshell => |subshell| self.compileSubshell(expr, subshell),
             .fd => |fd_expr| self.compileFd(expr, fd_expr),
+            // A type written in value position is compile-time only; it produces
+            // no runtime value (a type-returning comptime function is never
+            // actually invoked at runtime — its calls resolve to types).
+            .type_value => .fromValue(.void),
             else => {
                 try self.reportSourceError(expr, Error.UnsupportedExpression, .@"error", "expression type \"{t}\" not yet supported", .{expr.*});
                 return .fromValue(.void);
@@ -2322,9 +2650,19 @@ pub const IRCompiler = struct {
         self: *IRCompiler,
         expr: *ast.Expression,
     ) Error!?Result {
+        // `f.name`/`f.type` of a comptime field-loop variable fold to the field's
+        // name and to its type's serialized name.
+        if (self.comptimeFieldMember(expr)) |fm| {
+            if (std.mem.eql(u8, fm.member, "name")) return .fromValue(.{ .zig_string = fm.field.name.name });
+            if (std.mem.eql(u8, fm.member, "type")) return .fromValue(.{ .zig_string = try self.ownedTypeName(fm.field.type_expr.*) });
+            return null;
+        }
         return switch (expr.*) {
             .literal => |literal| try self.evalComptimeLiteral(literal),
             .identifier => |identifier| blk: {
+                // A comptime type reference (`T` bound by monomorphization, or a
+                // type name) folds to its serialized name, so `T == Int` reduces.
+                if (try self.comptimeTypeString(expr)) |ts| break :blk .fromValue(ts);
                 const binding = self.lookup(identifier.name, .{ .shallow = false }) orelse break :blk null;
                 if (binding.is_mutable or binding.result.source != .value) break :blk null;
                 break :blk binding.result;
@@ -2353,6 +2691,18 @@ pub const IRCompiler = struct {
                         null;
                 }
                 if (binary.op.isComparison()) {
+                    // A comptime type-pattern predicate: `T == Box(|B|)` matches the
+                    // left type's name against the right pattern, binding `|B|` on a
+                    // hit so the taken branch can use it (`echo "${B}"`).
+                    if ((binary.op == .equal or binary.op == .not_equal) and
+                        binary.right.* == .type_value and hasTypeCapture(binary.right.type_value.type_expr.*))
+                    {
+                        if (try self.comptimeTypeName(binary.left)) |subject| {
+                            defer self.allocator.free(subject);
+                            const matched = try self.matchTypeStringPattern(binary.right.type_value.type_expr.*, subject);
+                            break :blk .fromValue(.fromBoolean(if (binary.op == .equal) matched else !matched));
+                        }
+                    }
                     const left = (try self.evalComptimeExpression(binary.left)) orelse break :blk null;
                     const right = (try self.evalComptimeExpression(binary.right)) orelse break :blk null;
                     if (evaluateCompare(.from(binary.op), left.source, right.source)) |result| {
@@ -2423,12 +2773,423 @@ pub const IRCompiler = struct {
                 defer self.comptime_forcing -= 1;
                 break :blk try self.evalComptimeExpression(comptime_expr.operand);
             },
-            .call => |call| if (self.comptime_forcing > 0)
-                try self.evalComptimeCall(call)
-            else
-                null,
+            .call => |call| blk: {
+                // A type-introspection builtin (`@kind(T)`, `@fieldCount(T)`, …)
+                // folds to its comptime value.
+                if (try self.evalComptimeBuiltinValue(call)) |v| break :blk .fromValue(v);
+                // A comptime type reference (`Box(Int)`, or a bare `T`) folds to
+                // its serialized name.
+                if (try self.comptimeTypeString(expr)) |ts| break :blk .fromValue(ts);
+                break :blk if (self.comptime_forcing > 0) try self.evalComptimeCall(call) else null;
+            },
             else => null,
         };
+    }
+
+    /// A comptime type reference resolved to its serialized name value — a bound
+    /// type param (`T` → `Box(Int)`), a named type (`Int`), a `type_value`, or a
+    /// type application (`Box(Int)`). Null when `expr` is not a comptime type.
+    fn comptimeTypeString(self: *IRCompiler, expr: *const ast.Expression) Error!?ir.Value {
+        // The owned name backs the `zig_string` (compared by value in the folder);
+        // comptime type names are few and small, so keeping them alive is fine.
+        const name = (try self.comptimeTypeName(expr)) orelse return null;
+        return ir.Value{ .zig_string = name };
+    }
+
+    /// The serialized name of a comptime type reference as an owned string (caller
+    /// frees), or null when `expr` is not a comptime type.
+    fn comptimeTypeName(self: *IRCompiler, expr: *const ast.Expression) Error!?[]const u8 {
+        // `f.type` of a comptime field-loop variable is a comptime type.
+        if (self.comptimeFieldMember(expr)) |fm| {
+            if (std.mem.eql(u8, fm.member, "type")) return try self.ownedTypeName(fm.field.type_expr.*);
+            return null;
+        }
+        switch (expr.*) {
+            .identifier => |id| {
+                if (self.type_captures.get(id.name)) |t| {
+                    var w = std.Io.Writer.Allocating.init(self.allocator);
+                    defer w.deinit();
+                    try self.writeTypeName(&w.writer, t);
+                    return try self.allocator.dupe(u8, w.written());
+                }
+                if (isPrimitiveTypeName(id.name) or self.isTypeName(id.name)) {
+                    return try self.allocator.dupe(u8, id.name);
+                }
+                return null;
+            },
+            .type_value => |tv| {
+                var w = std.Io.Writer.Allocating.init(self.allocator);
+                defer w.deinit();
+                try self.writeTypeName(&w.writer, tv.type_expr.*);
+                return try self.allocator.dupe(u8, w.written());
+            },
+            .call => |call| {
+                if (call.arguments.len == 0) return try self.comptimeTypeName(call.callee);
+                if (call.callee.* != .identifier or !self.isTypeName(call.callee.identifier.name)) return null;
+                var w = std.Io.Writer.Allocating.init(self.allocator);
+                defer w.deinit();
+                try w.writer.writeAll(call.callee.identifier.name);
+                for (call.arguments) |arg| {
+                    try w.writer.writeByte('(');
+                    const an = (try self.comptimeTypeName(arg)) orelse return null;
+                    defer self.allocator.free(an);
+                    try w.writer.writeAll(an);
+                    try w.writer.writeByte(')');
+                }
+                return try self.allocator.dupe(u8, w.written());
+            },
+            else => return null,
+        }
+    }
+
+    fn isPrimitiveTypeName(name: []const u8) bool {
+        const names = [_][]const u8{ "Int", "String", "Bool", "Float", "Void", "Byte" };
+        for (names) |n| if (std.mem.eql(u8, name, n)) return true;
+        return false;
+    }
+
+    /// The `TypeExpr` a primitive type name denotes (`Int` → `.integer`,
+    /// `String` → `[]Byte`), or null for a non-primitive name.
+    fn primitiveTypeExpr(name: []const u8) ?ast.TypeExpr {
+        const p = ast.TypeExpr.PrimitiveType{ .span = .global };
+        if (std.mem.eql(u8, name, "Int")) return .{ .integer = p };
+        if (std.mem.eql(u8, name, "Float")) return .{ .float = p };
+        if (std.mem.eql(u8, name, "Bool")) return .{ .boolean = p };
+        if (std.mem.eql(u8, name, "Void")) return .{ .void = p };
+        if (std.mem.eql(u8, name, "Byte")) return .{ .byte = p };
+        if (std.mem.eql(u8, name, "String")) return string_type;
+        return null;
+    }
+
+    /// Resolves a comptime type-argument expression to a normalized `TypeExpr`:
+    /// follows a bound type parameter (`T` → its bound type), a named struct or
+    /// primitive, and resolves a generic application (`Box(Int)`) to its struct
+    /// body. The backbone of the type-introspection builtins.
+    fn resolveComptimeType(self: *IRCompiler, expr: *const ast.Expression) Error!?ast.TypeExpr {
+        const written = self.comptimeArgType(expr) orelse return null;
+        return self.normalizeComptimeType(written, 0);
+    }
+
+    fn normalizeComptimeType(self: *IRCompiler, t: ast.TypeExpr, depth: usize) ?ast.TypeExpr {
+        if (depth > 32) return t;
+        switch (t) {
+            .identifier => |id| {
+                if (id.path.segments.len != 1) return t;
+                const name = id.path.segments[0].name;
+                if (self.type_captures.get(name)) |bound| {
+                    if (!isBareName(bound, name)) return self.normalizeComptimeType(bound, depth + 1);
+                }
+                if (self.user_struct_types.get(name)) |st| return .{ .struct_type = st };
+                if (primitiveTypeExpr(name)) |p| return p;
+                return t;
+            },
+            .type_application => |app| {
+                if (self.resolveTypeApplication(app)) |resolved| return self.normalizeComptimeType(resolved, depth + 1);
+                return t;
+            },
+            .alias => |a| return self.normalizeComptimeType(a.type_expr.*, depth + 1),
+            else => return t,
+        }
+    }
+
+    /// The introspection *kind* name of a resolved type — the string `@kind(T)`
+    /// yields.
+    fn comptimeKindName(t: ast.TypeExpr) []const u8 {
+        return switch (t) {
+            .integer => "int",
+            .float => "float",
+            .boolean => "bool",
+            .byte => "byte",
+            .void => "void",
+            .null => "null",
+            .optional => "optional",
+            .array => |a| if (a.element.* == .byte) "string" else "array",
+            .struct_type => "struct",
+            .type_application => "struct",
+            .tuple => "tuple",
+            .sum => "sum",
+            .function => "function",
+            else => "unknown",
+        };
+    }
+
+    /// The struct a resolved type introspects as (`@fields`/`@fieldCount`/
+    /// `@hasField`), or null when it is not a struct.
+    fn comptimeStructOf(t: ast.TypeExpr) ?ast.TypeExpr.StructType {
+        return switch (t) {
+            .struct_type => |st| st,
+            else => null,
+        };
+    }
+
+    const ComptimeBuiltin = enum { kind, elem, child, field_count, has_field, has_method, fields, none };
+
+    fn comptimeBuiltinKind(name: []const u8) ComptimeBuiltin {
+        if (std.mem.eql(u8, name, "@kind")) return .kind;
+        if (std.mem.eql(u8, name, "@elem")) return .elem;
+        if (std.mem.eql(u8, name, "@child")) return .child;
+        if (std.mem.eql(u8, name, "@fieldCount")) return .field_count;
+        if (std.mem.eql(u8, name, "@hasField")) return .has_field;
+        if (std.mem.eql(u8, name, "@hasMethod")) return .has_method;
+        if (std.mem.eql(u8, name, "@fields")) return .fields;
+        return .none;
+    }
+
+    /// Whether a declared function name matches a method name, allowing an
+    /// overload-mangled form (`bind`, or `bind#0`).
+    fn methodNameMatches(decl_name: []const u8, method: []const u8) bool {
+        if (std.mem.eql(u8, decl_name, method)) return true;
+        return decl_name.len > method.len and
+            std.mem.startsWith(u8, decl_name, method) and
+            decl_name[method.len] == '#';
+    }
+
+    /// The head constructor name of a parameter type — `Maybe(Int)` → "Maybe";
+    /// unwraps optional/array wrappers. Returns "*" for a higher-kinded capture
+    /// `|M|(…)` (matches any constructor). Null when the type is not an
+    /// application.
+    fn headCtorName(t: ast.TypeExpr) ?[]const u8 {
+        return switch (t) {
+            .type_application => |app| if (app.ctor_is_capture) "*" else app.name.name,
+            .optional => |o| headCtorName(o.child.*),
+            .array => |a| headCtorName(a.element.*),
+            else => null,
+        };
+    }
+
+    /// Whether a top-level function named `method` exists whose first parameter is
+    /// an application of the constructor `ctor` (a UFCS-style "method on `M`"), or
+    /// a higher-kinded `|M|(…)` that accepts any constructor. Backs `@hasMethod`.
+    fn hasMethodForCtor(self: *IRCompiler, ctor: []const u8, method: []const u8) bool {
+        var it = self.comptime_fn_decls.valueIterator();
+        while (it.next()) |dp| {
+            const decl = dp.*;
+            const dn = (decl.name orelse continue).name;
+            if (!methodNameMatches(dn, method)) continue;
+            // A "method on M" is a function that mentions `M(…)` at its head — in
+            // its first parameter (`bind : M(A) -> …`, arg-dispatched) or its
+            // return type (`pure : A -> M(A)`, return-dispatched). A higher-kinded
+            // `|M|(…)` matches any constructor.
+            if (headCtorMatches(decl.return_type, ctor)) return true;
+            const params = switch (decl.params) {
+                ._non_variadic => |ps| ps,
+                else => continue,
+            };
+            if (params.len > 0) {
+                if (headCtorMatches(params[0].type_annotation, ctor)) return true;
+            }
+        }
+        return false;
+    }
+
+    fn headCtorMatches(maybe_type: ?*const ast.TypeExpr, ctor: []const u8) bool {
+        const t = maybe_type orelse return false;
+        const head = headCtorName(t.*) orelse return false;
+        return std.mem.eql(u8, head, "*") or std.mem.eql(u8, head, ctor);
+    }
+
+    /// The serialized name of a type, as an owned string (kept alive for the
+    /// backing `zig_string`; introspection names are few and small).
+    fn ownedTypeName(self: *IRCompiler, t: ast.TypeExpr) Error![]const u8 {
+        var w = std.Io.Writer.Allocating.init(self.allocator);
+        defer w.deinit();
+        try self.writeTypeName(&w.writer, t);
+        return try self.allocator.dupe(u8, w.written());
+    }
+
+    /// Evaluates a scalar type-introspection builtin (`@kind`/`@elem`/`@child`/
+    /// `@fieldCount`/`@hasField`) to its comptime value form (`.zig_string` for a
+    /// string/type name, `.integer`, or `.exit_code` for a bool). Returns null
+    /// when the callee is not such a builtin, an argument is not a comptime type,
+    /// or the builtin does not apply to the argument's kind (a misuse the caller
+    /// reports). `@fields` is not scalar and returns null here.
+    fn evalComptimeBuiltinValue(self: *IRCompiler, call: ast.CallExpr) Error!?ir.Value {
+        if (call.callee.* != .identifier) return null;
+        const which = comptimeBuiltinKind(call.callee.identifier.name);
+        if (which == .none or which == .fields) return null;
+        if (call.arguments.len == 0) return null;
+        // `@hasMethod(M, "name")` needs `M`'s constructor *name*, not its resolved
+        // struct — whether a UFCS function `name` takes an `M(…)` first argument.
+        if (which == .has_method) {
+            if (call.arguments.len < 2) return null;
+            const ctor = (try self.comptimeTypeName(call.arguments[0])) orelse return null;
+            defer self.allocator.free(ctor);
+            const method = (try self.comptimeStringArg(call.arguments[1])) orelse return null;
+            return ir.Value{ .exit_code = .fromBoolean(self.hasMethodForCtor(ctor, method)) };
+        }
+        const t = (try self.resolveComptimeType(call.arguments[0])) orelse return null;
+        switch (which) {
+            .kind => return ir.Value{ .zig_string = comptimeKindName(t) },
+            .elem => {
+                if (t != .array) return null;
+                return ir.Value{ .zig_string = try self.ownedTypeName(t.array.element.*) };
+            },
+            .child => {
+                if (t != .optional) return null;
+                return ir.Value{ .zig_string = try self.ownedTypeName(t.optional.child.*) };
+            },
+            .field_count => {
+                const st = comptimeStructOf(t) orelse return null;
+                return ir.Value{ .integer = @intCast(st.fields.len) };
+            },
+            .has_field => {
+                const st = comptimeStructOf(t) orelse return null;
+                if (call.arguments.len < 2) return null;
+                const field_name = (try self.comptimeStringArg(call.arguments[1])) orelse return null;
+                var found = false;
+                for (st.fields) |f| {
+                    if (std.mem.eql(u8, f.name.name, field_name)) found = true;
+                }
+                return ir.Value{ .exit_code = .fromBoolean(found) };
+            },
+            else => return null,
+        }
+    }
+
+    /// Folds an argument expected to be a compile-time string literal to its
+    /// bytes (`@hasField(T)("name")`), or null when it is not comptime-known.
+    fn comptimeStringArg(self: *IRCompiler, arg: *ast.Expression) Error!?[]const u8 {
+        const folded = (try self.evalComptimeExpression(arg)) orelse return null;
+        if (folded.source != .value) return null;
+        return switch (folded.source.value) {
+            .zig_string => |s| s,
+            else => null,
+        };
+    }
+
+    /// Folds a message string at compile time, including interpolations that name
+    /// comptime types (`${T}`) or fold to comptime values (`${n}`). Used by
+    /// `@compileError`. Owned result.
+    fn comptimeMessage(self: *IRCompiler, arg: *ast.Expression) Error!?[]const u8 {
+        if (arg.* != .literal or arg.literal != .string) {
+            if (try self.comptimeStringArg(arg)) |s| return try self.allocator.dupe(u8, s);
+            return null;
+        }
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(self.allocator);
+        for (arg.literal.string.segments) |seg| switch (seg) {
+            .text => |t| try buf.appendSlice(self.allocator, t.payload),
+            .interpolation => |ie| {
+                if (try self.comptimeTypeName(ie)) |tn| {
+                    defer self.allocator.free(tn);
+                    try buf.appendSlice(self.allocator, tn);
+                } else if (try self.evalComptimeExpression(ie)) |v| {
+                    if (v.source == .value) switch (v.source.value) {
+                        .zig_string => |s| try buf.appendSlice(self.allocator, s),
+                        .integer => |n| {
+                            const s = try std.fmt.allocPrint(self.allocator, "{d}", .{n});
+                            defer self.allocator.free(s);
+                            try buf.appendSlice(self.allocator, s);
+                        },
+                        .exit_code => |e| try buf.appendSlice(self.allocator, if (e.toBoolean()) "0" else "1"),
+                        else => {},
+                    };
+                }
+            },
+        };
+        return try self.allocator.dupe(u8, buf.items);
+    }
+
+    /// Compiles a type-introspection builtin call in value position. Returns null
+    /// when the callee is not a recognized introspection builtin (so ordinary
+    /// call compilation proceeds). A scalar builtin folds to a constant; a misuse
+    /// (wrong argument kind, or a non-comptime argument) is a compile error.
+    fn compileComptimeBuiltin(self: *IRCompiler, source: *ast.Expression, call: ast.CallExpr) Error!?Result {
+        const which = comptimeBuiltinKind(call.callee.identifier.name);
+        if (which == .none) return null;
+        if (which == .fields) {
+            try self.reportSourceError(
+                source,
+                Error.UnsupportedExpression,
+                .@"error",
+                "@fields(T) is only usable as the source of a comptime `for` loop",
+                .{},
+            );
+            return .fromValue(.void);
+        }
+        if (try self.evalComptimeBuiltinValue(call)) |value| {
+            return switch (value) {
+                .zig_string => |s| .fromValue(try self.addSlice(1, s)),
+                else => .fromValue(value),
+            };
+        }
+        // The builtin didn't produce a value. If the argument resolves to a
+        // *concrete* type, this is a genuine misuse (e.g. `@elem` on a struct).
+        // If it's still an unbound type variable, we're compiling the
+        // unspecialized template body (never executed once every call
+        // monomorphizes): emit a harmless fallback, mirroring `@kind`/`if`.
+        const resolved = if (call.arguments.len > 0) try self.resolveComptimeType(call.arguments[0]) else null;
+        if (resolved) |t| if (isConcreteComptimeType(t)) {
+            try self.reportSourceError(
+                source,
+                Error.UnsupportedExpression,
+                .@"error",
+                "{s} does not apply to a '{s}' type",
+                .{ call.callee.identifier.name, comptimeKindName(t) },
+            );
+            return .fromValue(.void);
+        };
+        return switch (which) {
+            .field_count => .fromValue(.{ .integer = 0 }),
+            .has_field => .fromValue(.{ .exit_code = .fromBoolean(false) }),
+            else => .fromValue(try self.addSlice(1, "")),
+        };
+    }
+
+    /// Whether a resolved type is a concrete type rather than an unresolved name
+    /// or type variable (an unbound `comptime T: type` in a template body).
+    fn isConcreteComptimeType(t: ast.TypeExpr) bool {
+        return switch (t) {
+            .identifier, .type_var, .type_capture => false,
+            else => true,
+        };
+    }
+
+    /// The struct field a comptime field-loop variable is currently bound to, for
+    /// the object of an `f.name` / `f.type` access (`f`, or its zero-arg-call
+    /// spelling). Null when the object is not such a variable.
+    fn comptimeFieldOf(self: *IRCompiler, object: *const ast.Expression) ?ast.TypeExpr.StructField {
+        const name = switch (object.*) {
+            .identifier => |id| id.name,
+            .call => |c| if (c.arguments.len == 0 and c.callee.* == .identifier)
+                c.callee.identifier.name
+            else
+                return null,
+            else => return null,
+        };
+        return self.comptime_field_vars.get(name);
+    }
+
+    const MemberAccess = struct { object: *const ast.Expression, member: []const u8 };
+
+    /// Normalizes a member access. The general expression parser encodes `a.b` as
+    /// a `.binary` with the `.member` op; the interpolation parser uses a
+    /// `.member` node. Returns the object and member name for either form.
+    fn asMemberAccess(expr: *const ast.Expression) ?MemberAccess {
+        switch (expr.*) {
+            .member => |m| return .{ .object = m.object, .member = m.member.name },
+            .binary => |b| {
+                if (b.op != .member) return null;
+                const name = switch (b.right.*) {
+                    .identifier => |id| id.name,
+                    .call => |c| if (c.arguments.len == 0 and c.callee.* == .identifier)
+                        c.callee.identifier.name
+                    else
+                        return null,
+                    else => return null,
+                };
+                return .{ .object = b.left, .member = name };
+            },
+            else => return null,
+        }
+    }
+
+    /// The field and accessed member (`name`/`type`) when `expr` is an `f.name` /
+    /// `f.type` access on a comptime field-loop variable; null otherwise.
+    fn comptimeFieldMember(self: *IRCompiler, expr: *const ast.Expression) ?struct { field: ast.TypeExpr.StructField, member: []const u8 } {
+        const ma = asMemberAccess(expr) orelse return null;
+        const field = self.comptimeFieldOf(ma.object) orelse return null;
+        return .{ .field = field, .member = ma.member };
     }
 
     /// Comptime-evaluates a pure function call (`comptime fib 10`). Resolves the
@@ -2648,9 +3409,11 @@ pub const IRCompiler = struct {
             // as the array itself; a String (`[]Byte`) stays on the byte path.
             .type_var => true,
             .array => |a| a.element.* != .byte,
-            // A generic struct application (`Box(Int)`) is captured by value like
-            // any struct, so it isn't byte-serialized (which would misread it).
-            .type_application => |app| self.user_struct_types.contains(app.name.name),
+            // A generic application (`Box(Int)`, or `M(A)` re-applying a captured
+            // constructor) is captured by value like any struct, so it isn't
+            // byte-serialized (which would misread it): every generic type
+            // constructor yields a struct.
+            .type_application => true,
             .identifier => |named| blk: {
                 const name = named.path.segments[named.path.segments.len - 1].name;
                 if (self.user_struct_types.contains(name)) break :blk true;
@@ -2686,8 +3449,16 @@ pub const IRCompiler = struct {
         const fn_type = binding.type_expr orelse return null;
         if (fn_type != .function) return null;
         const return_type_ptr = fn_type.function.return_type orelse return null;
-        if (!self.isTypedCaptureReturn(return_type_ptr)) return null;
         const fn_ref_value = binding.result.source.value;
+        // Decide typed-value vs byte capture on the *concrete* return type. A
+        // generic callee's declared return can be a bare type parameter (`T`), which
+        // `isTypedCaptureReturn` can't classify on its own — but resolved against the
+        // call's arguments it becomes e.g. `Vec(Int)` (a struct), which must be
+        // captured by value. Byte-capturing a struct round-trips it through stdout
+        // text and misreads it. Falls back to the declared return when unresolved.
+        const concrete_return = self.callConcreteReturnType(fn_ref_value.fn_ref.fn_addr.instr_set, info.arguments);
+        const decide_ptr: *const ast.TypeExpr = if (concrete_return) |*c| c else return_type_ptr;
+        if (!self.isTypedCaptureReturn(decide_ptr)) return null;
         // A zero-arg reference to a function that declares parameters is a
         // function *value* (`const f = dbl`), not a call to capture.
         if (info.arguments.len == 0 and
@@ -2818,7 +3589,12 @@ pub const IRCompiler = struct {
 
         // Dequeue the single yielded value (the error union) into %r.
         try self.addInstruction(.init(.from(source), .{ .pipe_dequeue = pipe_ref.dereference() }));
-        return try .from(ir.Location.initRegister(.r).typed(return_type_ptr.*));
+        // A generic callee's declared return may be a capture application (`M(B)`)
+        // whose variables are unbound at the call site; type the result with the
+        // concrete type bound from the arguments (`Maybe(Int)`) so member access on
+        // the value resolves its struct layout. Falls back to the declared return.
+        const result_type = self.callConcreteReturnType(fn_ref_value.fn_ref.fn_addr.instr_set, arguments) orelse return_type_ptr.*;
+        return try .from(ir.Location.initRegister(.r).typed(result_type));
     }
 
     const ModuleMemberFnRef = struct {
@@ -2958,7 +3734,19 @@ pub const IRCompiler = struct {
         const arg_refs = try self.allocator.alloc(ir.Location, info.arguments.len);
         defer self.allocator.free(arg_refs);
         for (info.arguments, 0..) |arg, i| {
-            const r = try self.compileExpressionWithCapture(source, arg);
+            // A fn-typed parameter takes a function *value*: pass a bare
+            // fn-reference argument as its fn_ref rather than invoking it (a
+            // nullary reference would otherwise be called by the capture path).
+            // A recipe-typed struct literal is materialized against its parameter
+            // type first, so it builds the concrete layout, not the empty recipe.
+            const r = if (try self.compileRecipeStructArg(arg, forked_set, i)) |rec|
+                rec
+            else if (try self.tryCompileTypeDeclAccess(arg, self.paramDeclType(forked_set, i))) |decl_val|
+                decl_val
+            else if (self.paramExpectsFnValue(forked_set, i))
+                (try self.compileFnValueArg(source, arg)) orelse try self.compileExpressionWithCapture(source, arg)
+            else
+                try self.compileExpressionWithCapture(source, arg);
             const ref = try self.newRef(source, "sync_arg");
             try self.set(source, ref, stableResultSource(r));
             arg_refs[i] = ref;
@@ -3693,6 +4481,191 @@ pub const IRCompiler = struct {
         return binding.result.isFunctionRef();
     }
 
+    /// Whether `call` is a `@field(…)(…)` builtin call (not a shadowing binding).
+    fn isFieldBuiltinCall(self: *IRCompiler, call: ast.CallExpr) bool {
+        return call.callee.* == .identifier and
+            std.mem.eql(u8, call.callee.identifier.name, "@field") and
+            self.lookup(call.callee.identifier.name, .{ .shallow = false }) == null;
+    }
+
+    /// `@field(value)(name)` — access the field named by the comptime string
+    /// `name` off the struct `value`, lowering to an ordinary member access
+    /// `value.<name>` once the name folds. `.read` yields the field's value;
+    /// `.lvalue` yields its slot (for `@field(value)(name) = v`). See the dispatch
+    /// in `compileCall` (read) and the assignment handling in `compileBinary`.
+    fn compileFieldBuiltin(self: *IRCompiler, source: *ast.Expression, call: ast.CallExpr, mode: MemberMode) Error!Result {
+        if (call.arguments.len != 2) {
+            try self.reportSourceError(
+                source,
+                Error.UnsupportedExpression,
+                .@"error",
+                "@field expects two arguments: @field(value, name)",
+                .{},
+            );
+            return .fromValue(.void);
+        }
+        const raw = (try self.comptimeStringArg(call.arguments[1])) orelse {
+            // In an unspecialized generic template the name may not fold yet — the
+            // loop that binds it (`for (@fields(T)) |f|`) unrolls to nothing there,
+            // so this body is never really executed; emit a harmless placeholder.
+            if (self.generic_template_depth > 0) return .fromValue(.void);
+            try self.reportSourceError(
+                source,
+                Error.UnsupportedExpression,
+                .@"error",
+                "@field's name argument must be a compile-time string",
+                .{},
+            );
+            return .fromValue(.void);
+        };
+        const member: ast.MemberExpr = .{
+            .object = call.arguments[0],
+            .member = .{ .name = try self.allocator.dupe(u8, raw), .span = source.span() },
+            .span = source.span(),
+        };
+        return self.compileMember(source, member, mode);
+    }
+
+    /// `Maybe(Int).nothing` — accessing a static `pub const` declaration of a
+    /// type produced by a comptime type constructor (module-like). Resolves the
+    /// constructor, finds the named decl in the type's `decls`, and compiles the
+    /// decl's value with the constructor's type parameters bound to the call's
+    /// arguments (so a `T` in the initializer resolves). Returns null when the
+    /// object is not such a type, or has no matching `pub const` member.
+    /// A member-access object that denotes a type-constructor application
+    /// `Maybe(Int)` written as a type value (`.type_value` wrapping a
+    /// `type_application`). Null for any other object shape.
+    fn memberObjectTypeApp(object: *const ast.Expression) ?ast.TypeExpr.TypeApplication {
+        if (object.* != .type_value) return null;
+        return switch (object.type_value.type_expr.*) {
+            .type_application => |app| app,
+            else => null,
+        };
+    }
+
+    fn tryCompileTypeDeclMember(self: *IRCompiler, member: ast.MemberExpr) Error!?Result {
+        // `Maybe(Int)` written as a type value (`.type_value`) — e.g. a binding
+        // initializer `= Maybe(Int).nothing`.
+        if (memberObjectTypeApp(member.object)) |app| {
+            return self.compileTypeDeclValue(app.name.name, app.args, member.member.name, false);
+        }
+        // `Maybe(Int)` parsed as a value call (bare interpolation form).
+        if (member.object.* != .call) return null;
+        const call = member.object.call;
+        if (call.callee.* != .identifier) return null;
+        if (!self.comptime_type_names.contains(call.callee.identifier.name)) return null;
+        const args = try self.allocator.alloc(*const ast.TypeExpr, call.arguments.len);
+        defer self.allocator.free(args);
+        for (call.arguments, args) |arg, *dst| dst.* = self.argToTypeExpr(arg) orelse return null;
+        return self.compileTypeDeclValue(call.callee.identifier.name, args, member.member.name, false);
+    }
+
+    /// Whether a member access's object is the empty-identifier sentinel the
+    /// parser emits for an implicit `.name` access, resolved against the
+    /// result-location type.
+    fn isImplicitMemberObject(object: *const ast.Expression) bool {
+        return object.* == .identifier and object.identifier.name.len == 0;
+    }
+
+    /// Compiles the value of a static `pub const` declaration `member_name` of the
+    /// type `Ctor(arg_types…)`, with the constructor's type parameters bound to
+    /// `arg_types` (so a `T` in the initializer resolves). Null when there is no
+    /// such constructor/decl, or the decl is a `pub fn` (not a value).
+    ///
+    /// `allow_struct` must be true only when called from a context that compiles
+    /// in a stable frame (a binding or a `yield` value): a struct-literal value
+    /// built in a deeply-nested member-access context stores a closure-cell
+    /// reference that goes stale, so the deep path passes false and bails there.
+    fn compileTypeDeclValue(self: *IRCompiler, ctor_name: []const u8, arg_types: []const *const ast.TypeExpr, member_name: []const u8, allow_struct: bool) Error!?Result {
+        if (!self.comptime_type_names.contains(ctor_name)) return null;
+        const base_st = self.user_struct_types.get(ctor_name) orelse return null;
+
+        const decl = for (base_st.decls) |d| {
+            if (std.mem.eql(u8, d.name.name, member_name)) break d;
+        } else return null;
+        const bd = switch (decl.decl_source) {
+            .binding_decl => |b| b,
+            // A `pub fn` member (a method/associated function) isn't a value here.
+            .fn_decl => return null,
+        };
+
+        const params = self.generic_ctor_params.get(ctor_name) orelse &[_]ast.Identifier{};
+        if (arg_types.len != params.len) return null;
+
+        // Bind each type parameter to its argument for the duration of compiling
+        // the initializer, so a `T` reference in it resolves (mirrors
+        // `materializeStructRecipe`). Restored afterward.
+        var saved = std.ArrayList(?ast.TypeExpr).empty;
+        defer saved.deinit(self.allocator);
+        for (params, 0..) |param, i| {
+            try saved.append(self.allocator, self.type_captures.get(param.name));
+            if (i < arg_types.len) try self.type_captures.put(self.allocator, param.name, arg_types[i].*);
+        }
+        defer for (params, saved.items) |param, prior| {
+            if (prior) |p| self.type_captures.put(self.allocator, param.name, p) catch {} else _ = self.type_captures.remove(param.name);
+        };
+
+        if (bd.initializer.* == .struct_literal and !allow_struct) return null;
+
+        return try self.compileExpressionWithCapture(bd.initializer, bd.initializer);
+    }
+
+    /// Compiles a static type-declaration access as a value **in the current
+    /// frame** (so a struct-literal declaration value stabilizes), for either the
+    /// explicit `Maybe(Int).nothing` form or the implicit `.nothing` resolved
+    /// against `expected` (a binding annotation, a parameter type, …). Null when
+    /// `expr` is not such an access, or there is no matching declaration.
+    fn tryCompileTypeDeclAccess(self: *IRCompiler, expr: *const ast.Expression, expected: ?*const ast.TypeExpr) Error!?Result {
+        // The general parser encodes `a.b` as a `.binary{.member}`; the implicit
+        // `.name` form is a `.member` with the empty-identifier object. Normalize.
+        const ma = asMemberAccess(expr) orelse return null;
+
+        // Resolve the constructor name and type arguments from either form.
+        var ctor_name: []const u8 = undefined;
+        var arg_types: []const *const ast.TypeExpr = undefined;
+        var owned_args: ?[]*const ast.TypeExpr = null;
+        defer if (owned_args) |a| self.allocator.free(a);
+        if (isImplicitMemberObject(ma.object)) {
+            const app = switch ((expected orelse return null).*) {
+                .type_application => |a| a,
+                else => return null,
+            };
+            ctor_name = app.name.name;
+            arg_types = app.args;
+        } else if (memberObjectTypeApp(ma.object)) |app| {
+            // `Maybe(Int)` written as a type application (`.type_value`).
+            ctor_name = app.name.name;
+            arg_types = app.args;
+        } else if (ma.object.* == .call and ma.object.call.callee.* == .identifier) {
+            // `Maybe(Int)` parsed as a value call (bare interpolation form).
+            const call = ma.object.call;
+            ctor_name = call.callee.identifier.name;
+            const args = try self.allocator.alloc(*const ast.TypeExpr, call.arguments.len);
+            owned_args = args;
+            for (call.arguments, args) |arg, *dst| dst.* = self.argToTypeExpr(arg) orelse return null;
+            arg_types = args;
+        } else return null;
+
+        return self.compileTypeDeclValue(ctor_name, arg_types, ma.member, true);
+    }
+
+    /// For a binding whose initializer is a static type declaration access
+    /// (`const a: Maybe(Int) = Maybe(Int).nothing` or the implicit `= .nothing`),
+    /// compiles the value in the binding's own frame and binds it. Returns false
+    /// when the initializer is not such an access (compile normally then).
+    fn compileTypeDeclBinding(
+        self: *IRCompiler,
+        source: anytype,
+        identifier: ast.Identifier,
+        expr: *ast.Expression,
+        annotation: ?*const ast.TypeExpr,
+        is_mutable: bool,
+    ) Error!bool {
+        const result = (try self.tryCompileTypeDeclAccess(expr, annotation)) orelse return false;
+        try self.compileIdentifierBinding(source, identifier, result.source, annotation, is_mutable, .normal);
+        return true;
+    }
+
     fn compileMember(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -3709,6 +4682,19 @@ pub const IRCompiler = struct {
             return self.compileWaitMember(source, member.object);
         }
 
+        // `f.name`/`f.type` of a comptime field-loop variable — a compile-time
+        // constant: the field's name, or its type's serialized name.
+        if (self.comptimeFieldOf(member.object)) |field| {
+            if (std.mem.eql(u8, member.member.name, "name")) {
+                return .fromValue(try self.addSlice(1, field.name.name));
+            }
+            if (std.mem.eql(u8, member.member.name, "type")) {
+                const type_name = try self.ownedTypeName(field.type_expr.*);
+                defer self.allocator.free(type_name);
+                return .fromValue(try self.addSlice(1, type_name));
+            }
+        }
+
         // `MyError.Variant` — construct a (payload-less) error value when the
         // object is an identifier naming a known error set.
         if (member.object.* == .identifier) {
@@ -3721,6 +4707,12 @@ pub const IRCompiler = struct {
                 );
             }
         }
+
+        // `Maybe(Int).nothing` — a static declaration of a type produced by a
+        // comptime type constructor. The constructor is module-like: its body's
+        // `pub const` decls are members of the type, so this compiles the decl's
+        // value with the type arguments bound (`T` → `Int`).
+        if (try self.tryCompileTypeDeclMember(member)) |result| return result;
 
         // A member access on a call/pipeline result (`(dbl v).x`, `v.method.x`
         // where `method` is a function) must value-capture the object — a plain
@@ -3777,6 +4769,18 @@ pub const IRCompiler = struct {
             return .fromValue(.void);
         };
 
+        // While compiling an unspecialized generic template (`comptime T: type`
+        // with `T` still unbound), a value typed by a type variable (`v: T`) has no
+        // concrete struct layout yet — `v.x` / `@field(v)("x")` can't resolve. This
+        // template body is never executed (each real call monomorphizes with `T`
+        // bound); emit a harmless placeholder instead of a spurious error, the way
+        // `@log`/`@compileError` suppress in a template. Inside a comptime loop over
+        // `@fields(T)` this never arises (the template unrolls it to nothing), but a
+        // member access *outside* such a loop would otherwise mis-report here.
+        if (self.generic_template_depth > 0 and !self.objectTypeHasStructLayout(object_type)) {
+            return .fromValue(.void);
+        }
+
         const struct_type = switch (object_type) {
             .array => {
                 if (!std.mem.eql(u8, member.member.name, "len")) {
@@ -3816,8 +4820,16 @@ pub const IRCompiler = struct {
             },
             .struct_type => |struct_type| struct_type,
             // A binding annotated with a user struct's name carries the type as
-            // an identifier; resolve it to the struct's layout.
-            .identifier => |named| self.user_struct_types.get(named.path.segments[named.path.segments.len - 1].name) orelse {
+            // an identifier; resolve it to the struct's layout. It may also be a
+            // *type variable* bound during specialization (a `comptime T: type`
+            // param where `T` → `Vec(Int)`): resolve it through `type_captures`
+            // (to a concrete struct name or a `Box(Int)` application) so member
+            // access on a `T`-typed value works anywhere in the body, not only
+            // inside a `for (@fields(T))` loop.
+            .identifier => |named| blk: {
+                const nm = named.path.segments[named.path.segments.len - 1].name;
+                if (self.user_struct_types.get(nm)) |st| break :blk st;
+                if (self.structTypeOfCapturedName(nm)) |st| break :blk st;
                 try self.reportSourceError(
                     source,
                     Error.NotImplemented,
@@ -4545,6 +5557,58 @@ pub const IRCompiler = struct {
             if (std.mem.eql(u8, name, "@src")) {
                 return self.compileIdentifier(source, call.callee.identifier);
             }
+            // `@compileError "msg"` — a compile-time failure. Reached only when its
+            // branch is actually compiled: a comptime `if`/`match` prunes the
+            // untaken arm, so it fires for exactly the specializations that select
+            // it. Suppressed in the unspecialized template (both arms compile).
+            if (std.mem.eql(u8, name, "@compileError")) {
+                if (self.generic_template_depth == 0) {
+                    const msg = if (call.arguments.len > 0)
+                        (try self.comptimeMessage(call.arguments[0])) orelse "compile error"
+                    else
+                        "compile error";
+                    try self.reportSourceError(source, Error.UnsupportedExpression, .@"error", "{s}", .{msg});
+                }
+                return .fromValue(.void);
+            }
+            // `@log msg` — a runtime debug print to the process's *real* stdout,
+            // bypassing the current thread's stdout pipe (which, inside a captured
+            // call, is a capture pipe — echoing there would pollute or deadlock the
+            // capture). The message is any value; it is rendered and newline-
+            // terminated. Suppressed in an unspecialized generic template (its body
+            // compiles every comptime branch), like `@compileError`.
+            if (std.mem.eql(u8, name, "@log") and
+                self.lookup(name, .{ .shallow = false }) == null)
+            {
+                if (self.generic_template_depth == 0) {
+                    const msg: ir.ValueSource = if (call.arguments.len > 0) blk: {
+                        const compiled = try self.compileExpression(call.arguments[0]);
+                        const ref = try self.newRef(source, "log_msg");
+                        try self.set(source, ref, stableResultSource(compiled));
+                        break :blk .fromLocation(ref.dereference());
+                    } else .fromValue(.{ .slice = ir.Value.Slice.empty(1) });
+                    try self.addInstruction(.init(.from(source), .{ .debug_log = msg }));
+                }
+                return .fromValue(.void);
+            }
+            // `@field(value, name)` — read the field named by the comptime string
+            // `name` off the struct `value`. The name folds at compile time
+            // (typically `f.name` from an unrolled `for (@fields(T)) |f|`), so this
+            // lowers to an ordinary member access `value.<name>`. This is what lets
+            // a comptime-unrolled loop touch each field's *value*, not just its
+            // metadata (the analog of Zig's `@field`).
+            if (std.mem.eql(u8, name, "@field") and
+                self.lookup(name, .{ .shallow = false }) == null)
+            {
+                return self.compileFieldBuiltin(source, call, .read);
+            }
+            // Type-introspection builtins (`@kind`, `@elem`, `@child`,
+            // `@fieldCount`, `@hasField`) fold to a compile-time constant.
+            if (name.len > 0 and name[0] == '@' and
+                self.lookup(name, .{ .shallow = false }) == null)
+            {
+                if (try self.compileComptimeBuiltin(source, call)) |result| return result;
+            }
             if (std.mem.eql(u8, name, "cd") and self.lookup(name, .{ .shallow = false }) == null) {
                 return self.compileBuiltinCd(source, call.arguments);
             }
@@ -4671,15 +5735,36 @@ pub const IRCompiler = struct {
             if (try self.tryUfcsRewrite(source, call.callee.binary.left, call.callee.binary.right.identifier.name, call.arguments, call.redirects)) |r| return r;
         }
 
+        // A module-member function call (`std.math.max 3 7`, `m.fn args`): resolve
+        // the fn_ref statically and fork it directly, instead of compiling the
+        // module-object receiver. Compiling the receiver reads the module binding's
+        // runtime value — inside a closure that binding is a *captured* module whose
+        // value resolves to a bad address, so a bare module call statement would
+        // fail there. The typed-value-capture path already resolves this statically.
+        if (call.redirects.len == 0) {
+            if (try self.moduleMemberFnRef(source)) |mm| {
+                return self.compileFunctionCall(source, mm.fn_ref_value, mm.arguments, &.{}, null);
+            }
+        }
+
         const callee = try self.compileExpression(call.callee);
 
         // Indirect call: a function-valued location (a `fn(...)`-typed parameter)
-        // called with arguments. The target function is only known at runtime.
-        if (callee.source == .location and call.arguments.len > 0 and call.redirects.len == 0) {
+        // called with arguments — or a *nullary* one referenced bare (`body`),
+        // which auto-calls like a nullary named fn / module member. The target
+        // function is only known at runtime. A fn value with parameters referenced
+        // with no arguments stays a value (`const g = f`), so it isn't called here.
+        if (callee.source == .location and call.redirects.len == 0) {
             if (callee.typeExpr()) |t| {
                 if (t == .function) {
-                    const rt: ?ast.TypeExpr = if (t.function.return_type) |r| r.* else null;
-                    return self.compileIndirectCall(source, callee.source.location, rt, call.arguments);
+                    const nullary = switch (t.function.params) {
+                        ._non_variadic => |ps| ps.len == 0,
+                        ._variadic => false,
+                    };
+                    if (call.arguments.len > 0 or nullary) {
+                        const rt: ?ast.TypeExpr = if (t.function.return_type) |r| r.* else null;
+                        return self.compileIndirectCall(source, callee.source.location, rt, call.arguments);
+                    }
                 }
             }
         }
@@ -4695,7 +5780,7 @@ pub const IRCompiler = struct {
                     .from(v)
                 else
                     self.compileFunctionCall(source, v, call.arguments, call.redirects, null),
-                .slice, .stream, .addr, .void, .null, .integer, .float, .strct, .exit_code, .pipe, .thread, .closeable, .err => .from(v),
+                .slice, .stream, .addr, .void, .null, .integer, .seq_len, .float, .strct, .exit_code, .pipe, .thread, .closeable, .err => .from(v),
                 .zig_string => Error.UnsupportedValueType,
             },
             .location => |loc| .from(loc),
@@ -5596,8 +6681,38 @@ pub const IRCompiler = struct {
             .array => |a| try collectCapturesInType(a.element.*, out, allocator),
             .optional => |o| try collectCapturesInType(o.child.*, out, allocator),
             .promise => |p| try collectCapturesInType(p.child.*, out, allocator),
-            .type_application => |app| for (app.args) |arg| try collectCapturesInType(arg.*, out, allocator),
+            .type_application => |app| {
+                // A higher-kinded application `|M|(A)` captures the constructor
+                // `M` in addition to any captures in its arguments.
+                if (app.ctor_is_capture) try out.append(allocator, app.name.name);
+                for (app.args) |arg| try collectCapturesInType(arg.*, out, allocator);
+            },
+            // A function-type parameter (`fn (|A|) |B|`) captures through its
+            // parameter and return types.
+            .function => |f| {
+                if (f.return_type) |rt| try collectCapturesInType(rt.*, out, allocator);
+                if (f.stdin_type) |st| try collectCapturesInType(st.*, out, allocator);
+                switch (f.params) {
+                    ._non_variadic => |ps| for (ps) |p| {
+                        if (p) |pt| try collectCapturesInType(pt.*, out, allocator);
+                    },
+                    ._variadic => |p| if (p) |pt| try collectCapturesInType(pt.*, out, allocator),
+                }
+            },
             else => {},
+        }
+    }
+
+    /// Serializes a comptime constant into a specialization cache key.
+    fn writeComptimeValueKey(w: *std.Io.Writer, value: Result) std.Io.Writer.Error!void {
+        if (value.source != .value) return w.writeAll("?");
+        switch (value.source.value) {
+            .integer => |i| try w.print("i{d}", .{i}),
+            .float => |f| try w.print("f{d}", .{f}),
+            .exit_code => |e| try w.print("b{}", .{e.toBoolean()}),
+            .zig_string => |s| try w.print("s{s}", .{s}),
+            .null => try w.writeAll("n"),
+            else => try w.writeAll("?"),
         }
     }
 
@@ -5623,9 +6738,47 @@ pub const IRCompiler = struct {
                 .string => string_type,
                 .null => null,
             },
-            .identifier, .call => self.resolveStaticType(arg),
+            .identifier, .call => self.argFunctionType(arg) orelse self.resolveStaticType(arg),
+            // A field access (`v.value`) parses as a `.binary` member expression;
+            // its static type is the accessed field's type (needed so a recursive
+            // call `f v.value` re-specializes at the field's concrete type).
+            .binary => self.resolveStaticType(arg),
             else => null,
         };
+    }
+
+    /// The full function type of a function-valued argument (`double` →
+    /// `fn (Int) Int`), reconstructed from the referenced function's declaration.
+    /// A hoisted fn binding's stored type carries only its return type (its param
+    /// slot is left empty at hoist time), so binding a `fn (|A|) |B|` parameter's
+    /// captures from such an argument needs the real parameter types. Null when
+    /// the argument does not name a plain function.
+    fn argFunctionType(self: *IRCompiler, arg: *ast.Expression) ?ast.TypeExpr {
+        const name = switch (arg.*) {
+            .identifier => |id| id.name,
+            .call => |call| if (call.arguments.len == 0 and call.callee.* == .identifier)
+                call.callee.identifier.name
+            else
+                return null,
+            else => return null,
+        };
+        const binding = self.lookup(name, .{ .shallow = false }) orelse return null;
+        if (!binding.result.isFunctionRef()) return null;
+        const instr_set = binding.result.source.value.fn_ref.fn_addr.instr_set;
+        const decl_ptr = self.comptime_fn_decls.get(instr_set) orelse return null;
+        const decl = decl_ptr.*;
+        const decl_params = switch (decl.params) {
+            ._non_variadic => |ps| ps,
+            else => return null,
+        };
+        const param_types = self.allocator.alloc(?*const ast.TypeExpr, decl_params.len) catch return null;
+        for (decl_params, param_types) |p, *pt| pt.* = p.type_annotation;
+        return ast.TypeExpr{ .function = .{
+            .params = .{ ._non_variadic = param_types },
+            .stdin_type = decl.stdin_type,
+            .return_type = decl.return_type,
+            .span = decl.span,
+        } };
     }
 
     /// Monomorphization: for a direct call to a top-level, non-recursive generic
@@ -5634,6 +6787,112 @@ pub const IRCompiler = struct {
     /// argument types, and return its instruction set. Returns null (use the
     /// generic function) when the callee isn't a specializable candidate or the
     /// type arguments can't be determined.
+    /// The type a comptime type argument denotes, in its written form: a bare
+    /// name (`Int`), a `type_value`, or a generic application kept unresolved
+    /// (`Box(Int)`, so it still serializes as `Box(Int)` and matches structurally
+    /// on demand). Null when the argument is not a type.
+    fn comptimeArgType(self: *IRCompiler, arg: *const ast.Expression) ?ast.TypeExpr {
+        // `f.type` of a comptime field-loop variable denotes that field's type.
+        if (self.comptimeFieldMember(arg)) |fm| {
+            return if (std.mem.eql(u8, fm.member, "type")) fm.field.type_expr.* else null;
+        }
+        switch (arg.*) {
+            .type_value => |tv| return tv.type_expr.*,
+            .identifier => |id| {
+                const seg = self.allocator.alloc(ast.Identifier, 1) catch return null;
+                seg[0] = id;
+                return ast.TypeExpr{ .identifier = .{ .path = .{ .segments = seg, .span = id.span }, .span = id.span } };
+            },
+            .call => |call| {
+                // A bare type name (`Int`) parses as a zero-argument call.
+                if (call.arguments.len == 0) return self.comptimeArgType(call.callee);
+                if (call.callee.* != .identifier) return null;
+                const args = self.allocator.alloc(*const ast.TypeExpr, call.arguments.len) catch return null;
+                for (call.arguments, args) |a, *dst| {
+                    const t = self.allocator.create(ast.TypeExpr) catch return null;
+                    t.* = self.comptimeArgType(a) orelse return null;
+                    dst.* = t;
+                }
+                return ast.TypeExpr{ .type_application = .{ .name = call.callee.identifier, .args = args, .span = call.callee.identifier.span } };
+            },
+            else => return null,
+        }
+    }
+
+    /// The specialization cache key a call to `instr_set` with `arguments` would
+    /// produce — mirrors `maybeSpecialize`'s key computation but leaves
+    /// `type_captures` unchanged (saved and restored). Used to tell whether a
+    /// recursive call is at the same concrete type as the specialization currently
+    /// being compiled. Null when the callee isn't a specialization candidate.
+    fn specializationCallKey(self: *IRCompiler, instr_set: usize, arguments: []const *ast.Expression) Error!?[]const u8 {
+        const decl_ptr = self.comptime_fn_decls.get(instr_set) orelse return null;
+        const fn_decl = decl_ptr.*;
+        if (fn_decl.params != ._non_variadic) return null;
+        const params = fn_decl.params._non_variadic;
+        if (params.len != arguments.len) return null;
+
+        var capture_names = std.ArrayList([]const u8).empty;
+        defer capture_names.deinit(self.allocator);
+        var value_param_names = std.ArrayList([]const u8).empty;
+        defer value_param_names.deinit(self.allocator);
+        for (params) |param| {
+            if (comptimeTypeParamName(param)) |name| {
+                try capture_names.append(self.allocator, name);
+            } else if (comptimeValueParamName(param)) |name| {
+                try value_param_names.append(self.allocator, name);
+            } else if (param.type_annotation) |ann| {
+                try collectCapturesInType(ann.*, &capture_names, self.allocator);
+            }
+        }
+        if (capture_names.items.len == 0 and value_param_names.items.len == 0) return null;
+
+        var saved = std.ArrayList(?ast.TypeExpr).empty;
+        defer saved.deinit(self.allocator);
+        for (capture_names.items) |name| try saved.append(self.allocator, self.type_captures.get(name));
+        defer for (capture_names.items, saved.items) |name, prior| {
+            if (prior) |p| self.type_captures.put(self.allocator, name, p) catch {} else _ = self.type_captures.remove(name);
+        };
+        for (capture_names.items) |name| _ = self.type_captures.remove(name);
+
+        for (params, arguments) |param, arg| {
+            if (comptimeTypeParamName(param)) |name| {
+                const denoted = self.comptimeArgType(arg) orelse return null;
+                self.type_captures.put(self.allocator, name, denoted) catch {};
+                continue;
+            }
+            const ann = param.type_annotation orelse continue;
+            if (!hasTypeCapture(ann.*)) continue;
+            const arg_type = self.argTypeExpr(arg) orelse return null;
+            self.bindTypeCaptures(ann.*, arg_type);
+        }
+        for (capture_names.items) |name| {
+            const bound = self.type_captures.get(name) orelse return null;
+            if (bound == .type_var) return null;
+        }
+
+        var value_results = std.StringHashMapUnmanaged(Result).empty;
+        defer value_results.deinit(self.allocator);
+        for (params, arguments) |param, arg| {
+            const name = comptimeValueParamName(param) orelse continue;
+            const val = (try self.evalComptimeExpression(arg)) orelse return null;
+            if (val.source != .value) return null;
+            try value_results.put(self.allocator, name, val);
+        }
+
+        var key_writer = std.Io.Writer.Allocating.init(self.allocator);
+        defer key_writer.deinit();
+        try key_writer.writer.print("{}", .{instr_set});
+        for (capture_names.items) |name| {
+            try key_writer.writer.print("|{s}=", .{name});
+            try self.writeTypeName(&key_writer.writer, self.type_captures.get(name).?);
+        }
+        for (value_param_names.items) |name| {
+            try key_writer.writer.print("|{s}#", .{name});
+            try writeComptimeValueKey(&key_writer.writer, value_results.get(name).?);
+        }
+        return try self.allocator.dupe(u8, key_writer.written());
+    }
+
     fn maybeSpecialize(
         self: *IRCompiler,
         instr_set: usize,
@@ -5651,10 +6910,21 @@ pub const IRCompiler = struct {
 
         var capture_names = std.ArrayList([]const u8).empty;
         defer capture_names.deinit(self.allocator);
+        var value_param_names = std.ArrayList([]const u8).empty;
+        defer value_param_names.deinit(self.allocator);
         for (params) |param| {
-            if (param.type_annotation) |ann| try collectCapturesInType(ann.*, &capture_names, self.allocator);
+            // A `comptime T: type` param monomorphizes the body per type argument:
+            // `T` is bound to that concrete type so `T == …` folds at compile time.
+            if (comptimeTypeParamName(param)) |name| {
+                try capture_names.append(self.allocator, name);
+            } else if (comptimeValueParamName(param)) |name| {
+                // A `comptime n: Int` param monomorphizes per constant value.
+                try value_param_names.append(self.allocator, name);
+            } else if (param.type_annotation) |ann| {
+                try collectCapturesInType(ann.*, &capture_names, self.allocator);
+            }
         }
-        if (capture_names.items.len == 0) return null;
+        if (capture_names.items.len == 0 and value_param_names.items.len == 0) return null;
 
         // Save any prior bindings for these names so the caller's context is
         // restored after the specialization is compiled.
@@ -5668,6 +6938,14 @@ pub const IRCompiler = struct {
 
         // Bind each capture to its argument's concrete type.
         for (params, arguments) |param, arg| {
+            // A `comptime T: type` param binds `T` directly to the type the
+            // argument denotes (`Box(Int)` → the type `Box(Int)`), kept in its
+            // written application form so `${T}` serializes as `Box(Int)`.
+            if (comptimeTypeParamName(param)) |name| {
+                const denoted = self.comptimeArgType(arg) orelse return null;
+                self.type_captures.put(self.allocator, name, denoted) catch {};
+                continue;
+            }
             const ann = param.type_annotation orelse continue;
             if (!hasTypeCapture(ann.*)) continue;
             const arg_type = self.argTypeExpr(arg) orelse return null;
@@ -5679,13 +6957,28 @@ pub const IRCompiler = struct {
             if (bound == .type_var) return null;
         }
 
-        // Build a cache key from the bound type arguments.
+        // Evaluate each comptime value param's argument to a compile-time constant;
+        // bail (use the generic body) if any argument isn't comptime-known.
+        var value_results = std.StringHashMapUnmanaged(Result).empty;
+        defer value_results.deinit(self.allocator);
+        for (params, arguments) |param, arg| {
+            const name = comptimeValueParamName(param) orelse continue;
+            const val = (try self.evalComptimeExpression(arg)) orelse return null;
+            if (val.source != .value) return null;
+            try value_results.put(self.allocator, name, val);
+        }
+
+        // Build a cache key from the bound type and value arguments.
         var key_writer = std.Io.Writer.Allocating.init(self.allocator);
         defer key_writer.deinit();
         try key_writer.writer.print("{}", .{instr_set});
         for (capture_names.items) |name| {
             try key_writer.writer.print("|{s}=", .{name});
             try self.writeTypeName(&key_writer.writer, self.type_captures.get(name).?);
+        }
+        for (value_param_names.items) |name| {
+            try key_writer.writer.print("|{s}#", .{name});
+            try writeComptimeValueKey(&key_writer.writer, value_results.get(name).?);
         }
         const key = key_writer.written();
 
@@ -5698,17 +6991,27 @@ pub const IRCompiler = struct {
         const owned_key = try self.allocator.dupe(u8, key);
         const prev_specializing = self.specializing;
         const prev_generic = self.specializing_generic;
+        const prev_key = self.specializing_key;
         self.specializing = true;
         self.specializing_generic = instr_set;
+        self.specializing_key = owned_key;
         self.specialization_depth += 1;
+        // Hand the comptime value constants to `compileFnDecl` (consumed while
+        // setting up parameters, before any nested call can clobber them).
+        self.pending_comptime_values.clearRetainingCapacity();
+        for (value_param_names.items) |name| {
+            self.pending_comptime_values.put(self.allocator, name, value_results.get(name).?) catch {};
+        }
         const result = self.compileFnDecl(fn_source, fn_decl) catch |err| {
             self.specializing = prev_specializing;
             self.specializing_generic = prev_generic;
+            self.specializing_key = prev_key;
             self.specialization_depth -= 1;
             return err;
         };
         self.specializing = prev_specializing;
         self.specializing_generic = prev_generic;
+        self.specializing_key = prev_key;
         self.specialization_depth -= 1;
         const spec_instr_set = result.source.value.fn_ref.fn_addr.instr_set;
         try self.specializations.put(self.allocator, owned_key, spec_instr_set);
@@ -5790,13 +7093,290 @@ pub const IRCompiler = struct {
         }
     }
 
+    /// Whether `object_type` resolves to a layout `compileMember` can address (a
+    /// struct, an array, or a resolvable struct name/application). Used to decide
+    /// whether an unresolved member access in a generic *template* is a real error
+    /// or just a not-yet-bound type variable to skip over.
+    fn objectTypeHasStructLayout(self: *IRCompiler, object_type: ast.TypeExpr) bool {
+        return switch (object_type) {
+            .struct_type, .array => true,
+            .identifier => |named| blk: {
+                const nm = named.path.segments[named.path.segments.len - 1].name;
+                break :blk self.user_struct_types.contains(nm) or self.structTypeOfCapturedName(nm) != null;
+            },
+            .type_application => |app| if (self.resolveTypeApplication(app)) |r| r == .struct_type else false,
+            else => false,
+        };
+    }
+
+    /// The struct layout a type-variable name resolves to when it was bound during
+    /// specialization (a `comptime T: type` param). `T` is bound in `type_captures`
+    /// to its denoted type — a concrete struct name (`Point`) or an application
+    /// (`Box(Int)`); resolve either to the struct. Null when the name isn't a bound
+    /// capture or doesn't denote a struct.
+    fn structTypeOfCapturedName(self: *IRCompiler, name: []const u8) ?ast.TypeExpr.StructType {
+        const bound = self.type_captures.get(name) orelse return null;
+        return switch (bound) {
+            .struct_type => |st| st,
+            .type_application => |app| blk: {
+                const resolved = self.resolveTypeApplication(app) orelse break :blk null;
+                break :blk if (resolved == .struct_type) resolved.struct_type else null;
+            },
+            .identifier => |id| blk: {
+                const nm = id.path.segments[id.path.segments.len - 1].name;
+                // Guard against a self-referential capture (`T` → `T`).
+                if (std.mem.eql(u8, nm, name)) break :blk null;
+                break :blk self.user_struct_types.get(nm) orelse self.structTypeOfCapturedName(nm);
+            },
+            else => null,
+        };
+    }
+
     /// Resolves a generic application (`Box(Int)`) to the constructor's struct
     /// body with the arguments substituted, or null when the constructor isn't a
     /// registered generic struct.
     fn resolveTypeApplication(self: *IRCompiler, app: ast.TypeExpr.TypeApplication) ?ast.TypeExpr {
-        const body_st = self.user_struct_types.get(app.name.name) orelse return null;
-        const params = self.generic_ctor_params.get(app.name.name) orelse &[_]ast.Identifier{};
-        return self.substituteTypeParams(.{ .struct_type = body_st }, params, app.args) catch null;
+        // A higher-kinded application `M(A)` whose constructor `M` was captured
+        // (bound in `type_captures` to a concrete constructor like `Maybe`):
+        // resolve it as that constructor applied to the arguments.
+        var name = app.name.name;
+        if (self.type_captures.get(name)) |bound| {
+            if (bound == .identifier and bound.identifier.path.segments.len == 1) {
+                const ctor = bound.identifier.path.segments[0].name;
+                if (!std.mem.eql(u8, ctor, name)) name = ctor;
+            }
+        }
+        const body_st = self.user_struct_types.get(name) orelse return null;
+        const params = self.generic_ctor_params.get(name) orelse &[_]ast.Identifier{};
+        const substituted = self.substituteTypeParams(.{ .struct_type = body_st }, params, app.args) catch return null;
+        if (substituted == .struct_type and substituted.struct_type.body_items.len > 0) {
+            const fields = self.materializeStructRecipe(substituted.struct_type, params, app.args) catch |err| {
+                self.log("@insert materialization failed: {}", .{err}) catch {};
+                return substituted;
+            };
+            var st = substituted.struct_type;
+            st.fields = fields;
+            st.body_items = &.{};
+            return .{ .struct_type = st };
+        }
+        return substituted;
+    }
+
+    /// Expands a struct body recipe (`@insert` / comptime `for … @insert`) to a
+    /// concrete field list, with the constructor's type parameters bound to `args`
+    /// (so `${T}`, `@fields(T)`, `f.name`/`f.type` fold). Runs at instantiation.
+    fn materializeStructRecipe(
+        self: *IRCompiler,
+        st: ast.TypeExpr.StructType,
+        params: []const ast.Identifier,
+        args: []const *const ast.TypeExpr,
+    ) Error![]const ast.TypeExpr.StructField {
+        var saved = std.ArrayList(?ast.TypeExpr).empty;
+        defer saved.deinit(self.allocator);
+        for (params, 0..) |param, i| {
+            try saved.append(self.allocator, self.type_captures.get(param.name));
+            if (i < args.len) try self.type_captures.put(self.allocator, param.name, args[i].*);
+        }
+        defer for (params, saved.items) |param, prior| {
+            if (prior) |p| self.type_captures.put(self.allocator, param.name, p) catch {} else _ = self.type_captures.remove(param.name);
+        };
+
+        var fields = std.ArrayList(ast.TypeExpr.StructField).empty;
+        defer fields.deinit(self.allocator);
+
+        for (st.body_items) |item| switch (item) {
+            .field => |f| {
+                const ft = try self.allocator.create(ast.TypeExpr);
+                ft.* = try self.substituteTypeParams(f.type_expr.*, params, args);
+                try fields.append(self.allocator, .{ .name = f.name, .type_expr = ft, .span = f.span });
+            },
+            .insert => |operand| try self.expandInsert(&fields, operand, params, args),
+            .for_insert => |fi| {
+                const arg = comptimeFieldsArg(fi.source) orelse return Error.UnsupportedExpression;
+                const resolved = (try self.resolveComptimeType(arg)) orelse return fields.toOwnedSlice(self.allocator);
+                const src_st = comptimeStructOf(resolved) orelse return Error.UnsupportedExpression;
+                const var_name = fi.var_name.name;
+                for (src_st.fields) |field| {
+                    const had_prev = self.comptime_field_vars.contains(var_name);
+                    const prev = if (had_prev) self.comptime_field_vars.get(var_name) else null;
+                    try self.comptime_field_vars.put(self.allocator, var_name, field);
+                    try self.expandInsert(&fields, fi.operand, params, args);
+                    if (prev) |p| self.comptime_field_vars.put(self.allocator, var_name, p) catch {} else _ = self.comptime_field_vars.remove(var_name);
+                }
+            },
+        };
+
+        return fields.toOwnedSlice(self.allocator);
+    }
+
+    /// Folds one `@insert` operand to a string (via `comptimeMessage`), re-parses
+    /// it as a field list, and appends the fields (types substituted so a literal
+    /// type parameter in the generated text also resolves).
+    fn expandInsert(
+        self: *IRCompiler,
+        fields: *std.ArrayList(ast.TypeExpr.StructField),
+        operand: *const ast.Expression,
+        params: []const ast.Identifier,
+        args: []const *const ast.TypeExpr,
+    ) Error!void {
+        const text = (try self.comptimeMessage(@constCast(operand))) orelse return Error.UnsupportedExpression;
+        const parsed = try self.reparseInsertFields(text);
+        for (parsed) |pf| {
+            const ft = try self.allocator.create(ast.TypeExpr);
+            ft.* = try self.substituteTypeParams(pf.type_expr.*, params, args);
+            try fields.append(self.allocator, .{ .name = pf.name, .type_expr = ft, .span = pf.span });
+        }
+    }
+
+    /// Re-parses a folded `@insert` string as a field list, using a lazily-created,
+    /// compiler-lifetime parser (the field ASTs live in its arena).
+    fn reparseInsertFields(self: *IRCompiler, text: []const u8) Error![]const ast.TypeExpr.StructField {
+        if (self.insert_parser == null) {
+            self.insert_parser = Parser.init(self.io, self.allocator, self.env_map, self.document_store);
+        }
+        return self.insert_parser.?.reparseFieldString(text) catch return Error.UnsupportedExpression;
+    }
+
+    /// The concrete return type of a call to a generic function, obtained by
+    /// binding the callee's `|T|`/`|M|` captures from the argument types (as
+    /// `maybeSpecialize` does) and substituting them into the declared return
+    /// type: `gmap double some` → `Maybe(Int)`. Used to type a generic call's
+    /// *result value* so member access on it (`(gmap double some).x`) resolves the
+    /// struct layout — the raw generic return `M(B)` leaves `M`/`B` unbound at the
+    /// call site. Restores `type_captures` before returning. Null when the callee
+    /// isn't a generic candidate, its captures don't fully bind, or the return
+    /// mentions no captured variable (it is already concrete).
+    fn callConcreteReturnType(self: *IRCompiler, instr_set: usize, arguments: []const *ast.Expression) ?ast.TypeExpr {
+        const decl_ptr = self.comptime_fn_decls.get(instr_set) orelse return null;
+        const fn_decl = decl_ptr.*;
+        const params = switch (fn_decl.params) {
+            ._non_variadic => |ps| ps,
+            else => return null,
+        };
+        if (params.len != arguments.len) return null;
+        const raw_return = (fn_decl.return_type orelse return null).*;
+
+        var capture_names = std.ArrayList([]const u8).empty;
+        defer capture_names.deinit(self.allocator);
+        for (params) |param| {
+            // A `comptime T: type` param introduces the type variable `T` (a bare
+            // identifier in annotations/return), bound from the type its argument
+            // denotes. Collect it alongside `|T|`-style captures so a return of `T`
+            // resolves to the concrete type.
+            if (comptimeTypeParamName(param)) |name| {
+                capture_names.append(self.allocator, name) catch return null;
+            } else if (param.type_annotation) |ann| {
+                collectCapturesInType(ann.*, &capture_names, self.allocator) catch return null;
+            }
+        }
+        if (capture_names.items.len == 0) return null;
+        if (!typeMentionsAny(raw_return, capture_names.items)) return null;
+
+        // Save + rebind captures, resolve the return, then restore — the call site
+        // must not keep these bindings (they belong to the callee's body).
+        var saved = std.ArrayList(?ast.TypeExpr).empty;
+        defer saved.deinit(self.allocator);
+        for (capture_names.items) |name| saved.append(self.allocator, self.type_captures.get(name)) catch return null;
+        defer for (capture_names.items, saved.items) |name, prior| {
+            if (prior) |p| self.type_captures.put(self.allocator, name, p) catch {} else _ = self.type_captures.remove(name);
+        };
+        for (capture_names.items) |name| _ = self.type_captures.remove(name);
+        for (params, arguments) |param, arg| {
+            if (comptimeTypeParamName(param)) |name| {
+                const denoted = self.comptimeArgType(arg) orelse return null;
+                self.type_captures.put(self.allocator, name, denoted) catch return null;
+                continue;
+            }
+            const ann = param.type_annotation orelse continue;
+            if (!hasTypeCapture(ann.*)) continue;
+            const arg_type = self.argTypeExpr(arg) orelse return null;
+            self.bindTypeCaptures(ann.*, arg_type);
+        }
+        for (capture_names.items) |name| {
+            const bound = self.type_captures.get(name) orelse return null;
+            if (bound == .type_var) return null;
+        }
+        return self.substituteCapturedType(raw_return) catch null;
+    }
+
+    /// Whether a type expression references any of `names` as a bare type variable
+    /// (an identifier `T`, a `type_var`, a `|T|` capture, or a constructor `M(…)`).
+    fn typeMentionsAny(t: ast.TypeExpr, names: []const []const u8) bool {
+        const has = struct {
+            fn f(n: []const u8, ns: []const []const u8) bool {
+                for (ns) |name| if (std.mem.eql(u8, n, name)) return true;
+                return false;
+            }
+        }.f;
+        return switch (t) {
+            .identifier => |named| named.path.segments.len == 1 and has(named.path.segments[0].name, names),
+            .type_var => |v| has(v.name, names),
+            .type_capture => |c| has(c.name, names),
+            .array => |a| typeMentionsAny(a.element.*, names),
+            .optional => |o| typeMentionsAny(o.child.*, names),
+            .promise => |p| typeMentionsAny(p.child.*, names),
+            .type_application => |app| blk: {
+                if (has(app.name.name, names)) break :blk true;
+                for (app.args) |arg| if (typeMentionsAny(arg.*, names)) break :blk true;
+                break :blk false;
+            },
+            else => false,
+        };
+    }
+
+    /// Rewrites a type by replacing every captured type variable with its bound
+    /// type from `type_captures`: `M(B)` (with `M`→`Maybe`, `B`→`Int`) becomes
+    /// `Maybe(Int)`. A name with no binding is left as-is.
+    fn substituteCapturedType(self: *IRCompiler, t: ast.TypeExpr) Error!ast.TypeExpr {
+        switch (t) {
+            .identifier => |named| {
+                if (named.path.segments.len == 1) {
+                    if (self.type_captures.get(named.path.segments[0].name)) |bound| {
+                        return try self.substituteCapturedType(bound);
+                    }
+                }
+                return t;
+            },
+            .type_var => |v| {
+                if (self.type_captures.get(v.name)) |bound| return try self.substituteCapturedType(bound);
+                return t;
+            },
+            .type_capture => |c| {
+                if (self.type_captures.get(c.name)) |bound| return try self.substituteCapturedType(bound);
+                return t;
+            },
+            .array => |a| {
+                const el = try self.allocator.create(ast.TypeExpr);
+                el.* = try self.substituteCapturedType(a.element.*);
+                return .{ .array = .{ .element = el, .span = a.span } };
+            },
+            .optional => |o| {
+                const ch = try self.allocator.create(ast.TypeExpr);
+                ch.* = try self.substituteCapturedType(o.child.*);
+                return .{ .optional = .{ .child = ch, .span = o.span } };
+            },
+            .promise => |p| {
+                const ch = try self.allocator.create(ast.TypeExpr);
+                ch.* = try self.substituteCapturedType(p.child.*);
+                return .{ .promise = .{ .child = ch, .span = p.span } };
+            },
+            .type_application => |app| {
+                var name = app.name;
+                if (self.type_captures.get(app.name.name)) |bound| {
+                    if (bound == .identifier and bound.identifier.path.segments.len == 1) {
+                        name = bound.identifier.path.segments[0];
+                    }
+                }
+                const new_args = try self.allocator.alloc(*const ast.TypeExpr, app.args.len);
+                for (app.args, new_args) |arg, *dst| {
+                    const na = try self.allocator.create(ast.TypeExpr);
+                    na.* = try self.substituteCapturedType(arg.*);
+                    dst.* = na;
+                }
+                return .{ .type_application = .{ .name = name, .args = new_args, .span = app.span } };
+            },
+            else => return t,
+        }
     }
 
     /// Whether a type is the bare single-segment name `name` — a capture `T`
@@ -5806,6 +7386,154 @@ pub const IRCompiler = struct {
         return switch (t) {
             .identifier => |id| id.path.segments.len == 1 and std.mem.eql(u8, id.path.segments[0].name, name),
             .type_capture => |c| std.mem.eql(u8, c.name, name),
+            else => false,
+        };
+    }
+
+    /// One segment of a serialized type pattern: literal text, or a `|capture|`
+    /// hole that binds a (balanced) slice of the subject.
+    const PatternSeg = union(enum) { literal: []const u8, capture: []const u8 };
+
+    /// Serializes a type pattern (`Box(|B|)`) into literal/capture segments —
+    /// `["Box(", capture B, ")"]` — matching the surface form a type serializes
+    /// to, with each `|capture|` left as a hole.
+    fn buildPatternSegs(self: *IRCompiler, t: ast.TypeExpr, segs: *std.ArrayList(PatternSeg), lit: *std.ArrayList(u8)) Error!void {
+        switch (t) {
+            .type_capture => |capture| {
+                if (lit.items.len > 0) {
+                    try segs.append(self.allocator, .{ .literal = try self.allocator.dupe(u8, lit.items) });
+                    lit.clearRetainingCapacity();
+                }
+                try segs.append(self.allocator, .{ .capture = capture.name });
+            },
+            .type_application => |app| {
+                try lit.appendSlice(self.allocator, app.name.name);
+                for (app.args) |arg| {
+                    try lit.append(self.allocator, '(');
+                    try self.buildPatternSegs(arg.*, segs, lit);
+                    try lit.append(self.allocator, ')');
+                }
+            },
+            else => {
+                var w = std.Io.Writer.Allocating.init(self.allocator);
+                defer w.deinit();
+                self.writeTypeName(&w.writer, t) catch {};
+                try lit.appendSlice(self.allocator, w.written());
+            },
+        }
+    }
+
+    /// Matches a serialized type string (the subject, e.g. `"Box(Int)"`) against a
+    /// type pattern, binding each `|capture|` to a balanced slice of the subject
+    /// (in `type_captures`, so `${B}` in the taken branch resolves). Returns
+    /// whether it matched.
+    fn matchTypeStringPattern(self: *IRCompiler, pattern: ast.TypeExpr, subject: []const u8) Error!bool {
+        var segs = std.ArrayList(PatternSeg).empty;
+        defer segs.deinit(self.allocator);
+        var lit = std.ArrayList(u8).empty;
+        defer lit.deinit(self.allocator);
+        try self.buildPatternSegs(pattern, &segs, &lit);
+        if (lit.items.len > 0) try segs.append(self.allocator, .{ .literal = try self.allocator.dupe(u8, lit.items) });
+
+        var bindings = std.ArrayList(struct { name: []const u8, value: []const u8 }).empty;
+        defer bindings.deinit(self.allocator);
+        var pos: usize = 0;
+        for (segs.items, 0..) |seg, i| switch (seg) {
+            .literal => |text| {
+                if (!std.mem.startsWith(u8, subject[pos..], text)) return false;
+                pos += text.len;
+            },
+            .capture => |name| {
+                // Capture a balanced slice up to the parenthesis that closes it.
+                const start = pos;
+                var depth: usize = 0;
+                while (pos < subject.len) : (pos += 1) {
+                    const c = subject[pos];
+                    if (c == '(') depth += 1 else if (c == ')') {
+                        if (depth == 0) break;
+                        depth -= 1;
+                    }
+                }
+                if (i + 1 >= segs.items.len) pos = subject.len;
+                try bindings.append(self.allocator, .{ .name = name, .value = subject[start..pos] });
+            },
+        };
+        if (pos != subject.len) return false;
+
+        // Bind each capture as a type value (an identifier for a bare name, else a
+        // marker) so `${B}` serializes it and `B == …` compares it.
+        for (bindings.items) |b| {
+            const value_name = try self.allocator.dupe(u8, b.value);
+            const seg = try self.allocator.alloc(ast.Identifier, 1);
+            seg[0] = .{ .name = value_name, .span = .global };
+            const t = ast.TypeExpr{ .identifier = .{ .path = .{ .segments = seg, .span = .global }, .span = .global } };
+            self.type_captures.put(self.allocator, b.name, t) catch {};
+        }
+        return true;
+    }
+
+    /// Recovers the generic constructor and type arguments that produce a struct,
+    /// by unifying it against each registered generic constructor's body
+    /// (`{ x: ?Int }` → `Maybe`, args `[Int]`). Used for higher-kinded capture,
+    /// where a resolved struct argument must be traced back to `M(A)`. Null when
+    /// no constructor matches.
+    const CtorApp = struct { name: ast.Identifier, args: []const *const ast.TypeExpr };
+
+    fn recoverCtorApplication(self: *IRCompiler, subject: ast.TypeExpr.StructType) ?CtorApp {
+        var it = self.user_struct_types.iterator();
+        while (it.next()) |entry| {
+            const ctor_name = entry.key_ptr.*;
+            const params = self.generic_ctor_params.get(ctor_name) orelse continue;
+            if (params.len == 0) continue;
+            var bindings: std.StringHashMapUnmanaged(ast.TypeExpr) = .empty;
+            defer bindings.deinit(self.allocator);
+            if (!self.unifyCtorTemplate(.{ .struct_type = entry.value_ptr.* }, .{ .struct_type = subject }, params, &bindings)) continue;
+            const args = self.allocator.alloc(*const ast.TypeExpr, params.len) catch continue;
+            var ok = true;
+            for (params, args) |p, *dst| {
+                const bound = bindings.get(p.name) orelse {
+                    ok = false;
+                    break;
+                };
+                const t = self.allocator.create(ast.TypeExpr) catch {
+                    ok = false;
+                    break;
+                };
+                t.* = bound;
+                dst.* = t;
+            }
+            if (!ok) continue;
+            return .{ .name = .{ .name = ctor_name, .span = .global }, .args = args };
+        }
+        return null;
+    }
+
+    /// Structural unification of a generic constructor's body `template` against a
+    /// concrete `subject`, binding each constructor parameter to the matched type.
+    fn unifyCtorTemplate(self: *IRCompiler, template: ast.TypeExpr, subject: ast.TypeExpr, params: []const ast.Identifier, bindings: *std.StringHashMapUnmanaged(ast.TypeExpr)) bool {
+        if (template == .identifier and template.identifier.path.segments.len == 1) {
+            const name = template.identifier.path.segments[0].name;
+            for (params) |p| if (std.mem.eql(u8, p.name, name)) {
+                bindings.put(self.allocator, name, subject) catch {};
+                return true;
+            };
+        }
+        if (std.meta.activeTag(template) != std.meta.activeTag(subject)) return false;
+        return switch (template) {
+            .integer, .float, .boolean, .byte, .void, .null => true,
+            .optional => |o| self.unifyCtorTemplate(o.child.*, subject.optional.child.*, params, bindings),
+            .array => |a| self.unifyCtorTemplate(a.element.*, subject.array.element.*, params, bindings),
+            .struct_type => |st| blk: {
+                const sub = subject.struct_type;
+                if (st.fields.len != sub.fields.len) break :blk false;
+                for (st.fields, sub.fields) |tf, sf| {
+                    if (!std.mem.eql(u8, tf.name.name, sf.name.name)) break :blk false;
+                    if (!self.unifyCtorTemplate(tf.type_expr.*, sf.type_expr.*, params, bindings)) break :blk false;
+                }
+                break :blk true;
+            },
+            .identifier => |id| subject == .identifier and
+                std.mem.eql(u8, id.path.segments[id.path.segments.len - 1].name, subject.identifier.path.segments[subject.identifier.path.segments.len - 1].name),
             else => false,
         };
     }
@@ -5821,9 +7549,33 @@ pub const IRCompiler = struct {
             .array => |a| if (subject == .array) self.bindTypeCaptures(a.element.*, subject.array.element.*),
             .optional => |o| if (subject == .optional) self.bindTypeCaptures(o.child.*, subject.optional.child.*),
             .promise => |p| if (subject == .promise) self.bindTypeCaptures(p.child.*, subject.promise.child.*),
-            // `Box(|T|)` — substitute into the body (keeping the capture), then
-            // match structurally against the subject struct.
+            // `|M|(A)` — a higher-kinded pattern: bind the constructor `M` to the
+            // subject's constructor and each argument pattern to the subject's
+            // corresponding argument (`Maybe(Int)` → M = Maybe, A = Int).
             .type_application => |app| {
+                if (app.ctor_is_capture) {
+                    var subj = subject;
+                    while (subj == .alias) subj = subj.alias.type_expr.*;
+                    // The subject may still be in application form (`Maybe(Int)`)
+                    // or already resolved to its struct (`{ x: ?Int }`). Recover
+                    // the constructor and its arguments from either.
+                    const recovered: ?CtorApp = switch (subj) {
+                        .type_application => |sa| .{ .name = sa.name, .args = sa.args },
+                        .struct_type => |sst| self.recoverCtorApplication(sst),
+                        else => null,
+                    };
+                    if (recovered) |rec| {
+                        const seg = self.allocator.alloc(ast.Identifier, 1) catch return;
+                        seg[0] = rec.name;
+                        const ctor_type = ast.TypeExpr{ .identifier = .{ .path = .{ .segments = seg, .span = .global }, .span = .global } };
+                        self.type_captures.put(self.allocator, app.name.name, ctor_type) catch {};
+                        const n = @min(app.args.len, rec.args.len);
+                        for (0..n) |i| self.bindTypeCaptures(app.args[i].*, rec.args[i].*);
+                    }
+                    return;
+                }
+                // `Box(|T|)` — substitute into the body (keeping the capture), then
+                // match structurally against the subject struct.
                 if (self.resolveTypeApplication(app)) |resolved| self.bindTypeCaptures(resolved, subject);
             },
             .struct_type => |st| {
@@ -5838,6 +7590,23 @@ pub const IRCompiler = struct {
                             }
                         }
                     }
+                }
+            },
+            // A function-type parameter (`fn (|A|) |B|`) binds its captures from
+            // the passed function's concrete signature (`fn (Int) Int`).
+            .function => |pf| {
+                if (subject != .function) return;
+                const sf = subject.function;
+                if (pf.return_type) |prt| if (sf.return_type) |srt| self.bindTypeCaptures(prt.*, srt.*);
+                switch (pf.params) {
+                    ._non_variadic => |pps| switch (sf.params) {
+                        ._non_variadic => |sps| {
+                            const n = @min(pps.len, sps.len);
+                            for (0..n) |i| if (pps[i]) |ppt| if (sps[i]) |spt| self.bindTypeCaptures(ppt.*, spt.*);
+                        },
+                        else => {},
+                    },
+                    else => {},
                 }
             },
             else => {},
@@ -5876,13 +7645,13 @@ pub const IRCompiler = struct {
             .alias => |al| try self.writeTypeName(w, al.type_expr.*),
             .type_var => |tv| try w.writeAll(tv.name),
             .type_application => |app| {
+                // Curried, one argument per parenthesis: `HashMap(Key)(Value)`.
                 try w.writeAll(app.name.name);
-                try w.writeByte('(');
-                for (app.args, 0..) |arg, i| {
-                    if (i > 0) try w.writeAll(", ");
+                for (app.args) |arg| {
+                    try w.writeByte('(');
                     try self.writeTypeName(w, arg.*);
+                    try w.writeByte(')');
                 }
-                try w.writeByte(')');
             },
             .struct_type => |st| {
                 try w.writeAll("struct { ");
@@ -5941,13 +7710,11 @@ pub const IRCompiler = struct {
         var alloc_writer = std.Io.Writer.Allocating.init(self.allocator);
         defer alloc_writer.deinit();
         const w = &alloc_writer.writer;
+        // Curried, one argument per parenthesis: `HashMap(Key)(Value)`.
         try w.writeAll(name);
-        if (call.arguments.len > 0) {
+        for (call.arguments) |arg| {
             try w.writeByte('(');
-            for (call.arguments, 0..) |arg, i| {
-                if (i > 0) try w.writeAll(", ");
-                try self.writeArgTypeName(w, arg);
-            }
+            try self.writeArgTypeName(w, arg);
             try w.writeByte(')');
         }
         return try self.addSlice(1, alloc_writer.written());
@@ -5983,9 +7750,26 @@ pub const IRCompiler = struct {
             .array => |a| hasTypeCapture(a.element.*),
             .optional => |o| hasTypeCapture(o.child.*),
             .promise => |p| hasTypeCapture(p.child.*),
-            .type_application => |app| for (app.args) |arg| {
-                if (hasTypeCapture(arg.*)) break true;
-            } else false,
+            .type_application => |app| blk: {
+                // `|M|(…)` — a higher-kinded constructor capture.
+                if (app.ctor_is_capture) break :blk true;
+                for (app.args) |arg| if (hasTypeCapture(arg.*)) break :blk true;
+                break :blk false;
+            },
+            // A function type parameter (`fn (|A|) |B|`) carries captures too.
+            .function => |f| blk: {
+                if (f.return_type) |rt| if (hasTypeCapture(rt.*)) break :blk true;
+                if (f.stdin_type) |st| if (hasTypeCapture(st.*)) break :blk true;
+                switch (f.params) {
+                    ._non_variadic => |ps| for (ps) |p| {
+                        if (p) |pt| if (hasTypeCapture(pt.*)) break :blk true;
+                    },
+                    ._variadic => |p| if (p) |pt| {
+                        if (hasTypeCapture(pt.*)) break :blk true;
+                    },
+                }
+                break :blk false;
+            },
             else => false,
         };
     }
@@ -6213,6 +7997,150 @@ pub const IRCompiler = struct {
     /// callee location, passing the arguments in the closure, and captures the
     /// yielded value. Closure size is the argument count — valid for a
     /// capture-free (top-level) function, which is what a HOF receives.
+    /// If `expr` names a nested function that captures its enclosing scope,
+    /// materializes a *closure-carrying* function value: a heap block holding the
+    /// captured variables (at the callee's capture slots, its parameter slots left
+    /// empty) plus an `fn_ref` pointing at it via `closure_addr`. This lets the
+    /// closure be passed as a value and called indirectly elsewhere (`bind ma
+    /// aux`), where the caller has no access to the captured variables. Returns
+    /// null when `expr` is not such a closure (a plain top-level function needs no
+    /// environment and is passed as its bare `fn_ref`).
+    fn tryCompileClosureFnValue(self: *IRCompiler, source: anytype, expr: *ast.Expression) Error!?Result {
+        const name = switch (expr.*) {
+            .identifier => |id| id.name,
+            .call => |c| if (c.arguments.len == 0 and c.callee.* == .identifier)
+                c.callee.identifier.name
+            else
+                return null,
+            else => return null,
+        };
+        const binding = self.lookup(name, .{ .shallow = false }) orelse return null;
+        if (!binding.result.isFunctionRef()) return null;
+        const fn_addr = binding.result.source.value.fn_ref.fn_addr;
+        try self.ensureFnBodyCompiled(fn_addr.instr_set);
+        return try self.buildClosureFnEnv(source, fn_addr, binding.type_expr);
+    }
+
+    /// Whether the callee's parameter `i` is declared with a function type — so a
+    /// bare fn-reference argument there is a function *value*, not a call to
+    /// invoke. Reads the callee's recorded declaration.
+    fn paramExpectsFnValue(self: *IRCompiler, instr_set: usize, i: usize) bool {
+        const decl = self.comptime_fn_decls.get(instr_set) orelse return false;
+        const params = switch (decl.*.params) {
+            ._non_variadic => |p| p,
+            else => return false,
+        };
+        if (i >= params.len) return false;
+        const ann = (params[i].type_annotation) orelse return false;
+        return ann.* == .function;
+    }
+
+    /// The declared type annotation of a callee's parameter `i`, or null when the
+    /// callee has no fixed-arity declaration or `i` is past its parameters.
+    fn paramDeclType(self: *IRCompiler, instr_set: usize, i: usize) ?*const ast.TypeExpr {
+        const decl = self.comptime_fn_decls.get(instr_set) orelse return null;
+        const params = switch (decl.*.params) {
+            ._non_variadic => |p| p,
+            else => return null,
+        };
+        if (i >= params.len) return null;
+        return params[i].type_annotation;
+    }
+
+    /// Constructs a recipe-typed struct literal passed as an argument
+    /// (`f Partial{ … }`) against the concrete layout its *parameter* type
+    /// materializes — the argument-position analog of the annotation-driven
+    /// materialization a `const p: Partial(T) = Partial{ … }` binding gets
+    /// (`compileBinding`). A recipe struct (`@insert` / `for (@fields)`) declares
+    /// no fields of its own, so without this the literal builds against the empty
+    /// raw layout and yields blank fields. Returns null when the argument is not a
+    /// recipe struct literal, or its parameter type does not materialize to a
+    /// struct (the normal argument path then applies).
+    fn compileRecipeStructArg(self: *IRCompiler, arg: *ast.Expression, instr_set: usize, i: usize) Error!?Result {
+        if (arg.* != .struct_literal) return null;
+        const raw = self.user_struct_types.get(arg.struct_literal.name.name) orelse return null;
+        if (raw.body_items.len == 0) return null;
+        const ann = self.paramDeclType(instr_set, i) orelse return null;
+        if (ann.* != .type_application) return null;
+        const materialized = self.resolveTypeApplication(ann.type_application) orelse return null;
+        if (materialized != .struct_type) return null;
+        return try self.compileStructValueLiteral(arg, materialized.struct_type, arg.struct_literal);
+    }
+
+    /// Compiles an argument that names a function (`plain`, a nullary or paramful
+    /// fn reference) as a function *value* — its fn_ref, with a capture environment
+    /// when it has captures — without invoking it. For a fn-typed parameter this is
+    /// what's wanted (`apply plain`), where the plain call path would instead invoke
+    /// a nullary reference. Returns null when the argument doesn't name a function
+    /// (an inline `fn`/block expression is handled by the normal path).
+    fn compileFnValueArg(self: *IRCompiler, source: anytype, arg: *ast.Expression) Error!?Result {
+        const name = switch (arg.*) {
+            .identifier => |id| id.name,
+            .call => |c| if (c.arguments.len == 0 and c.callee.* == .identifier)
+                c.callee.identifier.name
+            else
+                return null,
+            else => return null,
+        };
+        const binding = self.lookup(name, .{ .shallow = false }) orelse return null;
+        if (!binding.result.isFunctionRef()) return null;
+        const fn_addr = binding.result.source.value.fn_ref.fn_addr;
+        try self.ensureFnBodyCompiled(fn_addr.instr_set);
+        if (try self.buildClosureFnEnv(source, fn_addr, binding.type_expr)) |closure| return closure;
+        return binding.result;
+    }
+
+    /// Materializes a closure fn value: allocates the capture environment, copies
+    /// each captured binding into it, and emits `make_closure_fn`. Returns null
+    /// when the function captures nothing (the bare fn_ref is then the value).
+    fn buildClosureFnEnv(self: *IRCompiler, source: anytype, fn_addr: ir.InstructionAddr, type_expr: ?ast.TypeExpr) Error!?Result {
+        const instr_set = fn_addr.instr_set;
+        const captures = self.instruction_sets.items[instr_set].closure_captures;
+        const slot_count = self.instruction_sets.items[instr_set].closure_slot_count;
+        const param_count = self.instruction_sets.items[instr_set].param_count;
+        // A fn value needs a heap closure environment when it captures outer
+        // bindings, OR when its body uses closure cells beyond its parameter
+        // slots — e.g. a trailing-block/anonymous body that binds a command
+        // result (the command-capture protocol allocates scratch closure cells).
+        // Without one, the indirect-call path sizes the closure base to the
+        // argument count alone (`alloc args.len`), so those scratch-cell writes
+        // overflow it and alias adjacent heap (a thread handle → a dereference
+        // crash). Routing through a `slot_count`-sized env fixes that; `params`
+        // occupy the first slots (where `merge_args` copies the arguments), the
+        // scratch cells follow, so the two never collide.
+        if (captures.len == 0 and slot_count <= param_count) return null;
+
+        try self.alloc(source, slot_count);
+        const env_ref = try self.newRef(source, "closure_fn_env");
+        try self.set(source, env_ref, .fromLocation(.initRegister(.r)));
+        for (captures) |capture| {
+            const cap_binding = self.lookup(capture.identifier.name, .{ .shallow = false }) orelse continue;
+            const identifier_result = try self.compileIdentifier(source, capture.identifier);
+            try self.set(source, .initRegister(.r), .from(env_ref.dereference()));
+            const dst = ir.Location.initAdd(.{ .register = .r }, capture.slot, .{ .dereference = true });
+            // Capture by value for a `cimport` handle (a by-reference slot address
+            // can't be resolved as a library) and for a mutable `var` (whose
+            // frame-relative closure cell would resolve against the running
+            // closure's own frame, reading empty); by reference otherwise.
+            if (identifier_result.source == .location and
+                (self.bindingTypeIsCImport(cap_binding.type_expr) or cap_binding.is_mutable))
+            {
+                try self.set(source, dst, identifier_result.source);
+            } else if (identifier_result.source == .location) {
+                try self.set(source, dst, identifier_result.source.undereference());
+            } else {
+                try self.set(source, dst, identifier_result.source);
+            }
+        }
+        const result_ref = try self.newRef(source, "closure_fn");
+        try self.addInstruction(.init(.from(source), .{ .make_closure_fn = .{
+            .fn_addr = fn_addr,
+            .closure = env_ref.dereference(),
+            .result = result_ref.dereference(),
+        } }));
+        return .fromLocation(result_ref.dereference().typed(type_expr));
+    }
+
     fn compileIndirectCall(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -6220,17 +8148,31 @@ pub const IRCompiler = struct {
         return_type: ?ast.TypeExpr,
         args: []const *ast.Expression,
     ) Error!Result {
+        // A fn value whose stdout is a *byte channel* — `Void` (no output), or
+        // `String`/`Byte`/a command `execution` (raw bytes) — forwards its stdout to
+        // the caller's, like a bare command/function statement, and is not waited on
+        // here (the scheduler sequences its output in fork order). A typed capture
+        // pipe + dequeue is only for a *typed value* return (`Bool`/`Int`/a struct):
+        // for a byte channel it would deadlock, diverting the block's own `echo`
+        // output into the capture. (`Void` may surface as the bare identifier
+        // `Void`; `String` likewise as its name.)
+        const is_byte_channel = returnTypeIsByteChannel(return_type);
+
         const fn_ref_ref = try self.newRef(source, "indirect_fn");
         try self.set(source, fn_ref_ref, .from(callee_loc));
 
-        const pipe_ref = try self.newRef(source, "indirect_pipe");
-        try self.pipe(source, pipe_ref.dereference());
-        try self.pipeOpt(source, pipe_ref.dereference(), .typed, .fromValue(.fromBoolean(true)));
+        const pipe_ref = if (is_byte_channel) null else blk: {
+            const p = try self.newRef(source, "indirect_pipe");
+            try self.pipe(source, p.dereference());
+            try self.pipeOpt(source, p.dereference(), .typed, .fromValue(.fromBoolean(true)));
+            break :blk p;
+        };
 
         const arg_refs = try self.allocator.alloc(ir.Location, args.len);
         defer self.allocator.free(arg_refs);
         for (args, arg_refs) |arg, *ar| {
-            const arg_value = try self.compileExpression(arg);
+            const closure_fn = try self.tryCompileClosureFnValue(source, arg);
+            const arg_value = closure_fn orelse try self.compileExpression(arg);
             const r = try self.newRef(source, "indirect_arg");
             try self.set(source, r, stableResultSource(arg_value));
             ar.* = r.dereference();
@@ -6244,21 +8186,65 @@ pub const IRCompiler = struct {
             try self.set(source, .initAdd(.{ .register = .r }, i, .{ .dereference = true }), .from(ar));
         }
 
-        try self.addInstruction(.init(.from(source), .{ .fork = .{
-            .dest = ir.InstructionAddr.initAbs(0, 0),
-            .dest_from = fn_ref_ref.dereference(),
-            .stdin = self.threadStdin(),
-            .stdout = pipe_ref.dereference(),
-            .stderr = self.threadStderr(),
-            .closure = closure_ref.dereference(),
-            .subshell = .inherit,
-        } }));
+        try self.addInstruction(.init(.from(source), .{
+            .fork = .{
+                .dest = ir.InstructionAddr.initAbs(0, 0),
+                .dest_from = fn_ref_ref.dereference(),
+                .stdin = self.threadStdin(),
+                .stdout = if (pipe_ref) |p| p.dereference() else self.threadStdout(),
+                .stderr = self.threadStderr(),
+                .closure = closure_ref.dereference(),
+                .subshell = .inherit,
+                // If the fn value carries a captured environment, merge these
+                // argument slots into it (see the fork evaluator).
+                .merge_args = args.len,
+            },
+        }));
         const thread_ref = try self.newRef(source, "indirect_thread");
         try self.set(source, thread_ref, .fromLocation(.initRegister(.r)));
-        try self.wait(source, thread_ref.dereference().typed(thread_type));
 
-        try self.addInstruction(.init(.from(source), .{ .pipe_dequeue = pipe_ref.dereference() }));
-        return .fromLocation(ir.Location.initRegister(.r).typed(return_type orelse .global(.void)));
+        if (pipe_ref) |p| {
+            try self.wait(source, thread_ref.dereference().typed(thread_type));
+            try self.addInstruction(.init(.from(source), .{ .pipe_dequeue = p.dereference() }));
+            return .fromLocation(ir.Location.initRegister(.r).typed(return_type orelse .global(.void)));
+        }
+        // Void: hand back the running thread handle (like a bare statement call);
+        // the caller's statement finalizer streams/awaits it in order.
+        return .fromLocation(thread_ref.dereference().typed(thread_type));
+    }
+
+    /// Whether a function's declared return type denotes `Void` — either the
+    /// `.void` type or the bare identifier `Void` (how a `fn(…) Void` annotation
+    /// surfaces). A null return type (none declared) is also treated as void.
+    fn returnTypeIsVoid(rt: ?ast.TypeExpr) bool {
+        const t = rt orelse return true;
+        return switch (t) {
+            .void => true,
+            .identifier => |named| named.path.segments.len == 1 and
+                std.mem.eql(u8, named.path.segments[named.path.segments.len - 1].name, "Void"),
+            else => false,
+        };
+    }
+
+    /// Whether a fn value's declared stdout is a *byte channel* — `Void` (no
+    /// output), `String`/`Byte` (raw bytes), a `[]Byte` array, or a command
+    /// `execution` / its error union. Such a return is forwarded as bytes by
+    /// `compileIndirectCall` (no typed-value capture pipe), so a block that writes
+    /// to stdout doesn't deadlock. A *typed value* return (`Bool`/`Int`/a struct)
+    /// returns false and takes the enqueue/dequeue path.
+    fn returnTypeIsByteChannel(rt: ?ast.TypeExpr) bool {
+        const t = rt orelse return true;
+        return switch (t) {
+            .void, .byte, .execution => true,
+            .array => |a| a.element.* == .byte,
+            .err => true,
+            .error_union => |eu| returnTypeIsByteChannel(eu.payload.*),
+            .identifier => |named| named.path.segments.len == 1 and blk: {
+                const n = named.path.segments[named.path.segments.len - 1].name;
+                break :blk std.mem.eql(u8, n, "Void") or std.mem.eql(u8, n, "String") or std.mem.eql(u8, n, "Byte");
+            },
+            else => false,
+        };
     }
 
     fn compileFunctionCall(
@@ -6276,12 +8262,29 @@ pub const IRCompiler = struct {
         const fn_ref = fn_ref_value.fn_ref;
         var fn_addr = fn_ref.fn_addr;
 
-        // A self-recursive call inside a specialization body: its callee resolves
-        // to the generic set, so redirect it to the specialization being compiled
-        // (it then recurses at the same concrete type).
+        // Reconcile a recursive call inside a specialization body with the active
+        // specializations. The callee resolves either to the generic set (an
+        // `again`/forward reference) or directly to the in-progress specialization
+        // (its own in-scope self binding). Either way the call must land on the set
+        // whose bound type matches the call's argument types:
+        //   * same-type recursion  → the active specialization (fast self-recurse);
+        //   * polymorphic recursion (a call to the same generic at a *different*
+        //     type, e.g. `f 0` at `Int` inside `f`'s `Box` body) → the generic set,
+        //     so `maybeSpecialize` below builds a fresh spec for that type. Left on
+        //     the current spec it would self-recurse forever at the wrong type.
+        // The in-progress spec isn't in the `specializations` cache yet, so this is
+        // the only place that can route a same-type recursion to it.
         for (self.active_specializations.items) |as| {
-            if (fn_addr.instr_set == as.generic) {
+            const resolves_to_generic = fn_addr.instr_set == as.generic;
+            const resolves_to_spec = fn_addr.instr_set == as.spec;
+            if (!resolves_to_generic and !resolves_to_spec) continue;
+            const call_key = (try self.specializationCallKey(as.generic, arguments)) orelse continue;
+            const same_type = std.mem.eql(u8, call_key, as.key);
+            if (resolves_to_generic and same_type) {
                 fn_addr = ir.InstructionAddr.initAbs(as.spec, 0);
+                break;
+            } else if (resolves_to_spec and !same_type) {
+                fn_addr = ir.InstructionAddr.initAbs(as.generic, 0);
                 break;
             }
         }
@@ -6291,7 +8294,12 @@ pub const IRCompiler = struct {
         // Monomorphization: for a non-recursive direct call, redirect to a
         // per-type specialization when the callee's `|T|` captures resolve to
         // concrete argument types (so `${T}` folds to the concrete type name).
-        if (!is_self_recursive and stdout_override == null) {
+        // Specialization is orthogonal to where the callee's output goes: a typed
+        // value capture (`stdout_override` set) still benefits from monomorphizing
+        // the callee, so a `|T|`/`|M|` capture used as a comptime value in the body
+        // (`@hasMethod(M)(…)`, `${T}`) folds. Only recursion is excluded (the call
+        // already targets the active specialization).
+        if (!is_self_recursive) {
             if (try self.maybeSpecialize(fn_addr.instr_set, arguments)) |spec_instr_set| {
                 fn_addr = ir.InstructionAddr.initAbs(spec_instr_set, 0);
             }
@@ -6341,6 +8349,39 @@ pub const IRCompiler = struct {
         const captured_args = try self.allocator.alloc(?Result, arguments.len);
         defer self.allocator.free(captured_args);
         for (arguments, 0..) |arg, i| {
+            // A recipe-typed struct literal argument (`f Partial{ … }`) is
+            // materialized against its parameter type, so it builds the concrete
+            // layout rather than the empty raw recipe (the argument-position analog
+            // of the annotation-driven materialization a binding gets). The
+            // parameter annotations live on the callee's *declared* set (its
+            // recipe params are concrete, independent of any specialization), so
+            // resolve against `fn_ref`'s set, not the post-specialization address.
+            if (try self.compileRecipeStructArg(arg, fn_ref.fn_addr.instr_set, i)) |rec| {
+                const arg_ref = try self.newRef(source, "call_arg");
+                try self.set(source, arg_ref, stableResultSource(rec));
+                captured_args[i] = .fromLocation(arg_ref.dereference().typed(rec.typeExpr()));
+                continue;
+            }
+            // A static type-declaration access argument (`f .nothing`,
+            // `f Maybe(Int).empty`) resolved against the parameter type, built here
+            // in the caller's frame so a struct-literal value stabilizes.
+            if (try self.tryCompileTypeDeclAccess(arg, self.paramDeclType(fn_ref.fn_addr.instr_set, i))) |decl_val| {
+                const arg_ref = try self.newRef(source, "call_arg");
+                try self.set(source, arg_ref, stableResultSource(decl_val));
+                captured_args[i] = .fromLocation(arg_ref.dereference().typed(decl_val.typeExpr()));
+                continue;
+            }
+            // A fn-typed parameter takes a function *value*: pass a bare
+            // fn-reference argument (`apply plain`) as its fn_ref instead of
+            // invoking it (a nullary reference would otherwise be called).
+            if (self.paramExpectsFnValue(fn_addr.instr_set, i)) {
+                if (try self.compileFnValueArg(source, arg)) |v| {
+                    const arg_ref = try self.newRef(source, "call_arg");
+                    try self.set(source, arg_ref, stableResultSource(v));
+                    captured_args[i] = .fromLocation(arg_ref.dereference().typed(v.typeExpr()));
+                    continue;
+                }
+            }
             if (self.argNeedsValueCapture(arg)) {
                 const captured = try self.compileExpressionWithCapture(source, arg);
                 const arg_ref = try self.newRef(source, "call_arg");
@@ -6367,7 +8408,8 @@ pub const IRCompiler = struct {
             // *borrowed* stack slot, not a temp we own — popping it corrupts the
             // stack. Only pop when the arg compilation actually grew the frame.
             const stack_before_arg = self.currentFrame().rel_stack_counter;
-            const arg_result = try self.compileResultSaveR(source, try self.compileExpression(arg));
+            const closure_fn = try self.tryCompileClosureFnValue(source, arg);
+            const arg_result = try self.compileResultSaveR(source, closure_fn orelse try self.compileExpression(arg));
             try self.set(source, .initRegister(.r), .from(closure_ref.dereference()));
             try self.set(
                 source,
@@ -7080,6 +9122,36 @@ pub const IRCompiler = struct {
             return .fromValue(.void);
         }
 
+        // A comptime type subject (`match (T) { Int => …, Box(|E|) => … }`):
+        // resolve `T` to its serialized name and prune to the arm whose type
+        // pattern matches, binding that pattern's captures for the arm body.
+        if (try self.comptimeTypeName(match_expr.subject)) |subject_name| {
+            defer self.allocator.free(subject_name);
+            for (match_expr.cases) |case| {
+                switch (case.pattern) {
+                    .wildcard => return self.compileBlock(source, case.body),
+                    .type_pattern => |type_expr| {
+                        if (try self.matchTypeStringPattern(type_expr.*, subject_name)) {
+                            return self.compileBlock(source, case.body);
+                        }
+                    },
+                    // A bare type name (`Int`, `Box`) matches the subject string.
+                    .binding => |binding| if (std.mem.eql(u8, binding.name, subject_name)) {
+                        return self.compileBlock(source, case.body);
+                    },
+                    else => {},
+                }
+            }
+            try self.reportSourceError(
+                source,
+                Error.UnsupportedExpression,
+                .@"error",
+                "no match arm handles type '{s}' (add it or a `_` case)",
+                .{subject_name},
+            );
+            return .fromValue(.void);
+        }
+
         if (try self.evalComptimeExpression(match_expr.subject)) |subject| {
             for (match_expr.cases) |case| {
                 if (case.capture != null) break;
@@ -7179,6 +9251,12 @@ pub const IRCompiler = struct {
                         try self.jmp(source, predicate, false, next_case_addr);
                     }
                 },
+                // A type pattern only resolves against a comptime type subject,
+                // which the comptime path above prunes fully. Reaching here means
+                // the subject wasn't comptime-known (the unspecialized template
+                // body, never executed once every call monomorphizes): make the
+                // arm never-taken, mirroring how a comptime type `if` degrades.
+                .type_pattern => try self.jmp(source, null, false, next_case_addr),
                 else => unreachable,
             }
 
@@ -8546,6 +10624,9 @@ pub const IRCompiler = struct {
             .member => |m| self.syncBodyLowerable(m.object),
             .index => |i| self.syncBodyLowerable(i.target) and self.syncBodyLowerable(i.index),
             .call => |c| blk: {
+                // A call to a generic function forks (to monomorphize); the sync
+                // path can't sync-call it and would return its unwaited handle.
+                if (c.callee.* == .identifier and self.generic_fn_names.contains(c.callee.identifier.name)) break :blk false;
                 if (!self.syncBodyLowerable(c.callee)) break :blk false;
                 for (c.arguments) |a| if (!self.syncBodyLowerable(a)) break :blk false;
                 break :blk true;
@@ -8616,6 +10697,10 @@ pub const IRCompiler = struct {
                 for (ps) |p| {
                     if (p.pattern.* != .identifier) break :blk false;
                     if (p.is_mutable) break :blk false;
+                    // A `comptime` parameter (type or value) is monomorphized per
+                    // call through the fork path (`maybeSpecialize`); the sync call
+                    // bypasses that, so such a function must stay on the fork path.
+                    if (p.is_comptime) break :blk false;
                     if (p.type_annotation) |ta| if (hasTypeCapture(ta.*)) break :blk false;
                 }
                 break :blk true;
@@ -8714,9 +10799,16 @@ pub const IRCompiler = struct {
     fn fnDeclIsGeneric(fn_decl: ast.FunctionDecl) bool {
         switch (fn_decl.params) {
             ._non_variadic => |ps| for (ps) |p| {
+                // A `comptime T: type` param monomorphizes the body per type
+                // argument (so `T == …` folds and captures bind at compile time),
+                // just like a `|T|` capture.
+                if (comptimeTypeParamName(p) != null) return true;
                 if (p.type_annotation) |ta| if (hasTypeCapture(ta.*)) return true;
             },
-            ._variadic => |p| if (p.type_annotation) |ta| if (hasTypeCapture(ta.*)) return true,
+            ._variadic => |p| {
+                if (comptimeTypeParamName(p) != null) return true;
+                if (p.type_annotation) |ta| if (hasTypeCapture(ta.*)) return true;
+            },
         }
         if (fn_decl.return_type) |rt| if (hasTypeCapture(rt.*)) return true;
         if (fn_decl.stdin_type) |st| if (hasTypeCapture(st.*)) return true;
@@ -8731,9 +10823,17 @@ pub const IRCompiler = struct {
             if (expr.* != .fn_decl) continue;
             const name = expr.fn_decl.name orelse continue;
             if (self.lookup(name.name, .{ .shallow = true }) != null) continue;
+            // A comptime type function (`fn Box(comptime T: type) type`) is erased
+            // and resolves as a *type*, not a runtime value — leave it unbound so a
+            // `${Box}` / `${Box(Int)}` serializes to its type name.
+            if (self.comptime_type_names.contains(name.name)) continue;
             // A generic function (`|T|` captures) is monomorphized per call site,
-            // not called through one shared binding — leave it on that path.
-            if (fnDeclIsGeneric(expr.fn_decl)) continue;
+            // not called through one shared binding — leave it on that path, and
+            // record its name so a *call* to it is kept off the sync path too.
+            if (fnDeclIsGeneric(expr.fn_decl)) {
+                try self.generic_fn_names.put(self.allocator, name.name, {});
+                continue;
+            }
 
             const instr_set = try self.addInstructionSet();
             // A forward call site is compiled before the body, so the callee's
@@ -8828,7 +10928,7 @@ pub const IRCompiler = struct {
         // callee resolves to the generic set) recurses into this specialization.
         var pushed_active_specialization = false;
         if (self.specializing_generic) |generic| {
-            try self.active_specializations.append(self.allocator, .{ .generic = generic, .spec = instr_set });
+            try self.active_specializations.append(self.allocator, .{ .generic = generic, .spec = instr_set, .key = self.specializing_key orelse "" });
             self.specializing_generic = null;
             pushed_active_specialization = true;
         }
@@ -8878,6 +10978,10 @@ pub const IRCompiler = struct {
         // A stack handles nested function declarations.
         try self.stdin_type_stack.append(self.allocator, if (fn_decl.stdin_type) |st| st.* else null);
         defer _ = self.stdin_type_stack.pop();
+        // Track the declared return type so a `yield .name` in the body can
+        // resolve the implicit member against it.
+        try self.fn_return_type_stack.append(self.allocator, fn_decl.return_type);
+        defer _ = self.fn_return_type_stack.pop();
 
         self.instruction_sets.items[instr_set].param_count = fn_decl.params._non_variadic.len;
         for (fn_decl.params._non_variadic) |param| {
@@ -8885,12 +10989,25 @@ pub const IRCompiler = struct {
             switch (param.pattern.*) {
                 .discard => {},
                 .identifier => |identifier| {
-                    _ = try self.declareClosureValue(
+                    // Still allocate the runtime slot (keeps arg/slot indices in
+                    // step), but a comptime value param resolves to its constant,
+                    // so `n == 3` folds and `${n}` is the value.
+                    const loc = try self.declareClosureValue(
                         .mutable(identifier, .normal),
                         0,
                         false,
                         if (param.type_annotation) |type_annotation| self.normalizeStringTypes(type_annotation.*) else null,
                     );
+                    _ = loc;
+                    if (comptimeValueParamName(param) != null) {
+                        if (self.pending_comptime_values.get(identifier.name)) |constant| {
+                            const frame = try self.scopes.getFrame(0);
+                            if (frame.bindings.getPtr(identifier.name)) |b| {
+                                b.result = constant;
+                                b.is_mutable = false;
+                            }
+                        }
+                    }
                 },
                 .tuple, .record => {
                     try self.reportSourceError(
@@ -8918,6 +11035,16 @@ pub const IRCompiler = struct {
         // Compile the function body directly in the closure scope (no extra lexical push/pop)
         // so that top-level `pub` bindings land in the closure frame and are visible to the
         // pub-export epilogue below.  For non-block bodies fall back to compileExpression.
+        // The unspecialized template body of a generic function compiles every
+        // comptime branch (nothing is bound to prune them), so `@compileError`
+        // must not fire here — only in a concrete specialization or in
+        // non-generic code.
+        const is_generic_template = !self.specializing and fnDeclIsGeneric(fn_decl);
+        if (is_generic_template) self.generic_template_depth += 1;
+        defer if (is_generic_template) {
+            self.generic_template_depth -= 1;
+        };
+
         const result = if (fn_decl.body.* == .block) blk: {
             const block = fn_decl.body.block;
             // Identify this body's linear-buffer vars (grown in place). Saved and
@@ -9020,8 +11147,16 @@ pub const IRCompiler = struct {
         // forward on demand (`ensureFnBodyCompiled`) the enclosing scope is the
         // *caller's* frame, so a re-declare would leak the name into it.
         const already_hoist_declared = self.hoisted_set_sources.contains(instr_set);
+        // The specialized function itself is called directly by instruction set,
+        // so it must not re-declare its name in the enclosing scope. But a *nested*
+        // function declared inside a specialized body (`fn aux …` whose sibling
+        // `bind ma aux` references it) is not the specialization target — it still
+        // needs its name in scope. `pushed_active_specialization` is true only for
+        // the outermost specialized function (it consumed `specializing_generic`);
+        // nested decls leave it false, so they declare normally.
+        const is_specialization_target = self.specializing and pushed_active_specialization;
         if (fn_decl.name) |name| {
-            if (!self.specializing and !already_hoist_declared) {
+            if (!is_specialization_target and !already_hoist_declared) {
                 const fn_type = ast.TypeExpr{ .function = .{
                     .params = .nonVariadic(&.{}),
                     .stdin_type = fn_decl.stdin_type,
@@ -9061,6 +11196,19 @@ pub const IRCompiler = struct {
             }
         }
 
+        // An inline fn *expression* — a trailing block, an anonymous `fn`, or a
+        // named `fn … { … }` used in argument position — must have its closure
+        // environment materialized here so the fn value it yields carries its
+        // captures (an outer `var` is snapshotted by value). Whichever call path
+        // compiles the argument then sees a populated closure. A *hoisted*
+        // top-level declaration and a *specialization target* are not inline
+        // values (they are referenced by name / called by set), so they keep the
+        // bare fn_ref and build their env at each reference (`tryCompileClosureFnValue`).
+        if (!already_hoist_declared and !is_specialization_target) {
+            if (try self.buildClosureFnEnv(source, fn_ref.fn_ref.fn_addr, null)) |closure| {
+                return closure;
+            }
+        }
         return .from(fn_ref);
     }
 
@@ -9644,6 +11792,21 @@ pub const IRCompiler = struct {
                     return .from(result_ref.dereference().typed(optional_string_type));
                 }
 
+                // `@field(p)(name) = v` — assignment through a comptime-named field.
+                // Same discipline as `p.x = v` below: value into a stable ref first,
+                // then the lvalue slot (`@field` lowers to the member slot), then
+                // write immediately. A folding/lookup failure reports and yields a
+                // non-location result, so bail without writing.
+                if (binary.left.* == .call and self.isFieldBuiltinCall(binary.left.call)) {
+                    const value = try self.compileExpression(binary.right);
+                    const value_ref = try self.newRef(source, "field_assign_value");
+                    try self.set(source, value_ref, stableResultSource(value));
+                    const slot = try self.compileFieldBuiltin(binary.left, binary.left.call, .lvalue);
+                    if (slot.source != .location) return .from(value_ref.dereference().typed(value.typeExpr()));
+                    try self.set(source, slot.source.location, .from(value_ref.dereference()));
+                    return .from(value_ref.dereference().typed(value.typeExpr()));
+                }
+
                 // Struct field assignment `p.x = v`: compile the value into a
                 // stable ref first (so evaluating it can't clobber the base
                 // register), then compile the target as an lvalue (raw slot) and
@@ -9653,6 +11816,12 @@ pub const IRCompiler = struct {
                     const value_ref = try self.newRef(source, "field_assign_value");
                     try self.set(source, value_ref, stableResultSource(value));
                     const slot = try self.compileMemberBinary(source, binary.left.binary, .lvalue);
+                    // The lvalue may not resolve to a slot — e.g. in a generic
+                    // template body where the object's type is still an unbound type
+                    // variable (`out.x` where `out: T`). That body never runs (each
+                    // real call monomorphizes), so skip the write rather than deref a
+                    // non-location result.
+                    if (slot.source != .location) return .from(value_ref.dereference().typed(value.typeExpr()));
                     try self.set(source, slot.source.location, .from(value_ref.dereference()));
                     return .from(value_ref.dereference().typed(value.typeExpr()));
                 }
@@ -9716,9 +11885,18 @@ pub const IRCompiler = struct {
                     // `x = x <arith> n` in place. `.shift_or_append` here is
                     // `x = x >> n` (shift-right): the left is a mutable binding,
                     // never a command.
-                    if (right_binary.op.isArithmetic() or right_binary.op.category() == .shift_or_append) {
+                    // `x = x + y` on an *array* is concatenation, not scalar
+                    // arithmetic — it must fall through to `array_concat` (below),
+                    // not an in-place `ath`. (An `ath` on arrays only ever
+                    // "worked" by reading the length headers as integers, which was
+                    // wrong; guard it out explicitly.)
+                    const left_is_seq = if (left.typeExpr()) |t| (t == .array or isEmptyStructType(t)) else false;
+                    if (!left_is_seq and (right_binary.op.isArithmetic() or right_binary.op.category() == .shift_or_append)) {
                         if (expressionsStructurallyEqual(binary.left, right_binary.left)) {
-                            const right_operand = (try self.compileExpression(right_binary.right)).dereference();
+                            // Value-capture the operand: a call/pipeline operand
+                            // (`h = h + (f x)`) must yield its value, not a forked
+                            // thread handle (which `ath` cannot dereference).
+                            const right_operand = try self.compileArithmeticOperand(source, right_binary.right);
                             try self.ath(
                                 source,
                                 right_binary.op,
@@ -9897,7 +12075,11 @@ pub const IRCompiler = struct {
         array: ast.ArrayLiteral,
     ) Error!Result {
         try self.alloc(source, array.elements.len + 1);
-        try self.set(source, .initAbs(.{ .register = .r }, .{ .dereference = true }), .fromValue(.{ .integer = @as(i64, @intCast(array.elements.len)) }));
+        // Slot 0 is the sequence length, tagged `.seq_len` (not a plain integer) so
+        // the string materializer can tell this array apart from a struct whose
+        // first field happens to be an integer. It reads back as an ordinary `Int`
+        // (normalized on any location read — see `resolveLocation`).
+        try self.set(source, .initAbs(.{ .register = .r }, .{ .dereference = true }), .fromValue(.{ .seq_len = @as(i64, @intCast(array.elements.len)) }));
         const array_ref = try self.newRef(source, "array");
         try self.set(source, array_ref, .fromLocation(.initRegister(.r)));
         // Record each element's static type by position. A `.{ … }` literal is a
@@ -9957,6 +12139,19 @@ pub const IRCompiler = struct {
             }
         }
         return true;
+    }
+
+    /// Structural type equality by rendered form. Preferred over `std.meta.eql`
+    /// for comparing two `ast.TypeExpr`s: `std.meta.eql` recursively dereferences
+    /// every pointer/slice a type carries, so an aliased or transient sub-type
+    /// pointer anywhere makes it read stale memory; rendering walks each type
+    /// through its own `format`, ignoring spans and pointer identity.
+    fn typeRendersEqual(self: *IRCompiler, a: ast.TypeExpr, b: ast.TypeExpr) Error!bool {
+        const ra = try std.fmt.allocPrint(self.allocator, "{f}", .{a});
+        defer self.allocator.free(ra);
+        const rb = try std.fmt.allocPrint(self.allocator, "{f}", .{b});
+        defer self.allocator.free(rb);
+        return std.mem.eql(u8, ra, rb);
     }
 
     const ForSource = struct {
@@ -10670,6 +12865,73 @@ pub const IRCompiler = struct {
         return .fromValue(.void);
     }
 
+    /// The type argument of a `@fields(T)` call expression, or null when `expr`
+    /// is not such a call.
+    fn comptimeFieldsArg(expr: *const ast.Expression) ?*ast.Expression {
+        if (expr.* != .call) return null;
+        const call = expr.call;
+        if (call.callee.* != .identifier) return null;
+        if (comptimeBuiltinKind(call.callee.identifier.name) != .fields) return null;
+        if (call.arguments.len == 0) return null;
+        return call.arguments[0];
+    }
+
+    /// Compiles `for (@fields(T)) |f| { … }` by unrolling the body once per field
+    /// of the struct `T` resolves to, binding `f` to that field for the body
+    /// (so `f.name`/`f.type` fold). An unresolved `T` (the unspecialized template
+    /// body, never executed) unrolls zero times; a concrete non-struct is an
+    /// error.
+    fn compileComptimeFieldsForLoop(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        for_expr: ast.ForExpr,
+    ) Error!Result {
+        const arg = comptimeFieldsArg(for_expr.sources[0]).?;
+        const resolved = try self.resolveComptimeType(arg);
+        const st = blk: {
+            const t = resolved orelse break :blk null;
+            if (comptimeStructOf(t)) |st| break :blk st;
+            if (isConcreteComptimeType(t)) {
+                try self.reportSourceError(
+                    source,
+                    Error.UnsupportedExpression,
+                    .@"error",
+                    "@fields expects a struct type, got a '{s}'",
+                    .{comptimeKindName(t)},
+                );
+                return .fromValue(.void);
+            }
+            break :blk null;
+        };
+        // Unresolved (template) — the loop compiles to nothing; each real
+        // specialization re-runs this with `T` bound and unrolls.
+        const fields = if (st) |s| s.fields else return .fromValue(.void);
+
+        const var_name: ?[]const u8 = switch (for_expr.capture.bindings[0].*) {
+            .identifier => |id| id.name,
+            else => null,
+        };
+
+        for (fields) |field| {
+            try self.scopes.push(self.allocator, .lexical);
+            const had_prev = var_name != null and self.comptime_field_vars.contains(var_name.?);
+            const prev = if (had_prev) self.comptime_field_vars.get(var_name.?) else null;
+            if (var_name) |vn| try self.comptime_field_vars.put(self.allocator, vn, field);
+
+            const stack_before = self.currentFrame().rel_stack_counter;
+            const body_result = try self.compileExpressionAsStatement(source, for_expr.body);
+            if (isWaitable(body_result)) |loc| try self.wait(source, loc);
+            const extra = self.currentFrame().rel_stack_counter - stack_before;
+            for (0..extra) |_| _ = try self.pop(source);
+
+            if (var_name) |vn| {
+                if (prev) |p| self.comptime_field_vars.put(self.allocator, vn, p) catch {} else _ = self.comptime_field_vars.remove(vn);
+            }
+            self.scopes.pop();
+        }
+        return .fromValue(.void);
+    }
+
     fn compileForLoop(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -10682,6 +12944,13 @@ pub const IRCompiler = struct {
         // half of multi-value typed pipes (`producer | for (&0) |v| { ... }`).
         if (for_expr.sources.len == 1 and for_expr.sources[0].* == .fd) {
             return self.compileFdForLoop(source, for_expr);
+        }
+
+        // `for (@fields(T)) |f| { … }` — a comptime iteration over a struct
+        // type's fields, unrolled at compile time (one body copy per field, with
+        // `f.name`/`f.type` folded to that field's name and type).
+        if (for_expr.sources.len == 1 and comptimeFieldsArg(for_expr.sources[0]) != null) {
+            return self.compileComptimeFieldsForLoop(source, for_expr);
         }
 
         const for_sources = try self.allocator.alloc(ForSource, for_expr.sources.len);

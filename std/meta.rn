@@ -1,0 +1,76 @@
+// std.meta — generic, comptime-derived operations over any value, built on the
+// comptime field-introspection surface (`@kind`, `@fields`, `@field`). These are
+// the "derived" helpers a hand-written generic can't express without looking
+// *inside* a value's fields: a structural dump and a structural equality that
+// work for any struct, scalar, or string without per-type boilerplate.
+//
+// Each function is monomorphized per argument type: the `@kind(T)` test folds at
+// compile time (the untaken branch is never emitted), and `for (@fields(T))`
+// unrolls one copy per field with `f.name` bound, so `@field(v)(f.name)` is an
+// ordinary field read in the generated code.
+fn Void @() Void
+
+// A readable dump of any value. A struct renders as `{ name=value … }` over its
+// fields (in declaration order); a scalar/string renders as itself. A struct-typed
+// field **recurses**, so a nested struct shows its own bracketed form:
+//   { a=1 inner={ x=2 y=3 } }
+// Each field value is dumped by a recursive `show` at the field's own type — a
+// polymorphic recursion that specializes per level (a struct field recurses, a
+// scalar field terminates at `${v}`).
+pub fn Void show(v: |T|) String {
+  if (@kind(T) == "struct") {
+    var out = "{ "
+    for (@fields(T)) |f| {
+      const fv = @field(v)(f.name)
+      out = "${out}${f.name}=${show fv} "
+    }
+    yield "${out}}"
+  } else {
+    yield "${v}"
+  }
+}
+
+// Structural equality: a struct compares field-by-field, two scalars/strings
+// compare with `==`. A struct-typed field **recurses** into `eq` at the field's
+// own type (a polymorphic recursion that specializes per level), so nested
+// structs compare deeply — exact for structs built from scalars, strings, and
+// further structs.
+pub fn Void eq(a: |T|, b: T) Bool {
+  if (@kind(T) == "struct") {
+    var ok = true
+    for (@fields(T)) |f| {
+      const av = @field(a)(f.name)
+      const bv = @field(b)(f.name)
+      if (eq av bv) {
+        // fields match so far
+      } else {
+        ok = false
+      }
+    }
+    yield ok
+  } else {
+    yield a == b
+  }
+}
+
+// A structural hash of any value, as an Int. A struct combines its fields'
+// hashes in declaration order; a scalar/string hashes the bytes of its textual
+// form. Struct-typed fields **recurse**, so this is a deep hash: two values that
+// are `eq` hash equal, which makes it a usable key hash for a struct map key.
+// Arithmetic is kept within `1_000_000_007` so intermediate products stay bounded
+// (Runic has no bitwise ops); the result is non-negative.
+pub fn Void hash(v: |T|) Int {
+  if (@kind(T) == "struct") {
+    var h = 17
+    for (@fields(T)) |f| {
+      const fv = @field(v)(f.name)
+      h = (h * 31 + hash fv) % 1000000007
+    }
+    yield h
+  } else {
+    const s = "${v}"
+    var sh = 7
+    for (s.bytes) |b| { sh = (sh * 31 + b) % 1000000007 }
+    yield sh
+  }
+}

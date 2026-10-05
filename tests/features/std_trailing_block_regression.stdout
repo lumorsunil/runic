@@ -1,0 +1,3 @@
+retry win=0
+retry lose=1
+done

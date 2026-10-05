@@ -1,0 +1,4 @@
+origin: 0,0
+pair: 1,hi
+map some: 42
+map none: -1

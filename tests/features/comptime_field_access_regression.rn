@@ -1,0 +1,24 @@
+# `@field(value)(name)` reads the field named by a comptime string `name` off a
+# struct `value` — the analog of Zig's `@field(x, name)`. Its purpose is to let a
+# comptime-unrolled `for (@fields(T)) |f|` loop touch each field's *value* (not just
+# its `f.name`/`f.type` metadata), so implementations can be generated at comptime.
+
+# Generate a `key=value` dump for any struct T by unrolling over its fields.
+fn String show(comptime T: type, x: T) String {
+  var out = ""
+  for (@fields(T)) |f| out = "${out}${f.name}=${@field(x)(f.name)} "
+  yield out
+}
+
+fn User(comptime N: type) type { yield struct { name: N, age: Int, active: Bool } }
+const u: User(String) = User{ .name = "ada", .age = 36, .active = true }
+echo "${show User(String) u}"
+
+# A literal (non-loop) field name also works.
+echo "age: ${@field(u)("age")}"
+
+# Works for a differently-shaped struct with the same generic function (one
+# specialization per type), confirming the loop unrolls per instantiation.
+fn Pair(comptime E: type) type { yield struct { a: E, b: E } }
+const p: Pair(Int) = Pair{ .a = 1, .b = 2 }
+echo "${show Pair(Int) p}"

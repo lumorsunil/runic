@@ -643,22 +643,22 @@ pub fn parseCommandLine(allocator: Allocator, args: std.process.Args) !ParseResu
     var verbose = false;
     var strict = false;
     var parsing_options = true;
-    var idx: usize = 1;
 
-    while (idx < args.vector.len) {
-        const arg = std.mem.span(args.vector[idx]);
-        idx += 1;
+    var args_it = try args.iterateAllocator(allocator);
+    defer args_it.deinit();
+    _ = args_it.next();
 
+    while (args_it.next()) |arg| {
         if (parsing_options and std.mem.eql(u8, arg, "--")) {
             parsing_options = false;
             continue;
         }
 
         if (parsing_options and arg.len > 0 and arg[0] == '-') {
-            if (argEqual(arg, "--help") or argEqual(arg, "-h")) {
+            if (argEqual(arg, .{ "--help", "-h" })) {
                 return ParseResult.show_help;
             }
-            if (argEqual(arg, "--version") or argEqual(arg, "-V")) {
+            if (argEqual(arg, .{ "--version", "-v" })) {
                 return ParseResult.show_version;
             }
             if (argEqual(arg, "--print-ast")) {
@@ -677,13 +677,11 @@ pub fn parseCommandLine(allocator: Allocator, args: std.process.Args) !ParseResu
                 skip_type_check = true;
                 continue;
             }
-            if (argEqual(arg, "--eval") or argEqual(arg, "-c")) {
-                if (idx >= args.vector.len) return usageError(allocator, "{s} requires source text", .{arg});
+            if (argEqual(arg, .{ "--eval", "-c" })) {
                 if (script_path != null) return usageError(allocator, "Cannot combine {s} with a script path.", .{arg});
+                const arg_script_source = args_it.next() orelse return usageError(allocator, "{s} requires source text", .{arg});
                 script_path = try allocator.dupe(u8, ":inline");
-                const arg_script_source = std.mem.span(args.vector[idx]);
                 script_source = try allocator.dupe(u8, arg_script_source);
-                idx += 1;
                 parsing_options = false;
                 continue;
             }
@@ -699,7 +697,7 @@ pub fn parseCommandLine(allocator: Allocator, args: std.process.Args) !ParseResu
                 verbose = true;
                 continue;
             }
-            if (argEqual(arg, "--strict") or argEqual(arg, "-e")) {
+            if (argEqual(arg, .{ "--strict", "-e" })) {
                 strict = true;
                 continue;
             }
@@ -710,9 +708,7 @@ pub fn parseCommandLine(allocator: Allocator, args: std.process.Args) !ParseResu
                 continue;
             }
             if (argEqual(arg, "--trace")) {
-                if (idx >= args.vector.len) return usageError(allocator, "--trace requires a topic name", .{});
-                const value = std.mem.span(args.vector[idx]);
-                idx += 1;
+                const value = args_it.next() orelse return usageError(allocator, "--trace requires a topic name", .{});
                 if (value.len == 0) return usageError(allocator, "--trace requires a topic name", .{});
                 try trace_topics.append(try allocator.dupe(u8, value));
                 continue;
@@ -727,9 +723,7 @@ pub fn parseCommandLine(allocator: Allocator, args: std.process.Args) !ParseResu
                 continue;
             }
             if (argEqual(arg, "--env")) {
-                if (idx >= args.vector.len) return usageError(allocator, "--env requires KEY=VALUE", .{});
-                const raw = std.mem.span(args.vector[idx]);
-                idx += 1;
+                const raw = args_it.next() orelse return usageError(allocator, "--env requires KEY=VALUE", .{});
                 const override = parseEnvOverride(allocator, raw) catch {
                     return usageError(allocator, "Environment overrides must look like KEY=VALUE (got '{s}')", .{raw});
                 };
@@ -819,8 +813,18 @@ pub fn printUsage(writer: *std.Io.Writer) !void {
     try writer.flush();
 }
 
-fn argEqual(a: []const u8, b: []const u8) bool {
-    return std.mem.eql(u8, a, b);
+fn argEqual(a: []const u8, bs: anytype) bool {
+    return switch (@typeInfo(@TypeOf(bs))) {
+        .pointer => |p| switch (p.size) {
+            .slice, .one => std.mem.eql(u8, a, bs),
+            else => @compileError("invalid type passed to argEqual, requires either a string or tuple of strings, found " ++ @typeName(@TypeOf(bs))),
+        },
+        .@"struct" => {
+            inline for (bs) |b| if (std.mem.eql(u8, a, b)) return true;
+            return false;
+        },
+        else => @compileError("invalid type passed to argEqual, requires either a string or tuple of strings, found " ++ @typeName(@TypeOf(bs))),
+    };
 }
 
 fn parseEnvOverride(allocator: Allocator, raw: []const u8) !CliConfig.EnvOverride {

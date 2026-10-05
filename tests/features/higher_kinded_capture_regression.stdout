@@ -1,0 +1,7 @@
+Maybe of Int
+Box of String
+Maybe holding an int
+Box holding a string
+Pair of Int
+idM mi: 5
+idM bs: hi

@@ -1,0 +1,26 @@
+# Comptime value parameters (`comptime n: Int`, `comptime s: String`) are known
+# at compile time: the function is monomorphized per distinct constant argument,
+# so `if (n == 3)` folds and selects a branch at compile time and `${n}` is the
+# constant.
+
+fn Void size(comptime n: Int) String {
+    if (n == 1) { yield "one" } else { if (n == 2) { yield "two" } else { yield "many (${n})" } }
+}
+echo "${size 1}"
+echo "${size 2}"
+echo "${size 7}"
+
+# A comptime string parameter.
+fn Void greet(comptime name: String) String { yield "hello ${name}" }
+echo "${greet "world"}"
+
+# Comptime value alongside a runtime parameter.
+fn Void label(comptime prefix: String, x: Int) String { yield "${prefix}: ${x}" }
+echo "${label "n" 42}"
+
+# Comptime value alongside a comptime type parameter.
+fn Void tagged(comptime T: type, comptime tag: Int) String {
+    if (T == Int) { yield "int#${tag}" } else { yield "other#${tag}" }
+}
+echo "${tagged Int 5}"
+echo "${tagged Bool 9}"

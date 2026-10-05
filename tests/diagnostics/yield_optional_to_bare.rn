@@ -1,0 +1,5 @@
+# The yield optional-widening coercion is directional: a bare value (or null)
+# widens INTO an optional, but an optional does NOT satisfy a bare-value return.
+fn Void bad(o: ?Int) Int { yield o }
+
+bad 5

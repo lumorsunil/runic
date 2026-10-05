@@ -95,6 +95,18 @@ pub const IREvaluator = struct {
     allocator: Allocator,
     config: Config,
     context: *ir.context.IRProgramContext,
+    /// Current `materializeString` recursion depth, to bound rendering of a
+    /// pathological heap value. Runic values are normally acyclic, so a cycle is
+    /// always a bug; without this a self-referential heap region (e.g. a corrupted
+    /// struct whose field points back at itself) would recurse until the native
+    /// stack overflows and the process crashes. Capping it turns that into a
+    /// recoverable `MaterializeStringError` instead. The limit is far deeper than
+    /// any real value nests.
+    materialize_depth: usize = 0,
+
+    /// Maximum `materializeString` nesting before it bails with an error rather
+    /// than overflow the native stack on a cyclic/corrupt heap value.
+    const max_materialize_depth: usize = 256;
 
     pub const Config = struct {
         io: std.Io,
@@ -729,18 +741,55 @@ pub const IREvaluator = struct {
         };
     }
 
+    /// A sequence-length header read out of its heap cell behaves as an ordinary
+    /// `Int` everywhere except `maybeHeapSequenceLen` (which reads the raw cell
+    /// directly). Normalizing `.seq_len` → `.integer` on every *location* read
+    /// keeps the distinct tag confined to the heap: `.len`, arithmetic, indexing
+    /// and comparison all see a plain integer. A `.value` source is never
+    /// normalized — that is how the header is first written.
+    inline fn normSeqLen(v: ir.Value) ir.Value {
+        return switch (v) {
+            .seq_len => |n| .{ .integer = n },
+            else => v,
+        };
+    }
+
+    /// Reads an array's length header, accepting either the `.seq_len` tag (the
+    /// canonical form) or a plain `.integer` (headers written by an internal path
+    /// not yet migrated to `.seq_len`). Array ops and `join` know their operand is
+    /// an array, so they accept both; only `maybeHeapSequenceLen` — which must
+    /// *distinguish* an array from a struct — insists on the `.seq_len` tag.
+    inline fn seqLen(v: ir.Value) i64 {
+        return switch (v) {
+            .seq_len, .integer => |n| n,
+            else => unreachable,
+        };
+    }
+
     fn resolveValueSource(
         self: IREvaluator,
         thread: ir.context.IRThreadContext,
         value_source: ir.ValueSource,
     ) ResolveLocationError!ir.Value {
         return switch (value_source) {
-            .location => |loc| self.resolveLocation(thread, loc),
+            .location => |loc| normSeqLen(try self.resolveLocation(thread, loc)),
             .value => |value| value,
         };
     }
 
     fn tryResolveFastValueSource(
+        self: *IREvaluator,
+        thread: ir.context.IRThreadContext,
+        value_source: ir.ValueSource,
+    ) ResolveLocationError!?ir.Value {
+        const raw = (try self.tryResolveFastValueSourceRaw(thread, value_source)) orelse return null;
+        return switch (value_source) {
+            .location => normSeqLen(raw),
+            .value => raw,
+        };
+    }
+
+    fn tryResolveFastValueSourceRaw(
         self: *IREvaluator,
         thread: ir.context.IRThreadContext,
         value_source: ir.ValueSource,
@@ -757,7 +806,11 @@ pub const IREvaluator = struct {
                     thread.getRefPtr(ref, loc.mod).*,
                 .closure => {
                     const closure_base = thread.private.stack.items[3].addr;
-                    const closure_slot = thread.shared.heapGetPtr(loc.applyMod(closure_base)).?;
+                    // Fall back to the slow path when the slot is out of the
+                    // allocated closure block (rather than unwrapping null): a
+                    // captured value whose slot the fast path can't resolve is
+                    // handled by the full resolver.
+                    const closure_slot = thread.shared.heapGetPtr(loc.applyMod(closure_base)) orelse return null;
                     if (!loc.options.dereference) {
                         return closure_slot.*;
                     }
@@ -1126,31 +1179,7 @@ pub const IREvaluator = struct {
         return switch (instruction.type) {
             .comment => return .skip,
             .cimport_open => |op| {
-                var lib = std.DynLib.open(op.library_name) catch {
-                    std.log.err("could not load C library '{s}'", .{op.library_name});
-                    return Error.CImportLoadFailed;
-                };
-                errdefer lib.close();
-
-                const resolved = try self.allocator.alloc(ResolvedExtern, op.externs.len);
-                errdefer self.allocator.free(resolved);
-                for (op.externs, resolved) |ext, *dst| {
-                    const symbol_z = try self.allocator.dupeZ(u8, ext.symbol);
-                    defer self.allocator.free(symbol_z);
-                    const addr = lib.lookup(*anyopaque, symbol_z) orelse {
-                        std.log.err("C library '{s}' has no symbol '{s}'", .{ op.library_name, ext.symbol });
-                        return Error.CImportSymbolNotFound;
-                    };
-                    dst.* = .{ .symbol = ext.symbol, .addr = addr, .params = ext.params, .ret = ext.ret };
-                }
-
-                const cc = try self.allocator.create(CImportCloseable);
-                cc.* = .{
-                    .allocator = self.allocator,
-                    .lib = lib,
-                    .externs = resolved,
-                    .label = op.library_name,
-                };
+                const cc = try ffiLibOpen(self.allocator, op);
                 const handle = try self.context.addCloseable(&cc.closeable);
                 try self.context.addCImport(handle, cc);
                 try self.setLocation(thread, op.result, .{ .closeable = handle });
@@ -1590,13 +1619,22 @@ pub const IREvaluator = struct {
                 try self.setLocation(thread, is_type.result, .fromBoolean(matches));
                 return .cont;
             },
+            .make_closure_fn => |mcf| {
+                const closure_val = try self.resolveLocation(thread, mcf.closure);
+                const closure_addr: usize = switch (closure_val) {
+                    .addr => |a| a,
+                    else => 0,
+                };
+                try self.setLocation(thread, mcf.result, .{ .fn_ref = .{ .fn_addr = mcf.fn_addr, .closure_addr = closure_addr } });
+                return .cont;
+            },
             .str_op => |str_op| {
                 // `join`'s receiver is an array of strings, not a string, so it
                 // is handled before materializing the operand.
                 if (str_op.op == .join) {
                     const arr = try self.resolveValueSource(thread, str_op.operand);
                     const base = arr.addr;
-                    const count: usize = @intCast(thread.shared.heapGet(base).?.integer);
+                    const count: usize = @intCast(seqLen(thread.shared.heapGet(base).?));
                     var jsep = std.Io.Writer.Allocating.init(self.allocator);
                     defer jsep.deinit();
                     try self.materializeString(thread, try self.resolveValueSource(thread, str_op.arg0), &jsep.writer);
@@ -1686,7 +1724,7 @@ pub const IREvaluator = struct {
                         // (owned) string parts.
                         const base_val = try thread.shared.alloc(self.allocator, parts.items.len + 1);
                         const base = base_val.addr;
-                        thread.shared.heapGetPtr(base).?.* = .{ .integer = @intCast(parts.items.len) };
+                        thread.shared.heapGetPtr(base).?.* = .{ .seq_len = @intCast(parts.items.len) };
                         for (parts.items, 0..) |part, i| {
                             thread.shared.heapGetPtr(base + 1 + i).?.* = .{ .zig_string = try self.allocator.dupe(u8, part) };
                         }
@@ -1698,7 +1736,7 @@ pub const IREvaluator = struct {
                         // Runic (e.g. a string hash) without char indexing.
                         const base_val = try thread.shared.alloc(self.allocator, s.len + 1);
                         const base = base_val.addr;
-                        thread.shared.heapGetPtr(base).?.* = .{ .integer = @intCast(s.len) };
+                        thread.shared.heapGetPtr(base).?.* = .{ .seq_len = @intCast(s.len) };
                         for (s, 0..) |byte, i| {
                             thread.shared.heapGetPtr(base + 1 + i).?.* = .{ .integer = @intCast(byte) };
                         }
@@ -1714,12 +1752,12 @@ pub const IREvaluator = struct {
                 const value = try self.resolveValueSource(thread, ap.value);
                 // An empty/absent array (`.void`) starts a fresh one.
                 const len: usize = if (arr == .addr)
-                    @intCast(thread.shared.heapGet(arr.addr).?.integer)
+                    @intCast(seqLen(thread.shared.heapGet(arr.addr).?))
                 else
                     0;
                 const new_base = try thread.shared.alloc(self.allocator, len + 2);
                 const nb = new_base.addr;
-                thread.shared.heapGetPtr(nb).?.* = .{ .integer = @intCast(len + 1) };
+                thread.shared.heapGetPtr(nb).?.* = .{ .seq_len = @intCast(len + 1) };
                 if (arr == .addr) {
                     for (0..len) |i| thread.shared.heapGetPtr(nb + 1 + i).?.* = thread.shared.heapGet(arr.addr + 1 + i).?;
                 }
@@ -1731,7 +1769,7 @@ pub const IREvaluator = struct {
                 const arr = try self.resolveValueSource(thread, ap.array);
                 const value = try self.resolveValueSource(thread, ap.value);
                 const len: usize = if (arr == .addr)
-                    @intCast(thread.shared.heapGet(arr.addr).?.integer)
+                    @intCast(seqLen(thread.shared.heapGet(arr.addr).?))
                 else
                     0;
                 const cap: usize = if (arr == .addr)
@@ -1742,7 +1780,7 @@ pub const IREvaluator = struct {
                     // Spare capacity: append in place (O(1)). The array is linear,
                     // so no other reference observes the mutation.
                     thread.shared.heapGetPtr(arr.addr + 1 + len).?.* = value;
-                    thread.shared.heapGetPtr(arr.addr).?.* = .{ .integer = @intCast(len + 1) };
+                    thread.shared.heapGetPtr(arr.addr).?.* = .{ .seq_len = @intCast(len + 1) };
                     try self.setLocation(thread, ap.result, arr);
                     return .cont;
                 }
@@ -1751,7 +1789,7 @@ pub const IREvaluator = struct {
                 const new_cap = if (cap < 4) @as(usize, 4) else cap * 2;
                 const new_base = try thread.shared.alloc(self.allocator, new_cap + 1);
                 const nb = new_base.addr;
-                thread.shared.heapGetPtr(nb).?.* = .{ .integer = @intCast(len + 1) };
+                thread.shared.heapGetPtr(nb).?.* = .{ .seq_len = @intCast(len + 1) };
                 if (arr == .addr) {
                     for (0..len) |i| thread.shared.heapGetPtr(nb + 1 + i).?.* = thread.shared.heapGet(arr.addr + 1 + i).?;
                 }
@@ -1765,13 +1803,13 @@ pub const IREvaluator = struct {
                 const index = try self.resolveValueSource(thread, as.index);
                 const value = try self.resolveValueSource(thread, as.value);
                 const len: usize = if (arr == .addr)
-                    @intCast(thread.shared.heapGet(arr.addr).?.integer)
+                    @intCast(seqLen(thread.shared.heapGet(arr.addr).?))
                 else
                     0;
                 // Copy the array once, then overwrite the one element (if in range).
                 const new_base = try thread.shared.alloc(self.allocator, len + 1);
                 const nb = new_base.addr;
-                thread.shared.heapGetPtr(nb).?.* = .{ .integer = @intCast(len) };
+                thread.shared.heapGetPtr(nb).?.* = .{ .seq_len = @intCast(len) };
                 if (arr == .addr) {
                     for (0..len) |i| thread.shared.heapGetPtr(nb + 1 + i).?.* = thread.shared.heapGet(arr.addr + 1 + i).?;
                 }
@@ -1784,7 +1822,7 @@ pub const IREvaluator = struct {
             .array_slice => |sl| {
                 const arr = try self.resolveValueSource(thread, sl.array);
                 const len: i64 = if (arr == .addr)
-                    thread.shared.heapGet(arr.addr).?.integer
+                    seqLen(thread.shared.heapGet(arr.addr).?)
                 else
                     0;
                 const start_raw = (try self.resolveValueSource(thread, sl.start)).integer;
@@ -1795,7 +1833,7 @@ pub const IREvaluator = struct {
                 const out_len: usize = @intCast(hi - lo);
                 const new_base = try thread.shared.alloc(self.allocator, out_len + 1);
                 const nb = new_base.addr;
-                thread.shared.heapGetPtr(nb).?.* = .{ .integer = @intCast(out_len) };
+                thread.shared.heapGetPtr(nb).?.* = .{ .seq_len = @intCast(out_len) };
                 if (arr == .addr) {
                     for (0..out_len) |i| {
                         thread.shared.heapGetPtr(nb + 1 + i).?.* =
@@ -1808,11 +1846,11 @@ pub const IREvaluator = struct {
             .array_concat => |cc| {
                 const a = try self.resolveValueSource(thread, cc.left);
                 const b = try self.resolveValueSource(thread, cc.right);
-                const a_len: usize = if (a == .addr) @intCast(thread.shared.heapGet(a.addr).?.integer) else 0;
-                const b_len: usize = if (b == .addr) @intCast(thread.shared.heapGet(b.addr).?.integer) else 0;
+                const a_len: usize = if (a == .addr) @intCast(seqLen(thread.shared.heapGet(a.addr).?)) else 0;
+                const b_len: usize = if (b == .addr) @intCast(seqLen(thread.shared.heapGet(b.addr).?)) else 0;
                 const new_base = try thread.shared.alloc(self.allocator, a_len + b_len + 1);
                 const nb = new_base.addr;
-                thread.shared.heapGetPtr(nb).?.* = .{ .integer = @intCast(a_len + b_len) };
+                thread.shared.heapGetPtr(nb).?.* = .{ .seq_len = @intCast(a_len + b_len) };
                 if (a == .addr) for (0..a_len) |i| {
                     thread.shared.heapGetPtr(nb + 1 + i).?.* = thread.shared.heapGet(a.addr + 1 + i).?;
                 };
@@ -1827,7 +1865,7 @@ pub const IREvaluator = struct {
                 const index = try self.resolveValueSource(thread, as.index);
                 const value = try self.resolveValueSource(thread, as.value);
                 if (arr == .addr and index == .integer and index.integer >= 0) {
-                    const len: usize = @intCast(thread.shared.heapGet(arr.addr).?.integer);
+                    const len: usize = @intCast(seqLen(thread.shared.heapGet(arr.addr).?));
                     if (index.integer < len) {
                         // Linear array: write the element in place (O(1)).
                         thread.shared.heapGetPtr(arr.addr + 1 + @as(usize, @intCast(index.integer))).?.* = value;
@@ -2211,6 +2249,17 @@ pub const IREvaluator = struct {
                 try w.flush();
                 return .cont;
             },
+            .debug_log => |source| {
+                // Write straight to the process's real stdout stream, not the
+                // thread's stdout pipe (a forked/captured call's stdout is a
+                // capture pipe). This is out-of-band debug output.
+                const value = try self.resolveValueSource(thread, source);
+                var w = self.config.stdout.closeableWriter().writer;
+                try self.materializeString(thread, value, w);
+                try w.writeAll("\n");
+                try w.flush();
+                return .cont;
+            },
             .pipe_fwd => |pipe_fwd| {
                 const source_handle = (try self.resolveLocation(thread, pipe_fwd.source)).pipe;
                 const destination_handle = (try self.resolveLocation(thread, pipe_fwd.destination)).pipe;
@@ -2244,14 +2293,38 @@ pub const IREvaluator = struct {
                     return Error.MissingSpawnedThreadContext;
                 };
 
+                var fn_closure_addr: usize = 0;
                 const dest_addr: ir.ResolvedInstructionAddr = if (fork.dest_from) |loc| blk: {
                     const fn_val = try self.resolveLocation(thread, loc);
                     if (fn_val != .fn_ref) return Error.UnsupportedInstruction;
+                    fn_closure_addr = fn_val.fn_ref.closure_addr;
                     break :blk .init(fn_val.fn_ref.fn_addr.instr_set, 0);
                 } else try self.resolveAddr(thread, fork.dest);
                 new_thread.setInstructionCounter(dest_addr);
 
                 thread.private.result_register = .{ .thread = new_thread_handle };
+
+                // The callee's closure: when the fn value carries a captured
+                // environment (a nested closure passed as a value), use that block
+                // so the callee sees its captures — including for a *nullary* call
+                // (`merge_args == 0`), where the captures are the whole point (a
+                // trailing-block/`fn () …` closure reading an outer binding). When
+                // there are call arguments, copy their slots into the captured block
+                // first, so the callee sees both.
+                const closure_value: ir.Value = if (fn_closure_addr != 0) blk: {
+                    if (fork.merge_args > 0) {
+                        const provided = try self.resolveLocation(thread, fork.closure);
+                        const provided_addr: usize = switch (provided) {
+                            .addr => |a| a,
+                            else => 0,
+                        };
+                        for (0..fork.merge_args) |i| {
+                            const src = self.context.shared.heapGet(provided_addr + i) orelse continue;
+                            if (self.context.shared.heapGetPtr(fn_closure_addr + i)) |dst| dst.* = src;
+                        }
+                    }
+                    break :blk .{ .addr = fn_closure_addr };
+                } else try self.resolveLocation(thread, fork.closure);
 
                 try new_thread.private.stack.append(
                     self.allocator,
@@ -2267,7 +2340,7 @@ pub const IREvaluator = struct {
                 );
                 try new_thread.private.stack.append(
                     self.allocator,
-                    try self.resolveLocation(thread, fork.closure),
+                    closure_value,
                 );
 
                 return .cont;
@@ -2769,7 +2842,10 @@ pub const IREvaluator = struct {
         };
         const heap_value = try self.heapValueAt(heap_addr);
         return switch (heap_value) {
-            .integer => |len| .{ .heap_addr = heap_addr, .len = @intCast(len) },
+            // Only a `.seq_len` header marks an actual array. A struct whose first
+            // field is a plain `.integer` is NOT a sequence (that ambiguity used to
+            // make a struct render — and hash — as a bogus array).
+            .seq_len => |len| .{ .heap_addr = heap_addr, .len = @intCast(len) },
             else => null,
         };
     }
@@ -2779,16 +2855,17 @@ pub const IREvaluator = struct {
         thread: ir.context.IRThreadContext,
         heap_addr: usize,
         len: usize,
-        separator: ?u8,
+        separator: []const u8,
+        brackets: bool,
         w: *std.Io.Writer,
     ) MaterializeStringError!void {
+        if (brackets) try w.writeAll("[");
         for (0..len) |i| {
-            if (separator) |sep| {
-                if (i > 0) try w.writeByte(sep);
-            }
+            if (i > 0) try w.writeAll(separator);
             const element = try self.heapValueAt(heap_addr + i + 1);
             try self.materializeString(thread, element, w);
         }
+        if (brackets) try w.writeAll("]");
     }
 
     /// Duplicates `s` and applies a per-byte map, returning an owned zig_string.
@@ -2905,6 +2982,12 @@ pub const IREvaluator = struct {
     ) MaterializeStringError!void {
         // const resolvedValue = try self.dereferenceValue(thread, value);
 
+        // Guard against a cyclic/corrupt heap value (normally impossible — Runic
+        // values are acyclic): bail with an error instead of overflowing the stack.
+        if (self.materialize_depth >= max_materialize_depth) return MaterializeStringError.UnsupportedType;
+        self.materialize_depth += 1;
+        defer self.materialize_depth -= 1;
+
         switch (value) {
             .stream => |stream| for (0..stream.len) |i| {
                 const stream_value = try self.heapValueAt(i + stream.addr);
@@ -2920,10 +3003,12 @@ pub const IREvaluator = struct {
                 const string = try self.getSlice(slice);
                 try w.writeAll(string);
             },
-            inline .integer, .float => |t| try w.print("{}", .{t}),
+            inline .integer, .seq_len, .float => |t| try w.print("{}", .{t}),
             .addr => |addr| {
                 if (try self.maybeHeapSequenceLen(addr)) |seq| {
-                    try self.materializeHeapSequence(thread, seq.heap_addr, seq.len, null, w);
+                    // Default array→string coercion renders bracketed and
+                    // comma-separated: `[1, 2, 3]`.
+                    try self.materializeHeapSequence(thread, seq.heap_addr, seq.len, ", ", true, w);
                 } else {
                     const loc = self.context.mapAddr(addr);
                     switch (loc.abs) {
@@ -2966,7 +3051,9 @@ pub const IREvaluator = struct {
     ) MaterializeStringError!void {
         if (value == .addr) {
             if (try self.maybeHeapSequenceLen(value.addr)) |seq| {
-                try self.materializeHeapSequence(thread, seq.heap_addr, seq.len, ' ', w);
+                // Pipeline input splits an array into space-separated tokens
+                // (unbracketed), so a downstream stage reads one element per token.
+                try self.materializeHeapSequence(thread, seq.heap_addr, seq.len, " ", false, w);
                 return;
             }
         }
@@ -3603,4 +3690,34 @@ fn ffiArgPtr(v: ir.Value) Error!usize {
         .integer => |x| @bitCast(x),
         else => Error.CImportUnsupportedType,
     };
+}
+
+fn ffiLibOpen(allocator: Allocator, op: ir.Instruction.CImportOpen) !*CImportCloseable {
+    var lib = ffi.CrossDynLib.DynLib.open(allocator, op.library_name) catch {
+        std.log.err("could not load C library '{s}'", .{op.library_name});
+        return Error.CImportLoadFailed;
+    };
+    errdefer lib.close();
+
+    const resolved = try allocator.alloc(ResolvedExtern, op.externs.len);
+    errdefer allocator.free(resolved);
+    for (op.externs, resolved) |ext, *dst| {
+        const symbol_z = try allocator.dupeZ(u8, ext.symbol);
+        defer allocator.free(symbol_z);
+        const addr = try lib.lookup(symbol_z) orelse {
+            std.log.err("C library '{s}' has no symbol '{s}'", .{ op.library_name, ext.symbol });
+            return Error.CImportSymbolNotFound;
+        };
+        dst.* = .{ .symbol = ext.symbol, .addr = addr, .params = ext.params, .ret = ext.ret };
+    }
+
+    const cc = try allocator.create(CImportCloseable);
+    cc.* = .{
+        .allocator = allocator,
+        .lib = lib,
+        .externs = resolved,
+        .label = op.library_name,
+    };
+
+    return cc;
 }

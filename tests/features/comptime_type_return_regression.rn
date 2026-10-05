@@ -1,0 +1,20 @@
+# Type-returning comptime functions: an ordinary function with `comptime T: type`
+# params and a `yield`ed type is a generic-type constructor. Calling it produces
+# a concrete type usable in a binding and construction.
+
+fn Box(comptime T: type) type { yield struct { value: T } }
+const IntBox = Box Int
+const b = IntBox{ .value = 5 }
+echo "box=${b.value}"
+
+# Multiple type parameters.
+fn Entry(comptime K: type, comptime V: type) type { yield struct { key: K, value: V } }
+const SI = Entry String Int
+const e = SI{ .key = "hi", .value = 42 }
+echo "entry=${e.key}:${e.value}"
+
+# The produced type's fields carry the substituted element type.
+fn Pair(comptime T: type) type { yield struct { a: T, b: T } }
+const IP = Pair Int
+const p = IP{ .a = 3, .b = 4 }
+echo "sum=${p.a + p.b}"

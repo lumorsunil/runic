@@ -35,7 +35,7 @@ echo "empty=${empty.len()}"
 
 const Entity = struct { name: String }
 
-fn Void moveEntity(entity: Entity, pos: Vector) Void {
+fn Void moveEntity(entity: Entity, pos: Vector) String {
     echo "moved ${entity.name} to ${pos.x},${pos.y}"
 }
 
@@ -45,12 +45,12 @@ const hero = Entity{ .name = "hero" }
 moveEntity hero .{ .x = 3, .y = 5 }
 
 // More than one inferred argument in a single call.
-fn Void span(a: Vector, b: Vector) Void { echo "span=${a.x}..${b.x}" }
+fn Void span(a: Vector, b: Vector) String { echo "span=${a.x}..${b.x}" }
 span .{ .x = 1, .y = 0 } .{ .x = 9, .y = 0 }
 
 // UFCS method call: the receiver fills parameter 0, so the written argument
 // infers from parameter 1.
-fn Void warpTo(self: Entity, target: Vector) Void { echo "warp=${target.x},${target.y}" }
+fn Void warpTo(self: Entity, target: Vector) String { echo "warp=${target.x},${target.y}" }
 hero.warpTo(.{ .x = 7, .y = 2 })
 
 // --- Inference from a function's declared return type (`yield`) ---

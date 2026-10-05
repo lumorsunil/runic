@@ -1,0 +1,83 @@
+# The Maybe monad: an optional value wrapped in a struct, plus a `map` that
+# applies a function when the value is present and propagates "nothing"
+# otherwise.
+#
+# `map` takes a *function-type* parameter. A function type literal is written
+# `fn (ParamTypes...) ReturnType` — the parameters are bare types (no names, no
+# stdin type). Its argument and return types can be captured with `|A|` / `|B|`,
+# so `fn (|A|) |B|` is "any function from A to B" and binds A and B for the rest
+# of the signature (`ma: Maybe(A)` in, `Maybe(B)` out).
+
+const std = import "std"
+
+fn Maybe(comptime T: type) type {
+  yield struct { x: ?T }
+}
+
+fn Void pure(x: |A|) Maybe(A) {
+  yield .{ .x = x }
+}
+
+fn Void pure(x: |A|) []A {
+  yield .{x}
+}
+
+# `pure` is overloaded on its *return type*: the two definitions share a name and
+# argument list and differ only in what they produce. The overload is selected by
+# the expected type at the call site (here a binding annotation). A `pure 42` with
+# no expected type is ambiguous and reported as such.
+const pureMaybe: Maybe(Int) = pure 42
+const pureList: []Int = pure 42
+echo "pure -> Maybe: ${pureMaybe.x orelse 0}"
+echo "pure -> []:    ${pureList[0]}"
+
+fn Void map(f: fn (|A|) |B|, ma: |M|(A)) M(B) {
+  if (@hasMethod M "bind" and @hasMethod M "pure") {
+    fn Void aux(a: A) M(B) {
+      yield pure (f a)
+    }
+
+    yield bind aux ma
+  } else {
+    @compileError "type needs to implement bind and pure"
+  }
+}
+
+// TODO: uncomment and fix error that shows up
+fn Void map(f: fn (|A|) |B|, ma: []A) []B {
+  echo "hello from map"
+
+  var mb: []B = .{}
+
+  for (ma) |a| mb.push (f a)
+
+  yield mb
+}
+
+fn Void bind(f: fn (|A|) Maybe(|B|), ma: Maybe(A)) Maybe(B) {
+  if (ma.x) |x| yield f x else yield .{ .x = null }
+}
+
+fn Void double(n: Int) Int { yield n * 2 }
+fn Void label(n: Int) String { yield "n=${n}" }
+fn Void validateIs42(n: Int) Maybe(Int) {
+  if (n == 42) {
+    yield .{ .x = n }
+  } else {
+    yield .{ .x = null }
+  }
+}
+
+const some: Maybe(Int) = .{ .x = 21 }
+const some42: Maybe(Int) = .{ .x = 42 }
+const none: Maybe(Int) = .{ .x = null }
+
+# The captured return type B follows the mapped function: Int for `double`,
+# String for `label`.
+echo "double(some): ${(map double some).x}"
+echo "label(some):  ${(map label some).x}"
+echo "double(none): ${(map double none).x}"
+echo "double([1, 2, 3]): ${(map double .{1, 2, 3})}"
+echo "validateIs42(some): ${(bind validateIs42 some).x}"
+echo "validateIs42(some42): ${(bind validateIs42 some42).x}"
+echo "validateIs42(none): ${(bind validateIs42 none).x}"

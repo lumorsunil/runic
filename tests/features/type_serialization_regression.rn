@@ -12,8 +12,8 @@ echo "${Bool}"
 const Point = struct { x: Int, y: Int }
 echo "${Point}"
 
-// A generic constructor name.
-const Box(T) = struct { value: T }
+// A generic type (a comptime type function) name.
+fn Box(comptime T: type) type { yield struct { value: T } }
 echo "${Box}"
 
 // A `|T|` capture in a binding gives the captured concrete type.
@@ -28,7 +28,7 @@ echo Int String Point
 // A generic function parameter's `|T|` serializes to the concrete per-call type:
 // the call is monomorphized (a specialization is compiled with the type variable
 // bound to the argument's type).
-fn Void describe(x: |E|) Void {
+fn Void describe(x: |E|) String {
     echo "generic type is ${E}"
 }
 describe 5
@@ -46,9 +46,9 @@ echo "nested capture is ${W}"
 echo "${Box(Int)}"
 echo "${Box(String)}"
 echo "${Box(Box(Int))}"
-const Pair(A, B) = struct { first: A, second: B }
-echo "${Pair(Int, String)}"
-echo "${Pair(Box(Int), Bool)}"
+fn Pair(comptime A: type, comptime B: type) type { yield struct { first: A, second: B } }
+echo "${Pair(Int)(String)}"
+echo "${Pair(Box(Int))(Bool)}"
 
 // An array literal infers its element type, so a capture over it is concrete.
 const nums: |N| = .{ 1, 2, 3 }

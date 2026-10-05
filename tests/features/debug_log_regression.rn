@@ -1,0 +1,21 @@
+# `@log msg` writes to the process's real stdout for debugging, independent of
+# the current function's stdout pipe. Unlike a command (`echo`), it works inside
+# a function whose result is captured by value — its stdout is a capture pipe, so
+# an `echo` there would pollute or deadlock the capture, but `@log` bypasses it.
+# The message is any value and is rendered with interpolation, newline-terminated.
+
+fn triple(f: fn (|A|) |B|, xs: []A) []B {
+  @log "triple: mapping ${xs.len} elements"
+  var out: []B = .{ }
+  for (xs) |x| out = out.push (f x)
+  yield out
+}
+fn dbl(n: Int) Int { yield n * 2 }
+
+@log "start"
+@log "int: ${1 + 2}"
+const xs: []Int = .{ 10, 20 }
+# `triple`'s result is captured into a binding: its stdout is a capture pipe,
+# yet the `@log` inside still reaches the real stdout.
+const ys = triple dbl xs
+@log "done: ${ys[0]}, ${ys[1]}"

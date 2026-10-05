@@ -1,0 +1,12 @@
+get (1,2): a2
+get (3,4): b
+get (9,9): ?
+has (3,4): 0
+has (9,9): 1
+len: 2
+named: first
+edge e1: e1b
+edge e2: e2
+edge miss: ?
+edge len: 2
+int key: seven

@@ -1,0 +1,31 @@
+# Comptime type parameters: a `comptime T: type` argument is known at compile
+# time, so the function can compare it (`T == Int`) and select a branch at
+# compile time, and use it as an ordinary value type (`x: T`, `[]T`).
+
+# Branch on the comptime type; the untaken branch is discarded at compile time.
+fn Void describe(comptime T: type) String {
+    if (T == Int) { yield "integer" } else { if (T == Bool) { yield "boolean" } else { yield "other" } }
+}
+echo "${describe Int}"
+echo "${describe Bool}"
+echo "${describe String}"
+
+# A comptime type param used as a value parameter's type and the return type.
+fn Void identity(comptime T: type, x: T) T {
+    yield x
+}
+echo "id=${identity Int 42}"
+
+# Used as an array element type.
+fn Void firstOf(comptime T: type, xs: []T) T {
+    yield xs[0]
+}
+const nums = .{ 7, 8, 9 }
+echo "first=${firstOf Int nums}"
+
+# Multiple comptime type params alongside runtime params.
+fn Void tag(comptime A: type, comptime B: type, a: A, b: B) String {
+    if (A == B) { yield "same" } else { yield "different" }
+}
+echo "${tag Int Int 1 2}"
+echo "${tag Int Bool 1 true}"

@@ -542,6 +542,53 @@ fn Void describe(count: Int) Void {
 
 **Result:** Functions and conditional branches behave predictably, returning explicit values and avoiding bash’s implicit status codes.
 
+### Trailing-block closures
+
+A `{ … }` block written immediately after a command or function call is sugar for
+a **nullary closure argument** — so a function that takes a `fn() T` parameter
+reads like a built-in block construct. The block captures its enclosing scope
+(like any nested function value) and runs when the callee invokes the parameter:
+
+```rn
+fn withBrackets(body: fn() Void) Void {
+  echo "["
+  body            # invoke the block
+  echo "]"
+}
+
+const label = "job"
+withBrackets { echo "running ${label}" }     # captures `label`
+```
+
+This lets libraries define control-flow-style wrappers — timers, guards, retries,
+repeats — in ordinary Runic. Combined with a `comptime` count, a block-taking
+function becomes an unrolled construct:
+
+```rn
+fn repeat(comptime n: Int, body: fn() Void) Void { for (0..n) |_| { body } }
+repeat 3 { echo "tick" }
+```
+
+The block may also yield a value (`twice { yield 21 }`), and the sugar is exactly
+equivalent to passing an anonymous function: `withBrackets (fn Void () Void { … })`.
+Disambiguation follows the existing rule — an **uppercase** name before `{` is a
+struct literal (`Point { .x = 1 }`), a **lowercase** call is a trailing block; a
+`match subject { … }`'s arms are never mistaken for a block. The block captures
+both `const` and mutable `var` bindings from its scope (by value, at the point the
+closure is created).
+
+**Stdout typing.** A block's body is checked against its parameter's stdout type,
+exactly like a named function. A block that writes to `&1` — an `echo`, or a bare
+command — produces `String`, so it must be passed to a `fn () String` parameter; a
+value-returning block (`fn () Bool`, `fn () Int`, …) must *only* `yield` its value;
+and a `fn () Void` block must be silent (produce nothing on `&1`). A stray write of
+the wrong type is a compile error (redirect it with `1>&2` / `> "file"`, bind a
+command's result with `const _ = …`, or use `@log`). This mirrors the rule for
+named functions and prevents a stray write from corrupting the captured value.
+**Note:** a captured `var` is snapshotted by value, so a block mutating an outer
+`var` does not accumulate across repeated invocations — `std.control.retry`
+therefore accumulates success into its own local and yields once after the loop.
+
 ## Native iteration constructs
 
 `for` and `while` statements consume any iterator the runtime exposes, so streaming APIs and collections share the same loop syntax. Loops use Zig-style capture clauses to bind each yielded value (and optional index) to a local name.
@@ -638,6 +685,204 @@ interpreter's depth limit — the program fails to compile with a clear error
 rather than silently falling back to a runtime computation. (Without the
 keyword, `fib 10` is an ordinary runtime call.)
 
+### Comptime type parameters and `type`
+
+A parameter marked `comptime` must be known at compile time, and `type` is a
+first-class comptime value — so a function can take a type, compare it, and
+select a branch during compilation (the untaken branch is discarded):
+
+```rn
+fn Void describe(comptime T: type) String {
+  if (T == Int) { yield "integer" } else { yield "other" }
+}
+echo "${describe Int}"      // integer
+echo "${describe Bool}"     // other
+```
+
+A `comptime T: type` parameter is usable both as a value (`T == Int`) and as a
+type (`x: T`, `[]T`, the return type):
+
+```rn
+fn Void firstOf(comptime T: type, xs: []T) T { yield xs[0] }
+```
+
+A function with comptime type parameters is **monomorphized** — compiled once per
+distinct type argument, with the type known at compile time — so the branch is
+selected at compile time, not at runtime.
+
+#### Type predicates with captures
+
+A comparison against a type *pattern* binds a `|capture|` to the matched type
+argument, usable in the taken branch:
+
+```rn
+fn Void describe(comptime T: type) String {
+  if (T == Box(|E|)) { yield "box of ${E}" } else { yield "scalar ${T}" }
+}
+echo "${describe Box(Int)}"    // box of Int
+echo "${describe Int}"         // scalar Int
+```
+
+`Box(|E|)` matches any `Box(X)` and binds `E` to `X`. The bound capture is itself
+a comptime type, so it can feed further comptime logic (`E == Int`). Patterns
+nest (`Box(Box(|E|))`) and take multiple captures (`Pair(|A|)(|B|)`).
+
+#### Comptime value parameters
+
+A `comptime` parameter whose type is *not* `type` is a compile-time constant. The
+function is monomorphized per distinct value, so a test on it folds and `${n}` is
+that constant:
+
+```rn
+fn Void rep(comptime n: Int) String {
+  if (n == 1) { yield "once" } else { yield "${n} times" }
+}
+echo "${rep 1}"   // once
+echo "${rep 3}"   // 3 times
+```
+
+#### Matching on a type
+
+A `match` whose subject is a comptime type selects an arm at compile time. Each
+arm is a type pattern — a bare name (`Int`) or an application that may carry
+captures (`Box(|E|)`, `Pair(|X|)(|Y|)`) — and a matched capture is bound in that
+arm's body, exactly as in a type predicate:
+
+```rn
+fn Void classify(comptime T: type) String {
+  match (T) {
+    Int      => { yield "an int" }
+    Box(|E|) => { yield "a box of ${E}" }
+    _        => { yield "other" }
+  }
+}
+echo "${classify Box(Int)}"   // a box of Int
+echo "${classify Int}"        // an int
+echo "${classify Bool}"       // other
+```
+
+The bound capture is itself a comptime type, so a nested `match (E)` folds again.
+A `match` on a comptime *value* likewise prunes to the arm whose literal equals
+the value.
+
+#### Type introspection
+
+A comptime type can be inspected at compile time. Each builtin folds to a
+constant:
+
+| Builtin | Result | Notes |
+| --- | --- | --- |
+| `@kind(T)` | `String` | `"int"`, `"float"`, `"bool"`, `"string"`, `"struct"`, `"array"`, `"optional"`, … |
+| `@fieldCount(T)` | `Int` | number of fields of a struct type |
+| `@hasField(T)("name")` | `Bool` | whether a struct type has that field |
+| `@elem(T)` | type | element type of an array type (`[]X` → `X`) |
+| `@child(T)` | type | child type of an optional type (`?X` → `X`) |
+
+```rn
+fn Void describe(comptime T: type) String {
+  if (@kind(T) == "struct") {
+    yield "struct(${@fieldCount(T)}) hasValue=${@hasField(T)("value")}"
+  } else {
+    yield "a ${@kind(T)}"
+  }
+}
+```
+
+A leading `[]T` / `?T` is a value-position **type value** (like `struct { … }`
+or `Box(Int)`), so a composite type can be passed to a builtin directly:
+`@elem([]Int)` → `Int`, `@child(?Bool)` → `Bool`, `@kind([]Int)` → `"array"`.
+Using a builtin on a concrete type of the wrong kind (`@elem(Int)`) is a compile
+error.
+
+#### Iterating a struct's fields
+
+`for (@fields(T)) |f| { … }` iterates a struct type's fields at compile time —
+the loop is **unrolled**, one body copy per field, with `f.name` bound to the
+field name and `f.type` to the field's type (itself a comptime type):
+
+```rn
+fn Void dump(comptime T: type) Void {
+  for (@fields(T)) |f| {
+    if (f.type == Int) { echo "${f.name}: an int" }
+    else { echo "${f.name}: ${@kind(f.type)}" }
+  }
+}
+```
+
+`f.type` composes with the rest of the comptime surface: `@kind(f.type)`,
+`@elem(f.type)`, `f.type == Box(|E|)`, `match (f.type) { … }`, and even a nested
+`for (@fields(f.type))` when a field is itself a struct. An empty struct iterates
+zero times.
+
+#### Accessing a field's value by a comptime name — `@field`
+
+`f.name`/`f.type` give a field's *metadata*; `@field(value)(name)` gives its
+**value** — the field named by the compile-time string `name`, read off the
+struct `value`. It lowers to an ordinary member access `value.<name>`, so once
+`name` folds (typically `f.name` inside an unrolled loop) it is a plain field
+read. This is the analog of Zig's `@field(x, name)`, and it is what turns a
+comptime-unrolled loop from *inspecting* a type into *generating an
+implementation* over its values:
+
+```rn
+# A generic key=value dump for any struct.
+fn String show(comptime T: type, x: T) String {
+  var out = ""
+  for (@fields(T)) |f| out = "${out}${f.name}=${@field(x)(f.name)} "
+  yield out
+}
+```
+
+`@field` is also an **assignable place**: `@field(value)(name) = v` writes the
+named field (it lowers to `value.<name> = v`), so an unrolled loop can *set* each
+field, not only read it — e.g. a generic "reset" or field-wise transform:
+
+```rn
+var g: Vec = Vec{ .x = 1, .y = 2, .z = 3 }
+for (@fields(Vec)) |f| @field(g)(f.name) = 0     # zero every field
+```
+
+The `name` must be compile-time known — a runtime string is a compile error, and
+an unknown field name is reported like any other bad member access. Assigning
+through `@field` obeys mutability: the target must be a `var` (or a field of one),
+exactly like `value.field = v`.
+
+Together with generic struct *returns*, this makes field-wise implementations work
+end to end — a `comptime T: type` function can build and return a `T`:
+
+```rn
+fn doubled(comptime T: type, v: T) T {
+  var out = v
+  for (@fields(T)) |f| @field(out)(f.name) = @field(v)(f.name) * 2
+  yield out
+}
+```
+
+### Generic types as comptime functions
+
+A function whose parameters are `comptime` types and whose body `yield`s a type
+is a **generic-type constructor** — the same idea as a generic function, but it
+produces a type:
+
+```rn
+fn Box(comptime T: type) type { yield struct { value: T } }
+const IntBox = Box Int
+const b = IntBox{ .value = 5 }        // b.value : Int
+
+fn Entry(comptime K: type, comptime V: type) type {
+  yield struct { key: K, value: V }
+}
+```
+
+The type it produces resolves like any other: as an annotation and construction
+name in application form (`Box(Int)`, `Box{ … }`, `Box(|T|)` to capture the
+argument), or bound with a value call (`const IntBox = Box Int`). A generic type
+is applied like any call, so multiple arguments are written `Entry Key Value`
+(space) or curried `Entry(Key)(Value)` — one argument per parenthesis — **not**
+`Entry(Key, Value)`, which is a compile error. A type written in value position
+(`yield struct { … }`) is compile-time only — it is erased before the program
+runs.
+
 ### Type captures with `|T|`
 
 A type capture `|T|` binds `T` to the type occupying that position, and `T` is
@@ -676,17 +921,20 @@ and reference it bare thereafter (`fn Void first(xs: []|T|) T`).
 
 ### Generic type constructors
 
-A type binding can take type parameters, defining a generic type constructor:
+A generic type is a comptime type function — a function whose parameters are
+`comptime` types and whose body `yield`s a type (see *Generic types as comptime
+functions* above):
 
 ```rn
-const Box(T) = struct { value: T }
+fn Box(comptime T: type) type { yield struct { value: T } }
 
 const b: Box(Int) = Box{ .value = 5 }   // apply with Int
 echo "${b.value}"
 ```
 
-`Box(Int)` applies the constructor by substituting the argument. Combined with a
-`|T|` capture, a signature **destructures** an application to recover its type
+`Box(Int)` applies the constructor by substituting the argument, and
+`const IntBox = Box Int` binds the produced type directly. Combined with a `|T|`
+capture, a signature **destructures** an application to recover its type
 argument — so one function serves every instantiation:
 
 ```rn
@@ -694,14 +942,55 @@ fn Void unwrap(box: Box(|T|)) T { yield box.value }   // T = the element type
 unwrap b   // → 5
 ```
 
-Multiple parameters (`const Pair(A, B) = struct { first: A, second: B }`) and
-composition (`[]Box(Int)`) work too.
+Multiple parameters (`fn Pair(comptime A: type, comptime B: type) type { yield
+struct { first: A, second: B } }`) and composition (`[]Box(Int)`) work too.
 
 **Result:** reusable container and wrapper types without repetition. Because the
 runtime is dynamically typed, `Box(Int)` and `Box(String)` share a single layout
 — there is no monomorphization; the type arguments exist only for compile-time
-checking and capture. (Construction is currently the explicit `Box{ … }` form;
-an inferred `.{ … }` literal typed by its target is a planned addition.)
+checking and capture. (The older `const Box(T) = struct { … }` type-constructor
+form has been superseded by this comptime type function form.)
+
+### Static declarations and decl literals
+
+A type constructor is **module-like**: a `pub const` written in its body becomes
+a *static declaration* of the produced type, reachable as a member of that type.
+The declaration's value is resolved with the type arguments bound, so a `?T`
+reads as `?Int` for `Maybe(Int)`:
+
+```rn
+fn Maybe(comptime T: type) type {
+  pub const nothing: ?T = null
+  pub const empty: Maybe(T) = .{ .x = null }
+  yield struct { x: ?T }
+}
+
+echo "${Maybe(Int).nothing orelse -1}"      // -1
+const e: Maybe(Int) = Maybe(Int).empty      // a full Maybe(Int) value
+```
+
+Where the expected type is already known — a binding annotation, a `yield`
+against the function's return type, or a call argument against the parameter
+type — the type name can be dropped: a leading-dot **decl literal** `.name`
+resolves against that *result-location* type (the same idea as Zig's `.foo`):
+
+```rn
+const none: Maybe(Int) = .nothing            // = Maybe(Int).nothing
+
+fn Void makeEmpty() Maybe(Int) { yield .empty }
+
+fn Void take(m: Maybe(Int)) String { echo "${m.x orelse -1}" }
+take (.empty)                                // parens: see below
+```
+
+A **bare** `take .empty` is parsed as member access on `take` (a space-form
+grammar ambiguity — the dot binds as a member), so the implicit form in call
+position takes parentheses, `take (.empty)`, the way Zig writes `take(.empty)`.
+The explicit `take Maybe(Int).empty` needs none.
+
+**Result:** named constants and sentinels (`nothing`, `empty`, …) live on the
+type that defines them, and read back without restating the type when context
+supplies it.
 
 ### Serializing type identifiers
 
@@ -922,9 +1211,13 @@ fn Int square() Int {
 echo "4" | parseInt | square   // prints 16
 ```
 
-The declared stdout type constrains what may be `yield`ed to `&1` — `yield "text"`
-in an `Int`-stdout function is a compile-time error. (`yield &2` carries untyped
-diagnostic output and is not constrained.) A function may `yield` zero or more
+The declared stdout type constrains everything written to `&1` — not only
+`yield "text"` in an `Int`-stdout function, but also a bare `echo` or command (a
+command's output is `ExecutableError!String`). So a `Void`-stdout function must be
+silent: run a command for its effect by binding the result (`const _ = mkdir …`),
+redirecting it (`>&2`, `> "file"`), or using `@log`; a function that genuinely
+writes text declares a `String` stdout. (`yield &2` / `>&2` carry untyped
+diagnostic output and are not constrained; `cd`/`setenv` produce no output.) A function may `yield` zero or more
 times; there is no `return` — output is carried solely by `yield`, and a
 function halts when it runs out of statements (use `exit` to halt early):
 
@@ -944,6 +1237,32 @@ fn Int tee() Int {
     yield n * 10                    // result, goes to stdout
 }
 ```
+
+### `@log` — debug output to the real stdout
+
+`@log msg` prints its argument (rendered, with interpolation) followed by a
+newline, straight to the process's **real** stdout — independent of the current
+function's `&1` stream. It is for debugging.
+
+This matters because a function whose result is captured by value — bound
+(`const r = f x`) or interpolated (`${(f x)}`) — runs with its stdout wired to a
+capture transport, not the terminal. Writing to `&1` there (an `echo`, a bare
+command) feeds the capture, so it corrupts or stalls the captured value. `@log`
+side-steps that stream entirely:
+
+```rn
+fn map(f: fn (|A|) |B|, xs: []A) []B {
+    @log "map: ${xs.len} elements"   // reaches the terminal even when captured
+    var out: []B = .{ }
+    for (xs) |x| out = out.push (f x)
+    yield out
+}
+
+const doubled = map dbl .{ 1, 2, 3 }   // stdout is a capture; @log still prints
+```
+
+Use `yield &2 …` for diagnostics that belong on stderr, and `@log` for a quick
+trace that must appear on stdout regardless of how the function is called.
 
 A stage that `yield`s more than once emits each value as it happens (streamed,
 not buffered to the end), so one input value can produce several outputs:

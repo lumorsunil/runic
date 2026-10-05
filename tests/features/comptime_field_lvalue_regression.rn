@@ -1,0 +1,28 @@
+# `@field(value)(name) = v` — assignment through a comptime-named field. It lowers
+# to a member-slot write `value.<name> = v`, so a comptime-unrolled loop can *set*
+# each field, not only read it. (Reading `@field` also works outside a comptime
+# loop now — a generic body resolves a `T`-typed value's layout per specialization.)
+
+# Top level: set every field via an unrolled loop, then overwrite one explicitly.
+fn Vec(comptime E: type) type { yield struct { x: E, y: E, z: E } }
+var g: Vec(Int) = Vec{ .x = 1, .y = 2, .z = 3 }
+for (@fields(Vec(Int))) |f| @field(g)(f.name) = 0
+@field(g)("y") = 42
+echo "${g.x} ${g.y} ${g.z}"
+
+# In a (non-generic) function: mutate a local copy by computed name and return it.
+const V = struct { a: Int, b: Int }
+fn withA(v: V, n: Int) V {
+  var out = v
+  @field(out)("a") = n
+  yield out
+}
+const r: V = withA V{ .a = 1, .b = 2 } 99
+echo "${r.a} ${r.b}"
+
+# In a generic function, reading a field by comptime name works outside any loop
+# (the specialized body resolves the concrete layout).
+fn String firstField(comptime T: type, v: T) String {
+  yield "${@field(v)("a")}"
+}
+echo "first: ${firstField V V{ .a = 7, .b = 8 }}"

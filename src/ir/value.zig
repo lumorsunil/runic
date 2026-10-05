@@ -16,6 +16,14 @@ pub const Value = union(enum) {
     /// The language `Int` — a signed 64-bit integer. (Addresses/handles use the
     /// dedicated `.addr`/`.pipe`/… arms; this is the numeric value type.)
     integer: i64,
+    /// A heap *sequence* (array) length header, stored in the array's first heap
+    /// cell. Semantically an integer length, but a *distinct* tag so the string
+    /// materializer can tell an array (`[len, e0, …]`) apart from a struct
+    /// (`[f0, …]`), which is otherwise byte-identical when the first field is an
+    /// integer. Normalized to `.integer` whenever read through a location (so it
+    /// behaves as a plain `Int` for `.len`, arithmetic, indexing, …); only the
+    /// direct heap reads in the array ops and `maybeHeapSequenceLen` see the tag.
+    seq_len: i64,
     // TODO: decide on f32 or f64?
     float: f64,
     slice: Slice,
@@ -245,6 +253,12 @@ pub const Value = union(enum) {
 
     pub const FunctionRef = struct {
         fn_addr: InstructionAddr,
+        /// Heap address of this function value's captured environment, or 0 when
+        /// it captures nothing (a plain top-level function). A nested closure
+        /// passed as a value carries its closure here so an *indirect* call can
+        /// set it up — the callee's capture slots are pre-filled in this block
+        /// (its parameter slots left for the call to write).
+        closure_addr: usize = 0,
 
         pub fn format(
             self: @This(),

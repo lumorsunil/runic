@@ -1,0 +1,24 @@
+// A trailing-block / anonymous-fn closure can call module-member functions
+// (`std.math.max`, `std.testing.assertEq`, `std.fs.…`) as bare statements.
+// Previously a bare module call inside a closure read the captured module
+// binding's runtime value and resolved to a bad address; the fn_ref is now
+// resolved statically, like the value-position path. This is what lets library
+// control-flow blocks contain real assertions.
+const std = import "std"
+
+fn group(name: String, body: fn() String) String {
+  echo "── ${name}"
+  body
+}
+
+group "arithmetic" {
+  std.testing.assertEq (std.math.max 3 7) 7 "max"
+  std.testing.assertEq (std.math.min 3 7) 3 "min"
+  std.testing.assert (10 > 5) "greater"
+  echo "  ok"
+}
+
+group "strings" {
+  std.testing.assertContains "hello world" "world"
+  echo "  ok"
+}

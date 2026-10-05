@@ -21,7 +21,7 @@ const usage =
 pub fn run(
     io: std.Io,
     allocator: Allocator,
-    raw_args: []const [*:0]const u8,
+    args: std.process.Args,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
 ) !runic.ExitCode {
@@ -30,21 +30,16 @@ pub fn run(
     var out_path: ?[]const u8 = null;
     var binding: ?[]const u8 = null;
 
-    var i: usize = 0;
-    while (i < raw_args.len) : (i += 1) {
-        const arg = std.mem.span(raw_args[i]);
+    var args_it = try args.iterateAllocator(allocator);
+    defer args_it.deinit();
+
+    while (args_it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--lib")) {
-            i += 1;
-            if (i >= raw_args.len) return usageError(stderr, "--lib needs a value");
-            library = std.mem.span(raw_args[i]);
+            library = args_it.next() orelse return usageError(stderr, "--lib needs a value");
         } else if (std.mem.eql(u8, arg, "-o")) {
-            i += 1;
-            if (i >= raw_args.len) return usageError(stderr, "-o needs a value");
-            out_path = std.mem.span(raw_args[i]);
+            out_path = args_it.next() orelse return usageError(stderr, "-o needs a value");
         } else if (std.mem.eql(u8, arg, "--name")) {
-            i += 1;
-            if (i >= raw_args.len) return usageError(stderr, "--name needs a value");
-            binding = std.mem.span(raw_args[i]);
+            binding = args_it.next() orelse return usageError(stderr, "--name needs a value");
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             try stdout.writeAll(usage);
             try stdout.flush();

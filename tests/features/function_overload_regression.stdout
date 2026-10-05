@@ -1,0 +1,6 @@
+int 7
+str hi
+bool 0
+pure->Maybe: 42
+pure->[]: 7
+pure->Maybe(String): hey

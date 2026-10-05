@@ -51,10 +51,18 @@ fn mainImpl(init: std.process.Init) !runic.ExitCode {
     defer stdout.flush() catch {};
     defer stderr.flush() catch {};
 
-    // `runic cbind …` is a standalone tool (generate a C-FFI binding), not a
-    // script run — handle it before the normal command-line parsing.
-    if (args.vector.len >= 2 and std.mem.eql(u8, std.mem.span(args.vector[1]), "cbind")) {
-        return try cbind.run(io, allocator, args.vector[2..], stdout, stderr);
+    {
+        var args_it = try args.iterateAllocator(allocator);
+        defer args_it.deinit();
+        _ = args_it.next();
+
+        // `runic cbind …` is a standalone tool (generate a C-FFI binding), not a
+        // script run — handle it before the normal command-line parsing.
+        if (args_it.next()) |command| {
+            if (std.mem.eql(u8, command, "cbind")) {
+                return try cbind.run(io, allocator, args, stdout, stderr);
+            }
+        }
     }
 
     const result = try utils.parseCommandLine(allocator, args);

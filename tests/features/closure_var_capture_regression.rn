@@ -1,0 +1,29 @@
+# A trailing-block / anonymous-fn closure captures a mutable `var` from its
+# enclosing scope, reading the var's value when the closure is created. Previously
+# a captured `var` read empty (a `var` lives in a frame-relative closure cell the
+# running closure couldn't reach; the closure value carried no populated env).
+# Regression for that "mutable empty" bug. `const` capture is exercised alongside.
+
+fn run(body: fn() String) String { body }
+
+var n = 3
+const label = "job"
+run { echo "${label} n=${n}" }          # trailing block: captures var `n` and const `label`
+
+n = 7
+run { echo "after n=${n}" }             # captures the updated value at creation time
+
+# The explicit anonymous-fn form captures identically.
+run (fn Void () String { echo "explicit n=${n}" })
+
+# Multiple vars.
+var a = 1
+var b = 2
+run { echo "a=${a} b=${b}" }
+
+# A value-returning closure capturing a var, used in arithmetic — both the
+# trailing-block sugar and the explicit anonymous-fn form.
+fn get(f: fn() Int) Int { yield f }
+var base = 10
+echo "sugar=${get { yield base + 5 }}"
+echo "explicit=${get (fn Void () Int { yield base + 5 })}"

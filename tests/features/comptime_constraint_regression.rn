@@ -1,0 +1,41 @@
+# Type-class-lite constraint checking at compile time, combining higher-kinded
+# capture with two builtins:
+#   @hasMethod(M)("name") -> Bool: is there a function `name` whose first
+#                                  parameter is an `M(…)` (a UFCS "method on M")?
+#   @compileError "msg"           : fail compilation with `msg` — only from a
+#                                   branch that is actually compiled (a comptime
+#                                   if/match prunes the untaken arm), so it fires
+#                                   for exactly the types that reach it.
+
+fn Maybe(comptime T: type) type { yield struct { x: ?T } }
+fn Box(comptime T: type) type { yield struct { v: T } }
+
+# `bind`/`pure` make Maybe monad-ish; Box has neither.
+fn bind(ma: Maybe(|A|), f: fn (|A|) Maybe(|B|)) Maybe(B) {
+  if (ma.x) |x| yield f x else yield .{ .x = null }
+}
+fn pure(x: |A|) Maybe(A) { yield .{ .x = x } }
+
+# A constraint check over any constructor M, with a directed error for a type
+# that doesn't satisfy it.
+fn Void classify(m: |M|(|A|)) String {
+  if (@hasMethod(M)("bind")) {
+    if (@hasMethod(M)("pure")) { yield "${M} is a monad (bind + pure)" } else { yield "${M} has bind but not pure" }
+  } else { yield "${M} is a plain container" }
+}
+
+const mi: Maybe(Int) = Maybe{ .x = 5 }
+const bi: Box(Int) = Box{ .v = 5 }
+echo "${classify mi}"
+echo "${classify bi}"
+
+# @compileError only fires from a taken comptime branch — a `match (T)` default.
+fn Void scalarName(comptime T: type) String {
+  match (T) {
+    Int => { yield "int" }
+    Bool => { yield "bool" }
+    _ => { @compileError "scalarName: ${T} is not a scalar" }
+  }
+}
+echo "${scalarName Int}"
+echo "${scalarName Bool}"

@@ -421,24 +421,14 @@ pub const ReaderWriterStream = struct {
             return;
         }
 
-        const allocator = self.buffer_writer.allocator;
-        var sources_to_remove = std.ArrayList(usize).empty;
-        defer sources_to_remove.deinit(allocator);
-
-        for (self.sources.items, 0..) |source, i| {
-            if (source.isClosed()) {
-                try sources_to_remove.append(allocator, i);
-                if (self.config.close_destination) {
-                    _ = destination.close();
-                }
-                self.disconnectDestination();
-            }
-        }
-
-        if (sources_to_remove.items.len > 0) {
-            std.mem.sort(usize, sources_to_remove.items, self, lessThan);
-            self.disconnectSources(sources_to_remove.items);
-        }
+        // Sources that are still connected are left for `forward()` to handle,
+        // even ones already marked closed: a closed source (its process exited)
+        // may still have buffered OS-pipe data, which `forward()` drains to the
+        // destination before removing the source and propagating EOF. Closing the
+        // destination here based on `isClosed()` alone would strand that tail —
+        // e.g. a `{ echo a; echo b } | consumer` producer whose second line is
+        // still in flight when the consumer attaches, delivering only the first
+        // line and signalling EOF early (a dropped final line under load).
     }
 
     fn lessThan(_: *@This(), lhs: usize, rhs: usize) bool {

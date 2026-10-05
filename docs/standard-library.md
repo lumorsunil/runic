@@ -76,6 +76,8 @@ surfaces that will churn.
 | `std.math`    | Numeric helpers (`abs`/`min`/`max`/`clamp` + Float `sqrt`/`floor`/…).      |
 | `std.testing` | Assertions for `.rn` module and CLI smoke tests.                          |
 | `std.map`     | A generic hashed key/value map (immutable + mutable APIs).                 |
+| `std.meta`    | Comptime-derived structural operations over any value (`show`, `eq`).      |
+| `std.control` | Control-flow combinators that take a trailing block (`retry`, `repeat`).   |
 
 **Conventions.** Functions use the space-call form (`std.list.map xs f`), camelCase
 names, and explicit input/output types. A fallible operation returns an **error
@@ -161,6 +163,14 @@ return `ExecutableError!…` so callers use `catch`/`try`.
 | `mkdirp(p: String) ExecutableError!Void` | `mkdir -p` | create dirs |
 | `remove(p: String) ExecutableError!Void` | `rm -rf` | delete |
 | `cwd() String` | builtin `pwd` | current directory |
+| `withTempDir(body: fn() Void) Void` | `mktemp -d` + `cd` + `rm -rf` | run the trailing block in a throwaway directory |
+
+`withTempDir` runs its trailing block with a fresh temp directory as the working
+directory, then restores the previous directory and deletes the tree. The block
+operates there via the process working directory, so **child-process commands**
+(`mkdir`, `touch`, `cp`, `git`, …) land in the temp dir. A shell redirect
+(`echo "x" > f`) currently writes relative to the process's original directory,
+not the temp dir — create files with commands inside the block, or an absolute path.
 
 > **Note.** An earlier `std.process` module (helpers around a command's
 > `ExecutableError!String` value view) was **dropped** pending a rethink of the
@@ -191,7 +201,48 @@ Runic; the Float functions are backed by **new builtins** (see prerequisites).
 | `assert(cond: Bool, msg: String) Void` | abort (nonzero exit) with `msg` if false |
 | `assertEq(a: T, b: T, msg: String) Void` | abort if `a != b` |
 | `assertContains(s: String, sub: String) Void` | abort if `s` lacks `sub` |
+| `check(msg: String, cond: fn() Bool) Void` | abort unless the trailing block yields true |
+| `group(label: String, body: fn() Void) Void` | print a header, then run the trailing block of checks |
 | `fail(msg: String) Void` | unconditional abort |
+
+`check` takes its condition as a **trailing block** (a `fn () Bool` closure), so a
+multi-step assertion reads like a built-in block construct and captures its scope:
+
+```rn
+std.testing.check "list stays sorted" {
+  const xs = std.list.sort ys lt
+  yield xs[0] <= xs[xs.len - 1]
+}
+```
+
+`group` wraps a set of assertions in a labeled section — a header then the block
+(a `fn () Void`). It is organizational: a failing assertion inside still aborts the
+run; it does not catch or count failures.
+
+```rn
+std.testing.group "arithmetic" {
+  std.testing.assertEq (add 2 3) 5 "sum"
+  std.testing.assert (10 > 5) "greater"
+}
+```
+
+### `std.control`
+
+Control-flow combinators that take a **trailing block** (a nullary closure
+capturing its enclosing scope), so a loop/retry pattern reads like a built-in.
+
+| Signature | Behavior |
+| --- | --- |
+| `retry(times: Int, body: fn() Bool) Bool` | run `body` up to `times` times, stopping once it yields true; yield whether it eventually succeeded |
+| `repeat(n: Int, body: fn() Void) Void` | run `body` exactly `n` times |
+
+```rn
+const ok = std.control.retry 5 { yield (curl "-fsS" url).exit_code == 0 }
+std.control.repeat 3 { echo "tick" }
+```
+
+Once `retry`'s body succeeds it is not invoked again. Both treat a non-positive
+count as zero runs (`retry` then yields false).
 
 ### `std.map`
 
@@ -201,10 +252,14 @@ lookups are O(1) on average; a parallel ordered list preserves **insertion
 order** for `keys`/`values` (and `set` on an existing key keeps its position).
 Types resolve at comptime (generic constructors + monomorphization); the data
 operations run at runtime. Keys are compared with `==` and hashed by value, so
-`Int` and `String` keys work — a `String` is hashed over its bytes, so an
-interpolated key hashes identically to the same literal. The API is
-**immutable**, mirroring `arr.push`: `set`/`remove` return a new map. (The bucket
-count is fixed for now; resize-on-load-factor is a future refinement.)
+`Int`, `String`, and **struct** keys (at any nesting depth) work — a `String` is
+hashed over its bytes (an interpolated key hashes identically to the same
+literal), and a struct key is hashed structurally via `std.meta.hash` (which
+recurses into struct-typed fields) and matched with struct `==`, so two equal
+records are the same key (a coordinate `{ x, y }`, a nested `{ a: Point, b: Point }`,
+…). The API is **immutable**, mirroring `arr.push`: `set`/`remove` return a new
+map. (The bucket count is fixed for now; resize-on-load-factor is a future
+refinement.)
 
 | Signature | Result |
 | --- | --- |
@@ -230,6 +285,41 @@ const v = std.map.get m "a" orelse 0   // 1
 var counts = std.map.empty              // mutable style
 for (xs) |x| { std.map.setIn counts x ((std.map.get counts x orelse 0) + 1) }
 ```
+
+### `std.meta`
+
+Generic operations derived at **compile time** from the field-introspection
+surface (`@kind`, `@fields`, `@field`) — the "derived" helpers a hand-written
+generic can't express without looking *inside* a value's fields. Each function is
+monomorphized per argument type: `@kind(T)` folds (the untaken branch is never
+emitted) and `for (@fields(T))` unrolls one copy per field.
+
+| Signature | Result |
+| --- | --- |
+| `show(v: T) String` | a struct as `{ name=value … }`, a scalar/string as itself |
+| `eq(a: T, b: T) Bool` | structural equality (a struct field-by-field, else `==`) |
+| `hash(v: T) Int` | a structural hash (a struct combines its fields', else the bytes of `${v}`) |
+
+```rn
+fn Point(comptime E: type) type { yield struct { x: E, y: E } }
+const p: Point(Int) = Point{ .x = 3, .y = 7 }
+echo "${std.meta.show p}"        // { x=3 y=7 }
+echo "${std.meta.eq p p}"        // 0  (true)
+```
+
+All three **recurse into struct-typed fields** — a struct-typed field is dumped,
+compared, or hashed by a recursive call at the field's own type (a polymorphic
+recursion that specializes per level, terminating at a scalar/string). So a nested
+struct shows its own bracketed form, compares deeply, and hashes deeply:
+
+```rn
+const Line = struct { from: Point(Int), to: Point(Int) }
+const l: Line = Line{ .from = Point{ .x = 1, .y = 2 }, .to = Point{ .x = 3, .y = 4 } }
+echo "${std.meta.show l}"        // { from={ x=1 y=2 } to={ x=3 y=4 } }
+```
+
+`hash` makes equal values (by `eq`) hash equal, which is what lets `std.map` take a
+struct key (see below).
 
 ## Language prerequisites for Phase 3
 

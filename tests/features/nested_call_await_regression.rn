@@ -7,13 +7,13 @@
 fn Void @() Void
 
 fn Void stop() Void {
-  echo "stopping"
+  echo "stopping" 1>&2
   exit 0
 }
 
 fn Void guard(ok: Bool) Void {
   if (ok) {
-    echo "ok"
+    echo "ok" 1>&2
   } else {
     stop
   }

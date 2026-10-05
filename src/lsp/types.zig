@@ -572,21 +572,14 @@ pub const Position = struct {
             // over-long character on a valid line.
             if (i >= source.len) return null;
             switch (source[i]) {
-                '\\' => {
-                    if (i < source.len - 1) {
-                        const next = source[i + 1];
-
-                        switch (next) {
-                            'n' => {
-                                line += 1;
-                                column = 0;
-                            },
-                            else => column += 1,
-                        }
-                    } else {
-                        column += 1;
-                    }
-                },
+                // A backslash in the document text is an ordinary character (e.g.
+                // the `\` of a `\n` escape *inside a string literal*): it is two
+                // source characters, `\` then `n`, not a line break. Line breaks in
+                // the text are real newline bytes — the JSON transport already
+                // decodes `\n` escapes to 0x0A — handled by the `\r`/`\n` arms
+                // below. Treating backslash-n as a newline here miscounted every
+                // line after a string containing `\n`, so incremental edits landed
+                // at the wrong offset and corrupted the buffer.
                 '\r' => {
                     if (i < source.len - 1 and source[i + 1] == '\n') {
                         i += 1;
@@ -2257,4 +2250,33 @@ test "Position.findIndex returns null for out-of-bounds positions" {
     try std.testing.expectEqual(@as(?u32, null), (Position{ .line = 50, .character = 0 }).findIndex(source));
     // An in-bounds position still resolves to its byte offset (`foo` at col 6).
     try std.testing.expectEqual(@as(?u32, 6), (Position{ .line = 0, .character = 6 }).findIndex(source));
+}
+
+test "Position.findIndex: a backslash-n inside a string is not a line break" {
+    // A string literal containing a `\n` escape is a single line in the document
+    // (the `\` and `n` are ordinary characters). A regression previously treated
+    // backslash-n as a newline, so it miscounted every line after such a string
+    // and incremental edits landed at the wrong offset.
+    //
+    //   line 0: yield "a\nb"   — 12 characters, real newline byte at index 12
+    //   line 1: const x = 1    — 11 characters, real newline byte at index 24
+    const source = "yield \"a\\nb\"\nconst x = 1\n";
+
+    // The `\n` inside the string keeps line 0 as one line: its length is 12, so
+    // the real newline byte sits at index 12 and line 1 starts at index 13.
+    try std.testing.expectEqual(@as(?u32, 12), (Position{ .line = 0, .character = 12 }).findIndex(source));
+    // `const` on line 1 begins right after the newline, at byte 13 — not shifted
+    // by a phantom line break at the escape.
+    try std.testing.expectEqual(@as(?u32, 13), (Position{ .line = 1, .character = 0 }).findIndex(source));
+    // The `x` on line 1 (column 6) resolves to byte 19.
+    try std.testing.expectEqual(@as(?u32, 19), (Position{ .line = 1, .character = 6 }).findIndex(source));
+    // Line 2 (past the last real newline) starts at end of buffer (byte 25).
+    try std.testing.expectEqual(@as(?u32, 25), (Position{ .line = 2, .character = 0 }).findIndex(source));
+}
+
+test "Position.findIndex: a lone backslash counts as one column" {
+    const source = "a\\b\n"; // characters: 'a', '\', 'b', then newline
+    try std.testing.expectEqual(@as(?u32, 1), (Position{ .line = 0, .character = 1 }).findIndex(source)); // the backslash
+    try std.testing.expectEqual(@as(?u32, 2), (Position{ .line = 0, .character = 2 }).findIndex(source)); // 'b'
+    try std.testing.expectEqual(@as(?u32, 4), (Position{ .line = 1, .character = 0 }).findIndex(source)); // after newline
 }

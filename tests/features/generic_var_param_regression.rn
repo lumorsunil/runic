@@ -1,12 +1,13 @@
 // A `var` parameter of a generic type with an array field (`var b: Box(|T|)`
-// where `Box(T) = struct { items: []T }`) used to crash the compiler: matching
+// where `fn Box(comptime T: type) type { yield struct { items: []T } }`) used to
+// crash the compiler: matching
 // the capture against the argument could bind `T` to the bare name `T`, and
 // normalizing that self-referential type recursed until the stack overflowed.
 // The capture-binding and type-normalization now break that self-reference, so
 // reading and mutating the field compiles and runs.
 fn Void @() Void
 
-const Box(T) = struct { items: []T }
+fn Box(comptime T: type) type { yield struct { items: []T } }
 
 // Read a field of a var generic-typed parameter.
 pub fn Void firstOr(b: Box(|T|), fallback: T) T {

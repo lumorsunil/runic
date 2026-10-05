@@ -1,0 +1,13 @@
+# The default array→string coercion renders bracketed and comma-separated:
+# `[1, 2, 3]`, not the elements concatenated (`123`). It applies wherever an
+# array is coerced to a string — interpolation, a command argument, `@log`. Empty
+# is `[]`, nested arrays render recursively, and elements use their own coercion.
+const xs: []Int = .{ 1, 2, 3 }
+echo "ints: ${xs}"
+const ss: []String = .{ "a", "b" }
+echo "strs: ${ss}"
+const nested: [][]Int = .{ .{ 1, 2 }, .{ 3, 4 } }
+echo "nested: ${nested}"
+const empty: []Int = .{ }
+echo "empty: ${empty}"
+echo .{ 10, 20, 30 }

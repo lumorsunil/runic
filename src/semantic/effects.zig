@@ -185,7 +185,7 @@ const Collector = struct {
             .assignment => |a| try self.expr(a.expr),
             .subshell => |s| try self.expr(s.child),
             // Leaves and constructs that cannot contain a function declaration.
-            .identifier, .env_var, .path, .literal, .fd, .executable, .builtin, .import_expr, .cimport_expr => {},
+            .identifier, .env_var, .path, .literal, .fd, .executable, .builtin, .import_expr, .cimport_expr, .type_value => {},
         }
     }
 };
@@ -398,7 +398,7 @@ fn walkExpr(w: *Walk, e: *const ast.Expression, in_loop: bool) void {
         .assignment => |a| walkExpr(w, a.expr, in_loop),
 
         // Sync leaves.
-        .identifier, .env_var, .path, .literal => {},
+        .identifier, .env_var, .path, .literal, .type_value => {},
     }
 }
 

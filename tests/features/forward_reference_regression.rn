@@ -19,9 +19,9 @@ echo "odd7=${isOdd 7}"
 
 # A forward reference inside a function body, including a pipeline whose stages
 # (a generator and a consumer) are both declared later.
-fn Void run() Void { nums | showit }
+fn Void run() String { nums | showit }
 fn Void nums() Int { yield 1; yield 2; yield 3 }
-fn Void showit(n: Int) Void { echo "n=${n}" }
+fn Void showit(n: Int) String { echo "n=${n}" }
 run
 
 # A forward-referenced consumer that CAPTURES a global. `drive` forks `tally` (a
@@ -33,9 +33,9 @@ run
 const P = struct { x: Int, y: Int }
 var base = P{ .x = 100, .y = 200 }
 var pts = .{ P{ .x = 1, .y = 2 }, P{ .x = 3, .y = 4 } }
-fn Void drive() Void { pts | tally }
-fn Void tally(p: P) Void { echo "base=${base.x},${base.y} p=${p.x},${p.y}" }
+fn Void drive() String { pts | tally }
+fn Void tally(p: P) String { echo "base=${base.x},${base.y} p=${p.x},${p.y}" }
 drive
-fn Void driveLoop() Void { for (pts) |p| tallyLoop p }
-fn Void tallyLoop(p: P) Void { echo "sum=${base.x + p.x}" }
+fn Void driveLoop() String { for (pts) |p| tallyLoop p }
+fn Void tallyLoop(p: P) String { echo "sum=${base.x + p.x}" }
 driveLoop

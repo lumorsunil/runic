@@ -100,6 +100,47 @@ A cycle of feature work and engineering-health work:
   member chains and struct-literal fields. Alongside: a batch of fuzz-found
   crash/leak fixes and a type-checker-reset segfault fix so editing a file with
   functions no longer takes the server down. See theme 5 below.
+- **Comptime → a type-class-lite layer (0.12.0):** on top of
+  the comptime surface (below), a cluster of features that together give
+  constraint-checked, return-type-directed generics without a full type-class
+  system. **Function overloading** — a name declared more than once is an overload
+  set, resolved by argument types and, when several match, the expected type from
+  context (return-type polymorphism); resolution handles higher-kinded expected
+  types (`M(B)` picks the sole constructor-returning overload). **Higher-kinded
+  capture** — `|M|(A)` captures a type *constructor* plus its argument, so a body
+  is generic over any single-argument constructor and can re-apply it in the
+  return type (`M(B)`), monomorphized per concrete constructor. **Constraint
+  builtins** — `@hasMethod(M)("name")` folds to whether a function `name` heads on
+  `M(…)`, and `@compileError "msg"` fails compilation from a taken comptime branch;
+  together they express a directed constraint (a fully generic monad `map` guarded
+  by `@hasMethod`, erroring on a non-monad). **First-class closures** — a nested
+  closure that captures a runtime value can be passed as a value and called
+  indirectly, its environment intact. Plus a generic call is monomorphized even
+  when its result is captured by value or accessed inline (`(gmap f x).field`), so
+  a higher-kinded return resolves to a concrete struct at the use site. **Static
+  type declarations** — a type constructor is module-like: a `pub const` in its
+  body is a static member of the produced type (`Maybe(Int).nothing`), and where
+  the result-location type is known it reads as a leading-dot **decl literal**
+  (`const none: Maybe(Int) = .nothing`, also in `yield` and parenthesized call
+  arguments), Zig-style.
+- **Runtime/diagnostics polish (0.12.0):** `@log msg` prints to the process's
+  *real* stdout for debugging, bypassing a captured function's stdout pipe (an
+  `echo` there deadlocks the capture); a bare command or call whose stdout type
+  doesn't match the enclosing function's is now a compile error (byte channels
+  `Void`/`String` still run commands freely), pointing at `@log` / redirects /
+  binding; an array coerces to a string as `[1, 2, 3]` (bracketed, comma-joined,
+  nesting) instead of its elements run together, while pipeline input stays
+  space-separated; and an LSP off-by-one — a `\n` string escape miscounted as a
+  line break — that corrupted incremental edits is fixed. The `Void`-is-silent
+  rule closed a long-standing trailing-block capture deadlock. Two more fixes:
+  a pipeline producer that runs several command-statements no longer drops its
+  last line under load, and a type-checker-reset use-after-free that crashed the
+  language server after a few quick edits is gone.
+- **Editor hover polish (0.12.0):** hover now names a struct after the binding or
+  type constructor it came from (`Point{ … }`, `Maybe(Int){ … }`) instead of
+  `<struct>`, lists every signature of an overloaded function, types a field of an
+  anonymous `.{ … }` literal from its context, and resolves an implicit `.name`
+  declaration access against the result-location type.
 
 A known constraint discovered this cycle: `compiler.zig` is large (~10k lines)
 but cannot be cleanly split in current Zig — `usingnamespace` was removed and
@@ -240,14 +281,73 @@ Likely near- to mid-term candidates:
 - first-class / anonymous blocks — bare `{ … }` is already an eager
   expression-block, so a lambda form needs distinct syntax; a design decision
 - better user-defined struct/type support
-- **comptime functions returning types** (Zig-style) to supersede the current
-  generic type-constructor form. Today a parameterized type is written
-  `const Box(T) = struct { value: T }`; the intended long-term replacement is a
-  comptime function that returns a type —
-  `fn Box(comptime T: type) type { return struct { value: T } }` — unifying
-  generic types with ordinary functions and comptime evaluation. (Generic type
-  *variables* in signatures are now introduced explicitly with `|T|`; a bare
-  unknown uppercase type name is an error rather than a silent generic.)
+- ~~**comptime functions returning types** (Zig-style) to supersede the current
+  generic type-constructor form~~ — landed: a `comptime` parameter is
+  compile-time known, `type` is a first-class comptime value (comparable, usable
+  in `if`/`match` control flow), and a function that yields a type is a
+  generic-type constructor: `fn Box(comptime T: type) type { yield struct { value:
+  T } }`, then `const IntBox = Box Int; IntBox{ .value = 5 }`. It resolves in
+  application position (`Box(Int)`), serializes as a type (`${Box(Int)}` →
+  `Box(Int)`), and is a drop-in for `const Box(T) = …`, which is now **removed** —
+  `std/map` and the generic-type tests were migrated, and the old form reports a
+  directed error. (Generic type *variables* in signatures are introduced
+  explicitly with `|T|`; a bare unknown uppercase type name is an error rather than
+  a silent generic.) The comptime surface was then rounded out — all landed:
+  1. ~~**comptime value parameters**~~ — a `comptime n: Int` / `s: String`
+     parameter is a compile-time constant; the function is monomorphized per value
+     so `n == 3` folds and `${n}` is the constant.
+  2. ~~**`match` on a type**~~ — `match (T) { Int => …, Box(|E|) => …, _ => … }`
+     prunes to one arm at compile time, binding capture patterns (`|E|`) like a
+     type predicate; a `match` on a comptime value prunes by literal.
+  3. ~~**type introspection**~~ — `@kind(T)`, `@fieldCount(T)`,
+     `@hasField(T)("f")`, `@elem(T)`, `@child(T)` fold to constants; a leading
+     `[]T` / `?T` is a value-position type value (`@elem([]Int)` → `Int`).
+  4. ~~**comptime iteration**~~ — `for (@fields(T)) |f| { … }` unrolls per struct
+     field, binding `f.name` and `f.type` (a comptime type that composes with
+     `match`, the introspection builtins, and a nested `for (@fields(f.type))`).
+
+     The roadmap above is fully landed, and the `comptime-functions` branch then
+     built a **type-class-lite** layer on it (overloading, higher-kinded `|M|(A)`
+     capture, `@hasMethod`/`@compileError` constraints — see *Recently Landed*).
+
+     **Comptime — possible next directions** (unplanned; a comparison against
+     Jai and Mox, the two Jai-family comptime systems). Runic's model is a
+     *restricted, declarative* comptime — a folder plus per-type/value
+     monomorphization, closer to a subset of Zig's `comptime` — where those
+     languages run an arbitrary-code interpreter at compile time. Gaps, roughly
+     in order of value-to-effort:
+     - **Richer type reflection as a value.** Today introspection is scalar
+       builtins (`@kind`, `@fieldCount`, `@hasField`, `@elem`, `@child`) plus
+       `@fields` iteration. Jai/Mox expose a first-class type-info value (size,
+       field offsets, decls) you pass around. Natural additions: `@TypeOf(expr)`,
+       `@typeName(T)`, `@hasDecl`, field offset/size — mostly in reach of the
+       current folder.
+     - **Comptime type *construction*.** Runic can *return* a hand-written struct
+       type from a comptime fn; it cannot *build* one — e.g. a struct with a field
+       per element of a comptime list. Jai's `#insert`/data-layout transforms and
+       Mox's AST building do this. Would need a way to assemble a field list at
+       comptime (a bounded analog of Zig's `@Type(.{ .Struct = … })`), not full
+       AST splicing — the Jai/Mox "generate the source, re-parse it" way.
+       Design note: `future/comptime-type-construction.md`.
+     - **Arbitrary compile-time execution (`#run`).** Jai/Mox run *any* function
+       at compile time — I/O, `os_get_env`, exec, even a whole program — and bake
+       the result in; the build script itself is ordinary code (no Makefiles).
+       Runic's comptime deliberately evaluates only a fixed, side-effect-free
+       surface. This is the largest gap and the largest design commitment (a
+       comptime interpreter, sandboxing, build-time effects); likely *not* wanted
+       wholesale, but a narrow, pure `#run`-for-constants (bake a computed literal)
+       could be worth it.
+     - **Code generation / AST as data (`#insert`, `__compiler_parse`).** Partly
+       shipped: `@insert "…"` generates struct fields from a comptime string
+       (re-parsed and grafted), and `@field(value)(name)` + `for (@fields(T))`
+       generate *implementations* over values. A first-class AST value (`@code`)
+       is deferred indefinitely — its value collapsed once `@field`/`@fields`
+       shipped, and the reuse cases it seemed to unlock are better served by
+       trailing-block closures. See `future/comptime-type-construction.md`.
+     A genuine place Runic is *ahead* of both: constraint-checked, return-type
+     polymorphic **overloading** approaching type classes — Jai/Mox lean on `$T`
+     polymorphism + reflection instead. Worth keeping that as the distinguishing
+     direction rather than chasing full `#run`/AST metaprogramming.
 - support escaping whitespace in bareword executable/identifier syntax so
   commands or names containing spaces can be represented without immediately
   collapsing to quoted-string behavior

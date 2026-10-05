@@ -1,0 +1,4 @@
+Maybe is a monad (bind + pure)
+Box is a plain container
+int
+bool

@@ -1,0 +1,22 @@
+# A read-modify-write reassignment whose operand is a function call — `h = h + (f x)`
+# — value-captures the call's result instead of using its forked thread handle.
+# Previously the in-place `x = x <op> n` optimization compiled the operand without
+# capture, so a call operand left a thread the arithmetic couldn't dereference.
+
+fn id(n: Int) Int { yield n }
+fn dbl(n: Int) Int { yield n * 2 }
+
+var h = 2
+h = h + (id 5)
+echo "add: ${h}"
+
+h = h * (id 3)
+echo "mul: ${h}"
+
+h = h - (dbl 4)
+echo "sub: ${h}"
+
+# In a loop, accumulating call results in place.
+var acc = 0
+for (1..4) |i| { acc = acc + (dbl i) }
+echo "loop: ${acc}"

@@ -6,7 +6,7 @@
 // same type argument reuses one.
 
 // One type parameter, three call types → three specializations.
-fn Void describe(x: |T|) Void {
+fn Void describe(x: |T|) String {
     echo "${x} is ${T}"
 }
 describe 5
@@ -18,7 +18,7 @@ describe 10
 describe 20
 
 // Multiple type parameters bind independently.
-fn Void pair(a: |A|, b: |B|) Void {
+fn Void pair(a: |A|, b: |B|) String {
     echo "${A} + ${B}"
 }
 pair 1 "x"
@@ -27,8 +27,8 @@ pair true 0
 
 // A capture nested in a generic application (`Box(|T|)`) also monomorphizes:
 // the argument's concrete type flows through the constructor to the capture.
-const Box(T) = struct { value: T }
-fn Void unwrapType(b: Box(|T|)) Void {
+fn Box(comptime T: type) type { yield struct { value: T } }
+fn Void unwrapType(b: Box(|T|)) String {
     echo "unwrapped ${b.value} of type ${T}"
 }
 const bi: Box(Int) = Box{ .value = 7 }
@@ -39,7 +39,7 @@ unwrapType bs
 // Recursion stays at the specialized type: a self-recursive call inside a
 // specialization targets that same specialization, so `${T}` is concrete at
 // every level.
-fn Void countType(x: |T|, n: Int) Void {
+fn Void countType(x: |T|, n: Int) String {
     if (n > 0) {
         echo "level ${n} is ${T}"
         countType x (n - 1)

@@ -1,0 +1,5 @@
+{ x=3 y=7 }
+{ name=ada age=36 }
+scalar: 42
+eq pq=0 pr=1
+eq scalars: 0 1

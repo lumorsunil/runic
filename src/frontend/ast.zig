@@ -176,6 +176,12 @@ pub const TypeExpr = union(enum) {
     execution: PrimitiveType,
     thread: PrimitiveType,
     failed: FailedType,
+    /// The meta-type `type` — the type of a type value. Written as the annotation
+    /// of a `comptime T: type` parameter or the return type of a type-returning
+    /// function. A *type value* itself is represented by the `TypeExpr` it denotes
+    /// (e.g. `Int` is `.integer`); this variant is that value's own type. Fully
+    /// compile-time — it is erased before the IR/runtime.
+    type_type: PrimitiveType,
     /// An implicit generic type variable (an uppercase name in a function
     /// signature that isn't a declared type, e.g. `T`/`U` in `map`). Since the
     /// runtime is dynamically typed, a generic function compiles once; a type
@@ -202,14 +208,20 @@ pub const TypeExpr = union(enum) {
         name: Identifier,
         args: []const *const TypeExpr,
         span: Span,
+        /// True when the constructor itself is a captured type variable — a
+        /// *higher-kinded* application `|M|(A)`: `name` holds the capture name
+        /// `M`, bound to a concrete constructor (e.g. `Maybe`) when this pattern
+        /// is unified against an argument's type, then re-applied as `M(B)`.
+        ctor_is_capture: bool = false,
 
         pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
-            try writer.print("{s}(", .{self.name.name});
-            for (self.args, 0..) |arg, i| {
-                if (i > 0) try writer.writeAll(", ");
+            // Curried, one argument per parenthesis: `HashMap(Key)(Value)`.
+            try writer.print("{s}", .{self.name.name});
+            for (self.args) |arg| {
+                try writer.writeAll("(");
                 try arg.format(writer);
+                try writer.writeAll(")");
             }
-            try writer.writeAll(")");
         }
     };
 
@@ -380,6 +392,16 @@ pub const TypeExpr = union(enum) {
         fields: []const StructField,
         decls: []const StructDecl,
         span: Span,
+        /// The struct's display name, after the first binding it was bound to
+        /// (`const S = struct { … }` names it `S`), the way Zig names an
+        /// otherwise-anonymous struct. Null for a struct never bound to a name
+        /// (a struct literal's inferred type, a type-function result), which
+        /// formats as `<struct>`. Set by the type checker, used only for display.
+        name: ?[]const u8 = null,
+        /// Ordered compile-time recipe (`@insert` / comptime `for … @insert`).
+        /// Empty for an ordinary struct (fields in `fields`); non-empty only inside
+        /// a comptime type function, expanded to `fields` at instantiation.
+        body_items: []const StructBodyItem = &.{},
         /// When true, every field occupies exactly one slot — a struct-typed
         /// field holds an *address* to its sub-struct rather than being inlined.
         /// Used for the dynamically-built module result struct, whose pub-export
@@ -437,7 +459,7 @@ pub const TypeExpr = union(enum) {
         }
 
         pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
-            try writer.writeAll("<struct>{\n");
+            try writer.print("{s}{{\n", .{self.name orelse "<struct>"});
             for (self.fields) |field| {
                 try writer.print("  {s}: {f},\n", .{ field.name.name, field.type_expr });
             }
@@ -462,6 +484,28 @@ pub const TypeExpr = union(enum) {
         pub fn format(_: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
             try writer.writeAll("<struct_field>");
         }
+    };
+
+    /// One item in a struct body that still needs compile-time expansion — an
+    /// `@insert` or a comptime `for … @insert`, interleaved with ordinary fields
+    /// so source order is preserved. A struct with none of these has an empty
+    /// `body_items`; one with a generator carries the ordered recipe here, which
+    /// the compiler expands to concrete fields at instantiation.
+    pub const StructBodyItem = union(enum) {
+        field: StructField,
+        /// `@insert <operand>` — `operand` (a string literal) folds to a comptime
+        /// string, re-parsed as a `name: Type[, …]` field list.
+        insert: *const Expression,
+        /// `for (<source>) |<var>| @insert <operand>` — unroll over a comptime
+        /// source (`@fields(T)`), binding `<var>` per element.
+        for_insert: ForInsert,
+
+        pub const ForInsert = struct {
+            var_name: Identifier,
+            source: *const Expression,
+            operand: *const Expression,
+            span: Span,
+        };
     };
 
     pub const StructDecl = struct {
@@ -644,6 +688,7 @@ pub const TypeExpr = union(enum) {
             .type_var,
             .type_capture,
             .type_application,
+            .type_type,
             => 1,
             .struct_type => |struct_type| blk: {
                 if (struct_type.by_reference_fields) break :blk struct_type.fields.len;
@@ -710,6 +755,8 @@ pub const TypeExpr = union(enum) {
     const executableReturnType = TypeExpr{
         .execution = .{ .span = .global },
     };
+    /// The meta-type `type` — the type of a type value.
+    pub const typeType = TypeExpr{ .type_type = .{ .span = .global } };
     pub const executableType = TypeExpr{
         .function = .{
             .params = .variadic(&executableParameterType),
@@ -902,6 +949,7 @@ pub const Expression = union(enum) {
     builtin: BuiltinExpr,
     subshell: SubshellExpr,
     fd: FdExpr,
+    type_value: TypeValueExpr,
 
     pub fn span(self: Expression) Span {
         return switch (self) {
@@ -942,6 +990,11 @@ pub const Expression = union(enum) {
                 },
                 else => false,
             },
+            // `@field(value)(name)` is an assignable place — it lowers to the
+            // member slot `value.<name>`. (`@`-names can't be user identifiers, so
+            // a name check alone identifies the builtin.)
+            .call => |call| call.callee.* == .identifier and
+                std.mem.eql(u8, call.callee.identifier.name, "@field"),
             else => false,
         };
     }
@@ -1579,6 +1632,9 @@ pub const MatchPattern = union(enum) {
     path: Path,
     binding: Identifier,
     destructure: *BindingPattern,
+    // A comptime type pattern (`Int`, `Box(|E|)`, `Pair(|K|)(|V|)`) — matched
+    // against a comptime type subject, binding any `|capture|` in the arm body.
+    type_pattern: *const TypeExpr,
 
     pub fn span(self: MatchPattern) Span {
         return switch (self) {
@@ -1587,6 +1643,7 @@ pub const MatchPattern = union(enum) {
             .path => |path| path.span,
             .binding => |binding| binding.span,
             .destructure => |pattern| pattern.span(),
+            .type_pattern => |type_expr| type_expr.span(),
         };
     }
 };
@@ -2002,6 +2059,10 @@ pub const Parameter = struct {
     type_annotation: ?*const TypeExpr,
     default_value: ?*Expression,
     is_mutable: bool,
+    /// A `comptime` parameter: its argument must be known at compile time (a
+    /// `type`, or another comptime-constant value). Marks a function that is
+    /// specialized/evaluated at comptime per distinct argument at each call site.
+    is_comptime: bool = false,
     span: Span,
 
     pub fn resolveType(
@@ -2090,6 +2151,24 @@ pub const ExecutableExpr = struct {
         _: *semantic.Scope,
     ) semantic.Scope.Error!?*const TypeExpr {
         return &TypeExpr.executableType;
+    }
+};
+
+/// A type written in value position — `struct { … }`, `error { … }`, etc. — so a
+/// type can be produced as a value (`yield struct { value: T }` in a
+/// type-returning comptime function). Its value is the wrapped type; its own
+/// type is the meta-type `type`. Compile-time only (erased before the IR).
+pub const TypeValueExpr = struct {
+    type_expr: *const TypeExpr,
+    span: Span,
+
+    pub fn resolveType(
+        _: *@This(),
+        _: std.Io,
+        _: std.mem.Allocator,
+        _: *semantic.Scope,
+    ) semantic.Scope.Error!?*const TypeExpr {
+        return &TypeExpr.typeType;
     }
 };
 

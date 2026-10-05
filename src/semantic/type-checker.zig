@@ -3,6 +3,7 @@ const ast = @import("../frontend/ast.zig");
 const builtins = @import("../builtins.zig");
 const rainbow = @import("../rainbow.zig");
 const DocumentStore = @import("../document_store.zig").DocumentStore;
+const Parser = @import("../frontend/parser.zig").Parser;
 const token = @import("../frontend/token.zig");
 const CType = @import("../ffi/ctype.zig").CType;
 
@@ -23,7 +24,45 @@ pub const TypeChecker = struct {
     /// User-defined generic type constructors (`const Box(T) = struct { … }`),
     /// keyed by name. A `Box(Int)` application substitutes the args into `body`.
     generic_type_ctors: std.StringHashMapUnmanaged(GenericTypeCtor) = .empty,
+    /// Comptime type functions — an ordinary function whose comptime type params
+    /// and `yield`ed type make it a generic-type constructor
+    /// (`fn Box(comptime T: type) type { yield struct { value: T } }`). Keyed by
+    /// name; a `Box Int` call substitutes the args into the yielded type. The
+    /// Zig-native replacement for `generic_type_ctors`.
+    comptime_type_fns: std.StringHashMapUnmanaged(GenericTypeCtor) = .empty,
+    /// Function overload sets: an original name declared more than once maps to
+    /// its candidates, each renamed to a unique mangled name in the AST (so the
+    /// compiler sees distinct functions). A call to the original name is resolved
+    /// to one candidate by argument types and the expected return type, then its
+    /// callee is rewritten to that mangled name. Keyed by original name.
+    overload_sets: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(OverloadEntry)) = .empty,
+    /// The expected type of the expression currently being checked, when known
+    /// from context (a binding annotation, a `yield`'s return type, a call
+    /// argument's parameter type). Consulted to disambiguate a return-type-only
+    /// overload (`pure` → `Maybe(Int)` vs `[]Int`). A stack for nesting.
+    expected_type_stack: std.ArrayListUnmanaged(?*const ast.TypeExpr) = .empty,
+    /// The stdout (return) type expected of the next anonymous fn body about to be
+    /// checked — the parameter type when a trailing block / anonymous `fn(…) T` is
+    /// passed to a `fn(…) T` parameter (`check "m" { … }`, `retry n { … }`). A bare
+    /// trailing block declares no return type of its own, so `runFnDecl` adopts
+    /// this as the body's stdout type, making a `fn() Bool` body's stray `echo` the
+    /// same error a named function gets (and avoiding the capture-pipe deadlock it
+    /// would otherwise cause at runtime). Set by `runCall` around the argument and
+    /// consumed (cleared) by `runFnDecl` at entry, so nested fns don't inherit it.
+    pending_fn_body_stdout: ?*const ast.TypeExpr = null,
+    /// Overloaded call nodes already resolved (rewritten or reported), so a call
+    /// visited from several sites (walk, type resolution) is handled exactly once.
+    overload_resolved: std.AutoHashMapUnmanaged(*const ast.CallExpr, void) = .empty,
+    /// Names currently bound by a comptime `for (@fields(T)) |f|` loop. Within the
+    /// loop body, `f.type` is a comptime type (a valid `match`/introspection
+    /// subject) and `f.name` a string. Saved/restored around each such loop.
+    comptime_field_vars: std.StringHashMapUnmanaged(void) = .empty,
     env: ?*std.process.Environ.Map = null,
+    /// Lazily-created parser used to re-parse `@insert` operand strings into real
+    /// struct fields when materializing a recipe struct (mirrors the IR compiler's
+    /// `insert_parser`). Kept for the checker's lifetime so its arena outlives the
+    /// fields it produces.
+    insert_parser: ?Parser = null,
     /// Strict mode (`--strict`): also require handling of command failures
     /// (`ExecutableError`), which are otherwise exempt (bash-like exit-code
     /// model). A `set -e`-style opt-in — off by default.
@@ -35,6 +74,12 @@ pub const TypeChecker = struct {
     /// loop's child scope). A null entry means the enclosing function declared
     /// no stdout type, so its yields are unconstrained.
     stdout_type_stack: std.ArrayListUnmanaged(?*const ast.TypeExpr) = .empty,
+    /// Parallel to `stdout_type_stack`, but holding each function's *raw*
+    /// (unresolved) declared return type. `runYield` uses it to name an anonymous
+    /// struct literal (`yield .{ … }`) from the return type — the raw form keeps
+    /// a constructor name (`Maybe(B)`) that resolution erases into a nameless
+    /// struct. Pushed/popped together with `stdout_type_stack`.
+    stdout_return_raw_stack: std.ArrayListUnmanaged(?*const ast.TypeExpr) = .empty,
 
     /// Concrete variants inferred for each leading-`!T` (inferred) error set,
     /// keyed by the placeholder `error_set` node (shared by pointer between the
@@ -165,13 +210,20 @@ pub const TypeChecker = struct {
         self.modules = .empty;
         self.diagnostics = .empty;
         self.generic_type_ctors = .empty;
+        self.comptime_type_fns = .empty;
         // These collections are arena-backed, so `reset(.free_all)` just freed
         // their storage: clear the now-dangling headers too, otherwise the next
         // pass appends into freed memory (a segfault the moment a function body
         // is type-checked). This is why re-checking after an edit crashed.
         self.stdout_type_stack = .empty;
+        self.stdout_return_raw_stack = .empty;
+        self.overload_sets = .empty;
+        self.expected_type_stack = .empty;
+        self.pending_fn_body_stdout = null;
+        self.overload_resolved = .empty;
         self.inferred_error_sets = .empty;
         self.inferred_collector_stack = .empty;
+        self.comptime_field_vars = .empty;
     }
 
     fn reportSpanError(
@@ -547,6 +599,10 @@ pub const TypeChecker = struct {
     /// the type checker never accepts a forward reference the IR compiler (which
     /// hoists only top-level functions) would fail to compile.
     fn runTopLevelBlock(self: *TypeChecker, scope: *Scope, block: *ast.Block) Error!void {
+        // Pass 0: collect overload sets and mangle their declarations, so pass 1
+        // declares each candidate under a distinct name and calls can resolve.
+        try self.collectOverloads(block);
+
         // Pass 1 (source order): bindings/type declarations are checked normally,
         // and a function only has its *signature* declared. Declarations come
         // before the signatures that reference them, so a signature still resolves
@@ -669,10 +725,23 @@ pub const TypeChecker = struct {
         // type from the enclosing function's declared stdout (return) type. Only a
         // yield to stdout (&1) carries that type.
         if (yield_stmt.fd == 1 and exprMayNeedStructInference(yield_stmt.value) and
-            self.stdout_type_stack.items.len > 0)
+            self.stdout_return_raw_stack.items.len > 0)
         {
-            self.stampInferredLiteral(yield_stmt.value, self.stdout_type_stack.items[self.stdout_type_stack.items.len - 1]);
+            self.stampInferredLiteral(yield_stmt.value, self.stdout_return_raw_stack.items[self.stdout_return_raw_stack.items.len - 1]);
         }
+
+        // The enclosing function's declared return type is the yielded value's
+        // expected type — used to pick a return-type-only overload (`yield pure x`).
+        // Push the *raw* return type (resolved lazily in `overloadReturnMatches`,
+        // like a binding annotation): a higher-kinded `M(B)` resolves to a bare
+        // type variable, which loses the structure needed to disambiguate an
+        // overload by its return constructor.
+        const yield_expected: ?*const ast.TypeExpr = if (yield_stmt.fd == 1 and self.stdout_return_raw_stack.items.len > 0)
+            self.stdout_return_raw_stack.items[self.stdout_return_raw_stack.items.len - 1]
+        else
+            null;
+        try self.expected_type_stack.append(self.arena.allocator(), yield_expected);
+        defer _ = self.expected_type_stack.pop();
 
         try self.runExpression(scope, yield_stmt.value);
 
@@ -690,6 +759,9 @@ pub const TypeChecker = struct {
         const yielded = try self.resolveExprType(scope, yield_stmt.value) orelse return;
         const resolved = try self.resolvePipeType(scope, yielded) orelse return;
         if (self.pipeTypesEqual(resolved, declared_stdout)) return;
+        // A bare value (or `null`) widens into an optional, including nested in a
+        // struct field: `yield .{ .x = n }` satisfies a `Maybe(T)` return.
+        if (self.yieldCoercesToType(resolved, declared_stdout)) return;
 
         // Coerce into an error-union stdout type: a bare ok payload value (`T`)
         // or an error value both satisfy `E!T`.
@@ -773,6 +845,42 @@ pub const TypeChecker = struct {
         return self.pipeTypesEqual(yielded, optional.child);
     }
 
+    /// Whether a yielded value type *coerces* to a declared return type — a
+    /// directional widening the symmetric `pipeTypesEqual` can't express. On top
+    /// of exact equality it allows a bare value or `null` to satisfy an optional
+    /// (`T`/`null` → `?T`) and applies that structurally through struct fields and
+    /// array elements, so `{ x: Int }` (a `yield .{ .x = n }`) satisfies a
+    /// `{ x: ?Int }` return. The reverse — an optional where a bare value is
+    /// required — does not hold, which is why this stays out of `pipeTypesEqual`.
+    fn yieldCoercesToType(
+        self: *TypeChecker,
+        yielded: *const ast.TypeExpr,
+        declared: *const ast.TypeExpr,
+    ) bool {
+        if (self.pipeTypesEqual(yielded, declared)) return true;
+        const d = self.unaliasType(declared);
+        const y = self.unaliasType(yielded);
+        switch (d.*) {
+            .optional => {
+                if (y.* == .null) return true;
+                return self.yieldCoercesToType(yielded, d.optional.child);
+            },
+            .struct_type => {
+                if (y.* != .struct_type) return false;
+                const yf = y.struct_type.fields;
+                const df = d.struct_type.fields;
+                if (yf.len != df.len) return false;
+                for (yf, df) |ly, ld| {
+                    if (!std.mem.eql(u8, ly.name.name, ld.name.name)) return false;
+                    if (!self.yieldCoercesToType(ly.type_expr, ld.type_expr)) return false;
+                }
+                return true;
+            },
+            .array => return y.* == .array and self.yieldCoercesToType(y.array.element, d.array.element),
+            else => return false,
+        }
+    }
+
     /// An empty error set marks an inferred set (produced by leading-`!T` return
     /// types); its members are derived from the function body rather than written.
     fn isInferredErrorSet(error_set: ast.TypeExpr.ErrorSet) bool {
@@ -850,6 +958,13 @@ pub const TypeChecker = struct {
         body: *const ast.TypeExpr,
     };
 
+    /// One candidate of a function overload set: its mangled (unique) name and
+    /// the declaration it was renamed from.
+    pub const OverloadEntry = struct {
+        mangled: []const u8,
+        decl: *ast.FunctionDecl,
+    };
+
     /// Returns a copy of `type_expr` with each identifier that names one of
     /// `params` replaced by the corresponding entry in `args` — the core of a
     /// generic type application (`Box(Int)` substitutes `Int` for `T` in the
@@ -895,6 +1010,17 @@ pub const TypeChecker = struct {
                 }
                 var new_st = st;
                 new_st.fields = new_fields;
+                // Substitute a static decl's declared type too (`nothing: ?T` →
+                // `?Int`), so member access on the instantiated type sees it
+                // concretely.
+                if (st.decls.len > 0) {
+                    const new_decls = try self.arena.allocator().alloc(ast.TypeExpr.StructDecl, st.decls.len);
+                    for (st.decls, new_decls) |decl, *dst| {
+                        dst.* = decl;
+                        if (decl.type_expr) |t| dst.type_expr = try self.substituteTypeParams(t, params, args);
+                    }
+                    new_st.decls = new_decls;
+                }
                 return self.allocTypeExpression(.{ .struct_type = new_st });
             },
             else => return type_expr,
@@ -943,11 +1069,30 @@ pub const TypeChecker = struct {
 
     /// Resolves a `Name(args…)` application against a registered generic
     /// constructor: substitutes the args into its body, then resolves the result.
+    /// Whether `name` is bound in scope to a type variable (a `|T|`/`|M|` capture
+    /// introduced by the enclosing signature), rather than a concrete type.
+    fn nameIsTypeVar(self: *TypeChecker, scope: *Scope, name: []const u8) bool {
+        const binding = scope.lookup(name) orelse return false;
+        const t = binding.type_expr orelse return false;
+        return self.unaliasType(t).* == .type_var;
+    }
+
     fn resolveTypeApplication(
         self: *TypeChecker,
         scope: *Scope,
         app: ast.TypeExpr.TypeApplication,
     ) Error!*const ast.TypeExpr {
+        // A higher-kinded application `M(A)` whose constructor is a captured type
+        // variable is permissive in the generic body — a type variable that
+        // unifies with anything. The concrete constructor is bound only by the IR
+        // compiler's monomorphization (per `M`), which resolves `M(B)` for real.
+        // `M(A)` where `M` is a captured constructor — either written `|M|(A)`
+        // (ctor_is_capture) or a later bare `M(B)` whose `M` is a type variable
+        // introduced by an earlier `|M|(…)`. Permissive in the generic body; the
+        // IR compiler binds `M` concretely at monomorphization.
+        if (app.ctor_is_capture or self.nameIsTypeVar(scope, app.name.name)) {
+            return self.allocTypeExpression(.{ .type_var = .{ .name = app.name.name, .span = app.span } });
+        }
         const ctor = self.generic_type_ctors.get(app.name.name) orelse {
             try self.reportSpanError(
                 app.span,
@@ -963,7 +1108,200 @@ pub const TypeChecker = struct {
         const resolved_args = try self.arena.allocator().alloc(*const ast.TypeExpr, app.args.len);
         for (app.args, resolved_args) |arg, *dst| dst.* = try self.resolveTypeExpr(scope, arg);
         const substituted = try self.substituteTypeParams(ctor.body, ctor.params, resolved_args);
-        return self.resolveTypeExpr(scope, substituted);
+        // A comptime type constructor whose body uses `@insert` / `for … @insert`
+        // carries an unexpanded recipe. The type checker can't fold the operand
+        // strings to full types (no comptime string folder), but it can materialize
+        // the field *names* — so member access and (annotation-driven) construction
+        // catch typos statically; the field types stay permissive and the IR
+        // compiler resolves the real layout.
+        // Name the resulting struct after the written application (`Maybe(Int)`,
+        // `Pair(Int)(String)`) so hover shows `Maybe(Int){ … }` rather than
+        // `<struct>{ … }` — the type-function analog of a `const S = struct { … }`
+        // binding getting the name `S`. Display-only; each instantiation gets its
+        // own name, like Zig's `Maybe(i32)` vs `Maybe(bool)`.
+        if (substituted.* == .struct_type and substituted.struct_type.body_items.len > 0) {
+            if (try self.materializeRecipeFields(scope, substituted.struct_type, ctor.params, resolved_args)) |fields| {
+                var st = substituted.struct_type;
+                st.fields = fields;
+                st.body_items = &.{};
+                if (st.name == null) st.name = try std.fmt.allocPrint(self.arena.allocator(), "{f}", .{app});
+                return self.allocTypeExpression(.{ .struct_type = st });
+            }
+            // Couldn't statically resolve the recipe (e.g. a dynamic field *name*):
+            // keep it permissive and let the IR compiler materialize the layout.
+            return substituted;
+        }
+        const resolved = try self.resolveTypeExpr(scope, substituted);
+        if (resolved.* == .struct_type and resolved.struct_type.name == null) {
+            var st = resolved.struct_type;
+            st.name = try std.fmt.allocPrint(self.arena.allocator(), "{f}", .{app});
+            return self.allocTypeExpression(.{ .struct_type = st });
+        }
+        return resolved;
+    }
+
+    /// Materializes a struct recipe (`@insert` / `for (@fields(T)) |f| @insert …`)
+    /// into concrete fields for static checking — the same layout the IR compiler
+    /// produces, so member access and (annotation-driven) construction catch typos
+    /// and get real field types. An explicit (`.field`) item keeps its substituted
+    /// type; a generated field's name and type come from folding the operand string
+    /// and re-parsing it. Returns null when the recipe can't be statically resolved
+    /// (a dynamic field *name*, an unresolvable `@fields(…)` source, or a malformed
+    /// operand) — the caller then keeps it permissive for the compiler to handle.
+    fn materializeRecipeFields(
+        self: *TypeChecker,
+        scope: *Scope,
+        st: ast.TypeExpr.StructType,
+        params: []const ast.Identifier,
+        args: []const *const ast.TypeExpr,
+    ) Error!?[]const ast.TypeExpr.StructField {
+        const gpa = self.arena.allocator();
+        var fields = std.ArrayList(ast.TypeExpr.StructField).empty;
+        defer fields.deinit(gpa);
+        for (st.body_items) |item| switch (item) {
+            .field => |f| {
+                const subbed = try self.substituteTypeParams(f.type_expr, params, args);
+                try fields.append(gpa, .{ .name = f.name, .type_expr = subbed, .span = f.span });
+            },
+            .insert => |operand| {
+                if (!try self.expandInsert(&fields, operand, null, params, args)) return null;
+            },
+            .for_insert => |fi| {
+                const arg = comptimeFieldsCallArg(fi.source) orelse return null;
+                // The `@fields(…)` argument is usually the constructor's own type
+                // parameter (`@fields(T)`), which maps to the bound argument here —
+                // not something resolvable in the use-site scope.
+                const arg_type = self.insertSourceType(scope, arg, params, args) orelse return null;
+                const src = self.unaliasType(arg_type);
+                if (src.* != .struct_type) return null;
+                for (src.struct_type.fields) |ff| {
+                    if (!try self.expandInsert(&fields, fi.operand, ff, params, args)) return null;
+                }
+            },
+        };
+        return try gpa.dupe(ast.TypeExpr.StructField, fields.items);
+    }
+
+    /// Resolves the argument of a recipe's `@fields(<arg>)` source: a bare
+    /// identifier matching a constructor type parameter maps to its bound argument
+    /// (`@fields(T)` → the concrete arg); anything else is resolved in `scope`.
+    fn insertSourceType(
+        self: *TypeChecker,
+        scope: *Scope,
+        arg: *const ast.Expression,
+        params: []const ast.Identifier,
+        args: []const *const ast.TypeExpr,
+    ) ?*const ast.TypeExpr {
+        const name: ?[]const u8 = switch (arg.*) {
+            .identifier => |id| id.name,
+            .call => |c| if (c.arguments.len == 0 and c.callee.* == .identifier) c.callee.identifier.name else null,
+            else => null,
+        };
+        if (name) |n| for (params, 0..) |param, i| {
+            if (i < args.len and std.mem.eql(u8, param.name, n)) return args[i];
+        };
+        return self.argToType(scope, arg) catch null orelse null;
+    }
+
+    /// Expands one `@insert` operand into concrete fields (appended to `fields`).
+    /// The operand string is folded into a re-parseable `name: Type[, …]` list:
+    /// `${f.name}` becomes the bound field's literal name, and every other
+    /// interpolation (`${T}`, `${f.type}`, …) a fresh placeholder type identifier
+    /// whose real type is recorded and substituted back after re-parsing — so the
+    /// generated fields carry their true types (`?Int` supports `orelse`, etc.).
+    /// Returns false when the recipe can't be resolved statically (no re-parser, a
+    /// malformed operand, or an interpolation landing in field-*name* position), so
+    /// the caller can keep the whole struct permissive.
+    fn expandInsert(
+        self: *TypeChecker,
+        fields: *std.ArrayList(ast.TypeExpr.StructField),
+        operand: *const ast.Expression,
+        field_var: ?ast.TypeExpr.StructField,
+        params: []const ast.Identifier,
+        args: []const *const ast.TypeExpr,
+    ) Error!bool {
+        if (operand.* != .literal or operand.literal != .string) return false;
+        const gpa = self.arena.allocator();
+
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(gpa);
+        var ph_params = std.ArrayList(ast.Identifier).empty;
+        defer ph_params.deinit(gpa);
+        var ph_args = std.ArrayList(*const ast.TypeExpr).empty;
+        defer ph_args.deinit(gpa);
+
+        for (operand.literal.string.segments) |segment| switch (segment) {
+            .text => |t| try buf.appendSlice(gpa, t.payload),
+            .interpolation => |ie| {
+                // `${f.name}` is the generated field's name — emit it as literal text.
+                if (field_var) |fv| {
+                    if (memberAccessParts(ie)) |ma| {
+                        if (std.mem.eql(u8, ma.member, "name")) {
+                            try buf.appendSlice(gpa, fv.name.name);
+                            continue;
+                        }
+                    }
+                }
+                // Anything else fills a type position: record its resolved type and
+                // emit a placeholder identifier to swap back in after re-parsing.
+                const ty = self.interpType(ie, field_var, params, args) orelse
+                    try self.allocTypeExpression(.{ .failed = .{ .span = operand.span() } });
+                const placeholder = try std.fmt.allocPrint(gpa, "__ins_{d}", .{ph_args.items.len});
+                try ph_params.append(gpa, .{ .name = placeholder, .span = operand.span() });
+                try ph_args.append(gpa, ty);
+                try buf.appendSlice(gpa, placeholder);
+            },
+        };
+
+        const raw = self.reparseInsertFields(buf.items) orelse return false;
+        for (raw) |rf| {
+            // A placeholder in *name* position means the field name itself was
+            // dynamic — we don't know the real shape, so bail to permissive.
+            if (std.mem.startsWith(u8, rf.name.name, "__ins_")) return false;
+            const resolved = try self.substituteTypeParams(rf.type_expr, ph_params.items, ph_args.items);
+            try fields.append(gpa, .{ .name = rf.name, .type_expr = resolved, .span = rf.span });
+        }
+        return true;
+    }
+
+    /// The type an `@insert` interpolation stands for: `${f.type}` → the bound
+    /// field's type; a bare `${T}` naming a constructor type parameter → its bound
+    /// argument. Null when it names neither (a dynamic type the checker can't fold).
+    fn interpType(
+        self: *TypeChecker,
+        ie: *ast.Expression,
+        field_var: ?ast.TypeExpr.StructField,
+        params: []const ast.Identifier,
+        args: []const *const ast.TypeExpr,
+    ) ?*const ast.TypeExpr {
+        _ = self;
+        if (memberAccessParts(ie)) |ma| {
+            if (field_var) |fv| if (std.mem.eql(u8, ma.member, "type")) return fv.type_expr;
+            return null;
+        }
+        const name: ?[]const u8 = switch (ie.*) {
+            .identifier => |id| id.name,
+            .call => |c| if (c.arguments.len == 0 and c.callee.* == .identifier)
+                c.callee.identifier.name
+            else
+                null,
+            else => null,
+        };
+        if (name) |n| for (params, 0..) |param, i| {
+            if (i < args.len and std.mem.eql(u8, param.name, n)) return args[i];
+        };
+        return null;
+    }
+
+    /// Re-parses a folded `@insert` field-list string into struct fields, using a
+    /// lazily-created checker-lifetime parser. Null when there's no environment to
+    /// build one or the string doesn't parse as a field list.
+    fn reparseInsertFields(self: *TypeChecker, text: []const u8) ?[]const ast.TypeExpr.StructField {
+        const env = self.env orelse return null;
+        if (self.insert_parser == null) {
+            self.insert_parser = Parser.init(self.io, self.arena.allocator(), env, self.document_store);
+        }
+        return self.insert_parser.?.reparseFieldString(text) catch null;
     }
 
     fn runTypeBindingDecl(
@@ -986,7 +1324,18 @@ pub const TypeChecker = struct {
 
         try self.runTypeExpression(scope, type_binding_decl.type_expr);
 
-        const resolved_type_expr = try self.resolveTypeExpr(scope, type_binding_decl.type_expr);
+        var resolved_type_expr = try self.resolveTypeExpr(scope, type_binding_decl.type_expr);
+
+        // Name an otherwise-anonymous struct after the first binding it is bound
+        // to (`const S = struct { … }` → `S`), the way Zig does, so hover shows
+        // `S{ … }` rather than `<struct>{ … }`. A later alias (`const T = S`)
+        // resolves through `S` and does not overwrite the name (first binding
+        // wins); a struct that already carries a name keeps it.
+        if (resolved_type_expr.* == .struct_type and resolved_type_expr.struct_type.name == null) {
+            var named = resolved_type_expr.struct_type;
+            named.name = type_binding_decl.identifier.name;
+            resolved_type_expr = try self.allocTypeExpression(.{ .struct_type = named });
+        }
 
         scope.declareType(
             self.arena.allocator(),
@@ -1014,9 +1363,27 @@ pub const TypeChecker = struct {
             .array => |a| typeExprHasCapture(a.element),
             .optional => |o| typeExprHasCapture(o.child),
             .promise => |p| typeExprHasCapture(p.child),
-            .type_application => |app| for (app.args) |arg| {
-                if (typeExprHasCapture(arg)) break true;
-            } else false,
+            .type_application => |app| blk: {
+                // A higher-kinded application `|M|(…)` captures the constructor `M`.
+                if (app.ctor_is_capture) break :blk true;
+                for (app.args) |arg| if (typeExprHasCapture(arg)) break :blk true;
+                break :blk false;
+            },
+            // A function-type parameter (`fn (|A|) |B|`) captures through its
+            // parameter and return types.
+            .function => |f| blk: {
+                if (f.return_type) |rt| if (typeExprHasCapture(rt)) break :blk true;
+                if (f.stdin_type) |st| if (typeExprHasCapture(st)) break :blk true;
+                switch (f.params) {
+                    ._non_variadic => |ps| for (ps) |p| {
+                        if (p) |pt| if (typeExprHasCapture(pt)) break :blk true;
+                    },
+                    ._variadic => |p| if (p) |pt| {
+                        if (typeExprHasCapture(pt)) break :blk true;
+                    },
+                }
+                break :blk false;
+            },
             else => false,
         };
     }
@@ -1097,6 +1464,9 @@ pub const TypeChecker = struct {
                 if (self.unaliasType(t).* != .struct_type) return null;
                 return .{ .name = alias.name, .span = alias.span };
             },
+            // A generic application (`Maybe(B)`): stamp the constructor name, so
+            // `yield .{ … }` against a `Maybe(B)` return infers `Maybe{ … }`.
+            .type_application => |app| return app.name,
             else => return null,
         }
     }
@@ -1239,6 +1609,15 @@ pub const TypeChecker = struct {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, binding_decl.span);
 
+        // A comptime type-function call (`const IntBox = Box Int`) evaluates to a
+        // concrete type at compile time; bind the name as that type, so a later
+        // `IntBox{ … }` construction resolves it like any other type binding.
+        if (try self.evalComptimeTypeCall(scope, binding_decl.initializer)) |type_result| {
+            try self.runTypeExpression(scope, type_result);
+            try self.runBindingPattern(scope, binding_decl.pattern, type_result, binding_decl.is_pub, binding_decl.is_mutable);
+            return;
+        }
+
         // Inferred struct literal: `const v: Vector = .{ .x = 3 }` parses as an
         // anonymous struct literal (empty name); take its type from the binding's
         // annotation by stamping the annotation's type name onto the literal, so
@@ -1246,6 +1625,13 @@ pub const TypeChecker = struct {
         if (binding_decl.annotation != null and exprMayNeedStructInference(binding_decl.initializer)) {
             self.stampInferredLiteral(binding_decl.initializer, binding_decl.annotation);
         }
+
+        // The annotation is the initializer's expected type — used to pick a
+        // return-type-only overload (`const b: []Int = pure 42`). Pushed raw and
+        // resolved lazily only when an overload actually needs it, so a normal
+        // binding never re-resolves (and never re-reports) its annotation here.
+        try self.expected_type_stack.append(self.arena.allocator(), binding_decl.annotation);
+        defer _ = self.expected_type_stack.pop();
 
         try self.runExpression(scope, binding_decl.initializer);
 
@@ -1573,7 +1959,12 @@ pub const TypeChecker = struct {
             // capture elsewhere in the signature) or a declared type; otherwise
             // it is an undeclared-type error (a typo), not a silent generic.
             .type_capture => |capture| try out.put(self.arena.allocator(), capture.name, {}),
-            .type_application => |app| for (app.args) |arg| try self.collectTypeVars(outer, arg, out),
+            .type_application => |app| {
+                // A higher-kinded application `|M|(A)` introduces the constructor
+                // capture `M` as a type variable too.
+                if (app.ctor_is_capture) try out.put(self.arena.allocator(), app.name.name, {});
+                for (app.args) |arg| try self.collectTypeVars(outer, arg, out);
+            },
             .array => |a| try self.collectTypeVars(outer, a.element, out),
             .optional => |o| try self.collectTypeVars(outer, o.child, out),
             .promise => |p| try self.collectTypeVars(outer, p.child, out),
@@ -1805,6 +2196,141 @@ pub const TypeChecker = struct {
     /// resolve (no "type T not declared") and — resolved *in the function scope* —
     /// bakes them into the stored function type as `.type_var`, so a call site
     /// never re-resolves a raw `T`/`U`.
+    /// The bound name of a `comptime T: type` parameter — one that carries a
+    /// type value, usable as a type variable inside the body (`x: T`, `[]T`) and
+    /// compared as a value (`T == Int`). Null for any other parameter (including
+    /// a comptime *value* param such as `comptime n: Int`).
+    fn comptimeTypeParamName(param: *const ast.Parameter) ?[]const u8 {
+        if (!param.is_comptime) return null;
+        const annotation = param.type_annotation orelse return null;
+        if (annotation.* != .type_type) return null;
+        return switch (param.pattern.*) {
+            .identifier => |id| id.name,
+            else => null,
+        };
+    }
+
+    /// The type a `yield`ed type-value expression denotes — the body of a
+    /// type-returning function. Handles a bare `yield <type>` and a block whose
+    /// last `yield` produces a type. Null when the body does not simply yield a
+    /// type (a more complex comptime body is not reduced to a constructor).
+    fn yieldedType(body: *const ast.Expression) ?*const ast.TypeExpr {
+        switch (body.*) {
+            .type_value => |tv| return tv.type_expr,
+            .block => |block| {
+                var found: ?*const ast.TypeExpr = null;
+                for (block.statements) |stmt| {
+                    if (stmt.* == .yield_stmt and stmt.yield_stmt.value.* == .type_value) {
+                        found = stmt.yield_stmt.value.type_value.type_expr;
+                    }
+                }
+                return found;
+            },
+            else => return null,
+        }
+    }
+
+    /// If `fn_decl` is a comptime type function — returns `type`, has one or more
+    /// `comptime T: type` params, and `yield`s a type — the generic-type
+    /// constructor it is equivalent to (params + yielded body). Null otherwise.
+    fn comptimeTypeCtor(self: *TypeChecker, fn_decl: *const ast.FunctionDecl) Error!?GenericTypeCtor {
+        const return_type = fn_decl.return_type orelse return null;
+        if (return_type.* != .type_type) return null;
+        const body_type = yieldedType(fn_decl.body) orelse return null;
+
+        var names: std.ArrayListUnmanaged(ast.Identifier) = .empty;
+        switch (fn_decl.params) {
+            ._non_variadic => |params| for (params) |param| {
+                if (comptimeTypeParamName(param)) |name| {
+                    try names.append(self.arena.allocator(), .{ .name = name, .span = param.span });
+                }
+            },
+            ._variadic => |param| if (comptimeTypeParamName(param)) |name| {
+                try names.append(self.arena.allocator(), .{ .name = name, .span = param.span });
+            },
+        }
+        if (names.items.len == 0) return null;
+        // Fold the body's `pub const` declarations into the yielded struct's decls
+        // so the produced type carries them as static members (`Maybe(Int).nothing`,
+        // and the implicit `.nothing`). Mirrors the IR compiler's
+        // `withTypeFnPubDecls`.
+        const body = try self.foldTypeFnPubDecls(body_type, fn_decl.body);
+        return .{ .params = try names.toOwnedSlice(self.arena.allocator()), .body = body };
+    }
+
+    /// Returns `body` with every `pub const` in a type function's body block
+    /// appended to its struct `decls`. A non-struct or bare body is unchanged.
+    fn foldTypeFnPubDecls(self: *TypeChecker, body: *const ast.TypeExpr, fn_body: *const ast.Expression) Error!*const ast.TypeExpr {
+        if (body.* != .struct_type) return body;
+        if (fn_body.* != .block) return body;
+        var decls: std.ArrayListUnmanaged(ast.TypeExpr.StructDecl) = .empty;
+        try decls.appendSlice(self.arena.allocator(), body.struct_type.decls);
+        for (fn_body.block.statements) |stmt| {
+            switch (stmt.*) {
+                .binding_decl => |*bd| {
+                    if (!bd.is_pub) continue;
+                    if (bd.pattern.* != .identifier) continue;
+                    try decls.append(self.arena.allocator(), .{
+                        .name = bd.pattern.identifier,
+                        .type_expr = bd.annotation,
+                        .decl_source = .{ .binding_decl = bd },
+                        .span = bd.span,
+                    });
+                },
+                else => {},
+            }
+        }
+        if (decls.items.len == body.struct_type.decls.len) return body;
+        var st = body.struct_type;
+        st.decls = try decls.toOwnedSlice(self.arena.allocator());
+        return self.allocTypeExpression(.{ .struct_type = st });
+    }
+
+    /// The type a comptime call argument denotes (`Int` → the type Int, a nested
+    /// `Box Int` → its result type). Null when the argument is not a type.
+    fn argToType(self: *TypeChecker, scope: *Scope, arg: *const ast.Expression) Error!?*const ast.TypeExpr {
+        switch (arg.*) {
+            .type_value => |tv| return tv.type_expr,
+            .identifier => |id| {
+                const segments = try self.arena.allocator().alloc(ast.Identifier, 1);
+                segments[0] = id;
+                const named = try self.allocTypeExpression(.{ .identifier = .{
+                    .path = .{ .segments = segments, .span = id.span },
+                    .span = id.span,
+                } });
+                return try self.resolveTypeExpr(scope, named);
+            },
+            .call => |call| {
+                // A bare type name (`Int`) parses as a zero-argument call; unwrap
+                // it to its callee. A call with arguments is a nested comptime type
+                // call (`Box (Box Int)`).
+                if (call.arguments.len == 0) return try self.argToType(scope, call.callee);
+                return try self.evalComptimeTypeCall(scope, arg);
+            },
+            else => return null,
+        }
+    }
+
+    /// Evaluates a call to a comptime type function (`Box Int`) to the concrete
+    /// type it produces, substituting the type arguments into the yielded body.
+    /// Null when `expr` is not such a call.
+    fn evalComptimeTypeCall(self: *TypeChecker, scope: *Scope, expr: *const ast.Expression) Error!?*const ast.TypeExpr {
+        if (expr.* != .call) return null;
+        const call = expr.call;
+        if (call.callee.* != .identifier) return null;
+        const ctor = self.comptime_type_fns.get(call.callee.identifier.name) orelse {
+            return null;
+        };
+        if (call.arguments.len != ctor.params.len) {
+            return null;
+        }
+        const args = try self.arena.allocator().alloc(*const ast.TypeExpr, call.arguments.len);
+        for (call.arguments, args) |arg, *dst| {
+            dst.* = (try self.argToType(scope, arg)) orelse return null;
+        }
+        return try self.substituteTypeParams(ctor.body, ctor.params, args);
+    }
+
     fn declareSignatureTypeVars(
         self: *TypeChecker,
         scope: *Scope,
@@ -1816,9 +2342,15 @@ pub const TypeChecker = struct {
         if (fn_decl.stdin_type) |st| try self.collectTypeVars(scope, st, &type_vars);
         switch (fn_decl.params) {
             ._non_variadic => |params| for (params) |param| {
+                // A `comptime T: type` param introduces `T` as a type variable, so
+                // a later param annotation (`x: T`) and the return type resolve it.
+                if (comptimeTypeParamName(param)) |name| try type_vars.put(self.arena.allocator(), name, {});
                 if (param.type_annotation) |ta| try self.collectTypeVars(scope, ta, &type_vars);
             },
-            ._variadic => |param| if (param.type_annotation) |ta| try self.collectTypeVars(scope, ta, &type_vars),
+            ._variadic => |param| {
+                if (comptimeTypeParamName(param)) |name| try type_vars.put(self.arena.allocator(), name, {});
+                if (param.type_annotation) |ta| try self.collectTypeVars(scope, ta, &type_vars);
+            },
         }
         if (fn_decl.return_type) |rt| try self.collectTypeVars(scope, rt, &type_vars);
         var it = type_vars.keyIterator();
@@ -1835,6 +2367,233 @@ pub const TypeChecker = struct {
     /// already declared in this scope (a re-run, or a later `runFnDecl`). Builds a
     /// throwaway function scope only to bake in any signature type variables; the
     /// body is checked later by `runFnDecl` in its own scope.
+    /// Pass 0 of top-level checking: any function name declared more than once is
+    /// an overload set. Each such declaration is renamed to a unique mangled name
+    /// (`name#0`, `name#1`, …) — mutating the AST, which the IR compiler then sees
+    /// as distinct functions — and recorded so a call to the original name can be
+    /// resolved to one candidate (`resolveOverloadedCall`). The `#` separator can
+    /// never appear in a source identifier, so a mangled name cannot collide.
+    fn collectOverloads(self: *TypeChecker, block: *ast.Block) Error!void {
+        const a = self.arena.allocator();
+        var counts: std.StringHashMapUnmanaged(usize) = .empty;
+        defer counts.deinit(a);
+        for (block.statements) |statement| {
+            const fn_decl = fnDeclStatement(statement) orelse continue;
+            const name = (fn_decl.name orelse continue).name;
+            const gop = try counts.getOrPut(a, name);
+            gop.value_ptr.* = (if (gop.found_existing) gop.value_ptr.* else 0) + 1;
+        }
+
+        var indices: std.StringHashMapUnmanaged(usize) = .empty;
+        defer indices.deinit(a);
+        for (block.statements) |statement| {
+            const fn_decl = fnDeclStatement(statement) orelse continue;
+            const original = (fn_decl.name orelse continue).name;
+            if ((counts.get(original) orelse 0) < 2) continue;
+
+            const idx_gop = try indices.getOrPut(a, original);
+            const idx = if (idx_gop.found_existing) idx_gop.value_ptr.* else 0;
+            idx_gop.value_ptr.* = idx + 1;
+            const mangled = try std.fmt.allocPrint(a, "{s}#{d}", .{ original, idx });
+
+            const set_gop = try self.overload_sets.getOrPut(a, original);
+            if (!set_gop.found_existing) set_gop.value_ptr.* = .empty;
+            try set_gop.value_ptr.append(a, .{ .mangled = mangled, .decl = fn_decl });
+
+            fn_decl.name.?.name = mangled;
+        }
+    }
+
+    fn currentExpectedType(self: *TypeChecker) ?*const ast.TypeExpr {
+        if (self.expected_type_stack.items.len == 0) return null;
+        return self.expected_type_stack.items[self.expected_type_stack.items.len - 1];
+    }
+
+    /// The concrete struct that the current expected type resolves to when it is an
+    /// application of `ctor_name` (`const p: Partial(Point) = …`) that materialized
+    /// into real fields — the layout to validate a `Ctor{ … }` literal against, so
+    /// construction catches field typos. Null when there's no such expected type,
+    /// it names a different constructor, or the recipe stayed permissive (a dynamic
+    /// field name), in which case the caller keeps the permissive ctor-body check.
+    fn expectedMaterializedStruct(
+        self: *TypeChecker,
+        scope: *Scope,
+        ctor_name: []const u8,
+    ) Error!?ast.TypeExpr.StructType {
+        const expected = self.currentExpectedType() orelse return null;
+        // Trust the expected type as the layout to validate `Ctor{…}` against when
+        // it is an application of the *same* constructor (a `Partial(…)` annotation)
+        // — never an unrelated `Point(…)`. A parameter type comes in already
+        // resolved to its struct layout (the constructor name is gone); that is the
+        // declared type this argument must match, so it is trusted directly.
+        if (expected.* == .type_application and
+            !std.mem.eql(u8, expected.type_application.name.name, ctor_name)) return null;
+        const resolved = self.unaliasType(try self.resolveTypeExpr(scope, expected));
+        if (resolved.* != .struct_type) return null;
+        if (resolved.struct_type.body_items.len > 0) return null; // stayed permissive
+        return resolved.struct_type;
+    }
+
+    /// Permissive type match for overload selection: a generic parameter/return
+    /// (type variable or capture) accepts anything; otherwise the types must be
+    /// equal or coerce (a value widening into an optional, either direction — the
+    /// candidate's declared shape is what matters, not the yield direction).
+    fn overloadTypeMatches(self: *TypeChecker, a_type: *const ast.TypeExpr, b_type: *const ast.TypeExpr) bool {
+        const a = self.unaliasType(a_type);
+        const b = self.unaliasType(b_type);
+        if (a.* == .type_var or a.* == .type_capture) return true;
+        if (b.* == .type_var or b.* == .type_capture) return true;
+        return self.pipeTypesEqual(a, b) or self.yieldCoercesToType(a, b) or self.yieldCoercesToType(b, a);
+    }
+
+    /// Whether an overload candidate can accept the given call arguments: same
+    /// arity, and each argument's type matches the parameter's (a captured or
+    /// untyped parameter accepts anything; an argument whose type can't be
+    /// resolved here is treated permissively).
+    fn overloadAcceptsArgs(self: *TypeChecker, scope: *Scope, decl: *ast.FunctionDecl, args: []const *ast.Expression) bool {
+        const params = switch (decl.params) {
+            ._non_variadic => |ps| ps,
+            ._variadic => return true,
+        };
+        if (params.len != args.len) return false;
+        // Resolve each parameter annotation in the candidate's *own* signature
+        // scope, so a bare type-variable reference (`ma: []A`, where `A` is
+        // introduced by another parameter's `|A|`) resolves to a permissive type
+        // variable instead of being reported "not declared" — probing a candidate
+        // must not emit errors. Arguments stay in the caller's `scope`.
+        const fn_scope = self.arena.allocator().create(Scope) catch return true;
+        fn_scope.* = .initWithParent(scope, decl.span);
+        self.declareSignatureTypeVars(scope, fn_scope, decl) catch {};
+        for (params, args) |param, arg| {
+            const ann = param.type_annotation orelse continue;
+            // A higher-kinded parameter `|M|(…)` binds `M` to the argument's type
+            // *constructor* — which is always a named type (a struct / generic
+            // constructor application), never the built-in array or a primitive.
+            // So it accepts a constructor-like argument and rejects the rest; this
+            // is what lets a `map(…, |M|(A))` monad overload and a `map(…, []A)`
+            // list overload dispatch on the same call.
+            if (ann.* == .type_application and ann.type_application.ctor_is_capture) {
+                // An array literal (`.{ 1, 2, 3 }`) is array-like, never a named
+                // constructor — reject it outright. A homogeneous one has no
+                // resolved type here (it flows permissively), so the type check
+                // below can't catch it.
+                if (arg.* == .array) return false;
+                const arg_raw = (self.resolveExprType(scope, arg) catch continue) orelse continue;
+                const arg_type = self.resolveTypeExpr(scope, arg_raw) catch arg_raw;
+                if (!self.typeIsConstructorLike(arg_type)) return false;
+                continue;
+            }
+            if (typeExprHasCapture(ann)) continue;
+            const param_type = self.resolveTypeExpr(fn_scope, ann) catch continue;
+            if (self.unaliasType(param_type).* == .type_var) continue;
+            const arg_raw = (self.resolveExprType(scope, arg) catch continue) orelse continue;
+            const arg_type = self.resolveTypeExpr(scope, arg_raw) catch arg_raw;
+            if (!self.overloadTypeMatches(arg_type, param_type)) return false;
+        }
+        return true;
+    }
+
+    /// Whether a type has a named constructor `M(…)` can bind to — a struct or a
+    /// generic-constructor application. An array, optional, primitive, or function
+    /// has no such constructor, so a higher-kinded `|M|(…)` parameter rejects it.
+    fn typeIsConstructorLike(self: *TypeChecker, t: *const ast.TypeExpr) bool {
+        return switch (self.unaliasType(t).*) {
+            .struct_type, .type_application => true,
+            else => false,
+        };
+    }
+
+    /// Whether an overload candidate's declared return type matches `expected`.
+    /// The return type is resolved in a signature scope so its own type variables
+    /// (`Maybe(A)`) resolve.
+    fn overloadReturnMatches(self: *TypeChecker, scope: *Scope, decl: *ast.FunctionDecl, expected_raw: *const ast.TypeExpr) bool {
+        const fn_scope = self.arena.allocator().create(Scope) catch return false;
+        fn_scope.* = .initWithParent(scope, decl.span);
+        self.declareSignatureTypeVars(scope, fn_scope, decl) catch {};
+        // A higher-kinded expected type `M(B)` — the captured constructor `M`
+        // applied — resolves to a bare type variable, against which *every*
+        // candidate matches permissively. But a captured constructor can only ever
+        // be a named type constructor, so only a candidate that itself returns a
+        // named constructor application (`Maybe(A)`, not `[]A`/`Int`) can produce
+        // an `M(B)`. Match structurally on that, so the sole constructor-returning
+        // overload is selected (`yield pure x` inside a generic `map`); the caller
+        // stays ambiguous only if several candidates qualify. `M` is a type
+        // variable in the call-site `scope`; the candidate's return constructor is
+        // checked in its own signature scope.
+        if (self.isHigherKindedApp(scope, expected_raw)) {
+            const rt0 = decl.return_type orelse return false;
+            return self.returnIsConstructorApp(fn_scope, rt0);
+        }
+        // Resolve the expected type here (lazily) rather than at the push site, so
+        // an ordinary binding never re-resolves its annotation.
+        const expected = self.resolveTypeExpr(fn_scope, expected_raw) catch return false;
+        const rt = decl.return_type orelse return self.unaliasType(expected).* == .void;
+        const resolved_rt = self.resolveTypeExpr(fn_scope, rt) catch return false;
+        return self.overloadTypeMatches(resolved_rt, expected);
+    }
+
+    /// Whether `t` is a higher-kinded application `M(…)` whose constructor is a
+    /// captured/generic type variable — its concrete constructor is unknown in
+    /// this generic body (only monomorphization binds it).
+    fn isHigherKindedApp(self: *TypeChecker, scope: *Scope, t: *const ast.TypeExpr) bool {
+        return t.* == .type_application and
+            (t.type_application.ctor_is_capture or self.nameIsTypeVar(scope, t.type_application.name.name));
+    }
+
+    /// Whether a declared return type is a *named* constructor application
+    /// (`Maybe(A)`), rather than a capture, array, optional, or primitive. Only
+    /// such an overload can satisfy a higher-kinded `M(B)`.
+    fn returnIsConstructorApp(self: *TypeChecker, scope: *Scope, t: *const ast.TypeExpr) bool {
+        return t.* == .type_application and !t.type_application.ctor_is_capture and
+            !self.nameIsTypeVar(scope, t.type_application.name.name);
+    }
+
+    /// Resolves an overloaded call in place. If the callee names an overload set,
+    /// picks the candidate matching the argument types — and, when several match,
+    /// the expected return type from context — then rewrites the callee to that
+    /// candidate's mangled name. Idempotent (each call node is resolved once).
+    /// Reports an error on no match or an unresolved ambiguity.
+    fn resolveOverloadedCall(self: *TypeChecker, scope: *Scope, call: *ast.CallExpr) Error!void {
+        if (call.callee.* != .identifier) return;
+        const set = self.overload_sets.getPtr(call.callee.identifier.name) orelse return;
+        if (self.overload_resolved.contains(call)) return;
+        try self.overload_resolved.put(self.arena.allocator(), call, {});
+        const name = call.callee.identifier.name;
+
+        var matches: std.ArrayListUnmanaged(OverloadEntry) = .empty;
+        defer matches.deinit(self.arena.allocator());
+        for (set.items) |cand| {
+            if (self.overloadAcceptsArgs(scope, cand.decl, call.arguments)) {
+                try matches.append(self.arena.allocator(), cand);
+            }
+        }
+
+        if (matches.items.len == 0) {
+            try self.reportSpanError(call.span, Error.UnsupportedExpression, .@"error", "no overload of '{s}' matches the given arguments", .{name});
+            return;
+        }
+
+        var chosen: ?OverloadEntry = if (matches.items.len == 1) matches.items[0] else null;
+        if (chosen == null) {
+            if (self.currentExpectedType()) |expected| {
+                var count: usize = 0;
+                for (matches.items) |cand| {
+                    if (self.overloadReturnMatches(scope, cand.decl, expected)) {
+                        chosen = cand;
+                        count += 1;
+                    }
+                }
+                if (count != 1) chosen = null;
+            }
+        }
+
+        if (chosen) |c| {
+            call.callee.identifier.name = c.mangled;
+        } else {
+            try self.reportSpanError(call.span, Error.UnsupportedExpression, .@"error", "ambiguous call to overloaded '{s}'; annotate the expected type to select an overload", .{name});
+        }
+    }
+
     fn declareFunctionSignature(self: *TypeChecker, scope: *Scope, fn_decl: *ast.FunctionDecl) Error!void {
         const identifier = fn_decl.name orelse return;
         if (scope.bindings.contains(identifier.name)) return;
@@ -1845,6 +2604,15 @@ pub const TypeChecker = struct {
         const fn_scope = try self.arena.allocator().create(Scope);
         fn_scope.* = .initWithParent(scope, fn_decl.span);
         try self.declareSignatureTypeVars(scope, fn_scope, fn_decl);
+        // A type-returning comptime function acts as a generic-type constructor.
+        // Register it under `comptime_type_fns` so a `Box Int` value call resolves,
+        // and under `generic_type_ctors` so a `Box(Int)` application in a type
+        // position (e.g. a struct field `entries: []Entry(K, V)`) also resolves.
+        if (try self.comptimeTypeCtor(fn_decl)) |ctor| {
+            try self.comptime_type_fns.put(self.arena.allocator(), identifier.name, ctor);
+            try self.generic_type_ctors.put(self.arena.allocator(), identifier.name, ctor);
+        }
+
         const raw_fn_type = try self.resolveExprType(fn_scope, fn_decl);
         const resolved_fn_type = if (raw_fn_type) |t| try self.resolveTypeExpr(fn_scope, t) else null;
         try scope.declare(self.arena.allocator(), identifier, resolved_fn_type, fn_decl.is_pub, false);
@@ -1914,6 +2682,10 @@ pub const TypeChecker = struct {
 
         switch (fn_decl.params) {
             ._non_variadic => |params| for (params) |param| {
+                // A `comptime T: type` param is already declared as a type variable
+                // by `declareSignatureTypeVars`; declaring it again as a value here
+                // would shadow that, so `x: T` would no longer resolve as a type.
+                if (comptimeTypeParamName(param) != null) continue;
                 try self.checkParamAnnotated(param);
                 // Resolve the param's declared type (like the stdin/fn types
                 // above), so a primitive annotation such as `Int` — parsed as a
@@ -1932,28 +2704,40 @@ pub const TypeChecker = struct {
                 );
             },
             ._variadic => |param| {
-                try self.checkParamAnnotated(param);
-                const raw = try self.resolveExprType(fn_scope, param);
-                const param_type = if (raw) |t| try self.resolveTypeExpr(fn_scope, t) else null;
-                try self.runBindingPattern(
-                    fn_scope,
-                    param.pattern,
-                    param_type,
-                    false,
-                    param.is_mutable,
-                );
+                if (comptimeTypeParamName(param) == null) {
+                    try self.checkParamAnnotated(param);
+                    const raw = try self.resolveExprType(fn_scope, param);
+                    const param_type = if (raw) |t| try self.resolveTypeExpr(fn_scope, t) else null;
+                    try self.runBindingPattern(
+                        fn_scope,
+                        param.pattern,
+                        param_type,
+                        false,
+                        param.is_mutable,
+                    );
+                }
             },
         }
 
         // Make the declared stdout type visible to every `yield` in the body
         // (including yields nested in loops/blocks/matches) via the stack. Each
         // `runYield` validates against the top entry in the scope it runs in.
+        // A bare trailing block / anonymous fn declares no return type; adopt the
+        // stdout type its parameter context expects (`pending_fn_body_stdout`, set
+        // by `runCall`), so a `fn() Bool` body's stray `echo` is the same error a
+        // named `fn … Bool` gets. Consume it immediately so nested fns don't inherit.
+        const pending_stdout = self.pending_fn_body_stdout;
+        self.pending_fn_body_stdout = null;
         const resolved_return: ?*const ast.TypeExpr = if (fn_decl.return_type) |return_type|
             try self.resolveTypeExpr(fn_scope, return_type)
+        else if (pending_stdout) |p|
+            try self.resolveTypeExpr(fn_scope, p)
         else
             null;
         try self.stdout_type_stack.append(self.arena.allocator(), resolved_return);
         defer _ = self.stdout_type_stack.pop();
+        try self.stdout_return_raw_stack.append(self.arena.allocator(), fn_decl.return_type);
+        defer _ = self.stdout_return_raw_stack.pop();
 
         // If the return type is a leading-`!T` (inferred) error union, set up a
         // collector so the body's yielded/propagated errors become the concrete
@@ -2073,7 +2857,7 @@ pub const TypeChecker = struct {
             .struct_literal => |struct_literal| for (struct_literal.fields) |field| {
                 try self.validateFunctionBodyStdin(scope, field.value, enclosing_stdin);
             },
-            .fn_decl, .identifier, .env_var, .path, .literal, .pipeline_deprecated, .import_expr, .cimport_expr, .executable, .builtin, .fd => {},
+            .fn_decl, .identifier, .env_var, .path, .literal, .pipeline_deprecated, .import_expr, .cimport_expr, .executable, .builtin, .fd, .type_value => {},
         }
     }
 
@@ -2150,6 +2934,10 @@ pub const TypeChecker = struct {
     }
 
     fn runCall(self: *TypeChecker, scope: *Scope, call: *ast.CallExpr) Error!void {
+        // Resolve an overloaded callee to a concrete candidate first: the original
+        // (overloaded) name is not bound as a value, so running the callee before
+        // rewriting it would fail to resolve.
+        try self.resolveOverloadedCall(scope, call);
         try self.runExpression(scope, call.callee);
 
         // Inferred struct-literal arguments: `f entity .{ .x = 3 }` takes each
@@ -2158,13 +2946,64 @@ pub const TypeChecker = struct {
         // before checking the argument, so it validates like the named form.
         try self.stampInferredStructArgs(scope, call);
 
-        for (call.arguments) |arg| try self.runExpression(scope, arg);
+        // A recipe-ctor struct-literal argument (`f Partial{ … }`) is validated
+        // against the parameter's materialized type: push the parameter type as the
+        // expected type so `runStructLiteral` checks the fields (an unknown/missing
+        // field, a wrong value type) against the layout the parameter's annotation
+        // materializes — the same check a `const p: Partial(…) = Partial{ … }`
+        // binding gets. Only recipe-ctor literals opt in, to avoid disturbing
+        // return-type-overloaded arguments.
+        const arg_callee = try self.calleeFunctionForInference(scope, call.callee);
+        for (call.arguments, 0..) |arg, i| {
+            var pushed = false;
+            if (arg.* == .struct_literal and
+                self.generic_type_ctors.contains(arg.struct_literal.name.name))
+            {
+                if (arg_callee) |cf| {
+                    const param_index = i + cf.offset;
+                    const param_type: ?*const ast.TypeExpr = switch (cf.params) {
+                        ._non_variadic => |list| if (param_index < list.len) list[param_index] else null,
+                        ._variadic => |element| element,
+                    };
+                    if (param_type) |pt| {
+                        try self.expected_type_stack.append(self.arena.allocator(), pt);
+                        pushed = true;
+                    }
+                }
+            }
+            // A trailing block / anonymous fn argument adopts its `fn(…) T`
+            // parameter's return type `T` as the body's stdout type (so a `fn() Bool`
+            // body's stray `echo` is caught, like a named function's). `runFnDecl`
+            // reads and clears `pending_fn_body_stdout` at entry.
+            if (arg.* == .fn_decl and arg.fn_decl.return_type == null) {
+                if (arg_callee) |cf| {
+                    const param_index = i + cf.offset;
+                    const param_type: ?*const ast.TypeExpr = switch (cf.params) {
+                        ._non_variadic => |list| if (param_index < list.len) list[param_index] else null,
+                        ._variadic => |element| element,
+                    };
+                    if (param_type) |pt| {
+                        const unaliased = self.unaliasType(pt);
+                        if (unaliased.* == .function) {
+                            self.pending_fn_body_stdout = unaliased.function.return_type;
+                        }
+                    }
+                }
+            }
+            try self.runExpression(scope, arg);
+            self.pending_fn_body_stdout = null;
+            if (pushed) _ = self.expected_type_stack.pop();
+        }
 
         // A bare command (an identifier callee with no scope binding — `echo`,
         // `ls`, …) serializes each argument to a string, so a whole struct has
         // no valid form. User functions (which have a binding) and module calls
-        // (member callees) may legitimately take struct arguments.
-        const is_command = call.callee.* == .identifier and scope.lookup(call.callee.identifier.name) == null;
+        // (member callees) may legitimately take struct arguments. `@`-builtins
+        // (`@field(x)(name)`, `@fields(T)`, …) are not commands and take types /
+        // struct values by design, so they are exempt.
+        const is_command = call.callee.* == .identifier and
+            scope.lookup(call.callee.identifier.name) == null and
+            !(call.callee.identifier.name.len > 0 and call.callee.identifier.name[0] == '@');
         if (is_command) {
             for (call.arguments) |arg| {
                 // A struct-typed argument, or a generic struct literal (`Box{ … }`)
@@ -2211,6 +3050,8 @@ pub const TypeChecker = struct {
 
         try self.runExpression(scope, expr_stmt.expression);
 
+        try self.checkBareStatementStdout(scope, expr_stmt.expression);
+
         // Enforce error handling: a bare statement whose result is an error
         // (a value, a call, or a pipeline whose final stage yields an error
         // union) leaves it unhandled. At the top level there is nothing to
@@ -2234,6 +3075,97 @@ pub const TypeChecker = struct {
         }
     }
 
+    /// A bare statement that produces stdout output writes it to the enclosing
+    /// function's stdout (`&1`). Its output type must match the function's stdout
+    /// type; when it does not, the output corrupts the yielded value (and, on the
+    /// capture path, deadlocks). Two producers are checked:
+    ///
+    ///   - a command (`echo "x"`, `ls …`) — an identifier callee with no scope
+    ///     binding — writes text, i.e. `String`;
+    ///   - a bare call to a user function (`helper`, `g x`) forwards that
+    ///     function's own stdout (its declared return type).
+    ///
+    /// A byte-channel stdout (`Void` passthrough, `String`, `Byte`) accepts any
+    /// output, so it never mismatches. A command's result that is *bound*
+    /// (`const x = echo …`) is a binding, not an expression statement, so it never
+    /// reaches here; one that redirects stdout elsewhere (`>&2`, `> file`) is
+    /// skipped, as is a call to a `Void` function (it produces no stdout).
+    fn checkBareStatementStdout(self: *TypeChecker, scope: *Scope, expr: *ast.Expression) Error!void {
+        if (self.stdout_type_stack.items.len == 0) return; // top level: no stdout type
+        const declared = self.stdout_type_stack.items[self.stdout_type_stack.items.len - 1] orelse return;
+        // A byte-channel stdout accepts any output — no mismatch is possible.
+        // A `Void` stdout means the function produces *nothing* on `&1`: unlike a
+        // byte channel (`String`/`Byte`/a command `execution`), it does not accept a
+        // bare command's or `echo`'s output. (Run the command for effect by binding
+        // its result — `const _ = mkdir …` — redirecting it, or `@log`; a function
+        // that genuinely produces text declares a `String` stdout.) This guarantee —
+        // a `Void` function is silent — is what makes a bare `Void` call safe inside
+        // a value-returning body (no stray bytes corrupt the captured value).
+        if (self.stdoutAcceptsCommandBytes(declared) and self.unaliasType(declared).* != .void) return;
+        if (expr.* != .call) return;
+        const call = expr.call;
+        if (call.callee.* != .identifier) return; // UFCS / pipelines: not handled here
+        const name = call.callee.identifier.name;
+        // Builtins that don't write to `&1`: `@…` builtins (`@log` goes to the real
+        // stdout by design), and `cd`/`setenv`, which change process state and
+        // produce no output — so they are allowed in a `Void` function.
+        if (name.len > 0 and name[0] == '@') return;
+        if (std.mem.eql(u8, name, "cd") or std.mem.eql(u8, name, "setenv")) return;
+        if (call.redirects.len != 0) return; // stdout may be redirected away — skip
+
+        // The statement's stdout output type: `String` for a command (no binding),
+        // else the called function's declared return type.
+        const produced: *const ast.TypeExpr = if (scope.lookup(name)) |binding| blk: {
+            const t = binding.type_expr orelse return;
+            if (self.unaliasType(t).* != .function) return; // a value, not a call
+            const rt = self.unaliasType(t).function.return_type orelse return;
+            // A `Void` function produces no stdout output — nothing to mismatch.
+            if (self.unaliasType(rt).* == .void) return;
+            break :blk rt;
+        } else try self.allocStringType();
+
+        // Byte output (a command's `String`, or a `String`/`Byte`-returning call)
+        // into a stdout that is *not* a byte channel (we skipped those above) is a
+        // mismatch outright — never run it through the permissive unifier, which
+        // would wrongly match `String` (`[]Byte`) against a generic `[]T` because
+        // the element `T` is a type variable. For any other produced type, unify
+        // permissively so a type variable/capture never false-positives in a
+        // generic body; mismatch only on a concrete clash.
+        if (!self.stdoutAcceptsCommandBytes(produced) and self.overloadTypeMatches(produced, declared)) return;
+
+        var pw = std.Io.Writer.Allocating.init(self.arena.allocator());
+        defer pw.deinit();
+        produced.format(&pw.writer) catch {};
+        var dw = std.Io.Writer.Allocating.init(self.arena.allocator());
+        defer dw.deinit();
+        declared.format(&dw.writer) catch {};
+        try self.reportSpanError(
+            expr.span(),
+            Error.TypeMismatch,
+            .@"error",
+            "'{s}' writes '{s}' to stdout, but this function's stdout type is '{s}'; bind the result (const x = …), redirect it (>&2 or > \"file\"), or use @log for debug output",
+            .{ name, pw.written(), dw.written() },
+        );
+    }
+
+    /// Whether a function stdout type is a raw byte channel that a command's text
+    /// output is compatible with: `Void` (inherited/passthrough), `String`
+    /// (`[]Byte`), `Byte`, or a command `execution`. Any other type (`Int`,
+    /// `[]T`, `Maybe(T)`, an optional, a struct, …) carries a typed value.
+    fn stdoutAcceptsCommandBytes(self: *TypeChecker, t: *const ast.TypeExpr) bool {
+        return switch (self.unaliasType(t).*) {
+            .void, .execution, .byte => true,
+            .array => |a| a.element.* == .byte,
+            .identifier => |named| named.path.segments.len == 1 and
+                std.mem.eql(u8, named.path.segments[named.path.segments.len - 1].name, "String"),
+            else => false,
+        };
+    }
+
+    /// Whether a function stdout type is a raw byte channel that a command's text
+    /// output is compatible with: `Void` (inherited/passthrough), `String`
+    /// (`[]Byte`), `Byte`, or a command `execution`. Any other type (`Int`,
+    /// `[]T`, `Maybe(T)`, an optional, a struct, …) carries a typed value.
     /// Whether a bare expression statement's result is an unhandled
     /// (non-`ExecutableError`) error — the error escapes as the statement's
     /// value (a bare error value, a call to an error-returning function, or a
@@ -2321,6 +3253,9 @@ pub const TypeChecker = struct {
             .comptime_expr => |*comptime_expr| self.runExpression(scope, comptime_expr.operand),
             .subshell => |*subshell| self.runExpression(scope, subshell.child),
             .fd => |*fd_expr| self.runFd(scope, fd_expr),
+            // A type written in value position: validate the type it denotes so
+            // its parts (a struct field's type, a `comptime T` reference) resolve.
+            .type_value => |*type_value| self.runTypeExpression(scope, type_value.type_expr),
             else => return error.UnsupportedExpression,
         };
     }
@@ -2368,7 +3303,7 @@ pub const TypeChecker = struct {
             .alias => |*alias| self.runTypeAlias(alias),
             .failed => {},
             .type_var => {},
-            .void, .integer, .float, .boolean, .byte, .null, .execution, .thread => {},
+            .void, .integer, .float, .boolean, .byte, .null, .execution, .thread, .type_type => {},
             .optional, .promise => |prefix| try self.runTypeExpression(scope, prefix.child),
             .error_union => |error_union| {
                 try self.runTypeExpression(scope, error_union.err_set);
@@ -2498,6 +3433,27 @@ pub const TypeChecker = struct {
         }
 
         const for_scope = try scope.addChild(self.arena.allocator(), for_expr.span);
+
+        // `for (@fields(T)) |f| { … }` — comptime iteration over a struct type's
+        // fields. `f` is bound permissively; within the body `f.type` is a
+        // comptime type and `f.name` a string. The IR compiler unrolls it.
+        if (for_expr.sources.len == 1 and comptimeFieldsCallArg(for_expr.sources[0]) != null) {
+            const arg = comptimeFieldsCallArg(for_expr.sources[0]).?;
+            try self.runExpression(scope, arg);
+            const binding = for_expr.capture.bindings[0];
+            try self.runBindingPattern(for_scope, binding, null, false, false);
+            const var_name: ?[]const u8 = switch (binding.*) {
+                .identifier => |id| id.name,
+                else => null,
+            };
+            const had_prev = var_name != null and self.comptime_field_vars.contains(var_name.?);
+            if (var_name) |vn| try self.comptime_field_vars.put(self.arena.allocator(), vn, {});
+            defer if (var_name) |vn| {
+                if (!had_prev) _ = self.comptime_field_vars.remove(vn);
+            };
+            try self.runExpression(for_scope, for_expr.body);
+            return;
+        }
 
         for (for_expr.sources, for_expr.capture.bindings) |source, pattern| {
             try self.runExpression(scope, source);
@@ -2772,6 +3728,14 @@ pub const TypeChecker = struct {
             return;
         }
 
+        // Matching on a comptime type (`match (T) { Int => …, Box(|E|) => … }`):
+        // the subject is a type, each case is a type pattern, and any `|capture|`
+        // in a pattern binds as a type variable in that arm's body.
+        if (try self.isComptimeTypeSubject(scope, match_expr.subject)) {
+            try self.runComptimeTypeMatch(scope, match_expr);
+            return;
+        }
+
         for (match_expr.cases) |case| {
             if (case.capture != null) {
                 try self.reportSpanError(
@@ -2813,6 +3777,115 @@ pub const TypeChecker = struct {
             };
 
             try self.runBlockInNewScope(scope, @constCast(&case.body));
+        }
+    }
+
+    /// Whether a match subject is a comptime type value — a `comptime T: type`
+    /// param (its type resolves to a `.type_var`/`.type_type` marker) or a
+    /// literal type value (`match (Box(Int))`).
+    fn isComptimeTypeSubject(self: *TypeChecker, scope: *Scope, subject: *ast.Expression) Error!bool {
+        if (subject.* == .type_value) return true;
+        // `f.type` of a comptime `@fields` loop variable is a comptime type.
+        if (memberAccessParts(subject)) |ma| {
+            if (std.mem.eql(u8, ma.member, "type")) {
+                if (comptimeFieldVarName(ma.object)) |name| {
+                    if (self.comptime_field_vars.contains(name)) return true;
+                }
+            }
+        }
+        const t = (try self.resolveExprType(scope, subject)) orelse return false;
+        const u = self.unaliasType(t);
+        return u.* == .type_var or u.* == .type_type;
+    }
+
+    const MemberParts = struct { object: *ast.Expression, member: []const u8 };
+
+    /// Normalizes a member access, which the general expression parser encodes as
+    /// a `.binary` with the `.member` op while the interpolation parser uses a
+    /// `.member` node. Returns the object and member name for either form.
+    fn memberAccessParts(expr: *ast.Expression) ?MemberParts {
+        switch (expr.*) {
+            .member => |m| return .{ .object = m.object, .member = m.member.name },
+            .binary => |b| {
+                if (b.op != .member) return null;
+                const name = switch (b.right.*) {
+                    .identifier => |id| id.name,
+                    .call => |c| if (c.arguments.len == 0 and c.callee.* == .identifier)
+                        c.callee.identifier.name
+                    else
+                        return null,
+                    else => return null,
+                };
+                return .{ .object = b.left, .member = name };
+            },
+            else => return null,
+        }
+    }
+
+    /// The identifier name of a comptime field-loop variable used as the object
+    /// of an `f.name`/`f.type` access (`f`, or its zero-arg-call spelling).
+    fn comptimeFieldVarName(object: *const ast.Expression) ?[]const u8 {
+        return switch (object.*) {
+            .identifier => |id| id.name,
+            .call => |c| if (c.arguments.len == 0 and c.callee.* == .identifier)
+                c.callee.identifier.name
+            else
+                null,
+            else => null,
+        };
+    }
+
+    /// The type argument of a `@fields(T)` call, or null when `expr` is not one.
+    fn comptimeFieldsCallArg(expr: *const ast.Expression) ?*ast.Expression {
+        if (expr.* != .call) return null;
+        const call = expr.call;
+        if (call.callee.* != .identifier) return null;
+        if (!std.mem.eql(u8, call.callee.identifier.name, "@fields")) return null;
+        if (call.arguments.len == 0) return null;
+        return call.arguments[0];
+    }
+
+    /// Type-checks `match (T) { Int => …, Box(|E|) => …, _ => … }`. Each arm is a
+    /// type pattern; a pattern's `|capture|` binds as a type variable visible in
+    /// that arm's body. The actual pruning/binding happens at comptime in the IR
+    /// compiler — here we only validate the arms and scope the captures.
+    fn runComptimeTypeMatch(self: *TypeChecker, scope: *Scope, match_expr: *ast.MatchExpr) Error!void {
+        for (match_expr.cases) |case| {
+            const case_scope = try scope.addChild(self.arena.allocator(), case.span);
+            switch (case.pattern) {
+                // `_` and a bare type name (`Int`, `Box`) bind nothing.
+                .wildcard, .binding => {},
+                .type_pattern => |type_expr| {
+                    // Declare each `|capture|` as a type variable so the arm body
+                    // can reference it (`${E}`, `E == Int`).
+                    var captures: std.StringHashMapUnmanaged(void) = .empty;
+                    defer captures.deinit(self.arena.allocator());
+                    try self.collectTypeVars(case_scope, type_expr, &captures);
+                    var it = captures.keyIterator();
+                    while (it.next()) |name| {
+                        if (case_scope.lookup(name.*) != null) continue;
+                        const marker = try self.allocTypeExpression(.{ .type_var = .{ .name = name.*, .span = type_expr.span() } });
+                        try case_scope.declareType(self.arena.allocator(), ast.Identifier.global(name.*), marker, false);
+                    }
+                },
+                else => try self.reportSpanError(
+                    case.pattern.span(),
+                    Error.UnsupportedExpression,
+                    .@"error",
+                    "matching on a type expects a type pattern (`Int`, `Box(|E|)`) or `_`",
+                    .{},
+                ),
+            }
+            if (case.capture) |capture| {
+                try self.reportSpanError(
+                    capture.span,
+                    Error.UnsupportedExpression,
+                    .@"error",
+                    "a type match arm binds through its pattern (`Box(|E|)`), not a `=> |x|` clause",
+                    .{},
+                );
+            }
+            try self.runBlockInNewScope(case_scope, @constCast(&case.body));
         }
     }
 
@@ -3092,6 +4165,18 @@ pub const TypeChecker = struct {
             .member => |member| rootBindingName(member.object),
             else => null,
         };
+    }
+
+    /// The struct operand of a `@field(value)(name)` assignment target, or null
+    /// when `expr` is not such a call. Used to enforce mutability of the value
+    /// being written through and to find its root binding.
+    fn fieldBuiltinTarget(expr: *const ast.Expression) ?*const ast.Expression {
+        if (expr.* != .call) return null;
+        const call = expr.call;
+        if (call.callee.* != .identifier) return null;
+        if (!std.mem.eql(u8, call.callee.identifier.name, "@field")) return null;
+        if (call.arguments.len == 0) return null;
+        return call.arguments[0];
     }
 
     fn runIfCapture(
@@ -3455,6 +4540,36 @@ pub const TypeChecker = struct {
         try self.runExpression(scope, binary.left);
         try self.runExpression(scope, binary.right);
 
+        // `@field(p)(name) = v` — assignment through a comptime-named field. Handled
+        // before the type-resolution early-return below, because a `@field(…)` call
+        // has no resolvable value type here (so `left_type` would be null and the
+        // assignment checks skipped). Enforce that the value written through is
+        // mutable; the field's type often can't be resolved statically (a
+        // comptime-loop name doesn't fold in the checker), so value validation is
+        // deferred to the per-monomorphization member write in the IR compiler.
+        if (binary.op.isAssignment()) {
+            if (fieldBuiltinTarget(binary.left)) |object| {
+                // The object often parses as a bare command-style call (`p` → `p()`)
+                // in argument position; unwrap that to reach the root binding.
+                const obj = if (object.* == .call and object.call.arguments.len == 0)
+                    object.call.callee
+                else
+                    object;
+                if (rootBindingName(obj)) |root| {
+                    if (scope.lookup(root)) |binding| if (!binding.is_mutable) {
+                        try self.reportSpanError(
+                            binary.left.span(),
+                            Error.TypeMismatch,
+                            .@"error",
+                            "cannot assign to a field of immutable '{s}'; declare it with var",
+                            .{root},
+                        );
+                    };
+                }
+                return;
+            }
+        }
+
         const maybe_left_type = try self.resolveExprType(scope, binary.left);
         const maybe_right_type = try self.resolveExprType(scope, binary.right);
 
@@ -3511,6 +4626,9 @@ pub const TypeChecker = struct {
                     .{ .span = right_type.span() },
                 ),
                 .null => {},
+                // A type that failed to resolve already produced its own error;
+                // don't cascade an orelse mismatch on top of it.
+                .failed => {},
                 else => {
                     try self.reportSpanError(
                         binary.left.span(),
@@ -3638,9 +4756,22 @@ pub const TypeChecker = struct {
         );
     }
 
+    /// Whether a member access's object is the empty-identifier sentinel the
+    /// parser emits for an implicit `.name` access (`const v: T = .name`), to be
+    /// resolved against the result-location type.
+    fn isImplicitMemberObject(object: *const ast.Expression) bool {
+        return object.* == .identifier and object.identifier.name.len == 0;
+    }
+
     pub fn runMember(self: *TypeChecker, scope: *Scope, member: *ast.MemberExpr) Error!void {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, member.span);
+
+        // Implicit member access `.name` (object is the empty-identifier sentinel):
+        // resolved against the result-location type by the IR compiler. Accept it
+        // permissively here, the same way the explicit `Type.name` form is at this
+        // stage — don't run the empty identifier as an expression.
+        if (isImplicitMemberObject(member.object)) return;
 
         try self.runExpression(scope, member.object);
         const raw_object_type = try self.resolveExprType(scope, member.object) orelse {
@@ -3685,7 +4816,7 @@ pub const TypeChecker = struct {
             .thread => try self.runThreadMemberAccess(&member.member),
             .struct_type => |struct_type| try self.runStructMemberAccess(struct_type, &member.member),
             .error_set => |error_set| try self.runErrorSetMemberAccess(error_set, &member.member),
-            .null, .promise, .error_union, .err, .function, .fn_ref_type, .integer, .float, .boolean, .byte, .alias, .void, .type_merge, .sum, .type_capture, .type_application => return error.UnsupportedMemberAccess,
+            .null, .promise, .error_union, .err, .function, .fn_ref_type, .integer, .float, .boolean, .byte, .alias, .void, .type_merge, .sum, .type_capture, .type_application, .type_type => return error.UnsupportedMemberAccess,
             .module => |module| try self.runModuleMemberAccess(module, &member.member),
             .execution => |execution| try self.runExecutionMemberAccess(execution, &member.member),
             // .lazy => {
@@ -3738,6 +4869,9 @@ pub const TypeChecker = struct {
         try self.logTypeCheckTrace(@src().fn_name, identifier.span);
 
         if (struct_type.memberType(identifier.name) != null) return;
+        // An unexpanded `@insert` recipe struct has no resolved fields yet — accept
+        // any member permissively; the IR compiler resolves the real layout.
+        if (struct_type.body_items.len > 0) return;
 
         return error.MemberNotFound;
     }
@@ -4029,6 +5163,12 @@ pub const TypeChecker = struct {
         // (declared) even though the two `T`s are distinct nodes.
         if (resolved_left.* == .type_var or resolved_right.* == .type_var) return true;
 
+        // `null` inhabits any optional (`?T`), including nested in a struct field
+        // (`{ x: null }` satisfying `{ x: ?T }`) — the same coercion the top-level
+        // optional-yield check allows, applied structurally.
+        if (resolved_left.* == .null and resolved_right.* == .optional) return true;
+        if (resolved_left.* == .optional and resolved_right.* == .null) return true;
+
         if (std.meta.activeTag(resolved_left.*) != std.meta.activeTag(resolved_right.*)) return false;
 
         return switch (resolved_left.*) {
@@ -4089,7 +5229,7 @@ pub const TypeChecker = struct {
                 }
                 break :blk true;
             },
-            .void, .integer, .float, .boolean, .byte, .null, .execution, .thread => true,
+            .void, .integer, .float, .boolean, .byte, .null, .execution, .thread, .type_type => true,
             else => std.meta.eql(resolved_left.*, resolved_right.*),
         };
     }
@@ -4313,9 +5453,19 @@ pub const TypeChecker = struct {
             return;
         }
 
-        // A generic constructor (`Box{ … }` for `const Box(T) = struct { … }`):
-        // validate against the body struct with its type parameters permissive.
+        // A generic constructor (`Box{ … }` for `const Box(T) = struct { … }`, or a
+        // comptime type function `Partial{ … }`): validate against the body struct.
         if (self.generic_type_ctors.get(struct_literal.name.name)) |ctor| {
+            // Prefer the concrete layout from the *expected* type — the annotation
+            // `Partial(Point)`, which `resolveTypeApplication` materializes into
+            // real fields (including an `@insert` recipe). This is what lets a
+            // `Partial{ .zzz = 1 }` field typo be caught at construction. Fall back
+            // to the (parameter-permissive) ctor body when there's no matching
+            // annotation to take the instantiation from.
+            if (try self.expectedMaterializedStruct(scope, struct_literal.name.name)) |st| {
+                try self.runStructValueLiteral(scope, st, struct_literal);
+                return;
+            }
             const resolved = self.unaliasType(try self.resolveGenericCtorBody(scope, ctor));
             if (resolved.* == .struct_type) try self.runStructValueLiteral(scope, resolved.struct_type, struct_literal);
             return;
@@ -4355,6 +5505,14 @@ pub const TypeChecker = struct {
         struct_type: ast.TypeExpr.StructType,
         struct_literal: *ast.StructLiteral,
     ) Error!void {
+        // A struct carrying an unexpanded `@insert`/`for … @insert` recipe has no
+        // resolved fields yet — the IR compiler materializes them per instantiation.
+        // The type checker can't fold the recipe, so it validates permissively:
+        // check each value expression, but not against field names/count.
+        if (struct_type.body_items.len > 0) {
+            for (struct_literal.fields) |field| try self.runExpression(scope, field.value);
+            return;
+        }
         for (struct_literal.fields, 0..) |field, i| {
             // Duplicate field.
             for (struct_literal.fields[0..i]) |prev| {
@@ -4974,6 +6132,12 @@ pub const TypeChecker = struct {
         // from the module scope — including non-`pub` bindings, so an alias to a
         // `cimport` constant (`const rlf = rl.raylib`) is typed as that cimport
         // value (a struct of its externs) rather than null.
+        if (T == *ast.Expression and expr.* == .call) {
+            // Resolve an overloaded callee before its type (the return type) is
+            // read from the — otherwise unbound — original name.
+            try self.resolveOverloadedCall(scope, &expr.call);
+        }
+
         if (T == *ast.Expression) {
             const member_access: ?struct { object: *ast.Expression, name: []const u8 } = switch (expr.*) {
                 .member => |*m| .{ .object = m.object, .name = m.member.name },
@@ -5184,6 +6348,10 @@ pub const TypeChecker = struct {
             // A `||` merge is resolved to a concrete `error_set` or `sum` before
             // it is stored as a binding type, so a raw merge should not reach here.
             .type_merge => {},
+            // Assigning to a `type`-typed target (a `comptime T: type` param, a
+            // type-returning result): the value is a type. Permissive for now;
+            // type-value typing is refined as comptime evaluation lands.
+            .type_type => {},
             .sum => |*sum| self.validateTypeAssignmentSum(
                 sum,
                 assignment_type,
@@ -5710,6 +6878,7 @@ const GlobalTypes = struct {
     pub const Float = ast.TypeExpr{ .float = .{ .span = .global } };
     pub const Boole = ast.TypeExpr{ .boolean = .{ .span = .global } };
     pub const Byte = ast.TypeExpr{ .byte = .{ .span = .global } };
+    pub const TypeType = ast.TypeExpr{ .type_type = .{ .span = .global } };
     pub fn Array(comptime element: ast.TypeExpr) ast.TypeExpr {
         return .{ .array = .{ .element = &element, .span = .global } };
     }
@@ -5762,6 +6931,7 @@ const global_scope_definitions = [_]Definition{
     .init("Boole", GlobalTypes.Boole),
     .init("Boolean", GlobalTypes.Boole),
     .init("Byte", GlobalTypes.Byte),
+    .init("type", GlobalTypes.TypeType),
     .init("String", GlobalTypes.Array(GlobalTypes.Byte)),
     .init("ExecutableError", ast.TypeExpr.executableErrorType),
     .init("ParseError", ast.TypeExpr.parseErrorType),

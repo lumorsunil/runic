@@ -1,0 +1,44 @@
+// Polymorphic recursion: a generic function that recurses on itself at a
+// *different* concrete type each level. Inside a specialization body the callee
+// resolves to the specialization currently being compiled, so a naive
+// self-recursion redirect would loop forever compiling — and, once compiled,
+// fork forever at runtime — when the recursive call is at another type. The
+// compiler now reconciles each recursive call against the active specialization
+// by its argument-type key: a same-type call stays on the spec, a different-type
+// call re-routes through the generic and specializes anew.
+
+fn Box(comptime T: type) type { yield struct { value: T } }
+
+// A `@kind`-guarded self-call at a smaller type: the `struct` branch recurses at
+// `Int`, whose specialization takes the terminating `else` branch.
+fn f(v: |K|) Int {
+  if (@kind(K) == "struct") {
+    const c = f 0
+    yield c
+  } else {
+    yield 1
+  }
+}
+
+const b: Box(Int) = Box{ .value = 42 }
+echo "f b=${f b}"
+echo "f 9=${f 9}"
+
+// Genuine structural recursion: peel nested `Box` layers via a field access
+// (`v.value`), re-specializing at the field's concrete type at each step.
+fn depth(v: |K|) Int {
+  if (@kind(K) == "struct") {
+    const inner = depth v.value
+    yield inner + 1
+  } else {
+    yield 0
+  }
+}
+
+const b1: Box(Int) = Box{ .value = 7 }
+const b2: Box(Box(Int)) = Box{ .value = b1 }
+const b3: Box(Box(Box(Int))) = Box{ .value = b2 }
+echo "depth b1=${depth b1}"
+echo "depth b2=${depth b2}"
+echo "depth b3=${depth b3}"
+echo "depth 5=${depth 5}"

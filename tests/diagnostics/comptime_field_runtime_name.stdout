@@ -1,0 +1,6 @@
+[error]: tests/diagnostics/comptime_field_runtime_name.rn:7:9: @field's name argument must be a compile-time string
+   5:const p: Point(Int) = Point{ .x = 1, .y = 2 }
+   6:var name = "x"
+   7:echo "${@field(p)(name)}"
+   8:
+

@@ -3,8 +3,11 @@
 // association list scanned on collision. Iteration (`keys`/`values`) preserves
 // insertion order via a parallel ordered list; `set` on an existing key keeps
 // its original position. Keys are compared with `==` and hashed by value, so
-// `Int` and `String` keys work (a String is hashed over its bytes, so an
-// interpolated key hashes identically to the same literal).
+// `Int`, `String`, and **struct** keys (at any nesting depth) work — a String is
+// hashed over its bytes (an interpolated key hashes identically to the same
+// literal), and a struct key is hashed structurally via `std.meta.hash` (which
+// recurses into struct-typed fields) and matched with struct `==`, so two equal
+// records are the same key.
 //
 // Updates copy once with `arr.with` (O(n)) rather than rebuilding via a push
 // loop (O(n²)), so `set` stays O(buckets + n).
@@ -24,42 +27,44 @@
 // makes every `set` slower — see future/maps-plan.md.
 fn Void @() Void
 
-const Entry(K, V) = struct { key: K, value: V }
-const Bucket(K, V) = struct { entries: []Entry(K, V) }
-const Map(K, V) = struct { buckets: []Bucket(K, V), order: []Entry(K, V) }
+const meta = import "std/meta"
 
-// The bucket a key falls into for a map of `count` buckets: an Int in
-// [0, count). Strings are hashed over their bytes with a polynomial rolling hash
-// (Runic has no bitwise ops, so `*`/`+`/`%` only); Ints hash to themselves. `%`
+fn Entry(comptime K: type, comptime V: type) type { yield struct { key: K, value: V } }
+fn Bucket(comptime K: type, comptime V: type) type { yield struct { entries: []Entry(K)(V) } }
+fn Map(comptime K: type, comptime V: type) type { yield struct { buckets: []Bucket(K)(V), order: []Entry(K)(V) } }
+
+// The bucket a key falls into for a map of `count` buckets: an Int in [0, count).
+// Keys are hashed structurally with `std.meta.hash`, which handles any key type
+// uniformly — `Int`/`String`/`Float`/`Bool` by the bytes of their textual form,
+// and a **struct** (at any nesting depth) by recursing into its fields. So a
+// composite key works, and two `==`-equal keys always land in the same bucket.
+// A single unconditional call (rather than a `@kind`/`is String` branch) avoids
+// relying on the branch folding — which it can't inside this unspecialized
+// generic, the reason a nested-struct key used to miss the struct branch. `%`
 // with a positive divisor is non-negative.
 fn Void bucketFor(key: |K|, count: Int) Int {
-  if (key is String) {
-    var h = 0
-    for (key.bytes) |b| { h = h * 31 + b; h = h % 1000000007 }
-    yield h % count
-  } else {
-    yield key % count
-  }
+  const h = meta.hash key
+  yield h % count
 }
 
 // An empty map with 16 buckets.
-pub fn Void empty() Map(|K|, |V|) {
-  var bs: []Bucket(K, V) = .{ }
+pub fn Void empty() Map(|K|)(|V|) {
+  var bs: []Bucket(K)(V) = .{ }
   var i = 0
   while (i < 16) {
-    bs = bs.push Bucket(K, V){ .entries = .{ } }
+    bs = bs.push Bucket(K)(V){ .entries = .{ } }
     i = i + 1
   }
-  yield Map(K, V){ .buckets = bs, .order = .{ } }
+  yield Map(K)(V){ .buckets = bs, .order = .{ } }
 }
 
 // The map with `key` set to `value`: replaces the entry if `key` is present
 // (keeping its iteration position), otherwise appends it. Returns a new map.
-pub fn Void set(m: Map(|K|, |V|), key: K, value: V) Map(K, V) {
+pub fn Void set(m: Map(|K|)(|V|), key: K, value: V) Map(K)(V) {
   const nb = m.buckets.len
   const idx = bucketFor key nb
   const bucket = m.buckets[idx]
-  const entry = Entry(K, V){ .key = key, .value = value }
+  const entry = Entry(K)(V){ .key = key, .value = value }
   var bpos = 0 - 1
   var bi = 0
   for (bucket.entries) |e| {
@@ -68,13 +73,13 @@ pub fn Void set(m: Map(|K|, |V|), key: K, value: V) Map(K, V) {
   }
   if (bpos < 0) {
     // New key: append to its bucket and to the order.
-    const newBucket = Bucket(K, V){ .entries = bucket.entries.push entry }
+    const newBucket = Bucket(K)(V){ .entries = bucket.entries.push entry }
     const newBuckets = m.buckets.with idx newBucket
     const newOrder = m.order.push entry
-    yield Map(K, V){ .buckets = newBuckets, .order = newOrder }
+    yield Map(K)(V){ .buckets = newBuckets, .order = newOrder }
   }
   // Existing key: replace in place (immutably) in both the bucket and the order.
-  const newBucket = Bucket(K, V){ .entries = bucket.entries.with bpos entry }
+  const newBucket = Bucket(K)(V){ .entries = bucket.entries.with bpos entry }
   const newBuckets = m.buckets.with idx newBucket
   var opos = 0
   var oi = 0
@@ -83,18 +88,18 @@ pub fn Void set(m: Map(|K|, |V|), key: K, value: V) Map(K, V) {
     oi = oi + 1
   }
   const newOrder = m.order.with opos entry
-  yield Map(K, V){ .buckets = newBuckets, .order = newOrder }
+  yield Map(K)(V){ .buckets = newBuckets, .order = newOrder }
 }
 
 // Mutable variant of `set`: updates `m` in place (a Runic struct is passed by
 // reference, so the caller's map sees the change) and returns nothing. Use it
 // when you hold a `var` map and don't want to reassign — `std.map.setIn m k v`
 // instead of `m = std.map.set m k v`. Same replace-or-append semantics.
-pub fn Void setIn(var m: Map(|K|, |V|), key: K, value: V) Void {
+pub fn Void setIn(var m: Map(|K|)(|V|), key: K, value: V) Void {
   const nb = m.buckets.len
   const idx = bucketFor key nb
   const bucket = m.buckets[idx]
-  const entry = Entry(K, V){ .key = key, .value = value }
+  const entry = Entry(K)(V){ .key = key, .value = value }
   var bpos = 0 - 1
   var bi = 0
   for (bucket.entries) |e| {
@@ -102,10 +107,10 @@ pub fn Void setIn(var m: Map(|K|, |V|), key: K, value: V) Void {
     bi = bi + 1
   }
   if (bpos < 0) {
-    m.buckets = m.buckets.with idx Bucket(K, V){ .entries = bucket.entries.push entry }
+    m.buckets = m.buckets.with idx Bucket(K)(V){ .entries = bucket.entries.push entry }
     m.order = m.order.push entry
   } else {
-    m.buckets = m.buckets.with idx Bucket(K, V){ .entries = bucket.entries.with bpos entry }
+    m.buckets = m.buckets.with idx Bucket(K)(V){ .entries = bucket.entries.with bpos entry }
     var opos = 0
     var oi = 0
     for (m.order) |e| {
@@ -117,7 +122,7 @@ pub fn Void setIn(var m: Map(|K|, |V|), key: K, value: V) Void {
 }
 
 // The value for `key`, or absent.
-pub fn Void get(m: Map(|K|, |V|), key: K) ?V {
+pub fn Void get(m: Map(|K|)(|V|), key: K) ?V {
   const idx = bucketFor key m.buckets.len
   const bucket = m.buckets[idx]
   for (bucket.entries) |e| {
@@ -127,7 +132,7 @@ pub fn Void get(m: Map(|K|, |V|), key: K) ?V {
 }
 
 // Whether `key` is present.
-pub fn Void has(m: Map(|K|, |V|), key: K) Bool {
+pub fn Void has(m: Map(|K|)(|V|), key: K) Bool {
   const idx = bucketFor key m.buckets.len
   const bucket = m.buckets[idx]
   for (bucket.entries) |e| {
@@ -137,31 +142,31 @@ pub fn Void has(m: Map(|K|, |V|), key: K) Bool {
 }
 
 // The map without `key` (unchanged if absent). Returns a new map.
-pub fn Void remove(m: Map(|K|, |V|), key: K) Map(K, V) {
+pub fn Void remove(m: Map(|K|)(|V|), key: K) Map(K)(V) {
   const idx = bucketFor key m.buckets.len
   const bucket = m.buckets[idx]
-  var ents: []Entry(K, V) = .{ }
+  var ents: []Entry(K)(V) = .{ }
   for (bucket.entries) |e| {
     if (e.key == key) { } else { ents = ents.push e }
   }
-  const newBuckets = m.buckets.with idx Bucket(K, V){ .entries = ents }
-  var newOrder: []Entry(K, V) = .{ }
+  const newBuckets = m.buckets.with idx Bucket(K)(V){ .entries = ents }
+  var newOrder: []Entry(K)(V) = .{ }
   for (m.order) |e| {
     if (e.key == key) { } else { newOrder = newOrder.push e }
   }
-  yield Map(K, V){ .buckets = newBuckets, .order = newOrder }
+  yield Map(K)(V){ .buckets = newBuckets, .order = newOrder }
 }
 
 // Mutable variant of `remove`: deletes `key` from `m` in place (no return).
-pub fn Void removeIn(var m: Map(|K|, |V|), key: K) Void {
+pub fn Void removeIn(var m: Map(|K|)(|V|), key: K) Void {
   const idx = bucketFor key m.buckets.len
   const bucket = m.buckets[idx]
-  var ents: []Entry(K, V) = .{ }
+  var ents: []Entry(K)(V) = .{ }
   for (bucket.entries) |e| {
     if (e.key == key) { } else { ents = ents.push e }
   }
-  m.buckets = m.buckets.with idx Bucket(K, V){ .entries = ents }
-  var newOrder: []Entry(K, V) = .{ }
+  m.buckets = m.buckets.with idx Bucket(K)(V){ .entries = ents }
+  var newOrder: []Entry(K)(V) = .{ }
   for (m.order) |e| {
     if (e.key == key) { } else { newOrder = newOrder.push e }
   }
@@ -169,20 +174,20 @@ pub fn Void removeIn(var m: Map(|K|, |V|), key: K) Void {
 }
 
 // The keys, in insertion order.
-pub fn Void keys(m: Map(|K|, |V|)) []K {
+pub fn Void keys(m: Map(|K|)(|V|)) []K {
   var out: []K = .{ }
   for (m.order) |e| { out = out.push e.key }
   yield out
 }
 
 // The values, in insertion order.
-pub fn Void values(m: Map(|K|, |V|)) []V {
+pub fn Void values(m: Map(|K|)(|V|)) []V {
   var out: []V = .{ }
   for (m.order) |e| { out = out.push e.value }
   yield out
 }
 
 // The number of entries.
-pub fn Void len(m: Map(|K|, |V|)) Int {
+pub fn Void len(m: Map(|K|)(|V|)) Int {
   yield m.order.len
 }

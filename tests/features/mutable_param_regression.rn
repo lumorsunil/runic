@@ -8,7 +8,7 @@ fn Void @() Void
 const V = struct { x: Int, y: Int }
 
 # Mutate a `var` struct parameter's field directly.
-fn Void bumpField(var e: V) Void {
+fn Void bumpField(var e: V) String {
   e.x += 1
   echo "field=${e.x},${e.y}"
 }

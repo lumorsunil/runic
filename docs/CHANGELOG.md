@@ -10,6 +10,533 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ---
 
+## [Unreleased]
+
+## [0.12.0] - 2026-10-05
+
+A large comptime and type-system release that layers constraint-checked,
+return-type-directed generics on top of the comptime surface — a "type-class
+lite" without a full type-class system. Highlights: type-returning comptime
+functions (generic types), function overloading, higher-kinded capture
+(`|M|(A)`), comptime type predicates/introspection and field iteration,
+`@insert`/`@field`/`@log`, a growing standard library (`std.meta`, `std.map`,
+`std.control`, `std.testing`), trailing-block closures, and static declarations
+on constructor-produced types with Zig-style decl literals (`.nothing`). The
+stdout type system is now honest — a `Void` function is guaranteed silent — and
+the language server gains richer hover plus several crash and concurrency fixes.
+
+### Changed
+
+- **A struct type now renders with its name instead of `<struct>`.** A struct is
+  named after the first binding it is bound to (`const Point = struct { … }` →
+  `Point`), the way Zig names an otherwise-anonymous struct; a later alias
+  (`const P = Point`) does not take over the name. A struct produced by a type
+  constructor function (`fn Maybe(comptime T: type) type { yield struct { … } }`)
+  is named after the written application, so `Maybe(Int)` and `Maybe(String)` each
+  carry their own name. So hovering a value of such a type in the editor now shows
+  `Point{ x: Int, y: Int }` or `Maybe(Int){ x: ?Int }` rather than `<struct>{ … }`.
+  The name is display-only — it does not change type equality (two
+  structurally-identical structs with different names are still compatible). A
+  struct never bound to a name (a struct literal's inferred type) still renders as
+  `<struct>`.
+- **Hover on an overloaded function now lists every signature.** An overloaded
+  function (two definitions sharing a name, differing by return type — `pure` in
+  `examples/monads.rn`) is mangled per definition during type checking, so a plain
+  lookup found nothing and hover came back empty. It now falls back to the overload
+  set and shows one `const name: <signature>` block per definition, each with its
+  struct return type named.
+
+- **A `Void` stdout type now means the function produces *nothing* on `&1`** — it
+  no longer acts as a byte "passthrough". A function that writes to stdout (an
+  `echo`, or a bare command, which is typed `ExecutableError!String`) must declare
+  a `String` (or command) stdout type; to run a command for its *effect* inside a
+  `Void` function, bind its result (`const _ = mkdir …`), redirect it (`>&2`,
+  `> "file"`), or use `@log`. (`cd`/`setenv` are exempt — they change process state
+  and produce no output.) This makes a function's stdout type an honest statement
+  of what it writes, and in particular guarantees a `Void` function is silent — so
+  a bare `Void` call inside a value-returning body can't leak bytes into the
+  captured value (the last route to the trailing-block capture deadlock). The
+  stdlib's command helpers (`std.fs.mkdirp`/`remove`/`withTempDir`) bind their
+  command results; `std.testing.group` writes its header to stderr.
+- **An array coerces to a string as `[1, 2, 3]`**, bracketed and comma-separated,
+  instead of its elements run together (`123`). This applies wherever an array is
+  rendered to text — string interpolation (`"${xs}"`), a command argument, `@log`
+  — and nests (`[[1, 2], [3, 4]]`); an empty array is `[]`. Feeding an array into
+  a **pipeline** (`xs | …`) is unchanged: it still splits into space-separated
+  tokens so a downstream stage reads one element per token.
+
+### Added
+
+- **Static declarations on a type produced by a type constructor.** A comptime
+  type constructor is module-like: a `pub const` in its body becomes a static
+  member of the produced type, reachable the way a module's public member is —
+  `fn Maybe(comptime T: type) type { pub const nothing: ?T = null; yield struct { x: ?T } }`
+  then `Maybe(Int).nothing`. The declaration's value is compiled with the type
+  arguments bound, so a `?T` reads as `?Int` for `Maybe(Int)`. Declaration values
+  may be scalars/optionals/other expressions, or a struct literal
+  (`pub const empty: Maybe(T) = .{ … }`) — the latter is built in the consuming
+  binding's frame so it stabilizes like a direct `const e: Maybe(Int) = .{ … }`.
+- **Implicit declaration access `.name` against the result-location type.** When
+  the expected type is known, a leading-dot `.name` resolves to that type's static
+  declaration — `const none: Maybe(Int) = .nothing` is `Maybe(Int).nothing` — the
+  way Zig resolves a decl literal. Wired for a binding's annotation
+  (`const none: Maybe(Int) = .nothing`) and for a `yield` value against the
+  enclosing function's return type (`fn … Maybe(Int) { yield .empty }`), when that
+  type is a type-constructor application; the explicit `Type.name` form works
+  anywhere. A struct-literal declaration value resolves in these result-location
+  contexts too (it is built in the consuming frame so it stabilizes). It also
+  resolves as a **call argument** against the parameter type — explicit
+  (`f Maybe(Int).empty`) or, parenthesized so the dot is not read as a member
+  access on the callee, implicit (`f (.empty)`). A bare `f .empty` remains a
+  member access on `f` (a space-form grammar ambiguity, as `f(.x)` resolves in
+  Zig); use parentheses. The type checker now also carries a type constructor's
+  static decls on the produced type, so editor hover on either form (`.nothing`
+  or `Maybe(Int).nothing`) shows the resolved declaration, typed concretely
+  (`const nothing: ?Int`).
+- **`std.meta.hash(v) Int`** — a structural hash: a struct combines its fields'
+  hashes, a scalar/string hashes the bytes of its textual form. Recurses into
+  struct-typed fields, so it is a deep hash (equal values by `std.meta.eq` hash
+  equal). `std.meta.show` and `std.meta.eq` now **recurse** into struct-typed
+  fields too (a nested struct shows its own bracketed form and compares deeply),
+  via the polymorphic generic recursion the compiler now supports.
+- **`std.map` struct keys (any nesting depth).** A map key may now be a struct —
+  a coordinate `{ x, y }`, or a nested `{ a: Point, b: Point }`: it is hashed
+  structurally with `std.meta.hash` (which recurses into struct-typed fields) and
+  matched with struct `==`, so two equal records are the same key. (`Int`/`String`
+  keys are unchanged.)
+- **`std.control`** — control-flow combinators that take a trailing block:
+  `retry(times, body: fn() Bool) Bool` runs the body until it yields true (stopping
+  early on success) and reports whether it eventually succeeded;
+  `repeat(n, body: fn() Void)` runs the body a fixed number of times. Both read like
+  built-in loop/retry constructs and capture the enclosing scope.
+- **`std.testing.group "label" { … }`** — a labeled section wrapping a block of
+  assertions (a `fn () Void` trailing closure): it prints a header then runs the
+  block. Organizational only — a failing assertion inside still aborts the run.
+- **`std.fs.withTempDir { … }`** — runs the trailing block with a fresh temporary
+  directory as the working directory, then restores the previous directory and
+  deletes the tree. Child-process commands inside the block (`mkdir`, `touch`, `git`,
+  …) operate in the temp dir; a shell redirect still targets the original directory
+  (documented caveat).
+- **`std.testing.check "msg" { yield … }`** — a trailing-block assertion. The
+  condition is a `fn () Bool` closure, so a multi-step check reads like a built-in
+  block construct and captures its enclosing scope; it aborts (stderr + nonzero
+  exit) unless the block yields true. The first stdlib control-flow construct built
+  on trailing-block closures.
+- **Trailing-block closures.** A `{ … }` block written immediately after a
+  command/function call is sugar for a **nullary closure argument**, so a function
+  taking a `fn() T` parameter reads like a built-in block construct:
+  ```runic
+  fn withTimer(body: fn() Void) Void { const t = now; body; @log "${now - t}ms" }
+  withTimer { runJob }               # the block captures its scope and runs inside withTimer
+  ```
+  The block captures its enclosing scope like any nested function value. This lets
+  libraries define control-flow-style wrappers (timers, guards, retries) and, with
+  a `comptime` count, unrolled constructs (`repeat 3 { … }`). Disambiguation follows
+  the existing rule: an uppercase name before `{` is a struct literal, a lowercase
+  call is a trailing block. Supporting compiler work: a **nullary function *value*
+  is now invocable** — a bare `body` (a `fn()`-typed binding) auto-calls like a
+  nullary named function, for both value-returning and `Void` (effectful) closures.
+  The block captures both `const` and mutable `var` bindings from its scope.
+- **`std.meta` — comptime-derived structural operations.** `std.meta.show v`
+  renders any value (a struct as `{ name=value … }`, a scalar/string as itself);
+  `std.meta.eq a b` is structural equality (a struct compared field-by-field, else
+  `==`). Both are built on `@kind`/`@fields`/`@field` and monomorphize per type —
+  the first stdlib use of the comptime implementation-generation surface. (Now
+  recurse into struct-typed fields, along with `std.meta.hash` — see the recursive
+  `std.meta` entry above.)
+- **`@field(value)(name)` — access a struct field by a compile-time name.** The
+  analog of Zig's `@field(x, name)`: `name` is a compile-time string (typically
+  `f.name` from an unrolled `for (@fields(T)) |f|`), and the access lowers to an
+  ordinary member read `value.<name>`. This is what lets a comptime-unrolled loop
+  touch each field's *value* — not just its `f.name`/`f.type` metadata — so
+  implementations can be generated at compile time (a serializer, a pretty-printer,
+  a comparison), the way Zig's `inline for` does:
+  ```runic
+  fn String show(comptime T: type, x: T) String {
+      var out = ""
+      for (@fields(T)) |f| out = "${out}${f.name}=${@field(x)(f.name)} "
+      yield out
+  }
+  ```
+  A non-comptime name is a compile error (it can't resolve to a static field), and
+  an unknown field name is reported like any other bad member access. This extends
+  Runic's comptime story from generating *types* to generating *implementations*.
+  `@field` is also an **assignable place** — `@field(value)(name) = v` writes the
+  named field (obeying mutability, like `value.field = v`), so an unrolled loop can
+  *set* each field, not only read it. Reading `@field` now also works outside a
+  comptime `for (@fields)` loop in a generic body (a `T`-typed value's layout
+  resolves per specialization; the unspecialized template no longer mis-reports).
+  Combined with the generic-struct-return fix below, this makes field-wise
+  implementations (copy, transform, reset) work end to end.
+- **`@insert "…"` — compile-time struct field generation.** In a struct body,
+  `@insert` re-parses a string as a `name: Type[, …]` field list and grafts the
+  fields in — the Jai/Mox "generate the source, re-parse it" model of building a
+  type, rather than a `@Type`-style structured builtin. The string may be static
+  or interpolated (`${T}`), and a comptime `for (@fields(T)) |f| @insert "…"`
+  derives a struct's shape from another type's fields, one field per iteration —
+  so you can write "mapped types" like a partial (every field of `T`, optional):
+  ```runic
+  fn Partial(comptime T: type) type {
+      yield struct { for (@fields(T)) |f| @insert "${f.name}: ?${f.type}" }
+  }
+  const p: Partial(Point) = Partial{ .x = 1, .y = 2 }   // struct { x: ?Int, y: ?Int }
+  ```
+  Inserted fields sit alongside ordinary ones (order preserved). The recipe is
+  materialized per instantiation — the compiler folds `${…}`/`@fields` and
+  re-parses the field list, and the **type checker does the same** when it
+  resolves an application (`Partial(Point)`): it re-parses the operand into
+  concrete fields with their *real* types. So member access is typed precisely (a
+  generated `?Int` supports `orelse`; `p.a` bound to a `String` is a static type
+  error), and **construction is validated against the annotation's materialized
+  layout** — `Partial{ .zzz = 1 }` reports the unknown field `zzz` and the missing
+  field, and a wrong field value type is caught, all before the IR compiler runs.
+  A recipe whose field *names* are dynamic (or whose `@fields(…)` source can't be
+  resolved statically) stays permissive for the compiler to materialize; a bare
+  `Partial{…}` with no annotation to name the instantiation likewise falls back to
+  the permissive check. `@code` (AST as a first-class value) is a later increment —
+  see `future/comptime-type-construction.md`.
+- **`@log msg` — a debug print to the real stdout.** Writes its (rendered,
+  interpolated) argument, newline-terminated, straight to the process's stdout,
+  bypassing the current function's stdout pipe. Inside a function whose result is
+  captured by value (`const r = f x`, `${(f x)}`), the stdout pipe is a capture
+  transport — an `echo` there pollutes or deadlocks the capture — so `@log` is the
+  way to trace such a function:
+  ```runic
+  fn map(f: fn (|A|) |B|, xs: []A) []B {
+      @log "mapping ${xs.len} elements"
+      …
+  }
+  ```
+- **A bare statement whose stdout doesn't match the function's is now a compile
+  error.** A bare command (`echo "x"` → `String`) or a bare call to a function
+  (which forwards that function's own stdout) writes to the enclosing function's
+  stdout; its output type must match the function's stdout type. When it doesn't —
+  the stdout carries a typed value (`Int`, `[]T`, `Maybe(T)`, a struct — anything
+  but the byte channels `Void`/`String`/`Byte`) that the output would corrupt (and
+  previously deadlocked on the capture path) — it reports a stdout type mismatch
+  naming both types and pointing at the fixes: bind the result, redirect it (`>&2`,
+  `> "file"`), or use `@log`. A statement whose result is bound, whose stdout is
+  redirected, or whose type matches is unaffected, as are `Void`/`String`
+  functions and a call to a `Void` function.
+
+- **Function overloading.** A name declared more than once is an overload set;
+  a call resolves to one candidate by the argument types and — when several match
+  (they differ only in return type) — the expected type from context (a binding
+  annotation or the enclosing `yield`). This gives return-type polymorphism:
+  ```runic
+  fn Void pure(x: |A|) Maybe(A) { yield .{ .x = x } }
+  fn Void pure(x: |A|) []A     { yield .{ x } }
+  const m: Maybe(Int) = pure 42   # Maybe overload
+  const l: []Int      = pure 7    # [] overload
+  ```
+  An unresolved ambiguity (no expected type) is reported and asks for an
+  annotation.
+- **Higher-kinded capture.** A parameter type `|M|(A)` captures the type
+  *constructor* `M` (not just a type) along with `A`: from an argument of type
+  `Maybe(Int)` it binds `M = Maybe`, `A = Int`, so a function can be generic over
+  any single-argument constructor and use `M`/`A` as types in its body (`${M}`,
+  `A == Int`, `@kind(A)`). The captured constructor can also be re-applied in the
+  return type — `fn idM(m: |M|(|A|)) M(A) { yield m }` passes any container
+  through generically and reads it back at its concrete type.
+- **Constraint-checking builtins.** `@hasMethod(M)("name")` folds to whether a
+  function `name` mentions the constructor `M(…)` at its head (a first-parameter
+  `M(A)` or a return `M(A)`); `@compileError "msg"` fails compilation from a
+  taken comptime branch (with `${T}`-style interpolation). Together with `|M|(A)`
+  they express a type-class-lite constraint with a directed error:
+  ```runic
+  fn Void map(m: |M|(|A|)) String {
+      if (@hasMethod(M)("bind")) { … } else { @compileError "${M} lacks bind" }
+  }
+  ```
+- **Comptime type parameters and type logic.** A parameter marked `comptime` is
+  known at compile time, and `type` is a first-class comptime value, so an
+  ordinary function can take a type, compare it, and branch on it at compile
+  time — the untaken branch is discarded:
+  ```runic
+  fn Void describe(comptime T: type) String {
+      if (T == Int) { yield "integer" } else { yield "other" }
+  }
+  ```
+  A `comptime T: type` parameter is usable both as a value (`T == Int`) and as a
+  type (`x: T`, `[]T`, the return type). A function with comptime type parameters
+  is **monomorphized** — compiled once per distinct type argument, with the type
+  known at compile time — so the comparison genuinely selects a branch at compile
+  time rather than at runtime.
+- **Comptime type predicates with captures.** A comparison against a type pattern
+  binds a `|capture|` to the matched type argument, usable in the taken branch:
+  ```runic
+  if (T == Box(|E|)) { echo "a box of ${E}" }
+  ```
+  `Box(|E|)` matches any `Box(X)` at compile time, binding `E` to `X` (itself a
+  comptime type, so it can feed further comptime logic like `E == Int`). Patterns
+  nest (`Box(Box(|E|))`) and take multiple captures (`Pair(|A|)(|B|)`).
+- **Comptime value parameters.** A `comptime` parameter whose type is *not* `type`
+  (`comptime n: Int`, `comptime s: String`) is a compile-time constant: the
+  function is monomorphized per distinct value, so a test on it folds and `${n}`
+  is the constant:
+  ```runic
+  fn Void rep(comptime n: Int) String {
+      if (n == 1) { yield "once" } else { yield "${n} times" }
+  }
+  ```
+- **Comptime `match` on a type.** A `match` whose subject is a comptime type
+  selects an arm at compile time. Each arm is a type pattern — a bare name, or an
+  application with captures — and a matched capture is bound in the arm body:
+  ```runic
+  fn Void classify(comptime T: type) String {
+      match (T) {
+          Int      => { yield "an int" }
+          Box(|E|) => { yield "a box of ${E}" }
+          _        => { yield "other" }
+      }
+  }
+  ```
+  Captures nest and curry exactly as in a type predicate (`Pair(|X|)(|Y|)`,
+  `Box(Box(|E|))`), and the bound capture is itself a comptime type — a nested
+  `match (E)` folds again. A `match` on a comptime *value* likewise prunes to the
+  arm whose literal equals the value.
+- **Type-introspection builtins.** A comptime type can be inspected at compile
+  time — each fold to a constant:
+  ```runic
+  fn Void describe(comptime T: type) String {
+      if (@kind(T) == "struct" && @hasField(T)("value")) {
+          yield "a box of ${@fieldCount(T)} field(s)"
+      } else { yield "a ${@kind(T)}" }
+  }
+  ```
+  `@kind(T)` is the type's category (`"int"`, `"struct"`, `"array"`,
+  `"optional"`, …); `@fieldCount(T)` and `@hasField(T)("name")` query a struct's
+  fields; `@elem(T)` and `@child(T)` unwrap an array's element and an optional's
+  child. A leading `[]T` / `?T` is now a value-position **type value**, so a
+  composite type can be passed directly (`@elem([]Int)` → `Int`). A builtin used
+  on a concrete type of the wrong kind is a compile error.
+- **Comptime field iteration.** `for (@fields(T)) |f| { … }` unrolls at compile
+  time — one body copy per field of the struct type `T` — binding `f.name` (the
+  field name) and `f.type` (the field's type, itself a comptime type):
+  ```runic
+  fn Void dump(comptime T: type) Void {
+      for (@fields(T)) |f| {
+          if (f.type == Int) { echo "${f.name}: an int" }
+          else { echo "${f.name}: ${@kind(f.type)}" }
+      }
+  }
+  ```
+  `f.type` composes with everything else: `@kind(f.type)`, `@elem(f.type)`,
+  `f.type == Box(|E|)`, `match (f.type) { … }`, and a nested
+  `for (@fields(f.type))` when the field is itself a struct.
+- **Type-returning comptime functions (generic types).** A function that takes
+  `comptime` type parameters and `yield`s a type is a generic-type constructor —
+  the Zig-style replacement for the `const Box(T) = struct { … }` form:
+  ```runic
+  fn Box(comptime T: type) type { yield struct { value: T } }
+  const IntBox = Box Int
+  const b = IntBox{ .value = 5 }
+  ```
+  A comptime type function also resolves in application position (`Box(Int)` as an
+  annotation, `Box{ … }` inferred construction, `Box(|T|)` capture) and serializes
+  as a type (`${Box}` → `Box`, `${Box(Int)}` → `Box(Int)`), so it is a drop-in for
+  the old constructor form. Multiple type arguments are applied like any call —
+  `HashMap Key Value` (space) or curried `HashMap(Key)(Value)`, one argument per
+  parenthesis — not `HashMap(Key, Value)`, which reports a directed error. A type
+  written in value position (`yield struct { … }`) is a compile-time-only *type
+  value*, erased before the runtime.
+
+### Fixed
+
+- **Hovering a field of an anonymous `.{ … }` struct literal now shows its type.**
+  A field like `.x` in `.{ .x = … }` has no type name to look up, so hover came
+  back empty. It now takes the field's type from the literal's context — a binding
+  annotation (`const v: Point = .{ .x = 1 }`) or, inside a function, the declared
+  return type that the `yield` targets (so `.x` in `fn … Maybe(A) { yield .{ .x = x } }`
+  resolves to `?A`). Hover also now peels a type-constructor application
+  (`Maybe(Int)`) to its struct before a member/field lookup, so these resolve even
+  through a generic constructor.
+- **The language server no longer crashes after a few quick edits.** Rapidly
+  deleting/inserting lines in a file that uses compile-time field iteration
+  (`for (@fields(T)) |f|`) segfaulted the server. The type checker is reused across
+  re-checks, and its `reset()` frees the analysis arena and clears every
+  arena-backed collection back to empty — but it missed `comptime_field_vars`, so
+  that map's header kept pointing at freed storage and the next re-check wrote
+  through the dangling pointer. `reset()` now clears it too. Also fixes the
+  `zig build runic-lsp` step to re-install the binary (it previously compiled into
+  the cache but left a stale `zig-out/bin/runic-lsp` behind).
+- **A pipeline producer that runs several command-statements no longer drops its
+  last line under load.** `{ echo a; echo b } | consumer` (or any multi-command
+  producer stage) occasionally delivered only `a` and signalled EOF early, so a
+  downstream `grep`/`cat` saw a truncated stream — a timing-dependent flake
+  (~1-in-20 under scheduler pressure; it was the long-standing intermittent miss in
+  `runtime_regression`). An inter-stage pipe closed a source — and with it EOF'd the
+  consumer — the moment the source's *process* exited, without first draining the
+  OS-pipe bytes still buffered behind it. The second `echo`'s output, still in
+  flight when the consumer attached, was stranded and discarded on close.
+  `connectDestination` no longer force-closes the consumer on an already-closed
+  source; it leaves sources for `forward()`, which drains a closed source's buffered
+  tail before removing it and propagating EOF. Covered by
+  `pipeline_producer_drain_regression` (runs the pattern many times so a reintroduced
+  race shows up as a missing line).
+- **Binding a command result inside a trailing-block / anonymous-fn body works.**
+  `apply { const _ = mkdir "d"; … }` — running a command for its effect inside a
+  block, as `std.fs.withTempDir`'s body does — crashed at runtime with *"Could not
+  dereference value of type thread"*. The indirect-call path sized the block's heap
+  closure environment to its *argument* count (zero, for a nullary block), but the
+  command-capture protocol allocates scratch closure cells in the body; those writes
+  overflowed the undersized environment and aliased an adjacent heap value (a thread
+  handle), which the next dereference rejected. A fn value now always carries a
+  closure environment sized to its body's full closure-slot count — not only when it
+  captures an outer binding — so the scratch cells land in bounds (a block's
+  parameter slots still come first, where call arguments are merged).
+- **A value-returning trailing-block / anonymous-fn body is now stdout-type-checked
+  like a named function.** A `fn () Bool` (or `fn () Int`, …) block whose body wrote
+  to stdout — e.g. `check "msg" { echo "dbg"; yield cond }` — used to slip through
+  the checker and then **deadlock the scheduler** at runtime (the stray output was
+  diverted into the result-capture pipe, so the dequeue never completed). The body
+  now adopts its parameter's stdout type, so a stray `echo` is the same clean
+  compile error a named function gets (redirect it, bind it, or use `@log`); a
+  `fn () Void` block still writes freely. The block's expected stdout type is
+  threaded from the `fn (…) T` parameter at the call site. (The other route to the
+  same hang — a bare call to a `Void` function that itself `echo`es — is now closed
+  too: a `Void` stdout no longer accepts stray output, so a `Void` function is
+  guaranteed silent. See the `Void` stdout change above.)
+- **A struct value is no longer mistaken for an array when rendered.** An array's
+  heap length header now carries a distinct `.seq_len` tag (not a plain integer),
+  so the string materializer can tell an array (`[len, e0, …]`) apart from a struct
+  (`[f0, …]`) — previously byte-identical when the first field was an integer, which
+  made a struct hash and render as a bogus array. This is what lets `std.map` take
+  a **struct key at any nesting depth** (hashing a struct key no longer derails).
+  The tag reads back as an ordinary `Int` everywhere except the materializer, so
+  `.len`, indexing, iteration and arithmetic are unaffected.
+- **`x = x + y` on an array now concatenates** instead of silently misbehaving. The
+  in-place `x = x <op> n` reassignment optimization (meant for scalar accumulation)
+  wrongly applied to arrays, emitting an `ath` that "worked" only by reading the
+  length headers as integers; it now excludes array/sequence operands so array `+`
+  goes through `array_concat`. (`acc = acc + .{ i }` in a loop builds the array
+  correctly.)
+- **String materialization is also bounded** as a backstop: `materializeString`
+  caps its recursion depth, so any pathological/cyclic heap value yields a
+  recoverable error instead of overflowing the native stack. Normal (acyclic) data
+  never reaches the cap.
+- **A recipe-typed struct literal can now be constructed directly in argument
+  position.** `f Partial{ … }` (a `@insert` / `for (@fields)` recipe struct built
+  inline as a call argument, with no annotated binding) previously arrived with
+  blank fields: a recipe struct declares no fields of its own, and the IR compiler
+  materialized its concrete layout only from a binding annotation
+  (`const p: Partial(T) = Partial{ … }`). A recipe struct argument is now
+  materialized against its **parameter type** — the argument-position analog of the
+  annotation path — so it builds the real layout on both call paths (the sync
+  fast-path and the fork path, including a generic callee). The static typo check
+  for such arguments already shipped; this closes the runtime side. (A recipe
+  parameter type that names a sibling `comptime T: type` param still can't
+  materialize inside the function body — a separate limitation; see
+  `future/comptime-type-construction.md`.)
+- **A generic function may now recurse polymorphically — at a different type each
+  level — without hanging.** A `@kind`-guarded self-call such as `f 0` inside `f`'s
+  `Box` specialization, or `depth v.value` peeling a nested `Box`, previously
+  spun forever (a runaway fork recursion at runtime). Inside a specialization body
+  the recursive callee resolves to the specialization currently being compiled, so
+  it was treated as a same-type self-recursion and never re-specialized for the new
+  type — the `struct` branch (folded true for `Box`) called itself unconditionally.
+  Each recursive call is now reconciled against the active specializations by its
+  argument-type key: a same-type call stays on the in-progress spec (fast
+  self-recursion), while a different-type call re-routes through the generic and
+  specializes anew (so `@kind`/`@fields` fold correctly at that type and the
+  recursion terminates). A field-access argument (`v.value`) now also resolves its
+  static type, so structural recursion over struct fields specializes per level.
+  This unblocks recursive comptime constructs such as structural hashing/printing.
+- **A bare module-member call now works inside a closure.** A statement like
+  `std.testing.assertEq …` or `std.fs.mkdirp …` inside a trailing-block / anonymous
+  closure failed (`could not dereference address …`): compiling the module-object
+  receiver read the *captured* module binding's runtime value, which resolves to a
+  bad address in the closure. The call now resolves its fn_ref statically and forks
+  it directly (as the value-position path already did), so a closure body can call
+  module functions — the foundation for library control-flow blocks that contain
+  real assertions.
+- **A recipe-ctor struct literal passed as a call argument is now type-checked
+  against the parameter.** `f Partial{ .zzz = 1 }` where `f` takes a
+  `Partial(Rec(Int))` now reports the unknown/missing field statically (the
+  parameter's materialized layout is pushed as the expected type), matching the
+  check a `const p: Partial(…) = Partial{ … }` binding already got. (Constructing a
+  bare recipe literal in argument position at *runtime* still requires an annotated
+  binding — a separate, pre-existing compiler-materialization gap.)
+- **A read-modify-write reassignment with a call operand — `h = h + (f x)` — no
+  longer crashes.** The in-place `x = x <op> n` optimization compiled the operand
+  `n` without value-capture, so a call/pipeline operand left a forked thread handle
+  that the arithmetic then failed to dereference (and the call's output leaked to
+  stdout). The operand is now captured to its value, matching every other
+  arithmetic operand. (Binding the call to a temp was the workaround.)
+- **A function passed by *name* to a `fn()`-typed parameter is passed as a value,
+  not invoked at the call site.** `apply plain` (where `plain` is a nullary
+  function and `apply` takes a `fn() Int`) eagerly *called* `plain`, so the
+  parameter held the result (an `Int`) instead of the function — and the callee's
+  `yield f` then tried to invoke a non-function and failed (`UnsupportedInstruction`).
+  Both call paths (the fork-free sync call and the general fork call) now pass a
+  bare fn-reference argument as its fn value when the parameter's declared type is
+  a function, building a capture environment when it has one. Fixes passing a named
+  nested closure — capturing a `const` or `var` — to a higher-order function.
+- **A closure now captures a mutable `var` from its scope instead of reading
+  empty.** A trailing-block / anonymous-fn closure that referenced an outer `var`
+  used to render it empty: a `var` lives in a frame-relative closure cell the
+  running closure can't reach, and the closure value built for a `fn`-expression
+  argument carried no populated environment. Now an inline `fn` expression (a
+  trailing block, an anonymous `fn`, or a named `fn … { … }` in argument position)
+  materializes its capture environment in `compileFnDecl` (`make_closure_fn`), a
+  mutable capture is snapshotted by value, and a fork uses a nullary closure's
+  captured environment (previously used only when arguments were passed). This
+  covers both `Void`/effectful and value-returning closures (`get { yield n + 5 }`),
+  for `const` and `var` captures alike. A closure-slot fast path also falls back to
+  the full resolver instead of unwrapping null.
+- **Feature-test stdout fixtures named `*.rn.stdout` are now `*.stdout`.** The CLI
+  smoke runner derives the expected-output fixture by stripping `.rn` (so `foo.rn`
+  → `foo.stdout`) and only diffs stdout when that file exists. Twelve fixtures were
+  misnamed `foo.rn.stdout`, so their stdout was silently never checked (the tests
+  only verified a clean exit). Renamed to the matched form; their output is now
+  validated (all still pass).
+- **A `comptime T: type` function can now return a struct *value* without
+  corrupting it.** When a generic function's declared return was a bare type
+  parameter (`fn f(comptime T: type, v: T) T`), the call site couldn't classify the
+  return as a by-value capture, so the struct was byte-captured — round-tripped
+  through stdout text and misread on the way back (a `Vec` came out looking like an
+  array). The typed-vs-byte capture decision now resolves the declared return
+  against the call's arguments first (binding the comptime type params), so a return
+  that denotes a struct/application is captured by value. This is what makes generic,
+  field-wise builders — `copy`, `doubled`, a `reset` — work end to end with
+  `@field(value)(name)`.
+- **LSP: incremental edits no longer corrupt a file that contains a `\n` string
+  escape.** When mapping an editor position to a byte offset, the language server
+  treated a backslash-`n` in the document text (the two characters of a `\n`
+  escape *inside a string literal*) as a line break. Any file with such a string
+  miscounted every line after it, so an edit (deleting a line, pasting elsewhere)
+  landed at the wrong offset and scrambled the buffer — after which the parser
+  reported errors that made no sense. Line breaks are now only real newline bytes;
+  a backslash is an ordinary character.
+- **A generic function is now monomorphized even when its result is captured by
+  value.** A call whose result is bound with a type (`const r: Maybe(Int) = gmap
+  double some`) takes the typed-pipe capture path, which previously skipped
+  specialization — so a higher-kinded capture (`M`) stayed unbound in the body and
+  a constraint over it (`@hasMethod(M)("bind")`) could not fold. Specialization now
+  runs on that path too, so a *fully generic* monad `map` — written over any
+  constructor `M`, guarded by `@hasMethod(M)`/`@compileError`, and returning
+  `M(B)` — works end to end, and a non-monad argument fails compilation with a
+  directed error naming the constructor.
+- **A nested function declared inside a monomorphized body is visible to its
+  siblings.** `fn map(…) { fn aux(a) { … } yield bind ma aux }` used to lose the
+  `aux` binding when `map` was specialized (`command not found: 'aux'`); the nested
+  declaration now registers its name in the specialized body.
+- **A `fn (|A|) |B|` parameter binds its captures from a plain function argument.**
+  The captures `A`/`B` are now recovered from the passed function's real signature
+  (a hoisted function value's stored type carries only its return type), so a
+  generic parameter that depends solely on a function argument for a capture
+  (`ma: |M|(A)` where `A` comes from `f: fn (|A|) |B|`) specializes correctly.
+
+### Changed
+
+- **The `const Box(T) = struct { … }` generic type-constructor form is removed**,
+  superseded by comptime type functions (`fn Box(comptime T: type) type { … }`).
+  The two are equivalent at every use site (application, construction, capture,
+  serialization), so migrating a declaration is a one-line change; the standard
+  library's `std/map` types and the generic-type regression suite were migrated.
+  Writing the old form now reports a directed error pointing at the new one. Plain
+  (non-generic) type bindings — `const Point = struct { … }` — are unaffected.
+
 ## [0.11.0] - 2026-09-18
 
 ### Added

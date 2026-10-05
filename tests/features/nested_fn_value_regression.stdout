@@ -1,0 +1,4 @@
+nested: 10
+indirect via param: 14
+closure as arg: 105
+indirect via local, nested: 18

@@ -1,0 +1,7 @@
+[error]: tests/diagnostics/fn_value_body_stdout.rn:11:20: 'echo' writes 'String' to stdout, but this function's stdout type is 'Bool'; bind the result (const x = …), redirect it (>&2 or > "file"), or use @log for debug output
+   9:  yield cond
+  10:}
+  11:const ok = check { echo "debug"; yield true }
+  12:echo "ok=${ok}"
+  13:
+

@@ -48,6 +48,10 @@ pub const Parser = struct {
     interp_counter: usize = 0,
     diagnostics: std.ArrayList(Diagnostic) = .empty,
     logging_enabled: bool = false,
+    /// Suppresses trailing-block-closure sugar (`call { … }`) while parsing a
+    /// context where a following `{` opens a body, not a block argument — chiefly
+    /// a paren-less `match subject { … }`. Saved/restored around such a parse.
+    suppress_trailing_block: bool = false,
 
     const Self = @This();
 
@@ -659,6 +663,16 @@ pub const Parser = struct {
         return result;
     }
 
+    /// Parses a type written in value position (`struct { … }`) into a
+    /// `type_value` expression — a type produced as a value.
+    fn parseTypeValueExpression(self: *Self) Error!*ast.Expression {
+        const type_expr = try self.parseTypeExpr();
+        return self.allocExpression(.{ .type_value = .{
+            .type_expr = type_expr,
+            .span = type_expr.span(),
+        } });
+    }
+
     fn parseExpressionInner(self: *Self) Error!*ast.Expression {
         self.clearExpectedTokens();
 
@@ -675,6 +689,9 @@ pub const Parser = struct {
             .kw_comptime => self.parseComptimeExpression(),
             .kw_match => self.parseMatchExpression(),
             .kw_try => self.parseTryExpression(),
+            // A type written in value position (`yield struct { … }`) is a type
+            // value — the result of a type-returning comptime function.
+            .kw_struct => self.parseTypeValueExpression(),
             else => {
                 if (try self.parseMaybeUnaryExpression()) |unary_expr| return unary_expr;
                 if (try self.parseMaybeBinaryExpression()) |binary_expr| return binary_expr;
@@ -1097,8 +1114,31 @@ pub const Parser = struct {
                             });
                             continue;
                         },
+                        .l_bracket => {
+                            // A leading `[]T` in value position is a *type value*
+                            // (compile-time only) — e.g. `@elem([]Int)`. In the
+                            // `.expr` state there is no operand to index, so `[`
+                            // is unambiguously a type, not a postfix subscript.
+                            const breadcrumbInner = try self.createBreadcrumb("PBE:type_value");
+                            defer breadcrumbInner.end();
+                            try components.append(self.allocator, .{
+                                .expr = try self.parseTypeValueExpression(),
+                            });
+                            continue;
+                        },
                         .question => {
-                            if (components.items.len == 0 or components.items[components.items.len - 1] != .op or components.items[components.items.len - 1].op.payload != .member) {
+                            // A leading `?T` in value position is a type value
+                            // (`@child(?Int)`); after a member it is the optional
+                            // access marker.
+                            if (components.items.len == 0) {
+                                const breadcrumbInner = try self.createBreadcrumb("PBE:type_value");
+                                defer breadcrumbInner.end();
+                                try components.append(self.allocator, .{
+                                    .expr = try self.parseTypeValueExpression(),
+                                });
+                                continue;
+                            }
+                            if (components.items[components.items.len - 1] != .op or components.items[components.items.len - 1].op.payload != .member) {
                                 try self.reportParseError(Error.UnexpectedToken, next.span, "expected value, actual: {t}", .{next.tag});
                                 return Error.UnexpectedToken;
                             }
@@ -1145,6 +1185,28 @@ pub const Parser = struct {
                             defer breadcrumbInner.end();
                             try components.append(self.allocator, .{
                                 .expr = try self.parseBraceLiteralExpression(),
+                            });
+                            continue;
+                        },
+                        .dot => {
+                            // `.name` in value position — implicit member access (a
+                            // decl literal) resolved against the result-location type,
+                            // e.g. `const v: Maybe(Int) = .nothing`. Represented as a
+                            // member access whose object is the empty-identifier
+                            // sentinel (the "no written type" marker anonymous `.{ }`
+                            // literals also use); the expected type supplies the object
+                            // later.
+                            const breadcrumbInner = try self.createBreadcrumb("PBE:implicit_member");
+                            defer breadcrumbInner.end();
+                            _ = try self.nextToken(); // consume the dot
+                            const name_tok = try self.expectTokenTag(.identifier);
+                            const obj = try self.allocExpression(.{ .identifier = .{ .name = "", .span = next.span } });
+                            try components.append(self.allocator, .{
+                                .expr = try self.allocExpression(.{ .member = .{
+                                    .object = obj,
+                                    .member = .fromToken(name_tok),
+                                    .span = next.span.endAt(name_tok.span),
+                                } }),
                             });
                             continue;
                         },
@@ -1292,6 +1354,31 @@ pub const Parser = struct {
         //         return components.items[0].toExpression(self);
         //     }
         // }
+
+        // Trailing-block closure sugar: a `{ … }` immediately following a
+        // command/function call (a lowercase-headed application — an uppercase head
+        // is a struct literal, consumed in the `.expr` state above) becomes a
+        // nullary-closure argument, so `withTimer { … }` reads like a built-in block
+        // construct. The block captures the enclosing scope like any nested fn value.
+        // A newline before `{` ends the call first (statement separator), so a block
+        // on its own line stays a separate statement.
+        if (!self.suppress_trailing_block and
+            components.items.len >= 1 and components.items[0] == .identifier and
+            (try self.peekToken()).tag == .l_brace)
+        {
+            const block_expr = try self.parseBlockExpression();
+            const closure = try self.allocExpression(.{ .fn_decl = .{
+                .is_pub = false,
+                .name = null,
+                .params = .none,
+                .stdin_type = null,
+                .return_type = null,
+                .body = block_expr,
+                .span = block_expr.span(),
+            } });
+            try components.append(self.allocator, .{ .op = .{ .payload = .apply, .span = block_expr.span() } });
+            try components.append(self.allocator, .{ .expr = closure });
+        }
 
         return self.parseBinaryExpression(components.items, null, .left);
     }
@@ -2167,7 +2254,12 @@ pub const Parser = struct {
         // The subject parentheses are optional: `match (x) { … }` or `match x { … }`.
         const has_paren = (try self.peekToken()).tag == .l_paren;
         if (has_paren) _ = try self.expect(.l_paren);
+        // Without parens (`match subject { … }`), the `{` opens the arms, not a
+        // trailing block — suppress the block sugar while reading the subject.
+        const saved_suppress = self.suppress_trailing_block;
+        self.suppress_trailing_block = !has_paren;
         const subject = try self.parseExpression();
+        self.suppress_trailing_block = saved_suppress;
         if (has_paren) _ = try self.expect(.r_paren);
         _ = try self.expect(.l_brace);
         self.skipNewlines();
@@ -2253,6 +2345,18 @@ pub const Parser = struct {
                 }
 
                 if (segments.items.len == 1) {
+                    // A type application (`Box(Int)`, `Box(|E|)`, `Pair(|K|)(|V|)`)
+                    // in pattern position — a comptime type pattern.
+                    if ((try self.peekToken()).tag == .l_paren) {
+                        var type_args = try self.collectCurriedTypeArgs(first.name);
+                        defer type_args.deinit(self.allocator);
+                        const app = try self.allocTypeExpression(.{ .type_application = .{
+                            .name = first,
+                            .args = try self.copyToArena(*const ast.TypeExpr, type_args.items),
+                            .span = first.span.endAt(type_args.items[type_args.items.len - 1].span()),
+                        } });
+                        break :blk .{ .type_pattern = app };
+                    }
                     break :blk .{ .binding = segments.items[0] };
                 }
 
@@ -2704,6 +2808,19 @@ pub const Parser = struct {
         const next = try self.peekToken();
         if (next.tag != .kw_fn) return null;
 
+        // A regular named function `fn name(…)` (an identifier other than `@`
+        // directly followed by `(`) is not a script signature (`fn [stdin] @(…)`).
+        // Bail before speculatively parsing a stdin type, which would hard-error
+        // on a lowercase name (`fn greet(…)`) instead of rolling back.
+        const lookahead = try self.peekSlice(3);
+        if (lookahead.len >= 3 and
+            lookahead[1].tag == .identifier and
+            !std.mem.eql(u8, lookahead[1].lexeme, "@") and
+            lookahead[2].tag == .l_paren)
+        {
+            return null;
+        }
+
         var snapshot = try self.takeSnapshot();
         defer snapshot.deinit();
 
@@ -3062,16 +3179,49 @@ pub const Parser = struct {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
-        _ = try self.expect(.l_paren);
-        const args = try self.parseList(.comma, parseExpression, .{});
-        const close = try self.expect(.r_paren);
+        // A type-pattern application carrying a capture (`Box(|B|)`) — used in a
+        // comptime predicate `T == Box(|B|)` to match and bind. The leading `|`
+        // marks it; parse the whole thing as a type value.
+        const lead = try self.peekSlice(2);
+        if (lead.len >= 2 and lead[0].tag == .l_paren and lead[1].tag == .pipe) {
+            var type_args = try self.collectCurriedTypeArgs(callee_id.name);
+            defer type_args.deinit(self.allocator);
+            const app = try self.allocTypeExpression(.{ .type_application = .{
+                .name = callee_id,
+                .args = try self.copyToArena(*const ast.TypeExpr, type_args.items),
+                .span = callee_id.span.endAt(type_args.items[type_args.items.len - 1].span()),
+            } });
+            return self.allocExpression(.{ .type_value = .{ .type_expr = app, .span = app.span() } });
+        }
+
+        // Curried, one argument per parenthesis: `Box(Int)`, `HashMap(Key)(Value)`.
+        // A comma-separated argument list is not the application syntax.
+        var args = std.ArrayList(*ast.Expression).empty;
+        defer args.deinit(self.allocator);
+        var end = callee_id.span;
+        while ((try self.peekToken()).tag == .l_paren) {
+            _ = try self.expect(.l_paren);
+            try args.append(self.allocator, try self.parseExpression());
+            if ((try self.peekToken()).tag == .comma) {
+                const comma = try self.peekToken();
+                try self.reportParseError(
+                    Error.UnexpectedToken,
+                    comma.span,
+                    "type arguments are applied one per parenthesis: write `{s}(A)(B)`, not `{s}(A, B)`",
+                    .{ callee_id.name, callee_id.name },
+                );
+                return Error.UnexpectedToken;
+            }
+            const close = try self.expect(.r_paren);
+            end = close.span;
+        }
 
         return self.allocExpression(.{ .call = .{
             .callee = try self.allocExpression(.{ .identifier = callee_id }),
-            .arguments = args.payload,
+            .arguments = try self.copyToArena(*ast.Expression, args.items),
             .redirects = &.{},
             .background = false,
-            .span = callee_id.span.endAt(close.span),
+            .span = callee_id.span.endAt(end),
         } });
     }
 
@@ -3321,10 +3471,23 @@ pub const Parser = struct {
         defer breadcrumb.end();
 
         const next = try self.peekToken();
-        return switch (next.tag) {
-            .kw_const => try self.parseTry(parseTypeBinding),
-            else => null,
-        };
+        if (next.tag != .kw_const) return null;
+
+        // The generic type-constructor form `const Box(T) = …` is superseded by a
+        // comptime type function. Detect `const <Name>(` and report the migration
+        // directly, rather than letting it fail as a confusing downstream error.
+        const look = try self.peekSlice(3);
+        if (look.len >= 3 and look[1].tag == .identifier and look[2].tag == .l_paren) {
+            try self.reportParseError(
+                Error.UnexpectedToken,
+                look[2].span,
+                "generic types are comptime type functions now: write `fn {s}(comptime T: type) type {{ yield <type> }}` (then use `{s}(Int)` / `{s} Int`)",
+                .{ look[1].lexeme, look[1].lexeme, look[1].lexeme },
+            );
+            return Error.UnexpectedToken;
+        }
+
+        return try self.parseTry(parseTypeBinding);
     }
 
     fn parseTypeBinding(self: *Self) Error!ast.TypeBindingDecl {
@@ -3334,18 +3497,24 @@ pub const Parser = struct {
         const start = try self.expectTokenTag(.kw_const);
         const identifier = try self.parseTypeIdentifier();
 
-        // Optional type parameters for a generic type constructor:
-        // `const Box(T) = struct { value: T }`.
-        var params: []const ast.Identifier = &.{};
-        if ((try self.peekToken()).tag == .l_paren) {
-            _ = try self.expectTokenTag(.l_paren);
-            const list = try self.parseList(.comma, parseTypeIdentifier, .{});
-            _ = try self.expectTokenTag(.r_paren);
-            params = list.payload;
-        }
+        // Generic type parameters (`const Box(T) = …`) are no longer part of this
+        // form — they are written as comptime type functions and are rejected in
+        // `parseMaybeTypeBinding` before reaching here. A plain type binding
+        // (`const Point = struct { … }`) has no parameters.
+        const params: []const ast.Identifier = &.{};
 
         _ = try self.expectTokenTag(.assign);
         const type_expr = try self.parseTypeExpr();
+
+        // The type must be the whole right-hand side. Trailing tokens mean this
+        // is not a plain type binding but a value binding whose initializer is a
+        // call — e.g. `const IntBox = Box Int` (a comptime type-function call).
+        // Fail (without reporting) so `parseTry` rolls back and it is re-parsed
+        // as a value binding.
+        switch ((try self.peekToken()).tag) {
+            .newline, .semicolon, .eof, .r_brace => {},
+            else => return Error.UnexpectedToken,
+        }
 
         return .{
             .span = start.span.endAt(type_expr.span()),
@@ -3534,7 +3703,15 @@ pub const Parser = struct {
 
         const fn_token = try self.expectTokenTag(.kw_fn);
         const start = pub_token orelse fn_token;
-        const stdinType = try self.parseMaybeTypeExpr();
+
+        // Disambiguate `fn name(…)` (no stdin type) from `fn StdinType name(…)`.
+        // When `fn` is directly followed by `<identifier> (`, that identifier is
+        // the function name and there is no stdin type — otherwise `fn Box(…)`
+        // would be misread as a `Box(…)` type application in stdin-type position.
+        const lookahead = try self.peekSlice(2);
+        const name_first = lookahead.len >= 2 and
+            lookahead[0].tag == .identifier and lookahead[1].tag == .l_paren;
+        const stdinType = if (name_first) null else try self.parseMaybeTypeExpr();
         const identifier = try self.expectTokenTag(.identifier);
         _ = try self.expectTokenTag(.l_paren);
         const params = try self.parseList(.comma, parseParam, .{
@@ -3559,16 +3736,25 @@ pub const Parser = struct {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
 
-        // A leading `var` marks the parameter mutable, so the body may reassign it
-        // or mutate its fields (`fn f(var e: T) …` then `e.x += 1`) without a
-        // `var copy = e` shim. Parameters are immutable (const) otherwise; an
-        // explicit `const` is accepted as a no-op for symmetry.
+        // A leading `comptime` marks the parameter as compile-time known (a
+        // `type` argument, or another comptime constant). A leading `var` marks
+        // the parameter mutable, so the body may reassign it or mutate its fields
+        // (`fn f(var e: T) …` then `e.x += 1`) without a `var copy = e` shim.
+        // Parameters are immutable (const) otherwise; an explicit `const` is
+        // accepted as a no-op for symmetry. `comptime` may precede `var`/`const`.
         const start = try self.peekToken();
+        var is_comptime = false;
+        if (start.tag == .kw_comptime) {
+            _ = try self.nextToken();
+            is_comptime = true;
+        }
+
         var is_mutable = false;
-        if (start.tag == .kw_var) {
+        const mutability = try self.peekToken();
+        if (mutability.tag == .kw_var) {
             _ = try self.nextToken();
             is_mutable = true;
-        } else if (start.tag == .kw_const) {
+        } else if (mutability.tag == .kw_const) {
             _ = try self.nextToken();
         }
 
@@ -3584,6 +3770,7 @@ pub const Parser = struct {
             .type_annotation = annotation,
             .default_value = default_value,
             .is_mutable = is_mutable,
+            .is_comptime = is_comptime,
             .span = pattern.span().endAt(end),
         };
 
@@ -3837,43 +4024,179 @@ pub const Parser = struct {
         // `struct {}` stays a named (empty) struct.
         const ahead = try self.peekSlice(2);
         const is_named = (ahead.len >= 1 and ahead[0].tag == .r_brace) or
-            (ahead.len >= 2 and ahead[0].tag == .identifier and ahead[1].tag == .colon);
+            (ahead.len >= 2 and ahead[0].tag == .identifier and ahead[1].tag == .colon) or
+            (ahead.len >= 1 and (isInsertToken(ahead[0]) or ahead[0].tag == .kw_for));
         if (!is_named) return self.parseTupleTypeBody(start);
 
-        var fields = std.ArrayList(ast.TypeExpr.StructField).empty;
-        defer fields.deinit(self.allocator);
+        // Parse the body as an ordered item list — ordinary fields interleaved
+        // with `@insert` / comptime `for … @insert` generators (order preserved).
+        var items = std.ArrayList(ast.TypeExpr.StructBodyItem).empty;
+        defer items.deinit(self.allocator);
 
         while (true) {
             self.skipNewlines();
             const next = try self.peekToken();
             if (next.tag == .r_brace) break;
 
+            if (isInsertToken(next)) {
+                _ = try self.nextToken();
+                try self.parseInsertItem(&items);
+            } else if (next.tag == .kw_for) {
+                try self.parseForInsertItem(&items);
+            } else {
+                const name = try self.parseIdentifier();
+                _ = try self.expectTokenTag(.colon);
+                const field_type = try self.parseTypeExpr();
+                try items.append(self.allocator, .{ .field = .{
+                    .name = name,
+                    .type_expr = field_type,
+                    .span = name.span.endAt(field_type.span()),
+                } });
+            }
+
+            self.skipNewlines();
+            const delimiter = try self.peekToken();
+            if (delimiter.tag == .comma) _ = try self.nextToken();
+        }
+
+        const close = try self.expectTokenTag(.r_brace);
+        return self.finishStructType(items.items, start.span.endAt(close.span));
+    }
+
+    /// Builds the struct `TypeExpr` from a parsed body item list. With no
+    /// generators (every item a plain field), flatten to a `fields` slice. With an
+    /// `@insert`/`for … @insert`, keep the ordered recipe in `body_items` for
+    /// instantiation-time materialization (`fields` empty until then).
+    fn finishStructType(self: *Self, items: []const ast.TypeExpr.StructBodyItem, span: ast.Span) Error!*const ast.TypeExpr {
+        var has_generator = false;
+        for (items) |item| if (item != .field) {
+            has_generator = true;
+            break;
+        };
+        if (!has_generator) {
+            var fields = std.ArrayList(ast.TypeExpr.StructField).empty;
+            defer fields.deinit(self.allocator);
+            for (items) |item| try fields.append(self.allocator, item.field);
+            return self.allocTypeExpression(.{ .struct_type = .{
+                .fields = try self.copyToArena(ast.TypeExpr.StructField, fields.items),
+                .decls = &.{},
+                .span = span,
+            } });
+        }
+        return self.allocTypeExpression(.{ .struct_type = .{
+            .fields = &.{},
+            .decls = &.{},
+            .body_items = try self.copyToArena(ast.TypeExpr.StructBodyItem, items),
+            .span = span,
+        } });
+    }
+
+    /// Parses the operand of an `@insert` (the `@insert` token consumed). A static
+    /// string literal is re-parsed into fields immediately (increment 1); a dynamic
+    /// operand (interpolated literal / other expression) becomes an `.insert`
+    /// recipe item folded at instantiation.
+    fn parseInsertItem(self: *Self, items: *std.ArrayList(ast.TypeExpr.StructBodyItem)) Error!void {
+        const next = try self.peekToken();
+        if (next.tag == .string_start) {
+            const literal = try self.parseStringLiteral();
+            var static = true;
+            for (literal.segments) |segment| if (segment == .interpolation) {
+                static = false;
+                break;
+            };
+            if (static) {
+                var text = std.ArrayList(u8).empty;
+                defer text.deinit(self.allocator);
+                for (literal.segments) |segment| switch (segment) {
+                    .text => |t| try text.appendSlice(self.allocator, t.payload),
+                    .interpolation => unreachable,
+                };
+                const fields = try self.reparseFieldString(text.items);
+                for (fields) |f| try items.append(self.allocator, .{ .field = f });
+                return;
+            }
+            const operand = try self.allocExpression(.{ .literal = .{ .string = literal } });
+            try items.append(self.allocator, .{ .insert = operand });
+            return;
+        }
+        const operand = try self.parseExpression();
+        try items.append(self.allocator, .{ .insert = operand });
+    }
+
+    /// Parses `for (<source>) |<var>| @insert <operand>` in struct-field position.
+    fn parseForInsertItem(self: *Self, items: *std.ArrayList(ast.TypeExpr.StructBodyItem)) Error!void {
+        const for_tok = try self.expect(.kw_for);
+        _ = try self.expect(.l_paren);
+        const source = try self.parseForSource();
+        _ = try self.expect(.r_paren);
+        const capture = try self.parseCaptureClause();
+        if (capture.bindings.len != 1 or capture.bindings[0].* != .identifier) {
+            try self.reportParseError(Error.UnexpectedToken, capture.span, "a `for … @insert` in a struct body takes exactly one capture, e.g. `for (@fields(T)) |f| @insert \"…\"`", .{});
+            return Error.UnexpectedToken;
+        }
+        const var_name = capture.bindings[0].identifier;
+        self.skipNewlines();
+        const insert_tok = try self.peekToken();
+        if (!isInsertToken(insert_tok)) {
+            try self.reportParseError(Error.UnexpectedToken, insert_tok.span, "a `for` in a struct body must have an `@insert` body: `for (…) |f| @insert \"…\"`", .{});
+            return Error.UnexpectedToken;
+        }
+        _ = try self.nextToken(); // @insert
+        const operand = try self.parseExpression();
+        try items.append(self.allocator, .{ .for_insert = .{
+            .var_name = var_name,
+            .source = source,
+            .operand = operand,
+            .span = for_tok.span.endAt(operand.span()),
+        } });
+    }
+
+    /// Whether `tok` is the `@insert` compile-time code-insertion directive.
+    fn isInsertToken(tok: token.Token) bool {
+        return tok.tag == .identifier and std.mem.eql(u8, tok.lexeme, "@insert");
+    }
+
+    /// Re-lexes and parses `text` as a `name: Type[, …]` field list on a fresh
+    /// stream (parser re-entry), returning the fields; the outer stream is saved
+    /// and restored. Public so instantiation-time materialization (the IR
+    /// compiler) can re-parse a folded `@insert` string; the returned fields live
+    /// in this parser's arena, so the caller must keep the parser alive.
+    pub fn reparseFieldString(self: *Self, text: []const u8) Error![]const ast.TypeExpr.StructField {
+        const insert_source = try self.arena.allocator().dupe(u8, text);
+        const saved_stream = self.stream;
+        const saved_source = self.source;
+        self.stream = try .init(
+            self.io,
+            self.arena.allocator(),
+            self.environ_map,
+            "<@insert>",
+            insert_source,
+        );
+        errdefer self.stream = saved_stream;
+        self.source = insert_source;
+
+        var fields = std.ArrayList(ast.TypeExpr.StructField).empty;
+        defer fields.deinit(self.allocator);
+        while (true) {
+            self.skipNewlines();
+            const next = try self.peekToken();
+            if (next.tag == .eof) break;
             const name = try self.parseIdentifier();
             _ = try self.expectTokenTag(.colon);
             const field_type = try self.parseTypeExpr();
-
             try fields.append(self.allocator, .{
                 .name = name,
                 .type_expr = field_type,
                 .span = name.span.endAt(field_type.span()),
             });
-
             self.skipNewlines();
             const delimiter = try self.peekToken();
-            if (delimiter.tag == .comma) {
-                _ = try self.nextToken();
-            }
+            if (delimiter.tag == .comma) _ = try self.nextToken();
         }
 
-        const close = try self.expectTokenTag(.r_brace);
-
-        return self.allocTypeExpression(.{
-            .struct_type = .{
-                .fields = try self.copyToArena(ast.TypeExpr.StructField, fields.items),
-                .decls = &.{},
-                .span = start.span.endAt(close.span),
-            },
-        });
+        self.stream = saved_stream;
+        self.source = saved_source;
+        return self.copyToArena(ast.TypeExpr.StructField, fields.items);
     }
 
     /// Parses the positional body of a tuple type — `struct { T0, T1, … }` (the
@@ -3953,6 +4276,20 @@ pub const Parser = struct {
         const name = try self.parseTypeIdentifier();
         const close = try self.expectTokenTag(.pipe);
 
+        // A higher-kinded application `|M|(A)`: the captured `M` is a type
+        // *constructor*, applied to the following curried arguments. `M` is bound
+        // to a concrete constructor when this pattern is unified, then re-applied.
+        if ((try self.peekToken()).tag == .l_paren) {
+            var type_args = try self.collectCurriedTypeArgs(name.name);
+            defer type_args.deinit(self.allocator);
+            return self.allocTypeExpression(.{ .type_application = .{
+                .name = .{ .name = name.name, .span = open.span.endAt(close.span) },
+                .args = try self.copyToArena(*const ast.TypeExpr, type_args.items),
+                .span = open.span.endAt(type_args.items[type_args.items.len - 1].span()),
+                .ctor_is_capture = true,
+            } });
+        }
+
         return self.allocTypeExpression(.{
             .type_capture = .{
                 .name = name.name,
@@ -3982,6 +4319,13 @@ pub const Parser = struct {
             return Error.ExpectedTypeIdentifier;
         };
 
+        // `type` is the meta-type — the type of a type value (a `comptime T: type`
+        // param, a type-returning function's return type). It is the one
+        // lowercase type keyword, so recognize it before the uppercase check.
+        if (spanned_path.payload.len == 1 and std.mem.eql(u8, last_segment.name, "type")) {
+            return self.allocTypeExpression(.{ .type_type = .{ .span = spanned_path.span } });
+        }
+
         if (std.ascii.isLower(last_segment.name[0])) {
             const identifier_capitalized = try self.arena.allocator().dupe(
                 u8,
@@ -3998,15 +4342,16 @@ pub const Parser = struct {
             return Error.ExpectedTypeIdentifier;
         }
 
-        // A generic type application `Name(args…)` — e.g. `Box(Int)`, `Box(|T|)`.
+        // A generic type application, curried one argument per parenthesis:
+        // `Box(Int)`, `HashMap(Key)(Value)`. A comma-separated `HashMap(Key, Value)`
+        // is not the application syntax — a generic type is applied like any call.
         if ((try self.peekToken()).tag == .l_paren) {
-            _ = try self.expectTokenTag(.l_paren);
-            const args = try self.parseList(.comma, parseTypeExprArg, .{});
-            const close = try self.expectTokenTag(.r_paren);
+            var args = try self.collectCurriedTypeArgs(last_segment.name);
+            defer args.deinit(self.allocator);
             return self.allocTypeExpression(.{ .type_application = .{
                 .name = last_segment,
-                .args = args.payload,
-                .span = spanned_path.span.endAt(close.span),
+                .args = try self.copyToArena(*const ast.TypeExpr, args.items),
+                .span = spanned_path.span.endAt(args.items[args.items.len - 1].span()),
             } });
         }
 
@@ -4018,6 +4363,33 @@ pub const Parser = struct {
 
     /// A single type argument inside a `Name(args…)` application. Wraps
     /// `parseTypeExpr` for use with `parseList` (which expects a `*const` result).
+    /// Collects the curried type arguments of a generic application —
+    /// `(A)(B)(C)` → `[A, B, C]`, one argument per parenthesis. A comma inside a
+    /// parenthesis (`Name(A, B)`) is rejected with a directed error, since a
+    /// generic type is applied like any call, not with a parenthesized argument
+    /// list. Caller owns the returned list.
+    fn collectCurriedTypeArgs(self: *Self, name: []const u8) Error!std.ArrayList(*const ast.TypeExpr) {
+        var args = std.ArrayList(*const ast.TypeExpr).empty;
+        errdefer args.deinit(self.allocator);
+        while ((try self.peekToken()).tag == .l_paren) {
+            _ = try self.expectTokenTag(.l_paren);
+            const arg = try self.parseTypeExprArg();
+            try args.append(self.allocator, arg);
+            if ((try self.peekToken()).tag == .comma) {
+                const comma = try self.peekToken();
+                try self.reportParseError(
+                    Error.UnexpectedToken,
+                    comma.span,
+                    "type arguments are applied one per parenthesis: write `{s}(A)(B)`, not `{s}(A, B)`",
+                    .{ name, name },
+                );
+                return Error.UnexpectedToken;
+            }
+            _ = try self.expectTokenTag(.r_paren);
+        }
+        return args;
+    }
+
     fn parseTypeExprArg(self: *Self) Error!*const ast.TypeExpr {
         return self.parseTypeExpr();
     }

@@ -1,0 +1,10 @@
+scalar int
+scalar string
+box of int
+box of Bool
+box of Box(Int)
+pair Int/String
+other Bool
+zero
+one
+many (5)

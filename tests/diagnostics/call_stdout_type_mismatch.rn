@@ -1,0 +1,10 @@
+# A bare call to a function forwards that function's stdout to the enclosing
+# function's stdout (&1). `namer` writes a `String`, but `bad`'s stdout carries an
+# `Int` — a stdout type mismatch. (A call whose result is bound, or whose stdout
+# matches, is fine.)
+fn String namer() String { yield "hi" }
+fn Int bad() Int {
+  namer
+  yield 5
+}
+echo "${bad}"

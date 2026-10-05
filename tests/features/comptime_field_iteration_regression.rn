@@ -1,0 +1,49 @@
+# Comptime iteration over a struct type's fields. `for (@fields(T)) |f|` unrolls
+# at compile time — one body copy per field — with `f.name` folding to the field
+# name and `f.type` to its type (itself a comptime type, so `@kind(f.type)`,
+# `f.type == Int`, `match (f.type)`, and a nested `for (@fields(f.type))` all
+# work). The whole function is monomorphized per type argument.
+
+fn Box(comptime T: type) type { yield struct { value: T } }
+fn Pair(comptime A: type, comptime B: type) type { yield struct { a: A, b: B } }
+fn Empty(comptime T: type) type { yield struct { } }
+fn Rec(comptime T: type) type { yield struct { id: Int, label: String, items: []T, boxed: Box(T) } }
+
+# name/type/@fieldCount, and a plain field walk.
+fn Void walk(comptime T: type) String {
+    echo "${@fieldCount(T)} fields:"
+    for (@fields(T)) |f| { echo "  ${f.name}: ${f.type}" }
+}
+walk Pair(Int)(String)
+echo "empty ->"
+walk Empty(Int)
+
+# f.type in comparisons, match with captures, and introspection builtins.
+fn Void classify(comptime T: type) String {
+    for (@fields(T)) |f| {
+        if (f.type == Int) {
+            echo "  ${f.name}: int"
+        } else {
+            match (f.type) {
+                String => { echo "  ${f.name}: string" }
+                Box(|E|) => { echo "  ${f.name}: box of ${E}" }
+                _ => { echo "  ${f.name}: ${@kind(f.type)} of ${@elem(f.type)}" }
+            }
+        }
+    }
+}
+echo "classify Rec(Bool):"
+classify Rec(Bool)
+
+# Nested field iteration: walk each field's own (struct) type.
+fn Wrap(comptime T: type) type { yield struct { first: Pair(Int)(T), second: Pair(T)(Bool) } }
+fn Void deep(comptime T: type) String {
+    for (@fields(T)) |outer| {
+        echo "${outer.name}: ${outer.type}"
+        for (@fields(outer.type)) |inner| {
+            echo "    ${inner.name}: ${inner.type}"
+        }
+    }
+}
+echo "deep Wrap(String):"
+deep Wrap(String)
