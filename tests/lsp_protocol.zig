@@ -2800,6 +2800,55 @@ test "lsp hover lists every signature of an overloaded function" {
     try std.testing.expect(std.mem.indexOf(u8, value, "<struct>") == null);
 }
 
+test "lsp hover types an anonymous struct-literal field from its context" {
+    // `.x` in an anonymous `.{ .x = … }` literal has no name to look up; its type
+    // comes from the literal's context — a binding annotation, or (inside a
+    // function) the declared return type that its `yield` targets. Both should
+    // resolve the field type rather than coming back empty.
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\const Point = struct { x: Int, y: Int }
+        \\const v: Point = .{ .x = 1, .y = 2 }
+        \\fn Maybe(comptime T: type) type { yield struct { x: ?T } }
+        \\fn Void pure(x: |A|) Maybe(A) {
+        \\  yield .{ .x = x }
+        \\}
+        \\echo "${v.x}"
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        // `.x` in the annotated binding `const v: Point = .{ .x = 1, … }` (line 1).
+        try makeHoverRequest(allocator, 10, uri, 1, 21),
+        // `.x` in `pure`'s `yield .{ .x = x }` (line 4) — typed from the return type.
+        try makeHoverRequest(allocator, 11, uri, 4, 12),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const annotated = try findResponseById(allocator, output, 10);
+    defer allocator.free(annotated.body);
+    const annotated_parsed = try std.json.parseFromSlice(std.json.Value, allocator, annotated.body, .{});
+    defer annotated_parsed.deinit();
+    const annotated_value = annotated_parsed.value.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, annotated_value, "x: Int") != null);
+
+    const yielded = try findResponseById(allocator, output, 11);
+    defer allocator.free(yielded.body);
+    const yielded_parsed = try std.json.parseFromSlice(std.json.Value, allocator, yielded.body, .{});
+    defer yielded_parsed.deinit();
+    const yielded_value = yielded_parsed.value.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, yielded_value, "x: ?A") != null);
+}
+
 test "lsp hover shows execution result member type" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);

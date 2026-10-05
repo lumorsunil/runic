@@ -573,9 +573,17 @@ pub fn concreteType(
     while (guard < 8) : (guard += 1) {
         switch (current.*) {
             .alias => |alias_type| current = type_checker.resolveAliasType(&alias_type),
-            .identifier => {
+            .identifier, .type_application => {
+                // A named type (`Point`) or a type-constructor application
+                // (`Maybe(A)`) resolves to the struct it denotes, so member
+                // lookups see the fields. `Maybe(A)` with a type-variable argument
+                // still resolves — `T` substitutes to `A`, giving `struct { x: ?A }`.
                 const s = scope orelse return null;
-                current = type_checker.resolveTypeExpr(s, current) catch return null;
+                const resolved = type_checker.resolveTypeExpr(s, current) catch return null;
+                // Guard against a no-op resolve (application that can't reduce)
+                // so the loop terminates instead of spinning to the guard cap.
+                if (resolved == current) return current;
+                current = resolved;
             },
             else => return current,
         }

@@ -304,6 +304,14 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Fixed
 
+- **Hovering a field of an anonymous `.{ … }` struct literal now shows its type.**
+  A field like `.x` in `.{ .x = … }` has no type name to look up, so hover came
+  back empty. It now takes the field's type from the literal's context — a binding
+  annotation (`const v: Point = .{ .x = 1 }`) or, inside a function, the declared
+  return type that the `yield` targets (so `.x` in `fn … Maybe(A) { yield .{ .x = x } }`
+  resolves to `?A`). Hover also now peels a type-constructor application
+  (`Maybe(Int)`) to its struct before a member/field lookup, so these resolve even
+  through a generic constructor.
 - **The language server no longer crashes after a few quick edits.** Rapidly
   deleting/inserting lines in a file that uses compile-time field iteration
   (`for (@fields(T)) |f|`) segfaulted the server. The type checker is reused across

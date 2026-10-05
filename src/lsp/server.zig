@@ -1272,18 +1272,29 @@ pub const Server = struct {
         pos: types.Position,
     ) ?StructLitField {
         for (script.statements) |stmt| {
-            if (self.structLitFieldInStmt(scope, stmt, pos)) |field| return field;
+            if (self.structLitFieldInStmt(scope, stmt, pos, null)) |field| return field;
         }
         return null;
     }
 
     /// The type a struct literal constructs: a scope binding for a plain
-    /// `Vector{…}`, or a module member for a qualified `m.Vector{…}`.
+    /// `Vector{…}`, a module member for a qualified `m.Vector{…}`, or — for an
+    /// anonymous `.{ … }` literal (empty name) — the `expected` type flowing in
+    /// from its context (a `yield`'s function return type, a binding annotation).
     fn structLiteralType(
         self: *Server,
         scope: *runic.semantic.Scope,
         lit: runic.ast.StructLiteral,
+        expected: ?*const runic.ast.TypeExpr,
     ) ?*const runic.ast.TypeExpr {
+        // Prefer the context type when we have one. An anonymous `.{ … }` literal
+        // carries no usable name (and the type checker may rewrite its name to the
+        // bare constructor `Maybe`, dropping the `Int` arg — whose lookup is the
+        // type-constructor *function*, not the struct). The `expected` type
+        // (`Maybe(Int)`, a binding annotation or the enclosing function's return
+        // type) is authoritative, so use it; fall back to the written name only
+        // when there is no context type (`Point{ … }` with no annotation).
+        if (expected) |e| return e;
         if (lit.object) |object| {
             const object_name = switch (object.*) {
                 .identifier => |id| id.name,
@@ -1296,77 +1307,88 @@ pub const Server = struct {
         return binding.type_expr;
     }
 
-    fn structLitFieldInBlock(self: *Server, scope: *runic.semantic.Scope, block: runic.ast.Block, pos: types.Position) ?StructLitField {
+    fn structLitFieldInBlock(self: *Server, scope: *runic.semantic.Scope, block: runic.ast.Block, pos: types.Position, expected: ?*const runic.ast.TypeExpr) ?StructLitField {
         for (block.statements) |s| {
-            if (self.structLitFieldInStmt(scope, s, pos)) |field| return field;
+            if (self.structLitFieldInStmt(scope, s, pos, expected)) |field| return field;
         }
         return null;
     }
 
-    fn structLitFieldInStmt(self: *Server, scope: *runic.semantic.Scope, stmt: *const runic.ast.Statement, pos: types.Position) ?StructLitField {
+    /// `expected` is the type the position's value is expected to have, threaded
+    /// down so an anonymous `.{ … }` literal can be typed from its context: a
+    /// binding's annotation, or the enclosing function's return type (through its
+    /// `yield`/`exit`). Null where there is no such context.
+    fn structLitFieldInStmt(self: *Server, scope: *runic.semantic.Scope, stmt: *const runic.ast.Statement, pos: types.Position, expected: ?*const runic.ast.TypeExpr) ?StructLitField {
         return switch (stmt.*) {
-            .binding_decl => |bd| self.structLitFieldInExpr(scope, bd.initializer, pos),
-            .expression => |es| self.structLitFieldInExpr(scope, es.expression, pos),
-            .yield_stmt => |ys| self.structLitFieldInExpr(scope, ys.value, pos),
-            .exit_stmt => |xs| if (xs.value) |v| self.structLitFieldInExpr(scope, v, pos) else null,
-            .while_stmt => |ws| self.structLitFieldInExpr(scope, ws.condition, pos) orelse self.structLitFieldInBlock(scope, ws.body, pos),
+            .binding_decl => |bd| self.structLitFieldInExpr(scope, bd.initializer, pos, bd.annotation),
+            .expression => |es| self.structLitFieldInExpr(scope, es.expression, pos, expected),
+            .yield_stmt => |ys| self.structLitFieldInExpr(scope, ys.value, pos, expected),
+            .exit_stmt => |xs| if (xs.value) |v| self.structLitFieldInExpr(scope, v, pos, expected) else null,
+            .while_stmt => |ws| self.structLitFieldInExpr(scope, ws.condition, pos, null) orelse self.structLitFieldInBlock(scope, ws.body, pos, expected),
             else => null,
         };
     }
 
-    fn structLitFieldInExpr(self: *Server, scope: *runic.semantic.Scope, expr: *const runic.ast.Expression, pos: types.Position) ?StructLitField {
+    fn structLitFieldInExpr(self: *Server, scope: *runic.semantic.Scope, expr: *const runic.ast.Expression, pos: types.Position, expected: ?*const runic.ast.TypeExpr) ?StructLitField {
         switch (expr.*) {
             .struct_literal => |lit| {
+                const lit_type = self.structLiteralType(scope, lit, expected);
                 for (lit.fields) |field| {
                     if (positionInRange(pos, types.Range.fromSpan(field.name.span))) {
-                        const lit_type = self.structLiteralType(scope, lit) orelse return null;
-                        return .{ .object_type = lit_type, .member_name = field.name.name, .member_span = field.name.span };
+                        return .{ .object_type = lit_type orelse return null, .member_name = field.name.name, .member_span = field.name.span };
                     }
-                    // A field value can hold a nested literal (`.p = Point{ … }`).
-                    if (self.structLitFieldInExpr(scope, field.value, pos)) |nested| return nested;
+                    // A field value can hold a nested literal (`.p = Point{ … }`
+                    // or `.p = .{ … }`); its expected type is this field's type.
+                    const field_expected: ?*const runic.ast.TypeExpr = if (lit_type) |lt|
+                        completion.resolveMemberType(&self.workspace.type_checker, scope, lt, field.name.name)
+                    else
+                        null;
+                    if (self.structLitFieldInExpr(scope, field.value, pos, field_expected)) |nested| return nested;
                 }
-                if (lit.object) |object| return self.structLitFieldInExpr(scope, object, pos);
+                if (lit.object) |object| return self.structLitFieldInExpr(scope, object, pos, null);
                 return null;
             },
             .call => |call| {
-                if (self.structLitFieldInExpr(scope, call.callee, pos)) |s| return s;
-                for (call.arguments) |arg| if (self.structLitFieldInExpr(scope, arg, pos)) |s| return s;
+                if (self.structLitFieldInExpr(scope, call.callee, pos, null)) |s| return s;
+                for (call.arguments) |arg| if (self.structLitFieldInExpr(scope, arg, pos, null)) |s| return s;
                 return null;
             },
-            .binary => |b| return self.structLitFieldInExpr(scope, b.left, pos) orelse self.structLitFieldInExpr(scope, b.right, pos),
-            .unary => |u| return self.structLitFieldInExpr(scope, u.operand, pos),
-            .assignment => |a| return self.structLitFieldInExpr(scope, a.expr, pos),
+            .binary => |b| return self.structLitFieldInExpr(scope, b.left, pos, null) orelse self.structLitFieldInExpr(scope, b.right, pos, null),
+            .unary => |u| return self.structLitFieldInExpr(scope, u.operand, pos, null),
+            .assignment => |a| return self.structLitFieldInExpr(scope, a.expr, pos, null),
             .pipeline => |p| {
-                for (p.stages) |s| if (self.structLitFieldInExpr(scope, s, pos)) |sp| return sp;
+                for (p.stages) |s| if (self.structLitFieldInExpr(scope, s, pos, null)) |sp| return sp;
                 return null;
             },
-            .block => |b| return self.structLitFieldInBlock(scope, b, pos),
-            .if_expr => |i| return self.structLitFieldInIf(scope, &i, pos),
+            .block => |b| return self.structLitFieldInBlock(scope, b, pos, expected),
+            .if_expr => |i| return self.structLitFieldInIf(scope, &i, pos, expected),
             .for_expr => |f| {
-                for (f.sources) |s| if (self.structLitFieldInExpr(scope, s, pos)) |sp| return sp;
-                return self.structLitFieldInExpr(scope, f.body, pos);
+                for (f.sources) |s| if (self.structLitFieldInExpr(scope, s, pos, null)) |sp| return sp;
+                return self.structLitFieldInExpr(scope, f.body, pos, expected);
             },
             .match_expr => |m| {
-                if (self.structLitFieldInExpr(scope, m.subject, pos)) |s| return s;
-                for (m.cases) |c| if (self.structLitFieldInBlock(scope, c.body, pos)) |s| return s;
+                if (self.structLitFieldInExpr(scope, m.subject, pos, null)) |s| return s;
+                for (m.cases) |c| if (self.structLitFieldInBlock(scope, c.body, pos, expected)) |s| return s;
                 return null;
             },
-            .fn_decl => |f| return self.structLitFieldInExpr(scope, f.body, pos),
+            // A function body's `yield`/`exit` values are expected to have the
+            // function's declared return type.
+            .fn_decl => |f| return self.structLitFieldInExpr(scope, f.body, pos, if (f.return_type) |rt| rt else null),
             .array => |arr| {
-                for (arr.elements) |e| if (self.structLitFieldInExpr(scope, e, pos)) |s| return s;
+                for (arr.elements) |e| if (self.structLitFieldInExpr(scope, e, pos, null)) |s| return s;
                 return null;
             },
             .map => |mp| {
                 for (mp.entries) |e| {
-                    if (self.structLitFieldInExpr(scope, e.key, pos)) |s| return s;
-                    if (self.structLitFieldInExpr(scope, e.value, pos)) |s| return s;
+                    if (self.structLitFieldInExpr(scope, e.key, pos, null)) |s| return s;
+                    if (self.structLitFieldInExpr(scope, e.value, pos, null)) |s| return s;
                 }
                 return null;
             },
             .literal => |lit| switch (lit) {
                 .string => |s| {
                     for (s.segments) |seg| switch (seg) {
-                        .interpolation => |e| if (self.structLitFieldInExpr(scope, e, pos)) |sp| return sp,
+                        .interpolation => |e| if (self.structLitFieldInExpr(scope, e, pos, null)) |sp| return sp,
                         else => {},
                     };
                     return null;
@@ -1377,12 +1399,12 @@ pub const Server = struct {
         }
     }
 
-    fn structLitFieldInIf(self: *Server, scope: *runic.semantic.Scope, if_expr: *const runic.ast.IfExpr, pos: types.Position) ?StructLitField {
-        if (self.structLitFieldInExpr(scope, if_expr.condition, pos)) |s| return s;
-        if (self.structLitFieldInExpr(scope, if_expr.then_expr, pos)) |s| return s;
+    fn structLitFieldInIf(self: *Server, scope: *runic.semantic.Scope, if_expr: *const runic.ast.IfExpr, pos: types.Position, expected: ?*const runic.ast.TypeExpr) ?StructLitField {
+        if (self.structLitFieldInExpr(scope, if_expr.condition, pos, null)) |s| return s;
+        if (self.structLitFieldInExpr(scope, if_expr.then_expr, pos, expected)) |s| return s;
         if (if_expr.else_branch) |else_branch| switch (else_branch) {
-            .expr => |e| return self.structLitFieldInExpr(scope, e, pos),
-            .if_expr => |nested| return self.structLitFieldInIf(scope, nested, pos),
+            .expr => |e| return self.structLitFieldInExpr(scope, e, pos, expected),
+            .if_expr => |nested| return self.structLitFieldInIf(scope, nested, pos, expected),
             .condition => {},
         };
         return null;
