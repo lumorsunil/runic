@@ -67,7 +67,10 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   declaration — `const none: Maybe(Int) = .nothing` is `Maybe(Int).nothing` — the
   way Zig resolves a decl literal. Currently wired for a binding's annotation when
   it is a type-constructor application (`Maybe(Int)`); the explicit `Type.name`
-  form works anywhere.
+  form works anywhere. The type checker now also carries a type constructor's
+  static decls on the produced type, so editor hover on either form (`.nothing`
+  or `Maybe(Int).nothing`) shows the resolved declaration, typed concretely
+  (`const nothing: ?Int`).
 - **`std.meta.hash(v) Int`** — a structural hash: a struct combines its fields'
   hashes, a scalar/string hashes the bytes of its textual form. Recurses into
   struct-typed fields, so it is a deep hash (equal values by `std.meta.eq` hash

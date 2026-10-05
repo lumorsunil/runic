@@ -1010,6 +1010,17 @@ pub const TypeChecker = struct {
                 }
                 var new_st = st;
                 new_st.fields = new_fields;
+                // Substitute a static decl's declared type too (`nothing: ?T` →
+                // `?Int`), so member access on the instantiated type sees it
+                // concretely.
+                if (st.decls.len > 0) {
+                    const new_decls = try self.arena.allocator().alloc(ast.TypeExpr.StructDecl, st.decls.len);
+                    for (st.decls, new_decls) |decl, *dst| {
+                        dst.* = decl;
+                        if (decl.type_expr) |t| dst.type_expr = try self.substituteTypeParams(t, params, args);
+                    }
+                    new_st.decls = new_decls;
+                }
                 return self.allocTypeExpression(.{ .struct_type = new_st });
             },
             else => return type_expr,
@@ -2239,7 +2250,40 @@ pub const TypeChecker = struct {
             },
         }
         if (names.items.len == 0) return null;
-        return .{ .params = try names.toOwnedSlice(self.arena.allocator()), .body = body_type };
+        // Fold the body's `pub const` declarations into the yielded struct's decls
+        // so the produced type carries them as static members (`Maybe(Int).nothing`,
+        // and the implicit `.nothing`). Mirrors the IR compiler's
+        // `withTypeFnPubDecls`.
+        const body = try self.foldTypeFnPubDecls(body_type, fn_decl.body);
+        return .{ .params = try names.toOwnedSlice(self.arena.allocator()), .body = body };
+    }
+
+    /// Returns `body` with every `pub const` in a type function's body block
+    /// appended to its struct `decls`. A non-struct or bare body is unchanged.
+    fn foldTypeFnPubDecls(self: *TypeChecker, body: *const ast.TypeExpr, fn_body: *const ast.Expression) Error!*const ast.TypeExpr {
+        if (body.* != .struct_type) return body;
+        if (fn_body.* != .block) return body;
+        var decls: std.ArrayListUnmanaged(ast.TypeExpr.StructDecl) = .empty;
+        try decls.appendSlice(self.arena.allocator(), body.struct_type.decls);
+        for (fn_body.block.statements) |stmt| {
+            switch (stmt.*) {
+                .binding_decl => |*bd| {
+                    if (!bd.is_pub) continue;
+                    if (bd.pattern.* != .identifier) continue;
+                    try decls.append(self.arena.allocator(), .{
+                        .name = bd.pattern.identifier,
+                        .type_expr = bd.annotation,
+                        .decl_source = .{ .binding_decl = bd },
+                        .span = bd.span,
+                    });
+                },
+                else => {},
+            }
+        }
+        if (decls.items.len == body.struct_type.decls.len) return body;
+        var st = body.struct_type;
+        st.decls = try decls.toOwnedSlice(self.arena.allocator());
+        return self.allocTypeExpression(.{ .struct_type = st });
     }
 
     /// The type a comptime call argument denotes (`Int` → the type Int, a nested

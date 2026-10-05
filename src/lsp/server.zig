@@ -1331,6 +1331,20 @@ pub const Server = struct {
 
     fn structLitFieldInExpr(self: *Server, scope: *runic.semantic.Scope, expr: *const runic.ast.Expression, pos: types.Position, expected: ?*const runic.ast.TypeExpr) ?StructLitField {
         switch (expr.*) {
+            // Implicit member access `.name` (empty-identifier object) — a decl
+            // literal resolved against the result-location type. Treat it as a
+            // member of `expected` so hover shows the resolved declaration.
+            .member => |m| {
+                if (m.object.* == .identifier and m.object.identifier.name.len == 0) {
+                    if (expected) |e| {
+                        if (positionInRange(pos, types.Range.fromSpan(m.span))) {
+                            return .{ .object_type = e, .member_name = m.member.name, .member_span = m.member.span };
+                        }
+                    }
+                    return null;
+                }
+                return self.structLitFieldInExpr(scope, m.object, pos, null);
+            },
             .struct_literal => |lit| {
                 const lit_type = self.structLiteralType(scope, lit, expected);
                 for (lit.fields) |field| {

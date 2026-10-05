@@ -2849,6 +2849,45 @@ test "lsp hover types an anonymous struct-literal field from its context" {
     try std.testing.expect(std.mem.indexOf(u8, yielded_value, "x: ?A") != null);
 }
 
+test "lsp hover resolves an implicit member against the result-location type" {
+    // `.nothing` with no written object resolves against the binding's annotation
+    // (`const none: Maybe(Int) = .nothing`), so hover shows the type's static
+    // `nothing` decl — typed concretely (`?Int`) for `Maybe(Int)`.
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    const source =
+        \\fn Maybe(comptime T: type) type {
+        \\  pub const nothing: ?T = null
+        \\  yield struct { x: ?T }
+        \\}
+        \\const none: Maybe(Int) = .nothing
+        \\echo "done"
+        \\
+    ;
+    const uri = try fixture.writeDocument("main.rn", source);
+    defer allocator.free(uri);
+
+    const messages = [_][]const u8{
+        try makeDidOpen(allocator, uri, source),
+        // Hover on `.nothing` (line 4, char 28).
+        try makeHoverRequest(allocator, 10, uri, 4, 28),
+    };
+    defer for (messages) |message| allocator.free(message);
+
+    const output = try runServerWithMessages(allocator, &messages);
+    defer allocator.free(output);
+
+    const response = try findResponseById(allocator, output, 10);
+    defer allocator.free(response.body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+    const value = parsed.value.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, value, "nothing") != null);
+    try std.testing.expect(std.mem.indexOf(u8, value, "?Int") != null);
+}
+
 test "lsp hover shows execution result member type" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator);
