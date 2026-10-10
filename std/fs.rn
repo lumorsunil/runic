@@ -3,22 +3,20 @@
 // `ExecutableError!String` so callers use `catch`/`try`.
 fn Void @() Void
 
-// `test -e` — whether the path exists.
+// `test -e` — whether the path exists. A command's exit code is already a Bool
+// (0 → true), so the result's `exit_code` is the answer directly.
 pub fn Void exists(p: String) Bool {
-  const r = test "-e" p
-  yield (r.exit_code) == 0
+  yield (test "-e" p).exit_code
 }
 
 // `test -d` — whether the path is a directory.
 pub fn Void isDir(p: String) Bool {
-  const r = test "-d" p
-  yield (r.exit_code) == 0
+  yield (test "-d" p).exit_code
 }
 
 // `test -f` — whether the path is a regular file.
 pub fn Void isFile(p: String) Bool {
-  const r = test "-f" p
-  yield (r.exit_code) == 0
+  yield (test "-f" p).exit_code
 }
 
 // `cat` — the file's contents, or an error if it cannot be read.
