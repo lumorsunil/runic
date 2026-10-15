@@ -4,10 +4,10 @@
 // `lines` / `parseInt` / `parseFloat` builtins.
 
 // A typed function names its stdin and stdout types: `fn StdinType name() StdoutType`.
-// `&0` reads the stdin value; `yield` writes to stdout (`&1`). Output is explicit —
+// `&0` is the input stream; `&0 | first` reads one value; `yield` writes to stdout (`&1`). Output is explicit —
 // the body value is NOT pushed to stdout.
 fn Int square() Int {
-    const n = &0
+    const n = &0 | first
     yield n * n
 }
 
@@ -19,7 +19,7 @@ echo ""
 // A stage may also write to stderr with `yield &2` (untyped diagnostics). Only
 // the stdout `yield` is constrained by the declared stdout type.
 fn Int loud_double() Int {
-    const n = &0
+    const n = &0 | first
     yield &2 "[log] doubling ${n}\n"
     yield n * 2
 }
@@ -53,7 +53,7 @@ echo ""
 
 // `parseFloat` is the `Float` counterpart of `parseInt`.
 fn Float halve() Float {
-    const x = &0
+    const x = &0 | first
     yield x / 2.0
 }
 echo "=== parseFloat ==="

@@ -3,7 +3,8 @@ fn Void produce() String {
 }
 
 fn ?String consume() String {
-    const received = &0 orelse "fallback"
+    const raw = &0 | first
+    const received = raw orelse "fallback"
     yield "${received}"
 }
 

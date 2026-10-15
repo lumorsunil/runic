@@ -2,7 +2,7 @@
 // stderr. The two output streams are independent.
 
 fn Int tee() Int {
-    const n = &0
+    const n = &0 | first
     yield &2 "log: received ${n}"
     yield n * 10
 }

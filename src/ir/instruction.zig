@@ -223,6 +223,26 @@ pub const Instruction = struct {
         /// blocks (retries) until the stdin pipe signals completion (keep_open=false).
         /// stores the result in %r.
         collect_stdin,
+        /// reads a single element from the thread's stdin pipe into %r, or
+        /// `.null` at EOF. A typed pipe dequeues the next queued value; a byte
+        /// pipe consumes one byte (a length-1 String) via the pipe's read
+        /// cursor. Blocks (retries) while the pipe is empty but the producer is
+        /// still live; returns `.null` once empty and the producer is done.
+        /// Unlike `collect_stdin` it does not wait for the whole stream — it is
+        /// the primitive behind the `first`/`take`/`until` stream builtins.
+        read_stream_element,
+        /// `take n` over a byte stream: reads up to the count (this ValueSource,
+        /// an Int) of bytes from the thread's stdin pipe into %r as a String
+        /// (fewer at EOF). Peeks the pipe's read cursor and blocks (retries)
+        /// until enough bytes are buffered or the producer is done; consumes
+        /// only what it returns, so composes with later reads on the same pipe.
+        stream_take_bytes: ValueSource,
+        /// `until d` over a byte stream: reads bytes from the thread's stdin pipe
+        /// into %r as a String up to (excluding) the first occurrence of the
+        /// delimiter (this ValueSource, a String); all remaining bytes if the
+        /// producer ends with no delimiter. Blocks until the delimiter appears or
+        /// the producer is done; consumes the returned bytes and the delimiter.
+        stream_until_bytes: ValueSource,
         /// parses the string in %r into an Int (integer) value, trimming
         /// surrounding whitespace. stores the result in %r. invalid input is a
         /// runtime error.
@@ -303,7 +323,7 @@ pub const Instruction = struct {
 
         pub fn format(self: @This(), w: *std.Io.Writer) !void {
             switch (self) {
-                inline .push, .exit, .process_exit, .exit_with, .jmp, .fork, .set, .pipe_fwd, .pipe_file, .pipe_write, .wait, .stream, .pipe, .pipe_opt, .ath, .log, .cmp, .resolve_exit_code, .cd, .get_env, .set_env, .emit_lines, .pipe_dequeue, .call => |t| try w.print("{t} {f}", .{ self, t }),
+                inline .push, .exit, .process_exit, .exit_with, .jmp, .fork, .set, .pipe_fwd, .pipe_file, .pipe_write, .wait, .stream, .pipe, .pipe_opt, .ath, .log, .cmp, .resolve_exit_code, .cd, .get_env, .set_env, .emit_lines, .pipe_dequeue, .stream_take_bytes, .stream_until_bytes, .call => |t| try w.print("{t} {f}", .{ self, t }),
                 inline .ref, .comment, .get_module_cache, .set_module_cache => |t| try w.print("{t} {s}", .{ self, t }),
                 inline .alloc => |t| try w.print("{t} {}", .{ self, t }),
                 else => try w.print("{t}", .{self}),

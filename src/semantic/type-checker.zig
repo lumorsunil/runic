@@ -2671,10 +2671,15 @@ pub const TypeChecker = struct {
 
         if (fn_decl.stdin_type) |stdin_type| {
             const resolved = try self.resolveTypeExpr(fn_scope, stdin_type);
+            // `&0` has type `Stream(E)`, not `E`: it is the whole input stream,
+            // consumed inline (`&0 | first`, `for (&0)`, a pipe, `yield &0`), not
+            // a single value. This makes `&0 * &0` / `const n = &0` type errors
+            // that point at code needing `&0 | first`.
+            const stream_type = try self.allocTypeExpression(.{ .stream = .{ .child = resolved, .span = .global } });
             try fn_scope.declare(
                 self.arena.allocator(),
                 ast.Identifier.global(ast.FdExpr.stdin_binding_name),
-                resolved,
+                stream_type,
                 false,
                 false,
             );
@@ -3304,7 +3309,7 @@ pub const TypeChecker = struct {
             .failed => {},
             .type_var => {},
             .void, .integer, .float, .boolean, .byte, .null, .execution, .thread, .type_type => {},
-            .optional, .promise => |prefix| try self.runTypeExpression(scope, prefix.child),
+            .optional, .promise, .stream => |prefix| try self.runTypeExpression(scope, prefix.child),
             .error_union => |error_union| {
                 try self.runTypeExpression(scope, error_union.err_set);
                 try self.runTypeExpression(scope, error_union.payload);
@@ -3470,6 +3475,8 @@ pub const TypeChecker = struct {
                     const el = self.tupleElementType(unaliased.tuple) orelse break :blk null;
                     break :blk try self.resolveTypeExpr(scope, el);
                 }
+                // A `Stream(E)` source (`for (&0)`) iterates its elements `E`.
+                if (unaliased.* == .stream) break :blk try self.resolveTypeExpr(scope, unaliased.stream.child);
                 if (unaliased.* != .array) break :blk source_type;
                 // Resolve the element so a named primitive element (`[]Int` whose
                 // element parsed as the identifier `Int`) normalizes to its tag.
@@ -4809,6 +4816,7 @@ pub const TypeChecker = struct {
             .type_var => {},
             .identifier => return error.UnresolvedTypeLiteral,
             .optional => return error.MemberAccessOnOptional,
+            .stream => return error.UnsupportedMemberAccess,
             .array => |array| try self.runArrayMemberAccess(array, &member.member),
             // A tuple supports the same members as an array (`len`, …); it shares
             // the array's positional/slice representation.
@@ -4984,8 +4992,79 @@ pub const TypeChecker = struct {
 
         return switch (resolved_stage_type.*) {
             .function => |function| try self.resolvePipeType(scope, function.return_type),
+            // A `&0` source stage forwards its element stream, so its per-value
+            // stdout type is the element, not `Stream(E)` itself.
+            .stream => |s| try self.resolvePipeType(scope, s.child),
             else => resolved_stage_type,
         };
+    }
+
+    /// The builtin a pipeline stage invokes (`parseInt`, `lines`, `first`,
+    /// `take`, `until`), or null when the stage is not a bare, un-shadowed
+    /// builtin. Mirrors the IR compiler's `builtinStage`.
+    fn stageBuiltin(self: *TypeChecker, scope: *Scope, stage: *ast.Expression) ?builtins.Builtin {
+        _ = self;
+        _ = scope;
+        const callee = switch (stage.*) {
+            .call => |call| call.callee,
+            else => stage,
+        };
+        if (callee.* != .identifier) return null;
+        // Builtins are registered as global value bindings, so a scope lookup
+        // always finds them — match by the shared registry instead.
+        return builtins.lookup(callee.identifier.name);
+    }
+
+    /// The result type of a pipeline whose final stage is a stream limiter,
+    /// derived from the upstream element type: `first` → `?E`, `take`/`until` →
+    /// `[]E` (`String` for a byte stream). Null when the final stage is not a
+    /// limiter (ordinary resolution applies).
+    fn pipelineLimiterResultType(self: *TypeChecker, scope: *Scope, pipeline: *ast.Pipeline) Error!?*const ast.TypeExpr {
+        if (pipeline.stages.len == 0) return null;
+        const last = pipeline.stages[pipeline.stages.len - 1];
+        const b = self.stageBuiltin(scope, last) orelse return null;
+        if (b.kind != .limiter) return null;
+
+        // Upstream per-value (element) type, unwrapping an error-union/optional.
+        var elem: ?*const ast.TypeExpr = if (pipeline.stages.len >= 2)
+            try self.resolvePipelineStageStdoutType(scope, pipeline.stages[pipeline.stages.len - 2])
+        else
+            null;
+        if (elem) |e| {
+            const u = self.unaliasType(e);
+            // Unwrap an error union (`ParseError!Int` → `Int`) but keep an
+            // optional element (`?String` stays `?String`, so `first orelse …`
+            // still type-checks).
+            elem = switch (u.*) {
+                .error_union => |eu| eu.payload,
+                else => e,
+            };
+        }
+
+        // A byte stream (raw stdin / `String` / unknown) yields a `String`; a
+        // typed element stream yields that element.
+        const byte = blk: {
+            const e = elem orelse break :blk true;
+            const u = self.unaliasType(e);
+            break :blk switch (u.*) {
+                .byte => true,
+                .array => |arr| arr.element.* == .byte,
+                .execution => true,
+                else => false,
+            };
+        };
+
+        switch (b.limiter.?) {
+            .first => {
+                // One element of type `E` (a drop-in single read); `null` at EOF
+                // flows untyped, like the old bare `&0`.
+                return if (byte) try self.allocStringType() else (elem orelse try self.allocStringType());
+            },
+            .take, .until => {
+                if (byte) return try self.allocStringType();
+                return try self.allocTypeExpression(.{ .array = .{ .element = elem orelse try self.allocStringType(), .span = .global } });
+            },
+        }
     }
 
     fn resolvePipelineStageStdinType(
@@ -4993,6 +5072,13 @@ pub const TypeChecker = struct {
         scope: *Scope,
         stage: *ast.Expression,
     ) Error!?*const ast.TypeExpr {
+        // A limiter (`first`/`take`/`until`) adapts to its upstream — its stdin
+        // accepts any stream, so report it as unknown and skip the boundary
+        // check (the element type flows through to the limiter's own stdout).
+        if (self.stageBuiltin(scope, stage)) |b| {
+            if (b.kind == .limiter) return null;
+        }
+
         const target = switch (stage.*) {
             .call => |call| call.callee,
             else => stage,
@@ -6166,6 +6252,14 @@ pub const TypeChecker = struct {
             }
         }
 
+        // A pipeline ending in a stream limiter is polymorphic: its result type
+        // derives from the upstream element type (the limiter's own registered
+        // signature is only a placeholder), so compute it here before the AST's
+        // structural resolution would hand back that placeholder.
+        if (T == *ast.Expression and expr.* == .pipeline) {
+            if (try self.pipelineLimiterResultType(scope, &expr.pipeline)) |t| return t;
+        }
+
         const result = try expr.resolveType(self.io, self.arena.allocator(), scope);
 
         if (T == *ast.ImportExpr) {
@@ -6245,6 +6339,9 @@ pub const TypeChecker = struct {
         try switch (binding_type.*) {
             .failed => {},
             .type_var => {},
+            // A `Stream(E)` target isn't deeply validated here (streams are
+            // consumed inline, not assigned around); accept it.
+            .stream => {},
             .thread => unreachable,
             .void => |*void_| self.validateTypeAssignmentVoid(
                 void_,
@@ -6938,11 +7035,25 @@ const global_scope_definitions = [_]Definition{
 };
 
 /// Builtin value bindings (not types) available in every module's global scope,
-/// generated from the shared `builtins` registry.
+/// generated from the shared `builtins` registry. Stream limiters (`first`,
+/// `take`, `until`) are *not* registered as global bindings: they are common
+/// variable names (`const first, _, third = …`) and must not occupy the global
+/// scope. They are instead recognized structurally as pipeline stages
+/// (`stageBuiltin` / the IR compiler's `builtinStage`) via the shared registry.
+const global_value_count = blk: {
+    var c: usize = 0;
+    for (builtins.all) |b| {
+        if (b.kind != .limiter) c += 1;
+    }
+    break :blk c;
+};
 const global_value_definitions = blk: {
-    var defs: [builtins.all.len]Definition = undefined;
+    var defs: [global_value_count]Definition = undefined;
+    var j: usize = 0;
     for (builtins.all, 0..) |b, i| {
-        defs[i] = .{ .identifier = .{ .name = b.name, .span = .global }, .type_expr = &builtin_fn_types[i] };
+        if (b.kind == .limiter) continue;
+        defs[j] = .{ .identifier = .{ .name = b.name, .span = .global }, .type_expr = &builtin_fn_types[i] };
+        j += 1;
     }
     break :blk defs;
 };

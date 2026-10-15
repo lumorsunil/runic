@@ -621,6 +621,11 @@ pub const IRCompiler = struct {
     /// Stack of enclosing functions' declared stdin types, so `&0` can be
     /// typed correctly for coercions. Top is the innermost function.
     stdin_type_stack: std.ArrayList(?ast.TypeExpr) = .empty,
+    /// Parallel to `stdin_type_stack`: whether the current stage's stdin pipe
+    /// carries *typed* values (a queue) rather than raw bytes. A stream limiter
+    /// (`take`/`until`) reads a typed pipe value-by-value (→ `[]E`) and a byte
+    /// pipe cursor-by-cursor (→ `String`); this picks which.
+    stdin_is_typed_stack: std.ArrayList(bool) = .empty,
 
     /// Stack of enclosing functions' declared return types; top is the innermost.
     /// Used to supply a `yield`'s result-location type to an implicit `.name`.
@@ -3774,6 +3779,18 @@ pub const IRCompiler = struct {
         return try .from(ir.Location.initRegister(.r).typed(return_type));
     }
 
+    /// Whether `expr` is a `&0 | <limiter>` pipeline (the single-value /
+    /// bounded-read peephole), which compiles to a direct value rather than a
+    /// captured command pipeline.
+    fn isFdLimiterPipeline(self: *IRCompiler, expr: *ast.Expression) bool {
+        if (expr.* != .pipeline) return false;
+        const stages = expr.pipeline.stages;
+        if (stages.len != 2) return false;
+        if (!(stages[0].* == .fd and stages[0].fd.fd == 0)) return false;
+        const b = self.builtinStage(stages[1]) orelse return false;
+        return b.kind == .limiter;
+    }
+
     fn compileExpressionWithCapture(
         self: *IRCompiler,
         source: anytype,
@@ -3787,6 +3804,13 @@ pub const IRCompiler = struct {
         // clobber (a struct return is bound, never a command). Compile it
         // directly, bypassing capture.
         if (self.exprIsCImportStructCall(expr)) return try self.compileExpression(expr);
+
+        // `&0 | first`/`take`/`until` is a single-value read (the peephole in
+        // `compilePipeline`), not a captured command pipeline — compile it
+        // directly so it leaves its value in %r (and forwards an upstream error
+        // like a bare `&0`), instead of the stdio-capture path expecting it to
+        // write to a capture pipe.
+        if (self.isFdLimiterPipeline(expr)) return try self.compileExpression(expr);
 
         const background_capture = isBackgroundExecutionExpression(expr);
         const expr_effects = self.analyzeExpressionEffects(expr);
@@ -5388,6 +5412,185 @@ pub const IRCompiler = struct {
         try self.setLabel(after_label.local_addr.label, .abs);
     }
 
+    /// Whether a limiter stage over an element of this (inferred stdin) type
+    /// reads a raw byte stream — an unknown upstream (raw stdin), `Byte`, or
+    /// `String` (`[]Byte`). A byte-mode limiter yields a `String`; otherwise the
+    /// stream carries typed values and a limiter yields `?E` / `[]E`.
+    fn limiterByteMode(elem_opt: ?ast.TypeExpr) bool {
+        const elem = elem_opt orelse return true;
+        const u = switch (elem) {
+            .alias => |a| a.type_expr.*,
+            else => elem,
+        };
+        return switch (u) {
+            .byte => true,
+            .array => |arr| arr.element.* == .byte,
+            else => false,
+        };
+    }
+
+    /// Lowers a stream-limiter builtin stage (`first` / `take n` / `until d`).
+    /// Each reads a bounded prefix of the stage's stdin stream and writes the
+    /// result to stdout (the stage value). `first` reads one element as a scalar
+    /// (`read_stream_element`); `take`/`until` over a byte stream scan the read
+    /// cursor in one dedicated instruction, and over a typed stream loop
+    /// `read_stream_element` accumulating an array (mirroring
+    /// `compileParseMapStage`). The element type is inferred from the upstream
+    /// stage (`stdin_type_stack`).
+    fn compileLimiterStage(
+        self: *IRCompiler,
+        source: anytype,
+        which: builtins.Builtin.Limiter,
+        arg: ?*ast.Expression,
+        as_value: bool,
+    ) Error!Result {
+        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        const elem_opt: ?ast.TypeExpr = if (self.stdin_type_stack.items.len > 0)
+            self.stdin_type_stack.items[self.stdin_type_stack.items.len - 1]
+        else
+            null;
+        // A typed stdin pipe carries values (→ `[]E` / `?E`); a byte pipe carries
+        // raw bytes (→ `String`). The transport flag disambiguates a typed stream
+        // of `String` values (`lines`) from a raw byte stream.
+        const byte_mode = if (self.stdin_is_typed_stack.items.len > 0)
+            !self.stdin_is_typed_stack.items[self.stdin_is_typed_stack.items.len - 1]
+        else
+            limiterByteMode(elem_opt);
+        const elem = if (byte_mode) ast.TypeExpr.global(.byte) else (elem_opt orelse ast.TypeExpr.global(.byte));
+
+        switch (which) {
+            .first => {
+                // The first value of the stream, coerced to its element type — a
+                // drop-in for the old single-value `&0` read, and runtime-adaptive
+                // the same way: `collect_stdin` yields the whole byte buffer for a
+                // byte pipe or dequeues one value for a typed pipe, then the
+                // type-directed parse (Int) coerces it. `.null` at EOF flows
+                // through like the old `&0`.
+                try self.addInstruction(.init(.from(source), .collect_stdin));
+                if (elem_opt) |dt| {
+                    if (typeExprIsNamed(dt, "Int")) {
+                        try self.addInstruction(.init(.from(source), .parse_int));
+                        return self.emitLimiterResult(source, .initRegister(.r), ast.TypeExpr.global(.integer), as_value);
+                    }
+                }
+                return self.emitLimiterResult(source, .initRegister(.r), elem_opt orelse string_type, as_value);
+            },
+            .take => {
+                const count = try self.compileExpression(arg orelse return self.reportLimiterArgMissing(source, "take"));
+                const count_ref = try self.newRef(source, "take_count");
+                try self.set(source, count_ref, stableResultSource(count));
+                if (byte_mode) {
+                    try self.addInstruction(.init(.from(source), .{ .stream_take_bytes = .from(count_ref.dereference()) }));
+                    return self.emitLimiterResult(source, .initRegister(.r), string_type, as_value);
+                }
+                return self.compileTypedLimiterLoop(source, elem, count_ref, null, as_value);
+            },
+            .until => {
+                const delim = try self.compileExpression(arg orelse return self.reportLimiterArgMissing(source, "until"));
+                const delim_ref = try self.newRef(source, "until_delim");
+                try self.set(source, delim_ref, stableResultSource(delim));
+                if (byte_mode) {
+                    try self.addInstruction(.init(.from(source), .{ .stream_until_bytes = .from(delim_ref.dereference()) }));
+                    return self.emitLimiterResult(source, .initRegister(.r), string_type, as_value);
+                }
+                return self.compileTypedLimiterLoop(source, elem, null, delim_ref, as_value);
+            },
+        }
+    }
+
+    /// Emits a limiter's result: as a pipeline *stage* it writes the value to
+    /// stdout (the stage value, captured downstream); as a direct *value* (the
+    /// `&0 | limiter` peephole) it leaves it in place and returns it typed.
+    fn emitLimiterResult(self: *IRCompiler, source: anytype, loc: ir.Location, result_type: ast.TypeExpr, as_value: bool) Error!Result {
+        if (as_value) return .fromLocation(loc.typed(result_type));
+        try self.pipeWrite(source, self.threadStdout(), .fromLocation(loc.typed(result_type)));
+        return .fromValue(.void);
+    }
+
+    /// A limiter's per-value stdout type, derived from the upstream element type
+    /// (`stdin_type_stack`'s top): `first` → `?E`, `take`/`until` → `[]E`
+    /// (`String` for a byte element). Used when a limiter is a mid-pipeline stage
+    /// or the final capture.
+    fn limiterStdoutType(self: *IRCompiler, which: builtins.Builtin.Limiter) ast.TypeExpr {
+        const up: ?ast.TypeExpr = if (self.stdin_type_stack.items.len > 0)
+            self.stdin_type_stack.items[self.stdin_type_stack.items.len - 1]
+        else
+            null;
+        // Unwrap an error-union / optional to the plain element type.
+        const elem_opt: ?ast.TypeExpr = if (up) |e| switch (e) {
+            .error_union => |eu| eu.payload.*,
+            .optional => |o| o.child.*,
+            else => e,
+        } else null;
+        const byte = limiterByteMode(elem_opt);
+        const elem = if (byte) string_type else (elem_opt orelse string_type);
+        const ep = self.allocator.create(ast.TypeExpr) catch return string_type;
+        ep.* = elem;
+        return switch (which) {
+            .first => if (byte) string_type else elem,
+            .take, .until => if (byte) string_type else array_type(ep),
+        };
+    }
+
+    fn reportLimiterArgMissing(self: *IRCompiler, source: anytype, comptime name: []const u8) Error!Result {
+        try self.reportSourceError(source, Error.UnsupportedExpression, .@"error", name ++ " needs an argument (`" ++ name ++ " …`)", .{});
+        return .fromValue(.void);
+    }
+
+    /// Typed-stream `take`/`until`: loop `read_stream_element`, accumulating each
+    /// value into an array until the bound is met or EOF. Exactly one of
+    /// `count_ref` (take) / `delim_ref` (until) is non-null.
+    fn compileTypedLimiterLoop(
+        self: *IRCompiler,
+        source: anytype,
+        elem: ast.TypeExpr,
+        count_ref: ?ir.Location,
+        delim_ref: ?ir.Location,
+        as_value: bool,
+    ) Error!Result {
+        const value_ref = try self.newRef(source, "limiter_value");
+        const cond_ref = try self.newRef(source, "limiter_cond");
+        const acc_ref = try self.newRef(source, "limiter_acc");
+        try self.set(source, acc_ref, .fromValue(.void));
+        const i_ref: ?ir.Location = if (count_ref != null) try self.newRef(source, "limiter_i") else null;
+        if (i_ref) |ir_| try self.set(source, ir_, .fromValue(.{ .integer = 0 }));
+
+        const after_label = try self.newLabel("limiter_after", .unknown);
+        const loop_label = try self.newLabel("limiter_loop", .abs);
+
+        // take: stop once `i >= count` (so `take 0` reads nothing).
+        if (count_ref) |cr| {
+            try self.cmp(source, .greater_equal, .from(i_ref.?.dereference()), .from(cr.dereference()), cond_ref);
+            try self.jmp(source, try .from(cond_ref.dereference()), true, after_label);
+        }
+
+        try self.addInstruction(.init(.from(source), .read_stream_element));
+        try self.set(source, value_ref, .fromLocation(.initRegister(.r)));
+        try self.cmp(source, .equal, .from(value_ref.dereference()), .fromValue(.null), cond_ref);
+        try self.jmp(source, try .from(cond_ref.dereference()), true, after_label);
+
+        // until: stop (exclusive) at the first element equal to the delimiter.
+        if (delim_ref) |dr| {
+            try self.cmp(source, .equal, .from(value_ref.dereference()), .from(dr.dereference()), cond_ref);
+            try self.jmp(source, try .from(cond_ref.dereference()), true, after_label);
+        }
+
+        try self.addInstruction(.init(.from(source), .{ .array_push_inplace = .{
+            .array = .from(acc_ref.dereference()),
+            .value = .from(value_ref.dereference()),
+            .result = acc_ref.dereference(),
+        } }));
+        if (i_ref) |ir_| try self.ath(source, .add, .from(ir_.dereference()), .fromValue(.{ .integer = 1 }), ir_);
+
+        try self.jmp(source, null, true, loop_label);
+        try self.setLabel(after_label.local_addr.label, .abs);
+
+        const ep = try self.allocator.create(ast.TypeExpr);
+        ep.* = elem;
+        return self.emitLimiterResult(source, acc_ref.dereference(), array_type(ep), as_value);
+    }
+
     fn compileIdentifier(
         self: *IRCompiler,
         source: anytype,
@@ -5420,6 +5623,7 @@ pub const IRCompiler = struct {
                         try self.addInstruction(.init(.from(source), .collect_stdin));
                         try self.addInstruction(.init(.from(source), .{ .emit_lines = self.threadStdout() }));
                     },
+                    .limiter => return self.compileLimiterStage(source, builtin.limiter.?, null, false),
                 }
                 return .fromValue(.void);
             }
@@ -5543,6 +5747,14 @@ pub const IRCompiler = struct {
 
         if (call.callee.* == .identifier) {
             const name = call.callee.identifier.name;
+            // A stream-limiter builtin with an argument (`take n`, `until d`).
+            // `first` has none and is handled in `compileIdentifier`.
+            if (self.builtinStage(source)) |b| {
+                if (b.kind == .limiter) {
+                    const arg: ?*ast.Expression = if (call.arguments.len > 0) call.arguments[0] else null;
+                    return self.compileLimiterStage(source, b.limiter.?, arg, false);
+                }
+            }
             // A type application *with arguments* in value position
             // (`${Box(Int)}`) serializes to its type-application string. A bare
             // type name (zero args) is left to `compileIdentifier`, which
@@ -9334,6 +9546,28 @@ pub const IRCompiler = struct {
             else => stage,
         };
 
+        // A bare `&0` forwards the enclosing stdin: its output kind is that
+        // stdin's kind — typed for a scalar/struct/array element, bytes for a
+        // raw (String/Byte/unknown) stdin.
+        if (stage.* == .fd and stage.fd.fd == 0) {
+            const enclosing: ?ast.TypeExpr = if (self.stdin_type_stack.items.len > 0)
+                self.stdin_type_stack.items[self.stdin_type_stack.items.len - 1]
+            else
+                null;
+            const et = enclosing orelse return .byte_stream;
+            const u = switch (et) {
+                .alias => |a| a.type_expr.*,
+                else => et,
+            };
+            return switch (u) {
+                .void => .void_boundary,
+                .byte => .byte_stream,
+                .array => |arr| if (arr.element.* == .byte) .byte_stream else .exact_typed,
+                .execution => .byte_stream,
+                else => .exact_typed,
+            };
+        }
+
         // A parse builtin produces a scalar; `lines` produces a framed stream of
         // String values. All use typed (queue) transport.
         if (self.builtinStage(stage) != null) return .exact_typed;
@@ -9386,6 +9620,10 @@ pub const IRCompiler = struct {
         // where the builtin reads the whole blob as a single value.)
         if (self.builtinStage(stage)) |builtin| {
             if (builtin.kind == .parse_map) return .exact_typed;
+            // A limiter adapts to its upstream (like a block): permissive, so the
+            // upstream's output kind decides the boundary (`&0 | first` stays a
+            // byte stream; `parseInt | first` carries typed values).
+            if (builtin.kind == .limiter) return .exact_typed;
         }
         // A block stage declares no stdin type — it adapts to the upstream
         // stage (its `&0` is typed by inference). Treat it as permissive so the
@@ -9445,9 +9683,25 @@ pub const IRCompiler = struct {
             else => stage,
         };
 
+        // A bare `&0` stage forwards the enclosing function's stdin, so its
+        // per-value stdout type is that stdin's element type (pushed on
+        // `stdin_type_stack`). This lets a downstream limiter (`&0 | first`
+        // inside a typed-stdin block) see the real element type, not bytes.
+        if (stage.* == .fd and stage.fd.fd == 0) {
+            return if (self.stdin_type_stack.items.len > 0)
+                self.stdin_type_stack.items[self.stdin_type_stack.items.len - 1]
+            else
+                null;
+        }
+
         // A builtin's stdout type comes straight from the registry (`lines`
-        // frames its byte input into per-line String values).
-        if (self.builtinStage(stage)) |builtin| return builtin.outputType();
+        // frames its byte input into per-line String values). A limiter is
+        // polymorphic: its stdout derives from the upstream element type, which
+        // callers make visible as `stdin_type_stack`'s top before asking.
+        if (self.builtinStage(stage)) |builtin| {
+            if (builtin.kind == .limiter) return self.limiterStdoutType(builtin.limiter.?);
+            return builtin.outputType();
+        }
 
         // A block/bare-expression stage has no signature; infer its stdout type
         // from what it `yield`s to stdout (&1), so a `{ yield 1; ... }` producer
@@ -9904,6 +10158,26 @@ pub const IRCompiler = struct {
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
 
+        // Peephole: `&0 | <limiter>` reads the enclosing stdin *directly* as a
+        // value, instead of spawning a `&0` forward stage into the limiter. The
+        // forward (`pipeFwd`) only moves bytes, so forwarding a typed stdin pipe
+        // (e.g. a block's `Int` stdin) would drop its queued values; reading the
+        // enclosing stdin directly reads the right pipe (byte or typed) and lets
+        // the limiter return `?E`/`[]E`/`String` as the pipeline's value.
+        if (pipeline.stages.len == 2 and
+            pipeline.stages[0].* == .fd and pipeline.stages[0].fd.fd == 0)
+        {
+            if (self.builtinStage(pipeline.stages[1])) |b| {
+                if (b.kind == .limiter) {
+                    const arg: ?*ast.Expression = switch (pipeline.stages[1].*) {
+                        .call => |c| if (c.arguments.len > 0) c.arguments[0] else null,
+                        else => null,
+                    };
+                    return self.compileLimiterStage(source, b.limiter.?, arg, true);
+                }
+            }
+        }
+
         const refs = try self.allocator.alloc(ir.Location, pipeline.stages.len - 1);
         defer self.allocator.free(refs);
 
@@ -9997,7 +10271,10 @@ pub const IRCompiler = struct {
             else
                 null;
             const pushed_stdin = i > 0;
-            if (pushed_stdin) try self.stdin_type_stack.append(self.allocator, inferred_stdin);
+            if (pushed_stdin) {
+                try self.stdin_type_stack.append(self.allocator, inferred_stdin);
+                try self.stdin_is_typed_stack.append(self.allocator, self.boundaryUsesTypedTransport(pipeline.stages[i - 1], pipeline.stages[i]));
+            }
             // Only a receiver stage (not the producer at i==0) can bind stdin to
             // a parameter. A bare `&0` stage forwards stdin to stdout.
             const result = if (try self.tryCompileFdForwardStage(source, stage_expr)) |fwd|
@@ -10007,7 +10284,10 @@ pub const IRCompiler = struct {
             else
                 // The producer (i == 0): an array source streams its elements.
                 (try self.tryCompileArraySourceStage(source, stage_expr)) orelse try self.compileExpression(stage_expr);
-            if (pushed_stdin) _ = self.stdin_type_stack.pop();
+            if (pushed_stdin) {
+                _ = self.stdin_type_stack.pop();
+                _ = self.stdin_is_typed_stack.pop();
+            }
 
             // A stage's value is no longer auto-pushed to stdout; output is
             // explicit via `yield` (or subprocess writes). Just wait for a
@@ -10037,14 +10317,20 @@ pub const IRCompiler = struct {
         try self.scopes.push(self.allocator, .closure);
         const last_idx = pipeline.stages.len - 1;
         const last_pushed_stdin = last_idx > 0;
-        if (last_pushed_stdin) try self.stdin_type_stack.append(
-            self.allocator,
-            self.stageStdoutType(pipeline.stages[last_idx - 1]),
-        );
+        if (last_pushed_stdin) {
+            try self.stdin_type_stack.append(
+                self.allocator,
+                self.stageStdoutType(pipeline.stages[last_idx - 1]),
+            );
+            try self.stdin_is_typed_stack.append(self.allocator, self.boundaryUsesTypedTransport(pipeline.stages[last_idx - 1], pipeline.stages[last_idx]));
+        }
         const result = (try self.tryCompileFdForwardStage(source, pipeline.stages[last_idx])) orelse
             (try self.tryCompilePipelineParamStage(source, pipeline.stages[last_idx])) orelse
             try self.compileExpression(pipeline.stages[last_idx]);
-        if (last_pushed_stdin) _ = self.stdin_type_stack.pop();
+        if (last_pushed_stdin) {
+            _ = self.stdin_type_stack.pop();
+            _ = self.stdin_is_typed_stack.pop();
+        }
         if (isWaitable(result)) |loc| {
             try self.comment("wait from {s} (last stage)", .{@src().fn_name});
             try self.wait(source, loc);

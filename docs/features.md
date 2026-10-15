@@ -1193,8 +1193,54 @@ function's body still follow declare-before-use.)
 The three standard streams are referenced with file-descriptor syntax: `&0`
 (stdin), `&1` (stdout), `&2` (stderr).
 
-- `&0` is a value expression that reads the function's (or stage's) stdin.
+- `&0` is the function's (or stage's) stdin as a **`Stream(E)`** — the sequence
+  of input values of element type `E`. You don't operate on it directly; you
+  consume it (pipe it into a stage, `for (&0)` it, or `yield &0`). Using `&0` as
+  a scalar (`&0 * 2`, `const n = &0`) is a type error — read a value first.
 - `&1` / `&2` are write streams; you write to them with `yield` (see below).
+
+### Reading from a stream: `first`, `take`, `until`
+
+Three generic stream builtins consume a `Stream(E)`, used as pipeline stages
+after `&0` (or after any upstream stage):
+
+- `&0 | first` — the **first value**, coerced to `E` (a drop-in for a single
+  read). For a typed stream it is the next value; for a raw byte stream it is the
+  whole input coerced to `E` (parsed, for an `Int`/`Float` stage).
+- `&0 | take n` — up to `n` elements (a byte prefix of a byte stream, `n`
+  elements of a typed one).
+- `&0 | until d` — elements up to (but excluding) the first `d`.
+
+```rn
+fn Int square() Int {
+    const n = &0 | first    // one Int (parsed if the input arrives as bytes)
+    yield n * n
+}
+
+const line  = &0 | until "\n"   // read one line (returns at the newline)
+const three = &0 | take 3       // the next three bytes, as a String
+const whole = &0 | first        // a byte stream's whole input, as one String
+```
+
+`take`/`until` read only as far as they need and stop — `until "\n"` returns as
+soon as it sees a newline, without waiting for end of input — so they suit
+interactive and streaming input. The read cursor advances, so successive reads
+continue where the last left off:
+
+```rn
+const a = &0 | until "\n"   // first line
+const b = &0 | until "\n"   // second line
+```
+
+To read a single value in a pipeline stage, pipe into `first` — `const n = &0 |
+first` — rather than a bare `&0`. (Bind the result before using it in arithmetic
+or `orelse`: `const n = &0 | first; yield n * 2`.)
+
+> Note: stdin is *shared*, not pushed. Commands read the real file descriptor
+> directly, so a command that doesn't read stdin (`printf "prompt: "`) leaves it
+> untouched for a following `&0` read, and one that reads part of it (`head -c 5`)
+> consumes exactly its share — the rest flows to the next command or `&0`. This
+> works the same whether stdin is a terminal, a pipe, or a file.
 
 ### `yield` — pushing values to a stream
 
@@ -1205,7 +1251,8 @@ produces no stdout output.
 
 ```rn
 fn Int square() Int {
-    yield &0 * &0
+    const n = &0 | first
+    yield n * n
 }
 
 echo "4" | parseInt | square   // prints 16
@@ -1223,7 +1270,7 @@ function halts when it runs out of statements (use `exit` to halt early):
 
 ```rn
 fn Int consume() Void {
-    const n = &0
+    const n = &0 | first
     // no yield: this stage produces no stdout output
 }
 
@@ -1232,7 +1279,7 @@ echo "3" | parseInt | consume   // prints nothing
 
 ```rn
 fn Int tee() Int {
-    const n = &0
+    const n = &0 | first
     yield &2 "log: received ${n}"   // diagnostic, goes to stderr
     yield n * 10                    // result, goes to stdout
 }
@@ -1270,7 +1317,7 @@ not buffered to the end), so one input value can produce several outputs:
 ```rn
 // one input (6) -> two outputs: 36 now, 12 after the sleep
 echo "6" | parseInt | {
-    const in = &0
+    const in = &0 | first
     yield in * in
     sleep "2"
     yield in + in
@@ -1286,11 +1333,11 @@ fn Void greet(name: String) String {
 }
 ```
 
-### `&0` — reading typed stdin as a value
+### `&0` — reading typed stdin
 
-Inside a function body with a typed stdin, `&0` reads the function's stdin pipe
-and returns it as a value. This lets you process pipeline input with pure Runic
-expressions instead of relying on executables like `cat`.
+Inside a function body with a typed stdin, `&0` is the input `Stream(E)`; piping
+it into `first` reads one value, letting you process pipeline input with pure
+Runic expressions instead of relying on executables like `cat`.
 
 ```rn
 fn Void produce() String {
@@ -1298,7 +1345,7 @@ fn Void produce() String {
 }
 
 fn String transform() String {
-    const received = &0
+    const received = &0 | first
     yield "${received}!"
 }
 
@@ -1306,22 +1353,21 @@ produce | transform
 ```
 
 **Result:** Prints `hello from pipe!`. `produce` yields the string directly
-(no process involved), `transform` collects it via `&0` and yields it with
+(no process involved), `transform` reads it via `&0 | first` and yields it with
 `"!"` appended.
 
-The `&0` value has the type declared in the function's stdin position. Using
-it in a function that has `Void` stdin would be a type error.
+`&0`'s element type is the function's declared stdin type; `&0` on a `Void`-stdin
+function is a type error.
 
-`&0` is a **consuming** read: each read takes the next value off the input
-stream. To use a value more than once, bind it with `const` — `&0 * &0` would
-read *two* values, but `const n = &0; n * n` reads one and reuses it. Once the
-producer has closed, reading `&0` again yields EOF, and `yield`ing an EOF value
-emits nothing:
+`&0 | first` is a **consuming** read: each one takes the next value off the input
+stream. To use a value more than once, bind it — `const n = &0 | first; n * n`
+reads one value and reuses it. Once the producer has closed, reading again yields
+EOF, and `yield`ing an EOF value emits nothing:
 
 ```rn
 fn Int consume_once() Int {
-    yield &0    // emits the value
-    yield &0    // EOF: the producer is closed, so this emits nothing
+    yield &0 | first    // emits the value
+    yield &0 | first    // EOF: the producer is closed, so this emits nothing
 }
 
 echo "7" | parseInt | consume_once   // prints 7
@@ -1344,8 +1390,8 @@ echo "hello" | shout   // prints HELLO
 **Result:** `&0` pipes the function's stdin into `tr`, whose output becomes the
 function's output. It composes with more stages (`&0 | cat | wc "-c"`), streams
 line by line, and terminates cleanly on empty input. This is distinct from
-reading `&0` as a value (`const s = &0`, `yield &0`) above — the meaning is set
-by whether `&0` appears as a pipeline stage or in a value position.
+reading a value with `&0 | first` above — a bare `&0` is the stream, consumed by
+a stage, `for`, or `yield`.
 
 #### Consuming a live stream with `for (&0)`
 
@@ -1406,8 +1452,8 @@ way, and `parseBool` (`fn String parseBool() Bool`) parses the text `true`/`fals
 (case-insensitive, whitespace-trimmed) into a `Bool`. Each is `ParseError!T`, so
 a bad parse is a value a surrounding `catch`/`try` handles (`echo "maybe" |
 parseBool catch false`). A custom stage that should process every value uses the
-`for (&0) |v| { ... }` form — a stage that reads `&0` once (e.g. `const n = &0`)
-consumes only the first value.
+`for (&0) |v| { ... }` form — a stage that reads `&0 | first` once consumes only
+the first value.
 
 ### Mixed executable and typed-function pipelines
 
@@ -1417,7 +1463,7 @@ that precedes a typed function must match the function's declared stdin type
 
 ```rn
 fn String process() String {
-    const input = &0
+    const input = &0 | first
     yield "${input}!"
 }
 
@@ -1429,7 +1475,7 @@ Multi-stage pipelines work in all combinations:
 
 ```rn
 fn Void source() String { yield "pipeline" }
-fn String middle() String { const s = &0; yield "typed ${s}" }
+fn String middle() String { const s = &0 | first; yield "typed ${s}" }
 
 // typed fn → typed fn → executable
 source | middle | cat
@@ -1437,18 +1483,20 @@ source | middle | cat
 
 ### Non-string typed values and `parseInt`
 
-Pipelines are not limited to strings. A function whose stdin type is `Int`
-receives `&0` already parsed into an `Int`, so it can do arithmetic on it
-directly. The `parseInt` builtin bridges a `String` stage to an `Int` stage,
-making the type transition explicit:
+Pipelines are not limited to strings. A function whose stdin type is `Int` reads
+a value with `&0 | first` already as an `Int`, so it can do arithmetic on it. The
+`parseInt` builtin bridges a `String` stage to an `Int` stage, making the type
+transition explicit:
 
 ```rn
 fn Int doubler() Int {
-    yield &0 * 2
+    const n = &0 | first
+    yield n * 2
 }
 
 fn Int inc() Int {
-    yield &0 + 1
+    const n = &0 | first
+    yield n + 1
 }
 
 // String → parseInt → Int → Int : prints 21
@@ -1466,7 +1514,7 @@ feeding its output into a `String` stage is a compile-time mismatch.
 
 A stage that outputs `T` can feed a downstream stage whose stdin is `?T`. The
 value flows through unchanged and the downstream sees it as the non-null case,
-so `&0 orelse "default"` reads the piped value when present:
+so `&0 | first` reads a `?T` that `orelse` can default:
 
 ```rn
 fn Void produce() String {
@@ -1474,7 +1522,8 @@ fn Void produce() String {
 }
 
 fn ?String consume() String {
-    const received = &0 orelse "fallback"
+    const raw = &0 | first
+    const received = raw orelse "fallback"
     yield "${received}"
 }
 
@@ -1482,8 +1531,8 @@ produce | consume
 ```
 
 **Result:** Prints `coerced value`. The `?String` stdin of `consume` accepts the
-`String` produced upstream (a `T → ?T` coercion), and `&0` is typed as
-`?String` so the `orelse` fallback type-checks.
+`String` produced upstream (a `T → ?T` coercion), and `&0 | first` reads a
+`?String` the `orelse` fallback can default.
 
 ### Void boundaries and rejected mismatches
 

@@ -164,6 +164,11 @@ pub const TypeExpr = union(enum) {
     sum: SumType,
     err: ErrorType,
     array: ArrayType,
+    /// `Stream(E)` — a sequence of `E` values consumed lazily. The static type of
+    /// a readable file descriptor (`&0`). Type-checker-only: it is erased before
+    /// the IR (a stream is consumed inline via `first`/`take`/`until`/`for`/a
+    /// pipe, never materialized as a runtime value). The element is the child.
+    stream: PrefixType,
     struct_type: StructType,
     module: ModuleType,
     tuple: TupleType,
@@ -674,6 +679,7 @@ pub const TypeExpr = union(enum) {
             .function,
             .tuple,
             .array,
+            .stream,
             .optional,
             .promise,
             .error_union,
@@ -713,6 +719,11 @@ pub const TypeExpr = union(enum) {
             .promise => |promise| {
                 try writer.writeByte('^');
                 try promise.format(writer);
+            },
+            .stream => |stream| {
+                try writer.writeAll("Stream(");
+                try stream.format(writer);
+                try writer.writeByte(')');
             },
             .integer => {
                 try writer.writeAll("Int");

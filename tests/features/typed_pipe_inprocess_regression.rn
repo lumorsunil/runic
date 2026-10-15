@@ -4,7 +4,8 @@
 // consuming read, so the single input is bound once and reused.
 
 fn Int add_one() Int {
-    yield &0 + 1
+    const n = &0 | first
+    yield n + 1
 }
 
-echo "6" | parseInt | { const n = &0; yield n * n } | add_one
+echo "6" | parseInt | { const n = &0 | first; yield n * n } | add_one

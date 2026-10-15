@@ -578,7 +578,7 @@ pub const IREvaluator = struct {
         const stdout_pipe = try self.context.getPipe(stdout_handle);
         const stderr_pipe = try self.context.getPipe(stderr_handle);
 
-        const stdin_behavior = self.childStdinBehavior();
+        const stdin_behavior = self.childStdinBehavior(stdin_pipe);
         const stdout_behavior = try self.childStdIoBehavior(stdout_pipe, self.config.stdout, self.config.stdout_is_tty);
         const stderr_behavior = try self.childStdIoBehavior(stderr_pipe, self.config.stderr, self.config.stderr_is_tty);
         try flushInheritedChildOutput(stdout_pipe, stdout_behavior);
@@ -603,7 +603,7 @@ pub const IREvaluator = struct {
         process_io.* = .init(io, child_ptr, argv_slice[0], self.config.tracer);
         process_io.connect();
 
-        try stdin_pipe.connectDestination(process_io.closeableStdin());
+        if (std.meta.activeTag(stdin_behavior) == .pipe) try stdin_pipe.connectDestination(process_io.closeableStdin());
         if (std.meta.activeTag(stdout_behavior) == .pipe) try stdout_pipe.connectSource(process_io.closeableStdout());
         if (std.meta.activeTag(stderr_behavior) == .pipe) try stderr_pipe.connectSource(process_io.closeableStderr());
 
@@ -635,8 +635,14 @@ pub const IREvaluator = struct {
         return if (root_is_tty and pipe == root_pipe) .inherit else .pipe;
     }
 
-    fn childStdinBehavior(self: *IREvaluator) std.process.SpawnOptions.StdIo {
+    fn childStdinBehavior(self: *IREvaluator, stdin_pipe: *ReaderWriterStream) std.process.SpawnOptions.StdIo {
         _ = self;
+        // A command whose stdin is the real top-level stdin inherits the fd and
+        // reads it directly; the kernel tracks the offset so leftover stays for
+        // the next command / `&0`. The stdin drainer is demand-gated, so it does
+        // not compete for the fd while the command runs. Inter-stage stdins stay
+        // Runic pipes.
+        if (stdin_pipe.config.real_stdin) return .inherit;
         return .pipe;
     }
 
@@ -1418,17 +1424,140 @@ pub const IREvaluator = struct {
                     return .cont;
                 }
 
-                // Byte pipe: one value = the whole buffered input. Wait until the
-                // producer closes, read it all, then consume (a second read is
-                // EOF).
+                // Byte pipe: one value = the whole remaining input. Wait until
+                // the producer is done (EOF), then drain every still-unread byte
+                // from the read cursor (so it composes after element reads on the
+                // same pipe) and consume (a second read is EOF). EOF is
+                // `isReadEof` — `keep_open` cleared *or* the stdin source
+                // drained — so the top-level stdin pipe (whose `keep_open` stays
+                // set) no longer blocks forever.
                 if (self.context.isPipeConsumed(stdin_value.pipe)) {
+                    if (stdin_pipe.config.real_stdin) self.context.stdin_demand = false;
                     thread.private.result_register = .null;
                     return .cont;
                 }
-                if (stdin_pipe.config.keep_open) return .cont_no_instr_counter_inc;
-                const bytes = stdin_pipe.buffer_writer.written();
+                if (!stdin_pipe.isReadEof()) {
+                    if (stdin_pipe.config.real_stdin) self.context.stdin_demand = true;
+                    return .cont_no_instr_counter_inc;
+                }
+                if (stdin_pipe.config.real_stdin) self.context.stdin_demand = false;
+                const bytes = stdin_pipe.bufferedUnread();
                 const owned = try self.allocator.dupe(u8, bytes);
+                stdin_pipe.consumeBuffered(bytes.len);
                 try self.context.markPipeConsumed(stdin_value.pipe);
+                thread.private.result_register = .{ .zig_string = owned };
+                return .cont;
+            },
+            .read_stream_element => {
+                // Read exactly one element from the stdin pipe (the primitive
+                // behind `first`/`take`/`until`). EOF is `.null`. Unlike
+                // `collect_stdin` it never waits for the whole stream — it
+                // returns as soon as one element is available, so a limiter can
+                // stop early (e.g. `&0 | until "\n"` returns at the newline).
+                if (thread.private.stack.items.len < 1) return Error.MissingPipeHandle;
+                const stdin_value = thread.private.stack.items[0];
+                if (stdin_value != .pipe) return Error.MissingPipeHandle;
+                const stdin_pipe = try self.context.getPipe(stdin_value.pipe);
+                stdin_pipe.has_been_connected = true;
+
+                if (stdin_pipe.config.typed) {
+                    // Typed pipe: dequeue the next value (same error-forwarding
+                    // short-circuit as `collect_stdin`); block while empty+live;
+                    // EOF when empty+done.
+                    if (self.context.dequeueTypedPipeValue(stdin_value.pipe)) |typed_value| {
+                        if (typed_value == .err and
+                            thread.private.stack.items.len >= 2 and
+                            thread.private.stack.items[1] == .pipe)
+                        {
+                            try self.context.enqueueTypedPipeValue(thread.private.stack.items[1].pipe, typed_value);
+                        }
+                        thread.private.result_register = typed_value;
+                        return .cont;
+                    }
+                    if (!stdin_pipe.isReadEof()) return .cont_no_instr_counter_inc;
+                    thread.private.result_register = .null;
+                    return .cont;
+                }
+
+                // Byte pipe: consume exactly one byte (a length-1 String) via the
+                // read cursor; block while empty+live; EOF when empty+done.
+                const unread = stdin_pipe.bufferedUnread();
+                if (unread.len > 0) {
+                    if (stdin_pipe.config.real_stdin) self.context.stdin_demand = false;
+                    const owned = try self.allocator.dupe(u8, unread[0..1]);
+                    stdin_pipe.consumeBuffered(1);
+                    thread.private.result_register = .{ .zig_string = owned };
+                    return .cont;
+                }
+                if (!stdin_pipe.isReadEof()) {
+                    if (stdin_pipe.config.real_stdin) self.context.stdin_demand = true;
+                    return .cont_no_instr_counter_inc;
+                }
+                if (stdin_pipe.config.real_stdin) self.context.stdin_demand = false;
+                thread.private.result_register = .null;
+                return .cont;
+            },
+            .stream_take_bytes => |count_source| {
+                // `&0 | take n` over a byte stream. Peek the read cursor: once at
+                // least `n` bytes are buffered (or the producer is done), consume
+                // and return that prefix as a String; otherwise block.
+                if (thread.private.stack.items.len < 1) return Error.MissingPipeHandle;
+                const stdin_value = thread.private.stack.items[0];
+                if (stdin_value != .pipe) return Error.MissingPipeHandle;
+                const stdin_pipe = try self.context.getPipe(stdin_value.pipe);
+                stdin_pipe.has_been_connected = true;
+
+                const count_value = try self.resolveValueSource(thread, count_source);
+                const count: usize = if (count_value == .integer and count_value.integer > 0)
+                    @intCast(count_value.integer)
+                else
+                    0;
+                const unread = stdin_pipe.bufferedUnread();
+                const take_now = if (unread.len >= count or stdin_pipe.isReadEof())
+                    @min(count, unread.len)
+                else {
+                    if (stdin_pipe.config.real_stdin) self.context.stdin_demand = true;
+                    return .cont_no_instr_counter_inc;
+                };
+                if (stdin_pipe.config.real_stdin) self.context.stdin_demand = false;
+                const owned = try self.allocator.dupe(u8, unread[0..take_now]);
+                stdin_pipe.consumeBuffered(take_now);
+                thread.private.result_register = .{ .zig_string = owned };
+                return .cont;
+            },
+            .stream_until_bytes => |delim_source| {
+                // `&0 | until d` over a byte stream. Scan the read cursor for the
+                // delimiter: on a hit, return the prefix before it (consuming the
+                // prefix and the delimiter); at EOF with no hit, return all
+                // remaining bytes; otherwise block for more input.
+                if (thread.private.stack.items.len < 1) return Error.MissingPipeHandle;
+                const stdin_value = thread.private.stack.items[0];
+                if (stdin_value != .pipe) return Error.MissingPipeHandle;
+                const stdin_pipe = try self.context.getPipe(stdin_value.pipe);
+                stdin_pipe.has_been_connected = true;
+
+                var delim_writer = std.Io.Writer.Allocating.init(self.allocator);
+                defer delim_writer.deinit();
+                try self.materializeString(thread, try self.resolveValueSource(thread, delim_source), &delim_writer.writer);
+                const delim = delim_writer.written();
+
+                const unread = stdin_pipe.bufferedUnread();
+                if (delim.len > 0) {
+                    if (std.mem.indexOf(u8, unread, delim)) |i| {
+                        if (stdin_pipe.config.real_stdin) self.context.stdin_demand = false;
+                        const owned = try self.allocator.dupe(u8, unread[0..i]);
+                        stdin_pipe.consumeBuffered(i + delim.len);
+                        thread.private.result_register = .{ .zig_string = owned };
+                        return .cont;
+                    }
+                }
+                if (!stdin_pipe.isReadEof()) {
+                    if (stdin_pipe.config.real_stdin) self.context.stdin_demand = true;
+                    return .cont_no_instr_counter_inc;
+                }
+                if (stdin_pipe.config.real_stdin) self.context.stdin_demand = false;
+                const owned = try self.allocator.dupe(u8, unread);
+                stdin_pipe.consumeBuffered(unread.len);
                 thread.private.result_register = .{ .zig_string = owned };
                 return .cont;
             },
@@ -1997,7 +2126,7 @@ pub const IREvaluator = struct {
                 const stdout_pipe = try self.context.getPipe(stdout_handle);
                 const stderr_pipe = try self.context.getPipe(stderr_handle);
 
-                const stdin_behavior = self.childStdinBehavior();
+                const stdin_behavior = self.childStdinBehavior(stdin_pipe);
                 const stdout_behavior = try self.childStdIoBehavior(stdout_pipe, self.config.stdout, self.config.stdout_is_tty);
                 const stderr_behavior = try self.childStdIoBehavior(stderr_pipe, self.config.stderr, self.config.stderr_is_tty);
                 try flushInheritedChildOutput(stdout_pipe, stdout_behavior);
@@ -2023,7 +2152,7 @@ pub const IREvaluator = struct {
                 process_io.* = .init(io, child, argv_slice[0], self.config.tracer);
                 process_io.connect();
 
-                try stdin_pipe.connectDestination(process_io.closeableStdin());
+                if (std.meta.activeTag(stdin_behavior) == .pipe) try stdin_pipe.connectDestination(process_io.closeableStdin());
                 if (std.meta.activeTag(stdout_behavior) == .pipe) try stdout_pipe.connectSource(process_io.closeableStdout());
                 if (std.meta.activeTag(stderr_behavior) == .pipe) try stderr_pipe.connectSource(process_io.closeableStderr());
 
@@ -2413,10 +2542,20 @@ pub const IREvaluator = struct {
                 const streamee = try self.resolveLocation(thread, stream);
 
                 return switch (streamee) {
-                    .pipe => |pipe_handle| switch (try (try self.context.getPipe(pipe_handle)).forward(.unlimited)) {
-                        .no_source => .cont_no_instr_counter_inc,
-                        .closed => .cont,
-                        .not_done => .cont_no_instr_counter_inc,
+                    .pipe => |pipe_handle| blk: {
+                        const pipe = try self.context.getPipe(pipe_handle);
+                        // The real top-level stdin drainer idles unless a `&0`
+                        // read is waiting (`stdin_demand`) or a destination is
+                        // connected (an `&0 | …` forward). Idling means it never
+                        // pulls from the real fd while a command inherits it.
+                        if (pipe.config.real_stdin and !self.context.stdin_demand and pipe.destination == null) {
+                            break :blk .cont_no_instr_counter_inc;
+                        }
+                        break :blk switch (try pipe.forward(.unlimited)) {
+                            .no_source => .cont_no_instr_counter_inc,
+                            .closed => .cont,
+                            .not_done => .cont_no_instr_counter_inc,
+                        };
                     },
                     else => {
                         std.log.err("streamee: {t}", .{streamee});
@@ -3221,7 +3360,7 @@ test "evaluator tty regression keeps stdin piped" {
 
     try std.testing.expectEqual(
         std.process.SpawnOptions.StdIo.pipe,
-        evaluator.childStdinBehavior(),
+        evaluator.childStdinBehavior(fixture.stdin_stream),
     );
 }
 

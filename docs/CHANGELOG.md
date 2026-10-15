@@ -12,6 +12,44 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ## [Unreleased]
 
+### Changed
+
+- **`&0` is now a `Stream(E)`, not a single value (breaking).** A readable file
+  descriptor has type `Stream(E)` — the sequence of input values — so you consume
+  it (pipe it into a stage, `for (&0)`, or `yield &0`) rather than using it as a
+  scalar. `&0 * 2` / `const n = &0` are now type errors; read a value with
+  `&0 | first`. This removes the old caller-dependent ambiguity in `&0`'s type.
+  Existing single-value reads migrate to `&0 | first` (a drop-in: it reads the
+  first value coerced to the element type, parsing a byte stream the same way the
+  old `&0` did).
+
+### Added
+
+- **Stream-reading builtins `first`, `take`, and `until`.** Bounded reads of any
+  stream, used as pipeline stages: `&0 | first` reads the first value (coerced to
+  the element type — the next value of a typed stream, or the whole byte input
+  for a byte stream), `&0 | take n` up to `n` elements, and `&0 | until d` the
+  elements up to (excluding) the first `d`. Over a byte stream `take`/`until`
+  yield a `String`; over a typed stream (e.g. after `parseInt`) an array. `take`
+  and `until` stop as soon as they are satisfied — `&0 | until "\n"` returns at
+  the newline without waiting for end of input — and the read cursor advances so
+  successive reads continue where the last left off. They are recognized
+  structurally as pipeline stages, so they do not occupy the global scope and
+  remain usable as ordinary variable names.
+
+### Fixed
+
+- **A top-level stdin read no longer hangs.** Reading the process's stdin
+  (`&0 | first` / `&0 | until …`) now reaches end-of-input instead of blocking
+  forever waiting for the stdin pipe to close.
+- **Commands share stdin instead of having it pushed at them.** Commands read
+  the real file descriptor directly, so a command that doesn't read stdin
+  (`printf "prompt: "`) no longer consumes or closes it, and one that reads part
+  of it (`head -c 5`) consumes exactly its share — the remainder flows to the next
+  command or `&0`. This fixes prompt-then-read (`printf "prompt: "` then
+  `&0 | until "\n"`) whether stdin is a terminal, a pipe, or a file, and stdin is
+  now read on demand rather than eagerly drained up front.
+
 ## [0.12.0] - 2026-10-05
 
 A large comptime and type-system release that layers constraint-checked,

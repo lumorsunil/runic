@@ -124,6 +124,11 @@ pub fn runScript(
         .disconnect_destination = true,
         .keep_open = true,
         .propagate_eof_on_source_close = true,
+        // A command that exits without reading stdin (e.g. `printf "prompt: "`)
+        // must not drain or close the script's stdin — keep it open so a
+        // following `&0` read (or the next command) still sees the input.
+        .preserve_source_on_destination_close = true,
+        .real_stdin = true,
     }, tracer);
     defer stdin_stream.stream.deinit();
     const stdout_stream = try Stream(u8).initReaderWriter(allocator, "<<<stdout_pipe>>>", .{

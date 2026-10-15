@@ -78,6 +78,10 @@ pub const IRProgramContext = struct {
 
     pipes: std.AutoArrayHashMapUnmanaged(PipeHandle, *ReaderWriterStream) = .empty,
     pipe_handle_counter: usize = 0,
+    /// Set while a `&0` read is waiting on the real top-level stdin; the stdin
+    /// drainer only pulls from the real fd while this is true, so it never
+    /// competes with a command that inherits the fd.
+    stdin_demand: bool = false,
     /// In-process typed transport: for a pipe marked `typed` (an exact non-String
     /// pipeline boundary), the upstream stage enqueues each yielded value here
     /// instead of serializing it to bytes, and the downstream dequeues them one

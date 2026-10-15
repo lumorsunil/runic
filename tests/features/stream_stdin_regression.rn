@@ -1,0 +1,13 @@
+// Reading the process's stdin. `&0` is the whole stream; `&0 | until "\n"` reads
+// one line, returning at the newline rather than waiting for EOF; `&0 | take n`
+// reads n bytes. The pipe's read cursor advances, so successive reads continue
+// where the last left off, and a final bare `&0` drains the remainder. (The
+// matching input is in `stream_stdin_regression.stdin`.)
+const a = &0 | until "\n"
+const b = &0 | until "\n"
+const one = &0 | take 1
+const rest = &0
+echo "a=${a}"
+echo "b=${b}"
+echo "take1=${one}"
+echo "rest=[${rest}]"

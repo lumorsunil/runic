@@ -1,0 +1,12 @@
+// A command that doesn't read stdin must not consume it. Top-level commands
+// inherit the real fd (the kernel tracks the offset), so `echo` here reads
+// nothing and leaves the input for the following `&0` reads; `head -c` consumes
+// exactly 5 bytes and `&0` gets the remainder.
+// (Input is in stdin_shared_regression.stdin.)
+echo "start"
+const line = &0 | until "\n"
+echo "line=${line}"
+head "-c" "5"
+echo ""
+const rest = &0
+echo "rest=[${rest}]"
