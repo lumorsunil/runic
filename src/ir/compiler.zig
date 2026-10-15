@@ -6688,42 +6688,34 @@ pub const IRCompiler = struct {
         // command completes instead of hanging as an unreaped zombie. Placed
         // before the stdout branch (which may return early) so it runs on every
         // path.
-        if (stderr_redirect_pipe) |stderr_pipe| {
-            const stderr_drain_thread = try self.fork(
-                source,
-                self.stdoutStreamSet(),
-                self.threadStdin(),
-                stderr_pipe,
-                self.threadStderr(),
-                .noll,
-                .inherit,
-            );
-            try self.wait(source, stderr_drain_thread);
-            // Return `execution_handles` (its `.thread` was set right after the
-            // spawn) via an explicit push/pop, like the stdout branch below,
-            // rather than the position-based tail pops — an interpolated redirect
-            // target leaves an extra stack ref the tail doesn't account for.
-            try self.push(source, .from(execution_handles.dereference()));
-            const execution_handles_r = try self.pop(source);
-            return .from(execution_handles_r.typed(execution_handles_struct_type));
-        }
-
-        if (has_stdout_file_redirect) {
-            try self.set(source, .initRegister(.r2), .from(execution_handles.dereference()));
-            const redirect_stream_thread = try self.fork(
-                source,
-                self.stdoutStreamSet(),
-                self.threadStdin(),
-                .initAdd(
-                    .{ .register = .r2 },
-                    redirected_stdout_slot,
-                    .{ .dereference = true },
-                ),
-                self.threadStderr(),
-                .noll,
-                .inherit,
-            );
-            try self.wait(source, redirect_stream_thread);
+        // Drain each file-redirected stream into its file concurrently while the
+        // command runs — so it never blocks on a full pipe and completes instead
+        // of hanging as an unreaped zombie. Both drains are forked *first* (each
+        // thread handle captured into a stable ref, since a fork returns in %r
+        // which the next fork overwrites), then waited on, so a command writing
+        // to both stdout and stderr doesn't deadlock on the undrained one.
+        // Returns `execution_handles` (its `.thread` was set right after the
+        // spawn) via an explicit push/pop rather than the position-based tail
+        // pops below — an interpolated redirect target leaves an extra stack ref
+        // the tail doesn't account for.
+        if (stderr_redirect_pipe != null or has_stdout_file_redirect) {
+            var stderr_drain_ref: ?ir.Location = null;
+            if (stderr_redirect_pipe) |stderr_pipe| {
+                const t = try self.fork(source, self.stdoutStreamSet(), self.threadStdin(), stderr_pipe, self.threadStderr(), .noll, .inherit);
+                const r = try self.newRef(source, "stderr_drain");
+                try self.set(source, r, .from(t));
+                stderr_drain_ref = r.dereference();
+            }
+            var stdout_drain_ref: ?ir.Location = null;
+            if (has_stdout_file_redirect) {
+                try self.set(source, .initRegister(.r2), .from(execution_handles.dereference()));
+                const t = try self.fork(source, self.stdoutStreamSet(), self.threadStdin(), .initAdd(.{ .register = .r2 }, redirected_stdout_slot, .{ .dereference = true }), self.threadStderr(), .noll, .inherit);
+                const r = try self.newRef(source, "stdout_drain");
+                try self.set(source, r, .from(t));
+                stdout_drain_ref = r.dereference();
+            }
+            if (stderr_drain_ref) |d| try self.wait(source, d);
+            if (stdout_drain_ref) |d| try self.wait(source, d);
             try self.push(source, .from(execution_handles.dereference()));
             const execution_handles_r = try self.pop(source);
             return .from(execution_handles_r.typed(execution_handles_struct_type));
@@ -11648,6 +11640,60 @@ pub const IRCompiler = struct {
         return new_expr;
     }
 
+    /// Rewrites an fd-prefixed redirect binary (`cmd 2> file`, `cmd 2>> file`)
+    /// into a call carrying that redirect, unwrapping any inner redirect on its
+    /// left so multiple redirects on one command all collect onto one call
+    /// (`cmd > out 2> err` → a single call with both redirects). The parser
+    /// already folds the simple `cmd 2> file` case; this handles the nested-
+    /// binary case it leaves for the compiler (an inner `>`/`>>` stays a binary
+    /// because it is ambiguous with comparison/shift). Returns null when the left
+    /// is not a command or redirect.
+    fn fdRedirectCall(self: *IRCompiler, binary: ast.BinaryExpr) Error!?*ast.Expression {
+        const mode: ast.RedirectionMode = switch (binary.op) {
+            .fd_source_truncate_redirect => .truncate,
+            .fd_source_append_redirect => .append,
+            else => return null,
+        };
+        const target = coerceRedirectTargetExpr(binary.right);
+        const redirect = ast.Redirection{
+            .stream = binary.op.redirectStream(),
+            .mode = mode,
+            .target = .{ .path = .{ .value = target, .span = target.span() } },
+            .span = binary.left.span().endAt(binary.right.span()),
+        };
+        // Resolve the left into a command call, unwrapping an inner stdout
+        // (`>`/`>>`) or fd redirect so every redirect lands on the same call.
+        const base: *ast.Expression = switch (binary.left.*) {
+            .binary => |inner| switch (inner.op) {
+                .greater, .append_redirect => (try self.greaterRedirectCall(inner)) orelse return null,
+                .fd_source_truncate_redirect, .fd_source_append_redirect => (try self.fdRedirectCall(inner)) orelse return null,
+                else => return null,
+            },
+            .call => if (self.greaterLeftIsCommand(binary.left)) binary.left else return null,
+            .block, .subshell => binary.left,
+            else => return null,
+        };
+
+        const new_expr = try self.allocator.create(ast.Expression);
+        switch (base.*) {
+            .call => |call| new_expr.* = .{ .call = .{
+                .callee = call.callee,
+                .arguments = call.arguments,
+                .redirects = try std.mem.concat(self.allocator, ast.Redirection, &.{ call.redirects, &.{redirect} }),
+                .background = call.background,
+                .span = base.span().endAt(binary.right.span()),
+            } },
+            else => new_expr.* = .{ .call = .{
+                .callee = base,
+                .arguments = &.{},
+                .redirects = try self.allocator.dupe(ast.Redirection, &.{redirect}),
+                .background = false,
+                .span = base.span().endAt(binary.right.span()),
+            } },
+        }
+        return new_expr;
+    }
+
     /// Unwraps a bare zero-arg call (`> file`) to its identifier callee so the
     /// redirect target is the path expression, mirroring the parser.
     fn coerceRedirectTargetExpr(expr: *ast.Expression) *ast.Expression {
@@ -12051,7 +12097,13 @@ pub const IRCompiler = struct {
             .@"orelse" => {
                 return self.compileOrelseBinary(source, binary);
             },
-            .fd_source_truncate_redirect, .fd_source_append_redirect, .redirect_fd => return Error.UnsupportedBinaryOperation,
+            .fd_source_truncate_redirect, .fd_source_append_redirect => {
+                if (try self.fdRedirectCall(binary)) |call_expr| {
+                    return self.compileExpression(call_expr);
+                }
+                return Error.UnsupportedBinaryOperation;
+            },
+            .redirect_fd => return Error.UnsupportedBinaryOperation,
             .assign => {
                 if (binary.left.* == .env_var) {
                     const env_var = binary.left.env_var;

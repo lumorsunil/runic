@@ -1,0 +1,10 @@
+// A command can redirect stdout and stderr to separate files in one statement
+// (`> out 2> err`, in either order). Each stream is drained into its file
+// concurrently, so a command that writes to both doesn't deadlock. The targets
+// may be interpolated.
+const out = "/tmp/runic-combined-redirect-out.txt"
+const err = "/tmp/runic-combined-redirect-err.txt"
+
+sh "-c" "printf 'to-stdout\n'; printf 'to-stderr\n' 1>&2" > "${out}" 2> "${err}"
+cat "${out}"
+cat "${err}"

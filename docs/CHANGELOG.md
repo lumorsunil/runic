@@ -54,6 +54,9 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   unreaped zombie; its stderr is now drained into the file concurrently (as
   stdout's `>` already was), so it completes, large output doesn't block on a full
   pipe, and an interpolated target path (`2> "${path}"`) works.
+- **A command can redirect stdout and stderr to separate files at once**
+  (`cmd > out 2> err`, in either order), which previously failed to compile. Both
+  streams drain concurrently, so a command writing to both doesn't deadlock.
 
 ## [0.12.0] - 2026-10-05
 
