@@ -6508,6 +6508,9 @@ pub const IRCompiler = struct {
 
         var exec_stdout = self.threadStdout();
         var exec_stderr = self.threadStderr();
+        // The stderr file-redirect pipe (a stable stack ref), used after the
+        // command to fork its concurrent drain thread (see below).
+        var stderr_redirect_pipe: ?ir.Location = null;
 
         for (redirects) |redirect| {
             switch (redirect.target) {
@@ -6548,6 +6551,7 @@ pub const IRCompiler = struct {
                         exec_stdout = redirect_pipe_ref.dereference();
                     } else {
                         exec_stderr = redirect_pipe_ref.dereference();
+                        stderr_redirect_pipe = redirect_pipe_ref.dereference();
                     }
                 },
                 .fd => |target_fd| {
@@ -6662,15 +6666,47 @@ pub const IRCompiler = struct {
 
         // The command has finished (and connected its stdout). Clear the redirect
         // pipe's keep_open flag set at creation, so its drain closes the file once
-        // the (now-EOF) source drains, instead of spinning forever.
+        // the (now-EOF) source drains, instead of spinning forever. This runs in
+        // the closure body (after the command's wait), so `threadStdout`/
+        // `threadStderr` here are the closure's own stdio slots — the redirect
+        // pipes — and the flag is cleared only once all output has been written.
         if (has_stdout_file_redirect) {
             try self.pipeOpt(source, self.threadStdout(), .keep_open, .fromValue(.fromBoolean(false)));
+        }
+        if (has_stderr_file_redirect) {
+            try self.pipeOpt(source, self.threadStderr(), .keep_open, .fromValue(.fromBoolean(false)));
         }
 
         try self.setClosureIdentifiers();
         self.current_instruction_set = prev_instr_set;
         try self.compileClosureInitialization(source, spawned.closure);
         self.scopes.pop();
+
+        // Concurrently drain a file-redirected stderr (mirrors the stdout drain
+        // below): a drain thread forwards the command's stderr into the file
+        // while the command runs, so it never blocks on a full pipe, and the
+        // command completes instead of hanging as an unreaped zombie. Placed
+        // before the stdout branch (which may return early) so it runs on every
+        // path.
+        if (stderr_redirect_pipe) |stderr_pipe| {
+            const stderr_drain_thread = try self.fork(
+                source,
+                self.stdoutStreamSet(),
+                self.threadStdin(),
+                stderr_pipe,
+                self.threadStderr(),
+                .noll,
+                .inherit,
+            );
+            try self.wait(source, stderr_drain_thread);
+            // Return `execution_handles` (its `.thread` was set right after the
+            // spawn) via an explicit push/pop, like the stdout branch below,
+            // rather than the position-based tail pops — an interpolated redirect
+            // target leaves an extra stack ref the tail doesn't account for.
+            try self.push(source, .from(execution_handles.dereference()));
+            const execution_handles_r = try self.pop(source);
+            return .from(execution_handles_r.typed(execution_handles_struct_type));
+        }
 
         if (has_stdout_file_redirect) {
             try self.set(source, .initRegister(.r2), .from(execution_handles.dereference()));
@@ -6706,10 +6742,6 @@ pub const IRCompiler = struct {
             .from(thread_handle_ref.dereference()),
         );
         _ = try self.pop(source);
-
-        if (has_stderr_file_redirect) {
-            _ = try self.pop(source);
-        }
 
         const execution_handles_r = try self.pop(source);
         return .from(execution_handles_r.typed(execution_handles_struct_type));

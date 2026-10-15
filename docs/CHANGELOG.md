@@ -49,6 +49,11 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   command or `&0`. This fixes prompt-then-read (`printf "prompt: "` then
   `&0 | until "\n"`) whether stdin is a terminal, a pipe, or a file, and stdin is
   now read on demand rather than eagerly drained up front.
+- **Redirecting a command's stderr to a file (`2>` / `2>>`) no longer hangs.** A
+  command that actually writes to a file-redirected stderr used to deadlock as an
+  unreaped zombie; its stderr is now drained into the file concurrently (as
+  stdout's `>` already was), so it completes, large output doesn't block on a full
+  pipe, and an interpolated target path (`2> "${path}"`) works.
 
 ## [0.12.0] - 2026-10-05
 

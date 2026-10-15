@@ -1,0 +1,11 @@
+// A command's stderr can be redirected to a file with `2>` (truncate) / `2>>`
+// (append), like stdout's `>`. The redirect pipe is drained into the file
+// concurrently while the command runs, so a command that actually writes to
+// stderr completes (it previously hung as an unreaped zombie) and large output
+// doesn't deadlock on a full pipe. The target path may be interpolated.
+const path = "/tmp/runic-stderr-redirect-regression.txt"
+
+sh "-c" "printf 'first\n' 1>&2" 2> "${path}"
+cat "${path}"
+sh "-c" "printf 'second\n' 1>&2" 2>> "${path}"
+cat "${path}"
