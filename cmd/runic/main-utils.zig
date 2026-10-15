@@ -318,7 +318,7 @@ fn renderCallExpression(writer: *std.Io.Writer, level: usize, call: ast.CallExpr
             try writeIndent(writer, level + 2);
             try writer.print("stream: ", .{});
             switch (redirect.stream) {
-                .stdin, .stdout, .stderr => try writer.print("{t}\n", .{redirect.stream}),
+                .stdin, .stdout, .stderr, .both => try writer.print("{t}\n", .{redirect.stream}),
                 .descriptor => |d| try writer.print("fd: {}\n", .{d}),
             }
 

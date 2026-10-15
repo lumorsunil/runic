@@ -232,6 +232,9 @@ pub const Tag = enum {
     greater,
     fd_source_truncate_redirect,
     fd_source_append_redirect,
+    /// `&>` / `&>>` — redirect both stdout and stderr to a file.
+    amp_truncate_redirect,
+    amp_append_redirect,
     append_redirect,
     redirect_fd,
     greater_equal,

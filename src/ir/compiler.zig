@@ -6492,6 +6492,9 @@ pub const IRCompiler = struct {
                 .stdin => 0,
                 .stdout => 1,
                 .stderr => 2,
+                // `&>` routes both streams through one pipe (stdout's slot); the
+                // command's stderr is pointed at it too below.
+                .both => 1,
                 .descriptor => |fd| fd,
             };
             if (stream_fd_ == 1) has_stdout_file_redirect = true;
@@ -6515,10 +6518,12 @@ pub const IRCompiler = struct {
         for (redirects) |redirect| {
             switch (redirect.target) {
                 .path => |path_target| {
+                    const is_both = redirect.stream == .both;
                     const stream_fd: u8 = switch (redirect.stream) {
                         .stdin => 0,
                         .stdout => 1,
                         .stderr => 2,
+                        .both => 1,
                         .descriptor => |fd| fd,
                     };
                     if (stream_fd != 1 and stream_fd != 2) continue;
@@ -6549,6 +6554,9 @@ pub const IRCompiler = struct {
                             .from(redirect_pipe_ref.dereference()),
                         );
                         exec_stdout = redirect_pipe_ref.dereference();
+                        // `&>`: the command's stderr shares the one redirect pipe,
+                        // so both streams land in the single file via one drain.
+                        if (is_both) exec_stderr = redirect_pipe_ref.dereference();
                     } else {
                         exec_stderr = redirect_pipe_ref.dereference();
                         stderr_redirect_pipe = redirect_pipe_ref.dereference();
@@ -6565,6 +6573,9 @@ pub const IRCompiler = struct {
                         .stdin => 0,
                         .stdout => 1,
                         .stderr => 2,
+                        // `&>` only ever targets a path, never an fd, so it does
+                        // not reach this fd-dup branch.
+                        .both => 1,
                         .descriptor => |fd| fd,
                     };
                     switch (source_fd) {
@@ -11650,8 +11661,8 @@ pub const IRCompiler = struct {
     /// is not a command or redirect.
     fn fdRedirectCall(self: *IRCompiler, binary: ast.BinaryExpr) Error!?*ast.Expression {
         const mode: ast.RedirectionMode = switch (binary.op) {
-            .fd_source_truncate_redirect => .truncate,
-            .fd_source_append_redirect => .append,
+            .fd_source_truncate_redirect, .amp_truncate_redirect => .truncate,
+            .fd_source_append_redirect, .amp_append_redirect => .append,
             else => return null,
         };
         const target = coerceRedirectTargetExpr(binary.right);
@@ -11666,7 +11677,7 @@ pub const IRCompiler = struct {
         const base: *ast.Expression = switch (binary.left.*) {
             .binary => |inner| switch (inner.op) {
                 .greater, .append_redirect => (try self.greaterRedirectCall(inner)) orelse return null,
-                .fd_source_truncate_redirect, .fd_source_append_redirect => (try self.fdRedirectCall(inner)) orelse return null,
+                .fd_source_truncate_redirect, .fd_source_append_redirect, .amp_truncate_redirect, .amp_append_redirect => (try self.fdRedirectCall(inner)) orelse return null,
                 else => return null,
             },
             .call => if (self.greaterLeftIsCommand(binary.left)) binary.left else return null,
@@ -12097,7 +12108,7 @@ pub const IRCompiler = struct {
             .@"orelse" => {
                 return self.compileOrelseBinary(source, binary);
             },
-            .fd_source_truncate_redirect, .fd_source_append_redirect => {
+            .fd_source_truncate_redirect, .fd_source_append_redirect, .amp_truncate_redirect, .amp_append_redirect => {
                 if (try self.fdRedirectCall(binary)) |call_expr| {
                     return self.compileExpression(call_expr);
                 }

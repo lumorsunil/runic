@@ -1066,11 +1066,13 @@ Runic supports explicit stdout/stderr redirects for commands and preserves shell
 echo "out" > "out.log"      // truncate stdout to a file
 echo "more" >> "out.log"    // append stdout to a file
 echo "saved error" 2>"err.log"
+ls "src" "nope" > "out.log" 2> "err.log"   // stdout and stderr to separate files
+ls "src" "nope" &> "all.log"               // both stdout and stderr to one file
 
 echo "hello" 1>&2 2>"/dev/null"
 ```
 
-**Result:** `>` / `>>` redirect stdout (truncate / append), `2>...` redirects stderr, and `1>&2` duplicates stdout onto the current stderr target. Because redirects are applied left to right, `echo "hello" 1>&2 2>"/dev/null"` still writes `hello` to the original stderr stream instead of discarding it. Redirecting a *function call* or a *block*'s output to a file — `myFn > "file"`, `{ … } > "file"` — is also supported, including when the body runs external commands (their real stdout is drained to the file), and both `>` and `>>` apply.
+**Result:** `>` / `>>` redirect stdout (truncate / append), `2>` / `2>>` redirect stderr, `&>` / `&>>` redirect both streams to one file, and `1>&2` duplicates stdout onto the current stderr target. A command may combine stdout and stderr redirects in one statement (`> out 2> err`, in either order); each stream is drained to its file concurrently while the command runs. Because redirects are applied left to right, `echo "hello" 1>&2 2>"/dev/null"` still writes `hello` to the original stderr stream instead of discarding it. Redirecting a *function call* or a *block*'s output to a file — `myFn > "file"`, `{ … } > "file"` — is also supported, including when the body runs external commands (their real stdout is drained to the file), and both `>` and `>>` apply.
 
 **`>` and `>>` are overloaded.** Since `>` is also the greater-than operator and `>>` the shift-right operator, Runic resolves each by its left operand: a **command** (an external executable call, a function call, a block, or a subshell) makes it an output redirect, while a **value** makes it the operator. So `echo "x" > "f"` / `echo "x" >> "f"` and `myFn > "f"` redirect (truncate / append), but `n > 2` compares and `bits >> 2` shifts. `>&` and the fd-prefixed forms (`1>`, `2>>`, …) are always redirects. To use a function's return value as an operand instead of redirecting it, bind it first: `const r = myFn; if (r > 2) ...`.
 

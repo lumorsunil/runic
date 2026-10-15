@@ -1,0 +1,10 @@
+// `&>` / `&>>` redirect both stdout and stderr to one file (truncate / append).
+// Both streams flow through a single redirect pipe into the file. Separate
+// stdout-only and stderr-only commands keep the expected output unambiguous; the
+// append then adds to the same file. The target path may be interpolated.
+const path = "/tmp/runic-amp-redirect-regression.txt"
+
+sh "-c" "printf 'stdout-line\n'" &> "${path}"
+cat "${path}"
+sh "-c" "printf 'stderr-line\n' 1>&2" &>> "${path}"
+cat "${path}"

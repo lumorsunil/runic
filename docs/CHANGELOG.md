@@ -36,6 +36,9 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   successive reads continue where the last left off. They are recognized
   structurally as pipeline stages, so they do not occupy the global scope and
   remain usable as ordinary variable names.
+- **`&>` / `&>>` redirect both stdout and stderr to one file** (truncate /
+  append), e.g. `cmd &> "log.txt"`. Both streams are merged through a single
+  redirect pipe into the file.
 
 ### Fixed
 
