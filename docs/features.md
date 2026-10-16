@@ -1074,6 +1074,26 @@ echo "hello" 1>&2 2>"/dev/null"
 
 **Result:** `>` / `>>` redirect stdout (truncate / append), `2>` / `2>>` redirect stderr, `&>` / `&>>` redirect both streams to one file, and `1>&2` duplicates stdout onto the current stderr target. A command may combine stdout and stderr redirects in one statement (`> out 2> err`, in either order); each stream is drained to its file concurrently while the command runs. Because redirects are applied left to right, `echo "hello" 1>&2 2>"/dev/null"` still writes `hello` to the original stderr stream instead of discarding it. Redirecting a *function call* or a *block*'s output to a file — `myFn > "file"`, `{ … } > "file"` — is also supported, including when the body runs external commands (their real stdout is drained to the file), and both `>` and `>>` apply.
 
+**Redirect to an in-memory stream.** A redirect target can be a bare
+`Stream(E)` variable instead of a quoted file path — the command's output is then
+captured into an in-memory pipe bound to that variable (the command runs eagerly;
+its output is buffered), consumable with the stream builtins:
+
+```rn
+var out: Stream(String) = .{ }
+ls "src" > out            // capture stdout into the in-memory pipe `out`
+out | lines | parseInt    // consume it — `|`, `first`/`take`/`until`, `for (out)`
+
+var errs: Stream(String) = .{ }
+build "proj" 2> errs      // capture stderr (binding alone can't)
+var all: Stream(String) = .{ }
+cmd &> all                // capture both streams
+```
+
+A quoted-string target (`> "path"`) stays a file redirect; a bare identifier of
+type `Stream(E)` is the in-memory variant. `for (out)` over a raw byte stream
+yields the whole buffer once; pipe through `lines` for per-line values.
+
 **`>` and `>>` are overloaded.** Since `>` is also the greater-than operator and `>>` the shift-right operator, Runic resolves each by its left operand: a **command** (an external executable call, a function call, a block, or a subshell) makes it an output redirect, while a **value** makes it the operator. So `echo "x" > "f"` / `echo "x" >> "f"` and `myFn > "f"` redirect (truncate / append), but `n > 2` compares and `bits >> 2` shifts. `>&` and the fd-prefixed forms (`1>`, `2>>`, …) are always redirects. To use a function's return value as an operand instead of redirecting it, bind it first: `const r = myFn; if (r > 2) ...`.
 
 ## Error-aware pipelines

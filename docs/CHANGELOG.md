@@ -39,6 +39,14 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 - **`&>` / `&>>` redirect both stdout and stderr to one file** (truncate /
   append), e.g. `cmd &> "log.txt"`. Both streams are merged through a single
   redirect pipe into the file.
+- **Redirect a command's output to an in-memory `Stream(E)` variable.** With a
+  bare-identifier target (vs a quoted-string file path), `cmd > out` captures the
+  command's output into a `var out: Stream(String)` — an in-memory pipe — instead
+  of a file. The command runs eagerly, buffering its output; `out` is then
+  consumed with the stream builtins (`out | grep …`, `out | first`,
+  `out | lines | parseInt`, `for (out)`). `2> errs` captures stderr (not possible
+  via binding before), and `&> both` captures both streams. `Stream(E)` is now a
+  writable type annotation.
 
 ### Fixed
 

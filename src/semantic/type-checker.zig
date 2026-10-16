@@ -1093,6 +1093,13 @@ pub const TypeChecker = struct {
         if (app.ctor_is_capture or self.nameIsTypeVar(scope, app.name.name)) {
             return self.allocTypeExpression(.{ .type_var = .{ .name = app.name.name, .span = app.span } });
         }
+        // `Stream(E)` is the built-in stream type (the type of `&0` and of a
+        // stream-redirect target variable). It is not a user constructor; map it
+        // to the `.stream` TypeExpr with the resolved element type.
+        if (std.mem.eql(u8, app.name.name, "Stream") and app.args.len == 1) {
+            const elem = try self.resolveTypeExpr(scope, app.args[0]);
+            return self.allocTypeExpression(.{ .stream = .{ .child = elem, .span = app.span } });
+        }
         const ctor = self.generic_type_ctors.get(app.name.name) orelse {
             try self.reportSpanError(
                 app.span,

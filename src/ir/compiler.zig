@@ -6514,6 +6514,11 @@ pub const IRCompiler = struct {
         // The stderr file-redirect pipe (a stable stack ref), used after the
         // command to fork its concurrent drain thread (see below).
         var stderr_redirect_pipe: ?ir.Location = null;
+        // Stream-variable redirect targets (`cmd > out` where `out: Stream(E)`):
+        // after the command's output is drained into the redirect pipe's buffer,
+        // the pipe handle is bound to this lvalue so later `out | …` consumes it.
+        var stdout_stream_bind: ?ir.Location = null;
+        var stderr_stream_bind: ?ir.Location = null;
 
         for (redirects) |redirect| {
             switch (redirect.target) {
@@ -6527,6 +6532,33 @@ pub const IRCompiler = struct {
                         .descriptor => |fd| fd,
                     };
                     if (stream_fd != 1 and stream_fd != 2) continue;
+
+                    // `cmd > out` where `out: Stream(E)` — redirect into an
+                    // in-memory pipe bound to `out` (no file). Build the same
+                    // keep-open redirect pipe + concurrent drain, but with no
+                    // FileSink: the command's output accumulates in the pipe's
+                    // buffer, and the handle is bound to `out` after the drain so
+                    // a later `out | …` / `for (out)` consumes it.
+                    if (self.redirectTargetStreamBinding(path_target.value)) |_| {
+                        const out_loc = try self.compileExpression(path_target.value);
+                        const stream_pipe_ref = try self.newRef(source, "stream_redirect_pipe");
+                        try self.pipe(source, stream_pipe_ref);
+                        try self.pipeOpt(source, stream_pipe_ref.dereference(), .keep_open, .fromValue(.fromBoolean(true)));
+                        if (stream_fd == 1) {
+                            try self.set(source, .initRegister(.r2), .from(execution_handles.dereference()));
+                            try self.set(source, .initAdd(.{ .register = .r2 }, redirected_stdout_slot, .{ .dereference = true }), .from(stream_pipe_ref.dereference()));
+                            exec_stdout = stream_pipe_ref.dereference();
+                            if (is_both) exec_stderr = stream_pipe_ref.dereference();
+                            has_stdout_file_redirect = true;
+                            stdout_stream_bind = out_loc.source.location;
+                        } else {
+                            exec_stderr = stream_pipe_ref.dereference();
+                            stderr_redirect_pipe = stream_pipe_ref.dereference();
+                            stderr_stream_bind = out_loc.source.location;
+                        }
+                        continue;
+                    }
+
                     const redirect_target = try self.compileExpression(path_target.value);
                     const redirect_pipe_ref = try self.newRef(source, if (stream_fd == 1) "stdout_redirect_pipe" else "stderr_redirect_pipe");
                     try self.pipe(source, redirect_pipe_ref);
@@ -6727,6 +6759,15 @@ pub const IRCompiler = struct {
             }
             if (stderr_drain_ref) |d| try self.wait(source, d);
             if (stdout_drain_ref) |d| try self.wait(source, d);
+            // Bind a stream-variable redirect target (`cmd > out`) to the now-
+            // fully-buffered redirect pipe handle, so later `out | …` consumes it.
+            if (stdout_stream_bind) |bind_loc| {
+                try self.set(source, .initRegister(.r2), .from(execution_handles.dereference()));
+                try self.set(source, bind_loc, .fromLocation(.initAdd(.{ .register = .r2 }, redirected_stdout_slot, .{ .dereference = true })));
+            }
+            if (stderr_stream_bind) |bind_loc| {
+                try self.set(source, bind_loc, .from(stderr_redirect_pipe.?));
+            }
             try self.push(source, .from(execution_handles.dereference()));
             const execution_handles_r = try self.pop(source);
             return .from(execution_handles_r.typed(execution_handles_struct_type));
@@ -10181,9 +10222,31 @@ pub const IRCompiler = struct {
     /// stage is not a readable-fd (`&0`) expression, so normal stage compilation
     /// applies.
     fn tryCompileFdForwardStage(self: *IRCompiler, source: *ast.Expression, stage_expr: *ast.Expression) Error!?Result {
-        if (stage_expr.* != .fd or stage_expr.fd.fd != 0) return null;
-        try self.pipeFwd(source, self.threadStdin(), self.threadStdout());
-        return .fromValue(.void);
+        if (stage_expr.* == .fd and stage_expr.fd.fd == 0) {
+            try self.pipeFwd(source, self.threadStdin(), self.threadStdout());
+            return .fromValue(.void);
+        }
+        // A `Stream(E)` binding as a pipeline source (`out | …`) forwards its
+        // (buffered) pipe into the pipeline. Unlike `&0` — whose always-running
+        // top-level drainer pushes it — this pipe has no drainer, so connect it to
+        // the stage's stdout and fork a drainer to flush its buffer downstream.
+        if (asVarName(stage_expr)) |name| {
+            if (self.lookup(name, .{ .shallow = false })) |binding| {
+                if (binding.is_mutable) if (binding.type_expr) |t| if (self.typeIsStream(t)) {
+                    // Read the binding's current value (the pipe handle the
+                    // redirect stored) with the same location semantics the
+                    // redirect's assignment used.
+                    const v = try self.compileExpression(stage_expr);
+                    if (v.source != .location) return null;
+                    const pipe_loc = v.source.location;
+                    try self.pipeFwd(source, pipe_loc, self.threadStdout());
+                    const drain_thread = try self.fork(source, self.stdoutStreamSet(), self.threadStdin(), pipe_loc, self.threadStderr(), .noll, .inherit);
+                    try self.wait(source, drain_thread);
+                    return .fromValue(.void);
+                };
+            }
+        }
+        return null;
     }
 
     fn compilePipeline(
@@ -11732,6 +11795,50 @@ pub const IRCompiler = struct {
             return .from(ref.dereference().typed(type_expr));
         }
         return (try self.compileExpression(expr)).dereference();
+    }
+
+    /// Whether a type expression is a `Stream(E)` — the resolved `.stream` form
+    /// (type checker) or the written `Stream(E)` application the IR compiler
+    /// stores for a binding annotation (possibly aliased).
+    fn typeIsStream(self: *IRCompiler, t: ast.TypeExpr) bool {
+        _ = self;
+        const u = switch (t) {
+            .alias => |a| a.type_expr.*,
+            else => t,
+        };
+        return switch (u) {
+            .stream => true,
+            .type_application => |app| std.mem.eql(u8, app.name.name, "Stream"),
+            else => false,
+        };
+    }
+
+    /// If a redirect target expression names a mutable `Stream(E)` binding (the
+    /// in-memory-pipe redirect `cmd > out`), returns that binding; else null (a
+    /// string/interpolated target is a file redirect).
+    fn redirectTargetStreamBinding(self: *IRCompiler, value: *ast.Expression) ?*Scope.Binding {
+        const name = asVarName(value) orelse return null;
+        const binding = self.lookup(name, .{ .shallow = false }) orelse return null;
+        // Only a mutable `var` can be a stream redirect target — the redirect
+        // assigns it the pipe handle. (An immutable binding has no writable slot.)
+        if (!binding.is_mutable) return null;
+        const t = binding.type_expr orelse return null;
+        if (!self.typeIsStream(t)) return null;
+        return binding;
+    }
+
+    /// The element type of a `Stream(E)` binding/type, or null.
+    fn streamElementType(self: *IRCompiler, t: ast.TypeExpr) ?ast.TypeExpr {
+        _ = self;
+        const u = switch (t) {
+            .alias => |a| a.type_expr.*,
+            else => t,
+        };
+        return switch (u) {
+            .stream => |s| s.child.*,
+            .type_application => |app| if (std.mem.eql(u8, app.name.name, "Stream") and app.args.len == 1) app.args[0].* else null,
+            else => null,
+        };
     }
 
     /// The variable name an expression refers to, if it is a bare identifier or a
@@ -13327,6 +13434,20 @@ pub const IRCompiler = struct {
             return self.compileFdForLoop(source, for_expr);
         }
 
+        // `for (out) |x| body` where `out: Stream(E)` — iterate an in-memory
+        // pipe. Desugar to `out | { for (&0) |x| body }`: the block stage's stdin
+        // is out's pipe, and the inner `for (&0)` drains it via the existing
+        // live-stream for-loop.
+        if (for_expr.sources.len == 1) {
+            if (asVarName(for_expr.sources[0])) |name| {
+                if (self.lookup(name, .{ .shallow = false })) |binding| {
+                    if (binding.is_mutable) if (binding.type_expr) |t| if (self.typeIsStream(t)) {
+                        return self.compileStreamVarForLoop(source, for_expr);
+                    };
+                }
+            }
+        }
+
         // `for (@fields(T)) |f| { … }` — a comptime iteration over a struct
         // type's fields, unrolled at compile time (one body copy per field, with
         // `f.name`/`f.type` folded to that field's name and type).
@@ -13669,6 +13790,47 @@ pub const IRCompiler = struct {
         try self.setLabel(after_label.local_addr.label, .abs);
 
         return .fromValue(.void);
+    }
+
+    /// Lowers `for (out) |x| body` where `out: Stream(E)` by desugaring to the
+    /// pipeline `out | { for (&0) |x| body }`: the block stage's stdin is out's
+    /// pipe, so the inner `for (&0)` drains it via the live-stream for-loop. The
+    /// original capture and body are reused verbatim.
+    fn compileStreamVarForLoop(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        for_expr: ast.ForExpr,
+    ) Error!Result {
+        const a = self.allocator;
+        const span = source.span();
+
+        // `&0`
+        const fd0 = try a.create(ast.Expression);
+        fd0.* = .{ .fd = .{ .fd = 0, .span = span } };
+
+        // `for (&0) |x| body` (same capture + body)
+        const inner_for = try a.create(ast.Expression);
+        inner_for.* = .{ .for_expr = .{
+            .sources = try a.dupe(*ast.Expression, &.{fd0}),
+            .capture = for_expr.capture,
+            .body = for_expr.body,
+            .span = span,
+        } };
+
+        // `{ for (&0) |x| body }`
+        const stmt = try a.create(ast.Statement);
+        stmt.* = .{ .expression = .{ .expression = inner_for, .span = span } };
+        const block = try a.create(ast.Expression);
+        block.* = .{ .block = .{ .statements = try a.dupe(*ast.Statement, &.{stmt}), .span = span } };
+
+        // `out | { … }`
+        const pipeline = try a.create(ast.Expression);
+        pipeline.* = .{ .pipeline = .{
+            .stages = try a.dupe(*ast.Expression, &.{ for_expr.sources[0], block }),
+            .span = span,
+        } };
+
+        return self.compileExpression(pipeline);
     }
 
     /// Lowers `for (&0) |v| body` — a loop over the live stdin stream. Each
