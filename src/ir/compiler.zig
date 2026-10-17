@@ -6551,6 +6551,36 @@ pub const IRCompiler = struct {
                         const stream_pipe_ref = try self.newRef(source, "stream_redirect_pipe");
                         try self.pipe(source, stream_pipe_ref);
                         try self.pipeOpt(source, stream_pipe_ref.dereference(), .keep_open, .fromValue(.fromBoolean(true)));
+
+                        // Append (`>> out` / `2>> out` / `&>> out`): if `out`
+                        // already holds a pipe from an earlier redirect, drain its
+                        // (buffered, EOF) content into this fresh pipe *before* the
+                        // command connects, so the command's output accumulates
+                        // after it. A fresh/unwritten `out` still holds its zero
+                        // value (an empty struct), so the runtime `is pipe` test
+                        // skips the prepend and append degenerates to truncate.
+                        if (redirect.mode == .append) {
+                            const out_pipe = out_loc.source.location;
+                            const is_pipe_ref = try self.newRef(source, "append_target_is_pipe");
+                            try self.addInstruction(.init(.from(source), .{ .is_type = .{
+                                .operand = out_pipe,
+                                .tag = .pipe,
+                                .result = is_pipe_ref,
+                            } }));
+                            const skip_prepend = try self.newLabel("append_skip_prepend", .unknown);
+                            const is_pipe_cond: Result = try .from(is_pipe_ref.dereference().typed(.{ .boolean = .{ .span = source.span() } }));
+                            try self.jmp(source, is_pipe_cond, false, skip_prepend);
+                            // Forward the old pipe into the fresh one and fork a
+                            // drainer to flush its buffer (mirrors how a `Stream`
+                            // binding is consumed as a pipeline source). `wait`
+                            // makes it complete before the command writes; the
+                            // fresh pipe's `keep_open` keeps it open for that write.
+                            try self.pipeFwd(source, out_pipe, stream_pipe_ref.dereference());
+                            const prepend_drain = try self.fork(source, self.stdoutStreamSet(), self.threadStdin(), out_pipe, self.threadStderr(), .noll, .inherit);
+                            try self.wait(source, prepend_drain);
+                            try self.setLabel(skip_prepend.local_addr.label, .abs);
+                        }
+
                         if (stream_fd == 1) {
                             try self.set(source, .initRegister(.r2), .from(execution_handles.dereference()));
                             try self.set(source, .initAdd(.{ .register = .r2 }, redirected_stdout_slot, .{ .dereference = true }), .from(stream_pipe_ref.dereference()));

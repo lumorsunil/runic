@@ -442,8 +442,10 @@ pub const Instruction = struct {
 
     /// The runtime type categories testable by the `x is T` operator. Each maps
     /// to one or more `Value` tags (e.g. `string` accepts both `.zig_string` and
-    /// `.slice`); see `Evaluator`'s `is_type` handler.
-    pub const TypeTag = enum { int, float, string, boolean };
+    /// `.slice`); see `Evaluator`'s `is_type` handler. `pipe` is internal-only
+    /// (no surface type name maps to it): the compiler uses it to detect whether
+    /// a `Stream` binding already holds a pipe (for append redirects).
+    pub const TypeTag = enum { int, float, string, boolean, pipe };
 
     /// Tests whether `operand`'s runtime value matches `tag`.
     pub const IsType = struct {

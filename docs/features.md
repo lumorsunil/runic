@@ -1092,7 +1092,12 @@ cmd &> all                // capture both streams
 
 A quoted-string target (`> "path"`) stays a file redirect; a bare identifier of
 type `Stream(E)` is the in-memory variant. `for (out)` over a raw byte stream
-yields the whole buffer once; pipe through `lines` for per-line values.
+yields the whole buffer once; pipe through `lines` for per-line values. The
+append forms (`>>`, `2>>`, `&>>`) accumulate into the stream across commands —
+each command's output is buffered after whatever the stream already holds —
+while the truncate forms replace it; appending to a stream that has not been
+written yet behaves like a plain redirect. The target must be a `var` (the
+redirect assigns it); an immutable `const` stream target is a compile error.
 
 **`>` and `>>` are overloaded.** Since `>` is also the greater-than operator and `>>` the shift-right operator, Runic resolves each by its left operand: a **command** (an external executable call, a function call, a block, or a subshell) makes it an output redirect, while a **value** makes it the operator. So `echo "x" > "f"` / `echo "x" >> "f"` and `myFn > "f"` redirect (truncate / append), but `n > 2` compares and `bits >> 2` shifts. `>&` and the fd-prefixed forms (`1>`, `2>>`, …) are always redirects. To use a function's return value as an operand instead of redirecting it, bind it first: `const r = myFn; if (r > 2) ...`.
 

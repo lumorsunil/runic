@@ -49,7 +49,11 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   writable type annotation. The target must be a `var`: redirecting to an
   immutable `const` stream (in any of the `>`, `2>`, `&>` forms) reports a clear
   error — "cannot redirect to immutable '…'; declare the stream with var" —
-  rather than silently falling back to a file.
+  rather than silently falling back to a file. The append forms (`>>`, `2>>`,
+  `&>>`) accumulate into the stream across commands instead of replacing — each
+  command's output is buffered after whatever the stream already holds — while
+  the truncate forms (`>`, `2>`, `&>`) still replace. Appending to a stream that
+  has not been written yet behaves like a plain redirect.
 
 ### Fixed
 
@@ -59,7 +63,8 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   single `[error]:` diagnostic with the faulting line's `file:line:col` and the
   highlighted source line — the same shape as a compile error (e.g. consuming a
   `Stream` before anything was redirected into it: "cannot consume a stream
-  before it has been written to").
+  before it has been written to"). A missing command (`CommandNotFound`) is
+  rendered the same way, with its source line, instead of a bare one-line message.
 - **Compile and runtime errors now print to stderr, not stdout.** IR-compile and
   runtime diagnostics were written to stdout while the parser and type-checker
   stages already used stderr; they now all go to stderr, so an error never

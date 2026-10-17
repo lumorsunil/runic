@@ -103,6 +103,10 @@ pub const IREvaluator = struct {
     /// recoverable `MaterializeStringError` instead. The limit is far deeper than
     /// any real value nests.
     materialize_depth: usize = 0,
+    /// The missing command's name, stashed by `reportCommandNotFound` so the
+    /// runner can render a `[error]:` diagnostic for it. Duped onto `allocator`
+    /// because the argv it came from may be freed as the failed spawn unwinds.
+    command_not_found_name: ?[]const u8 = null,
 
     /// Maximum `materializeString` nesting before it bails with an error rather
     /// than overflow the native stack on a cyclic/corrupt heap value.
@@ -528,26 +532,14 @@ pub const IREvaluator = struct {
         return .{ .argv = argv, .owned = owned };
     }
 
-    /// Reports a missing executable the way bash does — the command name and
-    /// where it was invoked — with a precise message, then returns
-    /// `error.CommandNotFound`. The runner leaves that error un-decorated (it is
-    /// already reported here), so an unbound identifier used as a command no
-    /// longer surfaces as a bare `error.FileNotFound`.
+    /// Records a missing executable (the command name) and returns
+    /// `error.CommandNotFound`; the runner renders it as a `[error]:` diagnostic
+    /// at the faulting instruction's span, so an unbound identifier used as a
+    /// command no longer surfaces as a bare `error.FileNotFound`.
     fn reportCommandNotFound(self: *IREvaluator, thread: ir.context.IRThreadContext, name: []const u8) Error {
-        _ = self;
-        if (thread.currentInstruction()) |instr| {
-            if (instr.source) |source| {
-                const span = source.span();
-                std.log.err("{s}:{}:{}: command not found: '{s}'", .{
-                    span.start.file,
-                    span.start.line,
-                    span.start.column,
-                    name,
-                });
-                return error.CommandNotFound;
-            }
-        }
-        std.log.err("command not found: '{s}'", .{name});
+        _ = thread;
+        // Dupe: the argv this name points into may be freed as the spawn unwinds.
+        self.command_not_found_name = self.allocator.dupe(u8, name) catch name;
         return error.CommandNotFound;
     }
 
@@ -1744,6 +1736,8 @@ pub const IREvaluator = struct {
                     .boolean => operand == .exit_code,
                     // A string is either an interned Zig string or a runtime byte slice.
                     .string => operand == .zig_string or operand == .slice,
+                    // Internal-only: does the value currently hold a pipe handle?
+                    .pipe => operand == .pipe,
                 };
                 try self.setLocation(thread, is_type.result, .fromBoolean(matches));
                 return .cont;
