@@ -159,6 +159,9 @@ pub const Error =
         LabelAddrNotSet,
         StructTypeNotFound,
         NotImplemented,
+        /// Tags a diagnostic synthesized from a runtime (evaluator) error so it
+        /// renders through the normal diagnostic path; not raised by the compiler.
+        RuntimeError,
     };
 
 pub const GetFrameError = error{

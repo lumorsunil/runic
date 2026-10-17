@@ -55,6 +55,10 @@ pub const IRRunner = struct {
     document_store: *DocumentStore,
     script: *ast.Script,
     config: IRConfig,
+    /// The source span of the instruction a generic runtime error faulted on, so
+    /// `runIR` can render it as a proper `[error]:` diagnostic. Null when the
+    /// faulting instruction carries no source location.
+    runtime_error_span: ?ast.Span = null,
 
     pub fn init(
         allocator: Allocator,
@@ -116,26 +120,15 @@ pub const IRRunner = struct {
 
             // Some errors are reported with a precise, user-facing message at
             // the point they occur (e.g. InvalidInt/InvalidFloat name the
-            // offending input); don't also emit the generic "Error evaluating"
-            // line for those.
+            // offending input); let those propagate untouched.
             if (err == error.InvalidInt or err == error.InvalidFloat or err == error.CommandNotFound) return err;
 
+            // Otherwise capture the faulting instruction's source span so `runIR`
+            // can render a proper `[error]:` diagnostic (file:line:col + source
+            // line), the same shape as a compile error — instead of the old raw
+            // "Error evaluating …" / "runic exited with error …" pair.
             if (current_instr) |ci| {
-                if (ci.source) |source| {
-                    const span = source.span();
-                    const file_name = span.start.file;
-                    const line = span.start.line;
-                    const column = span.start.column;
-                    std.log.err("Error evaluating {s}:{}:{}: {}", .{
-                        file_name,
-                        line,
-                        column,
-                        err,
-                    });
-                } else {
-                    const addr = current_thread.getCurrentInstructionAddr();
-                    std.log.err("Error evaluating instruction {f}: {}", .{ addr, err });
-                }
+                self.runtime_error_span = if (ci.source) |source| source.span() else null;
             }
 
             return err;
@@ -226,7 +219,35 @@ pub fn runIR(
     if (config.dry_run) return .{ .success = .success };
 
     runner.log("\nRunning...\n", .{});
-    return .{ .success = try runner.run(&context) };
+    const exit_code = runner.run(&context) catch |err| {
+        // Precise, self-describing errors (they printed their own message at the
+        // point of failure) propagate untouched. Every other runtime error is
+        // rendered as a proper `[error]:` diagnostic, carrying the faulting
+        // instruction's source span captured by `run`.
+        if (err == error.InvalidInt or err == error.InvalidFloat or err == error.CommandNotFound) return err;
+        var diag_arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer diag_arena.deinit();
+        const da = diag_arena.allocator();
+        const diags = try da.alloc(ir.compiler.Diagnostic, 1);
+        diags[0] = .{
+            .err = ir.compiler.Error.RuntimeError,
+            ._span = runner.runtime_error_span,
+            .message = try runtimeErrorMessage(da, err),
+            ._severity = .@"error",
+        };
+        return RunResult.err_(diag_arena, diags);
+    };
+    return .{ .success = exit_code };
+}
+
+/// A human-readable message for a runtime error surfaced as a diagnostic. Known
+/// user-facing cases get a specific explanation; anything else falls back to the
+/// error name so an internal fault is still legible.
+fn runtimeErrorMessage(allocator: Allocator, err: anyerror) ![]const u8 {
+    return switch (err) {
+        error.UnsupportedForward => try allocator.dupe(u8, "cannot consume a stream before it has been written to"),
+        else => try std.fmt.allocPrint(allocator, "runtime error: {t}", .{err}),
+    };
 }
 
 pub fn debugIR(

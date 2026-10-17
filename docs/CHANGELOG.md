@@ -53,6 +53,13 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Fixed
 
+- **Runtime errors render like compile errors.** A runtime fault that isn't
+  already self-describing used to print a raw `Error evaluating …:
+  error.Foo` line followed by `runic exited with error: Foo`. It now renders as a
+  single `[error]:` diagnostic with the faulting line's `file:line:col` and the
+  highlighted source line — the same shape as a compile error (e.g. consuming a
+  `Stream` before anything was redirected into it: "cannot consume a stream
+  before it has been written to").
 - **Compile and runtime errors now print to stderr, not stdout.** IR-compile and
   runtime diagnostics were written to stdout while the parser and type-checker
   stages already used stderr; they now all go to stderr, so an error never

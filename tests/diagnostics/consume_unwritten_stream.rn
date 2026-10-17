@@ -1,0 +1,6 @@
+// Consuming a `Stream` before anything has been redirected into it is a runtime
+// error — the binding still holds its zero value, not a pipe. It should render
+// as a normal `[error]:` diagnostic (file:line:col + source line), not a raw
+// "Error evaluating …" / "runic exited with error …" pair.
+var out: Stream(String) = .{ }
+out | cat
