@@ -46,7 +46,10 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   consumed with the stream builtins (`out | grep …`, `out | first`,
   `out | lines | parseInt`, `for (out)`). `2> errs` captures stderr (not possible
   via binding before), and `&> both` captures both streams. `Stream(E)` is now a
-  writable type annotation.
+  writable type annotation. The target must be a `var`: redirecting to an
+  immutable `const` stream (in any of the `>`, `2>`, `&>` forms) reports a clear
+  error — "cannot redirect to immutable '…'; declare the stream with var" —
+  rather than silently falling back to a file.
 
 ### Fixed
 

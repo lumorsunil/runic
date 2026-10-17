@@ -6533,6 +6533,10 @@ pub const IRCompiler = struct {
                     };
                     if (stream_fd != 1 and stream_fd != 2) continue;
 
+                    if (self.redirectTargetImmutableStreamName(path_target.value)) |name| {
+                        try self.reportSourceError(path_target.value, Error.UnsupportedExpression, .@"error", "cannot redirect to immutable '{s}'; declare the stream with var", .{name});
+                        continue;
+                    }
                     // `cmd > out` where `out: Stream(E)` — redirect into an
                     // in-memory pipe bound to `out` (no file). Build the same
                     // keep-open redirect pipe + concurrent drain, but with no
@@ -11825,6 +11829,21 @@ pub const IRCompiler = struct {
         const t = binding.type_expr orelse return null;
         if (!self.typeIsStream(t)) return null;
         return binding;
+    }
+
+    /// If a redirect target expression names an *immutable* `Stream(E)` binding,
+    /// returns its name. Such a target is a user error: a stream redirect assigns
+    /// the pipe handle, which needs a writable `var` slot. Caught here (not just
+    /// in the type checker) because the `>` form stays a `greater` binary that the
+    /// type checker's redirect loop never sees — only `2>`/`&>` fold into
+    /// `call.redirects` there.
+    fn redirectTargetImmutableStreamName(self: *IRCompiler, value: *ast.Expression) ?[]const u8 {
+        const name = asVarName(value) orelse return null;
+        const binding = self.lookup(name, .{ .shallow = false }) orelse return null;
+        if (binding.is_mutable) return null;
+        const t = binding.type_expr orelse return null;
+        if (!self.typeIsStream(t)) return null;
+        return name;
     }
 
     /// The element type of a `Stream(E)` binding/type, or null.

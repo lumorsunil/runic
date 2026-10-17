@@ -1,0 +1,6 @@
+[error]: tests/diagnostics/redirect_to_immutable_stream.rn:6:25: cannot redirect to immutable 'out'; declare the stream with var
+   4:// rather than silently fall back to writing a file named `out`.
+   5:const out: Stream(String) = .{ }
+   6:sh "-c" "printf 'hi'" > out
+   7:
+

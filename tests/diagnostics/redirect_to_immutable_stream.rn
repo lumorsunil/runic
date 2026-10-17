@@ -1,0 +1,6 @@
+// Redirecting a command's output into a `Stream` requires a writable `var`:
+// the redirect assigns the pipe handle to the binding. A `const` stream has no
+// writable slot, so `cmd > out` (and `2>` / `&>`) must report a clear error
+// rather than silently fall back to writing a file named `out`.
+const out: Stream(String) = .{ }
+sh "-c" "printf 'hi'" > out

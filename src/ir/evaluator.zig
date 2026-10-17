@@ -2390,8 +2390,14 @@ pub const IREvaluator = struct {
                 return .cont;
             },
             .pipe_fwd => |pipe_fwd| {
-                const source_handle = (try self.resolveLocation(thread, pipe_fwd.source)).pipe;
-                const destination_handle = (try self.resolveLocation(thread, pipe_fwd.destination)).pipe;
+                const source_val = try self.resolveLocation(thread, pipe_fwd.source);
+                const destination_val = try self.resolveLocation(thread, pipe_fwd.destination);
+                // A `Stream` binding consumed before anything was redirected into
+                // it still holds its zero value (an empty struct), not a pipe.
+                // Report rather than panic on the union-field mismatch.
+                if (source_val != .pipe or destination_val != .pipe) return Error.UnsupportedForward;
+                const source_handle = source_val.pipe;
+                const destination_handle = destination_val.pipe;
                 const source_pipe = try self.context.getPipe(source_handle);
                 const destination_pipe = try self.context.getPipe(destination_handle);
 

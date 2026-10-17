@@ -3046,7 +3046,23 @@ pub const TypeChecker = struct {
         }
         for (call.redirects) |*redirect| {
             switch (redirect.target) {
-                .path => |p| try self.runExpression(scope, p.value),
+                .path => |p| {
+                    // A bare-identifier target naming a `Stream(E)` binding is an
+                    // in-memory-pipe redirect (`cmd > out`); it must be mutable so
+                    // the redirect can assign it. (A quoted/interpolated target, or
+                    // a bare word naming a non-Stream binding or nothing, is a file
+                    // path — left to run normally.)
+                    if (referencedBindingName(p.value)) |name| {
+                        if (scope.lookup(name)) |binding| {
+                            const decl = binding.declared_type orelse binding.type_expr;
+                            if (decl != null and self.unaliasType(decl.?).* == .stream and !binding.is_mutable) {
+                                try self.reportSpanError(p.span, Error.TypeMismatch, .@"error", "cannot redirect to immutable '{s}'; declare the stream with var", .{name});
+                                continue;
+                            }
+                        }
+                    }
+                    try self.runExpression(scope, p.value);
+                },
                 .fd => {},
             }
         }
