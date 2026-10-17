@@ -12,6 +12,21 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-17
+
+A streams-and-redirection release. A readable file descriptor is now a proper
+`Stream(E)` — `&0` is the sequence of input values, consumed with the new
+bounded-read builtins `first` / `take` / `until` rather than used as a scalar.
+Command output can be redirected to files more completely (`&>` / `&>>` merge
+stdout and stderr; stdout and stderr can target separate files at once) and,
+newly, into in-memory `Stream` variables (`cmd > out`, `2> errs`, `&> both`) for
+incremental consumption with the stream builtins — with append forms (`>>`,
+`2>>`, `&>>`) that accumulate across commands. On the diagnostics side, every
+runtime error now renders as a source-anchored `[error]:` diagnostic like a
+compile error (including missing commands, `cimport` failures, and `--debug-ir`
+mode), and all compiler/runtime diagnostics go to stderr instead of polluting a
+script's stdout. Several stdin/redirect deadlocks are fixed along the way.
+
 ### Changed
 
 - **`&0` is now a `Stream(E)`, not a single value (breaking).** A readable file

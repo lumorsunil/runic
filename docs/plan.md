@@ -141,6 +141,20 @@ A cycle of feature work and engineering-health work:
   `<struct>`, lists every signature of an overloaded function, types a field of an
   anonymous `.{ … }` literal from its context, and resolves an implicit `.name`
   declaration access against the result-location type.
+- **Streams and I/O redirection (0.13.0):** a readable fd is now a `Stream(E)` —
+  `&0` is the sequence of input values, read with the bounded builtins `first` /
+  `take` / `until` (recognized structurally as pipeline stages, so still usable as
+  variable names) rather than as a scalar. Redirection grew `&>` / `&>>` (merge
+  stdout+stderr to one file), simultaneous stdout+stderr to separate files, and
+  redirection into an in-memory `Stream` variable (`cmd > out`, `2> errs`,
+  `&> both`) consumed incrementally with the stream builtins — with append forms
+  (`>>`, `2>>`, `&>>`) that accumulate across commands. Several stdin/redirect
+  deadlocks were fixed (top-level stdin read, file-redirected stderr, combined
+  redirects; commands now share the real stdin fd instead of having it pushed at
+  them). **Diagnostics:** every runtime error renders as a source-anchored
+  `[error]:` diagnostic like a compile error — missing commands and `cimport`
+  failures included, and in `--debug-ir` mode — and all compiler/runtime
+  diagnostics go to stderr instead of a script's stdout.
 
 A known constraint discovered this cycle: `compiler.zig` is large (~10k lines)
 but cannot be cleanly split in current Zig — `usingnamespace` was removed and
