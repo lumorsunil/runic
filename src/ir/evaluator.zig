@@ -103,10 +103,12 @@ pub const IREvaluator = struct {
     /// recoverable `MaterializeStringError` instead. The limit is far deeper than
     /// any real value nests.
     materialize_depth: usize = 0,
-    /// The missing command's name, stashed by `reportCommandNotFound` so the
-    /// runner can render a `[error]:` diagnostic for it. Duped onto `allocator`
-    /// because the argv it came from may be freed as the failed spawn unwinds.
-    command_not_found_name: ?[]const u8 = null,
+    /// A fully-formed, human-readable detail message for a terminal runtime error
+    /// (the missing command, the C library that failed to load, …), stashed at the
+    /// error site so the runner/debugger can use it as the `[error]:` diagnostic
+    /// message. Allocated on `allocator` because the source bytes may be freed as
+    /// the faulting operation unwinds. Only read on the terminal error path.
+    error_detail: ?[]const u8 = null,
 
     /// Maximum `materializeString` nesting before it bails with an error rather
     /// than overflow the native stack on a cyclic/corrupt heap value.
@@ -538,8 +540,8 @@ pub const IREvaluator = struct {
     /// command no longer surfaces as a bare `error.FileNotFound`.
     fn reportCommandNotFound(self: *IREvaluator, thread: ir.context.IRThreadContext, name: []const u8) Error {
         _ = thread;
-        // Dupe: the argv this name points into may be freed as the spawn unwinds.
-        self.command_not_found_name = self.allocator.dupe(u8, name) catch name;
+        // Build now: the argv this name points into may be freed as the spawn unwinds.
+        self.error_detail = std.fmt.allocPrint(self.allocator, "command not found: '{s}'", .{name}) catch null;
         return error.CommandNotFound;
     }
 
@@ -1177,7 +1179,7 @@ pub const IREvaluator = struct {
         return switch (instruction.type) {
             .comment => return .skip,
             .cimport_open => |op| {
-                const cc = try ffiLibOpen(self.allocator, op);
+                const cc = try ffiLibOpen(self.allocator, op, &self.error_detail);
                 const handle = try self.context.addCloseable(&cc.closeable);
                 try self.context.addCImport(handle, cc);
                 try self.setLocation(thread, op.result, .{ .closeable = handle });
@@ -3831,9 +3833,9 @@ fn ffiArgPtr(v: ir.Value) Error!usize {
     };
 }
 
-fn ffiLibOpen(allocator: Allocator, op: ir.Instruction.CImportOpen) !*CImportCloseable {
+fn ffiLibOpen(allocator: Allocator, op: ir.Instruction.CImportOpen, error_detail: *?[]const u8) !*CImportCloseable {
     var lib = ffi.CrossDynLib.DynLib.open(allocator, op.library_name) catch {
-        std.log.err("could not load C library '{s}'", .{op.library_name});
+        error_detail.* = std.fmt.allocPrint(allocator, "could not load C library '{s}'", .{op.library_name}) catch null;
         return Error.CImportLoadFailed;
     };
     errdefer lib.close();
@@ -3844,7 +3846,7 @@ fn ffiLibOpen(allocator: Allocator, op: ir.Instruction.CImportOpen) !*CImportClo
         const symbol_z = try allocator.dupeZ(u8, ext.symbol);
         defer allocator.free(symbol_z);
         const addr = try lib.lookup(symbol_z) orelse {
-            std.log.err("C library '{s}' has no symbol '{s}'", .{ op.library_name, ext.symbol });
+            error_detail.* = std.fmt.allocPrint(allocator, "C library '{s}' has no symbol '{s}'", .{ op.library_name, ext.symbol }) catch null;
             return Error.CImportSymbolNotFound;
         };
         dst.* = .{ .symbol = ext.symbol, .addr = addr, .params = ext.params, .ret = ext.ret };

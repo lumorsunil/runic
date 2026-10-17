@@ -63,8 +63,11 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   single `[error]:` diagnostic with the faulting line's `file:line:col` and the
   highlighted source line — the same shape as a compile error (e.g. consuming a
   `Stream` before anything was redirected into it: "cannot consume a stream
-  before it has been written to"). A missing command (`CommandNotFound`) is
-  rendered the same way, with its source line, instead of a bare one-line message.
+  before it has been written to"). A missing command, and a failed `cimport`
+  (library that won't load, or a missing symbol), are rendered the same way —
+  with their source line and a specific message — instead of a bare log line
+  followed by a generic fallback. This applies in `--debug-ir` mode too, which
+  previously let runtime errors escape as a raw `runic exited with error …` line.
 - **Compile and runtime errors now print to stderr, not stdout.** IR-compile and
   runtime diagnostics were written to stdout while the parser and type-checker
   stages already used stderr; they now all go to stderr, so an error never

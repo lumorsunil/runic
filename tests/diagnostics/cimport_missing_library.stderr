@@ -1,0 +1,9 @@
+[error]: tests/diagnostics/cimport_missing_library.rn:5:13: could not load C library 'libdefinitely_missing_runic.so'
+   3:// a clear message — not a bare log line plus a generic fallback.
+   4:const c = import "std/ffi.rn"
+   5:const lib = cimport "libdefinitely_missing_runic.so" {
+   6:    extern fn nope(x: c.Double) c.Double
+   7:}
+   8:echo "opened"
+   9:
+
