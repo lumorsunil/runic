@@ -68,6 +68,8 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   with their source line and a specific message — instead of a bare log line
   followed by a generic fallback. This applies in `--debug-ir` mode too, which
   previously let runtime errors escape as a raw `runic exited with error …` line.
+  A diagnostic with no source location (a rare internal fault) no longer prints a
+  doubled space before its message.
 - **Compile and runtime errors now print to stderr, not stdout.** IR-compile and
   runtime diagnostics were written to stdout while the parser and type-checker
   stages already used stderr; they now all go to stderr, so an error never

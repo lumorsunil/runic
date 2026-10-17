@@ -388,10 +388,14 @@ fn processResult(
                     break :brk null;
                 } else null;
                 try writer.print("[{s}]: ", .{d.severity()});
-                if (maybe_span) |span| logFileLineAndCol(io, writer, span) catch |err| {
-                    try writer.print("<error logging file path : {}>", .{err});
-                };
-                try writer.print(" {s}\n", .{d.message});
+                if (maybe_span) |span| {
+                    logFileLineAndCol(io, writer, span) catch |err| {
+                        try writer.print("<error logging file path : {}>", .{err});
+                    };
+                    // Space separates the `file:line:col:` locator from the message.
+                    try writer.writeByte(' ');
+                }
+                try writer.print("{s}\n", .{d.message});
                 try if (source) |src| if (maybe_span) |span| logSpan(writer, span, src) else writer.writeAll("<unable to get the source>\n\n");
                 try writer.flush();
             }

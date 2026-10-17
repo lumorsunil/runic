@@ -1849,7 +1849,6 @@ pub const Parser = struct {
                     try args.append(self.allocator, .{ .string = string_literal });
                     last_token = next_token;
                 },
-                // TODO: implement for fd_source_..._redirect
                 .greater, .append_redirect => {
                     const redirect = try self.parseCommandRedirection();
                     try redirects.append(self.allocator, redirect);
