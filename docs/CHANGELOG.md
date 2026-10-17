@@ -53,6 +53,11 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Fixed
 
+- **Compile and runtime errors now print to stderr, not stdout.** IR-compile and
+  runtime diagnostics were written to stdout while the parser and type-checker
+  stages already used stderr; they now all go to stderr, so an error never
+  pollutes a script's stdout (e.g. when its output is being piped). Program
+  output still flows to stdout unchanged.
 - **A top-level stdin read no longer hangs.** Reading the process's stdin
   (`&0 | first` / `&0 | until …`) now reaches end-of-input instead of blocking
   forever waiting for the stdin pipe to close.

@@ -215,7 +215,11 @@ pub fn runScript(
         );
     }
 
-    return try processResult(io, &document_store.document_store, stdout, result) orelse .fromByte(1);
+    // Diagnostics go to stderr, like the parser and type-checker stages above —
+    // an IR-compile or runtime error must not pollute the program's stdout (e.g.
+    // when the script's output is being piped). Program output flows through
+    // `stdout_stream` during execution, not through this writer.
+    return try processResult(io, &document_store.document_store, stderr, result) orelse .fromByte(1);
 }
 
 const StatementExpressionIterator = struct {
