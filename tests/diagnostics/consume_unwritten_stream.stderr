@@ -1,0 +1,6 @@
+[error]: tests/diagnostics/consume_unwritten_stream.rn:6:1: cannot consume a stream before it has been written to
+   4:// "Error evaluating …" / "runic exited with error …" pair.
+   5:var out: Stream(String) = .{ }
+   6:out | cat
+   7:
+

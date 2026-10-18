@@ -164,6 +164,11 @@ pub const TypeExpr = union(enum) {
     sum: SumType,
     err: ErrorType,
     array: ArrayType,
+    /// `Stream(E)` — a sequence of `E` values consumed lazily. The static type of
+    /// a readable file descriptor (`&0`). Type-checker-only: it is erased before
+    /// the IR (a stream is consumed inline via `first`/`take`/`until`/`for`/a
+    /// pipe, never materialized as a runtime value). The element is the child.
+    stream: PrefixType,
     struct_type: StructType,
     module: ModuleType,
     tuple: TupleType,
@@ -674,6 +679,7 @@ pub const TypeExpr = union(enum) {
             .function,
             .tuple,
             .array,
+            .stream,
             .optional,
             .promise,
             .error_union,
@@ -713,6 +719,11 @@ pub const TypeExpr = union(enum) {
             .promise => |promise| {
                 try writer.writeByte('^');
                 try promise.format(writer);
+            },
+            .stream => |stream| {
+                try writer.writeAll("Stream(");
+                try stream.format(writer);
+                try writer.writeByte(')');
             },
             .integer => {
                 try writer.writeAll("Int");
@@ -1340,6 +1351,9 @@ pub const BinaryOp = union(enum) {
     greater,
     fd_source_truncate_redirect: StreamRef,
     fd_source_append_redirect: StreamRef,
+    /// `&>` / `&>>` — redirect both stdout and stderr to a file.
+    amp_truncate_redirect,
+    amp_append_redirect,
     append_redirect,
     redirect_fd,
     greater_equal,
@@ -1413,7 +1427,7 @@ pub const BinaryOp = union(enum) {
             .append_redirect => .shift_or_append,
             .assign => .assign,
             .add_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign, .or_assign, .and_assign => .compound_assign,
-            .fd_source_truncate_redirect, .fd_source_append_redirect, .redirect_fd => .redirect,
+            .fd_source_truncate_redirect, .fd_source_append_redirect, .amp_truncate_redirect, .amp_append_redirect, .redirect_fd => .redirect,
             .pipe => .pipe,
             .member => .member,
             .array_access => .index,
@@ -1446,6 +1460,8 @@ pub const BinaryOp = union(enum) {
             .greater => 15,
             .fd_source_truncate_redirect => 15,
             .fd_source_append_redirect => 15,
+            .amp_truncate_redirect => 15,
+            .amp_append_redirect => 15,
             .append_redirect => 15,
             .redirect_fd => 15,
             .greater_equal => 15,
@@ -1490,6 +1506,8 @@ pub const BinaryOp = union(enum) {
             .shift_left => .shift_left,
             .fd_source_truncate_redirect => .{ .fd_source_truncate_redirect = streamFromToken(tok) },
             .fd_source_append_redirect => .{ .fd_source_append_redirect = streamFromToken(tok) },
+            .amp_truncate_redirect => .amp_truncate_redirect,
+            .amp_append_redirect => .amp_append_redirect,
             .greater => .greater,
             .append_redirect => .append_redirect,
             .redirect_fd => .redirect_fd,
@@ -1549,6 +1567,7 @@ pub const BinaryOp = union(enum) {
         return switch (self) {
             .fd_source_truncate_redirect => |s| s,
             .fd_source_append_redirect => |s| s,
+            .amp_truncate_redirect, .amp_append_redirect => .both,
             .greater => .stdout,
             .append_redirect => .stdout,
             else => @panic("shouldn't happen <|:)-|--<"),
@@ -1903,6 +1922,8 @@ pub const StreamRef = union(enum) {
     stdout,
     stderr,
     descriptor: u8,
+    /// Both stdout and stderr together (the `&>` redirect).
+    both,
 };
 
 pub const RedirectionMode = enum {

@@ -1,0 +1,23 @@
+// Redirecting a command's output to a `Stream(E)` variable captures it into an
+// in-memory pipe, consumable with the stream builtins — `|`, `first`, `lines`,
+// `for`. `2>` captures stderr; `&>` captures both. The command runs eagerly and
+// its output is buffered into the pipe.
+var out: Stream(String) = .{ }
+sh "-c" "printf 'one\ntwo\nthree\n'" > out
+const n = out | lines | first
+echo "first-line=${n}"
+
+var errs: Stream(String) = .{ }
+sh "-c" "printf 'err-text' 1>&2" 2> errs
+errs | cat
+echo ""
+
+var both: Stream(String) = .{ }
+sh "-c" "printf 'O'; printf 'E' 1>&2" &> both
+both | cat
+echo ""
+
+var lines_src: Stream(String) = .{ }
+sh "-c" "printf '10\n20\n'" > lines_src
+lines_src | lines | parseInt | { for (&0) |x| yield "${x}," }
+echo ""

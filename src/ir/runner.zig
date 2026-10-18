@@ -55,6 +55,13 @@ pub const IRRunner = struct {
     document_store: *DocumentStore,
     script: *ast.Script,
     config: IRConfig,
+    /// The source span of the instruction a generic runtime error faulted on, so
+    /// `runIR` can render it as a proper `[error]:` diagnostic. Null when the
+    /// faulting instruction carries no source location.
+    runtime_error_span: ?ast.Span = null,
+    /// Extra detail for the faulting runtime error (e.g. the missing command's
+    /// name for `CommandNotFound`), used to build the diagnostic message.
+    runtime_error_detail: ?[]const u8 = null,
 
     pub fn init(
         allocator: Allocator,
@@ -114,29 +121,15 @@ pub const IRRunner = struct {
             const current_thread = evaluator.context.getCurrentThreadPtr() orelse unreachable;
             const current_instr = current_thread.currentInstruction();
 
-            // Some errors are reported with a precise, user-facing message at
-            // the point they occur (e.g. InvalidInt/InvalidFloat name the
-            // offending input); don't also emit the generic "Error evaluating"
-            // line for those.
-            if (err == error.InvalidInt or err == error.InvalidFloat or err == error.CommandNotFound) return err;
-
+            // Capture the faulting instruction's source span (and any extra
+            // detail, e.g. the missing command name) so `runIR` can render a
+            // proper `[error]:` diagnostic (file:line:col + source line), the same
+            // shape as a compile error — instead of a raw "Error evaluating …" /
+            // "runic exited with error …" pair.
             if (current_instr) |ci| {
-                if (ci.source) |source| {
-                    const span = source.span();
-                    const file_name = span.start.file;
-                    const line = span.start.line;
-                    const column = span.start.column;
-                    std.log.err("Error evaluating {s}:{}:{}: {}", .{
-                        file_name,
-                        line,
-                        column,
-                        err,
-                    });
-                } else {
-                    const addr = current_thread.getCurrentInstructionAddr();
-                    std.log.err("Error evaluating instruction {f}: {}", .{ addr, err });
-                }
+                self.runtime_error_span = if (ci.source) |source| source.span() else null;
             }
+            self.runtime_error_detail = evaluator.error_detail;
 
             return err;
         }) |result| switch (result) {
@@ -226,7 +219,66 @@ pub fn runIR(
     if (config.dry_run) return .{ .success = .success };
 
     runner.log("\nRunning...\n", .{});
-    return .{ .success = try runner.run(&context) };
+    const exit_code = runner.run(&context) catch |err| {
+        // Every runtime error is rendered as a proper `[error]:` diagnostic,
+        // carrying the faulting instruction's source span (and any detail, e.g.
+        // the missing command name) captured by `run`.
+        return runtimeErrorResult(allocator, err, runner.runtime_error_span, runner.runtime_error_detail);
+    };
+    return .{ .success = exit_code };
+}
+
+/// Builds the single-diagnostic `RunResult` for a runtime error surfaced from a
+/// runner or the debugger, so both render identically through `processResult`.
+/// The diagnostic owns its own arena (the run arena is torn down on return).
+fn runtimeErrorResult(
+    allocator: Allocator,
+    err: anyerror,
+    span: ?ast.Span,
+    detail: ?[]const u8,
+) Allocator.Error!RunResult {
+    var diag_arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer diag_arena.deinit();
+    const da = diag_arena.allocator();
+    const diags = try da.alloc(ir.compiler.Diagnostic, 1);
+    diags[0] = .{
+        .err = ir.compiler.Error.RuntimeError,
+        ._span = span,
+        .message = try runtimeErrorMessage(da, err, detail),
+        ._severity = .@"error",
+    };
+    return RunResult.err_(diag_arena, diags);
+}
+
+/// The source span of the instruction an evaluator faulted on, or null when the
+/// current thread/instruction has no source location. Used to anchor a runtime
+/// error's diagnostic (the debugger path, which has no `IRRunner` to stash it).
+fn evaluatorFaultingSpan(evaluator: *ir.evaluator.IREvaluator) ?ast.Span {
+    const thread = evaluator.context.getCurrentThreadPtr() orelse return null;
+    const instr = thread.currentInstruction() orelse return null;
+    return if (instr.source) |source| source.span() else null;
+}
+
+/// A human-readable message for a runtime error surfaced as a diagnostic. Errors
+/// whose site stashed a fully-formed `detail` (the missing command, the C library
+/// that failed to load, …) use it verbatim; other user-facing errors get a fixed
+/// explanation; anything else falls back to the error name so an internal fault
+/// is still legible. `detail` is consulted only for the errors known to set it,
+/// so a stale value can never leak into an unrelated error's message.
+fn runtimeErrorMessage(allocator: Allocator, err: anyerror, detail: ?[]const u8) ![]const u8 {
+    return switch (err) {
+        error.CommandNotFound,
+        error.CImportLoadFailed,
+        error.CImportSymbolNotFound,
+        => if (detail) |d|
+            try allocator.dupe(u8, d)
+        else
+            try std.fmt.allocPrint(allocator, "runtime error: {t}", .{err}),
+        error.CImportUnsupportedType => try allocator.dupe(u8, "unsupported type in a C FFI signature"),
+        error.UnsupportedForward => try allocator.dupe(u8, "cannot consume a stream before it has been written to"),
+        error.OutOfMemory => try allocator.dupe(u8, "out of memory"),
+        else => try std.fmt.allocPrint(allocator, "runtime error: {t}", .{err}),
+    };
 }
 
 pub fn debugIR(
@@ -274,7 +326,18 @@ pub fn debugIR(
         document_store,
         &context,
     );
-    return .{ .success = try debugger.run() };
+    const exit_code = debugger.run() catch |err| {
+        // Render a runtime error through the same diagnostic path as the normal
+        // runner — read the faulting span and detail from the debugger's
+        // evaluator (there is no `IRRunner` here to stash them).
+        return runtimeErrorResult(
+            allocator,
+            err,
+            evaluatorFaultingSpan(&debugger.evaluator),
+            debugger.evaluator.error_detail,
+        );
+    };
+    return .{ .success = exit_code };
 }
 
 fn logInstruction(

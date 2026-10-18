@@ -287,6 +287,16 @@ pub const ReaderWriterStream = struct {
     sources: std.ArrayList(CloseableReader(ExitCode)) = .empty,
     destination: ?CloseableWriter(ExitCode) = null,
     has_been_connected: bool = false,
+    /// Whether a *source* (reader) was ever connected (`connectSource`). Set for
+    /// the top-level stdin pipe (fed by the real stdin reader) but not for
+    /// pipeline intermediate pipes (fed via their writer). Distinguishes the two
+    /// EOF signals in `isReadEof`.
+    had_source: bool = false,
+    /// Read cursor into `buffer_writer`'s accumulated bytes for incremental,
+    /// element-at-a-time `&0` reads (`first`/`take`/`until`). Bytes before this
+    /// offset have already been consumed by a prior read; a whole-stream read
+    /// (`collect_stdin`) also honours it so reads compose on one pipe.
+    read_offset: usize = 0,
     config: Config,
     label: []const u8,
     tracer: *Tracer,
@@ -307,6 +317,17 @@ pub const ReaderWriterStream = struct {
         /// in-process (via the context's typed_pipe_values) instead of serializing
         /// to bytes. `yield` to such a pipe stores the value; `&0` reads it back.
         typed: bool = false,
+        /// When a *destination* (a child process's stdin) closes, keep this
+        /// stream's sources (and buffered data) open instead of closing them.
+        /// Set on the top-level stdin pipe so that a command which exits without
+        /// reading stdin (e.g. `printf`) does not drain or close the script's
+        /// stdin — it stays open and is reused by the next command or `&0` read.
+        preserve_source_on_destination_close: bool = false,
+        /// The process's real top-level stdin. Its drainer only pulls from the
+        /// real fd while a `&0` read is waiting (see `stdin_demand`), so it never
+        /// competes with a command that inherits the fd. Never set on pipeline
+        /// intermediate pipes.
+        real_stdin: bool = false,
 
         pub fn format(
             self: @This(),
@@ -371,6 +392,7 @@ pub const ReaderWriterStream = struct {
         );
 
         self.has_been_connected = true;
+        self.had_source = true;
         // self.source = source;
         try self.sources.append(try self.stream.getAllocator(), source);
     }
@@ -571,8 +593,12 @@ pub const ReaderWriterStream = struct {
         if (self.destination) |destination| {
             if (destination.isClosed()) {
                 self.disconnectDestination();
-                self.closeSources();
-                self.disconnectSourcesAll();
+                // A command's stdin closing must not close the script's stdin:
+                // keep the source (and buffer) for the next command / `&0`.
+                if (!self.config.preserve_source_on_destination_close) {
+                    self.closeSources();
+                    self.disconnectSourcesAll();
+                }
                 if (self.config.keep_open) {
                     self.tracer.trace(.information, &.{ "stream", @src().fn_name, "not_done" }, null, "stream destination closed, keeping open", .{});
                     return .not_done;
@@ -802,6 +828,37 @@ pub const ReaderWriterStream = struct {
             if (!destination.isClosed()) return false;
         }
         return true;
+    }
+
+    /// Buffered bytes not yet consumed by the read cursor (`read_offset`).
+    pub fn bufferedUnread(self: *ReaderWriterStream) []const u8 {
+        const all = self.buffer_writer.written();
+        if (self.read_offset >= all.len) return all[all.len..];
+        return all[self.read_offset..];
+    }
+
+    /// Advance the read cursor by `n` consumed bytes.
+    pub fn consumeBuffered(self: *ReaderWriterStream, n: usize) void {
+        self.read_offset += n;
+    }
+
+    /// Whether a byte reader has reached EOF: the producer is done — either
+    /// `keep_open` was cleared (pipeline intermediate pipes, flipped via
+    /// `pipeOpt` once the upstream stage finishes) or every source drained and
+    /// disconnected after having been connected (the top-level stdin pipe after
+    /// real EOF, whose `keep_open` stays set). Independent of buffered data, so
+    /// callers check `bufferedUnread()` first and treat EOF as "no more will
+    /// ever arrive".
+    pub fn isReadEof(self: *ReaderWriterStream) bool {
+        if (!self.config.keep_open) return true;
+        // Only the top-level stdin pipe (the one with
+        // `propagate_eof_on_source_close`) reaches EOF by draining its single
+        // real-stdin source while `keep_open` stays set. Pipeline intermediate
+        // pipes manage `keep_open` explicitly and can transiently have zero
+        // sources between sequential producers (e.g. `{ for … echo … } | lines`),
+        // so they must fall back to the `keep_open` signal above — never this.
+        return self.config.propagate_eof_on_source_close and
+            self.had_source and self.sources.items.len == 0;
     }
 
     pub fn format(

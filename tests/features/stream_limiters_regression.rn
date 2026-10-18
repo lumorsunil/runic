@@ -1,0 +1,15 @@
+// Stream-limiter builtins read a bounded prefix of any stream and stop: `first`
+// one element as a scalar, `take n` up to n elements, `until d` up to (but
+// excluding) a delimiter. Over a byte stream they yield a `String`; over a typed
+// stream (`parseInt`), the element (`first`) or an array of it (`take`). All are
+// ordinary pipeline stages, so they compose after `lines`, `parseInt`, etc.
+const a = echo "abcdef" | take 3
+echo "take=${a}"
+const b = echo "p\nq\nr" | lines | first
+echo "first=${b}"
+const c = echo "one two three" | until " "
+echo "until=[${c}]"
+const n = echo "6" | parseInt | first
+echo "n=${n}"
+const xs = (echo "1\n2\n3\n4" | lines | parseInt | take 2) catch .{ }
+echo "takelen=${xs.len} x0=${xs[0]} x1=${xs[1]}"

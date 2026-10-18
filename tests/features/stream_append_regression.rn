@@ -1,0 +1,41 @@
+// The append redirect forms (`>>`, `2>>`, `&>>`) to a `Stream(E)` variable
+// accumulate across commands rather than replacing: each command's output is
+// buffered after whatever the stream already holds. Appending to a stream that
+// has not been written yet degenerates to a plain (truncate) redirect, and the
+// truncate forms still replace.
+
+// `>>` accumulates stdout across three commands.
+var acc: Stream(String) = .{ }
+sh "-c" "printf 'a\n'" > acc
+sh "-c" "printf 'b\n'" >> acc
+sh "-c" "printf 'c\n'" >> acc
+acc | lines | { for (&0) |x| yield "${x}," }
+echo ""
+
+// `2>>` accumulates stderr.
+var errs: Stream(String) = .{ }
+sh "-c" "printf 'e1\n' 1>&2" 2> errs
+sh "-c" "printf 'e2\n' 1>&2" 2>> errs
+errs | lines | { for (&0) |x| yield "${x}," }
+echo ""
+
+// `&>>` accumulates both streams (one stream per command to keep ordering
+// deterministic).
+var both: Stream(String) = .{ }
+sh "-c" "printf 'o\n'" &> both
+sh "-c" "printf 'x\n' 1>&2" &>> both
+both | lines | { for (&0) |x| yield "${x}," }
+echo ""
+
+// `>>` on a never-written stream behaves like `>` (no prepend, no error).
+var fresh: Stream(String) = .{ }
+sh "-c" "printf 'only\n'" >> fresh
+fresh | lines | first
+echo ""
+
+// Truncate still replaces a stream's previous contents.
+var repl: Stream(String) = .{ }
+sh "-c" "printf 'first\n'" > repl
+sh "-c" "printf 'second\n'" > repl
+repl | lines | first
+echo ""

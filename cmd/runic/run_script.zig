@@ -124,6 +124,11 @@ pub fn runScript(
         .disconnect_destination = true,
         .keep_open = true,
         .propagate_eof_on_source_close = true,
+        // A command that exits without reading stdin (e.g. `printf "prompt: "`)
+        // must not drain or close the script's stdin — keep it open so a
+        // following `&0` read (or the next command) still sees the input.
+        .preserve_source_on_destination_close = true,
+        .real_stdin = true,
     }, tracer);
     defer stdin_stream.stream.deinit();
     const stdout_stream = try Stream(u8).initReaderWriter(allocator, "<<<stdout_pipe>>>", .{
@@ -210,7 +215,11 @@ pub fn runScript(
         );
     }
 
-    return try processResult(io, &document_store.document_store, stdout, result) orelse .fromByte(1);
+    // Diagnostics go to stderr, like the parser and type-checker stages above —
+    // an IR-compile or runtime error must not pollute the program's stdout (e.g.
+    // when the script's output is being piped). Program output flows through
+    // `stdout_stream` during execution, not through this writer.
+    return try processResult(io, &document_store.document_store, stderr, result) orelse .fromByte(1);
 }
 
 const StatementExpressionIterator = struct {
@@ -379,10 +388,14 @@ fn processResult(
                     break :brk null;
                 } else null;
                 try writer.print("[{s}]: ", .{d.severity()});
-                if (maybe_span) |span| logFileLineAndCol(io, writer, span) catch |err| {
-                    try writer.print("<error logging file path : {}>", .{err});
-                };
-                try writer.print(" {s}\n", .{d.message});
+                if (maybe_span) |span| {
+                    logFileLineAndCol(io, writer, span) catch |err| {
+                        try writer.print("<error logging file path : {}>", .{err});
+                    };
+                    // Space separates the `file:line:col:` locator from the message.
+                    try writer.writeByte(' ');
+                }
+                try writer.print("{s}\n", .{d.message});
                 try if (source) |src| if (maybe_span) |span| logSpan(writer, span, src) else writer.writeAll("<unable to get the source>\n\n");
                 try writer.flush();
             }

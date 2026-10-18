@@ -622,6 +622,13 @@ pub const Lexer = struct {
             }
             return self.finish(.startAt(start), .amp_amp);
         }
+        // `&>` / `&>>` — redirect both stdout and stderr to a file.
+        if (self.match('>')) {
+            if (self.match('>')) {
+                return self.finish(.startAt(start), .amp_append_redirect);
+            }
+            return self.finish(.startAt(start), .amp_truncate_redirect);
+        }
         // `&0`/`&1`/`&2` — a file-descriptor reference (stdin/stdout/stderr).
         // (`>&` for redirects is handled by lexGreater, so the `&` here is never
         // part of a redirect.)

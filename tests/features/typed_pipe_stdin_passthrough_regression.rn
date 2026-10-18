@@ -1,9 +1,10 @@
-// An explicit passthrough stage `{ yield &0 }` re-emits its input unchanged,
+// An explicit passthrough stage `{ yield &0 | first }` re-emits its input unchanged,
 // preserving its type. Here the Int from parseInt flows through the passthrough
 // into doubler.
 
 fn Int doubler() Int {
-    yield &0 * 2
+    const n = &0 | first
+    yield n * 2
 }
 
-echo "5" | parseInt | { yield &0 } | doubler
+echo "5" | parseInt | { yield &0 | first } | doubler

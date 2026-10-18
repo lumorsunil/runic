@@ -1,0 +1,8 @@
+// A `cimport` of a library that cannot be loaded is a runtime error. It should
+// render as a single `[error]:` diagnostic (source span + highlighted line) with
+// a clear message — not a bare log line plus a generic fallback.
+const c = import "std/ffi.rn"
+const lib = cimport "libdefinitely_missing_runic.so" {
+    extern fn nope(x: c.Double) c.Double
+}
+echo "opened"

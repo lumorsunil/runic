@@ -1251,7 +1251,7 @@ pub const Parser = struct {
                             state = .expr;
                             continue;
                         },
-                        .equal_equal, .bang_equal, .fd_source_truncate_redirect, .fd_source_append_redirect, .greater, .append_redirect, .redirect_fd, .greater_equal, .less, .less_equal, .shift_left, .plus, .minus, .star, .star_star, .slash, .percent, .kw_and, .kw_or, .kw_orelse, .pipe_pipe, .amp_amp, .pipe, .dot, .assign, .plus_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign, .or_assign, .and_assign => {
+                        .equal_equal, .bang_equal, .fd_source_truncate_redirect, .fd_source_append_redirect, .amp_truncate_redirect, .amp_append_redirect, .greater, .append_redirect, .redirect_fd, .greater_equal, .less, .less_equal, .shift_left, .plus, .minus, .star, .star_star, .slash, .percent, .kw_and, .kw_or, .kw_orelse, .pipe_pipe, .amp_amp, .pipe, .dot, .assign, .plus_assign, .minus_assign, .mul_assign, .div_assign, .rem_assign, .or_assign, .and_assign => {
                             const breadcrumbInner = try self.createBreadcrumb("PBE:op");
                             defer breadcrumbInner.end();
                             try components.append(self.allocator, .{
@@ -1428,10 +1428,10 @@ pub const Parser = struct {
             // whether the left operand is a command, whether each is a redirect
             // or an arithmetic operator. The fd-prefixed redirect operators
             // below (`1>`, `2>>`, …) are never arithmetic, so they always fold.
-            .fd_source_truncate_redirect, .fd_source_append_redirect => redirect: {
+            .fd_source_truncate_redirect, .fd_source_append_redirect, .amp_truncate_redirect, .amp_append_redirect => redirect: {
                 const mode: ast.RedirectionMode = switch (binary.binary.op) {
-                    .fd_source_truncate_redirect => .truncate,
-                    .fd_source_append_redirect => .append,
+                    .fd_source_truncate_redirect, .amp_truncate_redirect => .truncate,
+                    .fd_source_append_redirect, .amp_append_redirect => .append,
                     else => unreachable,
                 };
                 const path = try coerceRedirectionTargetExpression(right);
@@ -1849,7 +1849,6 @@ pub const Parser = struct {
                     try args.append(self.allocator, .{ .string = string_literal });
                     last_token = next_token;
                 },
-                // TODO: implement for fd_source_..._redirect
                 .greater, .append_redirect => {
                     const redirect = try self.parseCommandRedirection();
                     try redirects.append(self.allocator, redirect);

@@ -159,6 +159,9 @@ pub const Error =
         LabelAddrNotSet,
         StructTypeNotFound,
         NotImplemented,
+        /// Tags a diagnostic synthesized from a runtime (evaluator) error so it
+        /// renders through the normal diagnostic path; not raised by the compiler.
+        RuntimeError,
     };
 
 pub const GetFrameError = error{
@@ -621,6 +624,11 @@ pub const IRCompiler = struct {
     /// Stack of enclosing functions' declared stdin types, so `&0` can be
     /// typed correctly for coercions. Top is the innermost function.
     stdin_type_stack: std.ArrayList(?ast.TypeExpr) = .empty,
+    /// Parallel to `stdin_type_stack`: whether the current stage's stdin pipe
+    /// carries *typed* values (a queue) rather than raw bytes. A stream limiter
+    /// (`take`/`until`) reads a typed pipe value-by-value (→ `[]E`) and a byte
+    /// pipe cursor-by-cursor (→ `String`); this picks which.
+    stdin_is_typed_stack: std.ArrayList(bool) = .empty,
 
     /// Stack of enclosing functions' declared return types; top is the innermost.
     /// Used to supply a `yield`'s result-location type to an implicit `.name`.
@@ -3774,6 +3782,18 @@ pub const IRCompiler = struct {
         return try .from(ir.Location.initRegister(.r).typed(return_type));
     }
 
+    /// Whether `expr` is a `&0 | <limiter>` pipeline (the single-value /
+    /// bounded-read peephole), which compiles to a direct value rather than a
+    /// captured command pipeline.
+    fn isFdLimiterPipeline(self: *IRCompiler, expr: *ast.Expression) bool {
+        if (expr.* != .pipeline) return false;
+        const stages = expr.pipeline.stages;
+        if (stages.len != 2) return false;
+        if (!(stages[0].* == .fd and stages[0].fd.fd == 0)) return false;
+        const b = self.builtinStage(stages[1]) orelse return false;
+        return b.kind == .limiter;
+    }
+
     fn compileExpressionWithCapture(
         self: *IRCompiler,
         source: anytype,
@@ -3787,6 +3807,13 @@ pub const IRCompiler = struct {
         // clobber (a struct return is bound, never a command). Compile it
         // directly, bypassing capture.
         if (self.exprIsCImportStructCall(expr)) return try self.compileExpression(expr);
+
+        // `&0 | first`/`take`/`until` is a single-value read (the peephole in
+        // `compilePipeline`), not a captured command pipeline — compile it
+        // directly so it leaves its value in %r (and forwards an upstream error
+        // like a bare `&0`), instead of the stdio-capture path expecting it to
+        // write to a capture pipe.
+        if (self.isFdLimiterPipeline(expr)) return try self.compileExpression(expr);
 
         const background_capture = isBackgroundExecutionExpression(expr);
         const expr_effects = self.analyzeExpressionEffects(expr);
@@ -5388,6 +5415,185 @@ pub const IRCompiler = struct {
         try self.setLabel(after_label.local_addr.label, .abs);
     }
 
+    /// Whether a limiter stage over an element of this (inferred stdin) type
+    /// reads a raw byte stream — an unknown upstream (raw stdin), `Byte`, or
+    /// `String` (`[]Byte`). A byte-mode limiter yields a `String`; otherwise the
+    /// stream carries typed values and a limiter yields `?E` / `[]E`.
+    fn limiterByteMode(elem_opt: ?ast.TypeExpr) bool {
+        const elem = elem_opt orelse return true;
+        const u = switch (elem) {
+            .alias => |a| a.type_expr.*,
+            else => elem,
+        };
+        return switch (u) {
+            .byte => true,
+            .array => |arr| arr.element.* == .byte,
+            else => false,
+        };
+    }
+
+    /// Lowers a stream-limiter builtin stage (`first` / `take n` / `until d`).
+    /// Each reads a bounded prefix of the stage's stdin stream and writes the
+    /// result to stdout (the stage value). `first` reads one element as a scalar
+    /// (`read_stream_element`); `take`/`until` over a byte stream scan the read
+    /// cursor in one dedicated instruction, and over a typed stream loop
+    /// `read_stream_element` accumulating an array (mirroring
+    /// `compileParseMapStage`). The element type is inferred from the upstream
+    /// stage (`stdin_type_stack`).
+    fn compileLimiterStage(
+        self: *IRCompiler,
+        source: anytype,
+        which: builtins.Builtin.Limiter,
+        arg: ?*ast.Expression,
+        as_value: bool,
+    ) Error!Result {
+        try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        const elem_opt: ?ast.TypeExpr = if (self.stdin_type_stack.items.len > 0)
+            self.stdin_type_stack.items[self.stdin_type_stack.items.len - 1]
+        else
+            null;
+        // A typed stdin pipe carries values (→ `[]E` / `?E`); a byte pipe carries
+        // raw bytes (→ `String`). The transport flag disambiguates a typed stream
+        // of `String` values (`lines`) from a raw byte stream.
+        const byte_mode = if (self.stdin_is_typed_stack.items.len > 0)
+            !self.stdin_is_typed_stack.items[self.stdin_is_typed_stack.items.len - 1]
+        else
+            limiterByteMode(elem_opt);
+        const elem = if (byte_mode) ast.TypeExpr.global(.byte) else (elem_opt orelse ast.TypeExpr.global(.byte));
+
+        switch (which) {
+            .first => {
+                // The first value of the stream, coerced to its element type — a
+                // drop-in for the old single-value `&0` read, and runtime-adaptive
+                // the same way: `collect_stdin` yields the whole byte buffer for a
+                // byte pipe or dequeues one value for a typed pipe, then the
+                // type-directed parse (Int) coerces it. `.null` at EOF flows
+                // through like the old `&0`.
+                try self.addInstruction(.init(.from(source), .collect_stdin));
+                if (elem_opt) |dt| {
+                    if (typeExprIsNamed(dt, "Int")) {
+                        try self.addInstruction(.init(.from(source), .parse_int));
+                        return self.emitLimiterResult(source, .initRegister(.r), ast.TypeExpr.global(.integer), as_value);
+                    }
+                }
+                return self.emitLimiterResult(source, .initRegister(.r), elem_opt orelse string_type, as_value);
+            },
+            .take => {
+                const count = try self.compileExpression(arg orelse return self.reportLimiterArgMissing(source, "take"));
+                const count_ref = try self.newRef(source, "take_count");
+                try self.set(source, count_ref, stableResultSource(count));
+                if (byte_mode) {
+                    try self.addInstruction(.init(.from(source), .{ .stream_take_bytes = .from(count_ref.dereference()) }));
+                    return self.emitLimiterResult(source, .initRegister(.r), string_type, as_value);
+                }
+                return self.compileTypedLimiterLoop(source, elem, count_ref, null, as_value);
+            },
+            .until => {
+                const delim = try self.compileExpression(arg orelse return self.reportLimiterArgMissing(source, "until"));
+                const delim_ref = try self.newRef(source, "until_delim");
+                try self.set(source, delim_ref, stableResultSource(delim));
+                if (byte_mode) {
+                    try self.addInstruction(.init(.from(source), .{ .stream_until_bytes = .from(delim_ref.dereference()) }));
+                    return self.emitLimiterResult(source, .initRegister(.r), string_type, as_value);
+                }
+                return self.compileTypedLimiterLoop(source, elem, null, delim_ref, as_value);
+            },
+        }
+    }
+
+    /// Emits a limiter's result: as a pipeline *stage* it writes the value to
+    /// stdout (the stage value, captured downstream); as a direct *value* (the
+    /// `&0 | limiter` peephole) it leaves it in place and returns it typed.
+    fn emitLimiterResult(self: *IRCompiler, source: anytype, loc: ir.Location, result_type: ast.TypeExpr, as_value: bool) Error!Result {
+        if (as_value) return .fromLocation(loc.typed(result_type));
+        try self.pipeWrite(source, self.threadStdout(), .fromLocation(loc.typed(result_type)));
+        return .fromValue(.void);
+    }
+
+    /// A limiter's per-value stdout type, derived from the upstream element type
+    /// (`stdin_type_stack`'s top): `first` → `?E`, `take`/`until` → `[]E`
+    /// (`String` for a byte element). Used when a limiter is a mid-pipeline stage
+    /// or the final capture.
+    fn limiterStdoutType(self: *IRCompiler, which: builtins.Builtin.Limiter) ast.TypeExpr {
+        const up: ?ast.TypeExpr = if (self.stdin_type_stack.items.len > 0)
+            self.stdin_type_stack.items[self.stdin_type_stack.items.len - 1]
+        else
+            null;
+        // Unwrap an error-union / optional to the plain element type.
+        const elem_opt: ?ast.TypeExpr = if (up) |e| switch (e) {
+            .error_union => |eu| eu.payload.*,
+            .optional => |o| o.child.*,
+            else => e,
+        } else null;
+        const byte = limiterByteMode(elem_opt);
+        const elem = if (byte) string_type else (elem_opt orelse string_type);
+        const ep = self.allocator.create(ast.TypeExpr) catch return string_type;
+        ep.* = elem;
+        return switch (which) {
+            .first => if (byte) string_type else elem,
+            .take, .until => if (byte) string_type else array_type(ep),
+        };
+    }
+
+    fn reportLimiterArgMissing(self: *IRCompiler, source: anytype, comptime name: []const u8) Error!Result {
+        try self.reportSourceError(source, Error.UnsupportedExpression, .@"error", name ++ " needs an argument (`" ++ name ++ " …`)", .{});
+        return .fromValue(.void);
+    }
+
+    /// Typed-stream `take`/`until`: loop `read_stream_element`, accumulating each
+    /// value into an array until the bound is met or EOF. Exactly one of
+    /// `count_ref` (take) / `delim_ref` (until) is non-null.
+    fn compileTypedLimiterLoop(
+        self: *IRCompiler,
+        source: anytype,
+        elem: ast.TypeExpr,
+        count_ref: ?ir.Location,
+        delim_ref: ?ir.Location,
+        as_value: bool,
+    ) Error!Result {
+        const value_ref = try self.newRef(source, "limiter_value");
+        const cond_ref = try self.newRef(source, "limiter_cond");
+        const acc_ref = try self.newRef(source, "limiter_acc");
+        try self.set(source, acc_ref, .fromValue(.void));
+        const i_ref: ?ir.Location = if (count_ref != null) try self.newRef(source, "limiter_i") else null;
+        if (i_ref) |ir_| try self.set(source, ir_, .fromValue(.{ .integer = 0 }));
+
+        const after_label = try self.newLabel("limiter_after", .unknown);
+        const loop_label = try self.newLabel("limiter_loop", .abs);
+
+        // take: stop once `i >= count` (so `take 0` reads nothing).
+        if (count_ref) |cr| {
+            try self.cmp(source, .greater_equal, .from(i_ref.?.dereference()), .from(cr.dereference()), cond_ref);
+            try self.jmp(source, try .from(cond_ref.dereference()), true, after_label);
+        }
+
+        try self.addInstruction(.init(.from(source), .read_stream_element));
+        try self.set(source, value_ref, .fromLocation(.initRegister(.r)));
+        try self.cmp(source, .equal, .from(value_ref.dereference()), .fromValue(.null), cond_ref);
+        try self.jmp(source, try .from(cond_ref.dereference()), true, after_label);
+
+        // until: stop (exclusive) at the first element equal to the delimiter.
+        if (delim_ref) |dr| {
+            try self.cmp(source, .equal, .from(value_ref.dereference()), .from(dr.dereference()), cond_ref);
+            try self.jmp(source, try .from(cond_ref.dereference()), true, after_label);
+        }
+
+        try self.addInstruction(.init(.from(source), .{ .array_push_inplace = .{
+            .array = .from(acc_ref.dereference()),
+            .value = .from(value_ref.dereference()),
+            .result = acc_ref.dereference(),
+        } }));
+        if (i_ref) |ir_| try self.ath(source, .add, .from(ir_.dereference()), .fromValue(.{ .integer = 1 }), ir_);
+
+        try self.jmp(source, null, true, loop_label);
+        try self.setLabel(after_label.local_addr.label, .abs);
+
+        const ep = try self.allocator.create(ast.TypeExpr);
+        ep.* = elem;
+        return self.emitLimiterResult(source, acc_ref.dereference(), array_type(ep), as_value);
+    }
+
     fn compileIdentifier(
         self: *IRCompiler,
         source: anytype,
@@ -5420,6 +5626,7 @@ pub const IRCompiler = struct {
                         try self.addInstruction(.init(.from(source), .collect_stdin));
                         try self.addInstruction(.init(.from(source), .{ .emit_lines = self.threadStdout() }));
                     },
+                    .limiter => return self.compileLimiterStage(source, builtin.limiter.?, null, false),
                 }
                 return .fromValue(.void);
             }
@@ -5543,6 +5750,14 @@ pub const IRCompiler = struct {
 
         if (call.callee.* == .identifier) {
             const name = call.callee.identifier.name;
+            // A stream-limiter builtin with an argument (`take n`, `until d`).
+            // `first` has none and is handled in `compileIdentifier`.
+            if (self.builtinStage(source)) |b| {
+                if (b.kind == .limiter) {
+                    const arg: ?*ast.Expression = if (call.arguments.len > 0) call.arguments[0] else null;
+                    return self.compileLimiterStage(source, b.limiter.?, arg, false);
+                }
+            }
             // A type application *with arguments* in value position
             // (`${Box(Int)}`) serializes to its type-application string. A bare
             // type name (zero args) is left to `compileIdentifier`, which
@@ -6280,6 +6495,9 @@ pub const IRCompiler = struct {
                 .stdin => 0,
                 .stdout => 1,
                 .stderr => 2,
+                // `&>` routes both streams through one pipe (stdout's slot); the
+                // command's stderr is pointed at it too below.
+                .both => 1,
                 .descriptor => |fd| fd,
             };
             if (stream_fd_ == 1) has_stdout_file_redirect = true;
@@ -6296,17 +6514,88 @@ pub const IRCompiler = struct {
 
         var exec_stdout = self.threadStdout();
         var exec_stderr = self.threadStderr();
+        // The stderr file-redirect pipe (a stable stack ref), used after the
+        // command to fork its concurrent drain thread (see below).
+        var stderr_redirect_pipe: ?ir.Location = null;
+        // Stream-variable redirect targets (`cmd > out` where `out: Stream(E)`):
+        // after the command's output is drained into the redirect pipe's buffer,
+        // the pipe handle is bound to this lvalue so later `out | …` consumes it.
+        var stdout_stream_bind: ?ir.Location = null;
+        var stderr_stream_bind: ?ir.Location = null;
 
         for (redirects) |redirect| {
             switch (redirect.target) {
                 .path => |path_target| {
+                    const is_both = redirect.stream == .both;
                     const stream_fd: u8 = switch (redirect.stream) {
                         .stdin => 0,
                         .stdout => 1,
                         .stderr => 2,
+                        .both => 1,
                         .descriptor => |fd| fd,
                     };
                     if (stream_fd != 1 and stream_fd != 2) continue;
+
+                    if (self.redirectTargetImmutableStreamName(path_target.value)) |name| {
+                        try self.reportSourceError(path_target.value, Error.UnsupportedExpression, .@"error", "cannot redirect to immutable '{s}'; declare the stream with var", .{name});
+                        continue;
+                    }
+                    // `cmd > out` where `out: Stream(E)` — redirect into an
+                    // in-memory pipe bound to `out` (no file). Build the same
+                    // keep-open redirect pipe + concurrent drain, but with no
+                    // FileSink: the command's output accumulates in the pipe's
+                    // buffer, and the handle is bound to `out` after the drain so
+                    // a later `out | …` / `for (out)` consumes it.
+                    if (self.redirectTargetStreamBinding(path_target.value)) |_| {
+                        const out_loc = try self.compileExpression(path_target.value);
+                        const stream_pipe_ref = try self.newRef(source, "stream_redirect_pipe");
+                        try self.pipe(source, stream_pipe_ref);
+                        try self.pipeOpt(source, stream_pipe_ref.dereference(), .keep_open, .fromValue(.fromBoolean(true)));
+
+                        // Append (`>> out` / `2>> out` / `&>> out`): if `out`
+                        // already holds a pipe from an earlier redirect, drain its
+                        // (buffered, EOF) content into this fresh pipe *before* the
+                        // command connects, so the command's output accumulates
+                        // after it. A fresh/unwritten `out` still holds its zero
+                        // value (an empty struct), so the runtime `is pipe` test
+                        // skips the prepend and append degenerates to truncate.
+                        if (redirect.mode == .append) {
+                            const out_pipe = out_loc.source.location;
+                            const is_pipe_ref = try self.newRef(source, "append_target_is_pipe");
+                            try self.addInstruction(.init(.from(source), .{ .is_type = .{
+                                .operand = out_pipe,
+                                .tag = .pipe,
+                                .result = is_pipe_ref,
+                            } }));
+                            const skip_prepend = try self.newLabel("append_skip_prepend", .unknown);
+                            const is_pipe_cond: Result = try .from(is_pipe_ref.dereference().typed(.{ .boolean = .{ .span = source.span() } }));
+                            try self.jmp(source, is_pipe_cond, false, skip_prepend);
+                            // Forward the old pipe into the fresh one and fork a
+                            // drainer to flush its buffer (mirrors how a `Stream`
+                            // binding is consumed as a pipeline source). `wait`
+                            // makes it complete before the command writes; the
+                            // fresh pipe's `keep_open` keeps it open for that write.
+                            try self.pipeFwd(source, out_pipe, stream_pipe_ref.dereference());
+                            const prepend_drain = try self.fork(source, self.stdoutStreamSet(), self.threadStdin(), out_pipe, self.threadStderr(), .noll, .inherit);
+                            try self.wait(source, prepend_drain);
+                            try self.setLabel(skip_prepend.local_addr.label, .abs);
+                        }
+
+                        if (stream_fd == 1) {
+                            try self.set(source, .initRegister(.r2), .from(execution_handles.dereference()));
+                            try self.set(source, .initAdd(.{ .register = .r2 }, redirected_stdout_slot, .{ .dereference = true }), .from(stream_pipe_ref.dereference()));
+                            exec_stdout = stream_pipe_ref.dereference();
+                            if (is_both) exec_stderr = stream_pipe_ref.dereference();
+                            has_stdout_file_redirect = true;
+                            stdout_stream_bind = out_loc.source.location;
+                        } else {
+                            exec_stderr = stream_pipe_ref.dereference();
+                            stderr_redirect_pipe = stream_pipe_ref.dereference();
+                            stderr_stream_bind = out_loc.source.location;
+                        }
+                        continue;
+                    }
+
                     const redirect_target = try self.compileExpression(path_target.value);
                     const redirect_pipe_ref = try self.newRef(source, if (stream_fd == 1) "stdout_redirect_pipe" else "stderr_redirect_pipe");
                     try self.pipe(source, redirect_pipe_ref);
@@ -6334,8 +6623,12 @@ pub const IRCompiler = struct {
                             .from(redirect_pipe_ref.dereference()),
                         );
                         exec_stdout = redirect_pipe_ref.dereference();
+                        // `&>`: the command's stderr shares the one redirect pipe,
+                        // so both streams land in the single file via one drain.
+                        if (is_both) exec_stderr = redirect_pipe_ref.dereference();
                     } else {
                         exec_stderr = redirect_pipe_ref.dereference();
+                        stderr_redirect_pipe = redirect_pipe_ref.dereference();
                     }
                 },
                 .fd => |target_fd| {
@@ -6349,6 +6642,9 @@ pub const IRCompiler = struct {
                         .stdin => 0,
                         .stdout => 1,
                         .stderr => 2,
+                        // `&>` only ever targets a path, never an fd, so it does
+                        // not reach this fd-dup branch.
+                        .both => 1,
                         .descriptor => |fd| fd,
                     };
                     switch (source_fd) {
@@ -6450,9 +6746,15 @@ pub const IRCompiler = struct {
 
         // The command has finished (and connected its stdout). Clear the redirect
         // pipe's keep_open flag set at creation, so its drain closes the file once
-        // the (now-EOF) source drains, instead of spinning forever.
+        // the (now-EOF) source drains, instead of spinning forever. This runs in
+        // the closure body (after the command's wait), so `threadStdout`/
+        // `threadStderr` here are the closure's own stdio slots — the redirect
+        // pipes — and the flag is cleared only once all output has been written.
         if (has_stdout_file_redirect) {
             try self.pipeOpt(source, self.threadStdout(), .keep_open, .fromValue(.fromBoolean(false)));
+        }
+        if (has_stderr_file_redirect) {
+            try self.pipeOpt(source, self.threadStderr(), .keep_open, .fromValue(.fromBoolean(false)));
         }
 
         try self.setClosureIdentifiers();
@@ -6460,22 +6762,49 @@ pub const IRCompiler = struct {
         try self.compileClosureInitialization(source, spawned.closure);
         self.scopes.pop();
 
-        if (has_stdout_file_redirect) {
-            try self.set(source, .initRegister(.r2), .from(execution_handles.dereference()));
-            const redirect_stream_thread = try self.fork(
-                source,
-                self.stdoutStreamSet(),
-                self.threadStdin(),
-                .initAdd(
-                    .{ .register = .r2 },
-                    redirected_stdout_slot,
-                    .{ .dereference = true },
-                ),
-                self.threadStderr(),
-                .noll,
-                .inherit,
-            );
-            try self.wait(source, redirect_stream_thread);
+        // Concurrently drain a file-redirected stderr (mirrors the stdout drain
+        // below): a drain thread forwards the command's stderr into the file
+        // while the command runs, so it never blocks on a full pipe, and the
+        // command completes instead of hanging as an unreaped zombie. Placed
+        // before the stdout branch (which may return early) so it runs on every
+        // path.
+        // Drain each file-redirected stream into its file concurrently while the
+        // command runs — so it never blocks on a full pipe and completes instead
+        // of hanging as an unreaped zombie. Both drains are forked *first* (each
+        // thread handle captured into a stable ref, since a fork returns in %r
+        // which the next fork overwrites), then waited on, so a command writing
+        // to both stdout and stderr doesn't deadlock on the undrained one.
+        // Returns `execution_handles` (its `.thread` was set right after the
+        // spawn) via an explicit push/pop rather than the position-based tail
+        // pops below — an interpolated redirect target leaves an extra stack ref
+        // the tail doesn't account for.
+        if (stderr_redirect_pipe != null or has_stdout_file_redirect) {
+            var stderr_drain_ref: ?ir.Location = null;
+            if (stderr_redirect_pipe) |stderr_pipe| {
+                const t = try self.fork(source, self.stdoutStreamSet(), self.threadStdin(), stderr_pipe, self.threadStderr(), .noll, .inherit);
+                const r = try self.newRef(source, "stderr_drain");
+                try self.set(source, r, .from(t));
+                stderr_drain_ref = r.dereference();
+            }
+            var stdout_drain_ref: ?ir.Location = null;
+            if (has_stdout_file_redirect) {
+                try self.set(source, .initRegister(.r2), .from(execution_handles.dereference()));
+                const t = try self.fork(source, self.stdoutStreamSet(), self.threadStdin(), .initAdd(.{ .register = .r2 }, redirected_stdout_slot, .{ .dereference = true }), self.threadStderr(), .noll, .inherit);
+                const r = try self.newRef(source, "stdout_drain");
+                try self.set(source, r, .from(t));
+                stdout_drain_ref = r.dereference();
+            }
+            if (stderr_drain_ref) |d| try self.wait(source, d);
+            if (stdout_drain_ref) |d| try self.wait(source, d);
+            // Bind a stream-variable redirect target (`cmd > out`) to the now-
+            // fully-buffered redirect pipe handle, so later `out | …` consumes it.
+            if (stdout_stream_bind) |bind_loc| {
+                try self.set(source, .initRegister(.r2), .from(execution_handles.dereference()));
+                try self.set(source, bind_loc, .fromLocation(.initAdd(.{ .register = .r2 }, redirected_stdout_slot, .{ .dereference = true })));
+            }
+            if (stderr_stream_bind) |bind_loc| {
+                try self.set(source, bind_loc, .from(stderr_redirect_pipe.?));
+            }
             try self.push(source, .from(execution_handles.dereference()));
             const execution_handles_r = try self.pop(source);
             return .from(execution_handles_r.typed(execution_handles_struct_type));
@@ -6494,10 +6823,6 @@ pub const IRCompiler = struct {
             .from(thread_handle_ref.dereference()),
         );
         _ = try self.pop(source);
-
-        if (has_stderr_file_redirect) {
-            _ = try self.pop(source);
-        }
 
         const execution_handles_r = try self.pop(source);
         return .from(execution_handles_r.typed(execution_handles_struct_type));
@@ -9334,6 +9659,28 @@ pub const IRCompiler = struct {
             else => stage,
         };
 
+        // A bare `&0` forwards the enclosing stdin: its output kind is that
+        // stdin's kind — typed for a scalar/struct/array element, bytes for a
+        // raw (String/Byte/unknown) stdin.
+        if (stage.* == .fd and stage.fd.fd == 0) {
+            const enclosing: ?ast.TypeExpr = if (self.stdin_type_stack.items.len > 0)
+                self.stdin_type_stack.items[self.stdin_type_stack.items.len - 1]
+            else
+                null;
+            const et = enclosing orelse return .byte_stream;
+            const u = switch (et) {
+                .alias => |a| a.type_expr.*,
+                else => et,
+            };
+            return switch (u) {
+                .void => .void_boundary,
+                .byte => .byte_stream,
+                .array => |arr| if (arr.element.* == .byte) .byte_stream else .exact_typed,
+                .execution => .byte_stream,
+                else => .exact_typed,
+            };
+        }
+
         // A parse builtin produces a scalar; `lines` produces a framed stream of
         // String values. All use typed (queue) transport.
         if (self.builtinStage(stage) != null) return .exact_typed;
@@ -9386,6 +9733,10 @@ pub const IRCompiler = struct {
         // where the builtin reads the whole blob as a single value.)
         if (self.builtinStage(stage)) |builtin| {
             if (builtin.kind == .parse_map) return .exact_typed;
+            // A limiter adapts to its upstream (like a block): permissive, so the
+            // upstream's output kind decides the boundary (`&0 | first` stays a
+            // byte stream; `parseInt | first` carries typed values).
+            if (builtin.kind == .limiter) return .exact_typed;
         }
         // A block stage declares no stdin type — it adapts to the upstream
         // stage (its `&0` is typed by inference). Treat it as permissive so the
@@ -9445,9 +9796,25 @@ pub const IRCompiler = struct {
             else => stage,
         };
 
+        // A bare `&0` stage forwards the enclosing function's stdin, so its
+        // per-value stdout type is that stdin's element type (pushed on
+        // `stdin_type_stack`). This lets a downstream limiter (`&0 | first`
+        // inside a typed-stdin block) see the real element type, not bytes.
+        if (stage.* == .fd and stage.fd.fd == 0) {
+            return if (self.stdin_type_stack.items.len > 0)
+                self.stdin_type_stack.items[self.stdin_type_stack.items.len - 1]
+            else
+                null;
+        }
+
         // A builtin's stdout type comes straight from the registry (`lines`
-        // frames its byte input into per-line String values).
-        if (self.builtinStage(stage)) |builtin| return builtin.outputType();
+        // frames its byte input into per-line String values). A limiter is
+        // polymorphic: its stdout derives from the upstream element type, which
+        // callers make visible as `stdin_type_stack`'s top before asking.
+        if (self.builtinStage(stage)) |builtin| {
+            if (builtin.kind == .limiter) return self.limiterStdoutType(builtin.limiter.?);
+            return builtin.outputType();
+        }
 
         // A block/bare-expression stage has no signature; infer its stdout type
         // from what it `yield`s to stdout (&1), so a `{ yield 1; ... }` producer
@@ -9892,9 +10259,31 @@ pub const IRCompiler = struct {
     /// stage is not a readable-fd (`&0`) expression, so normal stage compilation
     /// applies.
     fn tryCompileFdForwardStage(self: *IRCompiler, source: *ast.Expression, stage_expr: *ast.Expression) Error!?Result {
-        if (stage_expr.* != .fd or stage_expr.fd.fd != 0) return null;
-        try self.pipeFwd(source, self.threadStdin(), self.threadStdout());
-        return .fromValue(.void);
+        if (stage_expr.* == .fd and stage_expr.fd.fd == 0) {
+            try self.pipeFwd(source, self.threadStdin(), self.threadStdout());
+            return .fromValue(.void);
+        }
+        // A `Stream(E)` binding as a pipeline source (`out | …`) forwards its
+        // (buffered) pipe into the pipeline. Unlike `&0` — whose always-running
+        // top-level drainer pushes it — this pipe has no drainer, so connect it to
+        // the stage's stdout and fork a drainer to flush its buffer downstream.
+        if (asVarName(stage_expr)) |name| {
+            if (self.lookup(name, .{ .shallow = false })) |binding| {
+                if (binding.is_mutable) if (binding.type_expr) |t| if (self.typeIsStream(t)) {
+                    // Read the binding's current value (the pipe handle the
+                    // redirect stored) with the same location semantics the
+                    // redirect's assignment used.
+                    const v = try self.compileExpression(stage_expr);
+                    if (v.source != .location) return null;
+                    const pipe_loc = v.source.location;
+                    try self.pipeFwd(source, pipe_loc, self.threadStdout());
+                    const drain_thread = try self.fork(source, self.stdoutStreamSet(), self.threadStdin(), pipe_loc, self.threadStderr(), .noll, .inherit);
+                    try self.wait(source, drain_thread);
+                    return .fromValue(.void);
+                };
+            }
+        }
+        return null;
     }
 
     fn compilePipeline(
@@ -9903,6 +10292,26 @@ pub const IRCompiler = struct {
         pipeline: ast.Pipeline,
     ) Error!Result {
         try self.comment("{f} -> {s}", .{ self.formatInlineSpan(source.span()), @src().fn_name });
+
+        // Peephole: `&0 | <limiter>` reads the enclosing stdin *directly* as a
+        // value, instead of spawning a `&0` forward stage into the limiter. The
+        // forward (`pipeFwd`) only moves bytes, so forwarding a typed stdin pipe
+        // (e.g. a block's `Int` stdin) would drop its queued values; reading the
+        // enclosing stdin directly reads the right pipe (byte or typed) and lets
+        // the limiter return `?E`/`[]E`/`String` as the pipeline's value.
+        if (pipeline.stages.len == 2 and
+            pipeline.stages[0].* == .fd and pipeline.stages[0].fd.fd == 0)
+        {
+            if (self.builtinStage(pipeline.stages[1])) |b| {
+                if (b.kind == .limiter) {
+                    const arg: ?*ast.Expression = switch (pipeline.stages[1].*) {
+                        .call => |c| if (c.arguments.len > 0) c.arguments[0] else null,
+                        else => null,
+                    };
+                    return self.compileLimiterStage(source, b.limiter.?, arg, true);
+                }
+            }
+        }
 
         const refs = try self.allocator.alloc(ir.Location, pipeline.stages.len - 1);
         defer self.allocator.free(refs);
@@ -9997,7 +10406,10 @@ pub const IRCompiler = struct {
             else
                 null;
             const pushed_stdin = i > 0;
-            if (pushed_stdin) try self.stdin_type_stack.append(self.allocator, inferred_stdin);
+            if (pushed_stdin) {
+                try self.stdin_type_stack.append(self.allocator, inferred_stdin);
+                try self.stdin_is_typed_stack.append(self.allocator, self.boundaryUsesTypedTransport(pipeline.stages[i - 1], pipeline.stages[i]));
+            }
             // Only a receiver stage (not the producer at i==0) can bind stdin to
             // a parameter. A bare `&0` stage forwards stdin to stdout.
             const result = if (try self.tryCompileFdForwardStage(source, stage_expr)) |fwd|
@@ -10007,7 +10419,10 @@ pub const IRCompiler = struct {
             else
                 // The producer (i == 0): an array source streams its elements.
                 (try self.tryCompileArraySourceStage(source, stage_expr)) orelse try self.compileExpression(stage_expr);
-            if (pushed_stdin) _ = self.stdin_type_stack.pop();
+            if (pushed_stdin) {
+                _ = self.stdin_type_stack.pop();
+                _ = self.stdin_is_typed_stack.pop();
+            }
 
             // A stage's value is no longer auto-pushed to stdout; output is
             // explicit via `yield` (or subprocess writes). Just wait for a
@@ -10037,14 +10452,20 @@ pub const IRCompiler = struct {
         try self.scopes.push(self.allocator, .closure);
         const last_idx = pipeline.stages.len - 1;
         const last_pushed_stdin = last_idx > 0;
-        if (last_pushed_stdin) try self.stdin_type_stack.append(
-            self.allocator,
-            self.stageStdoutType(pipeline.stages[last_idx - 1]),
-        );
+        if (last_pushed_stdin) {
+            try self.stdin_type_stack.append(
+                self.allocator,
+                self.stageStdoutType(pipeline.stages[last_idx - 1]),
+            );
+            try self.stdin_is_typed_stack.append(self.allocator, self.boundaryUsesTypedTransport(pipeline.stages[last_idx - 1], pipeline.stages[last_idx]));
+        }
         const result = (try self.tryCompileFdForwardStage(source, pipeline.stages[last_idx])) orelse
             (try self.tryCompilePipelineParamStage(source, pipeline.stages[last_idx])) orelse
             try self.compileExpression(pipeline.stages[last_idx]);
-        if (last_pushed_stdin) _ = self.stdin_type_stack.pop();
+        if (last_pushed_stdin) {
+            _ = self.stdin_type_stack.pop();
+            _ = self.stdin_is_typed_stack.pop();
+        }
         if (isWaitable(result)) |loc| {
             try self.comment("wait from {s} (last stage)", .{@src().fn_name});
             try self.wait(source, loc);
@@ -11330,6 +11751,60 @@ pub const IRCompiler = struct {
         return new_expr;
     }
 
+    /// Rewrites an fd-prefixed redirect binary (`cmd 2> file`, `cmd 2>> file`)
+    /// into a call carrying that redirect, unwrapping any inner redirect on its
+    /// left so multiple redirects on one command all collect onto one call
+    /// (`cmd > out 2> err` → a single call with both redirects). The parser
+    /// already folds the simple `cmd 2> file` case; this handles the nested-
+    /// binary case it leaves for the compiler (an inner `>`/`>>` stays a binary
+    /// because it is ambiguous with comparison/shift). Returns null when the left
+    /// is not a command or redirect.
+    fn fdRedirectCall(self: *IRCompiler, binary: ast.BinaryExpr) Error!?*ast.Expression {
+        const mode: ast.RedirectionMode = switch (binary.op) {
+            .fd_source_truncate_redirect, .amp_truncate_redirect => .truncate,
+            .fd_source_append_redirect, .amp_append_redirect => .append,
+            else => return null,
+        };
+        const target = coerceRedirectTargetExpr(binary.right);
+        const redirect = ast.Redirection{
+            .stream = binary.op.redirectStream(),
+            .mode = mode,
+            .target = .{ .path = .{ .value = target, .span = target.span() } },
+            .span = binary.left.span().endAt(binary.right.span()),
+        };
+        // Resolve the left into a command call, unwrapping an inner stdout
+        // (`>`/`>>`) or fd redirect so every redirect lands on the same call.
+        const base: *ast.Expression = switch (binary.left.*) {
+            .binary => |inner| switch (inner.op) {
+                .greater, .append_redirect => (try self.greaterRedirectCall(inner)) orelse return null,
+                .fd_source_truncate_redirect, .fd_source_append_redirect, .amp_truncate_redirect, .amp_append_redirect => (try self.fdRedirectCall(inner)) orelse return null,
+                else => return null,
+            },
+            .call => if (self.greaterLeftIsCommand(binary.left)) binary.left else return null,
+            .block, .subshell => binary.left,
+            else => return null,
+        };
+
+        const new_expr = try self.allocator.create(ast.Expression);
+        switch (base.*) {
+            .call => |call| new_expr.* = .{ .call = .{
+                .callee = call.callee,
+                .arguments = call.arguments,
+                .redirects = try std.mem.concat(self.allocator, ast.Redirection, &.{ call.redirects, &.{redirect} }),
+                .background = call.background,
+                .span = base.span().endAt(binary.right.span()),
+            } },
+            else => new_expr.* = .{ .call = .{
+                .callee = base,
+                .arguments = &.{},
+                .redirects = try self.allocator.dupe(ast.Redirection, &.{redirect}),
+                .background = false,
+                .span = base.span().endAt(binary.right.span()),
+            } },
+        }
+        return new_expr;
+    }
+
     /// Unwraps a bare zero-arg call (`> file`) to its identifier callee so the
     /// redirect target is the path expression, mirroring the parser.
     fn coerceRedirectTargetExpr(expr: *ast.Expression) *ast.Expression {
@@ -11357,6 +11832,65 @@ pub const IRCompiler = struct {
             return .from(ref.dereference().typed(type_expr));
         }
         return (try self.compileExpression(expr)).dereference();
+    }
+
+    /// Whether a type expression is a `Stream(E)` — the resolved `.stream` form
+    /// (type checker) or the written `Stream(E)` application the IR compiler
+    /// stores for a binding annotation (possibly aliased).
+    fn typeIsStream(self: *IRCompiler, t: ast.TypeExpr) bool {
+        _ = self;
+        const u = switch (t) {
+            .alias => |a| a.type_expr.*,
+            else => t,
+        };
+        return switch (u) {
+            .stream => true,
+            .type_application => |app| std.mem.eql(u8, app.name.name, "Stream"),
+            else => false,
+        };
+    }
+
+    /// If a redirect target expression names a mutable `Stream(E)` binding (the
+    /// in-memory-pipe redirect `cmd > out`), returns that binding; else null (a
+    /// string/interpolated target is a file redirect).
+    fn redirectTargetStreamBinding(self: *IRCompiler, value: *ast.Expression) ?*Scope.Binding {
+        const name = asVarName(value) orelse return null;
+        const binding = self.lookup(name, .{ .shallow = false }) orelse return null;
+        // Only a mutable `var` can be a stream redirect target — the redirect
+        // assigns it the pipe handle. (An immutable binding has no writable slot.)
+        if (!binding.is_mutable) return null;
+        const t = binding.type_expr orelse return null;
+        if (!self.typeIsStream(t)) return null;
+        return binding;
+    }
+
+    /// If a redirect target expression names an *immutable* `Stream(E)` binding,
+    /// returns its name. Such a target is a user error: a stream redirect assigns
+    /// the pipe handle, which needs a writable `var` slot. Caught here (not just
+    /// in the type checker) because the `>` form stays a `greater` binary that the
+    /// type checker's redirect loop never sees — only `2>`/`&>` fold into
+    /// `call.redirects` there.
+    fn redirectTargetImmutableStreamName(self: *IRCompiler, value: *ast.Expression) ?[]const u8 {
+        const name = asVarName(value) orelse return null;
+        const binding = self.lookup(name, .{ .shallow = false }) orelse return null;
+        if (binding.is_mutable) return null;
+        const t = binding.type_expr orelse return null;
+        if (!self.typeIsStream(t)) return null;
+        return name;
+    }
+
+    /// The element type of a `Stream(E)` binding/type, or null.
+    fn streamElementType(self: *IRCompiler, t: ast.TypeExpr) ?ast.TypeExpr {
+        _ = self;
+        const u = switch (t) {
+            .alias => |a| a.type_expr.*,
+            else => t,
+        };
+        return switch (u) {
+            .stream => |s| s.child.*,
+            .type_application => |app| if (std.mem.eql(u8, app.name.name, "Stream") and app.args.len == 1) app.args[0].* else null,
+            else => null,
+        };
     }
 
     /// The variable name an expression refers to, if it is a bare identifier or a
@@ -11733,7 +12267,13 @@ pub const IRCompiler = struct {
             .@"orelse" => {
                 return self.compileOrelseBinary(source, binary);
             },
-            .fd_source_truncate_redirect, .fd_source_append_redirect, .redirect_fd => return Error.UnsupportedBinaryOperation,
+            .fd_source_truncate_redirect, .fd_source_append_redirect, .amp_truncate_redirect, .amp_append_redirect => {
+                if (try self.fdRedirectCall(binary)) |call_expr| {
+                    return self.compileExpression(call_expr);
+                }
+                return Error.UnsupportedBinaryOperation;
+            },
+            .redirect_fd => return Error.UnsupportedBinaryOperation,
             .assign => {
                 if (binary.left.* == .env_var) {
                     const env_var = binary.left.env_var;
@@ -12946,6 +13486,20 @@ pub const IRCompiler = struct {
             return self.compileFdForLoop(source, for_expr);
         }
 
+        // `for (out) |x| body` where `out: Stream(E)` — iterate an in-memory
+        // pipe. Desugar to `out | { for (&0) |x| body }`: the block stage's stdin
+        // is out's pipe, and the inner `for (&0)` drains it via the existing
+        // live-stream for-loop.
+        if (for_expr.sources.len == 1) {
+            if (asVarName(for_expr.sources[0])) |name| {
+                if (self.lookup(name, .{ .shallow = false })) |binding| {
+                    if (binding.is_mutable) if (binding.type_expr) |t| if (self.typeIsStream(t)) {
+                        return self.compileStreamVarForLoop(source, for_expr);
+                    };
+                }
+            }
+        }
+
         // `for (@fields(T)) |f| { … }` — a comptime iteration over a struct
         // type's fields, unrolled at compile time (one body copy per field, with
         // `f.name`/`f.type` folded to that field's name and type).
@@ -13288,6 +13842,47 @@ pub const IRCompiler = struct {
         try self.setLabel(after_label.local_addr.label, .abs);
 
         return .fromValue(.void);
+    }
+
+    /// Lowers `for (out) |x| body` where `out: Stream(E)` by desugaring to the
+    /// pipeline `out | { for (&0) |x| body }`: the block stage's stdin is out's
+    /// pipe, so the inner `for (&0)` drains it via the live-stream for-loop. The
+    /// original capture and body are reused verbatim.
+    fn compileStreamVarForLoop(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        for_expr: ast.ForExpr,
+    ) Error!Result {
+        const a = self.allocator;
+        const span = source.span();
+
+        // `&0`
+        const fd0 = try a.create(ast.Expression);
+        fd0.* = .{ .fd = .{ .fd = 0, .span = span } };
+
+        // `for (&0) |x| body` (same capture + body)
+        const inner_for = try a.create(ast.Expression);
+        inner_for.* = .{ .for_expr = .{
+            .sources = try a.dupe(*ast.Expression, &.{fd0}),
+            .capture = for_expr.capture,
+            .body = for_expr.body,
+            .span = span,
+        } };
+
+        // `{ for (&0) |x| body }`
+        const stmt = try a.create(ast.Statement);
+        stmt.* = .{ .expression = .{ .expression = inner_for, .span = span } };
+        const block = try a.create(ast.Expression);
+        block.* = .{ .block = .{ .statements = try a.dupe(*ast.Statement, &.{stmt}), .span = span } };
+
+        // `out | { … }`
+        const pipeline = try a.create(ast.Expression);
+        pipeline.* = .{ .pipeline = .{
+            .stages = try a.dupe(*ast.Expression, &.{ for_expr.sources[0], block }),
+            .span = span,
+        } };
+
+        return self.compileExpression(pipeline);
     }
 
     /// Lowers `for (&0) |v| body` — a loop over the live stdin stream. Each

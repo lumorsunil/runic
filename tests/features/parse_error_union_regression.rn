@@ -17,13 +17,13 @@ echo "abc" | parseInt catch |e| match e {
 }
 
 # valid input still flows by-value through a downstream stage
-echo "10" | parseInt | { const n = &0; yield "n2=${n * 2}\n" }
+echo "10" | parseInt | { const n = &0 | first; yield "n2=${n * 2}\n" }
 
 # a mid-pipeline error short-circuits *through* a downstream arithmetic stage
 # (arithmetic on an error propagates it) and surfaces at the trailing catch.
-const e = echo "abc" | parseInt | { const n = &0; yield n * 2 } catch 99
+const e = echo "abc" | parseInt | { const n = &0 | first; yield n * 2 } catch 99
 echo "e=${e}"
-const f = echo "21" | parseInt | { const n = &0; yield n * 2 } catch 99
+const f = echo "21" | parseInt | { const n = &0 | first; yield n * 2 } catch 99
 echo "f=${f}"
 
 # `||` discards a pipeline's error and uses the fallback (like `catch`).
@@ -36,12 +36,12 @@ echo "h=${h}"
 # a downstream stage would *swallow* the value (a comparison) or the final
 # stage's type is plain `T` (a mid-pipeline error producer). The error leads the
 # stream, so the surrounding `catch` sees it.
-const i = echo "abc" | parseInt | { const n = &0; if (n > 5) { yield "big" } else { yield "small" } } catch "caught"
+const i = echo "abc" | parseInt | { const n = &0 | first; if (n > 5) { yield "big" } else { yield "small" } } catch "caught"
 echo "i=${i}"
-const j = echo "9" | parseInt | { const n = &0; if (n > 5) { yield "big" } else { yield "small" } } catch "caught"
+const j = echo "9" | parseInt | { const n = &0 | first; if (n > 5) { yield "big" } else { yield "small" } } catch "caught"
 echo "j=${j}"
-fn Int doubler() Int { yield &0 * 2 }
-fn Int inc() Int { yield &0 + 1 }
+fn Int doubler() Int { const n = &0 | first; yield n * 2 }
+fn Int inc() Int { const n = &0 | first; yield n + 1 }
 const k = echo "abc" | parseInt | doubler | inc catch 99
 echo "k=${k}"
 const l = echo "10" | parseInt | doubler | inc catch 99

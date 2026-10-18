@@ -100,10 +100,43 @@ pub const ProcessCloseable = struct {
         if (parent.term) |term| {
             log("result: {f}", .{term});
             return term;
-        } else {
-            log("result: null", .{});
-            return null;
         }
+        // When the child's stdout and stderr are inherited (no parent-side pipe),
+        // there is nothing for a stream drainer to read to EOF — so the usual
+        // completion path (`check_close_parent` fired from a stream close) never
+        // runs, and process completion must instead be detected by reaping the
+        // child directly. Poll for its exit without blocking; set `term` once it
+        // has exited so a waiter can proceed. (With a pipe on stdout/stderr the
+        // stream-close path still drives completion, so skip this.)
+        if (parent.process.stdout == null and parent.process.stderr == null) {
+            if (parent.tryReapExited()) |term| return term;
+        }
+        log("result: null", .{});
+        return null;
+    }
+
+    /// Non-blocking reap: if the child has exited, set and return `term`;
+    /// otherwise return null (still running). POSIX only — Windows keeps the
+    /// blocking `close()`-driven path.
+    fn tryReapExited(self: *@This()) ?ExitCode {
+        if (self.term) |t| return t;
+        if (@import("builtin").os.tag == .windows) return null;
+        const pid = self.process.id orelse return null;
+        var status: u32 = 0;
+        const linux = std.os.linux;
+        const rc = linux.waitpid(pid, &status, linux.W.NOHANG);
+        // 0 = still running; the pid = exited (reaped here); anything else = error.
+        if (rc != @as(usize, @intCast(pid))) return null;
+        const code: ExitCode = if (linux.W.IFEXITED(status))
+            .fromByte(linux.W.EXITSTATUS(status))
+        else if (linux.W.IFSIGNALED(status))
+            .fromByte(@as(u8, 128) +| @as(u8, @intCast(@intFromEnum(linux.W.TERMSIG(status)) & 0x7f)))
+        else
+            .fromByte(1);
+        // Mark the child reaped so `close()` won't wait() on it again.
+        self.process.id = null;
+        self.term = code;
+        return code;
     }
 
     pub fn getLabel(self: *Closeable(ExitCode)) []const u8 {

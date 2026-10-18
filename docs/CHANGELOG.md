@@ -12,6 +12,103 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-17
+
+A streams-and-redirection release. A readable file descriptor is now a proper
+`Stream(E)` — `&0` is the sequence of input values, consumed with the new
+bounded-read builtins `first` / `take` / `until` rather than used as a scalar.
+Command output can be redirected to files more completely (`&>` / `&>>` merge
+stdout and stderr; stdout and stderr can target separate files at once) and,
+newly, into in-memory `Stream` variables (`cmd > out`, `2> errs`, `&> both`) for
+incremental consumption with the stream builtins — with append forms (`>>`,
+`2>>`, `&>>`) that accumulate across commands. On the diagnostics side, every
+runtime error now renders as a source-anchored `[error]:` diagnostic like a
+compile error (including missing commands, `cimport` failures, and `--debug-ir`
+mode), and all compiler/runtime diagnostics go to stderr instead of polluting a
+script's stdout. Several stdin/redirect deadlocks are fixed along the way.
+
+### Changed
+
+- **`&0` is now a `Stream(E)`, not a single value (breaking).** A readable file
+  descriptor has type `Stream(E)` — the sequence of input values — so you consume
+  it (pipe it into a stage, `for (&0)`, or `yield &0`) rather than using it as a
+  scalar. `&0 * 2` / `const n = &0` are now type errors; read a value with
+  `&0 | first`. This removes the old caller-dependent ambiguity in `&0`'s type.
+  Existing single-value reads migrate to `&0 | first` (a drop-in: it reads the
+  first value coerced to the element type, parsing a byte stream the same way the
+  old `&0` did).
+
+### Added
+
+- **Stream-reading builtins `first`, `take`, and `until`.** Bounded reads of any
+  stream, used as pipeline stages: `&0 | first` reads the first value (coerced to
+  the element type — the next value of a typed stream, or the whole byte input
+  for a byte stream), `&0 | take n` up to `n` elements, and `&0 | until d` the
+  elements up to (excluding) the first `d`. Over a byte stream `take`/`until`
+  yield a `String`; over a typed stream (e.g. after `parseInt`) an array. `take`
+  and `until` stop as soon as they are satisfied — `&0 | until "\n"` returns at
+  the newline without waiting for end of input — and the read cursor advances so
+  successive reads continue where the last left off. They are recognized
+  structurally as pipeline stages, so they do not occupy the global scope and
+  remain usable as ordinary variable names.
+- **`&>` / `&>>` redirect both stdout and stderr to one file** (truncate /
+  append), e.g. `cmd &> "log.txt"`. Both streams are merged through a single
+  redirect pipe into the file.
+- **Redirect a command's output to an in-memory `Stream(E)` variable.** With a
+  bare-identifier target (vs a quoted-string file path), `cmd > out` captures the
+  command's output into a `var out: Stream(String)` — an in-memory pipe — instead
+  of a file. The command runs eagerly, buffering its output; `out` is then
+  consumed with the stream builtins (`out | grep …`, `out | first`,
+  `out | lines | parseInt`, `for (out)`). `2> errs` captures stderr (not possible
+  via binding before), and `&> both` captures both streams. `Stream(E)` is now a
+  writable type annotation. The target must be a `var`: redirecting to an
+  immutable `const` stream (in any of the `>`, `2>`, `&>` forms) reports a clear
+  error — "cannot redirect to immutable '…'; declare the stream with var" —
+  rather than silently falling back to a file. The append forms (`>>`, `2>>`,
+  `&>>`) accumulate into the stream across commands instead of replacing — each
+  command's output is buffered after whatever the stream already holds — while
+  the truncate forms (`>`, `2>`, `&>`) still replace. Appending to a stream that
+  has not been written yet behaves like a plain redirect.
+
+### Fixed
+
+- **Runtime errors render like compile errors.** A runtime fault that isn't
+  already self-describing used to print a raw `Error evaluating …:
+  error.Foo` line followed by `runic exited with error: Foo`. It now renders as a
+  single `[error]:` diagnostic with the faulting line's `file:line:col` and the
+  highlighted source line — the same shape as a compile error (e.g. consuming a
+  `Stream` before anything was redirected into it: "cannot consume a stream
+  before it has been written to"). A missing command, and a failed `cimport`
+  (library that won't load, or a missing symbol), are rendered the same way —
+  with their source line and a specific message — instead of a bare log line
+  followed by a generic fallback. This applies in `--debug-ir` mode too, which
+  previously let runtime errors escape as a raw `runic exited with error …` line.
+  A diagnostic with no source location (a rare internal fault) no longer prints a
+  doubled space before its message.
+- **Compile and runtime errors now print to stderr, not stdout.** IR-compile and
+  runtime diagnostics were written to stdout while the parser and type-checker
+  stages already used stderr; they now all go to stderr, so an error never
+  pollutes a script's stdout (e.g. when its output is being piped). Program
+  output still flows to stdout unchanged.
+- **A top-level stdin read no longer hangs.** Reading the process's stdin
+  (`&0 | first` / `&0 | until …`) now reaches end-of-input instead of blocking
+  forever waiting for the stdin pipe to close.
+- **Commands share stdin instead of having it pushed at them.** Commands read
+  the real file descriptor directly, so a command that doesn't read stdin
+  (`printf "prompt: "`) no longer consumes or closes it, and one that reads part
+  of it (`head -c 5`) consumes exactly its share — the remainder flows to the next
+  command or `&0`. This fixes prompt-then-read (`printf "prompt: "` then
+  `&0 | until "\n"`) whether stdin is a terminal, a pipe, or a file, and stdin is
+  now read on demand rather than eagerly drained up front.
+- **Redirecting a command's stderr to a file (`2>` / `2>>`) no longer hangs.** A
+  command that actually writes to a file-redirected stderr used to deadlock as an
+  unreaped zombie; its stderr is now drained into the file concurrently (as
+  stdout's `>` already was), so it completes, large output doesn't block on a full
+  pipe, and an interpolated target path (`2> "${path}"`) works.
+- **A command can redirect stdout and stderr to separate files at once**
+  (`cmd > out 2> err`, in either order), which previously failed to compile. Both
+  streams drain concurrently, so a command writing to both doesn't deadlock.
+
 ## [0.12.0] - 2026-10-05
 
 A large comptime and type-system release that layers constraint-checked,
