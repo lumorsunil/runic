@@ -239,8 +239,11 @@ Remaining follow-ups (smaller than the feature itself):
   pending;
 - per-value framing for `String` streams is opt-in via `lines` (raw byte streams
   read whole);
-- an untyped function parameter errors with a rough `error.TypeNotFound`
-  ("Type checker failed to run") rather than a clean, located diagnostic.
+- ~~an untyped function parameter errors with a rough `error.TypeNotFound`
+  ("Type checker failed to run") rather than a clean, located diagnostic~~ —
+  landed: an un-annotated parameter reports a clean, located
+  `parameter 'x' requires a type annotation` (one per bad param), and an unknown
+  type name points at introducing a generic with `|T|`.
 
 #### Error handling — landed (0.4.0)
 
