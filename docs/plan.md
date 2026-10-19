@@ -342,9 +342,22 @@ Likely near- to mid-term candidates:
      - **Richer type reflection as a value.** Today introspection is scalar
        builtins (`@kind`, `@fieldCount`, `@hasField`, `@elem`, `@child`) plus
        `@fields` iteration. Jai/Mox expose a first-class type-info value (size,
-       field offsets, decls) you pass around. Natural additions: `@TypeOf(expr)`,
-       `@typeName(T)`, `@hasDecl`, field offset/size — mostly in reach of the
-       current folder.
+       field offsets, decls) you pass around. Natural additions: `@hasDecl` and
+       field offset/size — mostly in reach of the current folder. (`@TypeOf` and
+       `@typeName` are intentionally *not* planned: a capture binding `const x:
+       |T| = expr` already names the type of an expression, and coercing a type
+       to a string — `${T}` — already yields its name.)
+     - **Narrow a generic type by `match` on built-in type patterns.** A value
+       binding already destructures and captures built-in type components —
+       `const x: []|E| = v` / `?|E|` binds `E` — but `match (T)` arms accept only
+       scalar types (`Int`) and named-constructor patterns (`Box(|E|)`), not the
+       built-in container/optional/error-union patterns (`[]|E|`, `?|E|`,
+       `E!|F|`). So narrowing a generic `T` by its structure forces a throwaway
+       `const _: []|E| = v` binding plus a `@kind`/`@elem` dance instead of a
+       clean `match (T) { []|E| => …, ?|E| => …, Box(|E|) => …, _ => … }`.
+       Closing it: extend the type-match arm parser to the built-in type patterns
+       and reuse the value-binding capture machinery. Bounded, additive, no
+       streaming-core risk — the current best-value comptime candidate.
      - **Comptime type *construction*.** Runic can *return* a hand-written struct
        type from a comptime fn; it cannot *build* one — e.g. a struct with a field
        per element of a comptime list. Jai's `#insert`/data-layout transforms and
