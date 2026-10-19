@@ -4,3 +4,4 @@
 // rather than only the first.
 const xs: []Int = .{ , , }
 const s = .{ .a = , .b = }
+const ys: []Int = .{ 1 +, 2 + }

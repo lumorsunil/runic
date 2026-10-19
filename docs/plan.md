@@ -190,9 +190,10 @@ Current focus areas:
   In-construct recovery also works: a statement sequence inside a
   function/block/`if`/`for`/`match` body recovers per statement, and a
   comma-separated expression list (array and struct literals) resynchronizes at
-  the comma so every bad element is reported in one pass. (Remaining edge: an
-  element parser that greedily consumes past the comma before failing — e.g. a
-  malformed `@`-builtin — still ends its list early.)
+  the comma so every malformed element is reported in one pass. (What can look
+  like non-recovery usually isn't a parse error at all: `#` starts a comment, and
+  a bareword like `@`/`cmd` parses as a command expression that fails later at
+  type-check or runtime, not during parsing.)
 - remaining gaps in function behavior, especially stdin/stdout semantics and
   piping through functions/blocks (a bare `&0` stage can now forward stdin into
   a pipeline; forward references / mutual recursion, `var` mutable parameters,

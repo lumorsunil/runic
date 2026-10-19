@@ -3,31 +3,48 @@
    4:// rather than only the first.
    5:const xs: []Int = .{ , , }
    6:const s = .{ .a = , .b = }
-   7:
+   7:const ys: []Int = .{ 1 +, 2 + }
+   8:
 
 [error]: tests/diagnostics/list_recovery.rn:5:24: expected value, actual: comma
    3:// so every bad element in an array or struct literal is reported in one pass
    4:// rather than only the first.
    5:const xs: []Int = .{ , , }
    6:const s = .{ .a = , .b = }
-   7:
+   7:const ys: []Int = .{ 1 +, 2 + }
+   8:
 
 [error]: tests/diagnostics/list_recovery.rn:5:26: expected value, actual: r_brace
    3:// so every bad element in an array or struct literal is reported in one pass
    4:// rather than only the first.
    5:const xs: []Int = .{ , , }
    6:const s = .{ .a = , .b = }
-   7:
+   7:const ys: []Int = .{ 1 +, 2 + }
+   8:
 
 [error]: tests/diagnostics/list_recovery.rn:6:19: expected value, actual: comma
    4:// rather than only the first.
    5:const xs: []Int = .{ , , }
    6:const s = .{ .a = , .b = }
-   7:
+   7:const ys: []Int = .{ 1 +, 2 + }
+   8:
 
 [error]: tests/diagnostics/list_recovery.rn:6:26: expected value, actual: r_brace
    4:// rather than only the first.
    5:const xs: []Int = .{ , , }
    6:const s = .{ .a = , .b = }
-   7:
+   7:const ys: []Int = .{ 1 +, 2 + }
+   8:
+
+[error]: tests/diagnostics/list_recovery.rn:7:25: expected value, actual: comma
+   5:const xs: []Int = .{ , , }
+   6:const s = .{ .a = , .b = }
+   7:const ys: []Int = .{ 1 +, 2 + }
+   8:
+
+[error]: tests/diagnostics/list_recovery.rn:7:31: expected value, actual: r_brace
+   5:const xs: []Int = .{ , , }
+   6:const s = .{ .a = , .b = }
+   7:const ys: []Int = .{ 1 +, 2 + }
+   8:
 
