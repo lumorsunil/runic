@@ -12,6 +12,15 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ## [Unreleased]
 
+### Changed
+
+- **Parser error recovery now extends into comma-separated expression lists.** A
+  malformed element in an array or struct literal records a diagnostic and the
+  parser resynchronizes at the next comma, so `const xs = .{ , , }` or
+  `.{ .a = , .b = }` reports every bad element in one pass instead of only the
+  first. (Statement-sequence recovery inside function/block/`if`/`for`/`match`
+  bodies already worked.)
+
 ## [0.13.0] - 2026-10-17
 
 A streams-and-redirection release. A readable file descriptor is now a proper

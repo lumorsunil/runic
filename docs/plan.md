@@ -187,7 +187,12 @@ Current focus areas:
   failure~~ — landed: top-level statement recovery reports multiple errors per
   parse; unterminated string/block-comment diagnostics; and a missing
   executable reports `command not found` instead of a bare `FileNotFound`.
-  Nested (in-construct) recovery is still future work.
+  In-construct recovery also works: a statement sequence inside a
+  function/block/`if`/`for`/`match` body recovers per statement, and a
+  comma-separated expression list (array and struct literals) resynchronizes at
+  the comma so every bad element is reported in one pass. (Remaining edge: an
+  element parser that greedily consumes past the comma before failing — e.g. a
+  malformed `@`-builtin — still ends its list early.)
 - remaining gaps in function behavior, especially stdin/stdout semantics and
   piping through functions/blocks (a bare `&0` stage can now forward stdin into
   a pipeline; forward references / mutual recursion, `var` mutable parameters,

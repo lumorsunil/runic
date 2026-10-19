@@ -1,0 +1,6 @@
+// Parser error recovery inside comma-separated expression lists: a malformed
+// element records a diagnostic and the parser resynchronizes at the next comma,
+// so every bad element in an array or struct literal is reported in one pass
+// rather than only the first.
+const xs: []Int = .{ , , }
+const s = .{ .a = , .b = }

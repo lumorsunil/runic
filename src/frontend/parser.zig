@@ -272,6 +272,21 @@ pub const Parser = struct {
         }
     }
 
+    /// Panic-mode resynchronization inside a comma-separated list: consumes
+    /// tokens after a failed element up to (but not including) the next comma, a
+    /// closing delimiter, a statement boundary, or EOF — so the list loop can
+    /// either continue at the comma or stop at the terminator. Always leaves the
+    /// stop token unconsumed; the caller advances past a comma itself.
+    fn recoverToListItemBoundary(self: *Self) void {
+        while (true) {
+            const tok = self.peekToken() catch return;
+            switch (tok.tag) {
+                .eof, .comma, .r_brace, .r_bracket, .r_paren, .newline, .semicolon => return,
+                else => _ = self.nextToken() catch return,
+            }
+        }
+    }
+
     /// Maximum diagnostics collected via recovery before parsing stops, so a
     /// pathological input can't produce an unbounded error list.
     const max_recovery_errors = 25;
@@ -771,6 +786,15 @@ pub const Parser = struct {
     /// Parses `{ .field = expr, ... }` following an already-consumed type-like
     /// identifier `name`. Commas and/or newlines separate fields; a trailing
     /// comma is allowed. Used for error value construction (and future structs).
+    /// Parses one `.name = value` field of a struct literal (named or anonymous).
+    fn parseStructFieldInit(self: *Self) Error!ast.StructLiteral.FieldInit {
+        const dot = try self.expectTokenTag(.dot);
+        const field_name = try self.parseIdentifier();
+        _ = try self.expectTokenTag(.assign);
+        const value = try self.parseExpression();
+        return .{ .name = field_name, .value = value, .span = dot.span.endAt(value.span()) };
+    }
+
     fn parseStructLiteral(self: *Self, name: ast.Identifier) Error!*ast.Expression {
         const breadcrumb = try self.createBreadcrumb(@src().fn_name);
         defer breadcrumb.end();
@@ -783,23 +807,21 @@ pub const Parser = struct {
         while (true) {
             self.skipNewlines();
             const next = try self.peekToken();
-            if (next.tag == .r_brace) break;
+            if (next.tag == .r_brace or next.tag == .eof) break;
 
-            const dot = try self.expectTokenTag(.dot);
-            const field_name = try self.parseIdentifier();
-            _ = try self.expectTokenTag(.assign);
-            const value = try self.parseExpression();
-
-            try fields.append(self.allocator, .{
-                .name = field_name,
-                .value = value,
-                .span = dot.span.endAt(value.span()),
-            });
-
-            self.skipNewlines();
-            const delimiter = try self.peekToken();
-            if (delimiter.tag == .comma) {
-                _ = try self.nextToken();
+            const before = self.diagnostics.items.len;
+            if (self.parseStructFieldInit()) |field| {
+                try fields.append(self.allocator, field);
+                self.skipNewlines();
+                if ((try self.peekToken()).tag == .comma) _ = try self.nextToken();
+            } else |err| {
+                if (self.diagnostics.items.len == before) self.recordParseFailure(err);
+                if (self.diagnostics.items.len >= max_recovery_errors) break;
+                self.recoverToListItemBoundary();
+                self.skipNewlines();
+                // Resume at the next field only when a comma follows; a
+                // terminator / EOF / stray token ends the field list.
+                if ((try self.peekToken()).tag == .comma) _ = try self.nextToken() else break;
             }
         }
 
@@ -2480,7 +2502,7 @@ pub const Parser = struct {
             const close = try self.expectTokenTag(.r_brace);
             return self.allocExpression(.{ .array = .{ .elements = &.{}, .span = start.span.endAt(close.span) } });
         }
-        const elements = try self.parseList(.comma, parseExpression, .{ .skipNewLines = true });
+        const elements = try self.parseList(.comma, parseExpression, .{ .skipNewLines = true, .recoverElements = true });
         const close = try self.expectTokenTag(.r_brace);
         return self.allocExpression(.{ .array = .{
             .elements = elements.payload,
@@ -2497,18 +2519,20 @@ pub const Parser = struct {
 
         while (true) {
             self.skipNewlines();
-            if ((try self.peekToken()).tag == .r_brace) break;
-            const dot = try self.expectTokenTag(.dot);
-            const field_name = try self.parseIdentifier();
-            _ = try self.expectTokenTag(.assign);
-            const value = try self.parseExpression();
-            try fields.append(self.allocator, .{
-                .name = field_name,
-                .value = value,
-                .span = dot.span.endAt(value.span()),
-            });
-            self.skipNewlines();
-            if ((try self.peekToken()).tag == .comma) _ = try self.nextToken();
+            const next = try self.peekToken();
+            if (next.tag == .r_brace or next.tag == .eof) break;
+            const before = self.diagnostics.items.len;
+            if (self.parseStructFieldInit()) |field| {
+                try fields.append(self.allocator, field);
+                self.skipNewlines();
+                if ((try self.peekToken()).tag == .comma) _ = try self.nextToken();
+            } else |err| {
+                if (self.diagnostics.items.len == before) self.recordParseFailure(err);
+                if (self.diagnostics.items.len >= max_recovery_errors) break;
+                self.recoverToListItemBoundary();
+                self.skipNewlines();
+                if ((try self.peekToken()).tag == .comma) _ = try self.nextToken() else break;
+            }
         }
         const close = try self.expectTokenTag(.r_brace);
         return self.allocExpression(.{ .struct_literal = .{
@@ -2671,6 +2695,12 @@ pub const Parser = struct {
 
     const ParseAndSkipUntilOptions = struct {
         skipNewLines: bool = false,
+        /// Recover within the list: a failed element records a diagnostic and the
+        /// parser resynchronizes at the next comma/terminator and continues, so a
+        /// list with several bad elements reports them all rather than only the
+        /// first. Off by default (most callers want a failed element to abort the
+        /// enclosing statement, which then recovers at the top level).
+        recoverElements: bool = false,
         terminators: ?union(enum) {
             _function: *const fn (token.Tag) bool,
             _list: []const token.Tag,
@@ -2718,7 +2748,24 @@ pub const Parser = struct {
         while (true) : (_ = try self.nextToken()) {
             if (options.skipNewLines) self.skipNewlines();
 
-            try parsed.append(self.allocator, try parser(self));
+            if (options.recoverElements) {
+                const before = self.diagnostics.items.len;
+                if (parser(self)) |item| {
+                    try parsed.append(self.allocator, item);
+                } else |err| {
+                    if (self.diagnostics.items.len == before) self.recordParseFailure(err);
+                    if (self.diagnostics.items.len >= max_recovery_errors) break;
+                    self.recoverToListItemBoundary();
+                    // Continue the list only when resynchronized at the delimiter
+                    // (the continue-expression consumes it); a terminator / EOF /
+                    // statement boundary ends the list, left for the caller.
+                    const after = self.peekToken() catch break;
+                    if (delimiter) |d| if (after.tag == d) continue;
+                    break;
+                }
+            } else {
+                try parsed.append(self.allocator, try parser(self));
+            }
 
             const next = try self.peekToken();
             const delim = delimiter orelse {
@@ -2728,6 +2775,12 @@ pub const Parser = struct {
             if (next.tag == delim) continue;
 
             break;
+        }
+
+        // Recovery may have discarded every element; return an empty list rather
+        // than reaching `getLast` on an empty buffer.
+        if (parsed.items.len == 0) {
+            return .{ .payload = &.{}, .span = start.span };
         }
 
         const last_item = parsed.getLast();
