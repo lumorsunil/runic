@@ -355,11 +355,18 @@ Likely near- to mid-term candidates:
        The subject may be a `comptime T: type` parameter or a type captured from a
        value binding (`const t: |T| = v`); the dispatch now routes a
        concretely-bound composite capture to the type-match path. Remaining
-       follow-ups: an error-union arm pattern (`E!|F|`) isn't parsed yet (an error
-       set can be a path, plus the inferred `!F` form), and a named generic
-       constructor captured *from a value* is stored structurally
-       (`struct { v: Int }`, not nominal `Box(Int)`), so `Box(|E|)` won't match a
-       value-captured instance — it falls to `_`.
+       follow-ups: a named generic constructor captured *from a value* is stored
+       structurally (`struct { v: Int }`, not nominal `Box(Int)`), so `Box(|E|)`
+       won't match a value-captured instance — it falls to `_`.
+       An **error-union arm pattern (`E!|F|`) is deferred** — not a parser tweak
+       but blocked on error unions not being first-class comptime type values:
+       `writeTypeName` serializes `.error_union` as `?`, `f(E!Int)` passes as the
+       malformed type arg `E()` while `f(!Int)` is parsed as negation and crashes,
+       and `collectTypeVars` doesn't recurse into error unions — plus the nominal
+       error-set name is structural like `Box`. Making `E!|F|` work means first
+       making error unions serialize, parse as type arguments, and collect
+       captures (a multi-area effort with design calls on nominal serialization
+       and `!T` vs unary `!`), not an arm-pattern addition.
      - **Comptime type *construction*.** Runic can *return* a hand-written struct
        type from a comptime fn; it cannot *build* one — e.g. a struct with a field
        per element of a comptime list. Jai's `#insert`/data-layout transforms and
