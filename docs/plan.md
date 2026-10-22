@@ -347,17 +347,19 @@ Likely near- to mid-term candidates:
        `@typeName` are intentionally *not* planned: a capture binding `const x:
        |T| = expr` already names the type of an expression, and coercing a type
        to a string — `${T}` — already yields its name.)
-     - **Narrow a generic type by `match` on built-in type patterns.** A value
-       binding already destructures and captures built-in type components —
-       `const x: []|E| = v` / `?|E|` binds `E` — but `match (T)` arms accept only
-       scalar types (`Int`) and named-constructor patterns (`Box(|E|)`), not the
-       built-in container/optional/error-union patterns (`[]|E|`, `?|E|`,
-       `E!|F|`). So narrowing a generic `T` by its structure forces a throwaway
-       `const _: []|E| = v` binding plus a `@kind`/`@elem` dance instead of a
-       clean `match (T) { []|E| => …, ?|E| => …, Box(|E|) => …, _ => … }`.
-       Closing it: extend the type-match arm parser to the built-in type patterns
-       and reuse the value-binding capture machinery. Bounded, additive, no
-       streaming-core risk — the current best-value comptime candidate.
+     - ~~**Narrow a generic type by `match` on built-in type patterns.**~~ —
+       landed: `match (T)` arms now accept the built-in container/optional
+       patterns (`[]|E|`, `?|E|`, nested `[]?|E|`) alongside scalar types and
+       named constructors (`Box(|E|)`), binding the element type in the arm body
+       — so narrowing no longer needs the throwaway `const _: []|E| = v` idiom.
+       The subject may be a `comptime T: type` parameter or a type captured from a
+       value binding (`const t: |T| = v`); the dispatch now routes a
+       concretely-bound composite capture to the type-match path. Remaining
+       follow-ups: an error-union arm pattern (`E!|F|`) isn't parsed yet (an error
+       set can be a path, plus the inferred `!F` form), and a named generic
+       constructor captured *from a value* is stored structurally
+       (`struct { v: Int }`, not nominal `Box(Int)`), so `Box(|E|)` won't match a
+       value-captured instance — it falls to `_`.
      - **Comptime type *construction*.** Runic can *return* a hand-written struct
        type from a comptime fn; it cannot *build* one — e.g. a struct with a field
        per element of a comptime list. Jai's `#insert`/data-layout transforms and

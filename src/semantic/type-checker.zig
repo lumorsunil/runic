@@ -3815,6 +3815,15 @@ pub const TypeChecker = struct {
     /// literal type value (`match (Box(Int))`).
     fn isComptimeTypeSubject(self: *TypeChecker, scope: *Scope, subject: *ast.Expression) Error!bool {
         if (subject.* == .type_value) return true;
+        // A bare identifier naming a declared type — including a capture bound to
+        // a concrete type by a value binding (`const t: |T| = xs` → `T` is the
+        // type `[]Int`) — is a comptime type subject. `resolveExprType` alone
+        // only reports `.type_var`/`.type_type` for an *abstract* capture, so a
+        // concretely-bound composite type (`[]Int`, a struct) would otherwise be
+        // misrouted to the value-match path.
+        if (referencedBindingName(subject)) |name| {
+            if (scope.lookup(name)) |binding| if (binding.is_type) return true;
+        }
         // `f.type` of a comptime `@fields` loop variable is a comptime type.
         if (memberAccessParts(subject)) |ma| {
             if (std.mem.eql(u8, ma.member, "type")) {

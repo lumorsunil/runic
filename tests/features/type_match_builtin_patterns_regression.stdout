@@ -1,0 +1,8 @@
+array of Int
+optional Float
+array of optional Bool
+string
+int
+other
+arr<Int>
+opt<Int>

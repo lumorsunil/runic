@@ -744,26 +744,34 @@ echo "${rep 3}"   // 3 times
 #### Matching on a type
 
 A `match` whose subject is a comptime type selects an arm at compile time. Each
-arm is a type pattern — a bare name (`Int`) or an application that may carry
-captures (`Box(|E|)`, `Pair(|X|)(|Y|)`) — and a matched capture is bound in that
-arm's body, exactly as in a type predicate:
+arm is a type pattern — a bare name (`Int`), a constructor application that may
+carry captures (`Box(|E|)`, `Pair(|X|)(|Y|)`), or a built-in container/optional
+pattern (`[]|E|`, `?|E|`, and nested forms like `[]?|E|`) — and a matched capture
+is bound in that arm's body, exactly as in a type predicate:
 
 ```rn
 fn Void classify(comptime T: type) String {
   match (T) {
-    Int      => { yield "an int" }
+    []|E|    => { yield "an array of ${E}" }
+    ?|E|     => { yield "an optional ${E}" }
     Box(|E|) => { yield "a box of ${E}" }
+    Int      => { yield "an int" }
     _        => { yield "other" }
   }
 }
+echo "${classify []Int}"      // an array of Int
 echo "${classify Box(Int)}"   // a box of Int
-echo "${classify Int}"        // an int
 echo "${classify Bool}"       // other
 ```
 
-The bound capture is itself a comptime type, so a nested `match (E)` folds again.
-A `match` on a comptime *value* likewise prunes to the arm whose literal equals
-the value.
+Arms are tried top to bottom, so order a more specific pattern (`[]?|E|`) before a
+more general one (`[]|E|`). The subject can also be a type captured from a value
+binding — `const t: |T| = someArray` then `match (T) { []|E| => … }` — which
+narrows a generic's structure without the throwaway `const _: []|E| = v` idiom.
+`String` serializes as `String` (not `[]Byte`), so an `[]|E|` arm does not match
+it — give it an explicit `String` arm. The bound capture is itself a comptime
+type, so a nested `match (E)` folds again. A `match` on a comptime *value*
+likewise prunes to the arm whose literal equals the value.
 
 #### Type introspection
 

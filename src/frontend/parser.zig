@@ -2407,6 +2407,10 @@ pub const Parser = struct {
                 const float_tok = try self.nextToken();
                 break :blk .{ .literal = .{ .float = .{ .text = float_tok.lexeme, .span = float_tok.span } } };
             },
+            // A built-in type pattern (`[]|E|`, `?|E|`) when matching on a type —
+            // the array/optional forms the identifier branch's constructor pattern
+            // (`Box(|E|)`) doesn't cover. Parsed as a full type expression.
+            .l_bracket, .question => .{ .type_pattern = try self.parseTypeExpr() },
             else => self.failExpectedTokens(tok.tag, &.{ .identifier, .string_start, .kw_null, .kw_true, .kw_false, .int_literal, .float_literal }),
         };
     }

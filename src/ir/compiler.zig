@@ -7739,6 +7739,19 @@ pub const IRCompiler = struct {
                     try lit.append(self.allocator, ')');
                 }
             },
+            // Built-in container patterns, mirroring `writeTypeName`'s serialized
+            // form so the prefix matches the subject's type name and a `|E|` child
+            // becomes a capture hole: `[]|E|` → `[]`+hole, `?|E|` → `?`+hole.
+            // (A `String` subject serializes as `String`, not `[]Byte`, so `[]|E|`
+            // does not match it — use an explicit `String` arm for that.)
+            .array => |a| {
+                try lit.appendSlice(self.allocator, "[]");
+                try self.buildPatternSegs(a.element.*, segs, lit);
+            },
+            .optional => |o| {
+                try lit.append(self.allocator, '?');
+                try self.buildPatternSegs(o.child.*, segs, lit);
+            },
             else => {
                 var w = std.Io.Writer.Allocating.init(self.allocator);
                 defer w.deinit();

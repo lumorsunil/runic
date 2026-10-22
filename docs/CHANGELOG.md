@@ -12,6 +12,17 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ## [Unreleased]
 
+### Added
+
+- **`match` on a type narrows built-in container/optional patterns.** A type-match
+  arm can now be `[]|E|`, `?|E|`, or a nested form like `[]?|E|` (alongside the
+  existing scalar `Int` and constructor `Box(|E|)` patterns), binding the element
+  type in the arm body — so narrowing a generic's structure no longer needs the
+  throwaway `const _: []|E| = v` idiom. The subject can be a `comptime T: type`
+  parameter or a type captured from a value binding (`const t: |T| = v`). (An
+  `[]|E|` arm does not match `String`, which serializes as `String` not `[]Byte`
+  — use an explicit `String` arm.)
+
 ### Changed
 
 - **Parser error recovery now extends into comma-separated expression lists.** A

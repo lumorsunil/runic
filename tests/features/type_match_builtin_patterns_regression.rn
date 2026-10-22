@@ -1,0 +1,32 @@
+// `match` on a type narrows built-in container/optional patterns and binds their
+// element type, the same way a value binding (`const x: []|E| = v`) captures it —
+// so narrowing a generic no longer needs a throwaway binding. Works whether the
+// type comes from a `comptime T: type` parameter or a value capture
+// (`const t: |T| = value`).
+
+fn describe(comptime T: type) String {
+    yield match (T) {
+        []?|E| => "array of optional ${E}",
+        []|E| => "array of ${E}",
+        ?|E| => "optional ${E}",
+        String => "string",
+        Int => "int",
+        _ => "other",
+    }
+}
+
+echo "${describe([]Int)}"
+echo "${describe(?Float)}"
+echo "${describe([]?Bool)}"
+echo "${describe(String)}"
+echo "${describe(Int)}"
+echo "${describe(Void)}"
+
+// A type captured from a value binding narrows the same way.
+const xs: []Int = .{ 1, 2 }
+const t: |T| = xs
+echo "${match (T) { []|E| => "arr<${E}>", _ => "?" }}"
+
+const opt: ?Int = 7
+const ot: |OT| = opt
+echo "${match (OT) { ?|E| => "opt<${E}>", _ => "?" }}"
