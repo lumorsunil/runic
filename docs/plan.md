@@ -465,6 +465,41 @@ The project now needs steady maintenance of its contributor-facing surface:
 - expand examples and regression coverage whenever a feature becomes stable
 - avoid accumulating speculative docs that are never brought back in sync
 
+### 7. Embedding Runic as a scripting runtime
+
+**Status: design / not started** — full direction in `future/embedding.md`.
+
+Let a host program embed Runic the way an app embeds Lua: the host links the
+runtime as a library, exposes a slice of its own functionality to a script as
+callable functions, hands Runic a script, and runs it; when the script calls an
+exposed function, control returns to the host, which does the work and passes a
+value back. This is the **inverse of the C FFI** (`cimport`, where a script
+reaches out to a C library) and reuses the library API already exported from
+`src/root.zig` plus the `runIR` entry point.
+
+Four additions on top of the existing pipeline: an **`Embed` facade**
+(`runic.Embed`) that owns the document store, host registry, capability config,
+and I/O wiring and returns a structured result; a **dynamic host-function
+registry** (distinct from the comptime builtin table); **type-checker
+integration** so a registered function is an ordinary function binding with a
+"native" body that calls type-check against a declared signature; and a
+**native-call dispatch** in the evaluator that marshals arguments to host
+values, invokes the Zig callback synchronously, and marshals the result back
+(parallel to the FFI call path, sharing value marshalling but not the ABI).
+
+Phasing: (1) facade + run-a-string returning a structured result;
+(2) scalar host functions — registry, type-checker declaration, native
+dispatch, scalar marshalling, and an `import "host"` module; (3) a
+deny-by-default **sandbox** config gating exec/filesystem/env/FFI for embedded
+scripts; (4) richer marshalling (arrays, maps, structs, optionals, error
+mapping); (5) a C ABI facade for non-Zig hosts (deferred — Zig hosts first).
+
+Open decisions (tracked in the note): the exposure syntax (`import "host"` vs
+ambient builtins), the signature representation, whether to add a `host_call` IR
+op or reuse the FFI call op, the value ABI (stable accessor API vs raw `Value`),
+sandbox granularity, and reentrancy/threading (synchronous single-threaded for
+v1).
+
 ## What Is Not in This Document
 
 This roadmap does not try to enumerate every open task.
@@ -476,7 +511,7 @@ Use:
 - `docs/lsp.md` for the current LSP-specific roadmap
 - `future/error-handling.md` and `future/typed-pipes.md` for feature-design
   notes that inform the roadmap but are not yet part of the implemented
-  language reference
+  language reference; `future/embedding.md` for the embedding direction (Theme 7)
 
 If one of those backlogs becomes the actual top-level project plan, this file
 should be updated to say so explicitly.
