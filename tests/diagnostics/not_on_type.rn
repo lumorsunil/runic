@@ -1,0 +1,6 @@
+// Applying `!` (logical not) to a type has no boolean meaning — a leading-`!`
+// error-union type (`!Int`) is a type annotation, not a value expression. This
+// used to fail only at runtime with an opaque UnsupportedNegOperand; it is now a
+// clear, located compile error.
+fn f(comptime T: type) String { yield "${T}" }
+echo "${f(!Int)}"

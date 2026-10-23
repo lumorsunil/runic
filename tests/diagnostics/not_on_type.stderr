@@ -1,0 +1,6 @@
+[error]: tests/diagnostics/not_on_type.rn:6:11: cannot apply `!` to a type; a leading-`!` error-union type is not valid in value position
+   4:// clear, located compile error.
+   5:fn f(comptime T: type) String { yield "${T}" }
+   6:echo "${f(!Int)}"
+   7:
+

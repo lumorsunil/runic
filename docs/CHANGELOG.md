@@ -12,6 +12,14 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`!` applied to a type is a clear compile error.** `!Int` (or any `!T` naming a
+  type — the look of a leading-`!` error-union *type* written in value position)
+  used to type-check and then fail at runtime with an opaque
+  `UnsupportedNegOperand`; it now reports a located "cannot apply `!` to a type"
+  diagnostic. Logical-not on a `Bool`, command, or thread is unchanged.
+
 ### Added
 
 - **`match` on a type narrows built-in container/optional patterns.** A type-match

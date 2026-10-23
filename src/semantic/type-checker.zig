@@ -4566,10 +4566,39 @@ pub const TypeChecker = struct {
         errdefer |err| self.log(@src().fn_name ++ ": error {}", .{err}) catch {};
         try self.logTypeCheckTrace(@src().fn_name, unary.span);
 
-        // TODO: add checking operator type compatability
+        // TODO: add fuller operator/operand type checking.
 
         try self.runExpression(scope, unary.operand);
-        _ = try self.resolveExprType(scope, unary.operand);
+        const operand_type = try self.resolveExprType(scope, unary.operand);
+
+        // `!T` where `T` is a type reads as logical-not applied to a type value,
+        // which has no boolean meaning and otherwise fails only at runtime with an
+        // opaque `UnsupportedNegOperand`. (A leading-`!` *error-union type* — the
+        // likely intent — is not a value-position expression.) Report it here.
+        if (unary.op == .logical_not and self.operandIsType(scope, unary.operand, operand_type)) {
+            try self.reportSpanError(
+                unary.span,
+                Error.TypeMismatch,
+                .@"error",
+                "cannot apply `!` to a type; a leading-`!` error-union type is not valid in value position",
+                .{},
+            );
+        }
+    }
+
+    /// Whether an expression denotes a type (a type value, or a bare identifier
+    /// naming a declared type / error set / capture) — used to reject operators
+    /// that have no meaning on a type, such as `!T`. A bare type name has no
+    /// resolvable *value* type, so the `is_type` binding is checked too.
+    fn operandIsType(self: *TypeChecker, scope: *Scope, operand: *ast.Expression, operand_type: ?*const ast.TypeExpr) bool {
+        if (operand.* == .type_value) return true;
+        if (operand_type) |t| {
+            const u = self.unaliasType(t);
+            if (u.* == .type_type or u.* == .type_var) return true;
+        }
+        // A bare type name (`Int`, a constructor, an error set, a captured type)
+        // has no resolvable value type, so recognize it structurally.
+        return self.isTypeIdentifierExpr(scope, operand);
     }
 
     pub fn runBinary(self: *TypeChecker, scope: *Scope, binary: *ast.BinaryExpr) Error!void {
