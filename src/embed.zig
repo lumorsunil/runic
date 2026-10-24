@@ -1,0 +1,334 @@
+//! Embedding facade — Phase 1 of the "embed Runic like Lua" direction
+//! (`future/embedding.md`, roadmap Theme 7).
+//!
+//! This is the library entry point for a host program that wants to run a Runic
+//! script from a source string and get a structured result back — captured
+//! stdout/stderr, an exit code, and a list of diagnostics — instead of the CLI's
+//! terminal rendering. It repackages the orchestration in
+//! `cmd/runic/run_script.zig` (parse → resolve imports → type-check → run)
+//! without the CLI-only concerns (print modes, env overrides, TTY detection).
+//!
+//! Later phases add host-function registration, a `host` module, a capability
+//! sandbox, and richer value marshalling (see the design note).
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
+const document = @import("frontend/document_store.zig");
+const FrontendDocumentStore = document.FrontendDocumentStore;
+const DocumentStore = @import("document_store.zig").DocumentStore;
+const ast = @import("frontend/ast.zig");
+const semantic = @import("semantic/root.zig");
+const TypeChecker = semantic.TypeChecker;
+const Stream = @import("stream.zig").Stream;
+const closeable = @import("closeable.zig");
+const ExitCode = @import("runtime/exit_code.zig").ExitCode;
+const TraceWriter = @import("trace-writer.zig").TraceWriter;
+const Tracer = @import("trace.zig").Tracer;
+const ir = @import("ir.zig");
+
+/// Severity of an embedding diagnostic, mirroring the frontend's.
+pub const Severity = enum { @"error", warning, information, hint };
+
+/// A compile- or run-time diagnostic, flattened for a host. All slices are owned
+/// by the `Outcome`'s arena and live until `Outcome.deinit`.
+pub const Diagnostic = struct {
+    severity: Severity,
+    message: []const u8,
+    /// Source file the diagnostic points at, or null when it has no location.
+    file: ?[]const u8,
+    line: usize,
+    column: usize,
+};
+
+/// The result of running a script. Owns every slice it hands back; call
+/// `deinit` when done.
+pub const Outcome = struct {
+    arena: std.heap.ArenaAllocator,
+    /// The script's exit code, or null when compilation failed (parse / import /
+    /// type-check error) so the script never ran.
+    exit_code: ?ExitCode,
+    /// Everything the script wrote to stdout / stderr.
+    stdout: []const u8,
+    stderr: []const u8,
+    /// Compile and runtime diagnostics (empty on a clean run).
+    diagnostics: []const Diagnostic,
+
+    /// True when the script compiled and ran without any error diagnostic.
+    pub fn ok(self: Outcome) bool {
+        if (self.exit_code == null) return false;
+        for (self.diagnostics) |d| if (d.severity == .@"error") return false;
+        return true;
+    }
+
+    pub fn deinit(self: *Outcome) void {
+        self.arena.deinit();
+    }
+};
+
+pub const Options = struct {
+    /// Logical path for the script; used in diagnostics and import resolution.
+    path: []const u8 = "<embedded>",
+    /// `script.args` visible to the script (e.g. `$1`).
+    args: []const []const u8 = &.{},
+    /// Bytes fed to the script's stdin.
+    stdin: []const u8 = "",
+    verbose: bool = false,
+};
+
+pub const Error = Allocator.Error || error{EmbedRunFailed};
+
+/// Runs `source` as a Runic script and returns a structured `Outcome`. A
+/// compile error yields an `Outcome` with `exit_code == null` and the
+/// diagnostics; a successful compile runs the script and reports its exit code
+/// plus any runtime diagnostic. `Error` is reserved for host-side failures
+/// (allocation, or an unexpected internal error), not script errors.
+pub fn run(gpa: Allocator, io: std.Io, source: []const u8, options: Options) Error!Outcome {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var diagnostics = std.ArrayList(Diagnostic).empty;
+
+    // An embedded run gets its own empty environment for now; a later phase can
+    // let the host seed it.
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+
+    var doc_store = FrontendDocumentStore.init(io, gpa, &env);
+    defer doc_store.deinit();
+
+    const entry = try doc_store.putDocument(options.path, source);
+    const resolved_path = entry.path;
+
+    // Parse the entry document.
+    switch (entry.parser.parseScript(resolved_path)) {
+        .success => {},
+        .err => |e| {
+            try collectDiagnostics(arena, &diagnostics, e.diagnostics());
+            return compileFailure(arena_state, &diagnostics);
+        },
+    }
+    const entry_ast = entry.ast orelse return compileFailure(arena_state, &diagnostics);
+
+    // Resolve (parse) every imported module into the store, recursively — the
+    // type checker expects them already present.
+    if (!try resolveImports(io, gpa, &doc_store.document_store, entry_ast, arena, &diagnostics)) {
+        return compileFailure(arena_state, &diagnostics);
+    }
+
+    // Type-check.
+    var type_checker = TypeChecker.init(io, gpa, &doc_store.document_store, &env, false);
+    defer type_checker.deinit();
+    const tc_result = type_checker.typeCheck(resolved_path) catch return error.EmbedRunFailed;
+    switch (tc_result) {
+        .success => {},
+        .err => |e| {
+            try collectDiagnostics(arena, &diagnostics, e.diagnostics());
+            return compileFailure(arena_state, &diagnostics);
+        },
+    }
+
+    // Wire stdin (from the provided bytes) and capture stdout/stderr.
+    var tracer = Tracer.init(io, gpa, .{ .echo_to_stdout = false });
+    defer tracer.deinit();
+
+    var stdin_reader = std.Io.Reader.fixed(options.stdin);
+    var stdout_capture = std.Io.Writer.Allocating.init(gpa);
+    defer stdout_capture.deinit();
+    var stderr_capture = std.Io.Writer.Allocating.init(gpa);
+    defer stderr_capture.deinit();
+
+    const stdin_stream = Stream(u8).initReaderWriter(gpa, "<<<embed_stdin>>>", .{
+        .close_source = false,
+        .disconnect_source = true,
+        .close_destination = true,
+        .disconnect_destination = true,
+        .keep_open = true,
+        .propagate_eof_on_source_close = true,
+        .preserve_source_on_destination_close = true,
+    }, &tracer) catch return error.EmbedRunFailed;
+    defer stdin_stream.stream.deinit();
+    const stdout_stream = Stream(u8).initReaderWriter(gpa, "<<<embed_stdout>>>", .{
+        .close_source = true,
+        .disconnect_source = true,
+        .close_destination = false,
+        .disconnect_destination = false,
+        .keep_open = true,
+    }, &tracer) catch return error.EmbedRunFailed;
+    defer stdout_stream.stream.deinit();
+    const stderr_stream = Stream(u8).initReaderWriter(gpa, "<<<embed_stderr>>>", .{
+        .close_source = true,
+        .disconnect_source = true,
+        .close_destination = false,
+        .disconnect_destination = false,
+        .keep_open = true,
+    }, &tracer) catch return error.EmbedRunFailed;
+    defer stderr_stream.stream.deinit();
+
+    var stdin_closeable = closeable.ManualCloseable(ExitCode){ .label = "<<<embed_stdin>>>" };
+    var stdout_closeable = closeable.NeverCloses(ExitCode){ .label = "<<<embed_stdout>>>" };
+    var stderr_closeable = closeable.NeverCloses(ExitCode){ .label = "<<<embed_stderr>>>" };
+
+    var wrapped_stdout_buffer: [1024]u8 = undefined;
+    var wrapped_stderr_buffer: [1024]u8 = undefined;
+    var wrapped_stdout = TraceWriter.init(&wrapped_stdout_buffer, &stdout_capture.writer, null, "<<<embed_t_stdout>>>");
+    var wrapped_stderr = TraceWriter.init(&wrapped_stderr_buffer, &stderr_capture.writer, null, "<<<embed_t_stderr>>>");
+
+    stdin_stream.connectSource(closeable.CloseableReader(ExitCode).init(&stdin_reader, &stdin_closeable.closeable)) catch return error.EmbedRunFailed;
+    stdout_stream.connectDestination(closeable.CloseableWriter(ExitCode).init(&wrapped_stdout.writer, &stdout_closeable.closeable)) catch return error.EmbedRunFailed;
+    stderr_stream.connectDestination(closeable.CloseableWriter(ExitCode).init(&wrapped_stderr.writer, &stderr_closeable.closeable)) catch return error.EmbedRunFailed;
+
+    var result = ir.runner.runIR(gpa, &doc_store.document_store, &entry.ast.?, .{
+        .io = io,
+        .verbose = options.verbose,
+        .dry_run = false,
+        .script_args = options.args,
+        .env = &env,
+        .stdin = stdin_stream,
+        .stdout = stdout_stream,
+        .stderr = stderr_stream,
+        .stdout_is_tty = false,
+        .stderr_is_tty = false,
+        .tracer = &tracer,
+    }) catch return error.EmbedRunFailed;
+    defer result.deinit();
+
+    // Push any bytes still buffered in the trace writers into the capture
+    // buffers before reading them.
+    wrapped_stdout.writer.flush() catch {};
+    wrapped_stderr.writer.flush() catch {};
+
+    var exit_code: ?ExitCode = null;
+    switch (result) {
+        .success => |code| exit_code = code,
+        .err => |e| try collectDiagnostics(arena, &diagnostics, e.diagnostics()),
+    }
+
+    // Allocate everything into the arena *before* moving it into the result:
+    // struct fields initialize in order, so `.arena = arena_state` would snapshot
+    // the arena before these allocations and strand them in the discarded local.
+    const out = try arena.dupe(u8, stdout_capture.written());
+    const err = try arena.dupe(u8, stderr_capture.written());
+    const diags = try diagnostics.toOwnedSlice(arena);
+    return .{
+        .arena = arena_state,
+        .exit_code = exit_code,
+        .stdout = out,
+        .stderr = err,
+        .diagnostics = diags,
+    };
+}
+
+/// Builds a compile-failure `Outcome` (no run; `exit_code == null`) with no
+/// captured output and the collected diagnostics.
+fn compileFailure(arena_state: std.heap.ArenaAllocator, diagnostics: *std.ArrayList(Diagnostic)) Error!Outcome {
+    var state = arena_state;
+    // Finish the arena allocation before the struct literal moves the arena (see
+    // the ordering note in `run`).
+    const diags = try diagnostics.toOwnedSlice(state.allocator());
+    return .{
+        .arena = state,
+        .exit_code = null,
+        .stdout = "",
+        .stderr = "",
+        .diagnostics = diags,
+    };
+}
+
+/// Flattens any diagnostic list (parser / type-checker / IR all share the
+/// `span()`/`severity()`/`message` interface) into the owned `Diagnostic` form,
+/// duping every string into `arena`.
+fn collectDiagnostics(arena: Allocator, out: *std.ArrayList(Diagnostic), diags: anytype) Allocator.Error!void {
+    for (diags) |d| {
+        const maybe_span: ?ast.Span = d.span();
+        try out.append(arena, .{
+            .severity = parseSeverity(d.severity()),
+            .message = try arena.dupe(u8, d.message),
+            .file = if (maybe_span) |s| try arena.dupe(u8, s.start.file) else null,
+            .line = if (maybe_span) |s| s.start.line else 0,
+            .column = if (maybe_span) |s| s.start.column else 0,
+        });
+    }
+}
+
+fn parseSeverity(name: []const u8) Severity {
+    return std.meta.stringToEnum(Severity, name) orelse .@"error";
+}
+
+/// Parses every module imported (transitively) by `script` into the store, so
+/// the type checker finds them. Returns false if any imported module failed to
+/// parse (its diagnostics are collected). Walks top-level `import "…"` and
+/// `const m = import "…"` statements — the positions imports occupy in practice.
+fn resolveImports(
+    io: std.Io,
+    gpa: Allocator,
+    ds: *DocumentStore,
+    script: ast.Script,
+    arena: Allocator,
+    diagnostics: *std.ArrayList(Diagnostic),
+) Error!bool {
+    var ok = true;
+    for (script.statements) |stmt| {
+        const expr: ?*const ast.Expression = switch (stmt.*) {
+            .expression => |e| e.expression,
+            .binding_decl => |b| b.initializer,
+            else => null,
+        };
+        const imp = if (expr) |e| switch (e.*) {
+            .import_expr => |import_expr| import_expr,
+            else => continue,
+        } else continue;
+
+        const module_path = document.resolveModulePath(io, gpa, imp.importer, imp.module_name) catch {
+            ok = false;
+            continue;
+        };
+        defer gpa.free(module_path);
+
+        // Already parsed (also breaks import cycles).
+        if ((ds.getAst(module_path) catch null) != null) continue;
+
+        const module_parser = ds.getParser(module_path) catch {
+            ok = false;
+            continue;
+        };
+        switch (module_parser.parseScript(module_path)) {
+            .success => |module_ast| {
+                if (!try resolveImports(io, gpa, ds, module_ast, arena, diagnostics)) ok = false;
+            },
+            .err => |e| {
+                try collectDiagnostics(arena, diagnostics, e.diagnostics());
+                ok = false;
+            },
+        }
+    }
+    return ok;
+}
+
+test "runs a script and captures stdout" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+
+    var outcome = try run(gpa, threaded.io(), "echo \"hello embed\"\n", .{});
+    defer outcome.deinit();
+
+    try std.testing.expect(outcome.ok());
+    try std.testing.expectEqualStrings("hello embed\n", outcome.stdout);
+    try std.testing.expectEqual(@as(usize, 0), outcome.diagnostics.len);
+}
+
+test "a type error comes back as a structured diagnostic, not a run" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+
+    var outcome = try run(gpa, threaded.io(), "const n: Int = \"not a number\"\n", .{});
+    defer outcome.deinit();
+
+    try std.testing.expect(!outcome.ok());
+    try std.testing.expectEqual(@as(?ExitCode, null), outcome.exit_code);
+    try std.testing.expect(outcome.diagnostics.len >= 1);
+    try std.testing.expectEqual(Severity.@"error", outcome.diagnostics[0].severity);
+}

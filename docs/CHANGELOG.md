@@ -12,6 +12,15 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ## [Unreleased]
 
+### Added
+
+- **Embedding facade (`runic.embed.run`).** A host Zig program can run a Runic
+  script from a source string and get a structured `Outcome` back — captured
+  stdout/stderr, an exit code (null on a compile error), and a flattened
+  diagnostic list — instead of the CLI's terminal rendering. Phase 1 of the
+  "embed Runic like Lua" direction (`future/embedding.md`); host-function
+  registration, a `host` module, and a sandbox come in later phases.
+
 ### Fixed
 
 - **`!` applied to a type is a clear compile error.** `!Int` (or any `!T` naming a

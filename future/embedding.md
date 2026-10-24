@@ -1,7 +1,12 @@
 # Embedding Runic as a scripting runtime
 
-Status: **design / not started.** This note captures direction; nothing here is
-implemented yet. The roadmap entry is Theme 7 in `docs/plan.md`.
+Status: **Phase 1 landed; Phases 2+ not started.** `runic.embed.run` (in
+`src/embed.zig`) runs a script from a source string and returns a structured
+`Outcome` (captured stdout/stderr, an exit code or null on compile error, and a
+flattened diagnostic list). Feeding the script's *stdin* from the provided bytes
+is deferred within Phase 1 — it exercises the delicate top-level-stdin pipe path
+and is not needed to unblock host integration. The roadmap entry is Theme 7 in
+`docs/plan.md`.
 
 ## Goal
 
@@ -137,9 +142,16 @@ to the host in the `RunResult` rather than being printed.
 
 ## Phasing
 
-1. **Facade + run-a-string** — `runic.Embed.init` / `run` returning a structured
-   result with captured output and diagnostics. Mostly repackaging
-   `run_script.zig`; no new language surface. Unblocks host integration tests.
+1. **Facade + run-a-string** — **landed.** `runic.embed.run(gpa, io, source,
+   options)` returns an `Outcome { exit_code, stdout, stderr, diagnostics }`,
+   capturing output into buffers and flattening parser/type-checker/runtime
+   diagnostics into a host-friendly `{ severity, message, file, line, column }`.
+   Repackages the `run_script.zig` orchestration (parse → resolve imports →
+   type-check → run) minus the CLI-only concerns. Stdin delivery from
+   `options.stdin` is deferred (the fixed-reader → stream wiring didn't deliver
+   to a top-level `&0`; revisit with the real-stdin pipe semantics). Import
+   resolution currently walks top-level `import`/`const … = import` statements —
+   the common positions; a later pass can share the CLI's full AST walk.
 2. **Scalar host functions** — registry + type-checker declaration + native-call
    dispatch + scalar marshalling + the `import "host"` module. The core of the
    feature; a script can call back into the host with `Int`/`Float`/`Bool`/
