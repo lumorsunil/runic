@@ -26,6 +26,8 @@ pub const IRConfig = struct {
     stdout_is_tty: bool = false,
     stderr_is_tty: bool = false,
     tracer: *Tracer,
+    /// Host functions an embedding registered (empty for the CLI).
+    host_functions: []const @import("../host.zig").HostFn = &.{},
     // stdin: CloseableReader(ExitCode),
     // stdout: CloseableWriter(ExitCode),
     // stderr: CloseableWriter(ExitCode),
@@ -113,6 +115,7 @@ pub const IRRunner = struct {
                 .stderr_is_tty = self.config.stderr_is_tty,
                 .tracer = self.config.tracer,
                 .pipe_allocator = self.free_allocator,
+                .host_functions = self.config.host_functions,
             },
             context,
         );

@@ -1,12 +1,22 @@
 # Embedding Runic as a scripting runtime
 
-Status: **Phase 1 landed; Phases 2+ not started.** `runic.embed.run` (in
+Status: **Phases 1–2 landed; Phases 3+ not started.** `runic.embed.run` (in
 `src/embed.zig`) runs a script from a source string and returns a structured
 `Outcome` (captured stdout/stderr, an exit code or null on compile error, and a
-flattened diagnostic list). Feeding the script's *stdin* from the provided bytes
-is deferred within Phase 1 — it exercises the delicate top-level-stdin pipe path
-and is not needed to unblock host integration. The roadmap entry is Theme 7 in
-`docs/plan.md`.
+flattened diagnostic list). A host can register functions (`options.host_functions`,
+`runic.embed.HostFn`) that the script calls **like commands** (`greet "world"`):
+when the evaluator is about to spawn a command whose name is registered, it calls
+the host callback instead, passing the string arguments and writing the returned
+string to the command's stdout. Feeding the script's *stdin* from the provided
+bytes is deferred within Phase 1. The roadmap entry is Theme 7 in `docs/plan.md`.
+
+The realized Phase 2 deliberately chose the **command-interception** model over
+the `import "host"` module sketched below: it reuses the entire external-command
+pipeline (type-checked as an executable, captured by binding, piped) and needed
+**no type-checker or IR changes** — only a dispatch hook at the two spawn sites
+in the evaluator. The trade-offs, now deferred to later phases: everything is
+string-marshalled (the command model), host functions are ambient command names
+rather than a namespaced module, and there are no typed signatures yet.
 
 ## Goal
 
@@ -152,10 +162,20 @@ to the host in the `RunResult` rather than being printed.
    to a top-level `&0`; revisit with the real-stdin pipe semantics). Import
    resolution currently walks top-level `import`/`const … = import` statements —
    the common positions; a later pass can share the CLI's full AST walk.
-2. **Scalar host functions** — registry + type-checker declaration + native-call
-   dispatch + scalar marshalling + the `import "host"` module. The core of the
-   feature; a script can call back into the host with `Int`/`Float`/`Bool`/
-   `String`.
+2. **Host functions callable from a script** — **landed**, via the
+   command-interception model (not the `import "host"` module originally
+   sketched). `options.host_functions` registers `{ name, callback, ctx }`; a
+   call to that name (`greet "world"`) dispatches to the Zig callback with the
+   string arguments, and the callback's returned string becomes the command's
+   stdout — captured by a binding (`const m = greet "x"`), piped, or printed,
+   with an exit code. Implemented as a dispatch hook at the evaluator's two spawn
+   sites (`spawnSimpleExec` and the `.exec` handler, the latter producing a
+   synthetic already-closed closeable so `wait` works unchanged); shared types in
+   `src/host.zig` avoid an import cycle. No type-checker or IR changes.
+   Deferred to later phases: **typed signatures** and non-string marshalling
+   (`Int`/`Float`/`Bool` arrive as strings today), a namespaced **`import "host"`
+   module** instead of ambient command names, and interception of host calls on
+   the *other* exec paths if any surface.
 3. **Sandbox config** — deny-by-default exec/FS/FFI for embedded mode, gated by
    the capability config.
 4. **Richer marshalling** — arrays, maps, structs, optionals, and bidirectional

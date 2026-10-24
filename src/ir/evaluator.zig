@@ -12,6 +12,8 @@ const compiler = runic.ir.compiler;
 const CImportCloseable = @import("../ffi/cimport.zig").CImportCloseable;
 const ResolvedExtern = @import("../ffi/cimport.zig").ResolvedExtern;
 const ffi = @import("../ffi/libffi.zig");
+const host = @import("../host.zig");
+const closeable_mod = @import("../closeable.zig");
 const CType = @import("../ffi/ctype.zig").CType;
 const CSig = @import("../ffi/ctype.zig").CSig;
 
@@ -129,6 +131,10 @@ pub const IREvaluator = struct {
         /// for freeing per-stage pipes during the run (P1). Falls back to
         /// `self.allocator` when null (tests, debugger), preserving old behavior.
         pipe_allocator: ?Allocator = null,
+        /// Host functions an embedding registered. A command whose name matches
+        /// one is dispatched to its callback instead of being spawned as a
+        /// process. Empty for the CLI and normal runs.
+        host_functions: []const host.HostFn = &.{},
     };
 
     pub fn init(
@@ -572,6 +578,12 @@ pub const IREvaluator = struct {
         const stdout_pipe = try self.context.getPipe(stdout_handle);
         const stderr_pipe = try self.context.getPipe(stderr_handle);
 
+        // An embedding may register host functions the script calls like a
+        // command; dispatch to the callback instead of spawning a process.
+        if (host.lookup(self.config.host_functions, argv_slice[0])) |host_fn| {
+            return try self.callHostFunction(host_fn, argv_slice, stdout_pipe);
+        }
+
         const stdin_behavior = self.childStdinBehavior(stdin_pipe);
         const stdout_behavior = try self.childStdIoBehavior(stdout_pipe, self.config.stdout, self.config.stdout_is_tty);
         const stderr_behavior = try self.childStdIoBehavior(stderr_pipe, self.config.stderr, self.config.stderr_is_tty);
@@ -617,6 +629,38 @@ pub const IREvaluator = struct {
         };
 
         return exit_code;
+    }
+
+    /// Dispatches a command call to a registered host function instead of
+    /// spawning a process (embedding, Phase 2). Writes the callback's `output`
+    /// to the call's stdout pipe — captured by a binding / piped onward exactly
+    /// like a real command's stdout — and returns its exit code. Synchronous, so
+    /// the return itself signals completion (no process to reap).
+    fn callHostFunction(
+        self: *IREvaluator,
+        host_fn: *const host.HostFn,
+        argv_slice: []const []const u8,
+        stdout_pipe: *ReaderWriterStream,
+    ) Error!ExitCode {
+        const response = host_fn.callback(.{
+            .args = argv_slice[1..],
+            .ctx = host_fn.ctx,
+            .arena = self.allocator,
+        });
+
+        if (response.output.len > 0) {
+            const writer = stdout_pipe.closeableWriter().writer;
+            try writer.writeAll(response.output);
+            try writer.flush();
+        }
+        // Drain whatever landed in the pipe buffer to its destination, mirroring
+        // the post-wait forward in `spawnSimpleExec`.
+        while (true) {
+            const event = try stdout_pipe.forward(.unlimited);
+            if (event != .not_done) break;
+        }
+
+        return .fromByte(response.exit_code);
     }
 
     fn childStdIoBehavior(
@@ -2121,6 +2165,21 @@ pub const IREvaluator = struct {
                 const stdin_pipe = try self.context.getPipe(stdin_handle);
                 const stdout_pipe = try self.context.getPipe(stdout_handle);
                 const stderr_pipe = try self.context.getPipe(stderr_handle);
+
+                // Host-function dispatch (embedding): call the registered
+                // callback instead of spawning. The result is a synthetic
+                // already-closed closeable carrying the exit code, so the usual
+                // `wait` + result handling work unchanged; the output was written
+                // straight to the stdout pipe.
+                if (host.lookup(self.config.host_functions, argv_slice[0])) |host_fn| {
+                    const code = try self.callHostFunction(host_fn, argv_slice, stdout_pipe);
+                    const mc = try self.allocator.create(closeable_mod.ManualCloseable(ExitCode));
+                    mc.* = .{ .label = "<<<host_fn>>>" };
+                    mc.setResult(code);
+                    const handle = try self.context.addCloseable(&mc.closeable);
+                    thread.private.result_register = .{ .closeable = handle };
+                    return .cont;
+                }
 
                 const stdin_behavior = self.childStdinBehavior(stdin_pipe);
                 const stdout_behavior = try self.childStdIoBehavior(stdout_pipe, self.config.stdout, self.config.stdout_is_tty);

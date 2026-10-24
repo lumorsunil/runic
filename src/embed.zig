@@ -26,6 +26,13 @@ const ExitCode = @import("runtime/exit_code.zig").ExitCode;
 const TraceWriter = @import("trace-writer.zig").TraceWriter;
 const Tracer = @import("trace.zig").Tracer;
 const ir = @import("ir.zig");
+const host = @import("host.zig");
+
+/// Host-function types, re-exported so a host program references them as
+/// `runic.embed.HostFn` / `.Call` / `.Response` without reaching into `host.zig`.
+pub const HostFn = host.HostFn;
+pub const Call = host.Call;
+pub const Response = host.Response;
 
 /// Severity of an embedding diagnostic, mirroring the frontend's.
 pub const Severity = enum { @"error", warning, information, hint };
@@ -74,6 +81,10 @@ pub const Options = struct {
     /// Bytes fed to the script's stdin.
     stdin: []const u8 = "",
     verbose: bool = false,
+    /// Host functions the script can call like commands (`greet "world"`). A
+    /// call to one of these names is dispatched to its callback instead of
+    /// spawning a process. The slice (and each `name`/`ctx`) must outlive `run`.
+    host_functions: []const HostFn = &.{},
 };
 
 pub const Error = Allocator.Error || error{EmbedRunFailed};
@@ -191,6 +202,7 @@ pub fn run(gpa: Allocator, io: std.Io, source: []const u8, options: Options) Err
         .stdout_is_tty = false,
         .stderr_is_tty = false,
         .tracer = &tracer,
+        .host_functions = options.host_functions,
     }) catch return error.EmbedRunFailed;
     defer result.deinit();
 
@@ -317,6 +329,68 @@ test "runs a script and captures stdout" {
     try std.testing.expect(outcome.ok());
     try std.testing.expectEqualStrings("hello embed\n", outcome.stdout);
     try std.testing.expectEqual(@as(usize, 0), outcome.diagnostics.len);
+}
+
+fn greetHost(call: Call) Response {
+    const name = if (call.args.len > 0) call.args[0] else "stranger";
+    const out = std.fmt.allocPrint(call.arena, "Hello, {s}!", .{name}) catch return .{ .exit_code = 1 };
+    return .{ .output = out };
+}
+
+fn sumHost(call: Call) Response {
+    var total: i64 = 0;
+    for (call.args) |a| total += std.fmt.parseInt(i64, a, 10) catch return .{ .exit_code = 1 };
+    const out = std.fmt.allocPrint(call.arena, "{d}", .{total}) catch return .{ .exit_code = 1 };
+    return .{ .output = out };
+}
+
+test "a script calls a registered host function (unbound, to stdout)" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+
+    const funcs = [_]HostFn{.{ .name = "greet", .callback = greetHost }};
+    var outcome = try run(gpa, threaded.io(), "greet \"world\"\n", .{ .host_functions = &funcs });
+    defer outcome.deinit();
+
+    try std.testing.expect(outcome.ok());
+    try std.testing.expectEqualStrings("Hello, world!", outcome.stdout);
+}
+
+test "a script captures a host function's result in a binding" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+
+    const funcs = [_]HostFn{.{ .name = "greet", .callback = greetHost }};
+    var outcome = try run(
+        gpa,
+        threaded.io(),
+        "const msg = greet \"world\"\necho \"${msg}\"\n",
+        .{ .host_functions = &funcs },
+    );
+    defer outcome.deinit();
+
+    try std.testing.expect(outcome.ok());
+    try std.testing.expectEqualStrings("Hello, world!\n", outcome.stdout);
+}
+
+test "a host function receives multiple arguments and its result pipes onward" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+
+    const funcs = [_]HostFn{.{ .name = "sum", .callback = sumHost }};
+    var outcome = try run(
+        gpa,
+        threaded.io(),
+        "const total = sum \"2\" \"3\" \"4\"\necho \"total=${total}\"\n",
+        .{ .host_functions = &funcs },
+    );
+    defer outcome.deinit();
+
+    try std.testing.expect(outcome.ok());
+    try std.testing.expectEqualStrings("total=9\n", outcome.stdout);
 }
 
 test "a type error comes back as a structured diagnostic, not a run" {

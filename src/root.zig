@@ -22,6 +22,7 @@ pub const ir = @import("ir.zig");
 pub const trace = @import("trace.zig");
 pub const signals = @import("signals.zig");
 pub const embed = @import("embed.zig");
+pub const host = @import("host.zig");
 
 // Aggregate the runtime module's unit tests. `zig build test` only runs test
 // declarations from files it actually pulls into the test binary; a top-level

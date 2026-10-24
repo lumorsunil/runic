@@ -18,8 +18,13 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   script from a source string and get a structured `Outcome` back — captured
   stdout/stderr, an exit code (null on a compile error), and a flattened
   diagnostic list — instead of the CLI's terminal rendering. Phase 1 of the
-  "embed Runic like Lua" direction (`future/embedding.md`); host-function
-  registration, a `host` module, and a sandbox come in later phases.
+  "embed Runic like Lua" direction (`future/embedding.md`).
+- **Host functions callable from an embedded script.** A host registers
+  functions via `options.host_functions` (`runic.embed.HostFn`); the script
+  calls them like commands (`greet "world"`) and the call dispatches to the Zig
+  callback with the string arguments, its returned string becoming the command's
+  stdout — captured by a binding, piped, or printed. Phase 2 of embedding; a
+  capability sandbox and typed/namespaced host functions come later.
 
 ### Fixed
 
