@@ -42,8 +42,10 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   returning marshalled scalar values (Int/Float/Bool/String) instead of strings.
   The type checker injects the host-declared signature, the call lowers to a new
   `native_call` IR instruction, and the evaluator marshals `Value`↔host around the
-  callback. Phase 5a of embedding; non-scalar marshalling and an `import "host"`
-  namespace come later.
+  callback. Phase 5a of embedding. Phase 5b adds **arrays and optionals** both
+  directions — `Ty`/`Value` nest (`.{ .array = &elem }`, `.{ .optional = &child }`),
+  so a typed host function can take/return `[]Int`, `?Int`, etc. Structs/maps,
+  error returns, and an `import "host"` namespace come later.
 
 ### Fixed
 

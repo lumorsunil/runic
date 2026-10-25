@@ -1,6 +1,6 @@
 # Embedding Runic as a scripting runtime
 
-Status: **Phases 1–4 and 5a landed; 5b+ not started.** `runic.embed.run` (in
+Status: **Phases 1–4, 5a, and 5b landed; 5c+ not started.** `runic.embed.run` (in
 `src/embed.zig`) runs a script from a source string and returns a structured
 `Outcome` (captured stdout/stderr, an exit code or null on compile error, and a
 flattened diagnostic list). A host can register functions (`options.host_functions`,
@@ -215,9 +215,12 @@ to the host in the `RunResult` rather than being printed.
    resolves the args, marshals `ir.value.Value` ↔ `host.Value`, invokes the
    callback, and marshals the result back. Exposure is ambient (like Phase 2);
    both `host_functions` (string) and `typed_host_functions` can be registered.
-   Remaining: **5b** non-scalar marshalling (arrays, maps, structs, optionals,
-   error returns), and **5c** an `import "host"` namespace instead of ambient
-   names.
+   **5b landed** — arrays and optionals, both directions: `Ty`/`Value` are
+   recursive (`.{ .array = &elem }`, `.{ .optional = &child }`), the type checker
+   builds the nested `[]T`/`?T` annotation, and the evaluator marshals a runtime
+   heap array (`.seq_len` header + elements) ↔ `host.Value.array` and `.null` ↔
+   an absent optional. Remaining: **5b-rest** structs/maps and error returns, and
+   **5c** an `import "host"` namespace instead of ambient names.
 6. **C ABI facade (deferred, maybe out of scope)** — a stable C header so
    non-Zig hosts can embed, mirroring Lua's C API. Large; only if there is real
    demand. Zig hosts are the near-term target.

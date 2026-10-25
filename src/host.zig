@@ -63,15 +63,29 @@ pub fn lookup(functions: []const HostFn, name: []const u8) ?*const HostFn {
 // declared with a Runic signature and called as a function (`add 2 3`), passing
 // and returning Runic *values* rather than strings. Phase 5a supports scalars.
 
-/// A scalar type in a typed host-function signature.
-pub const Ty = enum { int, float, bool, string };
+/// A type in a typed host-function signature. Scalars (Phase 5a) plus arrays and
+/// optionals (Phase 5b); arrays/optionals nest via the element/child pointer,
+/// e.g. `const e: Ty = .int; const t: Ty = .{ .array = &e };` for `[]Int`.
+pub const Ty = union(enum) {
+    int,
+    float,
+    bool,
+    string,
+    /// `[]element`
+    array: *const Ty,
+    /// `?child`
+    optional: *const Ty,
+};
 
-/// A scalar value passed to / returned from a typed host function.
+/// A value passed to / returned from a typed host function. Self-describing, so
+/// a result needs no `Ty`. `null` represents an absent optional.
 pub const Value = union(enum) {
     int: i64,
     float: f64,
     boolean: bool,
     string: []const u8,
+    array: []const Value,
+    null,
 };
 
 /// One invocation of a typed host function.

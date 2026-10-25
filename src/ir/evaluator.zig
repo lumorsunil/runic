@@ -676,7 +676,7 @@ pub const IREvaluator = struct {
     }
 
     /// Marshals a runtime value into a host value for a typed host-function
-    /// argument of declared type `ty` (Phase 5 scalars).
+    /// argument of declared type `ty` (Phase 5: scalars, arrays, optionals).
     fn marshalToHost(self: *IREvaluator, thread: ir.context.IRThreadContext, value: ir.Value, ty: host.Ty) Error!host.Value {
         return switch (ty) {
             .int => .{ .int = switch (value) {
@@ -693,16 +693,39 @@ pub const IREvaluator = struct {
                 try self.materializeString(thread, value, &buf.writer);
                 break :blk .{ .string = try buf.toOwnedSlice() };
             },
+            .optional => |child| if (value == .null) .null else try self.marshalToHost(thread, value, child.*),
+            .array => |element| blk: {
+                // A runtime array is a heap region: slot 0 is the `.seq_len`
+                // header, slots 1.. are the elements. An absent array is `.void`.
+                if (value != .addr) break :blk host.Value{ .array = &.{} };
+                const base = value.addr;
+                const len: usize = @intCast(seqLen(thread.shared.heapGet(base).?));
+                const out = try self.allocator.alloc(host.Value, len);
+                for (0..len) |i| {
+                    out[i] = try self.marshalToHost(thread, thread.shared.heapGet(base + 1 + i).?, element.*);
+                }
+                break :blk .{ .array = out };
+            },
         };
     }
 
     /// Marshals a typed host-function result back into a runtime value.
-    fn marshalFromHost(self: *IREvaluator, value: host.Value) Error!ir.Value {
+    fn marshalFromHost(self: *IREvaluator, thread: ir.context.IRThreadContext, value: host.Value) Error!ir.Value {
         return switch (value) {
             .int => |i| .{ .integer = i },
             .float => |f| .{ .float = f },
             .boolean => |b| .fromBoolean(b),
             .string => |s| .{ .zig_string = try self.allocator.dupe(u8, s) },
+            .null => .null,
+            .array => |elems| blk: {
+                // Build a runtime array: slot 0 = length, slots 1.. = elements.
+                const base_val = try thread.shared.alloc(self.allocator, elems.len + 1);
+                thread.shared.heapGetPtr(base_val.addr).?.* = .{ .seq_len = @intCast(elems.len) };
+                for (elems, 0..) |e, i| {
+                    thread.shared.heapGetPtr(base_val.addr + 1 + i).?.* = try self.marshalFromHost(thread, e);
+                }
+                break :blk base_val;
+            },
         };
     }
 
@@ -2640,7 +2663,7 @@ pub const IREvaluator = struct {
                     args[i] = try self.marshalToHost(thread, v, fn_decl.params[i]);
                 }
                 const response = fn_decl.callback(.{ .args = args, .ctx = fn_decl.ctx, .arena = self.allocator });
-                try self.setLocation(thread, nc.result, try self.marshalFromHost(response.value));
+                try self.setLocation(thread, nc.result, try self.marshalFromHost(thread, response.value));
                 return .cont;
             },
             .wait => |wait| {

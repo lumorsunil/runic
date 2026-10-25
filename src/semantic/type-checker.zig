@@ -2625,7 +2625,7 @@ pub const TypeChecker = struct {
         }
     }
 
-    /// The `TypeExpr` for a host scalar type (embedding).
+    /// The `TypeExpr` for a host type (embedding): scalars, arrays, optionals.
     fn hostTypeExpr(self: *TypeChecker, ty: @import("../host.zig").Ty) Error!*const ast.TypeExpr {
         return switch (ty) {
             .int => self.allocTypeExpression(.{ .integer = .{ .span = .global } }),
@@ -2633,6 +2633,14 @@ pub const TypeChecker = struct {
             .bool => self.allocTypeExpression(.{ .boolean = .{ .span = .global } }),
             .string => self.allocTypeExpression(.{ .array = .{
                 .element = try self.allocTypeExpression(.{ .byte = .{ .span = .global } }),
+                .span = .global,
+            } }),
+            .array => |element| self.allocTypeExpression(.{ .array = .{
+                .element = try self.hostTypeExpr(element.*),
+                .span = .global,
+            } }),
+            .optional => |child| self.allocTypeExpression(.{ .optional = .{
+                .child = try self.hostTypeExpr(child.*),
                 .span = .global,
             } }),
         };

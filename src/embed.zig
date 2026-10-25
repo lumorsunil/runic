@@ -507,8 +507,30 @@ test "a host function's lines marshal to an array through the pipeline" {
     try std.testing.expectEqualStrings("1,2,3,", outcome.stdout);
 }
 
+const int_ty: Ty = .int;
+
 fn addTyped(call: TypedCall) TypedResponse {
     return .{ .value = .{ .int = call.args[0].int + call.args[1].int } };
+}
+
+fn rangeArrTyped(call: TypedCall) TypedResponse {
+    const n: usize = @intCast(call.args[0].int);
+    const items = call.arena.alloc(Value, n) catch return .{ .value = .null };
+    for (0..n) |i| items[i] = .{ .int = @intCast(i + 1) };
+    return .{ .value = .{ .array = items } };
+}
+
+fn sumArrTyped(call: TypedCall) TypedResponse {
+    var total: i64 = 0;
+    for (call.args[0].array) |e| total += e.int;
+    return .{ .value = .{ .int = total } };
+}
+
+fn orZeroTyped(call: TypedCall) TypedResponse {
+    return .{ .value = .{ .int = switch (call.args[0]) {
+        .int => |i| i,
+        else => 0,
+    } } };
 }
 
 fn shoutTyped(call: TypedCall) TypedResponse {
@@ -551,6 +573,60 @@ test "a typed host function passes and returns String values" {
 
     try std.testing.expect(outcome.ok());
     try std.testing.expectEqualStrings("HI bob", outcome.stdout);
+}
+
+test "a typed host function returns an array (Phase 5b)" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+
+    const funcs = [_]TypedHostFn{.{ .name = "range", .params = &.{.int}, .returns = .{ .array = &int_ty }, .callback = rangeArrTyped }};
+    var outcome = try run(
+        gpa,
+        threaded.io(),
+        "const xs: []Int = range 3\nyield \"${xs}\"\n",
+        .{ .typed_host_functions = &funcs },
+    );
+    defer outcome.deinit();
+
+    try std.testing.expect(outcome.ok());
+    try std.testing.expectEqualStrings("[1, 2, 3]", outcome.stdout);
+}
+
+test "a typed host function receives an array argument (Phase 5b)" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+
+    const funcs = [_]TypedHostFn{.{ .name = "sumArr", .params = &.{.{ .array = &int_ty }}, .returns = .int, .callback = sumArrTyped }};
+    var outcome = try run(
+        gpa,
+        threaded.io(),
+        "const xs: []Int = .{ 10, 20, 30 }\nconst n: Int = sumArr xs\nyield \"${n}\"\n",
+        .{ .typed_host_functions = &funcs },
+    );
+    defer outcome.deinit();
+
+    try std.testing.expect(outcome.ok());
+    try std.testing.expectEqualStrings("60", outcome.stdout);
+}
+
+test "a typed host function with an optional argument (Phase 5b)" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+
+    const funcs = [_]TypedHostFn{.{ .name = "orZero", .params = &.{.{ .optional = &int_ty }}, .returns = .int, .callback = orZeroTyped }};
+    var outcome = try run(
+        gpa,
+        threaded.io(),
+        "const some: ?Int = 7\nconst none: ?Int = null\nyield \"${orZero some},${orZero none}\"\n",
+        .{ .typed_host_functions = &funcs },
+    );
+    defer outcome.deinit();
+
+    try std.testing.expect(outcome.ok());
+    try std.testing.expectEqualStrings("7,0", outcome.stdout);
 }
 
 test "a type error comes back as a structured diagnostic, not a run" {
