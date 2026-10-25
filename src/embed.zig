@@ -34,6 +34,12 @@ pub const HostFn = host.HostFn;
 pub const Call = host.Call;
 pub const Response = host.Response;
 pub const Sandbox = host.Sandbox;
+// Typed host functions (Phase 5).
+pub const TypedHostFn = host.TypedHostFn;
+pub const TypedCall = host.TypedCall;
+pub const TypedResponse = host.TypedResponse;
+pub const Ty = host.Ty;
+pub const Value = host.Value;
 
 /// Severity of an embedding diagnostic, mirroring the frontend's.
 pub const Severity = enum { @"error", warning, information, hint };
@@ -86,6 +92,9 @@ pub const Options = struct {
     /// call to one of these names is dispatched to its callback instead of
     /// spawning a process. The slice (and each `name`/`ctx`) must outlive `run`.
     host_functions: []const HostFn = &.{},
+    /// Typed host functions the script calls as functions (`add 2 3`), passing
+    /// and returning marshalled Runic values rather than strings (Phase 5).
+    typed_host_functions: []const TypedHostFn = &.{},
     /// Capability sandbox. Defaults to `.strict` (deny-by-default): the script
     /// can compute and call host functions but can't spawn processes, touch the
     /// filesystem, read/write the environment, or load C libraries. Loosen it
@@ -136,6 +145,7 @@ pub fn run(gpa: Allocator, io: std.Io, source: []const u8, options: Options) Err
 
     // Type-check.
     var type_checker = TypeChecker.init(io, gpa, &doc_store.document_store, &env, false);
+    type_checker.typed_host_functions = options.typed_host_functions;
     defer type_checker.deinit();
     const tc_result = type_checker.typeCheck(resolved_path) catch return error.EmbedRunFailed;
     switch (tc_result) {
@@ -209,6 +219,7 @@ pub fn run(gpa: Allocator, io: std.Io, source: []const u8, options: Options) Err
         .stderr_is_tty = false,
         .tracer = &tracer,
         .host_functions = options.host_functions,
+        .typed_host_functions = options.typed_host_functions,
         .sandbox = options.sandbox,
     }) catch return error.EmbedRunFailed;
     defer result.deinit();
@@ -494,6 +505,52 @@ test "a host function's lines marshal to an array through the pipeline" {
 
     try std.testing.expect(outcome.ok());
     try std.testing.expectEqualStrings("1,2,3,", outcome.stdout);
+}
+
+fn addTyped(call: TypedCall) TypedResponse {
+    return .{ .value = .{ .int = call.args[0].int + call.args[1].int } };
+}
+
+fn shoutTyped(call: TypedCall) TypedResponse {
+    const name = call.args[0].string;
+    const out = std.fmt.allocPrint(call.arena, "HI {s}", .{name}) catch return .{ .value = .{ .string = "" } };
+    return .{ .value = .{ .string = out } };
+}
+
+test "a typed host function passes and returns Int values" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+
+    const funcs = [_]TypedHostFn{.{ .name = "add", .params = &.{ .int, .int }, .returns = .int, .callback = addTyped }};
+    var outcome = try run(
+        gpa,
+        threaded.io(),
+        "const n: Int = add 2 3\nyield \"${n}\"\n",
+        .{ .typed_host_functions = &funcs },
+    );
+    defer outcome.deinit();
+
+    try std.testing.expect(outcome.ok());
+    try std.testing.expectEqualStrings("5", outcome.stdout);
+}
+
+test "a typed host function passes and returns String values" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+
+    const funcs = [_]TypedHostFn{.{ .name = "shout", .params = &.{.string}, .returns = .string, .callback = shoutTyped }};
+    var outcome = try run(
+        gpa,
+        threaded.io(),
+        "const s: String = shout \"bob\"\nyield \"${s}\"\n",
+        .{ .typed_host_functions = &funcs },
+    );
+    defer outcome.deinit();
+
+    try std.testing.expect(outcome.ok());
+    try std.testing.expectEqualStrings("HI bob", outcome.stdout);
 }
 
 test "a type error comes back as a structured diagnostic, not a run" {

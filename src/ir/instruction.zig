@@ -278,6 +278,11 @@ pub const Instruction = struct {
         /// restores `.sf`, and resumes at the saved return address. `%r` (the
         /// return value) is left untouched.
         ret,
+        /// Calls a typed host function (embedding, Phase 5): resolves each `args`
+        /// location to a value, marshals them to host values, invokes the
+        /// registered callback at `index`, and stores the marshalled result in
+        /// `result`.
+        native_call: NativeCall,
 
         pub fn push_(value: ValueSource) @This() {
             return .{ .push = value };
@@ -868,6 +873,15 @@ pub const Instruction = struct {
         ) std.Io.Writer.Error!void {
             try writer.print("{f} args={d}", .{ self.dest, self.args });
         }
+    };
+
+    pub const NativeCall = struct {
+        /// Index into the typed host-function registry.
+        index: usize,
+        /// The argument value locations, in declaration order.
+        args: []const Location,
+        /// Where the marshalled return value is stored.
+        result: Location,
     };
 
     pub const ResolveExitCode = struct {

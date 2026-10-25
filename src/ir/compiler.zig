@@ -13,6 +13,7 @@ const Parser = @import("../frontend/parser.zig").Parser;
 const resolveModulePath = @import("../frontend/document_store.zig").resolveModulePath;
 const CType = @import("../ffi/ctype.zig").CType;
 const CSig = @import("../ffi/ctype.zig").CSig;
+const host = @import("../host.zig");
 const Effects = @import("../semantic/effects.zig");
 const evaluateArithmetic = ir.evaluator.IREvaluator.evaluateArithmetic;
 const evaluateLogical = ir.evaluator.IREvaluator.evaluateLogical;
@@ -643,6 +644,10 @@ pub const IRCompiler = struct {
     comptime_forcing: usize = 0,
     comptime_fn_decls: std.AutoHashMapUnmanaged(usize, *const ast.FunctionDecl) = .empty,
     comptime_depth: usize = 0,
+    /// Typed host functions (embedding, Phase 5). A call to one of these names
+    /// lowers to a `native_call`. Set by the runner from the run config; empty
+    /// for the CLI.
+    typed_host_functions: []const host.TypedHostFn = &.{},
 
     /// Monomorphization. `fn_decl_sources` maps a function's instruction set to
     /// its declaration expression (so a specialization can recompile its body);
@@ -5732,6 +5737,31 @@ pub const IRCompiler = struct {
         return .from(closure_location);
     }
 
+    /// Lowers a call to a typed host function (embedding, Phase 5) to a
+    /// `native_call`: each argument is compiled to a value held in a ref, and the
+    /// instruction marshals them to the registered Zig callback at eval time.
+    fn compileNativeCall(
+        self: *IRCompiler,
+        source: *ast.Expression,
+        index: usize,
+        arguments: []const *ast.Expression,
+    ) Error!Result {
+        const arg_locs = try self.allocator.alloc(ir.Location, arguments.len);
+        for (arguments, 0..) |arg, i| {
+            const compiled = try self.compileExpression(arg);
+            const arg_ref = try self.newRef(source, "native_arg");
+            try self.set(source, arg_ref, stableResultSource(compiled));
+            arg_locs[i] = arg_ref.dereference();
+        }
+        const result_ref = try self.newRef(source, "native_result");
+        try self.addInstruction(.init(.from(source), .{ .native_call = .{
+            .index = index,
+            .args = arg_locs,
+            .result = result_ref,
+        } }));
+        return .from(result_ref.dereference());
+    }
+
     fn compileCall(
         self: *IRCompiler,
         source: *ast.Expression,
@@ -5750,6 +5780,14 @@ pub const IRCompiler = struct {
 
         if (call.callee.* == .identifier) {
             const name = call.callee.identifier.name;
+            // A typed host function (embedding, Phase 5): compile each argument as
+            // a value, push them, and emit a `native_call`. Shadowable by a local
+            // binding of the same name.
+            if (self.lookup(name, .{ .shallow = false }) == null) {
+                if (host.lookupTyped(self.typed_host_functions, name)) |index| {
+                    return self.compileNativeCall(source, index, call.arguments);
+                }
+            }
             // A stream-limiter builtin with an argument (`take n`, `until d`).
             // `first` has none and is handled in `compileIdentifier`.
             if (self.builtinStage(source)) |b| {

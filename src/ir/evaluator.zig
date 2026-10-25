@@ -136,6 +136,9 @@ pub const IREvaluator = struct {
         /// one is dispatched to its callback instead of being spawned as a
         /// process. Empty for the CLI and normal runs.
         host_functions: []const host.HostFn = &.{},
+        /// Typed host functions (embedding, Phase 5) — called as functions with
+        /// marshalled Runic values, dispatched by a `native_call` instruction.
+        typed_host_functions: []const host.TypedHostFn = &.{},
         /// Capability sandbox. Permissive for the CLI / normal runs; an embedding
         /// tightens it (deny-by-default) so an untrusted script can't spawn
         /// processes, touch the filesystem, read/write env, or load C libraries.
@@ -670,6 +673,37 @@ pub const IREvaluator = struct {
         try self.writeHostOutput(stderr_pipe, response.stderr);
 
         return .fromByte(response.exit_code);
+    }
+
+    /// Marshals a runtime value into a host value for a typed host-function
+    /// argument of declared type `ty` (Phase 5 scalars).
+    fn marshalToHost(self: *IREvaluator, thread: ir.context.IRThreadContext, value: ir.Value, ty: host.Ty) Error!host.Value {
+        return switch (ty) {
+            .int => .{ .int = switch (value) {
+                .integer => |n| n,
+                else => return Error.UnsupportedType,
+            } },
+            .float => .{ .float = value.toFloat() orelse return Error.UnsupportedType },
+            .bool => .{ .boolean = switch (value) {
+                .exit_code => |e| e.toBoolean(),
+                else => return Error.UnsupportedType,
+            } },
+            .string => blk: {
+                var buf = std.Io.Writer.Allocating.init(self.allocator);
+                try self.materializeString(thread, value, &buf.writer);
+                break :blk .{ .string = try buf.toOwnedSlice() };
+            },
+        };
+    }
+
+    /// Marshals a typed host-function result back into a runtime value.
+    fn marshalFromHost(self: *IREvaluator, value: host.Value) Error!ir.Value {
+        return switch (value) {
+            .int => |i| .{ .integer = i },
+            .float => |f| .{ .float = f },
+            .boolean => |b| .fromBoolean(b),
+            .string => |s| .{ .zig_string = try self.allocator.dupe(u8, s) },
+        };
     }
 
     /// Writes host-function output into a pipe and drains it to the pipe's
@@ -2597,6 +2631,17 @@ pub const IREvaluator = struct {
                 thread.private.stack_frame = frame.stack_frame;
                 thread.setInstructionCounter(frame.return_addr);
                 return .cont_no_instr_counter_inc;
+            },
+            .native_call => |nc| {
+                const fn_decl = self.config.typed_host_functions[nc.index];
+                const args = try self.allocator.alloc(host.Value, nc.args.len);
+                for (nc.args, 0..) |loc, i| {
+                    const v = try self.resolveLocation(thread, loc);
+                    args[i] = try self.marshalToHost(thread, v, fn_decl.params[i]);
+                }
+                const response = fn_decl.callback(.{ .args = args, .ctx = fn_decl.ctx, .arena = self.allocator });
+                try self.setLocation(thread, nc.result, try self.marshalFromHost(response.value));
+                return .cont;
             },
             .wait => |wait| {
                 const waitee = try self.resolveLocation(thread, wait.waitee);

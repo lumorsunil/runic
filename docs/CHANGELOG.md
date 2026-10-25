@@ -35,8 +35,15 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   carries `stderr` (written to the call's stderr) alongside `output`, and a
   non-zero `exit_code` makes the call a catchable failure (`const x = hostfn ||
   "fallback"`). Structured results already marshal through the pipeline
-  (`hostfn | lines | parseInt` → `[]Int`). Phase 4 of embedding; passing
-  Runic values (not strings) to/from host functions is a later typed-native path.
+  (`hostfn | lines | parseInt` → `[]Int`). Phase 4 of embedding.
+- **Typed host functions pass and return Runic values.** `options.typed_host_functions`
+  (`runic.embed.TypedHostFn` = `{ name, params, returns, callback }`) registers a
+  function the script calls as a function — `const n: Int = add 2 3` — passing and
+  returning marshalled scalar values (Int/Float/Bool/String) instead of strings.
+  The type checker injects the host-declared signature, the call lowers to a new
+  `native_call` IR instruction, and the evaluator marshals `Value`↔host around the
+  callback. Phase 5a of embedding; non-scalar marshalling and an `import "host"`
+  namespace come later.
 
 ### Fixed
 

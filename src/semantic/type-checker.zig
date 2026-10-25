@@ -67,6 +67,10 @@ pub const TypeChecker = struct {
     /// (`ExecutableError`), which are otherwise exempt (bash-like exit-code
     /// model). A `set -e`-style opt-in — off by default.
     strict: bool = false,
+    /// Typed host functions (embedding, Phase 5), declared into each module's
+    /// global scope so a script's `name args…` call type-checks against the
+    /// host-declared signature. Empty for the CLI.
+    typed_host_functions: []const @import("../host.zig").TypedHostFn = &.{},
     /// Stack of the enclosing functions' declared stdout types. Pushed when a
     /// function body is type-checked and consulted by `runYield` so that every
     /// `yield &1` is validated in the scope where it actually appears (e.g.
@@ -421,6 +425,7 @@ pub const TypeChecker = struct {
         scope.* = .init(script.span);
 
         const global_scope = try addGlobalScope(self.arena.allocator(), scope);
+        try self.declareTypedHostFunctions(global_scope);
 
         if (script.signature) |signature| {
             switch (signature.params) {
@@ -2599,6 +2604,38 @@ pub const TypeChecker = struct {
         } else {
             try self.reportSpanError(call.span, Error.UnsupportedExpression, .@"error", "ambiguous call to overloaded '{s}'; annotate the expected type to select an overload", .{name});
         }
+    }
+
+    /// Declares each registered typed host function (embedding, Phase 5) as a
+    /// function-typed binding, so a `name args…` call type-checks against the
+    /// host-declared `(params…) returns` signature.
+    fn declareTypedHostFunctions(self: *TypeChecker, scope: *Scope) Error!void {
+        const arena = self.arena.allocator();
+        for (self.typed_host_functions) |f| {
+            if (scope.bindings.contains(f.name)) continue;
+            const params = try arena.alloc(?*const ast.TypeExpr, f.params.len);
+            for (f.params, 0..) |p, i| params[i] = try self.hostTypeExpr(p);
+            const fn_type = try self.allocTypeExpression(.{ .function = .{
+                .params = .{ ._non_variadic = params },
+                .stdin_type = null,
+                .return_type = try self.hostTypeExpr(f.returns),
+                .span = .global,
+            } });
+            try scope.declare(arena, ast.Identifier.global(f.name), fn_type, true, false);
+        }
+    }
+
+    /// The `TypeExpr` for a host scalar type (embedding).
+    fn hostTypeExpr(self: *TypeChecker, ty: @import("../host.zig").Ty) Error!*const ast.TypeExpr {
+        return switch (ty) {
+            .int => self.allocTypeExpression(.{ .integer = .{ .span = .global } }),
+            .float => self.allocTypeExpression(.{ .float = .{ .span = .global } }),
+            .bool => self.allocTypeExpression(.{ .boolean = .{ .span = .global } }),
+            .string => self.allocTypeExpression(.{ .array = .{
+                .element = try self.allocTypeExpression(.{ .byte = .{ .span = .global } }),
+                .span = .global,
+            } }),
+        };
     }
 
     fn declareFunctionSignature(self: *TypeChecker, scope: *Scope, fn_decl: *ast.FunctionDecl) Error!void {

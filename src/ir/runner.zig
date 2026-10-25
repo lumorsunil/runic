@@ -28,6 +28,8 @@ pub const IRConfig = struct {
     tracer: *Tracer,
     /// Host functions an embedding registered (empty for the CLI).
     host_functions: []const @import("../host.zig").HostFn = &.{},
+    /// Typed host functions an embedding registered (empty for the CLI).
+    typed_host_functions: []const @import("../host.zig").TypedHostFn = &.{},
     /// Capability sandbox (permissive for the CLI; tightened by an embedding).
     sandbox: @import("../host.zig").Sandbox = .permissive,
     // stdin: CloseableReader(ExitCode),
@@ -96,6 +98,7 @@ pub const IRRunner = struct {
             self.config.script_args,
             self.config.env,
         );
+        compiler.typed_host_functions = self.config.typed_host_functions;
         const result = try compiler.compile();
 
         return switch (result) {
@@ -118,6 +121,7 @@ pub const IRRunner = struct {
                 .tracer = self.config.tracer,
                 .pipe_allocator = self.free_allocator,
                 .host_functions = self.config.host_functions,
+                .typed_host_functions = self.config.typed_host_functions,
                 .sandbox = self.config.sandbox,
             },
             context,

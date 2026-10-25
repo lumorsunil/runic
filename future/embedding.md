@@ -1,6 +1,6 @@
 # Embedding Runic as a scripting runtime
 
-Status: **Phases 1–4 landed; Phases 5+ not started.** `runic.embed.run` (in
+Status: **Phases 1–4 and 5a landed; 5b+ not started.** `runic.embed.run` (in
 `src/embed.zig`) runs a script from a source string and returns a structured
 `Outcome` (captured stdout/stderr, an exit code or null on compile error, and a
 flattened diagnostic list). A host can register functions (`options.host_functions`,
@@ -203,12 +203,21 @@ to the host in the `RunResult` rather than being printed.
    IR call lowering + `ir.value.Value` ↔ host marshalling), and host functions
    reading piped **stdin** needs scheduler-cooperative draining of the stdin
    pipe. Both are larger than the command-model work above.
-5. **Typed native host functions + `import "host"`** — the larger follow-on: a
-   host function declared with a Runic signature, namespaced under an imported
-   `host` module, called through a dedicated native-call IR op, with
-   `ir.value.Value` ↔ host marshalling for scalars, arrays, maps, and structs.
-   This is the "sections 3–5 above" design; it reopens the type-checker/IR
-   surface the command-model phases deliberately avoided.
+5. **Typed native host functions** — **5a landed.** A host registers
+   `options.typed_host_functions` (`runic.embed.TypedHostFn` =
+   `{ name, params: []Ty, returns: Ty, callback, ctx }`); the script calls it as
+   an ordinary function (`const n: Int = add 2 3`), passing and returning Runic
+   *values* (scalars: Int/Float/Bool/String) rather than strings. Implemented via
+   the typed native-call path: the type checker injects a function-typed binding
+   per host function into each module's global scope (so the call checks against
+   the declared signature), the IR compiler lowers such a call to a new
+   `native_call` instruction (args compiled to value refs), and the evaluator
+   resolves the args, marshals `ir.value.Value` ↔ `host.Value`, invokes the
+   callback, and marshals the result back. Exposure is ambient (like Phase 2);
+   both `host_functions` (string) and `typed_host_functions` can be registered.
+   Remaining: **5b** non-scalar marshalling (arrays, maps, structs, optionals,
+   error returns), and **5c** an `import "host"` namespace instead of ambient
+   names.
 6. **C ABI facade (deferred, maybe out of scope)** — a stable C header so
    non-Zig hosts can embed, mirroring Lua's C API. Large; only if there is real
    demand. Zig hosts are the near-term target.
