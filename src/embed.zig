@@ -33,6 +33,7 @@ const host = @import("host.zig");
 pub const HostFn = host.HostFn;
 pub const Call = host.Call;
 pub const Response = host.Response;
+pub const Sandbox = host.Sandbox;
 
 /// Severity of an embedding diagnostic, mirroring the frontend's.
 pub const Severity = enum { @"error", warning, information, hint };
@@ -85,6 +86,11 @@ pub const Options = struct {
     /// call to one of these names is dispatched to its callback instead of
     /// spawning a process. The slice (and each `name`/`ctx`) must outlive `run`.
     host_functions: []const HostFn = &.{},
+    /// Capability sandbox. Defaults to `.strict` (deny-by-default): the script
+    /// can compute and call host functions but can't spawn processes, touch the
+    /// filesystem, read/write the environment, or load C libraries. Loosen it
+    /// per capability (e.g. `.{ .allow_exec = true, ... }`) to grant access.
+    sandbox: Sandbox = Sandbox.strict,
 };
 
 pub const Error = Allocator.Error || error{EmbedRunFailed};
@@ -203,6 +209,7 @@ pub fn run(gpa: Allocator, io: std.Io, source: []const u8, options: Options) Err
         .stderr_is_tty = false,
         .tracer = &tracer,
         .host_functions = options.host_functions,
+        .sandbox = options.sandbox,
     }) catch return error.EmbedRunFailed;
     defer result.deinit();
 
@@ -323,7 +330,8 @@ test "runs a script and captures stdout" {
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
 
-    var outcome = try run(gpa, threaded.io(), "echo \"hello embed\"\n", .{});
+    // `echo` is an external command; grant exec since this tests capture.
+    var outcome = try run(gpa, threaded.io(), "echo \"hello embed\"\n", .{ .sandbox = .permissive });
     defer outcome.deinit();
 
     try std.testing.expect(outcome.ok());
@@ -367,7 +375,7 @@ test "a script captures a host function's result in a binding" {
         gpa,
         threaded.io(),
         "const msg = greet \"world\"\necho \"${msg}\"\n",
-        .{ .host_functions = &funcs },
+        .{ .host_functions = &funcs, .sandbox = .permissive },
     );
     defer outcome.deinit();
 
@@ -385,12 +393,58 @@ test "a host function receives multiple arguments and its result pipes onward" {
         gpa,
         threaded.io(),
         "const total = sum \"2\" \"3\" \"4\"\necho \"total=${total}\"\n",
-        .{ .host_functions = &funcs },
+        .{ .host_functions = &funcs, .sandbox = .permissive },
     );
     defer outcome.deinit();
 
     try std.testing.expect(outcome.ok());
     try std.testing.expectEqualStrings("total=9\n", outcome.stdout);
+}
+
+test "the default sandbox denies spawning an external command" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+
+    // `echo` is an external process; the default (strict) sandbox forbids it.
+    var outcome = try run(gpa, threaded.io(), "echo \"hi\"\n", .{});
+    defer outcome.deinit();
+
+    try std.testing.expect(!outcome.ok());
+    try std.testing.expect(outcome.diagnostics.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, outcome.diagnostics[0].message, "sandbox") != null);
+}
+
+test "granting exec lets the script spawn a command" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+
+    var outcome = try run(gpa, threaded.io(), "echo \"hi\"\n", .{ .sandbox = .{
+        .allow_exec = true,
+        .allow_fs = false,
+        .allow_env = false,
+        .allow_ffi = false,
+    } });
+    defer outcome.deinit();
+
+    try std.testing.expect(outcome.ok());
+    try std.testing.expectEqualStrings("hi\n", outcome.stdout);
+}
+
+test "host functions remain callable under the strict sandbox" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+
+    // No exec/fs/env/ffi granted, yet a registered host function still runs —
+    // it is the sanctioned effect surface.
+    const funcs = [_]HostFn{.{ .name = "greet", .callback = greetHost }};
+    var outcome = try run(gpa, threaded.io(), "greet \"world\"\n", .{ .host_functions = &funcs });
+    defer outcome.deinit();
+
+    try std.testing.expect(outcome.ok());
+    try std.testing.expectEqualStrings("Hello, world!", outcome.stdout);
 }
 
 test "a type error comes back as a structured diagnostic, not a run" {

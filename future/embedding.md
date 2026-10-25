@@ -1,6 +1,6 @@
 # Embedding Runic as a scripting runtime
 
-Status: **Phases 1–2 landed; Phases 3+ not started.** `runic.embed.run` (in
+Status: **Phases 1–3 landed; Phases 4+ not started.** `runic.embed.run` (in
 `src/embed.zig`) runs a script from a source string and returns a structured
 `Outcome` (captured stdout/stderr, an exit code or null on compile error, and a
 flattened diagnostic list). A host can register functions (`options.host_functions`,
@@ -176,8 +176,18 @@ to the host in the `RunResult` rather than being printed.
    (`Int`/`Float`/`Bool` arrive as strings today), a namespaced **`import "host"`
    module** instead of ambient command names, and interception of host calls on
    the *other* exec paths if any surface.
-3. **Sandbox config** — deny-by-default exec/FS/FFI for embedded mode, gated by
-   the capability config.
+3. **Sandbox config** — **landed.** `options.sandbox` (`runic.embed.Sandbox`,
+   default `.strict`) gates four surfaces with per-capability booleans —
+   `allow_exec` (spawn an external command), `allow_fs` (file redirects, `cd`),
+   `allow_env` (`$VAR`, `env.set`), `allow_ffi` (`cimport`). A denied operation
+   stops the run with a located `[error]:` diagnostic naming what was blocked.
+   Registered host functions are always callable (the sanctioned effect
+   surface), so a strict script can still compute and call back into the host.
+   Implemented as capability checks at the evaluator's spawn / `cimport_open` /
+   `cd` / `get_env` / `set_env` / `pipe_file` sites, threaded through `IRConfig`
+   and the evaluator `Config` (both default `.permissive`, so the CLI is
+   unchanged). Note: because `echo`/`printf` are external commands, a strict
+   script emits output with `yield` or by calling a host function, not `echo`.
 4. **Richer marshalling** — arrays, maps, structs, optionals, and bidirectional
    error mapping; optional host-provided constants/values.
 5. **C ABI facade (deferred, maybe out of scope)** — a stable C header so

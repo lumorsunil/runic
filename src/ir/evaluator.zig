@@ -78,6 +78,7 @@ pub const Error =
         CImportLoadFailed,
         CImportSymbolNotFound,
         CImportUnsupportedType,
+        SandboxDenied,
     };
 
 pub const Result = union(enum) {
@@ -135,6 +136,10 @@ pub const IREvaluator = struct {
         /// one is dispatched to its callback instead of being spawned as a
         /// process. Empty for the CLI and normal runs.
         host_functions: []const host.HostFn = &.{},
+        /// Capability sandbox. Permissive for the CLI / normal runs; an embedding
+        /// tightens it (deny-by-default) so an untrusted script can't spawn
+        /// processes, touch the filesystem, read/write env, or load C libraries.
+        sandbox: host.Sandbox = .permissive,
     };
 
     pub fn init(
@@ -551,6 +556,14 @@ pub const IREvaluator = struct {
         return error.CommandNotFound;
     }
 
+    /// Stops the run because the sandbox forbids a side-effecting operation.
+    /// Records a specific detail (surfaced as the `[error]:` diagnostic message)
+    /// and returns `SandboxDenied`.
+    fn denySandbox(self: *IREvaluator, comptime fmt: []const u8, args: anytype) Error {
+        self.error_detail = std.fmt.allocPrint(self.allocator, fmt, args) catch null;
+        return error.SandboxDenied;
+    }
+
     fn spawnSimpleExec(
         self: *IREvaluator,
         thread: ir.context.IRThreadContext,
@@ -583,6 +596,9 @@ pub const IREvaluator = struct {
         if (host.lookup(self.config.host_functions, argv_slice[0])) |host_fn| {
             return try self.callHostFunction(host_fn, argv_slice, stdout_pipe);
         }
+
+        if (!self.config.sandbox.allow_exec)
+            return self.denySandbox("running an external command is not permitted in this sandbox: '{s}'", .{argv_slice[0]});
 
         const stdin_behavior = self.childStdinBehavior(stdin_pipe);
         const stdout_behavior = try self.childStdIoBehavior(stdout_pipe, self.config.stdout, self.config.stdout_is_tty);
@@ -1223,6 +1239,8 @@ pub const IREvaluator = struct {
         return switch (instruction.type) {
             .comment => return .skip,
             .cimport_open => |op| {
+                if (!self.config.sandbox.allow_ffi)
+                    return self.denySandbox("loading a C library (cimport) is not permitted in this sandbox: '{s}'", .{op.library_name});
                 const cc = try ffiLibOpen(self.allocator, op, &self.error_detail);
                 const handle = try self.context.addCloseable(&cc.closeable);
                 try self.context.addCImport(handle, cc);
@@ -1334,6 +1352,8 @@ pub const IREvaluator = struct {
                 return .cont;
             },
             .cd => |path_source| {
+                if (!self.config.sandbox.allow_fs)
+                    return self.denySandbox("changing directory is not permitted in this sandbox", .{});
                 const ctx = self.context.getSubshellContextPtr(thread.private.subshell_context);
                 const resolved = try self.resolveValueSource(thread, path_source);
                 const path: []const u8 = if (resolved == .void) blk: {
@@ -2181,6 +2201,9 @@ pub const IREvaluator = struct {
                     return .cont;
                 }
 
+                if (!self.config.sandbox.allow_exec)
+                    return self.denySandbox("running an external command is not permitted in this sandbox: '{s}'", .{argv_slice[0]});
+
                 const stdin_behavior = self.childStdinBehavior(stdin_pipe);
                 const stdout_behavior = try self.childStdIoBehavior(stdout_pipe, self.config.stdout, self.config.stdout_is_tty);
                 const stderr_behavior = try self.childStdIoBehavior(stderr_pipe, self.config.stderr, self.config.stderr_is_tty);
@@ -2326,6 +2349,8 @@ pub const IREvaluator = struct {
                 };
             },
             .get_env => |get_env| {
+                if (!self.config.sandbox.allow_env)
+                    return self.denySandbox("reading the environment ('{s}') is not permitted in this sandbox", .{get_env.name});
                 const ctx = self.context.getSubshellContextPtr(thread.private.subshell_context);
                 const value: ir.Value = if (ctx.env.get(get_env.name)) |text|
                     .{ .zig_string = text }
@@ -2335,6 +2360,8 @@ pub const IREvaluator = struct {
                 return .cont;
             },
             .set_env => |set_env| {
+                if (!self.config.sandbox.allow_env)
+                    return self.denySandbox("writing the environment is not permitted in this sandbox", .{});
                 const ctx = self.context.getSubshellContextPtr(thread.private.subshell_context);
                 const env_map = try self.getOrCreateSubshellEnv(ctx);
                 // A dynamic name (`env.set name value`) is materialized; otherwise
@@ -2378,6 +2405,8 @@ pub const IREvaluator = struct {
                 return .cont;
             },
             .pipe_file => |pipe_file| {
+                if (!self.config.sandbox.allow_fs)
+                    return self.denySandbox("writing to a file (redirect) is not permitted in this sandbox", .{});
                 const pipe_handle = (try self.resolveLocation(thread, pipe_file.pipe)).pipe;
                 const pipe = try self.context.getPipe(pipe_handle);
 

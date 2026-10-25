@@ -28,6 +28,8 @@ pub const IRConfig = struct {
     tracer: *Tracer,
     /// Host functions an embedding registered (empty for the CLI).
     host_functions: []const @import("../host.zig").HostFn = &.{},
+    /// Capability sandbox (permissive for the CLI; tightened by an embedding).
+    sandbox: @import("../host.zig").Sandbox = .permissive,
     // stdin: CloseableReader(ExitCode),
     // stdout: CloseableWriter(ExitCode),
     // stderr: CloseableWriter(ExitCode),
@@ -116,6 +118,7 @@ pub const IRRunner = struct {
                 .tracer = self.config.tracer,
                 .pipe_allocator = self.free_allocator,
                 .host_functions = self.config.host_functions,
+                .sandbox = self.config.sandbox,
             },
             context,
         );
@@ -278,6 +281,10 @@ fn runtimeErrorMessage(allocator: Allocator, err: anyerror, detail: ?[]const u8)
         else
             try std.fmt.allocPrint(allocator, "runtime error: {t}", .{err}),
         error.CImportUnsupportedType => try allocator.dupe(u8, "unsupported type in a C FFI signature"),
+        error.SandboxDenied => if (detail) |d|
+            try allocator.dupe(u8, d)
+        else
+            try allocator.dupe(u8, "operation not permitted in this sandbox"),
         error.UnsupportedForward => try allocator.dupe(u8, "cannot consume a stream before it has been written to"),
         error.OutOfMemory => try allocator.dupe(u8, "out of memory"),
         else => try std.fmt.allocPrint(allocator, "runtime error: {t}", .{err}),

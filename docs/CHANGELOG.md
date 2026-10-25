@@ -23,8 +23,14 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   functions via `options.host_functions` (`runic.embed.HostFn`); the script
   calls them like commands (`greet "world"`) and the call dispatches to the Zig
   callback with the string arguments, its returned string becoming the command's
-  stdout — captured by a binding, piped, or printed. Phase 2 of embedding; a
-  capability sandbox and typed/namespaced host functions come later.
+  stdout — captured by a binding, piped, or printed. Phase 2 of embedding.
+- **Capability sandbox for embedded scripts.** `runic.embed.run`'s
+  `options.sandbox` (default `.strict`) gates four side-effecting surfaces with
+  per-capability flags — `allow_exec` (spawn an external command), `allow_fs`
+  (file redirects / `cd`), `allow_env` (`$VAR` / `env.set`), `allow_ffi`
+  (`cimport`). A denied operation stops the run with a located diagnostic naming
+  what was blocked; registered host functions are always callable. The CLI is
+  unaffected (it runs fully permissive). Phase 3 of embedding.
 
 ### Fixed
 
