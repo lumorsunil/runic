@@ -508,6 +508,23 @@ test "a host function's lines marshal to an array through the pipeline" {
 }
 
 const int_ty: Ty = .int;
+const point_fields = [_]host.Ty.Field{
+    .{ .name = "x", .ty = &int_ty },
+    .{ .name = "y", .ty = &int_ty },
+};
+const point_ty: Ty = .{ .strct = &point_fields };
+
+fn makePointTyped(call: TypedCall) TypedResponse {
+    const vals = call.arena.alloc(Value, 2) catch return .{ .value = .null };
+    vals[0] = .{ .int = call.args[0].int };
+    vals[1] = .{ .int = call.args[1].int };
+    return .{ .value = .{ .strct = vals } };
+}
+
+fn pointSumTyped(call: TypedCall) TypedResponse {
+    const p = call.args[0].strct;
+    return .{ .value = .{ .int = p[0].int + p[1].int } };
+}
 
 fn addTyped(call: TypedCall) TypedResponse {
     return .{ .value = .{ .int = call.args[0].int + call.args[1].int } };
@@ -627,6 +644,42 @@ test "a typed host function with an optional argument (Phase 5b)" {
 
     try std.testing.expect(outcome.ok());
     try std.testing.expectEqualStrings("7,0", outcome.stdout);
+}
+
+test "a typed host function returns a struct (Phase 5b-rest)" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+
+    const funcs = [_]TypedHostFn{.{ .name = "makePoint", .params = &.{ .int, .int }, .returns = point_ty, .callback = makePointTyped }};
+    var outcome = try run(
+        gpa,
+        threaded.io(),
+        "const p: struct { x: Int, y: Int } = makePoint 3 4\nyield \"${p.x},${p.y}\"\n",
+        .{ .typed_host_functions = &funcs },
+    );
+    defer outcome.deinit();
+
+    try std.testing.expect(outcome.ok());
+    try std.testing.expectEqualStrings("3,4", outcome.stdout);
+}
+
+test "a typed host function receives a struct argument (Phase 5b-rest)" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+
+    const funcs = [_]TypedHostFn{.{ .name = "pointSum", .params = &.{point_ty}, .returns = .int, .callback = pointSumTyped }};
+    var outcome = try run(
+        gpa,
+        threaded.io(),
+        "const p: struct { x: Int, y: Int } = .{ .x = 5, .y = 6 }\nconst n: Int = pointSum p\nyield \"${n}\"\n",
+        .{ .typed_host_functions = &funcs },
+    );
+    defer outcome.deinit();
+
+    try std.testing.expect(outcome.ok());
+    try std.testing.expectEqualStrings("11", outcome.stdout);
 }
 
 test "a type error comes back as a structured diagnostic, not a run" {

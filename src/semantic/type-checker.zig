@@ -2650,6 +2650,24 @@ pub const TypeChecker = struct {
                 .child = try self.hostTypeExpr(child.*),
                 .span = .global,
             } }),
+            .strct => |host_fields| blk: {
+                const fields = try self.arena.allocator().alloc(ast.TypeExpr.StructField, host_fields.len);
+                for (host_fields, 0..) |hf, i| fields[i] = .{
+                    .name = ast.Identifier.global(hf.name),
+                    .type_expr = try self.hostTypeExpr(hf.ty.*),
+                    .span = .global,
+                };
+                break :blk self.allocTypeExpression(.{
+                    .struct_type = .{
+                        .fields = fields,
+                        .decls = &.{},
+                        .span = .global,
+                        // Each field is one slot (the field value, or an address for a
+                        // nested struct) — the layout `marshalTo/FromHost` builds.
+                        .by_reference_fields = true,
+                    },
+                });
+            },
         };
     }
 

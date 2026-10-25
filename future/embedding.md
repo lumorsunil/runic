@@ -1,6 +1,6 @@
 # Embedding Runic as a scripting runtime
 
-Status: **Phases 1–4, 5a, and 5b landed; 5c+ not started.** `runic.embed.run` (in
+Status: **Phases 1–4, 5a, 5b (incl. structs) landed; 5c not started.** `runic.embed.run` (in
 `src/embed.zig`) runs a script from a source string and returns a structured
 `Outcome` (captured stdout/stderr, an exit code or null on compile error, and a
 flattened diagnostic list). A host can register functions (`options.host_functions`,
@@ -219,8 +219,16 @@ to the host in the `RunResult` rather than being printed.
    recursive (`.{ .array = &elem }`, `.{ .optional = &child }`), the type checker
    builds the nested `[]T`/`?T` annotation, and the evaluator marshals a runtime
    heap array (`.seq_len` header + elements) ↔ `host.Value.array` and `.null` ↔
-   an absent optional. Remaining: **5b-rest** structs/maps and error returns, and
-   **5c** an `import "host"` namespace instead of ambient names.
+   an absent optional. **5b-rest: structs landed** — a host `Ty.strct` (fields
+   with names + types) and `Value.strct` (field values in order) marshal both
+   directions; the type checker builds a `by_reference_fields` struct type (one
+   slot per field) that the newly-fixed inline-`struct { … }`-annotation
+   inference lets a script bind (`const p: struct { x: Int, y: Int } = makePoint
+   3 4`), and the evaluator builds/reads the struct heap region by that layout.
+   Remaining: **maps** (no first-class Runic type — skipped) and **error
+   returns** (needs the error-set model; a fallible host function is expressible
+   today as `?T` or a result struct). **5c**: an `import "host"` namespace instead
+   of ambient names.
 6. **C ABI facade (deferred, maybe out of scope)** — a stable C header so
    non-Zig hosts can embed, mirroring Lua's C API. Large; only if there is real
    demand. Zig hosts are the near-term target.

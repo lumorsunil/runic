@@ -694,6 +694,17 @@ pub const IREvaluator = struct {
                 break :blk .{ .string = try buf.toOwnedSlice() };
             },
             .optional => |child| if (value == .null) .null else try self.marshalToHost(thread, value, child.*),
+            .strct => |fields| blk: {
+                // A struct value is a heap region; with `by_reference_fields` each
+                // field is one slot, so field i is at base + i (declaration order).
+                if (value != .addr) return Error.UnsupportedType;
+                const base = value.addr;
+                const out = try self.allocator.alloc(host.Value, fields.len);
+                for (fields, 0..) |f, i| {
+                    out[i] = try self.marshalToHost(thread, thread.shared.heapGet(base + i).?, f.ty.*);
+                }
+                break :blk .{ .strct = out };
+            },
             .array => |element| blk: {
                 // A runtime array is a heap region: slot 0 is the `.seq_len`
                 // header, slots 1.. are the elements. An absent array is `.void`.
@@ -717,6 +728,15 @@ pub const IREvaluator = struct {
             .boolean => |b| .fromBoolean(b),
             .string => |s| .{ .zig_string = try self.allocator.dupe(u8, s) },
             .null => .null,
+            .strct => |fields| blk: {
+                // Build a struct heap region: field i at slot i (one slot each,
+                // matching the `by_reference_fields` layout the type carries).
+                const base_val = try thread.shared.alloc(self.allocator, fields.len);
+                for (fields, 0..) |f, i| {
+                    thread.shared.heapGetPtr(base_val.addr + i).?.* = try self.marshalFromHost(thread, f);
+                }
+                break :blk base_val;
+            },
             .array => |elems| blk: {
                 // Build a runtime array: slot 0 = length, slots 1.. = elements.
                 const base_val = try thread.shared.alloc(self.allocator, elems.len + 1);

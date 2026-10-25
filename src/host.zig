@@ -75,6 +75,11 @@ pub const Ty = union(enum) {
     array: *const Ty,
     /// `?child`
     optional: *const Ty,
+    /// A struct type: its fields in declaration order.
+    strct: []const Field,
+
+    /// One field of a struct type.
+    pub const Field = struct { name: []const u8, ty: *const Ty };
 };
 
 /// A value passed to / returned from a typed host function. Self-describing, so
@@ -85,6 +90,8 @@ pub const Value = union(enum) {
     boolean: bool,
     string: []const u8,
     array: []const Value,
+    /// Field values in the struct's declaration order.
+    strct: []const Value,
     null,
 };
 
