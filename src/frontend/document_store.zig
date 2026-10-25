@@ -195,6 +195,15 @@ pub fn resolveModulePath(
         return std.mem.concat(allocator, u8, &.{ ":", trimmed });
     }
 
+    // The reserved `host` namespace (embedding, Theme 7 Phase 5c) resolves to the
+    // virtual `:host` module — a source the embedding facade generates from its
+    // registered typed host functions and puts in the document store before the
+    // run. Outside embedding there is no `:host` document, so `import "host"`
+    // reports "module not found" as usual.
+    if (std.mem.eql(u8, moduleName, "host")) {
+        return allocator.dupe(u8, ":host");
+    }
+
     const dirname = std.fs.path.dirname(importer) orelse "./";
     const relative = try std.fs.path.join(allocator, &.{ dirname, moduleName });
     defer allocator.free(relative);

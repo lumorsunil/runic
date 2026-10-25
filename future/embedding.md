@@ -1,6 +1,6 @@
 # Embedding Runic as a scripting runtime
 
-Status: **Phases 1–4, 5a, 5b (incl. structs) landed; 5c not started.** `runic.embed.run` (in
+Status: **Phases 1–4 and 5 (a, b, c) landed.** `runic.embed.run` (in
 `src/embed.zig`) runs a script from a source string and returns a structured
 `Outcome` (captured stdout/stderr, an exit code or null on compile error, and a
 flattened diagnostic list). A host can register functions (`options.host_functions`,
@@ -213,22 +213,28 @@ to the host in the `RunResult` rather than being printed.
    the declared signature), the IR compiler lowers such a call to a new
    `native_call` instruction (args compiled to value refs), and the evaluator
    resolves the args, marshals `ir.value.Value` ↔ `host.Value`, invokes the
-   callback, and marshals the result back. Exposure is ambient (like Phase 2);
-   both `host_functions` (string) and `typed_host_functions` can be registered.
+   callback, and marshals the result back.
    **5b landed** — arrays and optionals, both directions: `Ty`/`Value` are
    recursive (`.{ .array = &elem }`, `.{ .optional = &child }`), the type checker
    builds the nested `[]T`/`?T` annotation, and the evaluator marshals a runtime
    heap array (`.seq_len` header + elements) ↔ `host.Value.array` and `.null` ↔
    an absent optional. **5b-rest: structs landed** — a host `Ty.strct` (fields
    with names + types) and `Value.strct` (field values in order) marshal both
-   directions; the type checker builds a `by_reference_fields` struct type (one
-   slot per field) that the newly-fixed inline-`struct { … }`-annotation
-   inference lets a script bind (`const p: struct { x: Int, y: Int } = makePoint
-   3 4`), and the evaluator builds/reads the struct heap region by that layout.
-   Remaining: **maps** (no first-class Runic type — skipped) and **error
-   returns** (needs the error-set model; a fallible host function is expressible
-   today as `?T` or a result struct). **5c**: an `import "host"` namespace instead
-   of ambient names.
+   directions; the type checker builds a struct type whose one-slot-per-field
+   layout the newly-fixed inline-`struct { … }`-annotation inference lets a script
+   bind (`const p: struct { x: Int, y: Int } = host.makePoint 3 4`), and the
+   evaluator builds/reads the struct heap region by that layout (nested *struct*
+   fields are not yet supported). **5c landed** — typed host functions are
+   namespaced under `import "host"`: the facade generates a `:host` module source
+   (one `pub fn` wrapper per function, forwarding to an internal `__host_<name>`
+   the compiler dispatches), registered in the document store before the run;
+   `host` resolves to `:host` in `resolveModulePath`. `const host = import "host"`
+   then `host.add 2 3`. (A side improvement this needed: `pipeTypesEqual` treats a
+   resolved scalar and its type-name identifier as equal — e.g. `.integer` vs
+   `.identifier "Int"` — so a struct built with resolved fields matches a parsed
+   `struct { x: Int }`.) Remaining: **maps** (no first-class Runic type — skipped)
+   and **error returns** (needs the error-set model; a fallible host function is
+   expressible today as `?T` or a result struct).
 6. **C ABI facade (deferred, maybe out of scope)** — a stable C header so
    non-Zig hosts can embed, mirroring Lua's C API. Large; only if there is real
    demand. Zig hosts are the near-term target.

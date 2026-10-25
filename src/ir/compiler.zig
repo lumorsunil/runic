@@ -5790,11 +5790,13 @@ pub const IRCompiler = struct {
 
         if (call.callee.* == .identifier) {
             const name = call.callee.identifier.name;
-            // A typed host function (embedding, Phase 5): compile each argument as
-            // a value, push them, and emit a `native_call`. Shadowable by a local
-            // binding of the same name.
-            if (self.lookup(name, .{ .shallow = false }) == null) {
-                if (host.lookupTyped(self.typed_host_functions, name)) |index| {
+            // A typed host function (embedding, Phase 5): the generated `host`
+            // module's wrapper forwards to the internal `__host_<name>` name,
+            // which lowers to a `native_call`. Shadowable by a local binding.
+            if (self.lookup(name, .{ .shallow = false }) == null and
+                std.mem.startsWith(u8, name, host.typed_prefix))
+            {
+                if (host.lookupTyped(self.typed_host_functions, name[host.typed_prefix.len..])) |index| {
                     return self.compileNativeCall(source, index, call.arguments);
                 }
             }

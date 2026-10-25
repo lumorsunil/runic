@@ -55,7 +55,10 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   adds **structs** both directions (`Ty.strct` / `Value.strct`), building on the
   inline-`struct { … }`-annotation inference above — e.g. a host function
   returning `struct { x: Int, y: Int }`. Maps (no first-class Runic type) and
-  error returns (use `?T` today) are out; an `import "host"` namespace comes later.
+  error returns (use `?T` today) are out. Phase 5c namespaces typed host
+  functions under **`import "host"`** — `const host = import "host"` then
+  `host.add 2 3` — via a generated `:host` module (wrappers forwarding to the
+  dispatcher), instead of ambient names.
 
 ### Fixed
 

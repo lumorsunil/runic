@@ -2618,8 +2618,12 @@ pub const TypeChecker = struct {
     /// host-declared `(params…) returns` signature.
     fn declareTypedHostFunctions(self: *TypeChecker, scope: *Scope) Error!void {
         const arena = self.arena.allocator();
+        const prefix = @import("../host.zig").typed_prefix;
         for (self.typed_host_functions) |f| {
-            if (scope.bindings.contains(f.name)) continue;
+            // Exposed under the internal `__host_<name>` name; the generated
+            // `host` module's `host.<name>` wrapper forwards to it.
+            const internal = try std.mem.concat(arena, u8, &.{ prefix, f.name });
+            if (scope.bindings.contains(internal)) continue;
             const params = try arena.alloc(?*const ast.TypeExpr, f.params.len);
             for (f.params, 0..) |p, i| params[i] = try self.hostTypeExpr(p);
             const fn_type = try self.allocTypeExpression(.{ .function = .{
@@ -2628,7 +2632,7 @@ pub const TypeChecker = struct {
                 .return_type = try self.hostTypeExpr(f.returns),
                 .span = .global,
             } });
-            try scope.declare(arena, ast.Identifier.global(f.name), fn_type, true, false);
+            try scope.declare(arena, ast.Identifier.global(internal), fn_type, true, false);
         }
     }
 
@@ -2662,9 +2666,14 @@ pub const TypeChecker = struct {
                         .fields = fields,
                         .decls = &.{},
                         .span = .global,
-                        // Each field is one slot (the field value, or an address for a
-                        // nested struct) — the layout `marshalTo/FromHost` builds.
-                        .by_reference_fields = true,
+                        // Default layout (inline fields) matches the parsed
+                        // `struct { … }` the generated `host` wrapper declares, so
+                        // a yield of this type checks against the wrapper's return.
+                        // Host struct fields are one slot each (scalars/arrays/
+                        // optionals), so `marshalTo/FromHost`'s field-i-at-slot-i
+                        // layout still holds; a nested *struct* field is not yet
+                        // supported.
+                        .by_reference_fields = false,
                     },
                 });
             },
@@ -5366,6 +5375,32 @@ pub const TypeChecker = struct {
         );
     }
 
+    /// The canonical primitive name for a type that *is* a primitive, whether
+    /// written as a resolved scalar (`.integer`) or a type-name identifier
+    /// (`.identifier "Int"`); null for anything else. `String` is `[]Byte`.
+    fn primitiveTypeName(t: *const ast.TypeExpr) ?[]const u8 {
+        return switch (t.*) {
+            .integer => "Int",
+            .float => "Float",
+            .boolean => "Bool",
+            .byte => "Byte",
+            .void => "Void",
+            .array => |a| if (a.element.* == .byte) "String" else null,
+            .identifier => |id| blk: {
+                if (id.path.segments.len != 1) break :blk null;
+                const n = id.path.segments[0].name;
+                if (std.mem.eql(u8, n, "Int")) break :blk "Int";
+                if (std.mem.eql(u8, n, "Float")) break :blk "Float";
+                if (std.mem.eql(u8, n, "Bool") or std.mem.eql(u8, n, "Boole") or std.mem.eql(u8, n, "Boolean")) break :blk "Bool";
+                if (std.mem.eql(u8, n, "Byte")) break :blk "Byte";
+                if (std.mem.eql(u8, n, "Void")) break :blk "Void";
+                if (std.mem.eql(u8, n, "String")) break :blk "String";
+                break :blk null;
+            },
+            else => null,
+        };
+    }
+
     fn pipeTypesEqual(
         self: *TypeChecker,
         left: *const ast.TypeExpr,
@@ -5385,6 +5420,15 @@ pub const TypeChecker = struct {
         // optional-yield check allows, applied structurally.
         if (resolved_left.* == .null and resolved_right.* == .optional) return true;
         if (resolved_left.* == .optional and resolved_right.* == .null) return true;
+
+        // Two references to the same primitive compare equal regardless of form
+        // — a resolved scalar (`.integer`) vs a type-name identifier
+        // (`.identifier "Int"`). This lets a struct built with resolved field
+        // types (a typed host function's injected return) match a `struct { x:
+        // Int }` whose parsed fields are still identifiers.
+        if (primitiveTypeName(resolved_left)) |lp| {
+            if (primitiveTypeName(resolved_right)) |rp| return std.mem.eql(u8, lp, rp);
+        }
 
         if (std.meta.activeTag(resolved_left.*) != std.meta.activeTag(resolved_right.*)) return false;
 

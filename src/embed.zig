@@ -124,6 +124,14 @@ pub fn run(gpa: Allocator, io: std.Io, source: []const u8, options: Options) Err
     var doc_store = FrontendDocumentStore.init(io, gpa, &env);
     defer doc_store.deinit();
 
+    // Expose typed host functions under `import "host"` (Phase 5c): generate the
+    // `:host` module source (one wrapper per function, forwarding to the internal
+    // `__host_<name>`) and register it before parse/import resolution.
+    if (options.typed_host_functions.len > 0) {
+        const host_source = generateHostModule(arena, options.typed_host_functions) catch return error.EmbedRunFailed;
+        _ = try doc_store.putDocument(":host", host_source);
+    }
+
     const entry = try doc_store.putDocument(options.path, source);
     const resolved_path = entry.path;
 
@@ -264,6 +272,54 @@ fn compileFailure(arena_state: std.heap.ArenaAllocator, diagnostics: *std.ArrayL
         .stderr = "",
         .diagnostics = diags,
     };
+}
+
+/// Generates the `:host` module source (Phase 5c): one `pub fn` per typed host
+/// function, forwarding to the internal `__host_<name>` the compiler dispatches.
+fn generateHostModule(arena: Allocator, funcs: []const TypedHostFn) ![]const u8 {
+    var w = std.Io.Writer.Allocating.init(arena);
+    for (funcs) |f| {
+        try w.writer.print("pub fn Void {s}(", .{f.name});
+        for (f.params, 0..) |p, i| {
+            if (i > 0) try w.writer.writeAll(", ");
+            try w.writer.print("a{d}: ", .{i});
+            try renderHostTy(&w.writer, p);
+        }
+        try w.writer.writeAll(") ");
+        try renderHostTy(&w.writer, f.returns);
+        try w.writer.print(" {{ yield {s}{s}", .{ host.typed_prefix, f.name });
+        for (0..f.params.len) |i| try w.writer.print(" a{d}", .{i});
+        try w.writer.writeAll(" }\n");
+    }
+    return w.toOwnedSlice();
+}
+
+/// Renders a host type as Runic type-annotation source.
+fn renderHostTy(w: *std.Io.Writer, ty: Ty) !void {
+    switch (ty) {
+        .int => try w.writeAll("Int"),
+        .float => try w.writeAll("Float"),
+        .bool => try w.writeAll("Bool"),
+        .string => try w.writeAll("String"),
+        .array => |e| {
+            try w.writeAll("[]");
+            try renderHostTy(w, e.*);
+        },
+        .optional => |c| {
+            try w.writeAll("?");
+            try renderHostTy(w, c.*);
+        },
+        .strct => |fields| {
+            try w.writeAll("struct { ");
+            for (fields, 0..) |hf, i| {
+                if (i > 0) try w.writeAll(", ");
+                try w.writeAll(hf.name);
+                try w.writeAll(": ");
+                try renderHostTy(w, hf.ty.*);
+            }
+            try w.writeAll(" }");
+        },
+    }
 }
 
 /// Flattens any diagnostic list (parser / type-checker / IR all share the
@@ -565,7 +621,7 @@ test "a typed host function passes and returns Int values" {
     var outcome = try run(
         gpa,
         threaded.io(),
-        "const n: Int = add 2 3\nyield \"${n}\"\n",
+        "const host = import \"host\"\nconst n: Int = host.add 2 3\nyield \"${n}\"\n",
         .{ .typed_host_functions = &funcs },
     );
     defer outcome.deinit();
@@ -583,7 +639,7 @@ test "a typed host function passes and returns String values" {
     var outcome = try run(
         gpa,
         threaded.io(),
-        "const s: String = shout \"bob\"\nyield \"${s}\"\n",
+        "const host = import \"host\"\nconst s: String = host.shout \"bob\"\nyield \"${s}\"\n",
         .{ .typed_host_functions = &funcs },
     );
     defer outcome.deinit();
@@ -601,7 +657,7 @@ test "a typed host function returns an array (Phase 5b)" {
     var outcome = try run(
         gpa,
         threaded.io(),
-        "const xs: []Int = range 3\nyield \"${xs}\"\n",
+        "const host = import \"host\"\nconst xs: []Int = host.range 3\nyield \"${xs}\"\n",
         .{ .typed_host_functions = &funcs },
     );
     defer outcome.deinit();
@@ -619,7 +675,7 @@ test "a typed host function receives an array argument (Phase 5b)" {
     var outcome = try run(
         gpa,
         threaded.io(),
-        "const xs: []Int = .{ 10, 20, 30 }\nconst n: Int = sumArr xs\nyield \"${n}\"\n",
+        "const host = import \"host\"\nconst xs: []Int = .{ 10, 20, 30 }\nconst n: Int = host.sumArr xs\nyield \"${n}\"\n",
         .{ .typed_host_functions = &funcs },
     );
     defer outcome.deinit();
@@ -637,7 +693,7 @@ test "a typed host function with an optional argument (Phase 5b)" {
     var outcome = try run(
         gpa,
         threaded.io(),
-        "const some: ?Int = 7\nconst none: ?Int = null\nyield \"${orZero some},${orZero none}\"\n",
+        "const host = import \"host\"\nconst some: ?Int = 7\nconst none: ?Int = null\nyield \"${host.orZero some},${host.orZero none}\"\n",
         .{ .typed_host_functions = &funcs },
     );
     defer outcome.deinit();
@@ -655,7 +711,7 @@ test "a typed host function returns a struct (Phase 5b-rest)" {
     var outcome = try run(
         gpa,
         threaded.io(),
-        "const p: struct { x: Int, y: Int } = makePoint 3 4\nyield \"${p.x},${p.y}\"\n",
+        "const host = import \"host\"\nconst p: struct { x: Int, y: Int } = host.makePoint 3 4\nyield \"${p.x},${p.y}\"\n",
         .{ .typed_host_functions = &funcs },
     );
     defer outcome.deinit();
@@ -673,7 +729,7 @@ test "a typed host function receives a struct argument (Phase 5b-rest)" {
     var outcome = try run(
         gpa,
         threaded.io(),
-        "const p: struct { x: Int, y: Int } = .{ .x = 5, .y = 6 }\nconst n: Int = pointSum p\nyield \"${n}\"\n",
+        "const host = import \"host\"\nconst p: struct { x: Int, y: Int } = .{ .x = 5, .y = 6 }\nconst n: Int = host.pointSum p\nyield \"${n}\"\n",
         .{ .typed_host_functions = &funcs },
     );
     defer outcome.deinit();

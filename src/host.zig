@@ -120,6 +120,12 @@ pub const TypedHostFn = struct {
     ctx: ?*anyopaque = null,
 };
 
+/// Prefix for the internal name a typed host function is exposed under (Phase
+/// 5c). The generated `host` module's wrapper `host.add` forwards to this
+/// `__host_add` internal name, which the compiler dispatches to the registry;
+/// users reach host functions through the `host.` namespace, not this name.
+pub const typed_prefix = "__host_";
+
 /// The registry index of the typed function named `name`, or null.
 pub fn lookupTyped(functions: []const TypedHostFn, name: []const u8) ?usize {
     for (functions, 0..) |f, i| {

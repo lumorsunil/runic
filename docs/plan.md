@@ -467,8 +467,8 @@ The project now needs steady maintenance of its contributor-facing surface:
 
 ### 7. Embedding Runic as a scripting runtime
 
-**Status: Phases 1–4, 5a, 5b (incl. structs) landed; 5c not started** — full
-direction in `future/embedding.md`. `runic.embed.run` runs a script from a source string and
+**Status: Phases 1–4 and 5 (a–c) landed** — full direction in
+`future/embedding.md`. `runic.embed.run` runs a script from a source string and
 returns a structured `Outcome` (captured stdout/stderr, exit code or null on a
 compile error, and a flattened diagnostic list). A host can register functions
 (`options.host_functions`) that the script calls like commands (`greet "world"`),
@@ -481,11 +481,11 @@ marshals through the pipeline (`hostfn | lines | parseInt`). Typed host function
 (`options.typed_host_functions`) now also pass/return Runic *scalar* values —
 `const n: Int = add 2 3` — via a type-checker-injected signature, a `native_call`
 IR op, and `Value`↔host marshalling (Phase 5a), now including arrays and
-optionals both directions (Phase 5b), and structs both directions (5b-rest, on
-the new inline-`struct { … }`-annotation inference). Deferred: maps (no
-first-class Runic type) and error returns (expressible via `?T` today), an
-`import "host"` namespace, host functions reading piped stdin, and stdin delivery
-to the script.
+optionals both directions (Phase 5b), structs both directions (5b-rest, on the
+new inline-`struct { … }`-annotation inference), and namespacing under
+`import "host"` / `host.add` via a generated `:host` module (5c). Deferred: maps
+(no first-class Runic type) and error returns (expressible via `?T` today), host
+functions reading piped stdin, and stdin delivery to the script.
 
 Let a host program embed Runic the way an app embeds Lua: the host links the
 runtime as a library, exposes a slice of its own functionality to a script as
