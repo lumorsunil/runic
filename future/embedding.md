@@ -1,6 +1,6 @@
 # Embedding Runic as a scripting runtime
 
-Status: **Phases 1–3 landed; Phases 4+ not started.** `runic.embed.run` (in
+Status: **Phases 1–4 landed; Phases 5+ not started.** `runic.embed.run` (in
 `src/embed.zig`) runs a script from a source string and returns a structured
 `Outcome` (captured stdout/stderr, an exit code or null on compile error, and a
 flattened diagnostic list). A host can register functions (`options.host_functions`,
@@ -188,9 +188,28 @@ to the host in the `RunResult` rather than being printed.
    and the evaluator `Config` (both default `.permissive`, so the CLI is
    unchanged). Note: because `echo`/`printf` are external commands, a strict
    script emits output with `yield` or by calling a host function, not `echo`.
-4. **Richer marshalling** — arrays, maps, structs, optionals, and bidirectional
-   error mapping; optional host-provided constants/values.
-5. **C ABI facade (deferred, maybe out of scope)** — a stable C header so
+4. **Richer I/O and error mapping** — **landed (within the string model).** A
+   host callback now also returns `stderr` (written to the call's stderr, e.g. an
+   error message) alongside `output` and `exit_code`; a non-zero `exit_code`
+   makes the call a **catchable** command failure (`const x = hostfn || "fallback"`,
+   `hostfn catch |e| …`). Structured data already marshals through the pipeline:
+   `hostfn | lines | parseInt` yields a `[]Int`, so arrays need no special
+   support, and host-provided values are expressible as host functions
+   (`const v = config "key"`). Known gap: a bound/caught command's stderr isn't
+   routed to the script's stderr (a pre-existing capture-pipe-routing behavior,
+   not host-specific). **Still deferred — typed native marshalling:** passing
+   `Int`/`Float`/struct values to/from a host function *as Runic values* rather
+   than strings needs the typed native-call path (type-checker declaration + an
+   IR call lowering + `ir.value.Value` ↔ host marshalling), and host functions
+   reading piped **stdin** needs scheduler-cooperative draining of the stdin
+   pipe. Both are larger than the command-model work above.
+5. **Typed native host functions + `import "host"`** — the larger follow-on: a
+   host function declared with a Runic signature, namespaced under an imported
+   `host` module, called through a dedicated native-call IR op, with
+   `ir.value.Value` ↔ host marshalling for scalars, arrays, maps, and structs.
+   This is the "sections 3–5 above" design; it reopens the type-checker/IR
+   surface the command-model phases deliberately avoided.
+6. **C ABI facade (deferred, maybe out of scope)** — a stable C header so
    non-Zig hosts can embed, mirroring Lua's C API. Large; only if there is real
    demand. Zig hosts are the near-term target.
 

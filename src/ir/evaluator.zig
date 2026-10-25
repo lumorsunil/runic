@@ -594,7 +594,7 @@ pub const IREvaluator = struct {
         // An embedding may register host functions the script calls like a
         // command; dispatch to the callback instead of spawning a process.
         if (host.lookup(self.config.host_functions, argv_slice[0])) |host_fn| {
-            return try self.callHostFunction(host_fn, argv_slice, stdout_pipe);
+            return try self.callHostFunction(host_fn, argv_slice, stdout_pipe, stderr_pipe);
         }
 
         if (!self.config.sandbox.allow_exec)
@@ -649,14 +649,16 @@ pub const IREvaluator = struct {
 
     /// Dispatches a command call to a registered host function instead of
     /// spawning a process (embedding, Phase 2). Writes the callback's `output`
-    /// to the call's stdout pipe — captured by a binding / piped onward exactly
-    /// like a real command's stdout — and returns its exit code. Synchronous, so
-    /// the return itself signals completion (no process to reap).
+    /// and `stderr` to the call's stdout/stderr pipes — captured by a binding /
+    /// piped onward exactly like a real command's — and returns its exit code (a
+    /// non-zero code makes the call a catchable failure). Synchronous, so the
+    /// return itself signals completion (no process to reap).
     fn callHostFunction(
         self: *IREvaluator,
         host_fn: *const host.HostFn,
         argv_slice: []const []const u8,
         stdout_pipe: *ReaderWriterStream,
+        stderr_pipe: *ReaderWriterStream,
     ) Error!ExitCode {
         const response = host_fn.callback(.{
             .args = argv_slice[1..],
@@ -664,19 +666,25 @@ pub const IREvaluator = struct {
             .arena = self.allocator,
         });
 
-        if (response.output.len > 0) {
-            const writer = stdout_pipe.closeableWriter().writer;
-            try writer.writeAll(response.output);
-            try writer.flush();
-        }
-        // Drain whatever landed in the pipe buffer to its destination, mirroring
-        // the post-wait forward in `spawnSimpleExec`.
-        while (true) {
-            const event = try stdout_pipe.forward(.unlimited);
-            if (event != .not_done) break;
-        }
+        try self.writeHostOutput(stdout_pipe, response.output);
+        try self.writeHostOutput(stderr_pipe, response.stderr);
 
         return .fromByte(response.exit_code);
+    }
+
+    /// Writes host-function output into a pipe and drains it to the pipe's
+    /// destination, mirroring the post-wait forward in `spawnSimpleExec`.
+    fn writeHostOutput(self: *IREvaluator, pipe: *ReaderWriterStream, bytes: []const u8) Error!void {
+        _ = self;
+        if (bytes.len > 0) {
+            const writer = pipe.closeableWriter().writer;
+            try writer.writeAll(bytes);
+            try writer.flush();
+        }
+        while (true) {
+            const event = try pipe.forward(.unlimited);
+            if (event != .not_done) break;
+        }
     }
 
     fn childStdIoBehavior(
@@ -2192,7 +2200,7 @@ pub const IREvaluator = struct {
                 // `wait` + result handling work unchanged; the output was written
                 // straight to the stdout pipe.
                 if (host.lookup(self.config.host_functions, argv_slice[0])) |host_fn| {
-                    const code = try self.callHostFunction(host_fn, argv_slice, stdout_pipe);
+                    const code = try self.callHostFunction(host_fn, argv_slice, stdout_pipe, stderr_pipe);
                     const mc = try self.allocator.create(closeable_mod.ManualCloseable(ExitCode));
                     mc.* = .{ .label = "<<<host_fn>>>" };
                     mc.setResult(code);

@@ -31,8 +31,12 @@ pub const Response = struct {
     /// Bytes written to the call's stdout (captured by a binding, piped onward,
     /// or printed). Empty for a function used only for its effect.
     output: []const u8 = "",
-    /// The call's exit code (0 = success); surfaces through the normal
-    /// command exit-code model.
+    /// Bytes written to the call's stderr (e.g. an error message for a non-zero
+    /// `exit_code`). Flows to the script's stderr like any command's.
+    stderr: []const u8 = "",
+    /// The call's exit code (0 = success); surfaces through the normal command
+    /// exit-code model, so a non-zero code makes the call a catchable failure
+    /// (`hostfn || …`, `hostfn catch |e| …`).
     exit_code: u8 = 0,
 };
 

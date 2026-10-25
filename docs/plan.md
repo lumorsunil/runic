@@ -467,7 +467,7 @@ The project now needs steady maintenance of its contributor-facing surface:
 
 ### 7. Embedding Runic as a scripting runtime
 
-**Status: Phases 1–3 landed; Phases 4+ not started** — full direction in
+**Status: Phases 1–4 landed; Phases 5+ not started** — full direction in
 `future/embedding.md`. `runic.embed.run` runs a script from a source string and
 returns a structured `Outcome` (captured stdout/stderr, exit code or null on a
 compile error, and a flattened diagnostic list). A host can register functions
@@ -475,9 +475,12 @@ compile error, and a flattened diagnostic list). A host can register functions
 dispatched to a Zig callback with string args and a string/exit-code result —
 implemented by intercepting command spawns, so no type-checker/IR changes. A
 deny-by-default capability sandbox (`options.sandbox`, default `.strict`) gates
-exec / filesystem / env / FFI, with host functions always allowed. Deferred:
-typed signatures and non-string marshalling, an `import "host"` namespace, and
-stdin delivery.
+exec / filesystem / env / FFI, with host functions always allowed. Host callbacks
+also return `stderr` and a catchable non-zero exit code, and structured data
+marshals through the pipeline (`hostfn | lines | parseInt`). Deferred (the larger
+follow-on): typed *native-value* marshalling (Int/struct as Runic values, via a
+type-checker/IR native-call path) under an `import "host"` namespace, host
+functions reading piped stdin, and stdin delivery to the script.
 
 Let a host program embed Runic the way an app embeds Lua: the host links the
 runtime as a library, exposes a slice of its own functionality to a script as

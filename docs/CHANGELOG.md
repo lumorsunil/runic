@@ -31,6 +31,12 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
   (`cimport`). A denied operation stops the run with a located diagnostic naming
   what was blocked; registered host functions are always callable. The CLI is
   unaffected (it runs fully permissive). Phase 3 of embedding.
+- **Embedded host functions report errors.** A host callback's `Response` now
+  carries `stderr` (written to the call's stderr) alongside `output`, and a
+  non-zero `exit_code` makes the call a catchable failure (`const x = hostfn ||
+  "fallback"`). Structured results already marshal through the pipeline
+  (`hostfn | lines | parseInt` → `[]Int`). Phase 4 of embedding; passing
+  Runic values (not strings) to/from host functions is a later typed-native path.
 
 ### Fixed
 

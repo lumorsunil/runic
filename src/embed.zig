@@ -352,6 +352,17 @@ fn sumHost(call: Call) Response {
     return .{ .output = out };
 }
 
+fn boomHost(_: Call) Response {
+    return .{ .stderr = "boom!", .exit_code = 3 };
+}
+
+fn rangeHost(call: Call) Response {
+    const n = if (call.args.len > 0) std.fmt.parseInt(usize, call.args[0], 10) catch 0 else 0;
+    var buf = std.Io.Writer.Allocating.init(call.arena);
+    for (1..n + 1) |i| buf.writer.print("{d}\n", .{i}) catch return .{ .exit_code = 1 };
+    return .{ .output = buf.written() };
+}
+
 test "a script calls a registered host function (unbound, to stdout)" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
@@ -445,6 +456,44 @@ test "host functions remain callable under the strict sandbox" {
 
     try std.testing.expect(outcome.ok());
     try std.testing.expectEqualStrings("Hello, world!", outcome.stdout);
+}
+
+test "a host function reports a failure via stderr and a non-zero exit code" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+
+    const funcs = [_]HostFn{.{ .name = "boom", .callback = boomHost }};
+
+    // Unbound: the host function's stderr flows to the script's stderr.
+    var out_err = try run(gpa, threaded.io(), "boom\n", .{ .host_functions = &funcs });
+    defer out_err.deinit();
+    try std.testing.expect(out_err.ok());
+    try std.testing.expectEqualStrings("boom!", out_err.stderr);
+
+    // The failure (non-zero exit) is catchable with `||`, recovering a fallback.
+    var out_catch = try run(gpa, threaded.io(), "const x = boom || \"caught\"\nyield \"${x}\"\n", .{ .host_functions = &funcs });
+    defer out_catch.deinit();
+    try std.testing.expect(out_catch.ok());
+    try std.testing.expectEqualStrings("caught", out_catch.stdout);
+}
+
+test "a host function's lines marshal to an array through the pipeline" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+
+    const funcs = [_]HostFn{.{ .name = "range", .callback = rangeHost }};
+    var outcome = try run(
+        gpa,
+        threaded.io(),
+        "range \"3\" | lines | parseInt | { for (&0) |n| yield \"${n},\" }\n",
+        .{ .host_functions = &funcs },
+    );
+    defer outcome.deinit();
+
+    try std.testing.expect(outcome.ok());
+    try std.testing.expectEqualStrings("1,2,3,", outcome.stdout);
 }
 
 test "a type error comes back as a structured diagnostic, not a run" {
