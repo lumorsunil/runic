@@ -899,6 +899,12 @@ pub const StructLiteral = struct {
     /// The module the struct type comes from, for qualified construction
     /// (`m.Vector3{ … }`). Null for a plain local `Vector3{ … }`.
     object: ?*Expression = null,
+    /// For an anonymous literal (`.{ … }`) inferred from an *inline* struct-type
+    /// context (`const p: struct { x: Int } = .{ … }`, or a host function's
+    /// struct return): the resolved `.struct_type` TypeExpr, stamped by the type
+    /// checker so the IR compiler can build it without a registered name. Null
+    /// for a named/qualified/generic literal.
+    inferred_struct_type: ?*const TypeExpr = null,
 
     pub const FieldInit = struct {
         name: Identifier,

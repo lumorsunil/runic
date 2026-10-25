@@ -4126,6 +4126,16 @@ pub const IRCompiler = struct {
             return self.compileStructValueLiteral(source, struct_type, struct_literal);
         }
 
+        // An anonymous literal inferred from an inline struct-type context: the
+        // type checker stamped the resolved struct type on it, so build directly.
+        if (struct_literal.name.name.len == 0) {
+            if (struct_literal.inferred_struct_type) |t| {
+                if (t.* == .struct_type) {
+                    return self.compileStructValueLiteral(source, t.struct_type, struct_literal);
+                }
+            }
+        }
+
         const error_set = self.error_sets.get(struct_literal.name.name) orelse {
             try self.reportSourceError(
                 source,

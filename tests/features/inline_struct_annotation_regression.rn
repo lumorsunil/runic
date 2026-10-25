@@ -1,0 +1,8 @@
+// An anonymous struct literal `.{ … }` can be typed by an inline `struct { … }`
+// annotation, not just a named struct type — the type checker stamps the
+// resolved struct type onto the literal and the IR builds it by layout.
+const p: struct { x: Int, y: Int } = .{ .x = 10, .y = 20 }
+echo "${p.x},${p.y}"
+
+const s: struct { name: String, age: Int } = .{ .name = "bob", .age = 42 }
+echo "${s.name} is ${s.age}"

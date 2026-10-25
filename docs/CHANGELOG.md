@@ -14,6 +14,13 @@ Version numbers follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.
 
 ### Added
 
+- **An inline `struct { … }` annotation types an anonymous struct literal.**
+  `const p: struct { x: Int, y: Int } = .{ .x = 1, .y = 2 }` now works — not just
+  a *named* struct type. The type checker stamps the resolved struct type onto
+  the literal (`inferred_struct_type`) and the IR compiler builds it by layout,
+  with no registered name needed. (This also unblocks struct returns from typed
+  host functions.)
+
 - **Embedding facade (`runic.embed.run`).** A host Zig program can run a Runic
   script from a source string and get a structured `Outcome` back — captured
   stdout/stderr, an exit code (null on a compile error), and a flattened

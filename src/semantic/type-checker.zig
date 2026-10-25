@@ -1517,7 +1517,14 @@ pub const TypeChecker = struct {
     ) void {
         const ctx = context orelse return;
         if (isAnonStructLiteral(expr)) {
-            if (self.structTypeNameToStamp(ctx)) |named| expr.struct_literal.name = named;
+            if (self.structTypeNameToStamp(ctx)) |named| {
+                expr.struct_literal.name = named;
+            } else if (self.unaliasType(ctx).* == .struct_type) {
+                // An inline struct-type context (`const p: struct { … } = .{ … }`)
+                // has no name to stamp; carry the resolved struct type on the
+                // literal so both stages build it without a registered name.
+                expr.struct_literal.inferred_struct_type = self.unaliasType(ctx);
+            }
             return;
         }
         if (expr.* == .array and self.unaliasType(ctx).* == .array) {
@@ -5583,6 +5590,18 @@ pub const TypeChecker = struct {
         }
 
         for (struct_literal.fields) |field| try self.runExpression(scope, field.value);
+
+        // An anonymous literal inferred from an inline struct-type context
+        // (`const p: struct { … } = .{ … }`): validate the fields against the
+        // stamped struct type directly — there is no name to look up.
+        if (struct_literal.name.name.len == 0) {
+            if (struct_literal.inferred_struct_type) |t| {
+                if (self.unaliasType(t).* == .struct_type) {
+                    try self.runStructValueLiteral(scope, self.unaliasType(t).struct_type, struct_literal);
+                    return;
+                }
+            }
+        }
 
         // An anonymous struct literal `.{ .x = … }` whose name was never inferred
         // from context (no annotation to take a type from). Give a directed error
